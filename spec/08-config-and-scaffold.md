@@ -44,7 +44,13 @@ export interface ResizeConfig {
     // sqsTransport lazily builds + memoizes one SQSClient from these fields; see 05 · §10.3.
   };
 }
-// getResizeConfig(app)  = deepmerge(default, app.getConfig('resize'), { arrayMerge: overwrite })
+// defaultResizeConfig: Partial<ResizeConfig> — every TUNABLE is defaulted (formats, quality,
+//   effort, lockTtlMs, leaseMs, maxAttempts, …); the host-REQUIRED fields (mediaModelName,
+//   bucketPublic, publicURL) are NOT defaulted — they come from the host's src/config/resize.ts.
+// const overwrite = (_dest: unknown[], src: unknown[]) => src;   // arrays REPLACE, never concat
+// getResizeConfig(app) = deepmerge(defaultResizeConfig, app.getConfig('resize') ?? {}, { arrayMerge: overwrite })
+//   → THROWS a clear error if a required field (mediaModelName/bucketPublic/publicURL) is still
+//     missing (fail fast at first use, not mid-resize).
 // requiredFormats(config) = config.webpAvifOnly ? ['webp','avif'] : config.formats
 ```
 
@@ -60,6 +66,13 @@ The framework discovers models and commands by **auto-scanning one host folder, 
 filename** (`server.ts:572-599`; verified — [Appendix C/D](./appendix.md)). There is no
 `registerModel` API and no bootstrap factory that reaches the worker/CLI process, so the
 `ResizeTask` model and `ResizeWorker` command **must exist as files in the host's `src/`**.
+
+> **How `resize/scaffold` itself runs (no chicken-and-egg).** The generator does **not** use the
+> framework's host-folder command scan — the host files don't exist yet. It ships as a **package
+> bin** (`package.json` `"bin": { "resize-scaffold": "./dist/scaffold/command.js" }` —
+> [09 · Packaging](./09-packaging-and-tests.md)), run once from the host project root via
+> `npx @adaptivestone/framework-module-resize resize-scaffold` (or an npm script). The generated
+> `ResizeWorker`/`ResizeTask` files are then what the framework's scanner picks up at runtime.
 
 But those files are **one-line re-exports of module-owned definitions**, not vendored copies —
 so the schema/behavior stays in the npm package (auto-updates, no drift) and the host file only
@@ -89,8 +102,19 @@ export { default } from '@adaptivestone/framework-module-resize/commands/ResizeW
 > **Eager-mode hosts** ([11 · Modes](./11-modes.md)) skip the model + command entirely — they
 > only scaffold `src/config/resize.ts`.
 
+> **Write paths.** Files are written under the host project root (the bin's `process.cwd()`):
+> `src/models/`, `src/commands/`, `src/config/` by default — each overridable via the app's
+> `foldersConfig` keys `models`/`commands`/`config` ([02 · §4](./02-types-and-api.md)) or a
+> `--out <dir>` flag. Missing folders are created; an existing file is **never overwritten**
+> without `--force`.
+
 `resize/scaffold --check` — idempotent drift mode: for re-export files, verify the import path;
-for config, diff vs the current default template. Never silently overwrite.
+for config, diff vs the current default template. Prints a per-file status (`ok` / `drift` /
+`missing`) and **exits non-zero (1) if any file is missing or drifted**, 0 if all clean (so CI
+can gate on it). Never silently overwrites.
+`resize/scaffold --eject` — writes the **full editable model** (not the re-export) from the
+`ResizeTask.model.full.ts.tpl` template ([09 · §3](./09-packaging-and-tests.md)), for hosts
+needing custom fields/indexes. `--force` overwrites existing scaffolded files.
 
 `ResizeTask` schema that `makeResizeTaskModel` builds (Mongoose, framework `BaseModel`):
 

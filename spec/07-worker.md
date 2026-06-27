@@ -27,7 +27,7 @@ async function runResizeWorker(app) {
   // The worker only supplies the WORK. The TRANSPORT owns completion/redelivery (05 · §10.1):
   // it runs lease → handleTask → complete | fail, keeping the leaseToken/attempts in its own
   // closure (they never ride on `task`). processTask SUCCEEDS by returning, FAILS by throwing.
-  await transport.startWorker(app, (task) => processTask(app, task), { signal: controller.signal });
+  await transport.startWorker(app, (task, taskOpts) => processTask(app, task, taskOpts), { signal: controller.signal });
   app.logger.info('resize worker stopped');
 }
 // Completion + observer firing are the TRANSPORT's job (05 · §10.2), not the worker's:
@@ -39,7 +39,10 @@ async function runResizeWorker(app) {
 // finish in-flight, then stop on opts.signal.)
 ```
 
-`processTask(app, { mediaId, pipeline, previews })` (`src/resizeTask.ts`):
+`processTask(app, { mediaId, pipeline, previews }, taskOpts?)` (`src/resizeTask.ts`).
+`taskOpts?.signal` is the per-task lease-loss `AbortSignal` (§10.2 `renew`); between variants
+(step 7) the loop checks `taskOpts?.signal?.aborted` and stops launching new variants if set —
+**best-effort only**; correctness holds via the fencing token regardless:
 
    Throughout `processTask`, **`ctx = {}`** — the read-path ctx does not cross the queue
    ([04 · Pipelines](./04-pipelines-and-hooks.md) §8); pipeline steps depend on `media`/`metadata`.

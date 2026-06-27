@@ -23,7 +23,7 @@ export type TMinimalResizeApp = {
     warn(msg: string, ...rest: unknown[]): void;
     error(msg: string, ...rest: unknown[]): void;
   };
-  foldersConfig?: { [k: string]: string | undefined };
+  foldersConfig?: { [k: string]: string | undefined };  // host src-folder overrides used ONLY by the scaffold to resolve write paths (keys `models`/`commands`/`config`); see 08 · §12
 };
 ```
 
@@ -75,7 +75,7 @@ export interface Preview {
 }
 
 export interface MediaLike {
-  id?: string;
+  id?: string;            // media id precedence: `media.id ?? String(media._id)` (06 · §17 step 4)
   _id?: { toString(): string };
   original?: Original;
   previews?: Preview[];
@@ -142,7 +142,6 @@ export type * from './types.d.ts';
 > `/commands/ResizeWorker.js`) so the scaffolded host files can re-export them — see
 > [08 · Scaffold](./08-config-and-scaffold.md) and the `exports` map in
 > [09 · Packaging](./09-packaging-and-tests.md).
-```
 
 `ResizeEngine` — process-wide registries (static methods over module-scope maps, like
 email's `registerTemplateEngine`):
@@ -162,7 +161,7 @@ class ResizeEngine {
     pipeline?: string;              // selects a registered pipeline; default 'default'
     formats?: PreviewFormat[];      // default = requiredFormats(config)
     publicURL?: string;             // default from config (cdnURL ?? publicURL)
-    ctx?: Record<string, unknown>;  // threaded to hooks + steps (e.g. { entity:'event', isOwner:true })
+    ctx?: Record<string, unknown>;  // threaded to read-path hooks; reaches pipeline steps ONLY in eager mode (04 · §8). Keys read by the engine: ctx.isOwner / ctx.isAdmin gate signedUrl originals. e.g. { entity:'event', isOwner:true }
     enqueueMissing?: boolean;       // default true
   }): Promise<{ decision: ReadDecision; output: unknown /* whatever formatPublicUrls returns */ }>;
 
@@ -177,6 +176,16 @@ class ResizeEngine {
   }): Promise<{ previews: Preview[] }>;
 }
 ```
+
+**Registration semantics** (the static registries above):
+- `registerQueueTransport` / `registerStorage` — **exactly one active; last registration wins**
+  (re-registering replaces). `getActiveTransport()`/`getActiveStorage()` return it; the worker
+  throws a clear error if no transport (or, for upload, no storage) is registered.
+- `registerPipeline(name, p)` — keyed by `name`; **last registration for a name wins**. An
+  unknown name resolves to the empty pipeline (no steps — [04](./04-pipelines-and-hooks.md) §8).
+- `hook(name, fn)` — **appends** (multiple taps allowed); they run in registration order
+  ([04](./04-pipelines-and-hooks.md) §9). All registration is process-wide, called once at
+  bootstrap, in **both** the API and worker processes.
 
 The read-path behavior of `resolve` is specified in
 [06 · Read & enqueue](./06-read-and-enqueue.md); the synchronous `generate` (eager mode) in

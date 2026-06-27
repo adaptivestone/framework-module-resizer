@@ -24,8 +24,9 @@ export interface QueueTransport {
   // per task and is responsible for completion/redelivery.
   startWorker(
     app: TMinimalResizeApp,
-    handleTask: (task: LeasedTask) => Promise<void>,
-    opts: { signal: AbortSignal },
+    // taskOpts.signal aborts THIS task if its lease is lost (best-effort; see `renew`).
+    handleTask: (task: LeasedTask, taskOpts?: { signal: AbortSignal }) => Promise<void>,
+    opts: { signal: AbortSignal },   // worker-wide shutdown
   ): Promise<void>;
 }
 ```
@@ -92,14 +93,21 @@ ResizeTask.findOneAndUpdate(
 )
 ```
 
-The claim mints a fresh random **`leaseToken`** (the fencing token). `complete`/`fail`/`renew`
+The claim mints a fresh random **`leaseToken`** (the fencing token;
+`randomToken() = randomBytes(16).toString('hex')`). `complete`/`fail`/`renew`
 all filter on `{ _id, leaseToken, status:'processing', leaseExpiresAt:{ $gt: now } }` — a
 0-matched update means this worker **lost the lease** (its lease expired and another worker
 re-claimed), so it drops the result instead of clobbering the new owner. (Validated against
 mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.md).)
 
 - `renew(taskId, leaseToken)` → extend the lease: guarded `$set: { leaseExpiresAt: now+leaseMs }`.
-  Called by the worker heartbeat; if it 0-matches, the worker aborts the in-flight task.
+  Called by the worker heartbeat. If it **0-matches, the lease was lost** (another worker
+  re-claimed). Correctness does **not** depend on stopping the in-flight work: this worker's
+  later `complete`/`fail` are fencing-guarded no-ops, and any `$push` it still does writes
+  *valid* previews that the new owner's existing-preview check simply reuses (idempotent). The
+  transport SHOULD abort the in-flight task to save CPU — `startWorker` aborts the per-task
+  `taskOpts.signal`, which `processTask` checks between variants (best-effort, §11) — but a task
+  that runs to completion anyway corrupts nothing.
 - `complete(taskId, leaseToken)` → guarded `{ status:'completed', completedAt: now }`; on a
   matched update, fire `afterTaskComplete` (skip if 0-matched — the lease was lost).
 - `fail(taskId, leaseToken, error)` (retry-with-backoff, then dead-letter): if

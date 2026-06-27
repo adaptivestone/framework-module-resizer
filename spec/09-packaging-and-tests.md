@@ -42,9 +42,10 @@ framework-module-resize/
 │   ├── scaffold/
 │   │   ├── command.ts      # `resize/scaffold` generator (writes thin re-export shims into host app)
 │   │   └── templates/
-│   │       ├── ResizeTask.model.ts.tpl    # re-export: export default makeResizeTaskModel({fileRef:'File'})
-│   │       ├── ResizeWorker.command.ts.tpl# re-export: export { default } from '.../commands/ResizeWorker.js'
-│   │       └── resize.config.ts.tpl        # full editable config copy
+│   │       ├── ResizeTask.model.ts.tpl      # re-export: export default makeResizeTaskModel({fileRef:'File'})
+│   │       ├── ResizeTask.model.full.ts.tpl # --eject: full editable model (custom fields/indexes)
+│   │       ├── ResizeWorker.command.ts.tpl  # re-export: export { default } from '.../commands/ResizeWorker.js'
+│   │       └── resize.config.ts.tpl         # full editable config copy
 │   └── assets/
 │       └── placeholders/   # optional default placeholders (loading.jpg/webp/avif) — host may override
 ```
@@ -63,6 +64,7 @@ framework-module-resize/
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
     "./config/resize.js": "./dist/config/resize.js"
   },
+  "bin": { "resize-scaffold": "./dist/scaffold/command.js" },   // npx @adaptivestone/framework-module-resize resize-scaffold (08 · §12)
   "engines": { "node": ">=22.12.0" },
   "files": ["dist"],
   "scripts": {
@@ -76,7 +78,7 @@ framework-module-resize/
   "dependencies": { "sharp": "^0.34.0", "deepmerge": "^4.3.1" },
   "peerDependencies": { "mongoose": "*" },
   "optionalDependencies": { "@aws-sdk/client-sqs": "*", "sqs-consumer": "*" },
-  "devDependencies": { "@biomejs/biome": "^2.4.9", "@types/node": "^26.0.0", "typescript": "^6.0.0" }
+  "devDependencies": { "@biomejs/biome": "^2.4.9", "@types/node": "^26.0.0", "typescript": "^6.0.0", "mongodb-memory-server": "^10.0.0" }
 }
 ```
 
@@ -116,9 +118,23 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   enqueue only for missing; enqueue failure does not throw; `canUseOriginal` when known.
 - `enqueue`: dedup by identity; dispatch-lock dedup (held lock ⇒ skipped); no task when
   nothing survives; dispatch locks released on enqueue failure.
-- `mongoTransport`: enqueue maps `mediaId→fileId` and stores `pipeline`; `lease` claims
-  oldest pending, reclaims an expired `processing` lease, two concurrent leases never
-  claim the same task.
+- `mongoTransport` (against **`mongodb-memory-server`** — atomic claim semantics can't be
+  faked with plain objects): enqueue maps `mediaId→fileId` and stores `pipeline`; `lease`
+  claims oldest pending, reclaims an expired `processing` lease, **never reclaims an exhausted
+  one** (`attempts >= maxAttempts`); two concurrent leases never claim the same task;
+  `complete`/`fail`/`renew` are fencing-guarded (a stale `leaseToken` 0-matches); `fail` retries
+  with backoff then dead-letters; the dead-letter sweep flips crash-looped tasks and fires
+  `onTaskDeadLettered` once each.
+- `sqsTransport` (mocked `@aws-sdk/client-sqs` + `sqs-consumer` — no live AWS): `enqueue` sends
+  to `config.sqs.queueUrl` with the right body and returns `{ taskId }`; a thrown `handleTask`
+  propagates (→ SQS redeliver) and fires `onTaskFailed`; `opts.signal` stops the consumer.
+- `config`: `getResizeConfig` deep-merges defaults, host arrays **replace** (not concat),
+  required-field omission throws; `requiredFormats` honors `webpAvifOnly`.
+- `hooks`: `runWaterfall` threads values in registration order AND a throwing tap is logged +
+  skipped (read never breaks); `runObservers` swallows tap errors.
+- `scaffold` (write to a temp dir): emits the re-export/config files; `--check` reports
+  `ok`/`drift`/`missing` and exits non-zero on drift; `--eject` writes the full model; never
+  overwrites without `--force`.
 - `resizeTask.processTask`: skips existing previews; pipeline `beforeSteps` run once before
   resize; `.rotate()` on both branches; filtered variant reaches `variantSteps` with its
   `filters`; per-format encode settings applied (`quality`/`effort` per codec, not one shared

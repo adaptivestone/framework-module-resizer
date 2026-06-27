@@ -22,13 +22,17 @@ getSizeKey({ width, height, fit }): string
 // height only         → `${height}h`           e.g. "400h"
 // none                → throw Error
 // (a dimension counts only if it is a finite number > 0; `fit` wins if set)
+// Dimensions are positive INTEGERS by contract; getSizeKey rounds each with Math.round so the
+// key ALWAYS round-trips through parseSizeKey's integer regexes (a fractional dim would else
+// produce a non-matching key — the round-trip is the 01 · Architecture identity invariant).
 
 parseSizeKey(key): { sizeKey, width?, height?, fit }
-// "fit"            → { fit:true }
-// /^(\d+)x(\d+)$/  → width+height
-// /^(\d+)w$/       → width
-// /^(\d+)h$/       → height
-// else             → { sizeKey, fit:false }  (no dims)
+// Always echoes `sizeKey: key` and a boolean `fit`; width/height set only when matched:
+// "fit"            → { sizeKey:"fit", fit:true }
+// /^(\d+)x(\d+)$/  → { sizeKey:key, width, height, fit:false }
+// /^(\d+)w$/       → { sizeKey:key, width, fit:false }
+// /^(\d+)h$/       → { sizeKey:key, height, fit:false }
+// else             → { sizeKey:key, fit:false }  (no dims)
 ```
 
 **Filter signature** (canonical, order-independent; empty-filter-bag bug from a prior
@@ -51,19 +55,26 @@ getPreviewIdentity(sizeKey, format, filters?): string
 **Content type:**
 
 ```ts
-getImageContentType(format?): `image/${format}` | undefined
+getImageContentType(format?: PreviewFormat): `image/${PreviewFormat}` | undefined
+// For the three RASTER PREVIEW formats only → `image/jpeg|webp|avif` (undefined if format missing).
+// Do NOT pass an ORIGINAL's format: originals (incl. SVG) carry their own `original.contentType`
+// (e.g. 'image/svg+xml') and are served from THAT, never via this helper — which would mis-map
+// 'svg'→'image/svg' and 'jpg'→'image/jpg'.
 ```
 
 **Dimensions:**
 
 ```ts
 calculateResizedDimensions(origW, origH, targetW, targetH, fit=false,
-                           maxSize={width:2000,height:1200}): { width, height }
-// !fit → { width: targetW, height: targetH } as-is (sharp 'cover' does the cropping).
-// fit  → fit inside maxSize preserving aspect ratio, never exceeding the original
-//        (no upscaling). Returns the rounded fitted dims.
-//        (Rationale for `fit` — the uncropped modal/full-view variant — is in
-//         07 · Worker.)
+                           maxSize={width:2000,height:1200}): { width?, height? }
+// !fit (cover) → { width: targetW, height: targetH } passed through unchanged; EITHER may be
+//        undefined for a width-only ("620w") or height-only ("400h") key — sharp then resizes
+//        by the provided side, preserving aspect (cover crops only when BOTH are set). The
+//        worker clamps each provided side to config.maxResultDimension before encode (07 · Worker).
+// fit  → fit inside maxSize preserving aspect ratio, never exceeding the original (no upscaling);
+//        both returned sides rounded with Math.round.
+//        (Rationale for `fit` — the uncropped modal/full-view variant — is in 07 · Worker.)
+// maxSize default {2000,1200} MUST equal config.maxSize (08 · Config); callers always pass it in.
 ```
 
 Build the preview identity and **all** lock keys from `getPreviewIdentity` only.
