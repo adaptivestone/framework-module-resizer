@@ -28,14 +28,21 @@ export interface ResizeConfig {
   maxSourcePixels: number;         // default 50_000_000 (≈imgproxy MAX_SRC_RESOLUTION) — rejected BEFORE decode, from metadata()
   maxResultDimension: number;      // default 5000 — clamp on the cover branch too (fit already capped by maxSize)
   animated: boolean;               // default false — true sets sharp { animated:true } so GIF/WebP keep frames (else flattened to frame 1)
-  lockTtlMs: { dispatch: number; worker: number }; // default { 60000, 120000 }
-  leaseMs: number;                 // default 60000 — worker heartbeats renew at leaseMs/2; set ≥ ~2× worst-case encode
+  lockTtlMs: { dispatch: number; worker: number }; // default { dispatch: 60000, worker: 60000 }. worker MUST be ≤ leaseMs so a crashed worker's locks free within the lease window (07 · doneness invariant)
+  leaseMs: number;                 // default 60000 — worker heartbeat renews the lease at leaseMs/2; set ≥ ~2× worst-case encode
   retryBackoffMs: { base: number; max: number };   // default { base: 5000, max: 300000 } — delayed re-lease on fail
   maxAttempts: number;             // default 3 — retries before dead-letter (sane 3–5; SQS default 10). Mongo status:'dead' / SQS DLQ
   idlePollMs: number;              // default 1000
   workerConcurrency: number;       // default 4
   workerEnabled: boolean;          // default false (env-driven in host)
   placeholderPrefix?: string;      // e.g. 'placeholders/loading'
+  sqs?: {                          // REQUIRED when the SQS transport is active (05 · §10.3); ignored by the Mongo transport
+    queueUrl: string;              //   the work queue URL (SendMessage target + Consumer source)
+    region?: string;               //   default: AWS_REGION / SDK default chain
+    endpoint?: string;             //   optional override (LocalStack / VPC endpoint)
+    // credentials are NOT config — they come from the standard AWS provider chain (env / instance role).
+    // sqsTransport lazily builds + memoizes one SQSClient from these fields; see 05 · §10.3.
+  };
 }
 // getResizeConfig(app)  = deepmerge(default, app.getConfig('resize'), { arrayMerge: overwrite })
 // requiredFormats(config) = config.webpAvifOnly ? ['webp','avif'] : config.formats

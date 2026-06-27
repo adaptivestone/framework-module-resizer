@@ -24,28 +24,38 @@ async function runResizeWorker(app) {
   const controller = new AbortController();
   process.once('SIGTERM', () => controller.abort());
   process.once('SIGINT',  () => controller.abort());
-  await transport.startWorker(app, (task) => handle(app, task, transport), { signal: controller.signal });
+  // The worker only supplies the WORK. The TRANSPORT owns completion/redelivery (05 · §10.1):
+  // it runs lease → handleTask → complete | fail, keeping the leaseToken/attempts in its own
+  // closure (they never ride on `task`). processTask SUCCEEDS by returning, FAILS by throwing.
+  await transport.startWorker(app, (task) => processTask(app, task), { signal: controller.signal });
   app.logger.info('resize worker stopped');
 }
-// handle = processTask → complete (mongo, leaseToken-guarded) / ack (sqs) → afterTaskComplete;
-//          on throw → transport.fail: retries (backoff) up to config.maxAttempts (onTaskFailed
-//          each attempt), then dead-letters (onTaskDeadLettered). See 05 · Transport §10.2.
-//          The Mongo transport wraps handleTask in a heartbeat (renew at leaseMs/2) so a long
-//          resize keeps its lease. (Graceful: finish in-flight, then stop.)
+// Completion + observer firing are the TRANSPORT's job (05 · §10.2), not the worker's:
+//   returns → transport.complete (mongo, leaseToken-guarded) / ack (sqs) → fire afterTaskComplete
+//   throws  → transport.fail: retry (backoff) up to config.maxAttempts (fire onTaskFailed each
+//             attempt), then dead-letter (fire onTaskDeadLettered). SQS: throw → redeliver → DLQ.
+// processTask itself fires onPreviewGenerated per preview it writes. The Mongo transport wraps
+// handleTask in a heartbeat (renew at leaseMs/2) so a long resize keeps its lease. (Graceful:
+// finish in-flight, then stop on opts.signal.)
 ```
 
 `processTask(app, { mediaId, pipeline, previews })` (`src/resizeTask.ts`):
 
-1. Load media by id (via `config.mediaModelName`). If no `original` → return (log).
+   Throughout `processTask`, **`ctx = {}`** — the read-path ctx does not cross the queue
+   ([04 · Pipelines](./04-pipelines-and-hooks.md) §8); pipeline steps depend on `media`/`metadata`.
+1. Load media by id (via `config.mediaModelName`). If no `original` → **return** (log) — a
+   no-op success; the transport then marks the task complete.
    **Defensive SVG guard:** if `original` is SVG (`contentType === 'image/svg+xml'` /
-   `format === 'svg'`) → complete the task as a no-op (log). SVG is pass-through and should
+   `format === 'svg'`) → **return** (no-op success; log). SVG is pass-through and should
    never be enqueued (the read path short-circuits it — [06](./06-read-and-enqueue.md) §17
    step 6); this guard only stops a stray task from rasterizing it or looping.
 2. **Download the original once** (`storage.download`). If no storage → throw.
 3. `origMeta = await sharp(buf).metadata()`; capture the **true** original `origW0/origH0`.
    **Source-pixel guard (before any decode/resize):** if `origW0*origH0 > config.maxSourcePixels`
-   → fail the task (image-bomb defense at the metadata stage, à la imgproxy — cheaper than the
-   decoder-level `limitInputPixels`). **Backfill:** if `media.original.width/height` are missing,
+   → **throw** (image-bomb defense at the metadata stage, à la imgproxy — cheaper than the
+   decoder-level `limitInputPixels`); the transport fails it → retries → dead-letters (a
+   fixed-size oversized source won't recover, so surfacing it as dead is correct). **Backfill:**
+   if `media.original.width/height` are missing,
    include `$set: { 'original.width': origW0, 'original.height': origH0 }` in the final update.
 4. Resolve the named pipeline (`getPipeline(pipeline)`); run its **`beforeSteps`** chain
    over `buf` once: `buf = await step(buf, { media, metadata: origMeta, ctx })`.
@@ -54,9 +64,13 @@ async function runResizeWorker(app) {
    `getPreviewIdentity(sizeKey, format, filters)`).
 7. For each requested preview, **bounded by `config.workerConcurrency`** (default 4 — do
    NOT use unbounded `Promise.all`):
-   - If it already exists → skip and release its **dispatch** lock.
+   - If it already exists (in the step-6 existing-preview set) → skip and release its
+     **dispatch** lock. *(This DB check — not the lock — is what makes re-runs idempotent.)*
    - Acquire the **worker lock** `resize_worker:${mediaId}:${identity}` TTL
-     `config.lockTtlMs.worker` (default 120s). If not acquired → skip.
+     `config.lockTtlMs.worker` (default 60s, **must be ≤ `config.leaseMs`** — see the doneness
+     invariant below). The lock is **best-effort dedup only** (avoids two concurrent tasks
+     double-generating the same variant). If not acquired → **skip** this variant and leave it
+     missing; a later read re-detects and re-enqueues it. Do **not** treat a lock-skip as "done".
    - `{ width, height } = calculateResizedDimensions(procW, procH, reqW, reqH, variant.fit, config.maxSize)`.
    - Build the sharp pipeline (`.rotate()` on **every** branch — EXIF; every `sharp()` call
      in the worker uses `{ failOn: 'none', limitInputPixels: config.limitInputPixels }`):
@@ -77,13 +91,26 @@ async function runResizeWorker(app) {
      `info.format` (`image/${info.format}`), not the requested format. (Never reuse one quality int
      across codecs — see [08 · Config](./08-config-and-scaffold.md).)
    - Upload to the **public** bucket with a **random/unguessable** key
-     `${prefix}/${randomBytes(16).hex}.${format}` (prefix = original key's folder).
+     `${prefix}/${randomBytes(16).toString('hex')}.${format}` (prefix = original key's folder).
    - Collect `{ bucket, key, sizeKey, filters, format, contentType, actualWidth: width,
      actualHeight: height, requestedWidth?, requestedHeight?, fit? }`.
    - On error: log, release the worker lock, continue (one bad variant must not fail the
      whole task).
-8. `$push` all generated previews (and the backfill `$set`) in **one** media update.
+8. `$push` all generated previews (and the backfill `$set`) in **one** media update. Fire
+   `onPreviewGenerated` per pushed preview.
 9. Release every dispatch + worker lock for processed variants (success and error paths).
+
+> **Doneness invariant (prevents silent loss).** The DB `media.previews[]` set — **not** task
+> status, **not** lock state — is the single source of truth for what exists. `processTask`
+> returning (→ the transport marking the task `completed`) does **not** assert every requested
+> variant was produced: a variant that was skipped (lock held) or errored is simply absent from
+> `previews[]`, and the next `resolve` re-detects it as missing and re-enqueues it. Because
+> `lockTtlMs.worker ≤ leaseMs`, a worker that crashes mid-task has its in-flight worker locks
+> expire within the lease window, so the re-leased (or next-read) task can regenerate the
+> skipped variant promptly rather than waiting out a longer lock TTL. (A worker lock is **not**
+> renewed; if a live task runs longer than the TTL its lock may lapse, at worst letting a rare
+> concurrent task regenerate the same variant — a harmless duplicate row/object, the same
+> accepted orphan limitation as a crash, never data loss.)
 10. Fire `onPreviewGenerated` (observer) per preview.
 
 **Why `fit` exists (and why `.rotate()` is mandatory on it):** users upload a mix of

@@ -50,18 +50,27 @@ interface).
 
 - `enqueue` → `ResizeTask.create({ fileId: mediaId, pipeline, previews, status:'pending', attempts:0 }, { writeConcern:{ w:'majority' } })`,
   returns `{ taskId }`.  *(maps generic `mediaId` → host-owned `fileId`; durable enqueue.)*
-- `startWorker` → poll loop: **dead-letter sweep → lease → handleTask (+ heartbeat) → complete | fail**,
+- `startWorker` → poll loop: **dead-letter sweep → lease → handleTask (+ heartbeat) → complete (fire `afterTaskComplete`) | fail**,
   sleeping `config.idlePollMs` on an empty lease, until `opts.signal` aborts. `leasedBy =
   "resizer-" + process.pid`. While a task runs, a heartbeat timer calls `renew` every
-  `config.leaseMs/2` so a long resize doesn't lose its lease.
+  `config.leaseMs/2` so a long resize doesn't lose its lease. The `leaseToken` and `attempts`
+  needed by `complete`/`fail` are retained from the `lease` result in the loop's **own
+  closure** — they are not part of `LeasedTask` and never reach `handleTask`/`processTask`.
 - **dead-letter sweep** (each poll, cheap + indexed) — moves crash-looped tasks out of
   rotation (a worker that died never called `fail`, so the task is stuck `processing`):
 
 ```ts
-ResizeTask.updateMany(
-  { status: 'processing', leaseExpiresAt: { $lt: now }, attempts: { $gte: maxAttempts } },
-  { $set: { status: 'dead', deadAt: now, error: 'max attempts exceeded (crash loop)' } },
-) // for each newly-dead task → runObservers(onTaskDeadLettered)
+// enumerate FIRST — updateMany returns only a count, so observers couldn't otherwise fire per task:
+const filter = { status: 'processing', leaseExpiresAt: { $lt: now }, attempts: { $gte: maxAttempts } };
+const stuck = await ResizeTask.find(filter, { _id: 1, fileId: 1, pipeline: 1, previews: 1 }).lean();
+if (stuck.length) {
+  await ResizeTask.updateMany(
+    { _id: { $in: stuck.map(t => t._id) }, ...filter },   // re-assert filter so a just-re-leased task isn't clobbered
+    { $set: { status: 'dead', deadAt: now, error: 'max attempts exceeded (crash loop)' } },
+  );
+  const err = new Error('max attempts exceeded (crash loop)');
+  for (const t of stuck) runObservers(app, 'onTaskDeadLettered', t, err, {});   // ctx = {} in the worker
+}
 ```
 
 - `lease` → atomic claim of the oldest eligible task (also reclaims a crashed worker's
@@ -91,7 +100,8 @@ mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.
 
 - `renew(taskId, leaseToken)` → extend the lease: guarded `$set: { leaseExpiresAt: now+leaseMs }`.
   Called by the worker heartbeat; if it 0-matches, the worker aborts the in-flight task.
-- `complete(taskId, leaseToken)` → guarded `{ status:'completed', completedAt: now }`.
+- `complete(taskId, leaseToken)` → guarded `{ status:'completed', completedAt: now }`; on a
+  matched update, fire `afterTaskComplete` (skip if 0-matched — the lease was lost).
 - `fail(taskId, leaseToken, error)` (retry-with-backoff, then dead-letter): if
   `task.attempts < maxAttempts` → guarded `{ status:'pending', leaseToken: null,
   leaseExpiresAt: new Date(now + backoff(attempts)) }` so the **pending branch only re-claims
@@ -104,15 +114,23 @@ mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.
 
 ### 10.3 SQS transport (`src/transports/sqs.ts`) — OPTIONAL
 
-- `enqueue` → `SendMessageCommand`, body `{ mediaId, pipeline, previews }`.
-- `startWorker` → `sqs-consumer` `Consumer.create({ queueUrl, sqs, handleMessage })`;
-  per message parse → `handleTask` → resolve = ack/delete (throw to redeliver after the
-  queue's visibility timeout). Wire `opts.signal` → `consumer.stop()`.
+**Config & client.** `sqsTransport` is a singleton object (parallel to `mongoTransport`);
+`app` is threaded into every method, so it reads all settings from `config.sqs` (see
+[08 · Config](./08-config-and-scaffold.md)): `queueUrl` (required), optional `region` /
+`endpoint`. Credentials are **not** config — they resolve via the standard AWS provider chain
+(env / instance role). The transport lazily constructs (and memoizes) one `SQSClient` from
+`config.sqs` on first use.
+
+- `enqueue` → `SendMessageCommand` to `config.sqs.queueUrl`, body `{ mediaId, pipeline, previews }`; returns `{ taskId: MessageId ?? null }`.
+- `startWorker` → `sqs-consumer` `Consumer.create({ queueUrl: config.sqs.queueUrl, sqs: client, handleMessage })`;
+  per message parse → `handleTask` → on resolve ack/delete + fire `afterTaskComplete`; on throw,
+  fire `onTaskFailed` and let SQS redeliver after the queue's visibility timeout. Wire
+  `opts.signal` → `consumer.stop()`.
 - **Dead-letter is native** — no module code. The host configures the queue's redrive
   policy (`maxReceiveCount = config.maxAttempts`) with a DLQ; the transport just throws on
   failure, SQS redelivers up to the cap, then moves the message to the DLQ. There is no
-  Mongo-style `dead` status or sweep here. (To surface `onTaskDeadLettered`, the host may
-  attach a small consumer to the DLQ; the module doesn't require it.)
+  Mongo-style `dead` status or sweep here, so `onTaskDeadLettered` does **not** fire for SQS
+  (the host may attach a small consumer to the DLQ to surface it; the module doesn't require it).
 - Lazy-load `@aws-sdk/client-sqs` / `sqs-consumer` (dynamic `import()`), so the module
   works without them installed.
 

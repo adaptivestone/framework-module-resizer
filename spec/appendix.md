@@ -68,7 +68,8 @@ source list at the end.
 - **Per-format encode** ([08](./08-config-and-scaffold.md), [07](./07-worker.md)): sharp
   defaults differ by codec (JPEG 80, WebP 80, AVIF 50) and aren't perceptually comparable —
   JPEG q80 ≈ AVIF q64 ≈ WebP q82. Config is now `quality.{jpeg:80,webp:80,avif:64}` +
-  `effort.{webp:4,avif:6}`. AVIF is "encode-once/decode-many" CPU-heavy — which itself
+  `effort.{webp:4,avif:4}` (AVIF lowered from 6 to sharp's default 4 — see the AVIF-effort
+  correction below). AVIF is "encode-once/decode-many" CPU-heavy — which itself
   justifies persisting+caching derivatives over per-request regen. [sharp docs, sharp#4227,
   industrialempathy]
 - **Idempotent worker invariant** ([01](./01-architecture.md), [05](./05-transport-and-storage.md)):

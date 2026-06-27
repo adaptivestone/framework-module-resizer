@@ -79,8 +79,10 @@ const { previews } = await ResizeEngine.generate(app, {
 
 ### Behavior (`generate`)
 1. Resolve config + storage + the named pipeline. **Storage is required** (throws if none).
-2. `sizes = runWaterfall('resolveSizes', sizes, ctx)`; expand to `sizes × formats × filters`
-   identities via `getPreviewIdentity` (same as the read path).
+2. `sizes = await runWaterfall(app, 'resolveSizes', sizes, ctx)`; expand to `sizes × formats × filters`
+   identities via `getPreviewIdentity` (same as the read path). In eager mode `ctx` **is** the
+   caller's real ctx (same process) — so pipeline steps here receive it, unlike the queued
+   worker where `ctx === {}` ([04 · Pipelines](./04-pipelines-and-hooks.md) §8).
 3. **Skip identities already present** in `media.previews` (idempotent — safe to re-run; e.g.
    re-upload, or adding new sizes later).
 4. Run the **same core as `processTask`** ([07 · Worker](./07-worker.md) steps 2–8):

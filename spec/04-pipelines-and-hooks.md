@@ -34,10 +34,19 @@ export interface Pipeline {
 }
 ```
 
+> **`ctx` does NOT cross the queue boundary.** Pipeline steps run in the **worker**, a
+> separate process reached over the queue. The task carries only `{ mediaId, pipeline,
+> previews }` — never the read-path `ctx` (which holds request-scoped, often non-serializable
+> data). So in the **queued (lazy) worker, `ctx === {}`**; durable per-media data a step needs
+> must be read from the loaded `media` document (the worker loads it — [07](./07-worker.md)
+> step 1) or persisted onto it earlier. The full read/caller `ctx` is available to steps
+> **only in eager mode** (`ResizeEngine.generate`, synchronous in the request process —
+> [11 · Modes](./11-modes.md)). Write steps to depend on `media`/`metadata`, not `ctx`.
+
 ```ts
 // bootstrap (server.ts) — runs in API and worker
-ResizeEngine.registerPipeline('car', {
-  beforeSteps:  [detectAndBlurPlates, detectAndBlurAnimals],         // safety: applies to every variant
+ResizeEngine.registerPipeline('photo', {
+  beforeSteps:  [detectAndBlurPlates, detectAndBlurFaces],           // safety: applies to every variant
   variantSteps: [(img, { variant }) => variant.filters?.blur ? img.blur(Number(variant.filters.blur)) : img],
 });
 ResizeEngine.registerPipeline('avatar', {});                         // no special processing
@@ -94,9 +103,20 @@ into the flow): `onPreviewGenerated(preview, ctx)`, `afterTaskComplete(task, ctx
 `onTaskDeadLettered(task, error, ctx)` (task exhausted `config.maxAttempts` → dead-letter;
 host can alert/page — see [05 · Transport](./05-transport-and-storage.md)).
 
+> The **worker/transport-fired** observers (`onPreviewGenerated`, `afterTaskComplete`,
+> `onTaskFailed`, `onTaskDeadLettered`) run in the worker process and receive **`ctx === {}`**
+> (no read-path ctx crosses the queue — see the pipeline note above). `onPreviewGenerated` is
+> fired by the worker per generated preview; the completion/failure observers are fired by the
+> transport (§10.2). Only the **read-path** waterfalls below carry the caller's real `ctx`.
+
 ```ts
-async function runWaterfall(name, value, ctx) {
-  for (const fn of hooks.get(name) ?? []) value = await fn(value, ctx);
+// Waterfall taps are HOST code on the read path; a throwing tap must never break the read.
+// Each tap is guarded: on throw, log and keep the prior value (treat the tap as identity).
+async function runWaterfall(app, name, value, ctx) {
+  for (const fn of hooks.get(name) ?? []) {
+    try { value = await fn(value, ctx); }
+    catch (e) { app.logger.error(`resize waterfall ${name} tap failed (skipped)`, e); }
+  }
   return value;
 }
 async function runObservers(app, name, ...args) {

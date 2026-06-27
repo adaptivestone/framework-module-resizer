@@ -94,7 +94,14 @@ export interface MissingPreview {
   fit?: boolean;
 }
 
-export interface ReadyEntry { sizeKey: string; format: PreviewFormat; filters?: Filters; preview: Preview; url: string; }
+export interface ReadyEntry {
+  sizeKey: string;
+  format: PreviewFormat;
+  filters?: Filters;
+  url: string;
+  preview?: Preview;       // present for generated previews; ABSENT for original-backed entries
+  isOriginal?: boolean;    // true when `url` points at the untouched original (SVG pass-through, or "original already fits")
+}
 
 export interface ReadDecision {
   ready: ReadyEntry[];
