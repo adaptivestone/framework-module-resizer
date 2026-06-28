@@ -28,7 +28,7 @@ ResizeEngine.hook('formatPublicUrls', (decision, ctx) => toHostDto(decision, ctx
 ```
 
 ```bash
-npm run cli resize/scaffold        # vendor ResizeTask model + resize config into the app
+npx @adaptivestone/framework-module-resize resize-scaffold   # vendor ResizeTask model + resize config into the app (package bin — 08 · §12)
 npm run cli ResizeWorker           # run the worker process (separate from the API; workerEnabled gates it)
 ```
 

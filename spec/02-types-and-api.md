@@ -23,7 +23,8 @@ export type TMinimalResizeApp = {
     warn(msg: string, ...rest: unknown[]): void;
     error(msg: string, ...rest: unknown[]): void;
   };
-  foldersConfig?: { [k: string]: string | undefined };  // host src-folder overrides used ONLY by the scaffold to resolve write paths (keys `models`/`commands`/`config`); see 08 · §12
+  events?: { emit(name: string, ...args: unknown[]): void };  // framework EventEmitter (app.events); observers are mirrored as `resize:<name>` — duck-typed, NOT a framework import (04 · §9)
+  foldersConfig?: { [k: string]: string | undefined };  // part of the framework app shape; NOT read by the resize module (the standalone scaffold bin resolves write paths from cwd + `--out` — 08 · §12)
 };
 ```
 
@@ -133,15 +134,19 @@ export {
 export { default as defaultResizeConfig, getResizeConfig, requiredFormats } from './config/resize.ts';
 export { mongoTransport } from './transports/mongo.ts';
 export { sqsTransport } from './transports/sqs.ts';   // optional (lazy-loads aws sdk)
-export { makeResizeTaskModel } from './models/ResizeTask.ts';  // factory the host re-exports (Mongo transport)
+export { default as ResizeTaskModel } from './models/ResizeTask.ts';  // BaseModel subclass; the host's scaffolded model `extends` it (Mongo transport)
+export type { TResizeTask } from './models/ResizeTask.ts';            // = GetModelTypeFromClass<typeof ResizeTaskModel>
+export { resizeMediaSchemaFragment } from './models/mediaFragment.ts';  // optional `as const` schema fragment the host spreads into File/Media (08 · §12)
 export type * from './types.d.ts';
 ```
 
-> The `ResizeTask` model factory and the `ResizeWorker` command are also exposed as deep
+> The `ResizeTaskModel` **class** and the `ResizeWorker` command are also exposed as deep
 > package subpaths (`@adaptivestone/framework-module-resize/models/ResizeTask.js` and
-> `/commands/ResizeWorker.js`) so the scaffolded host files can re-export them — see
-> [08 · Scaffold](./08-config-and-scaffold.md) and the `exports` map in
-> [09 · Packaging](./09-packaging-and-tests.md).
+> `/commands/ResizeWorker.js`) so the scaffolded host files can **`extend` the model class** and
+> **re-export the command** — see [08 · Scaffold](./08-config-and-scaffold.md) and the `exports`
+> map in [09 · Packaging](./09-packaging-and-tests.md). The host's `src/models/ResizeTask.ts` must
+> be a literal `class … extends ResizeTaskModel` (not a factory call) so the framework's
+> `npm run gen` AST codegen detects it as a `BaseModel` subclass and types `getModel('ResizeTask')`.
 
 `ResizeEngine` — process-wide registries (static methods over module-scope maps, like
 email's `registerTemplateEngine`):
@@ -179,8 +184,10 @@ class ResizeEngine {
 
 **Registration semantics** (the static registries above):
 - `registerQueueTransport` / `registerStorage` — **exactly one active; last registration wins**
-  (re-registering replaces). `getActiveTransport()`/`getActiveStorage()` return it; the worker
-  throws a clear error if no transport (or, for upload, no storage) is registered.
+  (re-registering replaces). `getActiveTransport()`/`getActiveStorage()` return it **or
+  `undefined`** (they don't throw). The worker **logs and exits cleanly** if no transport is
+  registered ([07 · Worker](./07-worker.md)); a **missing storage throws inside `processTask`**
+  (07 step 2), since the worker can't download/upload without it.
 - `registerPipeline(name, p)` — keyed by `name`; **last registration for a name wins**. An
   unknown name resolves to the empty pipeline (no steps — [04](./04-pipelines-and-hooks.md) §8).
 - `hook(name, fn)` — **appends** (multiple taps allowed); they run in registration order

@@ -21,6 +21,10 @@ async function runResizeWorker(app) {
   if (config.workerEnabled === false) { app.logger.info('resize worker disabled (workerEnabled=false)'); return; }
   const transport = getActiveTransport();
   if (!transport) { app.logger.error('resize worker: no queue transport registered'); return; }
+  // Tune sharp ONCE for a concurrent worker: keep workerConcurrency × sharp.concurrency ≈ nCPU
+  // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
+  sharp.concurrency(config.sharpConcurrency);
+  sharp.cache(config.sharpCache);
   const controller = new AbortController();
   process.once('SIGTERM', () => controller.abort());
   process.once('SIGINT',  () => controller.abort());
@@ -53,20 +57,32 @@ async function runResizeWorker(app) {
    never be enqueued (the read path short-circuits it — [06](./06-read-and-enqueue.md) §17
    step 6); this guard only stops a stray task from rasterizing it or looping.
 2. **Download the original once** (`storage.download`). If no storage → throw.
-3. `origMeta = await sharp(buf).metadata()`; capture the **true** original `origW0/origH0`.
-   **Source-pixel guard (before any decode/resize):** if `origW0*origH0 > config.maxSourcePixels`
-   → **throw** (image-bomb defense at the metadata stage, à la imgproxy — cheaper than the
-   decoder-level `limitInputPixels`); the transport fails it → retries → dead-letters (a
-   fixed-size oversized source won't recover, so surfacing it as dead is correct). **Backfill:**
-   if `media.original.width/height` are missing,
-   include `$set: { 'original.width': origW0, 'original.height': origH0 }` in the final update.
+3. `origMeta = await sharp(buf).metadata()`. **Use DISPLAY orientation for ALL dimension math** —
+   `.rotate()` auto-orients before resize, and EXIF orientations 5–8 swap width/height, so the
+   *stored* dims are wrong for rotated phone photos:
+   `const o = origMeta.orientation ?? 1; const [dispW, dispH] = o >= 5 ? [origMeta.height, origMeta.width] : [origMeta.width, origMeta.height]`.
+   **Source-/animation-pixel guard (before any decode/resize):** `const frames = config.animated ?
+   Math.min(origMeta.pages ?? 1, config.maxAnimationFrames) : 1`; if
+   `origMeta.width * origMeta.height * frames > config.maxSourcePixels` → **throw** (image-/animation-bomb
+   defense at the metadata stage, à la imgproxy — cheaper than the decoder-level `limitInputPixels`);
+   the transport fails it → retries → dead-letters (a fixed-size oversized source won't recover, so
+   surfacing it as dead is correct). **Backfill the DISPLAY dims** if missing:
+   `$set: { 'original.width': dispW, 'original.height': dispH }` in the final update.
 4. Resolve the named pipeline (`getPipeline(pipeline)`); run its **`beforeSteps`** chain
    over `buf` once: `buf = await step(buf, { media, metadata: origMeta, ctx })`.
-5. `procMeta = await sharp(buf).metadata()`; use `procW/procH` for resize math.
+5. `procMeta = await sharp(buf).metadata()`; derive **display** `procW/procH` the same way (swap when
+   `procMeta.orientation >= 5`) and use those for resize math (since `.rotate()` runs before `.resize()`).
 6. Build the existing-preview set from `media.previews` (identity
    `getPreviewIdentity(sizeKey, format, filters)`).
-7. For each requested preview, **bounded by `config.workerConcurrency`** (default 4 — do
-   NOT use unbounded `Promise.all`):
+7. **Decode the original ONCE** into a base pipeline, then process each requested preview
+   **bounded by `config.workerConcurrency`** (default 4 — NOT unbounded `Promise.all`), cloning
+   the base per variant so the decode is shared across all variants (not redone N times):
+   ```ts
+   const base = sharp(buf, { failOn: 'none', sequentialRead: true,
+     limitInputPixels: config.limitInputPixels, animated: config.animated,
+     pages: config.animated ? config.maxAnimationFrames : 1 });
+   ```
+   For each requested preview:
    - If it already exists (in the step-6 existing-preview set) → skip and release its
      **dispatch** lock. *(This DB check — not the lock — is what makes re-runs idempotent.)*
    - Acquire the **worker lock** `resize_worker:${mediaId}:${identity}` TTL
@@ -74,34 +90,47 @@ async function runResizeWorker(app) {
      invariant below). The lock is **best-effort dedup only** (avoids two concurrent tasks
      double-generating the same variant). If not acquired → **skip** this variant and leave it
      missing; a later read re-detects and re-enqueues it. Do **not** treat a lock-skip as "done".
-   - `{ width, height } = calculateResizedDimensions(procW, procH, reqW, reqH, variant.fit, config.maxSize)`.
-   - Build the sharp pipeline (`.rotate()` on **every** branch — EXIF; every `sharp()` call
-     in the worker uses `{ failOn: 'none', limitInputPixels: config.limitInputPixels }`):
+   - `{ width, height } = calculateResizedDimensions(procW, procH, reqW, reqH, variant.fit, config.maxSize)` (cover branch: clamp each provided side to `config.maxResultDimension`; `fit` is already capped by `maxSize`).
+   - Build the per-variant pipeline by **cloning the base** (`.rotate()` on **every** branch, normalize colorspace **before** `variantSteps`, sharpen after downscale, flatten alpha only when the output is jpeg):
      ```ts
-     // for the cover branch, clamp width/height to config.maxResultDimension first (fit is already capped by maxSize)
-     let img = sharp(buf, { failOn: 'none', sequentialRead: true,
-                            limitInputPixels: config.limitInputPixels, animated: config.animated })
-       .rotate()  // = autoOrient(): orient by EXIF tag, then strip it — MANDATORY on every branch
+     let img = base.clone()
+       .rotate()                                  // autoOrient by EXIF then strip — MANDATORY, every branch
        .resize(width, height,
-         variant.fit ? { fit: 'inside', withoutEnlargement: true } : { fit: 'cover', position: 'center' });
-     for (const step of pipeline.variantSteps ?? []) img = await step(img, { variant, ctx }); // per-variant filters/watermark
-     img = img.toColorspace('srgb');  // normalize wide-gamut → sRGB before encode (AWS converts, doesn't just drop ICC)
+         variant.fit ? { fit: 'inside', withoutEnlargement: true } : { fit: 'cover', position: 'center' })
+       .toColorspace('srgb');                     // normalize BEFORE variantSteps so composited overlay colors are predictable
+     const sharpenOn = variant.fit ? config.sharpen && config.sharpen.fit : config.sharpen && config.sharpen.cover;
+     if (sharpenOn) img = img.sharpen();          // mild unsharp to recover Lanczos downscale softening
+     for (const step of pipeline.variantSteps ?? []) img = await step(img, { variant, ctx }); // watermark/filters, post-resize
+     if (format === 'jpeg' && procMeta.hasAlpha) img = img.flatten({ background: config.flattenBackground }); // else transparent → black
      ```
-   - Encode by format with **per-format** settings: `jpeg({ quality: config.quality.jpeg })`,
-     `webp({ quality: config.quality.webp, effort: config.effort.webp })`,
+   - Encode by format with **per-format** settings:
+     `jpeg({ quality: config.quality.jpeg, mozjpeg: config.mozjpeg, chromaSubsampling: config.chromaSubsampling })`,
+     `webp({ quality: config.quality.webp, effort: config.effort.webp, smartSubsample: config.chromaSubsampling === '4:4:4' })`,
      `avif({ quality: config.quality.avif, effort: config.effort.avif })`. Encode via
      `toBuffer({ resolveWithObject: true })` and set `contentType` from the **actual encoded**
      `info.format` (`image/${info.format}`), not the requested format. (Never reuse one quality int
      across codecs — see [08 · Config](./08-config-and-scaffold.md).)
+     > **Color note:** `toColorspace('srgb')` sets the working space but does **not** ICC-transform a
+     > tagged **Display-P3 / Adobe RGB / CMYK** source — and sharp strips ICC by default, so such a
+     > source would be reinterpreted as sRGB (visible shift). Verify against a P3 and a CMYK sample;
+     > either keep the source profile (`.keepIccProfile()`) so the browser color-manages, or do a real
+     > profile→sRGB transform before stripping.
    - Upload to the **public** bucket with a **random/unguessable** key
      `${prefix}/${randomBytes(16).toString('hex')}.${format}` (prefix = original key's folder).
-   - Collect `{ bucket, key, sizeKey, filters, format, contentType, actualWidth: width,
-     actualHeight: height, requestedWidth?, requestedHeight?, fit? }`.
-   - On error: log, release the worker lock, continue (one bad variant must not fail the
-     whole task).
+   - Collect `{ bucket, key, sizeKey, filters, format, contentType, actualWidth: info.width,
+     actualHeight: info.height, requestedWidth?, requestedHeight?, fit? }` — **`actualWidth/Height`
+     come from the encoded `info`, not the resize box** (box ≠ output for `fit`, and `info` already
+     reflects the post-rotate dims).
+   - On error: log, release the worker lock, **record this variant as failed**, and continue (one
+     bad variant must not fail the whole task — but see step 10).
 8. `$push` all generated previews (and the backfill `$set`) in **one** media update. Fire
    `onPreviewGenerated` per pushed preview.
 9. Release every dispatch + worker lock for processed variants (success and error paths).
+10. **Poison-variant guard.** If this run produced **zero** new previews **and** ≥1 variant errored,
+    **throw** (after releasing locks) so the transport's retry → backoff → dead-letter path engages.
+    Without it, a deterministically-failing variant makes the task "succeed" every time → the next
+    `resolve` re-enqueues it → it loops forever with no operator signal. (A run that produced *some*
+    previews returns success; its still-missing variants are simply re-enqueued by the next read.)
 
 > **Doneness invariant (prevents silent loss).** The DB `media.previews[]` set — **not** task
 > status, **not** lock state — is the single source of truth for what exists. `processTask`
@@ -114,7 +143,6 @@ async function runResizeWorker(app) {
 > renewed; if a live task runs longer than the TTL its lock may lapse, at worst letting a rare
 > concurrent task regenerate the same variant — a harmless duplicate row/object, the same
 > accepted orphan limitation as a crash, never data loss.)
-10. Fire `onPreviewGenerated` (observer) per preview.
 
 **Why `fit` exists (and why `.rotate()` is mandatory on it):** users upload a mix of
 portrait and landscape originals. Grid/thumbnail variants use `cover` (cropped to a fixed

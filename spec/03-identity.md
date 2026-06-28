@@ -75,6 +75,8 @@ calculateResizedDimensions(origW, origH, targetW, targetH, fit=false,
 //        both returned sides rounded with Math.round.
 //        (Rationale for `fit` — the uncropped modal/full-view variant — is in 07 · Worker.)
 // maxSize default {2000,1200} MUST equal config.maxSize (08 · Config); callers always pass it in.
+// origW/origH MUST be DISPLAY dimensions (post-EXIF-orient): the worker swaps width/height when
+// metadata.orientation >= 5 before calling (07 · Worker step 3/5), else `fit` mis-sizes rotated photos.
 ```
 
 Build the preview identity and **all** lock keys from `getPreviewIdentity` only.

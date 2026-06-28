@@ -88,9 +88,10 @@ The substantive decisions baked in here, settled against real usage across the p
     [07](./spec/07-worker.md)); **eager** (`ResizeEngine.generate`, synchronous at upload, no
     queue/worker/`ResizeTask`) is a documented simpler alternative — same `previews[]` shape, so
     a host can switch or mix. See [11 · Modes](./spec/11-modes.md).
-11c. **Scaffold = thin re-exports.** The framework auto-scans `src/models`/`src/commands` by
-    filename, so `ResizeTask`/`ResizeWorker` are 1-line re-exports of module-owned definitions
-    (schema/behavior stay in npm; host injects only the `ref`) — no vendored-copy drift.
+11c. **Scaffold = thin shims.** The framework auto-scans `src/models`/`src/commands` by
+    filename, so `ResizeTask` is a 1-line `class … extends ResizeTaskModel` and `ResizeWorker` a
+    1-line re-export of module-owned definitions (schema/behavior stay in npm — no vendored-copy
+    drift). The `extends`-a-class form lets the framework's `npm run gen` type `getModel('ResizeTask')`.
 12. **Poison tasks are capped.** A task retries up to `config.maxAttempts` (default 3),
     then **dead-letters** — Mongo `status:'dead'` (retained ~30d, replayable) or SQS DLQ
     via the queue's redrive policy. New `onTaskDeadLettered` observer.
@@ -123,7 +124,7 @@ wins — all folded into `04`/`05`/`07`/`08`. Remaining open gaps are flagged ho
    `$push`, original-dims backfill, both-tier lock release; clean no-op when disabled.
 5. Storage strategy registered and used by the worker; read path works without it (except
    optional signed-original).
-6. `resize/scaffold` emits an editable `ResizeTask` model (+ `pipeline`/`filters`/`fit`) +
+6. `resize-scaffold` (package bin) emits an editable `ResizeTask` model (+ `pipeline`/`filters`/`fit`) +
    config into a host app; `--check` reports drift.
 7. No `@adaptivestone/framework` / `mongoose` import anywhere; only `TMinimalResizeApp`.
 8. `node:test` suite ([09](./spec/09-packaging-and-tests.md#20-tests-nodetest-mirroring-the-email-module-no-live-awsmongo-where-avoidable))

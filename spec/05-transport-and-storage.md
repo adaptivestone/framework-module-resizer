@@ -32,7 +32,8 @@ export interface QueueTransport {
 ```
 
 Exactly **one** transport is active. The worker ([07](./07-worker.md)) just calls
-`transport.startWorker(app, task => processTask(app, task), { signal })`. `app` is threaded
+`transport.startWorker(app, (task, taskOpts) => processTask(app, task, taskOpts), { signal })`
+(`taskOpts` threads the per-task lease-loss signal — see `handleTask` above). `app` is threaded
 so the transport stays stateless and the bootstrap line is
 `registerQueueTransport(mongoTransport)`.
 
@@ -61,16 +62,19 @@ interface).
   rotation (a worker that died never called `fail`, so the task is stuck `processing`):
 
 ```ts
-// enumerate FIRST — updateMany returns only a count, so observers couldn't otherwise fire per task:
+// Per-row claim-to-dead so EXACTLY ONE worker fires the observer (updateMany returns only a
+// count → can't enumerate; many workers sweep concurrently → updateMany would double-fire).
+// findOneAndUpdate is atomic: only the worker whose update matched gets the doc back.
 const filter = { status: 'processing', leaseExpiresAt: { $lt: now }, attempts: { $gte: maxAttempts } };
-const stuck = await ResizeTask.find(filter, { _id: 1, fileId: 1, pipeline: 1, previews: 1 }).lean();
-if (stuck.length) {
-  await ResizeTask.updateMany(
-    { _id: { $in: stuck.map(t => t._id) }, ...filter },   // re-assert filter so a just-re-leased task isn't clobbered
-    { $set: { status: 'dead', deadAt: now, error: 'max attempts exceeded (crash loop)' } },
+const err = 'max attempts exceeded (crash loop)';
+for (;;) {
+  const dead = await ResizeTask.findOneAndUpdate(
+    filter,
+    { $set: { status: 'dead', deadAt: now, error: err } },
+    { returnDocument: 'after' },
   );
-  const err = new Error('max attempts exceeded (crash loop)');
-  for (const t of stuck) runObservers(app, 'onTaskDeadLettered', t, err, {});   // ctx = {} in the worker
+  if (!dead) break;                                          // none left this poll
+  runObservers(app, 'onTaskDeadLettered', dead, new Error(err), {});   // ctx = {} in the worker
 }
 ```
 

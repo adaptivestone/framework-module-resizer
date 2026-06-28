@@ -108,6 +108,15 @@ host can alert/page — see [05 · Transport](./05-transport-and-storage.md)).
 > (no read-path ctx crosses the queue — see the pipeline note above). `onPreviewGenerated` is
 > fired by the worker per generated preview; the completion/failure observers are fired by the
 > transport (§10.2). Only the **read-path** waterfalls below carry the caller's real `ctx`.
+>
+> **Also mirrored on the framework event bus.** Every observer is additionally emitted on
+> `app.events` (the framework's `EventEmitter`, `server.ts`) as `resize:<name>` — e.g.
+> `resize:onTaskDeadLettered` — so hosts can subscribe with the bus they already use for
+> `'shutdown'` etc., without registering a module hook. The typed `ResizeEngine.hook(...)` registry
+> stays the **primary contract** because it is **awaited and error-isolated** (a throwing observer
+> is logged, not propagated) — raw `EventEmitter.emit` is synchronous, unawaited, and a throwing
+> listener would propagate into the worker. So: `hook()` for guaranteed/awaited handling; `app.events`
+> for fire-and-forget ecosystem subscribers. `app.events` is optional on `TMinimalResizeApp`.
 
 ```ts
 // Waterfall taps are HOST code on the read path; a throwing tap must never break the read.
@@ -120,7 +129,9 @@ async function runWaterfall(app, name, value, ctx) {
   return value;
 }
 async function runObservers(app, name, ...args) {
-  for (const fn of hooks.get(name) ?? []) {
+  try { app.events?.emit(`resize:${name}`, ...args); }       // fire-and-forget mirror onto the framework bus
+  catch (e) { app.logger.error(`resize event ${name} listener failed`, e); }
+  for (const fn of hooks.get(name) ?? []) {                  // primary: typed, awaited, error-isolated
     try { await fn(...args); } catch (e) { app.logger.error(`resize hook ${name} failed`, e); }
   }
 }

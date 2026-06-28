@@ -31,7 +31,8 @@ framework-module-resize/
 │   ├── images.ts          # getSizeKey / parseSizeKey / getFilterSig / getPreviewIdentity /
 │   │                      #   calculateResizedDimensions / getImageContentType
 │   ├── models/
-│   │   └── ResizeTask.ts   # makeResizeTaskModel({fileRef}) — BaseModel factory (host re-exports it)
+│   │   ├── ResizeTask.ts   # ResizeTaskModel — BaseModel subclass + TResizeTask type (host `extends` it)
+│   │   └── mediaFragment.ts # optional `as const` media schema fragment (host spreads into File/Media — 08 · §12)
 │   ├── commands/
 │   │   └── ResizeWorker.ts # AbstractCommand: run() → runResizeWorker(this.app); isShouldInitModels=true
 │   ├── transports/
@@ -40,9 +41,9 @@ framework-module-resize/
 │   ├── config/
 │   │   └── resize.ts       # default config + getResizeConfig(app) + requiredFormats(config)
 │   ├── scaffold/
-│   │   ├── command.ts      # `resize/scaffold` generator (writes thin re-export shims into host app)
+│   │   ├── command.ts      # `resize-scaffold` bin generator (shebang #!/usr/bin/env node; writes re-export shims into host app)
 │   │   └── templates/
-│   │       ├── ResizeTask.model.ts.tpl      # re-export: export default makeResizeTaskModel({fileRef:'File'})
+│   │       ├── ResizeTask.model.ts.tpl      # extends: export default class ResizeTask extends ResizeTaskModel {}
 │   │       ├── ResizeTask.model.full.ts.tpl # --eject: full editable model (custom fields/indexes)
 │   │       ├── ResizeWorker.command.ts.tpl  # re-export: export { default } from '.../commands/ResizeWorker.js'
 │   │       └── resize.config.ts.tpl         # full editable config copy
@@ -71,12 +72,12 @@ framework-module-resize/
     "prepublishOnly": "npm run build",
     "build": "node preBuild.ts && tsc && node postBuild.ts",
     "types:check": "tsc --noEmit",
-    "test": "node --test",
+    "test": "node --experimental-strip-types --test",
     "check": "biome check",
     "check:fix": "biome check --write"
   },
   "dependencies": { "sharp": "^0.34.0", "deepmerge": "^4.3.1" },
-  "peerDependencies": { "mongoose": "*" },
+  "peerDependencies": { "mongoose": "*", "@adaptivestone/framework": "*" },
   "optionalDependencies": { "@aws-sdk/client-sqs": "*", "sqs-consumer": "*" },
   "devDependencies": { "@biomejs/biome": "^2.4.9", "@types/node": "^26.0.0", "typescript": "^6.0.0", "mongodb-memory-server": "^10.0.0" }
 }
@@ -104,7 +105,8 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   Mirror the email module's `preBuild.ts`/`postBuild.ts`.
 - `package.json` `files: ["dist"]`; `prepublishOnly: npm run build`.
 - `npm run check` (biome), `npm run types:check` (tsc --noEmit), and `npm test`
-  (`node --test`) must pass.
+  (`node --experimental-strip-types --test`, so the `.ts` test files run directly on Node ≥22.12)
+  must pass.
 
 ---
 
@@ -132,7 +134,7 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   required-field omission throws; `requiredFormats` honors `webpAvifOnly`.
 - `hooks`: `runWaterfall` threads values in registration order AND a throwing tap is logged +
   skipped (read never breaks); `runObservers` swallows tap errors.
-- `scaffold` (write to a temp dir): emits the re-export/config files; `--check` reports
+- `scaffold` (write to a temp dir): emits the model `extends` shim + command re-export + config files; `--check` reports
   `ok`/`drift`/`missing` and exits non-zero on drift; `--eject` writes the full model; never
   overwrites without `--force`.
 - `resizeTask.processTask`: skips existing previews; pipeline `beforeSteps` run once before
@@ -141,6 +143,11 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   int); **idempotent re-run** — re-processing a task whose previews already exist generates
   nothing and produces no duplicate `$push`; `sharp()` called with `limitInputPixels`; bounded
   concurrency; `$push` shape (incl. `filters`/`fit`); original dims backfilled when missing;
-  both lock tiers released (success + error).
+  both lock tiers released (success + error); **EXIF-rotated source** (orientation 6/8) → `fit`
+  box + backfilled dims use DISPLAY orientation (W/H swapped); **`actualWidth/Height` from encoded
+  `info`** not the resize box (a `fit` variant's recorded dims ≤ box); **transparent source → jpeg**
+  variant is flattened (not black); **poison variant** (a `variantStep` that always throws) →
+  task throws when zero previews produced (engages dead-letter, no infinite re-enqueue); sharpen
+  applied per `config.sharpen` (cover vs fit); jpeg encoded with `mozjpeg`/`chromaSubsampling`.
 - `worker`: clean no-op when `workerEnabled=false`; graceful stop on abort;
   transport-agnostic (`startWorker` is what's invoked).
