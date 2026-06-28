@@ -1,0 +1,66 @@
+{
+  "name": "@adaptivestone/framework-module-resize",
+  "version": "0.1.0",
+  "description": "Adaptive stone node js framework module: lazy image resize (sharp)",
+  "main": "./dist/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
+    "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
+    "./config/resize.js": "./dist/config/resize.js"
+  },
+  "bin": {
+    "resize-scaffold": "./dist/scaffold/command.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adaptivestone/framework-module-resize.git"
+  },
+  "homepage": "https://framework.adaptivestone.com/docs/resize",
+  "keywords": [
+    "node",
+    "image",
+    "resize",
+    "sharp",
+    "framework",
+    "adaptivestone",
+    "framework-module-resize"
+  ],
+  "scripts": {
+    "prepublishOnly": "npm run build",
+    "build": "node preBuild.ts && tsc && node postBuild.ts",
+    "types:check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test",
+    "check": "biome check",
+    "check:fix": "biome check --write"
+  },
+  "files": [
+    "dist"
+  ],
+  "author": "Andrei Lahunou",
+  "license": "MIT",
+  "dependencies": {
+    "deepmerge": "^4.3.1",
+    "sharp": "^0.34.0"
+  },
+  "peerDependencies": {
+    "@adaptivestone/framework": "*",
+    "mongoose": "*"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-sqs": "*",
+    "sqs-consumer": "*"
+  },
+  "devDependencies": {
+    "@adaptivestone/framework": "^5.0.0",
+    "@biomejs/biome": "^2.4.9",
+    "@types/node": "^26.0.0",
+    "mongodb-memory-server": "^11.0.0",
+    "mongoose": "^9.0.0",
+    "typescript": "7.0.1-rc"
+  }
+}

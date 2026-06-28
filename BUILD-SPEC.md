@@ -92,7 +92,7 @@ The substantive decisions baked in here, settled against real usage across the p
     filename, so `ResizeTask` is a 1-line `class … extends ResizeTaskModel` and `ResizeWorker` a
     1-line re-export of module-owned definitions (schema/behavior stay in npm — no vendored-copy
     drift). The `extends`-a-class form lets the framework's `npm run gen` type `getModel('ResizeTask')`.
-12. **Poison tasks are capped.** A task retries up to `config.maxAttempts` (default 3),
+12. **Poison tasks are capped.** A task retries up to `config.queue.maxAttempts` (default 3),
     then **dead-letters** — Mongo `status:'dead'` (retained ~30d, replayable) or SQS DLQ
     via the queue's redrive policy. New `onTaskDeadLettered` observer.
 13. **Research-backed encode + hardening.** Per-format `quality`/`effort` (sharp codec
