@@ -31,7 +31,7 @@ simplest; predictable; zero new infra            scales; fast uploads; no wasted
   photo; a 1–2 s wait to bake variants is fine).
 - **Small, bounded size catalogs** you'll almost always use — pre-generating them wastes
   nothing.
-- **Single-process deployments** where running a separate worker (and `workerEnabled`,
+- **Single-process deployments** where running a separate worker (and `worker.enabled`,
   scaffolded `ResizeTask`, a queue) is more operational weight than the problem deserves.
 - **Strong-consistency reads** — the moment the upload returns, every size is ready; no
   placeholder phase, no "generating…" UX, no eventual consistency to reason about.
@@ -87,7 +87,7 @@ const { previews } = await ResizeEngine.generate(app, {
    re-upload, or adding new sizes later).
 4. Run the **same core as `processTask`** ([07 · Worker](./07-worker.md) steps 2–8):
    download the original once, source-pixel guard, `beforeSteps` (once), then per-variant
-   (bounded by `config.workerConcurrency`) `.rotate()` → `cover|fit` → `variantSteps` → encode
+   (bounded by `config.worker.concurrency`) `.rotate()` → `cover|fit` → `variantSteps` → encode
    → upload (random key).
 5. If `persist` → one `$push` of all generated previews (+ `original.width/height` backfill);
    else return them for the host to store.
@@ -108,10 +108,11 @@ const { previews } = await ResizeEngine.generate(app, {
   because everything is generated before the first read.
 
 ### Config differences
-Eager mode ignores the queue/worker knobs (`workerEnabled`, `leaseMs`, `lockTtlMs`,
-`maxAttempts`, `retryBackoffMs`, `idlePollMs`). It still uses: `bucketPublic`, `publicURL`/
-`cdnURL`, `formats`/`webpAvifOnly`, `maxSize`, `quality`/`effort`, `limitInputPixels`,
-`maxSourcePixels`/`maxResultDimension`, `workerConcurrency` (the inline bound), `animated`.
+Eager mode ignores the `queue.*` knobs and `worker.enabled` (no lease/retry/poll). It still
+uses: `formats`/`webpAvifOnly`, `maxSize`, `animated`, all of `encode.*`, `limits.*`, and
+`worker.concurrency` (the inline bound). Storage (buckets + URL) still comes from the registered
+storage driver — `generate` uploads via `storage.upload(...)` and persists the returned ref,
+exactly like the worker.
 
 ---
 

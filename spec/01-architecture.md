@@ -134,17 +134,17 @@ live Mongo needed for the unit suite.
 - Enqueue and observer hooks must never throw into the read or worker flow. On enqueue
   failure, **release the dispatch locks** so a later read can retry.
 - Read path returns the decision; it must not fabricate a response shape.
-- Worker concurrency is bounded by `config.workerConcurrency`.
-- Poison tasks are capped: a task is retried up to `config.maxAttempts`, then **dead-lettered**
+- Worker concurrency is bounded by `config.worker.concurrency`.
+- Poison tasks are capped: a task is retried up to `config.queue.maxAttempts`, then **dead-lettered**
   (Mongo `status:'dead'`, retained ~30d for inspection/replay; SQS via the queue's DLQ).
   The lease never reclaims a task past the cap, so no crash-loop runs forever.
 - **The worker is idempotent.** Both transports are *at-least-once* — re-running a task for an
   already-generated identity must skip via the existing-preview check (worker §11 step 6),
   never duplicate. ("Effectively exactly-once" only holds for an idempotent consumer.)
-- **Encode per format, never one shared quality.** `config.quality.{jpeg,webp,avif}` +
-  `config.effort.{webp,avif}` — sharp codec defaults differ and aren't perceptually comparable.
+- **Encode per format, never one shared quality.** `config.encode.quality.{jpeg,webp,avif}` +
+  `config.encode.effort.{webp,avif}` — sharp codec defaults differ and aren't perceptually comparable.
 - **Decompression-bomb guard:** every worker `sharp()` call passes `limitInputPixels:
-  config.limitInputPixels`. If a host ever fetches originals by remote URL (the module itself
+  config.limits.inputPixels`. If a host ever fetches originals by remote URL (the module itself
   uses internal `bucket+key`), apply OWASP SSRF mitigations: host-allowlist, no raw user URLs,
   redirects disabled.
 - ESM only; `erasableSyntaxOnly` — no enums/namespaces/decorators/parameter-properties;

@@ -37,7 +37,7 @@ those implementations:
 Usage facts that shaped this spec: readiness flags exist purely to let the **frontend** show
 a placeholder before a preview is ready (no backend polling exists); format negotiation is
 done by the **frontend** `<picture>` element (so the module emits all formats); the worker
-was under-deployed in practice (so `workerEnabled` + graceful read degradation are mandatory).
+was under-deployed in practice (so `worker.enabled` + graceful read degradation are mandatory).
 
 ---
 
@@ -76,7 +76,7 @@ source list at the end.
   delivery is *at-least-once*; "effectively exactly-once" needs an idempotent consumer. The
   existing-preview check is that guard. [mongomq2]
 - **Hardening** ([01](./01-architecture.md), [07](./07-worker.md)): added
-  `config.limitInputPixels` (decompression-bomb guard) on every worker `sharp()`; SSRF note —
+  `config.limits.inputPixels` (decompression-bomb guard) on every worker `sharp()`; SSRF note —
   the module reads by internal `bucket+key`, but a host fetching remote originals must
   host-allowlist, reject raw user URLs, and disable redirects. [OWASP SSRF]
 
@@ -185,8 +185,8 @@ to our model).
 - **FIX — check source pixels *before* decode.** imgproxy reads header dims and rejects "image
   bombs" before allocation (`security/checker.go:53`), with explicit defaults: `MAX_SRC_RESOLUTION`
   **50 MP**, `MAX_RESULT_DIMENSION`, `MAX_SRC_FILE_SIZE`, `MAX_ANIMATION_FRAMES=1`. We already read
-  `metadata()` for dims (worker step 3) — add a `origW0*origH0 > config.maxSourcePixels` guard
-  there + a max-result-dimension cap. **(Folded into `07`/`08`; default `maxSourcePixels:
+  `metadata()` for dims (worker step 3) — add a `origW0*origH0 > config.limits.sourcePixels` guard
+  there + a max-result-dimension cap. **(Folded into `07`/`08`; default `limits.sourcePixels:
   50_000_000`.)**
 - **NOTE — presets-only.** imgproxy's anti-resize-bomb tool (`ONLY_PRESETS` /
   `ALLOWED_PROCESSING_OPTIONS`) is its substitute for URL signing. Our size catalogs are

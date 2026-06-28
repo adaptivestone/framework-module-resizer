@@ -100,7 +100,7 @@ bootstrap, taps run **in registration order**, **awaited sequentially**.
 **Observer** (side effects; return ignored; errors logged via `app.logger`, never thrown
 into the flow): `onPreviewGenerated(preview, ctx)`, `afterTaskComplete(task, ctx)`,
 `onTaskFailed(task, error, ctx)` (per failed *attempt*, will retry),
-`onTaskDeadLettered(task, error, ctx)` (task exhausted `config.maxAttempts` → dead-letter;
+`onTaskDeadLettered(task, error, ctx)` (task exhausted `config.queue.maxAttempts` → dead-letter;
 host can alert/page — see [05 · Transport](./05-transport-and-storage.md)).
 
 > The **worker/transport-fired** observers (`onPreviewGenerated`, `afterTaskComplete`,

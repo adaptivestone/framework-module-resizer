@@ -37,8 +37,11 @@ Lock.waitForUnlock(key: string): Promise<void>;                       // optiona
 ```
 
 > **Storage is NOT on the app interface.** It is a registered strategy
-> (see [05 · Transport & storage](./05-transport-and-storage.md)), keeping the read
-> path storage-free and the contract minimal.
+> (`ResizeEngine.registerStorage`, see [05 · Transport & storage](./05-transport-and-storage.md)),
+> which keeps the app contract minimal and the storage-specific options (buckets, base URL) in the
+> driver rather than `ResizeConfig`. The read path does call the storage driver's **pure,
+> I/O-free `publicUrl`** to build URLs, so the driver must be registered in the API process too —
+> but no storage I/O is on the read path.
 
 ---
 
@@ -51,9 +54,15 @@ export type PreviewFormat = 'jpeg' | 'webp' | 'avif';
 // the identity. e.g. { blur: 40 }. Empty / undefined → 'none' in the identity.
 export type Filters = Record<string, string | number | boolean>;
 
-export interface Original {
-  bucket: string;
+// Opaque storage locator round-tripped between the module and the active storage driver
+// (05 · §10.4). `key` is always present; `bucket` is S3-specific — a filesystem/GCS/other
+// driver may omit it. The module never interprets these; it passes them back to the driver.
+export interface StorageRef {
   key: string;
+  bucket?: string;
+}
+
+export interface Original extends StorageRef {
   format?: string;
   size?: number;
   contentType?: string;
@@ -61,9 +70,7 @@ export interface Original {
   height?: number;
 }
 
-export interface Preview {
-  bucket: string;
-  key: string;
+export interface Preview extends StorageRef {
   sizeKey: string;            // canonical size key — see 03 · Identity
   filters?: Filters;          // part of identity — see 03 · Identity
   requestedWidth?: number;
@@ -165,7 +172,6 @@ class ResizeEngine {
     sizes: SizeInput[];
     pipeline?: string;              // selects a registered pipeline; default 'default'
     formats?: PreviewFormat[];      // default = requiredFormats(config)
-    publicURL?: string;             // default from config (cdnURL ?? publicURL)
     ctx?: Record<string, unknown>;  // threaded to read-path hooks; reaches pipeline steps ONLY in eager mode (04 · §8). Keys read by the engine: ctx.isOwner / ctx.isAdmin gate signedUrl originals. e.g. { entity:'event', isOwner:true }
     enqueueMissing?: boolean;       // default true
   }): Promise<{ decision: ReadDecision; output: unknown /* whatever formatPublicUrls returns */ }>;

@@ -70,7 +70,7 @@ calculateResizedDimensions(origW, origH, targetW, targetH, fit=false,
 // !fit (cover) → { width: targetW, height: targetH } passed through unchanged; EITHER may be
 //        undefined for a width-only ("620w") or height-only ("400h") key — sharp then resizes
 //        by the provided side, preserving aspect (cover crops only when BOTH are set). The
-//        worker clamps each provided side to config.maxResultDimension before encode (07 · Worker).
+//        worker clamps each provided side to config.limits.resultDimension before encode (07 · Worker).
 // fit  → fit inside maxSize preserving aspect ratio, never exceeding the original (no upscaling);
 //        both returned sides rounded with Math.round.
 //        (Rationale for `fit` — the uncropped modal/full-view variant — is in 07 · Worker.)

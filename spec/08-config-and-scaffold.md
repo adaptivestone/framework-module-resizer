@@ -10,60 +10,74 @@ The default config (merged with the host's), and the scaffold command that vendo
 
 ## §13. Config (`src/config/resize.ts`, merged with `app.getConfig('resize')`)
 
+The core config is **module behavior only**. Storage-specific options (buckets, base URL)
+live in the **storage driver**, and transport-specific options (SQS queue URL, region) live
+in the **transport driver** — each is passed to its driver at registration ([05 · Transport &
+storage](./05-transport-and-storage.md)), so the core never encodes an S3-bucket shape and a
+new driver (GCS, R2, filesystem, …) is self-contained. Related knobs are grouped into
+`encode` / `limits` / `queue` / `worker` sub-objects.
+
 ```ts
 export interface ResizeConfig {
   mediaModelName: string;          // host media model, e.g. 'File' or 'Media'
-  bucketPublic: string;            // previews destination
-  bucketPrivate?: string;          // originals (for signedUrl reads)
-  publicURL: string;
-  cdnURL?: string;                 // preferred over publicURL when set
   formats: PreviewFormat[];        // default ['jpeg','webp','avif']
   webpAvifOnly?: boolean;          // when true, requiredFormats() drops 'jpeg' (read + worker MUST agree)
   maxSize: { width: number; height: number };   // default { 2000, 1200 }  (the `fit` cap)
+  animated: boolean;               // default false — true sets sharp { animated:true } so GIF/WebP keep frames
+
   // Per-format encode settings (research-backed; sharp defaults differ per codec and are NOT
   // perceptually comparable — JPEG q80 ≈ AVIF q64 ≈ WebP q82). NEVER reuse one quality int.
-  quality: { jpeg: number; webp: number; avif: number };  // default { jpeg:80, webp:82, avif:64 } (webp 82 ≈ jpeg 80 ≈ avif 64 — the cited equivalence)
-  effort:  { webp: number; avif: number };                // default { webp:4, avif:4 } (sharp default / AWS DIT). Previews are persisted + CDN-cached (encode-once), so raising to 5–6 is usually worth it — smaller files for one-time CPU
-  mozjpeg: boolean;                // default true — jpeg({ mozjpeg:true }): progressive + trellis quantization, ~10–20% smaller at equal quality
-  chromaSubsampling: '4:2:0' | '4:4:4';  // default '4:2:0' (sharp's JPEG default, fine for photos); '4:4:4' keeps full chroma for text/logos/UI — recommended for the `fit` full-view. WebP analog: webp({ smartSubsample:true }) at 4:4:4
-  sharpen: { cover: boolean; fit: boolean } | false;  // default { cover:true, fit:false } — mild unsharp AFTER downscale; ON for heavy-downscale crops, OFF for the large modal (avoids halos)
-  flattenBackground: string;       // default '#ffffff' — when a source has alpha and the output format is jpeg, .flatten({background}) before encode (else transparent → black)
-  limitInputPixels: number;        // default 268402689 (sharp default ~0x3FFF²) — decoder decompression-bomb guard
-  maxSourcePixels: number;         // default 50_000_000 (≈imgproxy MAX_SRC_RESOLUTION) — rejected BEFORE decode, from metadata(); counts width*height*frames
-  maxResultDimension: number;      // default 5000 — clamp on the cover branch too (fit already capped by maxSize)
-  animated: boolean;               // default false — true sets sharp { animated:true } so GIF/WebP keep frames (else flattened to frame 1)
-  maxAnimationFrames: number;      // default 64 — when animated, cap decoded frames (sharp `pages`) — animation-bomb guard (≈imgproxy MAX_ANIMATION_FRAMES); also multiplied into the maxSourcePixels check
-  lockTtlMs: { dispatch: number; worker: number }; // default { dispatch: 60000, worker: 60000 }. worker MUST be ≤ leaseMs so a crashed worker's locks free within the lease window (07 · doneness invariant)
-  leaseMs: number;                 // default 60000 — worker heartbeat renews the lease at leaseMs/2; set ≥ ~2× worst-case encode
-  retryBackoffMs: { base: number; max: number };   // default { base: 5000, max: 300000 } — delayed re-lease on fail
-  maxAttempts: number;             // default 3 — retries before dead-letter (sane 3–5; SQS default 10). Mongo status:'dead' / SQS DLQ
-  idlePollMs: number;              // default 1000
-  workerConcurrency: number;       // default 4 — variants resized in parallel per task (NOT unbounded Promise.all)
-  sharpConcurrency: number;        // default 1 — sharp.concurrency() (libvips threads per op). Keep workerConcurrency × sharpConcurrency ≈ nCPU to avoid thread oversubscription
-  sharpCache: boolean;             // default false — sharp.cache(): a worker processes distinct images, so the libvips operation cache mostly wastes memory
-  workerEnabled: boolean;          // default false (env-driven in host)
-  placeholderPrefix?: string;      // e.g. 'placeholders/loading'
-  sqs?: {                          // REQUIRED when the SQS transport is active (05 · §10.3); ignored by the Mongo transport
-    queueUrl: string;              //   the work queue URL (SendMessage target + Consumer source)
-    region?: string;               //   default: AWS_REGION / SDK default chain
-    endpoint?: string;             //   optional override (LocalStack / VPC endpoint)
-    // credentials are NOT config — they come from the standard AWS provider chain (env / instance role).
-    // sqsTransport lazily builds + memoizes one SQSClient from these fields; see 05 · §10.3.
+  encode: {
+    quality: { jpeg: number; webp: number; avif: number };  // default { jpeg:80, webp:82, avif:64 } (the cited equivalence)
+    effort:  { webp: number; avif: number };                // default { webp:4, avif:4 } (sharp default / AWS DIT). Persisted + CDN-cached (encode-once), so 5–6 is usually worth it
+    mozjpeg: boolean;              // default true — jpeg({ mozjpeg:true }): progressive + trellis quantization, ~10–20% smaller at equal quality
+    chromaSubsampling: '4:2:0' | '4:4:4';  // default '4:2:0' (fine for photos); '4:4:4' keeps full chroma for text/logos/UI. WebP analog: webp({ smartSubsample:true }) at 4:4:4
+    sharpen: { cover: boolean; fit: boolean } | false;  // default { cover:true, fit:false } — mild unsharp AFTER downscale; ON for crops, OFF for the large modal (avoids halos)
+    flattenBackground: string;     // default '#ffffff' — alpha source + jpeg output → .flatten({background}) before encode (else transparent → black)
   };
+
+  // Decode/decompression-bomb guards.
+  limits: {
+    inputPixels: number;           // default 268402689 (sharp default ~0x3FFF²) — sharp limitInputPixels (decoder bomb guard)
+    sourcePixels: number;          // default 50_000_000 (≈imgproxy MAX_SRC_RESOLUTION) — rejected BEFORE decode, from metadata(); counts width*height*frames
+    resultDimension: number;       // default 5000 — clamp on the cover branch too (fit already capped by maxSize)
+    animationFrames: number;       // default 64 — when animated, cap decoded frames (sharp `pages`) — animation-bomb guard; also multiplied into the sourcePixels check
+  };
+
+  // Queue/lease tuning (used by the Mongo transport; harmless for SQS, which has native redrive).
+  queue: {
+    lockTtlMs: { dispatch: number; worker: number }; // default { 60000, 60000 }. worker MUST be ≤ leaseMs so a crashed worker's locks free within the lease window (07 · doneness invariant)
+    leaseMs: number;               // default 60000 — worker heartbeat renews the lease at leaseMs/2; set ≥ ~2× worst-case encode
+    retryBackoffMs: { base: number; max: number };   // default { base: 5000, max: 300000 } — delayed re-lease on fail
+    maxAttempts: number;           // default 3 — retries before dead-letter (sane 3–5; SQS default 10). Mongo status:'dead' / SQS DLQ
+    idlePollMs: number;            // default 1000
+  };
+
+  // Worker runtime tuning.
+  worker: {
+    enabled: boolean;              // default false (env-driven in host)
+    concurrency: number;           // default 4 — variants resized in parallel per task (NOT unbounded Promise.all)
+    sharpConcurrency: number;      // default 1 — sharp.concurrency() (libvips threads per op). Keep concurrency × sharpConcurrency ≈ nCPU
+    sharpCache: boolean;           // default false — sharp.cache(): a worker processes distinct images, so the op-cache mostly wastes memory
+  };
+
+  placeholderPrefix?: string;      // e.g. 'placeholders/loading' (a logical key prefix; the storage driver forms its URL)
 }
-// defaultResizeConfig: Partial<ResizeConfig> — every TUNABLE is defaulted (formats, quality,
-//   effort, lockTtlMs, leaseMs, maxAttempts, …); the host-REQUIRED fields (mediaModelName,
-//   bucketPublic, publicURL) are NOT defaulted — they come from the host's src/config/resize.ts.
+// defaultResizeConfig: Partial<ResizeConfig> — every TUNABLE is defaulted (formats, encode.*,
+//   limits.*, queue.*, worker.*); the one host-REQUIRED field (mediaModelName) is NOT defaulted —
+//   it comes from the host's src/config/resize.ts. (Buckets/URLs/queueUrl are NOT here — they are
+//   driver options, supplied at registerStorage()/registerQueueTransport() — see 05.)
 // const overwrite = (_dest: unknown[], src: unknown[]) => src;   // arrays REPLACE, never concat
 // getResizeConfig(app) = deepmerge(defaultResizeConfig, app.getConfig('resize') ?? {}, { arrayMerge: overwrite })
-//   → THROWS a clear error if a required field (mediaModelName/bucketPublic/publicURL) is still
-//     missing (fail fast at first use, not mid-resize).
+//   → THROWS a clear error if `mediaModelName` is still missing (fail fast at first use, not mid-resize).
 // requiredFormats(config) = config.webpAvifOnly ? ['webp','avif'] : config.formats
 ```
 
 `requiredFormats()` is the **single source** for the format list, used by both the read
 path and the worker. Never hardcode the format list anywhere else. Arrays in the host
 override **replace** the default (so `formats:['webp','avif']` doesn't concat to five).
+Nested sub-objects (`encode`, `queue`, …) deep-merge field-by-field, so a host overriding
+just `encode.quality.avif` keeps every other default.
 
 ---
 
@@ -157,7 +171,7 @@ fileId:  { type: ObjectId, ref: this.fileRef, required: true },   // this.fileRe
 pipeline:{ type: String, default: 'default' },              // which registered pipeline the worker runs
 previews: [{ sizeKey, filters: Mixed, requestedWidth?, requestedHeight?, format(enum), fit? }],
 status:  { enum: ['pending','processing','completed','dead'], default: 'pending' },
-attempts:{ type: Number, default: 0 },                      // capped by config.maxAttempts → 'dead'
+attempts:{ type: Number, default: 0 },                      // capped by config.queue.maxAttempts → 'dead'
 leasedBy: String, leaseToken: String,                       // leaseToken = fencing token (see §10.2)
 leaseExpiresAt: Date, completedAt: Date, deadAt: Date, error: String,
 
@@ -172,7 +186,7 @@ schema.index({ leaseExpiresAt: 1 },
 schema.index({ fileId: 1, createdAt: -1 });
 ```
 
-> **Dead-letter & replay.** A task that crashes or errors past `config.maxAttempts` lands
+> **Dead-letter & replay.** A task that crashes or errors past `config.queue.maxAttempts` lands
 > in `status:'dead'` (see [05 · Transport §10.2](./05-transport-and-storage.md)), retained
 > ~30 days by the `deadAt` TTL above. To **replay**, reset the row:
 > `ResizeTask.updateOne({ _id }, { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } })`.

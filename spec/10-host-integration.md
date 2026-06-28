@@ -14,8 +14,8 @@ worker, the upload-time dims capture, and the real per-entity size catalogs the 
 // src/server.ts (runs in every process — API and worker) — register strategies + hooks once
 import { ResizeEngine, mongoTransport } from '@adaptivestone/framework-module-resize';
 
-ResizeEngine.registerQueueTransport(mongoTransport);
-ResizeEngine.registerStorage(myS3Storage); // { download, upload, publicUrl?, signedUrl? }
+ResizeEngine.registerQueueTransport(mongoTransport);                  // or sqsTransport({ queueUrl, region }) — driver owns its options
+ResizeEngine.registerStorage(myS3Storage); // { download, upload, publicUrl, signedUrl? } — driver owns buckets + base URL (05 · §10.4)
 
 ResizeEngine.registerPipeline('default', {});
 ResizeEngine.registerPipeline('listing', { beforeSteps: [blurPlates] });               // async detector
@@ -29,7 +29,7 @@ ResizeEngine.hook('formatPublicUrls', (decision, ctx) => toHostDto(decision, ctx
 
 ```bash
 npx @adaptivestone/framework-module-resize resize-scaffold   # vendor ResizeTask model + resize config into the app (package bin — 08 · §12)
-npm run cli ResizeWorker           # run the worker process (separate from the API; workerEnabled gates it)
+npm run cli ResizeWorker           # run the worker process (separate from the API; worker.enabled gates it)
 ```
 
 ```ts

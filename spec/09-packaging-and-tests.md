@@ -128,7 +128,7 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   with backoff then dead-letters; the dead-letter sweep flips crash-looped tasks and fires
   `onTaskDeadLettered` once each.
 - `sqsTransport` (mocked `@aws-sdk/client-sqs` + `sqs-consumer` — no live AWS): `enqueue` sends
-  to `config.sqs.queueUrl` with the right body and returns `{ taskId }`; a thrown `handleTask`
+  to the transport's `queueUrl` option with the right body and returns `{ taskId }`; a thrown `handleTask`
   propagates (→ SQS redeliver) and fires `onTaskFailed`; `opts.signal` stops the consumer.
 - `config`: `getResizeConfig` deep-merges defaults, host arrays **replace** (not concat),
   required-field omission throws; `requiredFormats` honors `webpAvifOnly`.
@@ -148,6 +148,6 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   `info`** not the resize box (a `fit` variant's recorded dims ≤ box); **transparent source → jpeg**
   variant is flattened (not black); **poison variant** (a `variantStep` that always throws) →
   task throws when zero previews produced (engages dead-letter, no infinite re-enqueue); sharpen
-  applied per `config.sharpen` (cover vs fit); jpeg encoded with `mozjpeg`/`chromaSubsampling`.
-- `worker`: clean no-op when `workerEnabled=false`; graceful stop on abort;
+  applied per `config.encode.sharpen` (cover vs fit); jpeg encoded with `encode.mozjpeg`/`encode.chromaSubsampling`.
+- `worker`: clean no-op when `worker.enabled=false`; graceful stop on abort;
   transport-agnostic (`startWorker` is what's invoked).

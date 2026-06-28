@@ -53,9 +53,9 @@ interface).
 - `enqueue` → `ResizeTask.create({ fileId: mediaId, pipeline, previews, status:'pending', attempts:0 }, { writeConcern:{ w:'majority' } })`,
   returns `{ taskId }`.  *(maps generic `mediaId` → host-owned `fileId`; durable enqueue.)*
 - `startWorker` → poll loop: **dead-letter sweep → lease → handleTask (+ heartbeat) → complete (fire `afterTaskComplete`) | fail**,
-  sleeping `config.idlePollMs` on an empty lease, until `opts.signal` aborts. `leasedBy =
+  sleeping `config.queue.idlePollMs` on an empty lease, until `opts.signal` aborts. `leasedBy =
   "resizer-" + process.pid`. While a task runs, a heartbeat timer calls `renew` every
-  `config.leaseMs/2` so a long resize doesn't lose its lease. The `leaseToken` and `attempts`
+  `config.queue.leaseMs/2` so a long resize doesn't lose its lease. The `leaseToken` and `attempts`
   needed by `complete`/`fail` are retained from the `lease` result in the loop's **own
   closure** — they are not part of `LeasedTask` and never reach `handleTask`/`processTask`.
 - **dead-letter sweep** (each poll, cheap + indexed) — moves crash-looped tasks out of
@@ -126,41 +126,84 @@ mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.
 
 ### 10.3 SQS transport (`src/transports/sqs.ts`) — OPTIONAL
 
-**Config & client.** `sqsTransport` is a singleton object (parallel to `mongoTransport`);
-`app` is threaded into every method, so it reads all settings from `config.sqs` (see
-[08 · Config](./08-config-and-scaffold.md)): `queueUrl` (required), optional `region` /
-`endpoint`. Credentials are **not** config — they resolve via the standard AWS provider chain
-(env / instance role). The transport lazily constructs (and memoizes) one `SQSClient` from
-`config.sqs` on first use.
+**Driver-owned options.** `sqsTransport` is a **factory** (not a singleton): the host calls
+`registerQueueTransport(sqsTransport({ queueUrl, region?, endpoint? }))` at bootstrap and the
+returned transport closes over those options — they are **not** in `ResizeConfig`. `queueUrl`
+is required; `region` / `endpoint` are optional. Credentials are **never** options — they
+resolve via the standard AWS provider chain (env / instance role). The transport lazily
+constructs (and memoizes) one `SQSClient` from its options on first use.
 
-- `enqueue` → `SendMessageCommand` to `config.sqs.queueUrl`, body `{ mediaId, pipeline, previews }`; returns `{ taskId: MessageId ?? null }`.
-- `startWorker` → `sqs-consumer` `Consumer.create({ queueUrl: config.sqs.queueUrl, sqs: client, handleMessage })`;
+```ts
+export function sqsTransport(opts: { queueUrl: string; region?: string; endpoint?: string }): QueueTransport;
+```
+
+- `enqueue` → `SendMessageCommand` to `opts.queueUrl`, body `{ mediaId, pipeline, previews }`; returns `{ taskId: MessageId ?? null }`.
+- `startWorker` → `sqs-consumer` `Consumer.create({ queueUrl: opts.queueUrl, sqs: client, handleMessage })`;
   per message parse → `handleTask` → on resolve ack/delete + fire `afterTaskComplete`; on throw,
   fire `onTaskFailed` and let SQS redeliver after the queue's visibility timeout. Wire
   `opts.signal` → `consumer.stop()`.
 - **Dead-letter is native** — no module code. The host configures the queue's redrive
-  policy (`maxReceiveCount = config.maxAttempts`) with a DLQ; the transport just throws on
+  policy (`maxReceiveCount = config.queue.maxAttempts`) with a DLQ; the transport just throws on
   failure, SQS redelivers up to the cap, then moves the message to the DLQ. There is no
   Mongo-style `dead` status or sweep here, so `onTaskDeadLettered` does **not** fire for SQS
   (the host may attach a small consumer to the DLQ to surface it; the module doesn't require it).
 - Lazy-load `@aws-sdk/client-sqs` / `sqs-consumer` (dynamic `import()`), so the module
   works without them installed.
 
+> The Mongo transport (`mongoTransport`) needs **no options** — it uses the host-scaffolded
+> `ResizeTask` model and the lease/retry knobs under `config.queue` — so it stays a plain
+> singleton: `registerQueueTransport(mongoTransport)`.
+
 ### 10.4 Storage interface — `registerStorage`
 
-The one seam that lets the worker (and optional signed-original reads) touch S3 without
-importing host helpers. `app` is threaded for parity with the transport.
+The one seam that lets the worker (and the read path's URL building) reach storage without
+the module importing host helpers or knowing what a "bucket" is. **The driver owns all
+storage-specific options** (buckets, base URL, region, credentials) — they live in the driver,
+not `ResizeConfig`. Storage is **host-implemented** (the host writes a small object closing
+over its own S3/GCS/filesystem client + buckets); the module ships only this interface. `app`
+is threaded for parity with the transport.
 
 ```ts
+// StorageRef is the opaque locator the driver round-trips onto the document (02 · §5).
+// `key` is always present; `bucket` is S3-specific and may be absent for other drivers.
 export interface ResizeStorage {
-  download(app: TMinimalResizeApp, ref: { bucket: string; key: string }): Promise<Buffer | Uint8Array>;
-  upload(app: TMinimalResizeApp, args: { bucket: string; key: string; body: Buffer | Uint8Array; contentType: string }):
-    Promise<{ bucket: string; key: string }>;
-  publicUrl?(app: TMinimalResizeApp, ref: { bucket: string; key: string }): string;           // optional; engine falls back to `${publicURL}/${key}`
-  signedUrl?(app: TMinimalResizeApp, ref: { bucket: string; key: string }, ttlSeconds: number): Promise<string>; // optional; owner/admin reads
+  // Download an existing object by its stored locator (the worker's original; rarely a re-read).
+  download(app: TMinimalResizeApp, ref: StorageRef): Promise<Buffer | Uint8Array>;
+
+  // Upload a NEW object. The module supplies the logical `key` + `visibility`; the DRIVER
+  // decides physical placement (which bucket / base dir) and returns the locator to persist.
+  upload(
+    app: TMinimalResizeApp,
+    args: { key: string; body: Buffer | Uint8Array; contentType: string; visibility: 'public' | 'private' },
+  ): Promise<StorageRef>;
+
+  // PURE, synchronous, NO I/O — the public URL for a stored object. Called on the read path,
+  // so it must not touch the network. Required: the driver is the single source for object URLs.
+  publicUrl(app: TMinimalResizeApp, ref: StorageRef): string;
+
+  // Optional: a time-limited signed URL for owner/admin reads of a private original.
+  signedUrl?(app: TMinimalResizeApp, ref: StorageRef, ttlSeconds: number): Promise<string>;
 }
 ```
 
-Exactly one active. The **read path uses storage only optionally** (for `canUseOriginal`
-signed URLs); the **worker requires it** (download + upload) and throws a clear error if
-none is registered.
+Exactly one active. **Both the read path and the worker require it:** the worker for
+`download` + `upload`, the read path for the pure, I/O-free `publicUrl` (and the optional,
+owner/admin-gated `signedUrl`). So `registerStorage(...)` must run at bootstrap in **every**
+process that calls `resolve` or the worker; a missing storage throws a clear error in the
+worker ([07 · Worker](./07-worker.md) step 2) and makes `resolve` log + return the safe empty
+decision ([06 · Read & enqueue](./06-read-and-enqueue.md) never-throw guarantee).
+
+Example host driver (S3, closing over its own buckets + CDN base):
+
+```ts
+ResizeEngine.registerStorage({
+  download: (app, ref) => s3.getObject(ref.bucket!, ref.key),
+  upload: async (app, { key, body, contentType, visibility }) => {
+    const bucket = visibility === 'public' ? 'my-cdn' : 'my-originals';
+    await s3.putObject(bucket, key, body, contentType);
+    return { bucket, key };               // ← persisted onto the preview/original
+  },
+  publicUrl: (app, ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
+  signedUrl: (app, ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
+});
+```
