@@ -63,11 +63,13 @@ export interface ResizeConfig {
 
   placeholderPrefix?: string;      // e.g. 'placeholders/loading' (a logical key prefix; the storage driver forms its URL)
 }
-// defaultResizeConfig: Partial<ResizeConfig> — every TUNABLE is defaulted (formats, encode.*,
-//   limits.*, queue.*, worker.*); the one host-REQUIRED field (mediaModelName) is NOT defaulted —
-//   it comes from the host's src/config/resize.ts. (Buckets/URLs/queueUrl are NOT here — they are
-//   driver options, supplied at registerStorage()/registerQueueTransport() — see 05.)
-// const overwrite = (_dest: unknown[], src: unknown[]) => src;   // arrays REPLACE, never concat
+// defaultResizeConfig: Omit<ResizeConfig,'mediaModelName'> — every TUNABLE is defaulted (formats,
+//   encode.*, limits.*, queue.*, worker.*) and completeness-checked by the type; the one
+//   host-REQUIRED field (mediaModelName) is NOT defaulted — it comes from the host's
+//   src/config/resize.ts. (Buckets/URLs/queueUrl are NOT here — they are driver options, supplied
+//   at registerStorage()/registerQueueTransport() — see 05.)
+// host config is DeepPartial<ResizeConfig> (override any field at any depth; arrays REPLACE).
+// const overwrite = (_dest, src) => src;   // arrayMerge: arrays REPLACE, never concat
 // getResizeConfig(app) = deepmerge(defaultResizeConfig, app.getConfig('resize') ?? {}, { arrayMerge: overwrite })
 //   → THROWS a clear error if `mediaModelName` is still missing (fail fast at first use, not mid-resize).
 // requiredFormats(config) = config.webpAvifOnly ? ['webp','avif'] : config.formats

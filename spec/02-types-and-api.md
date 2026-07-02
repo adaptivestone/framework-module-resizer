@@ -12,7 +12,7 @@ public surface (`src/index.ts`).
 
 ```ts
 export type TMinimalResizeApp = {
-  getConfig(name: 'resize'): Partial<ResizeConfig>;
+  getConfig(name: 'resize'): DeepPartial<ResizeConfig>;  // host overrides any field at any depth; arrays REPLACE (08 · §13)
   // Returns a Mongoose model registered by the host. At minimum:
   //  - 'Lock'       (framework built-in: acquireLock/releaseLock/waitForUnlock)
   //  - 'ResizeTask' (scaffolded into the host app; only for the Mongo transport)

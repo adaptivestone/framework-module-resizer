@@ -19,7 +19,9 @@
 > them. Where prior approaches conflicted, this spec is authoritative and fixes their bugs
 > (see [Appendix A](./spec/appendix.md#a-bugs-this-spec-fixes)).
 >
-> This file is the **index**. The detailed spec lives in [`spec/`](./spec/).
+> This file is the **index**. The detailed spec lives in [`spec/`](./spec/). For the live
+> **implementation status & build order** (what's built, how to continue), see
+> [`BUILD-PLAN.md`](./BUILD-PLAN.md).
 
 ---
 

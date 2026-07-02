@@ -4,12 +4,23 @@
 // runtime imports. Source-coupled types (Pipeline, BeforeStep, VariantStep,
 // QueueTransport, ResizeStorage, HookName, HookFn) live next to their code.
 
+// Recursive partial: every field optional at every depth, BUT arrays are kept whole
+// (a host config array REPLACES the default — it is never deep-merged element-by-element,
+// matching getResizeConfig's arrayMerge — see 08 · §13). Used for host config overrides.
+export type DeepPartial<T> = T extends readonly (infer _U)[]
+  ? T
+  : T extends object
+    ? { [K in keyof T]?: DeepPartial<T[K]> }
+    : T;
+
 // ---------------------------------------------------------------------------
 // Minimal app interface (the slice of the framework app the module depends on)
 // ---------------------------------------------------------------------------
 
 export type TMinimalResizeApp = {
-  getConfig(name: 'resize'): Partial<ResizeConfig>;
+  // A host overrides only the fields it cares about, at any depth (DeepPartial); the
+  // module deep-merges them onto defaultResizeConfig in getResizeConfig (08 · §13).
+  getConfig(name: 'resize'): DeepPartial<ResizeConfig>;
   // Returns a Mongoose model registered by the host. At minimum:
   //  - 'Lock'       (framework built-in: acquireLock/releaseLock/waitForUnlock)
   //  - 'ResizeTask' (scaffolded into the host app; only for the Mongo transport)
