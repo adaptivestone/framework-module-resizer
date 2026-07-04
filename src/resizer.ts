@@ -6,6 +6,7 @@
 // can install a fake per run.
 import type { Metadata, Sharp } from 'sharp';
 import { getApp } from './app.ts';
+import { resolveImpl } from './engine.ts';
 import { frameworkLockProvider, type LockProvider } from './locks.ts';
 import { frameworkMediaStore, type MediaStore } from './mediaStore.ts';
 import type {
@@ -173,8 +174,11 @@ export class Resizer {
   /** Register a tap. Multiple taps per name are allowed; registration order is preserved. */
   hook(name: HookName, fn: HookFn): void {
     const taps = this.hooks.get(name);
-    if (taps) taps.push(fn);
-    else this.hooks.set(name, [fn]);
+    if (taps) {
+      taps.push(fn);
+    } else {
+      this.hooks.set(name, [fn]);
+    }
   }
 
   /** Register a named pipeline — last-wins per name (04 · §8). */
@@ -231,10 +235,11 @@ export class Resizer {
   }
 
   /**
-   * Read path (06 · §17) — the host calls this from its DTO builders.
-   * STUB: the engine lands in build step 5 (src/engine.ts).
+   * Read path (06 · §17) — the host calls this from its DTO builders. Delegates to the
+   * engine (src/engine.ts), which partitions ready vs missing, enqueues the missing set,
+   * and never throws into the caller's read.
    */
-  async resolve(_opts: {
+  async resolve(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string; // selects a registered pipeline; default 'default'
@@ -242,7 +247,7 @@ export class Resizer {
     ctx?: Record<string, unknown>; // threaded to read-path hooks (04 · §8)
     enqueueMissing?: boolean; // default true
   }): Promise<{ decision: ReadDecision; output: unknown }> {
-    throw new Error('not implemented yet (build step 5)');
+    return resolveImpl(this, opts);
   }
 
   /**

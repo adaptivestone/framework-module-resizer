@@ -50,7 +50,9 @@ function installFakeApp(
   const events = opts.withEvents
     ? {
         emit(name: string, ...args: unknown[]) {
-          if (opts.emitThrows) throw new Error('emit boom');
+          if (opts.emitThrows) {
+            throw new Error('emit boom');
+          }
           emitted.push([name, ...args]);
         },
       }
@@ -320,16 +322,20 @@ describe('runObservers', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Read/eager stubs — bodies land in build step 5
+// Read/eager stubs — resolve landed in build step 5; generate lands in step 8
 // ---------------------------------------------------------------------------
 
 describe('resolve/generate stubs', () => {
-  test('resolve rejects with a not-implemented error', async () => {
+  test('resolve delegates to the engine (no longer a stub)', async () => {
+    installFakeApp();
     const r = new Resizer(baseOpts());
-    await assert.rejects(
-      () => r.resolve({ media: {}, sizes: [] }),
-      /not implemented/,
-    );
+    const { decision, output } = await r.resolve({
+      media: {},
+      sizes: [],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(output, decision);
   });
 
   test('generate rejects with a not-implemented error', async () => {

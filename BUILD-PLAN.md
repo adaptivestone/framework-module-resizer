@@ -61,14 +61,14 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 3 | Config | `src/config/resize.ts` | spec/08 §13 | ✅ done (TDD) | 9 |
 | 3 | Ambient app gateway | `src/app.ts` | spec/02 §4 | ✅ done (TDD) | 2 |
 | 4 | Resizer class + hook bus + defaulted seams | `src/resizer.ts`, `src/mediaStore.ts`, `src/locks.ts` | spec/02 §6, spec/04, spec/05 §10.6 | ✅ done (TDD) | 32 |
-| 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ⬜ | — |
+| 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ✅ done (TDD) | 31 (23 engine + 8 enqueue) |
 | 6 | Models | `src/models/ResizeTask.ts`, `src/models/mediaFragment.ts` | spec/08 §12 | ⬜ | — |
 | 7 | Transports + storage driver | `src/transports/mongo.ts`, `src/transports/sqs.ts`, `src/storage/s3.ts` | spec/05 | ⬜ | — |
 | 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ⬜ | — |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ⬜ | — |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
 
-**Suite total so far: 74 tests, all green.** Full target test plan is spec/09 §20.
+**Suite total so far: 105 tests, all green.** Full target test plan is spec/09 §20.
 
 ---
 
