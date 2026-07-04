@@ -34,9 +34,10 @@ export interface QueueTransport {
 
 Exactly **one** transport is active. The worker ([07](./07-worker.md)) just calls
 `transport.startWorker((task, taskOpts) => processTask(task, taskOpts), { signal })`
-(`taskOpts` threads the per-task lease-loss signal — see `handleTask` above). The bootstrap
-line stays `registerQueueTransport(mongoTransport)`; the mongo transport reaches the
-`ResizeTask` model through `getApp()`.
+(`taskOpts` threads the per-task lease-loss signal — see `handleTask` above). The wiring is
+the constructor option: `new Resizer({ transport: mongoTransport, … })` ([02 · §6](./02-types-and-api.md));
+the mongo transport reaches the `ResizeTask` model through `getApp()`. `transport` is
+optional — an eager-only host omits it ([11 · Modes](./11-modes.md)).
 
 > **Delivery is at-least-once** (true of both transports — confirmed for the Mongo
 > lease/visibility pattern and SQS). A task may be delivered more than once (lease expiry +
@@ -127,9 +128,9 @@ mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.
 
 ### 10.3 SQS transport (`src/transports/sqs.ts`) — OPTIONAL
 
-**Driver-owned options.** `sqsTransport` is a **factory** (not a singleton): the host calls
-`registerQueueTransport(sqsTransport({ queueUrl, region?, endpoint? }))` at bootstrap and the
-returned transport closes over those options — they are **not** in `ResizeConfig`. `queueUrl`
+**Driver-owned options.** `sqsTransport` is a **factory** (not a singleton): the host passes
+`transport: sqsTransport({ queueUrl, region?, endpoint? })` to the `Resizer` constructor and
+the returned transport closes over those options — they are **not** in `ResizeConfig`. `queueUrl`
 is required; `region` / `endpoint` are optional. Credentials are **never** options — they
 resolve via the standard AWS provider chain (env / instance role). The transport lazily
 constructs (and memoizes) one `SQSClient` from its options on first use.
@@ -153,9 +154,9 @@ export function sqsTransport(opts: { queueUrl: string; region?: string; endpoint
 
 > The Mongo transport (`mongoTransport`) needs **no options** — it uses the host-scaffolded
 > `ResizeTask` model and the lease/retry knobs under `config.queue` — so it stays a plain
-> singleton: `registerQueueTransport(mongoTransport)`.
+> singleton: `new Resizer({ transport: mongoTransport, … })`.
 
-### 10.4 Storage interface — `registerStorage`
+### 10.4 Storage interface — the required `storage` option
 
 The one seam that lets the worker (and the read path's URL building) reach storage without
 the module importing host helpers or knowing what a "bucket" is. **The driver owns all
@@ -189,16 +190,16 @@ export interface ResizeStorage {
 
 Exactly one active. **Both the read path and the worker require it:** the worker for
 `download` + `upload`, the read path for the pure, I/O-free `publicUrl` (and the optional,
-owner/admin-gated `signedUrl`). So `registerStorage(...)` must run at bootstrap in **every**
-process that calls `resolve` or the worker; a missing storage throws a clear error in the
-worker ([07 · Worker](./07-worker.md) step 2) and makes `resolve` log + return the safe empty
-decision ([06 · Read & enqueue](./06-read-and-enqueue.md) never-throw guarantee).
+owner/admin-gated `signedUrl`). `storage` is therefore the one **required** constructor
+option ([02 · §6](./02-types-and-api.md)) — the type system and the constructor enforce it at
+boot, in **every** process that constructs the Resizer (the "no storage registered" runtime
+degradation class from the registry design no longer exists).
 
 A custom driver is just a small object (host-implemented — e.g. GCS or a filesystem; for
 plain S3 use the shipped `s3Storage`, §10.5):
 
 ```ts
-ResizeEngine.registerStorage({
+new Resizer({ …, storage: {
   download: (ref) => s3.getObject(ref.bucket!, ref.key),
   upload: async ({ key, body, contentType, visibility }) => {
     const bucket = visibility === 'public' ? 'my-cdn' : 'my-originals';
@@ -207,14 +208,14 @@ ResizeEngine.registerStorage({
   },
   publicUrl: (ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
   signedUrl: (ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
-});
+}});
 ```
 
 ### 10.5 S3 storage driver (`src/storage/s3.ts`) — SHIPPED (optional deps)
 
 **Driver-owned options, factory-shaped** (exactly like `sqsTransport`): the host calls
-`registerStorage(s3Storage({ … }))` and the returned driver closes over its options — nothing
-storage-specific enters `ResizeConfig`. Credentials are **never** options (standard AWS
+`storage: s3Storage({ … })` in the `Resizer` constructor and the returned driver closes over
+its options — nothing storage-specific enters `ResizeConfig`. Credentials are **never** options (standard AWS
 provider chain). The factory lazily constructs (and memoizes) one `S3Client` on first I/O use.
 
 ```ts
@@ -244,9 +245,9 @@ export function s3Storage(opts: {
 
 The last two DB touchpoints, behind the same single-active-strategy pattern — so the **core
 is fully DB-free**: with a non-Mongo transport plus custom drivers here, nothing in the module
-touches Mongo. Unlike transport/storage, each has a **framework-backed default active out of
-the box** (a standard host registers nothing); `registerMediaStore`/`registerLockProvider`
-replace it (last wins).
+touches Mongo. Both are **optional constructor options with framework-backed defaults**
+([02 · §6](./02-types-and-api.md)): omit them and `frameworkMediaStore`/`frameworkLockProvider`
+are used; pass your own to swap the DB layer. Fixed at construction, like every driver.
 
 ```ts
 export interface MediaStore {

@@ -3,7 +3,7 @@
 > Part of the [`@adaptivestone/framework-module-resize` build spec](../BUILD-SPEC.md).
 > Prev: [01 · Architecture](./01-architecture.md) · Next: [03 · Identity](./03-identity.md)
 
-The minimal app interface, the data shapes (`src/types.d.ts`), and the `ResizeEngine`
+The minimal app interface, the data shapes (`src/types.d.ts`), and the `Resizer`
 public surface (`src/index.ts`).
 
 ---
@@ -45,8 +45,8 @@ Lock.releaseLock(key: string): Promise<void>;
 Lock.waitForUnlock(key: string): Promise<void>;                       // optional, may be unused
 ```
 
-> **Storage is NOT on the app interface.** It is a registered strategy
-> (`ResizeEngine.registerStorage`, see [05 · Transport & storage](./05-transport-and-storage.md)),
+> **Storage is NOT on the app interface.** It is an injected strategy
+> (the required `storage:` constructor option, see [05 · Transport & storage](./05-transport-and-storage.md)),
 > which keeps the app contract minimal and the storage-specific options (buckets, base URL) in the
 > driver rather than `ResizeConfig`. The read path does call the storage driver's **pure,
 > I/O-free `publicUrl`** to build URLs, so the driver must be registered in the API process too —
@@ -140,7 +140,7 @@ fields; the module ignores them).
 ## §6. Public API (`src/index.ts`)
 
 ```ts
-export { default as ResizeEngine } from './engine.ts';
+export { Resizer, getResizer } from './resizer.ts';   // constructor-wired; one instance per process
 export { default as ResizeWorker, runResizeWorker } from './worker.ts';
 export { processTask } from './resizeTask.ts';
 export {
@@ -151,8 +151,8 @@ export { default as defaultResizeConfig, getResizeConfig, requiredFormats } from
 export { mongoTransport } from './transports/mongo.ts';
 export { sqsTransport } from './transports/sqs.ts';   // optional (lazy-loads aws sdk)
 export { s3Storage } from './storage/s3.ts';          // shipped storage driver (lazy-loads aws sdk)
-export { frameworkMediaStore } from './mediaStore.ts';    // DEFAULT media store (auto-active)
-export { frameworkLockProvider } from './locks.ts';       // DEFAULT lock provider (auto-active)
+export { frameworkMediaStore } from './mediaStore.ts';    // DEFAULT media store (used when the option is omitted)
+export { frameworkLockProvider } from './locks.ts';       // DEFAULT lock provider (used when the option is omitted)
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';  // BaseModel subclass; the host's scaffolded model `extends` it (Mongo transport)
 export type { TResizeTask } from './models/ResizeTask.ts';            // = GetModelTypeFromClass<typeof ResizeTaskModel>
 export { resizeMediaSchemaFragment } from './models/mediaFragment.ts';  // optional `as const` schema fragment the host spreads into File/Media (08 · §12)
@@ -167,21 +167,35 @@ export type * from './types.d.ts';
 > be a literal `class … extends ResizeTaskModel` (not a factory call) so the framework's
 > `npm run gen` AST codegen detects it as a `BaseModel` subclass and types `getModel('ResizeTask')`.
 
-`ResizeEngine` — process-wide registries (static methods over module-scope maps, like
-email's `registerTemplateEngine`):
+**`Resizer` — constructor-wired, one instance per process.** All drivers are injected in ONE
+visible options literal at construction (no register-call sequence, no hidden global
+registries). The constructor sets the process-wide **active instance** — a second
+`new Resizer(...)` **throws** (mirroring the framework's `setAppInstance`
+one-server-per-process rule); `resetResizerForTests()` is the test-only escape hatch. The
+worker command and module internals reach the instance via `getResizer()` (throws a clear
+error if no Resizer was constructed). The host constructs it in bootstrap code that runs in
+**both** the API and worker processes (e.g. the scaffolded `src/resizer.ts`, imported from
+`src/server.ts` — [08 · §12](./08-config-and-scaffold.md)).
 
 ```ts
-class ResizeEngine {
-  // --- extension registration (call once at host bootstrap, e.g. src/server.ts) ---
-  static hook(name: HookName, fn: HookFn): void;             // cross-cutting hooks (04)
-  static registerPipeline(name: string, p: Pipeline): void;  // per-media-type processing (04)
-  static registerQueueTransport(t: QueueTransport): void;    // exactly one active (05)
-  static registerStorage(s: ResizeStorage): void;            // exactly one active (05)
-  static registerMediaStore(s: MediaStore): void;            // media load/persist; DEFAULT active: framework models (05 · §10.6)
-  static registerLockProvider(l: LockProvider): void;        // dispatch/worker locks; DEFAULT active: framework Lock (05 · §10.6)
+export interface ResizerOptions {
+  storage: ResizeStorage;                // REQUIRED — both modes need it (05 · §10.4); missing = boot-time type/throw error
+  transport?: QueueTransport;            // lazy mode only (05 · §10.1); omit for eager-only hosts (11 · Modes)
+  mediaStore?: MediaStore;               // default: frameworkMediaStore (05 · §10.6)
+  lockProvider?: LockProvider;           // default: frameworkLockProvider (05 · §10.6)
+  pipelines?: Record<string, Pipeline>;  // initial named pipelines (04 · §8)
+  hooks?: Partial<Record<HookName, HookFn | HookFn[]>>;  // initial taps (04 · §9)
+}
+
+class Resizer {
+  constructor(opts: ResizerOptions);     // fills defaults; sets the active instance (throws on a second construction)
+
+  // --- incremental extension (other modules can tap in via getResizer()) ---
+  hook(name: HookName, fn: HookFn): void;             // appends (04 · §9)
+  registerPipeline(name: string, p: Pipeline): void;  // last-wins per name (04 · §8)
 
   // --- read path (host calls this from its DTO builders) ---
-  static async resolve(opts: {
+  async resolve(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;              // selects a registered pipeline; default 'default'
@@ -191,7 +205,7 @@ class ResizeEngine {
   }): Promise<{ decision: ReadDecision; output: unknown /* whatever formatPublicUrls returns */ }>;
 
   // --- eager mode (synchronous generate at upload; no queue/worker) — see 11 · Modes ---
-  static async generate(opts: {
+  async generate(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;
@@ -200,24 +214,27 @@ class ResizeEngine {
     persist?: boolean;              // default true → $push previews + backfill dims
   }): Promise<{ previews: Preview[] }>;
 }
+
+export function getResizer(): Resizer;        // the active instance; THROWS a clear error if none constructed
+export function resetResizerForTests(): void; // TEST-ONLY (not re-exported from index.ts docs)
 ```
 
-**Registration semantics** (the static registries above):
-- `registerQueueTransport` / `registerStorage` — **exactly one active; last registration wins**
-  (re-registering replaces). `getActiveTransport()`/`getActiveStorage()` return it **or
-  `undefined`** (they don't throw). The worker **logs and exits cleanly** if no transport is
-  registered ([07 · Worker](./07-worker.md)); a **missing storage throws inside `processTask`**
-  (07 step 2), since the worker can't download/upload without it.
-- `registerMediaStore` / `registerLockProvider` — **exactly one active; last wins** — but unlike
-  transport/storage they are **never absent**: the framework-backed defaults
-  (`frameworkMediaStore`, `frameworkLockProvider` — [05 · §10.6](./05-transport-and-storage.md))
-  are active until replaced, so `getActiveMediaStore()`/`getActiveLockProvider()` always return
-  a driver and a standard host registers nothing.
-- `registerPipeline(name, p)` — keyed by `name`; **last registration for a name wins**. An
-  unknown name resolves to the empty pipeline (no steps — [04](./04-pipelines-and-hooks.md) §8).
-- `hook(name, fn)` — **appends** (multiple taps allowed); they run in registration order
-  ([04](./04-pipelines-and-hooks.md) §9). All registration is process-wide, called once at
-  bootstrap, in **both** the API and worker processes.
+**Wiring semantics** (constructor options above):
+- **Drivers are fixed at construction** — no re-registration/last-wins mutation for
+  transport/storage/mediaStore/lockProvider. Swapping a driver = constructing the Resizer
+  differently (tests just build fresh instances after `resetResizerForTests()`).
+- `storage` is **required** (the type system + constructor enforce it — the "forgot to
+  register storage" runtime degradation class is gone). `transport` is **optional**: eager-only
+  hosts ([11 · Modes](./11-modes.md)) omit it; with no transport, `resolve` logs once and skips
+  enqueueing (missing variants stay placeholders), and the worker **logs and exits cleanly**
+  ([07 · Worker](./07-worker.md)).
+- `mediaStore` / `lockProvider` omitted → the framework-backed defaults
+  (`frameworkMediaStore`, `frameworkLockProvider` — [05 · §10.6](./05-transport-and-storage.md)).
+  The instance always has all four drivers resolved after construction.
+- `pipelines` / `hooks` seed the initial sets; `resizer.registerPipeline(name, p)` (last-wins
+  per name; unknown name → empty pipeline) and `resizer.hook(name, fn)` (appends; taps run in
+  registration order) allow incremental additions later — e.g. another module tapping
+  observers via `getResizer().hook(...)`.
 
 The read-path behavior of `resolve` is specified in
 [06 · Read & enqueue](./06-read-and-enqueue.md); the synchronous `generate` (eager mode) in

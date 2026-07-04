@@ -60,7 +60,7 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 2 | Identity helpers | `src/images.ts` | spec/03 | ✅ done (TDD) | 31 |
 | 3 | Config | `src/config/resize.ts` | spec/08 §13 | ✅ done (TDD) | 9 |
 | 3 | Ambient app gateway | `src/app.ts` | spec/02 §4 | ✅ done (TDD) | 2 |
-| 4 | Registry + hooks + defaulted seams | `src/registry.ts`, `src/hooks.ts`, `src/mediaStore.ts`, `src/locks.ts` | spec/04, spec/05 §10.6 | ⬜ next | — |
+| 4 | Resizer class + hook bus + defaulted seams | `src/resizer.ts`, `src/mediaStore.ts`, `src/locks.ts` | spec/02 §6, spec/04, spec/05 §10.6 | ✅ done (TDD) | 32 |
 | 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ⬜ | — |
 | 6 | Models | `src/models/ResizeTask.ts`, `src/models/mediaFragment.ts` | spec/08 §12 | ⬜ | — |
 | 7 | Transports + storage driver | `src/transports/mongo.ts`, `src/transports/sqs.ts`, `src/storage/s3.ts` | spec/05 | ⬜ | — |
@@ -68,7 +68,7 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ⬜ | — |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
 
-**Suite total so far: 42 tests, all green.** Full target test plan is spec/09 §20.
+**Suite total so far: 74 tests, all green.** Full target test plan is spec/09 §20.
 
 ---
 
@@ -76,32 +76,35 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 
 Each step lists the spec section to implement against and the key behaviors to test.
 
-**4 — `src/registry.ts` + `src/hooks.ts` + `src/mediaStore.ts` + `src/locks.ts` (spec/04, spec/05 §10.6).** Pure logic, no infra.
-- registry: module-scope maps for the single-active **transport** + **storage**
-  (`register*`/`getActive*`; last-wins; `getActive*` returns the value or `undefined`, never
-  throws) and named **pipelines** (`registerPipeline`/`getPipeline`; last-wins per name;
-  unknown name → empty pipeline `{}`). Define `Pipeline`/`BeforeStep`/`VariantStep` here.
-- **defaulted seams** (spec/05 §10.6): `MediaStore` + `frameworkMediaStore` (load via
+**4 — `src/resizer.ts` + `src/mediaStore.ts` + `src/locks.ts` (spec/02 §6, spec/04, spec/05 §10.6).** Pure logic, no infra.
+- **`Resizer` class** (spec/02 §6): constructor takes `ResizerOptions` (`storage` REQUIRED;
+  `transport?`; `mediaStore?`/`lockProvider?` default to the framework drivers; `pipelines?`/
+  `hooks?` seed the initial sets); drivers fixed at construction (instance fields); the
+  constructor sets the **one-per-process active-instance slot** (second construction THROWS,
+  mirroring setAppInstance); `getResizer()` returns it or throws a clear error;
+  `resetResizerForTests()` clears it. Instance methods: `hook(name, fn)` (appends),
+  `registerPipeline(name, p)` (last-wins per name; unknown → frozen empty `{}`), and the
+  hook bus — `runWaterfall(name,value,ctx)` (guards each tap: throw → log + keep prior value)
+  and `runObservers(name,...args)` (guarded `events?.emit('resize:'+name,…)` mirror first,
+  then each tap awaited, error-isolated); logger/events via `getApp()` at call time. The
+  `QueueTransport`/`LeasedTask`/`ResizeStorage`/`Pipeline`/`BeforeStep`/`VariantStep`
+  interfaces live here (or a small `interfaces.ts` if cycles demand). `resolve`/`generate`
+  method bodies come in step 5 (stubs may throw 'not implemented' until then).
+- **defaulted seams** (spec/05 §10.6, unchanged): `MediaStore` + `frameworkMediaStore` (load via
   `getModel(config.mediaModelName)`; `appendPreviews` = ONE `findByIdAndUpdate` `$push {$each}`
   + optional `$set` dims) and `LockProvider` + `frameworkLockProvider` (framework `Lock`,
-  ms→seconds conversion inside). Registry slots for both are **pre-filled with the defaults**
-  (`getActive*` never returns `undefined` for these); `registerMediaStore`/`registerLockProvider`
-  replace (last-wins). Test with a fake `app.getModel`.
-- hooks: `hook(name, fn)` appends; `runWaterfall(name,value,ctx)` threads value through
-  taps in registration order, **guarding each tap** (throw → log + skip, keep prior value);
-  `runObservers(name,...args)` fires `events?.emit('resize:'+name, …)` (fire-and-forget)
-  then awaits each typed tap **error-isolated**. Both read logger/events via `getApp()`.
+  ms→seconds conversion inside). Test with a fake `app.getModel` via setAppInstance.
 
 **5 — `src/engine.ts` + `src/enqueue.ts` (spec/06, spec/02 §6).**
 - `enqueue`: dedup by `getPreviewIdentity`; per-identity **dispatch lock**
   (`resize_dispatch:${mediaId}:${identity}`, TTL `config.queue.lockTtlMs.dispatch`); only
   lock-winners survive; `transport.enqueue`; on throw **or** `taskId===null` release the
   survivors' locks; never throw to caller.
-- `ResizeEngine.resolve`: the read-path algorithm (spec/06 §17) incl. SVG pass-through
+- `resizer.resolve`: the read-path algorithm (spec/06 §17) incl. SVG pass-through
   (`isOriginal:true`, `preview` omitted), "original already fits" fast-path, URLs via
-  `storage.publicUrl(ref)` (driver required — log + safe-empty if absent), `runWaterfall`
-  for `resolveSizes`/`beforeEnqueue`/`formatPublicUrls`, and the **never-throw** wrapper.
-  `ResizeEngine` also holds the static registration methods (delegates to registry/hooks).
+  `this.storage.publicUrl(ref)` (always present — required option), no-transport → log once +
+  skip enqueue, `runWaterfall` for `resolveSizes`/`beforeEnqueue`/`formatPublicUrls`, and the
+  **never-throw** wrapper. Implemented in `src/engine.ts`, called by the `Resizer` methods.
 
 **6 — `src/models/ResizeTask.ts` + `src/models/mediaFragment.ts` (spec/08 §12).**
 - `ResizeTaskModel extends BaseModel` (framework) with `static get modelSchema()` (fields in
@@ -130,7 +133,7 @@ Each step lists the spec section to implement against and the key behaviors to t
   by `config.worker.concurrency` → rotate/resize/colorspace/sharpen/variantSteps/flatten/encode
   → `storage.upload({…,visibility:'public'})` persist returned ref → single `$push` → locks →
   poison-variant guard). Command is an `AbstractCommand` with `isShouldInitModels=true`.
-  `ResizeEngine.generate` (eager mode, spec/11) shares this core.
+  `resizer.generate` (eager mode, spec/11) shares this core.
 
 **9 — `src/scaffold/command.ts` + `templates/` (spec/08 §12, spec/09 §3).**
 - `resize-scaffold` package bin (shebang). Emits the `extends ResizeTaskModel` model shim, the
@@ -196,7 +199,10 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     (no mixin/factory). Spec §22.7 + 01 §2.3/§16 now carve out the one deliberate framework
     import (`src/models/ResizeTask.ts`). Optional FRAMEWORK-side improvements (our repo, not
     blockers): duck-typed brand check instead of nominal `instanceof` at `server.ts:423`;
-    opt-in `modules:[…]` extra scan roots in `folderConfig` to eliminate host shims entirely.
+    opt-in `modules:[…]` extra scan roots in `folderConfig` to eliminate host shims entirely;
+    a throwing `getAppInstance()` getter next to `appInstance` in `helpers/appInstance.ts`
+    (framework-side "not initialized" guard for every consumer — this module keeps `src/app.ts`
+    for the `TMinimalResizeApp` type-slice cast either way, but its guard then becomes redundant).
 11. **The app is ambient — no `app` parameter anywhere (2026-07-04).** The framework exports a
     process-wide `appInstance` singleton (`helpers/appInstance.js`, set at Server construction,
     one-server-per-process ENFORCED, `setAppInstance`/`resetAppInstance` test hooks; present in
@@ -209,6 +215,16 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     via `setAppInstance` (node:test = per-file process isolation). Cost accepted: a duplicated
     framework copy now also breaks `appInstance` (peer-dep single-copy was already mandatory).
     Added `@types/express` devDep (framework's d.ts graph needs it once we import its helpers).
+12. **Constructor-wired public API (2026-07-04, user decision).** `ResizeEngine` static
+    registries → **`new Resizer(opts)`**: all drivers in ONE visible options literal, fixed at
+    construction; `storage` REQUIRED (boot-time enforcement kills the "forgot to register
+    storage" runtime degradation), `transport` optional (eager-only hosts omit it);
+    `mediaStore`/`lockProvider` default to the framework drivers when omitted; `pipelines`/
+    `hooks` seed initial sets, `resizer.hook`/`resizer.registerPipeline` for late additions.
+    One instance per process: constructor sets the active slot (second construction throws,
+    mirroring setAppInstance); worker + late taps use `getResizer()`. Scaffold gains an
+    editable `src/resizer.ts` construction-site template. Step 4 reworked accordingly
+    (registry.ts + hooks.ts fold into the Resizer class).
 
 ---
 

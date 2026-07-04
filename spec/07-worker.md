@@ -20,8 +20,8 @@ async function runResizeWorker() {
   const app = getApp();                 // ambient framework app (02 · §4)
   const config = getResizeConfig();
   if (config.worker.enabled === false) { app.logger.info('resize worker disabled (worker.enabled=false)'); return; }
-  const transport = getActiveTransport();
-  if (!transport) { app.logger.error('resize worker: no queue transport registered'); return; }
+  const { transport } = getResizer();   // the active instance (02 · §6); getResizer throws a clear error if none constructed
+  if (!transport) { app.logger.error('resize worker: Resizer was constructed without a transport (eager-only wiring)'); return; }
   // Tune sharp ONCE for a concurrent worker: keep worker.concurrency × sharp.concurrency ≈ nCPU
   // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
   sharp.concurrency(config.worker.sharpConcurrency);
@@ -59,8 +59,8 @@ async function runResizeWorker() {
    `format === 'svg'`) → **return** (no-op success; log). SVG is pass-through and should
    never be enqueued (the read path short-circuits it — [06](./06-read-and-enqueue.md) §17
    step 6); this guard only stops a stray task from rasterizing it or looping.
-2. **Download the original once** — `getActiveStorage()`; if none → **throw** (the worker can't
-   run without storage). `buf = await storage.download(media.original)` (`Original` is a
+2. **Download the original once** — `storage = getResizer().storage` (always present: the
+   required constructor option). `buf = await storage.download(media.original)` (`Original` is a
    `StorageRef`, so it passes straight through — see [05 · §10.4](./05-transport-and-storage.md)).
 3. `origMeta = await sharp(buf).metadata()`. **Use DISPLAY orientation for ALL dimension math** —
    `.rotate()` auto-orients before resize, and EXIF orientations 5–8 swap width/height, so the

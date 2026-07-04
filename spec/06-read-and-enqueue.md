@@ -3,20 +3,20 @@
 > Part of the [`@adaptivestone/framework-module-resize` build spec](../BUILD-SPEC.md).
 > Prev: [05 · Transport & storage](./05-transport-and-storage.md) · Next: [07 · Worker](./07-worker.md)
 
-The synchronous HTTP-side path: `ResizeEngine.resolve` decides ready vs missing and hands
+The synchronous HTTP-side path: `resizer.resolve` decides ready vs missing and hands
 missing variants to `enqueue`. Neither may throw into the caller's read.
 
 ---
 
-## §17. Read-path algorithm (`ResizeEngine.resolve` + `src/engine.ts`)
+## §17. Read-path algorithm (`resizer.resolve` + `src/engine.ts`)
 
 1. `sizes = await runWaterfall('resolveSizes', opts.sizes, ctx)` — host size magic
    (expand/inject/map/dedupe; e.g. add `{ fit:true }` for entity `event`). `runWaterfall`
    guards each host tap (a throwing tap is logged and skipped — [04 · Hooks](./04-pipelines-and-hooks.md) §9).
 2. `formats = opts.formats ?? requiredFormats(config)`.
-3. `storage = getActiveStorage()`. If **none is registered**, log a clear error and return the
-   safe empty decision (`{ decision: { ready: [], missing: [] }, output: … }`) — without storage
-   no URL can be built (see the never-throw guarantee below). All URLs below come from
+3. `storage = this.storage` — always present: it is the **required** constructor option
+   ([02 · §6](./02-types-and-api.md)), so the old "no storage registered → safe-empty" runtime
+   case no longer exists. All URLs below come from
    `storage.publicUrl(ref)`, which is **pure / I/O-free** (the driver owns the base URL — see
    [05 · §10.4](./05-transport-and-storage.md)).
 4. `pipeline = opts.pipeline ?? 'default'`; `mediaId = media.id ?? String(media._id)`.
@@ -58,7 +58,9 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
 8. `missing = await runWaterfall('beforeEnqueue', decision.missing, ctx)`; **assign it
    back to `decision.missing`** so steps 9–10 and the host's `formatPublicUrls` see the same
    (post-hook) set that was enqueued.
-9. If `enqueueMissing` (default true) and `decision.missing.length` → `await enqueue(
+9. If `enqueueMissing` (default true) and `decision.missing.length`: when the instance has
+   **no `transport`** (eager-only construction — [11 · Modes](./11-modes.md)), log once and
+   skip (missing variants simply stay placeholders); else `await enqueue(
    mediaId, pipeline, decision.missing)` (§18) inside try/catch — enqueue must never throw
    into the read.
 10. `output = await runWaterfall('formatPublicUrls', decision, ctx)` — the host turns the
@@ -73,7 +75,7 @@ host's job, driven off `decision`.
 > **Never-throw guarantee (the read must not break on a host error).** Three layers:
 > (1) each waterfall tap is guarded inside `runWaterfall` (throws logged + skipped — §9);
 > (2) `enqueue` is wrapped (step 9); (3) the **entire `resolve` body** runs inside a
-> try/catch — any unexpected internal error (incl. **no storage registered**, step 3) is logged
+> try/catch — any unexpected internal error is logged
 > and `resolve` returns the safe value `{ decision: { ready, missing: [] }, output: decision }`
 > (the `ready` entries built so far, nothing enqueued) instead of rejecting into the caller's read.
 > `signedUrl` (the only I/O in the read, owner/admin-gated) is also caught and falls back to the

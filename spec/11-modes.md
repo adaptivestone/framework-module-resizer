@@ -45,16 +45,17 @@ simplest; predictable; zero new infra            scales; fast uploads; no wasted
 
 ---
 
-## §11.1 Eager API — `ResizeEngine.generate`
+## §11.1 Eager API — `resizer.generate`
 
 Eager mode is just the **shared resize core called inline** (no queue, no lease, no
-transport). The host calls it from its own create/update handler.
+transport). The host constructs the Resizer **without a `transport`** and calls `generate`
+from its own create/update handler.
 
 ```ts
-class ResizeEngine {
+class Resizer {
   // Synchronous generation: download once → beforeSteps → per-variant (bounded)
   // resize + variantSteps + encode + upload → returns (and optionally persists) previews.
-  static async generate(opts: {
+  async generate(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;              // same named pipeline registry as resolve() (default 'default')
@@ -69,7 +70,7 @@ Host usage (e.g. inside a file-upload controller):
 
 ```ts
 // after the original is uploaded and the media doc created:
-const { previews } = await ResizeEngine.generate({
+const { previews } = await resizer.generate({
   media: fileDoc,
   sizes: getEventMediaSizes(),         // host's catalog
   pipeline: 'listing',

@@ -11,22 +11,28 @@ worker, the upload-time dims capture, and the real per-entity size catalogs the 
 ## §19. Host integration (for the README)
 
 ```ts
-// src/server.ts (runs in every process — API and worker) — register strategies + hooks once
-import { ResizeEngine, mongoTransport, s3Storage } from '@adaptivestone/framework-module-resize';
+// src/resizer.ts (scaffolded; imported by src/server.ts so it runs in every process — API and worker)
+// ALL wiring in one visible literal — drivers are fixed at construction (02 · §6).
+import { Resizer, mongoTransport, s3Storage } from '@adaptivestone/framework-module-resize';
 
-ResizeEngine.registerQueueTransport(mongoTransport);                  // or sqsTransport({ queueUrl, region }) — driver owns its options
-ResizeEngine.registerStorage(s3Storage({                              // shipped driver (05 · §10.5) — or any custom ResizeStorage object (05 · §10.4)
-  bucketPublic: 'my-cdn', bucketPrivate: 'my-originals', publicUrl: 'https://cdn.example.com',
-}));
-
-ResizeEngine.registerPipeline('default', {});
-ResizeEngine.registerPipeline('listing', { beforeSteps: [blurPlates] });               // async detector
-ResizeEngine.registerPipeline('premium', {
-  variantSteps: [(img, { variant }) => variant.filters?.blur ? img.blur(Number(variant.filters.blur)) : img],
+export const resizer = new Resizer({
+  transport: mongoTransport,                 // or sqsTransport({ queueUrl, region }); omit entirely for eager-only (11)
+  storage: s3Storage({                       // REQUIRED — shipped driver (05 · §10.5) or any custom ResizeStorage (05 · §10.4)
+    bucketPublic: 'my-cdn', bucketPrivate: 'my-originals', publicUrl: 'https://cdn.example.com',
+  }),
+  // mediaStore / lockProvider omitted → framework defaults (05 · §10.6)
+  pipelines: {
+    default: {},
+    listing: { beforeSteps: [blurPlates] },  // async detector
+    premium: {
+      variantSteps: [(img, { variant }) => variant.filters?.blur ? img.blur(Number(variant.filters.blur)) : img],
+    },
+  },
+  hooks: {
+    resolveSizes:     (sizes, ctx) => ctx.entity === 'event' ? [...sizes, { fit: true }] : sizes,
+    formatPublicUrls: (decision, ctx) => toHostDto(decision, ctx),   // host's shape + placeholders
+  },
 });
-
-ResizeEngine.hook('resolveSizes',     (sizes, ctx) => ctx.entity === 'event' ? [...sizes, { fit:true }] : sizes);
-ResizeEngine.hook('formatPublicUrls', (decision, ctx) => toHostDto(decision, ctx));     // host's shape + placeholders
 ```
 
 ```bash
@@ -36,7 +42,8 @@ npm run cli ResizeWorker           # run the worker process (separate from the A
 
 ```ts
 // in a host DTO builder (no app argument — the module reads the ambient appInstance)
-const { output } = await ResizeEngine.resolve({
+import { resizer } from '../resizer.ts';   // or: getResizer()
+const { output } = await resizer.resolve({
   media: fileDoc,
   pipeline: 'listing',
   sizes: [{ width:1760, height:990 }, { width:620 }, { fit:true }, { width:300, height:300, filters:{ blur:40 } }],

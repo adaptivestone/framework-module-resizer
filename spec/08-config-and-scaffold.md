@@ -67,7 +67,7 @@ export interface ResizeConfig {
 //   encode.*, limits.*, queue.*, worker.*) and completeness-checked by the type; the one
 //   host-REQUIRED field (mediaModelName) is NOT defaulted — it comes from the host's
 //   src/config/resize.ts. (Buckets/URLs/queueUrl are NOT here — they are driver options, supplied
-//   at registerStorage()/registerQueueTransport() — see 05.)
+//   to the driver factories passed into `new Resizer({ storage, transport })` — see 05.)
 // host config is DeepPartial<ResizeConfig> (override any field at any depth; arrays REPLACE).
 // const overwrite = (_dest, src) => src;   // arrayMerge: arrays REPLACE, never concat
 // getResizeConfig() = deepmerge(defaultResizeConfig, getApp().getConfig('resize') ?? {}, { arrayMerge: overwrite })
@@ -128,6 +128,9 @@ export { default } from '@adaptivestone/framework-module-resize/commands/ResizeW
 > A host needing custom fields/indexes can `--eject` the model to a full editable copy.
 
 `resize-scaffold` emits:
+- `src/resizer.ts` — the **construction site** (editable): `export const resizer = new Resizer({
+  transport: mongoTransport, storage: /* TODO: s3Storage({...}) or custom */, pipelines: {…} })`.
+  The host imports it once from `src/server.ts` so it runs in **every** process (API + worker).
 - `src/models/ResizeTask.ts` — thin `extends ResizeTaskModel` shim (Mongo transport only). `--eject` for a full copy.
 - `src/commands/ResizeWorker.ts` — thin re-export.
 - `src/config/resize.ts` — a **real editable copy** (config is *meant* to be tuned; this is the

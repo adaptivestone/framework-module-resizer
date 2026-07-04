@@ -30,7 +30,7 @@
 | # | File | Covers (§) |
 |---|---|---|
 | 01 | [Architecture](./spec/01-architecture.md) | concept, principles, models touched, out-of-scope, invariants (§1, §2, §14–§16) |
-| 02 | [Types & Public API](./spec/02-types-and-api.md) | `TMinimalResizeApp`, data shapes, `ResizeEngine` API (§4–§6) |
+| 02 | [Types & Public API](./spec/02-types-and-api.md) | `TMinimalResizeApp`, data shapes, `Resizer` API (§4–§6) |
 | 03 | [Identity helpers](./spec/03-identity.md) | size keys, filter sig, preview identity, dims (§7) |
 | 04 | [Pipelines & hooks](./spec/04-pipelines-and-hooks.md) | named pipelines (`beforeSteps`/`variantSteps`) + cross-cutting hooks (§8, §9) |
 | 05 | [Transport & storage](./spec/05-transport-and-storage.md) | `QueueTransport` (mongo/sqs) + `ResizeStorage` (§10) |
@@ -54,7 +54,7 @@ The substantive decisions baked in here, settled against real usage across the p
 
 1. **Storage is a registered strategy**, not part of the app interface — the abstract
    `ResizeStorage` interface plus shipped drivers (v1: `s3Storage`; more can be added without
-   touching the core), registered via `ResizeEngine.registerStorage(...)`. The registered
+   touching the core), injected as the **required `storage:` option** of `new Resizer({…})`. The injected
    driver is required in **every** process: the worker for `download`/`upload`, the read path
    for the pure, I/O-free `publicUrl` (no storage I/O ever happens on a read).
 2. **The queue transport owns consumption.** Its interface is `enqueue` + `startWorker`;
@@ -64,9 +64,11 @@ The substantive decisions baked in here, settled against real usage across the p
    transport, storage, **media store**, and **lock provider** are single-active strategies
    whose methods take no `app` — the module reads the framework's `appInstance` singleton
    through one gateway (`src/app.ts` `getApp()`), matching the framework's enforced
-   one-server-per-process model. The last two seams default to the framework models
-   (`registerMediaStore`/`registerLockProvider` swap the DB layer), so the core owns only
-   the resize logic and bootstrap stays `registerQueueTransport(mongoTransport)`.
+   one-server-per-process model. All drivers are injected in ONE constructor literal —
+   `new Resizer({ transport, storage, mediaStore?, lockProvider?, pipelines?, hooks? })` —
+   fixed at construction, one instance per process (`getResizer()` for the worker/late taps).
+   The mediaStore/lockProvider options default to the framework models when omitted, so the
+   core owns only the resize logic.
 4. **Filters are part of the preview identity.** A `300x300` regular preview and a
    `300x300` blurred preview coexist as distinct cached variants. Identity is
    `sizeKey:format:filterSig`; the host defines what a filter *does* to pixels.
@@ -95,7 +97,7 @@ The substantive decisions baked in here, settled against real usage across the p
     host owns SVG sanitization (XSS/SSRF).
 11. **Tests use `node:test`** (zero deps, mirroring `framework-module-email`).
 11b. **Two modes from one core.** Lazy/queued is the default ([06](./spec/06-read-and-enqueue.md),
-    [07](./spec/07-worker.md)); **eager** (`ResizeEngine.generate`, synchronous at upload, no
+    [07](./spec/07-worker.md)); **eager** (`resizer.generate`, synchronous at upload, no
     queue/worker/`ResizeTask`) is a documented simpler alternative — same `previews[]` shape, so
     a host can switch or mix. See [11 · Modes](./spec/11-modes.md).
 11c. **Scaffold = thin shims.** The framework auto-scans `src/models`/`src/commands` by
@@ -122,7 +124,7 @@ wins — all folded into `04`/`05`/`07`/`08`. Remaining open gaps are flagged ho
 ## §22. Definition of done
 
 1. Builds to `dist`, ESM, `tsc`+biome clean.
-2. `ResizeEngine.resolve` returns correct ready/missing (incl. filtered variants), runs
+2. `resizer.resolve` returns correct ready/missing (incl. filtered variants), runs
    the cross-cutting hooks, threads the pipeline name into enqueue; never fabricates a
    DTO; enqueue failure never throws into the read.
 3. Mongo transport: `enqueue` + atomic `lease` + reclaim + `complete/fail` +

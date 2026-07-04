@@ -40,16 +40,22 @@ export interface Pipeline {
 > data). So in the **queued (lazy) worker, `ctx === {}`**; durable per-media data a step needs
 > must be read from the loaded `media` document (the worker loads it — [07](./07-worker.md)
 > step 1) or persisted onto it earlier. The full read/caller `ctx` is available to steps
-> **only in eager mode** (`ResizeEngine.generate`, synchronous in the request process —
+> **only in eager mode** (`resizer.generate`, synchronous in the request process —
 > [11 · Modes](./11-modes.md)). Write steps to depend on `media`/`metadata`, not `ctx`.
 
 ```ts
-// bootstrap (server.ts) — runs in API and worker
-ResizeEngine.registerPipeline('photo', {
-  beforeSteps:  [detectAndBlurPlates, detectAndBlurFaces],           // safety: applies to every variant
-  variantSteps: [(img, { variant }) => variant.filters?.blur ? img.blur(Number(variant.filters.blur)) : img],
+// bootstrap (src/resizer.ts, imported by server.ts) — runs in API and worker
+const resizer = new Resizer({
+  storage, transport,
+  pipelines: {
+    photo: {
+      beforeSteps:  [detectAndBlurPlates, detectAndBlurFaces],       // safety: applies to every variant
+      variantSteps: [(img, { variant }) => variant.filters?.blur ? img.blur(Number(variant.filters.blur)) : img],
+    },
+    avatar: {},                                                      // no special processing
+  },
 });
-ResizeEngine.registerPipeline('avatar', {});                         // no special processing
+// later / from another module: getResizer().registerPipeline('premium', { … })  (last-wins per name)
 ```
 
 Semantics (validated against thumbor's production detector/filter pipeline — see
@@ -112,7 +118,7 @@ host can alert/page — see [05 · Transport](./05-transport-and-storage.md)).
 > **Also mirrored on the framework event bus.** Every observer is additionally emitted on
 > `app.events` (the framework's `EventEmitter`, `server.ts`) as `resize:<name>` — e.g.
 > `resize:onTaskDeadLettered` — so hosts can subscribe with the bus they already use for
-> `'shutdown'` etc., without registering a module hook. The typed `ResizeEngine.hook(...)` registry
+> `'shutdown'` etc., without registering a module hook. The typed `resizer.hook(...)` registry
 > stays the **primary contract** because it is **awaited and error-isolated** (a throwing observer
 > is logged, not propagated) — raw `EventEmitter.emit` is synchronous, unawaited, and a throwing
 > listener would propagate into the worker. So: `hook()` for guaranteed/awaited handling; `app.events`
@@ -140,5 +146,6 @@ async function runObservers(name, ...args) {
 ```
 
 The pipeline registry, queue transport, storage, media store, and lock provider are **NOT**
-hooks — each is a single active strategy registered via its own method (the last two with
-framework-backed defaults — [05 · §10.6](./05-transport-and-storage.md)).
+hooks — each is a single active strategy wired via the `Resizer` constructor options
+([02 · §6](./02-types-and-api.md); the last two default to the framework drivers —
+[05 · §10.6](./05-transport-and-storage.md)).

@@ -55,18 +55,19 @@ legacy synchronous, all-or-nothing upload-time resize that prior implementations
    `appInstance` binding unset.
 4. **Injected strategies, not baked behavior.** The core owns only the main resize logic
    (identity, read decision, sharp pipeline, orchestration); **every integration is a
-   swappable seam**: **(a) hooks** (waterfall value-transforms + observers, see
-   [04](./04-pipelines-and-hooks.md)), **(b) named pipelines** (`beforeSteps` +
-   `variantSteps` per media type, [04](./04-pipelines-and-hooks.md)), **(c) one active
-   queue transport** (`registerQueueTransport`, [05](./05-transport-and-storage.md)),
-   **(d) one active storage** (`registerStorage`, [05](./05-transport-and-storage.md)),
-   **(e) one active media store** (`registerMediaStore` — how the worker loads media docs
-   and persists previews, [05 §10.6](./05-transport-and-storage.md)), **(f) one active lock
-   provider** (`registerLockProvider` — dispatch/worker locks,
-   [05 §10.6](./05-transport-and-storage.md)). (c)/(d) ship drivers (mongo/sqs; s3) and
-   require registration; (e)/(f) have **framework-backed defaults active out of the box**,
-   so a standard host registers nothing — but any of them can be replaced (another DB,
-   Redis locks, …) without touching the core.
+   swappable seam**, wired in ONE visible `new Resizer({ … })` constructor literal
+   ([02 · §6](./02-types-and-api.md)): **(a) hooks** (waterfall value-transforms + observers,
+   see [04](./04-pipelines-and-hooks.md)), **(b) named pipelines** (`beforeSteps` +
+   `variantSteps` per media type, [04](./04-pipelines-and-hooks.md)), **(c) the queue
+   transport** (`transport:` option — optional; lazy mode only,
+   [05](./05-transport-and-storage.md)), **(d) storage** (`storage:` option — the one
+   REQUIRED driver, [05](./05-transport-and-storage.md)), **(e) the media store**
+   (`mediaStore:` option — how the worker loads media docs and persists previews,
+   [05 §10.6](./05-transport-and-storage.md)), **(f) the lock provider** (`lockProvider:`
+   option, [05 §10.6](./05-transport-and-storage.md)). (c)/(d) ship drivers (mongo/sqs; s3);
+   (e)/(f) **default to the framework-backed drivers when omitted**, so a standard host wires
+   only transport + storage — but any seam can be replaced (another DB, Redis locks, …)
+   without touching the core. Drivers are fixed at construction; one Resizer per process.
 5. **Ship defaults, merge host config.** Provide a default `resize` config; deep-merge
    it under `app.getConfig('resize')` (host wins; arrays replace, not concat).
 6. **One shared identity helper** used by read, enqueue, worker, and scaffolded model.

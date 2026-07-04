@@ -20,12 +20,12 @@ framework-module-resize/
 ├── postBuild.ts           # copy non-TS assets (types.d.ts, assets/, scaffold/templates/) into dist
 ├── README.md
 ├── src/
-│   ├── index.ts           # public entry: ResizeEngine, ResizeWorker, helpers, transports, types
+│   ├── index.ts           # public entry: Resizer, getResizer, ResizeWorker, helpers, drivers, types
 │   ├── types.d.ts         # hand-authored types (copied verbatim to dist)
 │   ├── app.ts             # getApp(): the ONE gateway to the framework's ambient appInstance (02 · §4)
-│   ├── engine.ts          # ResizeEngine: read decision + registration surface
-│   ├── registry.ts        # module-scope active transport + storage + mediaStore + lockProvider + named pipelines (avoids import cycles)
-│   ├── hooks.ts           # hook bus (waterfall + observer)
+│   ├── resizer.ts         # Resizer class (constructor-wired drivers, pipelines, hook bus) + the
+│   │                      #   one-per-process active-instance slot + getResizer() (02 · §6)
+│   ├── engine.ts          # resolve/generate read-path implementation (called by Resizer methods)
 │   ├── mediaStore.ts      # MediaStore seam + frameworkMediaStore DEFAULT (media load / single preview write) — 05 · §10.6
 │   ├── locks.ts           # LockProvider seam + frameworkLockProvider DEFAULT (framework Lock, ms→s) — 05 · §10.6
 │   ├── enqueue.ts         # dedup + dispatch-lock + transport.enqueue
@@ -167,11 +167,14 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
   required-field omission throws; `requiredFormats` honors `webpAvifOnly`.
 - `hooks`: `runWaterfall` threads values in registration order AND a throwing tap is logged +
   skipped (read never breaks); `runObservers` swallows tap errors.
-- `mediaStore` / `locks`: the defaults are active without registration and hit
-  `app.getModel(...)` correctly (fake app: `findById`; `appendPreviews` issues ONE
-  `findByIdAndUpdate` with `$push {$each}` + optional `$set`; `acquire` passes **seconds** to
-  `acquireLock`); `registerMediaStore`/`registerLockProvider` replace the default (last-wins)
-  and enqueue/worker use the active driver.
+- `mediaStore` / `locks`: the framework defaults hit `app.getModel(...)` correctly (fake app:
+  `findById`; `appendPreviews` issues ONE `findByIdAndUpdate` with `$push {$each}` + optional
+  `$set`; `acquire` passes **seconds** to `acquireLock`).
+- `resizer`: constructor fills `mediaStore`/`lockProvider` defaults when omitted and keeps a
+  passed driver; `storage` required (type-level); a SECOND `new Resizer` throws;
+  `getResizer()` throws a clear error before construction and returns the instance after;
+  `resetResizerForTests()` clears the slot; constructor seeds `pipelines`/`hooks`; unknown
+  pipeline name → empty pipeline; `resizer.hook` appends in order.
 - `scaffold` (write to a temp dir): emits the model `extends` shim + command re-export + config files; `--check` reports
   `ok`/`drift`/`missing` and exits non-zero on drift; `--eject` writes the full model; never
   overwrites without `--force`.
