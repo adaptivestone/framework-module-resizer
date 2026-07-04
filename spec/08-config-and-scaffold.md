@@ -70,7 +70,7 @@ export interface ResizeConfig {
 //   at registerStorage()/registerQueueTransport() — see 05.)
 // host config is DeepPartial<ResizeConfig> (override any field at any depth; arrays REPLACE).
 // const overwrite = (_dest, src) => src;   // arrayMerge: arrays REPLACE, never concat
-// getResizeConfig(app) = deepmerge(defaultResizeConfig, app.getConfig('resize') ?? {}, { arrayMerge: overwrite })
+// getResizeConfig() = deepmerge(defaultResizeConfig, getApp().getConfig('resize') ?? {}, { arrayMerge: overwrite })
 //   → THROWS a clear error if `mediaModelName` is still missing (fail fast at first use, not mid-resize).
 // requiredFormats(config) = config.webpAvifOnly ? ['webp','avif'] : config.formats
 ```
@@ -117,6 +117,10 @@ export { default } from '@adaptivestone/framework-module-resize/commands/ResizeW
 > (no `extends` identifier to follow), so `getModel('ResizeTask')` would fall back to an untyped
 > form. `fileRef` is an overridable static, **not** a constructor/factory arg — it's a runtime
 > populate hint that doesn't affect the document type, so overriding it never changes the types.
+> *(Verified 2026-07-04 against framework v5 source: `codegen/astModel.ts` resolves bare-package
+> ancestors via `createRequire().resolve()` and recurses; `astExtract.ts` `readExtends` returns
+> `null` for call/member expressions — exactly why a factory breaks detection. Commands are never
+> AST-parsed, so the re-export shim is safe. See [01 · §14](./01-architecture.md).)*
 
 > File name == class name == `'ResizeTask'` (the loader keys `getModel('ResizeTask')` by file
 > name; mongoose refs use the class name). `ResizeWorker` must set
@@ -128,7 +132,7 @@ export { default } from '@adaptivestone/framework-module-resize/commands/ResizeW
 - `src/commands/ResizeWorker.ts` — thin re-export.
 - `src/config/resize.ts` — a **real editable copy** (config is *meant* to be tuned; this is the
   one place drift is intended). The framework does NOT auto-merge module defaults, so this file
-  spreads the module's defaults and the module's `getResizeConfig(app)` deep-merges again.
+  spreads the module's defaults and the module's `getResizeConfig()` deep-merges again.
 - `src/assets/placeholders/*` — optional local placeholders.
 
 > **Eager-mode hosts** ([11 · Modes](./11-modes.md)) skip the model + command entirely — they

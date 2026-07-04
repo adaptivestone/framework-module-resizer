@@ -1,19 +1,29 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
-import type {
-  DeepPartial,
-  ResizeConfig,
-  TMinimalResizeApp,
-} from '../types.d.ts';
+import { afterEach, describe, test } from 'node:test';
+import {
+  resetAppInstance,
+  setAppInstance,
+} from '@adaptivestone/framework/helpers/appInstance.js';
+import type { DeepPartial, ResizeConfig } from '../types.d.ts';
 import defaultResizeConfig, {
   getResizeConfig,
   requiredFormats,
 } from './resize.ts';
 
-const makeApp = (resize: DeepPartial<ResizeConfig>): TMinimalResizeApp => ({
-  getConfig: () => resize,
-  getModel: () => ({}),
-  logger: { info() {}, warn() {}, error() {} },
+// Install a fake ambient app whose getConfig('resize') returns the given override
+// (the module reads it through getApp() — src/app.ts). Per-file isolation: node:test
+// runs each test file in its own process, so the singleton never leaks across files.
+const useHostConfig = (resize: DeepPartial<ResizeConfig>) => {
+  resetAppInstance();
+  setAppInstance({
+    getConfig: () => resize,
+    getModel: () => ({}),
+    logger: { info() {}, warn() {}, error() {} },
+  } as never);
+};
+
+afterEach(() => {
+  resetAppInstance();
 });
 
 describe('defaultResizeConfig', () => {
@@ -30,9 +40,11 @@ describe('defaultResizeConfig', () => {
 
 describe('getResizeConfig', () => {
   test('a deep override keeps every sibling default', () => {
-    const config = getResizeConfig(
-      makeApp({ mediaModelName: 'File', encode: { quality: { avif: 50 } } }),
-    );
+    useHostConfig({
+      mediaModelName: 'File',
+      encode: { quality: { avif: 50 } },
+    });
+    const config = getResizeConfig();
     assert.equal(config.encode.quality.avif, 50); // overridden
     assert.equal(config.encode.quality.jpeg, 80); // sibling default kept
     assert.equal(config.encode.mozjpeg, true); // sibling default kept
@@ -40,34 +52,42 @@ describe('getResizeConfig', () => {
   });
 
   test('host arrays REPLACE the default (no concat)', () => {
-    const config = getResizeConfig(
-      makeApp({ mediaModelName: 'File', formats: ['webp', 'avif'] }),
-    );
-    assert.deepEqual(config.formats, ['webp', 'avif']);
+    useHostConfig({ mediaModelName: 'File', formats: ['webp', 'avif'] });
+    assert.deepEqual(getResizeConfig().formats, ['webp', 'avif']);
   });
 
   test('throws when the required mediaModelName is missing', () => {
-    assert.throws(() => getResizeConfig(makeApp({})), /mediaModelName/);
+    useHostConfig({});
+    assert.throws(() => getResizeConfig(), /mediaModelName/);
+  });
+
+  test('throws a clear error when no app is initialized at all', () => {
+    resetAppInstance();
+    assert.throws(() => getResizeConfig(), /not initialized/);
   });
 
   test('does NOT mutate the shared defaultResizeConfig singleton', () => {
-    getResizeConfig(
-      makeApp({ mediaModelName: 'File', encode: { quality: { avif: 10 } } }),
-    );
+    useHostConfig({
+      mediaModelName: 'File',
+      encode: { quality: { avif: 10 } },
+    });
+    getResizeConfig();
     assert.equal(defaultResizeConfig.encode?.quality.avif, 64);
   });
 });
 
 describe('requiredFormats', () => {
   test('webpAvifOnly drops jpeg', () => {
-    const config = getResizeConfig(
-      makeApp({ mediaModelName: 'File', webpAvifOnly: true }),
-    );
-    assert.deepEqual(requiredFormats(config), ['webp', 'avif']);
+    useHostConfig({ mediaModelName: 'File', webpAvifOnly: true });
+    assert.deepEqual(requiredFormats(getResizeConfig()), ['webp', 'avif']);
   });
 
   test('otherwise returns config.formats verbatim', () => {
-    const config = getResizeConfig(makeApp({ mediaModelName: 'File' }));
-    assert.deepEqual(requiredFormats(config), ['jpeg', 'webp', 'avif']);
+    useHostConfig({ mediaModelName: 'File' });
+    assert.deepEqual(requiredFormats(getResizeConfig()), [
+      'jpeg',
+      'webp',
+      'avif',
+    ]);
   });
 });

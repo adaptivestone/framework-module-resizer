@@ -11,13 +11,14 @@ The async side: a transport-agnostic loop plus `processTask`, where the named pi
 
 ## §11. Worker (`src/worker.ts` + `src/resizeTask.ts`)
 
-`runResizeWorker(app)` is the transport-agnostic entry; `ResizeWorker` is a thin
+`runResizeWorker()` is the transport-agnostic entry; `ResizeWorker` is a thin
 `AbstractCommand`-shaped class whose `run()` calls it (host registers it via scaffold or
 re-export and launches `npm run cli ResizeWorker`).
 
 ```ts
-async function runResizeWorker(app) {
-  const config = getResizeConfig(app);
+async function runResizeWorker() {
+  const app = getApp();                 // ambient framework app (02 · §4)
+  const config = getResizeConfig();
   if (config.worker.enabled === false) { app.logger.info('resize worker disabled (worker.enabled=false)'); return; }
   const transport = getActiveTransport();
   if (!transport) { app.logger.error('resize worker: no queue transport registered'); return; }
@@ -31,7 +32,7 @@ async function runResizeWorker(app) {
   // The worker only supplies the WORK. The TRANSPORT owns completion/redelivery (05 · §10.1):
   // it runs lease → handleTask → complete | fail, keeping the leaseToken/attempts in its own
   // closure (they never ride on `task`). processTask SUCCEEDS by returning, FAILS by throwing.
-  await transport.startWorker(app, (task, taskOpts) => processTask(app, task, taskOpts), { signal: controller.signal });
+  await transport.startWorker((task, taskOpts) => processTask(task, taskOpts), { signal: controller.signal });
   app.logger.info('resize worker stopped');
 }
 // Completion + observer firing are the TRANSPORT's job (05 · §10.2), not the worker's:
@@ -43,21 +44,23 @@ async function runResizeWorker(app) {
 // finish in-flight, then stop on opts.signal.)
 ```
 
-`processTask(app, { mediaId, pipeline, previews }, taskOpts?)` (`src/resizeTask.ts`).
+`processTask({ mediaId, pipeline, previews }, taskOpts?)` (`src/resizeTask.ts`).
 `taskOpts?.signal` is the per-task lease-loss `AbortSignal` (§10.2 `renew`); between variants
 (step 7) the loop checks `taskOpts?.signal?.aborted` and stops launching new variants if set —
 **best-effort only**; correctness holds via the fencing token regardless:
 
    Throughout `processTask`, **`ctx = {}`** — the read-path ctx does not cross the queue
    ([04 · Pipelines](./04-pipelines-and-hooks.md) §8); pipeline steps depend on `media`/`metadata`.
-1. Load media by id (via `config.mediaModelName`). If no `original` → **return** (log) — a
+1. Load media via the active `MediaStore` — `mediaStore.load(mediaId)`
+   ([05 · §10.6](./05-transport-and-storage.md); the default reads the `config.mediaModelName`
+   model). If no doc or no `original` → **return** (log) — a
    no-op success; the transport then marks the task complete.
    **Defensive SVG guard:** if `original` is SVG (`contentType === 'image/svg+xml'` /
    `format === 'svg'`) → **return** (no-op success; log). SVG is pass-through and should
    never be enqueued (the read path short-circuits it — [06](./06-read-and-enqueue.md) §17
    step 6); this guard only stops a stray task from rasterizing it or looping.
 2. **Download the original once** — `getActiveStorage()`; if none → **throw** (the worker can't
-   run without storage). `buf = await storage.download(app, media.original)` (`Original` is a
+   run without storage). `buf = await storage.download(media.original)` (`Original` is a
    `StorageRef`, so it passes straight through — see [05 · §10.4](./05-transport-and-storage.md)).
 3. `origMeta = await sharp(buf).metadata()`. **Use DISPLAY orientation for ALL dimension math** —
    `.rotate()` auto-orients before resize, and EXIF orientations 5–8 swap width/height, so the
@@ -87,7 +90,8 @@ async function runResizeWorker(app) {
    For each requested preview:
    - If it already exists (in the step-6 existing-preview set) → skip and release its
      **dispatch** lock. *(This DB check — not the lock — is what makes re-runs idempotent.)*
-   - Acquire the **worker lock** `resize_worker:${mediaId}:${identity}` TTL
+   - Acquire the **worker lock** `resize_worker:${mediaId}:${identity}` (via the active
+     `LockProvider` — [05 · §10.6](./05-transport-and-storage.md)) TTL
      `config.queue.lockTtlMs.worker` (default 60s, **must be ≤ `config.queue.leaseMs`** — see the
      doneness invariant below). The lock is **best-effort dedup only** (avoids two concurrent tasks
      double-generating the same variant). If not acquired → **skip** this variant and leave it
@@ -120,7 +124,7 @@ async function runResizeWorker(app) {
      > profile→sRGB transform before stripping.
    - Build a **random/unguessable** logical key `${prefix}/${randomBytes(16).toString('hex')}.${format}`
      (prefix = original key's folder) and upload via the driver, which **owns the destination**:
-     `const ref = await storage.upload(app, { key, body, contentType, visibility: 'public' })`. The
+     `const ref = await storage.upload({ key, body, contentType, visibility: 'public' })`. The
      driver returns the `StorageRef` (`{ bucket?, key }`) to persist (it may rewrite the key).
    - Collect `{ ...ref, sizeKey, filters, format, contentType, actualWidth: info.width,
      actualHeight: info.height, requestedWidth?, requestedHeight?, fit? }` — spread the
@@ -129,8 +133,10 @@ async function runResizeWorker(app) {
      post-rotate dims).
    - On error: log, release the worker lock, **record this variant as failed**, and continue (one
      bad variant must not fail the whole task — but see step 10).
-8. `$push` all generated previews (and the backfill `$set`) in **one** media update. Fire
-   `onPreviewGenerated` per pushed preview.
+8. Persist all generated previews (and the dims backfill) in **one**
+   `mediaStore.appendPreviews(mediaId, previews, backfillDims?)` call
+   ([05 · §10.6](./05-transport-and-storage.md); the framework default = a single
+   `$push { $each }` + `$set` update). Fire `onPreviewGenerated` per pushed preview.
 9. Release every dispatch + worker lock for processed variants (success and error paths).
 10. **Poison-variant guard.** If this run produced **zero** new previews **and** ≥1 variant errored,
     **throw** (after releasing locks) so the transport's retry → backoff → dead-letter path engages.

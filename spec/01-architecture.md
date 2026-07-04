@@ -39,18 +39,34 @@ legacy synchronous, all-or-nothing upload-time resize that prior implementations
    queue **model** and **config** are emitted into the host app as editable source by a
    scaffold command (the "shadcn" approach), because schema needs host-specific refs,
    fields, and indexes and must live in the host's own `src` for its typecheck/codegen.
-3. **The framework is the environment, not a dependency.** Never
-   `import '@adaptivestone/framework'` (or `mongoose`). Depend only on a minimal
-   duck-typed `TMinimalResizeApp`. Reach host primitives (the framework `Lock` model,
-   the scaffolded queue model, the host media model) via `app.getModel(...)`. A hard
-   import would version-lock every host app and risk a duplicate framework
-   instance with a split model registry.
-4. **Four injected strategies, not baked behavior.** Divergence is injected via:
-   **(a) hooks** (waterfall value-transforms + observers, see
+3. **The framework is a peer, reached through one gateway; the app is ambient, never a
+   parameter.** The module never `import`s `mongoose`, and imports
+   `@adaptivestone/framework` in exactly **two files**: **`src/app.ts`** (wraps the
+   framework's `appInstance` singleton as `getApp()` — the framework sets it once per
+   process at Server construction and *enforces* one server per process, so no API or
+   driver method takes an `app` argument) and **`src/models/ResizeTask.ts`**
+   (`ResizeTaskModel` must be a literal `class … extends BaseModel` — the runtime loader's
+   `instanceof` check and the `npm run gen` `extends`-walk both require it — §14).
+   Everything else consumes the duck-typed `TMinimalResizeApp` slice returned by
+   `getApp()`, and only the default drivers reach host primitives via
+   `getApp().getModel(...)` ([05 · §10.6](./05-transport-and-storage.md)). Both
+   `@adaptivestone/framework` and `mongoose` are **peerDependencies** — mandatory: a
+   nested second framework copy would break the `instanceof` check AND leave the module's
+   `appInstance` binding unset.
+4. **Injected strategies, not baked behavior.** The core owns only the main resize logic
+   (identity, read decision, sharp pipeline, orchestration); **every integration is a
+   swappable seam**: **(a) hooks** (waterfall value-transforms + observers, see
    [04](./04-pipelines-and-hooks.md)), **(b) named pipelines** (`beforeSteps` +
    `variantSteps` per media type, [04](./04-pipelines-and-hooks.md)), **(c) one active
    queue transport** (`registerQueueTransport`, [05](./05-transport-and-storage.md)),
-   **(d) one active storage** (`registerStorage`, [05](./05-transport-and-storage.md)).
+   **(d) one active storage** (`registerStorage`, [05](./05-transport-and-storage.md)),
+   **(e) one active media store** (`registerMediaStore` — how the worker loads media docs
+   and persists previews, [05 §10.6](./05-transport-and-storage.md)), **(f) one active lock
+   provider** (`registerLockProvider` — dispatch/worker locks,
+   [05 §10.6](./05-transport-and-storage.md)). (c)/(d) ship drivers (mongo/sqs; s3) and
+   require registration; (e)/(f) have **framework-backed defaults active out of the box**,
+   so a standard host registers nothing — but any of them can be replaced (another DB,
+   Redis locks, …) without touching the core.
 5. **Ship defaults, merge host config.** Provide a default `resize` config; deep-merge
    it under `app.getConfig('resize')` (host wins; arrays replace, not concat).
 6. **One shared identity helper** used by read, enqueue, worker, and scaffolded model.
@@ -61,9 +77,13 @@ legacy synchronous, all-or-nothing upload-time resize that prior implementations
 
 ---
 
-## §14. Models the module touches (all via `app.getModel`)
+## §14. Models the DEFAULT drivers touch (all via `app.getModel`)
 
-The module never imports mongoose or any schema. It reaches three models by name:
+The module never imports mongoose or any schema. The **core** touches no model at all — DB
+access lives in drivers: the media doc behind the **media store** seam, locks behind the
+**lock provider** seam ([05 §10.6](./05-transport-and-storage.md); framework-backed defaults
+active out of the box), and `ResizeTask` inside the Mongo **transport** (driver-owned — a
+different transport removes it entirely). The default drivers reach three models by name:
 
 | Model | Source | Methods the module calls |
 |---|---|---|
@@ -73,8 +93,9 @@ The module never imports mongoose or any schema. It reaches three models by name
 
 Naming seam: the module speaks **`mediaId`** everywhere; the scaffolded `ResizeTask`
 uses **`fileId`** (host-owned ref). The Mongo transport is the only place that maps them
-(`fileId: mediaId` on enqueue; `mediaId: String(doc.fileId)` on lease). Tests pass a fake
-`app` whose `getModel` returns plain objects implementing only those few methods — no
+(`fileId: mediaId` on enqueue; `mediaId: String(doc.fileId)` on lease). Tests install a fake
+app via `setAppInstance(...)` (the framework's own test hook — [02 · §4](./02-types-and-api.md))
+whose `getModel` returns plain objects implementing only those few methods — no
 live Mongo needed for the unit suite.
 
 **Verified framework contracts** (read from `@adaptivestone/framework` source — see
@@ -86,11 +107,27 @@ live Mongo needed for the unit suite.
 - `app.getModel(name)` returns the model **or `false`** for an unknown name (never throws); keyed
   by **file name**. The worker/transport must tolerate `false`.
 - `app.getConfig(name)` returns `{}` for unknown and does **not** deep-merge module defaults with
-  host overrides (the host file *replaces* the framework file) — so `getResizeConfig(app)` must do
+  host overrides (the host file *replaces* the framework file) — so `getResizeConfig()` must do
   its own deep-merge of module defaults + `app.getConfig('resize')`.
 - The worker is an `AbstractCommand` with `async run(): Promise<boolean>`, `this.app` available,
   `static description`, and **`static isShouldInitModels = true`** (so models + the Mongo
   connection are ready before `run()`).
+- **`npm run gen` codegen (verified 2026-07-04 against framework v5 source).** Pure AST via
+  `oxc-parser` — no file is imported/executed. A model is detected by walking the exported
+  class's `extends` chain (`codegen/astModel.ts` `isBaseModelSource`); a **bare-package
+  ancestor is resolved via `createRequire(fromFile).resolve(spec)`** and recursed (depth 5) —
+  so the scaffolded `class ResizeTask extends ResizeTaskModel {}` (deep import
+  `…/models/ResizeTask.js`) **is** detected, and `genTypes.d.ts` types `getModel('ResizeTask')`
+  as `GetModelTypeFromClass<typeof import('./src/models/ResizeTask.ts').default>` — inherited
+  `modelSchema` statics included. Obligations on this package: `exports` subpath +
+  shipped `.d.ts` for `models/ResizeTask.js`, and a **literal `class … extends BaseModel`**
+  (a mixin/factory superclass makes `readExtends` return null → untyped fallback).
+  **Commands are never AST-parsed** — the `export { default } from …` re-export shim is safe
+  (`BaseCli` reads `.default` + statics at runtime only).
+- **No module auto-discovery exists** in the framework (no node_modules/keyword scan; loaders
+  scan only framework folders + the host `foldersConfig`) — host-side scaffold shims are the
+  **only** way a package contributes a model/command. (A future framework `modules:[…]` scan
+  root could remove the shims; not required for this module.)
 
 ---
 
@@ -117,8 +154,11 @@ live Mongo needed for the unit suite.
 
 ## §16. Constraints / invariants
 
-- Never `import '@adaptivestone/framework'` or `import 'mongoose'`; use
-  `TMinimalResizeApp` + `getModel`.
+- No `mongoose` imports anywhere. `@adaptivestone/framework` imported in exactly two
+  files: `src/app.ts` (ambient `appInstance` → `getApp()`) and `src/models/ResizeTask.ts`
+  (literal `extends BaseModel` + type-only `GetModelTypeFromClass`) — §2.3, covered by the
+  peer deps. Everything else consumes the `TMinimalResizeApp` slice via `getApp()`; the
+  app is never a parameter.
 - Build the preview identity and **all** lock keys from `getPreviewIdentity` only
   (`sizeKey:format:filterSig`).
 - `fit` uses its own size key (`"fit"`); never collide with a `WxH` key.

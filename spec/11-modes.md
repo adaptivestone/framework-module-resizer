@@ -54,7 +54,7 @@ transport). The host calls it from its own create/update handler.
 class ResizeEngine {
   // Synchronous generation: download once → beforeSteps → per-variant (bounded)
   // resize + variantSteps + encode + upload → returns (and optionally persists) previews.
-  static async generate(app: TMinimalResizeApp, opts: {
+  static async generate(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;              // same named pipeline registry as resolve() (default 'default')
@@ -69,7 +69,7 @@ Host usage (e.g. inside a file-upload controller):
 
 ```ts
 // after the original is uploaded and the media doc created:
-const { previews } = await ResizeEngine.generate(app, {
+const { previews } = await ResizeEngine.generate({
   media: fileDoc,
   sizes: getEventMediaSizes(),         // host's catalog
   pipeline: 'listing',
@@ -79,7 +79,7 @@ const { previews } = await ResizeEngine.generate(app, {
 
 ### Behavior (`generate`)
 1. Resolve config + storage + the named pipeline. **Storage is required** (throws if none).
-2. `sizes = await runWaterfall(app, 'resolveSizes', sizes, ctx)`; expand to `sizes × formats × filters`
+2. `sizes = await runWaterfall('resolveSizes', sizes, ctx)`; expand to `sizes × formats × filters`
    identities via `getPreviewIdentity` (same as the read path). In eager mode `ctx` **is** the
    caller's real ctx (same process) — so pipeline steps here receive it, unlike the queued
    worker where `ctx === {}` ([04 · Pipelines](./04-pipelines-and-hooks.md) §8).
@@ -89,11 +89,12 @@ const { previews } = await ResizeEngine.generate(app, {
    download the original once, source-pixel guard, `beforeSteps` (once), then per-variant
    (bounded by `config.worker.concurrency`) `.rotate()` → `cover|fit` → `variantSteps` → encode
    → upload (random key).
-5. If `persist` → one `$push` of all generated previews (+ `original.width/height` backfill);
+5. If `persist` → one `mediaStore.appendPreviews(...)` call (all generated previews +
+   `original.width/height` backfill — [05 · §10.6](./05-transport-and-storage.md));
    else return them for the host to store.
 6. Return `{ previews }`.
 
-> **Implementation note:** write the resize core ONCE (`generatePreviews(app, ctx)` in
+> **Implementation note:** write the resize core ONCE (`generatePreviews(...)` in
 > `resizeTask.ts`). The lazy worker's `processTask` = this core **plus** lease / locks /
 > transport bookkeeping; `generate` = this core **without** them. Do not duplicate the sharp
 > pipeline.

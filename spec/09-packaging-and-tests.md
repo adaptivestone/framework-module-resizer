@@ -22,9 +22,12 @@ framework-module-resize/
 ├── src/
 │   ├── index.ts           # public entry: ResizeEngine, ResizeWorker, helpers, transports, types
 │   ├── types.d.ts         # hand-authored types (copied verbatim to dist)
+│   ├── app.ts             # getApp(): the ONE gateway to the framework's ambient appInstance (02 · §4)
 │   ├── engine.ts          # ResizeEngine: read decision + registration surface
-│   ├── registry.ts        # module-scope active transport + storage + named pipelines (avoids import cycles)
+│   ├── registry.ts        # module-scope active transport + storage + mediaStore + lockProvider + named pipelines (avoids import cycles)
 │   ├── hooks.ts           # hook bus (waterfall + observer)
+│   ├── mediaStore.ts      # MediaStore seam + frameworkMediaStore DEFAULT (media load / single preview write) — 05 · §10.6
+│   ├── locks.ts           # LockProvider seam + frameworkLockProvider DEFAULT (framework Lock, ms→s) — 05 · §10.6
 │   ├── enqueue.ts         # dedup + dispatch-lock + transport.enqueue
 │   ├── worker.ts          # runResizeWorker / ResizeWorker (transport-agnostic loop)
 │   ├── resizeTask.ts      # processTask: download once, beforeSteps, sharp+variantSteps, upload, $push, locks
@@ -38,8 +41,10 @@ framework-module-resize/
 │   ├── transports/
 │   │   ├── mongo.ts        # DEFAULT transport (Mongo queue + lease). No new infra.
 │   │   └── sqs.ts          # OPTIONAL transport (AWS SQS + sqs-consumer). Optional peer deps.
+│   ├── storage/
+│   │   └── s3.ts           # SHIPPED storage driver (S3/S3-compatible). Optional peer deps, lazy-loaded.
 │   ├── config/
-│   │   └── resize.ts       # default config + getResizeConfig(app) + requiredFormats(config)
+│   │   └── resize.ts       # default config + getResizeConfig() + requiredFormats(config)
 │   ├── scaffold/
 │   │   ├── command.ts      # `resize-scaffold` bin generator (shebang #!/usr/bin/env node; writes re-export shims into host app)
 │   │   └── templates/
@@ -66,7 +71,7 @@ framework-module-resize/
     "./config/resize.js": "./dist/config/resize.js"
   },
   "bin": { "resize-scaffold": "./dist/scaffold/command.js" },   // npx @adaptivestone/framework-module-resize resize-scaffold (08 · §12)
-  "engines": { "node": ">=22.12.0" },
+  "engines": { "node": ">=24.0.0" },
   "files": ["dist"],
   "scripts": {
     "prepublishOnly": "npm run build",
@@ -77,11 +82,26 @@ framework-module-resize/
     "check:fix": "biome check --write"
   },
   "dependencies": { "sharp": "^0.34.0", "deepmerge": "^4.3.1" },
-  "peerDependencies": { "mongoose": "*", "@adaptivestone/framework": "*" },
-  "optionalDependencies": { "@aws-sdk/client-sqs": "*", "sqs-consumer": "*" },
-  "devDependencies": { "@biomejs/biome": "^2.4.9", "@types/node": "^26.0.0", "typescript": "^6.0.0", "mongodb-memory-server": "^10.0.0" }
+  "peerDependencies": {
+    "mongoose": "*", "@adaptivestone/framework": "*",
+    "@aws-sdk/client-sqs": "*", "sqs-consumer": "*",
+    "@aws-sdk/client-s3": "*", "@aws-sdk/s3-request-presigner": "*"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-sqs": { "optional": true }, "sqs-consumer": { "optional": true },
+    "@aws-sdk/client-s3": { "optional": true }, "@aws-sdk/s3-request-presigner": { "optional": true }
+  },
+  "devDependencies": { "@biomejs/biome": "^2.4.9", "@types/node": "^26.0.0", "typescript": "^7.0.0", "mongodb-memory-server": "^11.0.0" }
 }
 ```
+
+> **Why optional PEERS, not `optionalDependencies`:** npm **installs** `optionalDependencies`
+> by default (they are "optional" only in that an install *failure* doesn't abort) — listing the
+> AWS SDKs there would force them onto every host. An optional *peer*
+> (`peerDependenciesMeta.optional`) is never auto-installed: a host installs
+> `@aws-sdk/client-sqs`+`sqs-consumer` only to use the SQS transport, and
+> `@aws-sdk/client-s3`(+presigner) only to use the shipped `s3Storage` driver. The dynamic
+> `import()` in each driver is the runtime guard.
 
 `tsconfig.json` — copy the email module verbatim: `target esnext`, `module nodenext`,
 `allowImportingTsExtensions`, `rewriteRelativeImportExtensions`, `verbatimModuleSyntax`,
@@ -92,9 +112,9 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
 `dist`.
 
 > `mongoose` is a peer dep (host already has it; the module never imports it — `getModel`
-> returns `any`). `sharp` and `deepmerge` are hard deps. SQS deps are optional,
-> lazy-loaded. `erasableSyntaxOnly` forbids enums/namespaces/parameter-properties — use
-> `as const` unions (e.g. `PreviewFormat`).
+> returns `any`). `sharp` and `deepmerge` are hard deps. The AWS deps (SQS transport, S3
+> storage driver) are optional peers, lazy-loaded. `erasableSyntaxOnly` forbids
+> enums/namespaces/parameter-properties — use `as const` unions (e.g. `PreviewFormat`).
 
 ---
 
@@ -112,6 +132,14 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
 
 ## §20. Tests (`node:test`, mirroring the email module; no live AWS/Mongo where avoidable)
 
+> **Ambient-app harness.** The module reads the framework app via `getApp()` (02 · §4); each
+> test file installs a fake with `setAppInstance(fakeApp)` and clears it with
+> `resetAppInstance()` (both exported by `@adaptivestone/framework/helpers/appInstance.js`).
+> Per-file isolation is free: the node:test runner executes each test file in its own process,
+> so the singleton never leaks across files.
+
+- `app`: `getApp` throws a clear "not initialized" error before any Server/fake exists;
+  returns the ambient instance once set.
 - `images`: `getSizeKey`/`parseSizeKey` for `WxH`, `Ww`, `Hh`, `fit`, invalid;
   `getFilterSig` order-independence + empty→`none`; `getPreviewIdentity` composition;
   `calculateResizedDimensions` `fit` cap + no-upscale.
@@ -130,10 +158,20 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
 - `sqsTransport` (mocked `@aws-sdk/client-sqs` + `sqs-consumer` — no live AWS): `enqueue` sends
   to the transport's `queueUrl` option with the right body and returns `{ taskId }`; a thrown `handleTask`
   propagates (→ SQS redeliver) and fires `onTaskFailed`; `opts.signal` stops the consumer.
+- `s3Storage` (mocked `@aws-sdk/client-s3` — no live AWS): `upload` routes
+  `visibility:'public'|'private'` to the right bucket and returns the persisted `{ bucket, key }`;
+  `publicUrl` is pure (no client construction) and correct in all three forms (publicUrl base /
+  path-style endpoint / virtual-hosted); `download` passes the stored `ref` through; `signedUrl`
+  lazy-loads the presigner.
 - `config`: `getResizeConfig` deep-merges defaults, host arrays **replace** (not concat),
   required-field omission throws; `requiredFormats` honors `webpAvifOnly`.
 - `hooks`: `runWaterfall` threads values in registration order AND a throwing tap is logged +
   skipped (read never breaks); `runObservers` swallows tap errors.
+- `mediaStore` / `locks`: the defaults are active without registration and hit
+  `app.getModel(...)` correctly (fake app: `findById`; `appendPreviews` issues ONE
+  `findByIdAndUpdate` with `$push {$each}` + optional `$set`; `acquire` passes **seconds** to
+  `acquireLock`); `registerMediaStore`/`registerLockProvider` replace the default (last-wins)
+  and enqueue/worker use the active driver.
 - `scaffold` (write to a temp dir): emits the model `extends` shim + command re-export + config files; `--check` reports
   `ok`/`drift`/`missing` and exits non-zero on drift; `--eject` writes the full model; never
   overwrites without `--force`.

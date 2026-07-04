@@ -2,7 +2,8 @@
 // This file is copied verbatim into dist by postBuild.ts (tsc does not emit it),
 // so it MUST stay dependency-free: no imports of source (.ts) modules and no
 // runtime imports. Source-coupled types (Pipeline, BeforeStep, VariantStep,
-// QueueTransport, ResizeStorage, HookName, HookFn) live next to their code.
+// QueueTransport, ResizeStorage, MediaStore, LockProvider, HookName, HookFn)
+// live next to their code.
 
 // Recursive partial: every field optional at every depth, BUT arrays are kept whole
 // (a host config array REPLACES the default — it is never deep-merged element-by-element,
@@ -14,7 +15,12 @@ export type DeepPartial<T> = T extends readonly (infer _U)[]
     : T;
 
 // ---------------------------------------------------------------------------
-// Minimal app interface (the slice of the framework app the module depends on)
+// Minimal app interface — the SLICE of the framework app the module consumes.
+// The app is never a parameter: the module reads the framework's ambient
+// appInstance through src/app.ts getApp() (set once per process at Server
+// construction; the framework enforces one server per process). This type
+// documents that slice and is the shape a test fake must satisfy when installed
+// via setAppInstance() (see 02 · §4).
 // ---------------------------------------------------------------------------
 
 export type TMinimalResizeApp = {

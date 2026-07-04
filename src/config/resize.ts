@@ -1,9 +1,6 @@
 import merge from 'deepmerge';
-import type {
-  PreviewFormat,
-  ResizeConfig,
-  TMinimalResizeApp,
-} from '../types.d.ts';
+import { getApp } from '../app.ts';
+import type { PreviewFormat, ResizeConfig } from '../types.d.ts';
 
 // Every TUNABLE is defaulted (and completeness-checked by the Omit type). Only the
 // host-required `mediaModelName` is absent — the host sets it in src/config/resize.ts.
@@ -49,12 +46,13 @@ export default defaultResizeConfig;
 const overwrite = (_dest: unknown[], src: unknown[]): unknown[] => src;
 
 /**
- * Deep-merge the host's `resize` config over the module defaults, then fail fast if the
- * one required field is still missing. Returns a fully-resolved ResizeConfig. Never
- * mutates `defaultResizeConfig` (deepmerge returns a fresh object).
+ * Deep-merge the host's `resize` config (read from the ambient app — src/app.ts) over
+ * the module defaults, then fail fast if the one required field is still missing.
+ * Returns a fully-resolved ResizeConfig. Never mutates `defaultResizeConfig`
+ * (deepmerge returns a fresh object).
  */
-export function getResizeConfig(app: TMinimalResizeApp): ResizeConfig {
-  const host = app.getConfig('resize') ?? {};
+export function getResizeConfig(): ResizeConfig {
+  const host = getApp().getConfig('resize') ?? {};
   const merged = merge(defaultResizeConfig, host, {
     arrayMerge: overwrite,
   }) as ResizeConfig;

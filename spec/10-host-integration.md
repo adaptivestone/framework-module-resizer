@@ -12,10 +12,12 @@ worker, the upload-time dims capture, and the real per-entity size catalogs the 
 
 ```ts
 // src/server.ts (runs in every process — API and worker) — register strategies + hooks once
-import { ResizeEngine, mongoTransport } from '@adaptivestone/framework-module-resize';
+import { ResizeEngine, mongoTransport, s3Storage } from '@adaptivestone/framework-module-resize';
 
 ResizeEngine.registerQueueTransport(mongoTransport);                  // or sqsTransport({ queueUrl, region }) — driver owns its options
-ResizeEngine.registerStorage(myS3Storage); // { download, upload, publicUrl, signedUrl? } — driver owns buckets + base URL (05 · §10.4)
+ResizeEngine.registerStorage(s3Storage({                              // shipped driver (05 · §10.5) — or any custom ResizeStorage object (05 · §10.4)
+  bucketPublic: 'my-cdn', bucketPrivate: 'my-originals', publicUrl: 'https://cdn.example.com',
+}));
 
 ResizeEngine.registerPipeline('default', {});
 ResizeEngine.registerPipeline('listing', { beforeSteps: [blurPlates] });               // async detector
@@ -33,8 +35,8 @@ npm run cli ResizeWorker           # run the worker process (separate from the A
 ```
 
 ```ts
-// in a host DTO builder
-const { output } = await ResizeEngine.resolve(app, {
+// in a host DTO builder (no app argument — the module reads the ambient appInstance)
+const { output } = await ResizeEngine.resolve({
   media: fileDoc,
   pipeline: 'listing',
   sizes: [{ width:1760, height:990 }, { width:620 }, { fit:true }, { width:300, height:300, filters:{ blur:40 } }],

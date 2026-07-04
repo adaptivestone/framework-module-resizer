@@ -3,9 +3,11 @@
 > Part of the [`@adaptivestone/framework-module-resize` build spec](../BUILD-SPEC.md).
 > Prev: [04 · Pipelines & hooks](./04-pipelines-and-hooks.md) · Next: [06 · Read & enqueue](./06-read-and-enqueue.md)
 
-The two infrastructure strategies: the queue transport (which also drives the worker) and
-storage. Each has exactly one active implementation; `app` is threaded into every method
-so the strategies stay stateless.
+The infrastructure strategies: the queue transport (which also drives the worker), storage,
+and the defaulted media-store/lock seams (§10.6). Each has exactly one active implementation.
+Driver methods take **no `app` parameter** — the shipped drivers read the framework's ambient
+`appInstance` through the module's `getApp()` gateway ([02 · §4](./02-types-and-api.md)) when
+they need framework primitives; custom drivers simply close over their own clients.
 
 ---
 
@@ -17,13 +19,12 @@ so the strategies stay stateless.
 export interface LeasedTask { taskId: string; mediaId: string; pipeline: string; previews: MissingPreview[]; }
 
 export interface QueueTransport {
-  enqueue(app: TMinimalResizeApp, task: { mediaId: string; pipeline: string; previews: MissingPreview[] }):
+  enqueue(task: { mediaId: string; pipeline: string; previews: MissingPreview[] }):
     Promise<{ taskId: string | null }>;
 
   // The transport drives consumption its own way (poll OR push). It calls handleTask
   // per task and is responsible for completion/redelivery.
   startWorker(
-    app: TMinimalResizeApp,
     // taskOpts.signal aborts THIS task if its lease is lost (best-effort; see `renew`).
     handleTask: (task: LeasedTask, taskOpts?: { signal: AbortSignal }) => Promise<void>,
     opts: { signal: AbortSignal },   // worker-wide shutdown
@@ -32,10 +33,10 @@ export interface QueueTransport {
 ```
 
 Exactly **one** transport is active. The worker ([07](./07-worker.md)) just calls
-`transport.startWorker(app, (task, taskOpts) => processTask(app, task, taskOpts), { signal })`
-(`taskOpts` threads the per-task lease-loss signal — see `handleTask` above). `app` is threaded
-so the transport stays stateless and the bootstrap line is
-`registerQueueTransport(mongoTransport)`.
+`transport.startWorker((task, taskOpts) => processTask(task, taskOpts), { signal })`
+(`taskOpts` threads the per-task lease-loss signal — see `handleTask` above). The bootstrap
+line stays `registerQueueTransport(mongoTransport)`; the mongo transport reaches the
+`ResizeTask` model through `getApp()`.
 
 > **Delivery is at-least-once** (true of both transports — confirmed for the Mongo
 > lease/visibility pattern and SQS). A task may be delivered more than once (lease expiry +
@@ -74,7 +75,7 @@ for (;;) {
     { returnDocument: 'after' },
   );
   if (!dead) break;                                          // none left this poll
-  runObservers(app, 'onTaskDeadLettered', dead, new Error(err), {});   // ctx = {} in the worker
+  runObservers('onTaskDeadLettered', dead, new Error(err), {});   // ctx = {} in the worker
 }
 ```
 
@@ -159,30 +160,30 @@ export function sqsTransport(opts: { queueUrl: string; region?: string; endpoint
 The one seam that lets the worker (and the read path's URL building) reach storage without
 the module importing host helpers or knowing what a "bucket" is. **The driver owns all
 storage-specific options** (buckets, base URL, region, credentials) — they live in the driver,
-not `ResizeConfig`. Storage is **host-implemented** (the host writes a small object closing
-over its own S3/GCS/filesystem client + buckets); the module ships only this interface. `app`
-is threaded for parity with the transport.
+not `ResizeConfig`. Storage mirrors the queue seam: this abstract interface plus **shipped
+drivers** (v1 ships `s3Storage` — §10.5; filesystem/GCS/R2 drivers can be added later without
+touching the core). A host on anything not shipped implements the interface itself — a small
+object closing over its own client + buckets (no `app` parameter — see the file intro).
 
 ```ts
 // StorageRef is the opaque locator the driver round-trips onto the document (02 · §5).
 // `key` is always present; `bucket` is S3-specific and may be absent for other drivers.
 export interface ResizeStorage {
   // Download an existing object by its stored locator (the worker's original; rarely a re-read).
-  download(app: TMinimalResizeApp, ref: StorageRef): Promise<Buffer | Uint8Array>;
+  download(ref: StorageRef): Promise<Buffer | Uint8Array>;
 
   // Upload a NEW object. The module supplies the logical `key` + `visibility`; the DRIVER
   // decides physical placement (which bucket / base dir) and returns the locator to persist.
   upload(
-    app: TMinimalResizeApp,
     args: { key: string; body: Buffer | Uint8Array; contentType: string; visibility: 'public' | 'private' },
   ): Promise<StorageRef>;
 
   // PURE, synchronous, NO I/O — the public URL for a stored object. Called on the read path,
   // so it must not touch the network. Required: the driver is the single source for object URLs.
-  publicUrl(app: TMinimalResizeApp, ref: StorageRef): string;
+  publicUrl(ref: StorageRef): string;
 
   // Optional: a time-limited signed URL for owner/admin reads of a private original.
-  signedUrl?(app: TMinimalResizeApp, ref: StorageRef, ttlSeconds: number): Promise<string>;
+  signedUrl?(ref: StorageRef, ttlSeconds: number): Promise<string>;
 }
 ```
 
@@ -193,17 +194,92 @@ process that calls `resolve` or the worker; a missing storage throws a clear err
 worker ([07 · Worker](./07-worker.md) step 2) and makes `resolve` log + return the safe empty
 decision ([06 · Read & enqueue](./06-read-and-enqueue.md) never-throw guarantee).
 
-Example host driver (S3, closing over its own buckets + CDN base):
+A custom driver is just a small object (host-implemented — e.g. GCS or a filesystem; for
+plain S3 use the shipped `s3Storage`, §10.5):
 
 ```ts
 ResizeEngine.registerStorage({
-  download: (app, ref) => s3.getObject(ref.bucket!, ref.key),
-  upload: async (app, { key, body, contentType, visibility }) => {
+  download: (ref) => s3.getObject(ref.bucket!, ref.key),
+  upload: async ({ key, body, contentType, visibility }) => {
     const bucket = visibility === 'public' ? 'my-cdn' : 'my-originals';
     await s3.putObject(bucket, key, body, contentType);
     return { bucket, key };               // ← persisted onto the preview/original
   },
-  publicUrl: (app, ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
-  signedUrl: (app, ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
+  publicUrl: (ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
+  signedUrl: (ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
 });
 ```
+
+### 10.5 S3 storage driver (`src/storage/s3.ts`) — SHIPPED (optional deps)
+
+**Driver-owned options, factory-shaped** (exactly like `sqsTransport`): the host calls
+`registerStorage(s3Storage({ … }))` and the returned driver closes over its options — nothing
+storage-specific enters `ResizeConfig`. Credentials are **never** options (standard AWS
+provider chain). The factory lazily constructs (and memoizes) one `S3Client` on first I/O use.
+
+```ts
+export function s3Storage(opts: {
+  bucketPublic: string;    // previews land here (upload visibility 'public')
+  bucketPrivate?: string;  // originals ('private'); defaults to bucketPublic
+  publicUrl?: string;      // CDN/base URL for public objects, e.g. 'https://cdn.example.com'
+  region?: string;
+  endpoint?: string;       // S3-compatible: MinIO / localstack / R2
+  forcePathStyle?: boolean;
+}): ResizeStorage;
+```
+
+- `upload` → `PutObjectCommand` to `bucketPublic`/`bucketPrivate` by `visibility`; returns
+  `{ bucket, key }`. **No per-object ACL** — public access is bucket policy (every prior
+  implementation works this way).
+- `download` → `GetObjectCommand(ref.bucket ?? opts.bucketPrivate ?? opts.bucketPublic, ref.key)` → `Buffer`.
+- `publicUrl` → **pure string building, no SDK, no I/O**: `${opts.publicUrl}/${ref.key}` when
+  set; else path-style `${endpoint}/${bucket}/${key}` when `endpoint`/`forcePathStyle`, else
+  virtual-hosted `https://${bucket}.s3.${region}.amazonaws.com/${key}`.
+- `signedUrl` → `@aws-sdk/s3-request-presigner` `getSignedUrl` with `expiresIn: ttlSeconds`.
+- Lazy-load `@aws-sdk/client-s3` / `@aws-sdk/s3-request-presigner` via dynamic `import()` —
+  they are optional **peer** deps ([09 · Packaging](./09-packaging-and-tests.md)), so the
+  module installs and runs without them unless this driver is used.
+
+### 10.6 Media store & lock provider (`src/mediaStore.ts`, `src/locks.ts`) — DEFAULTED seams
+
+The last two DB touchpoints, behind the same single-active-strategy pattern — so the **core
+is fully DB-free**: with a non-Mongo transport plus custom drivers here, nothing in the module
+touches Mongo. Unlike transport/storage, each has a **framework-backed default active out of
+the box** (a standard host registers nothing); `registerMediaStore`/`registerLockProvider`
+replace it (last wins).
+
+```ts
+export interface MediaStore {
+  // Load the media doc for the WORKER (the read path never calls this — resolve() receives
+  // `media` from the caller). Resolving to null/undefined makes the task a logged no-op (07 step 1).
+  load(mediaId: string): Promise<MediaLike | null>;
+
+  // The worker's single write: append generated previews (+ optionally backfill the
+  // original's display dims) atomically.
+  appendPreviews(
+    mediaId: string,
+    previews: Preview[],
+    backfillDims?: { width: number; height: number },
+  ): Promise<void>;
+}
+
+export interface LockProvider {
+  acquire(key: string, ttlMs: number): Promise<boolean>; // true if acquired
+  release(key: string): Promise<void>;
+}
+```
+
+- **`frameworkMediaStore` (default):** `load` →
+  `getApp().getModel(config.mediaModelName).findById(mediaId)`;
+  `appendPreviews` → **one** `findByIdAndUpdate` combining `$push: { previews: { $each } }`
+  with the optional `$set: { 'original.width', 'original.height' }`.
+- **`frameworkLockProvider` (default):** `acquire` →
+  `getApp().getModel('Lock').acquireLock(key, Math.ceil(ttlMs / 1000))` — the framework Lock
+  TTL is **seconds**, so the ms→s conversion lives *here*, never at call sites; `release` →
+  `Lock.releaseLock(key)`.
+- **Used by:** `enqueue` (dispatch locks — [06 · §18](./06-read-and-enqueue.md)), `processTask`
+  (media load, worker locks, the single preview write — [07](./07-worker.md)), `generate`
+  (persist — [11](./11-modes.md)). Lock **keys** stay module-owned and identity-derived
+  ([03](./03-identity.md)) regardless of provider.
+- **Swap examples:** a Redis/redlock `LockProvider`; a `MediaStore` over another DB/ORM or a
+  remote media service.

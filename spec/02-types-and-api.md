@@ -8,7 +8,16 @@ public surface (`src/index.ts`).
 
 ---
 
-## §4. Minimal app interface (`src/types.d.ts`)
+## §4. Minimal app interface (`src/types.d.ts`) — consumed via the ambient `appInstance`
+
+**The app is never a parameter.** The framework sets a process-wide singleton at Server
+construction (`setAppInstance`, one-server-per-process **enforced** — a second Server throws)
+and exports it from `@adaptivestone/framework/helpers/appInstance.js`. The module reads it
+through one internal gateway — **`getApp()` in `src/app.ts`** (clear error if called before
+the Server exists) — and `TMinimalResizeApp` documents the **slice** of that app the module
+actually consumes. It is also the shape a test fake must satisfy: tests call
+`setAppInstance(fake)` / `resetAppInstance()` (per-file isolation is free — the node:test
+runner executes each test file in its own process).
 
 ```ts
 export type TMinimalResizeApp = {
@@ -141,6 +150,9 @@ export {
 export { default as defaultResizeConfig, getResizeConfig, requiredFormats } from './config/resize.ts';
 export { mongoTransport } from './transports/mongo.ts';
 export { sqsTransport } from './transports/sqs.ts';   // optional (lazy-loads aws sdk)
+export { s3Storage } from './storage/s3.ts';          // shipped storage driver (lazy-loads aws sdk)
+export { frameworkMediaStore } from './mediaStore.ts';    // DEFAULT media store (auto-active)
+export { frameworkLockProvider } from './locks.ts';       // DEFAULT lock provider (auto-active)
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';  // BaseModel subclass; the host's scaffolded model `extends` it (Mongo transport)
 export type { TResizeTask } from './models/ResizeTask.ts';            // = GetModelTypeFromClass<typeof ResizeTaskModel>
 export { resizeMediaSchemaFragment } from './models/mediaFragment.ts';  // optional `as const` schema fragment the host spreads into File/Media (08 · §12)
@@ -165,9 +177,11 @@ class ResizeEngine {
   static registerPipeline(name: string, p: Pipeline): void;  // per-media-type processing (04)
   static registerQueueTransport(t: QueueTransport): void;    // exactly one active (05)
   static registerStorage(s: ResizeStorage): void;            // exactly one active (05)
+  static registerMediaStore(s: MediaStore): void;            // media load/persist; DEFAULT active: framework models (05 · §10.6)
+  static registerLockProvider(l: LockProvider): void;        // dispatch/worker locks; DEFAULT active: framework Lock (05 · §10.6)
 
   // --- read path (host calls this from its DTO builders) ---
-  static async resolve(app: TMinimalResizeApp, opts: {
+  static async resolve(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;              // selects a registered pipeline; default 'default'
@@ -177,7 +191,7 @@ class ResizeEngine {
   }): Promise<{ decision: ReadDecision; output: unknown /* whatever formatPublicUrls returns */ }>;
 
   // --- eager mode (synchronous generate at upload; no queue/worker) — see 11 · Modes ---
-  static async generate(app: TMinimalResizeApp, opts: {
+  static async generate(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;
@@ -194,6 +208,11 @@ class ResizeEngine {
   `undefined`** (they don't throw). The worker **logs and exits cleanly** if no transport is
   registered ([07 · Worker](./07-worker.md)); a **missing storage throws inside `processTask`**
   (07 step 2), since the worker can't download/upload without it.
+- `registerMediaStore` / `registerLockProvider` — **exactly one active; last wins** — but unlike
+  transport/storage they are **never absent**: the framework-backed defaults
+  (`frameworkMediaStore`, `frameworkLockProvider` — [05 · §10.6](./05-transport-and-storage.md))
+  are active until replaced, so `getActiveMediaStore()`/`getActiveLockProvider()` always return
+  a driver and a standard host registers nothing.
 - `registerPipeline(name, p)` — keyed by `name`; **last registration for a name wins**. An
   unknown name resolves to the empty pipeline (no steps — [04](./04-pipelines-and-hooks.md) §8).
 - `hook(name, fn)` — **appends** (multiple taps allowed); they run in registration order

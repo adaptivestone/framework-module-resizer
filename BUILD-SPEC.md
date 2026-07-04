@@ -52,13 +52,21 @@ identity helper (03) underpins everything; build and test it first.
 
 The substantive decisions baked in here, settled against real usage across the prior implementations:
 
-1. **Storage is a registered strategy**, not part of the app interface. The worker reaches
-   S3 via `ResizeEngine.registerStorage(...)`. The read path is storage-free.
+1. **Storage is a registered strategy**, not part of the app interface — the abstract
+   `ResizeStorage` interface plus shipped drivers (v1: `s3Storage`; more can be added without
+   touching the core), registered via `ResizeEngine.registerStorage(...)`. The registered
+   driver is required in **every** process: the worker for `download`/`upload`, the read path
+   for the pure, I/O-free `publicUrl` (no storage I/O ever happens on a read).
 2. **The queue transport owns consumption.** Its interface is `enqueue` + `startWorker`;
    `lease/complete/fail` are transport-internal (Mongo polls, SQS is push-driven). The
    worker is transport-agnostic.
-3. **`app` is threaded into transport and storage methods** (stateless strategies;
-   bootstrap stays `registerQueueTransport(mongoTransport)`).
+3. **Every integration is a driver seam; the app is ambient, never a parameter.** Queue
+   transport, storage, **media store**, and **lock provider** are single-active strategies
+   whose methods take no `app` — the module reads the framework's `appInstance` singleton
+   through one gateway (`src/app.ts` `getApp()`), matching the framework's enforced
+   one-server-per-process model. The last two seams default to the framework models
+   (`registerMediaStore`/`registerLockProvider` swap the DB layer), so the core owns only
+   the resize logic and bootstrap stays `registerQueueTransport(mongoTransport)`.
 4. **Filters are part of the preview identity.** A `300x300` regular preview and a
    `300x300` blurred preview coexist as distinct cached variants. Identity is
    `sizeKey:format:filterSig`; the host defines what a filter *does* to pixels.
@@ -118,17 +126,23 @@ wins — all folded into `04`/`05`/`07`/`08`. Remaining open gaps are flagged ho
    the cross-cutting hooks, threads the pipeline name into enqueue; never fabricates a
    DTO; enqueue failure never throws into the read.
 3. Mongo transport: `enqueue` + atomic `lease` + reclaim + `complete/fail` +
-   `maxAttempts`→dead-letter sweep, deduped by the two-tier framework `Lock`
-   (`resize_dispatch:*` / `resize_worker:*`, keyed by identity).
+   `maxAttempts`→dead-letter sweep, deduped by the two-tier locks via the active
+   `LockProvider` (framework `Lock` by default;
+   `resize_dispatch:*` / `resize_worker:*`, keyed by identity).
 4. `ResizeWorker` (transport-agnostic via `startWorker`) runs the named pipeline's
    `beforeSteps` once, then generates avif/webp/(jpeg) previews with EXIF rotation, `fit`
    inside/no-upscale, per-variant `variantSteps`/filters, bounded concurrency, random keys,
    `$push`, original-dims backfill, both-tier lock release; clean no-op when disabled.
-5. Storage strategy registered and used by the worker; read path works without it (except
-   optional signed-original).
+5. Storage strategy (shipped `s3Storage` or a custom driver) registered and used by the
+   worker (`download`/`upload`) and by the read path (pure `publicUrl`); `resolve` degrades
+   to the safe-empty decision — never throws — when none is registered.
 6. `resize-scaffold` (package bin) emits an editable `ResizeTask` model (+ `pipeline`/`filters`/`fit`) +
    config into a host app; `--check` reports drift.
-7. No `@adaptivestone/framework` / `mongoose` import anywhere; only `TMinimalResizeApp`.
+7. No `mongoose` import anywhere; `@adaptivestone/framework` imported in exactly two files —
+   `src/app.ts` (the ambient `appInstance` gateway; the app is never a parameter) and
+   `src/models/ResizeTask.ts` (literal `extends BaseModel`, required by the runtime loader +
+   `npm run gen` AST codegen) — both safe via the peer deps (spec/01 §2.3). Everything else
+   uses the `TMinimalResizeApp` slice via `getApp()`.
 8. `node:test` suite ([09](./spec/09-packaging-and-tests.md#20-tests-nodetest-mirroring-the-email-module-no-live-awsmongo-where-avoidable))
    green.
 9. README documents install, the registrations (transport, storage, pipelines, hooks),

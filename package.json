@@ -49,18 +49,37 @@
   },
   "peerDependencies": {
     "@adaptivestone/framework": "*",
-    "mongoose": "*"
-  },
-  "optionalDependencies": {
+    "@aws-sdk/client-s3": "*",
     "@aws-sdk/client-sqs": "*",
+    "@aws-sdk/s3-request-presigner": "*",
+    "mongoose": "*",
     "sqs-consumer": "*"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": {
+      "optional": true
+    },
+    "@aws-sdk/client-sqs": {
+      "optional": true
+    },
+    "@aws-sdk/s3-request-presigner": {
+      "optional": true
+    },
+    "sqs-consumer": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@adaptivestone/framework": "^5.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-sqs": "^3.0.0",
+    "@aws-sdk/s3-request-presigner": "^3.0.0",
     "@biomejs/biome": "^2.4.9",
+    "@types/express": "^5.0.6",
     "@types/node": "^26.0.0",
     "mongodb-memory-server": "^11.0.0",
     "mongoose": "^9.0.0",
+    "sqs-consumer": "^14.0.0",
     "typescript": "7.0.1-rc"
   }
 }

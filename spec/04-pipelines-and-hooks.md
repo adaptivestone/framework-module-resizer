@@ -121,14 +121,16 @@ host can alert/page — see [05 · Transport](./05-transport-and-storage.md)).
 ```ts
 // Waterfall taps are HOST code on the read path; a throwing tap must never break the read.
 // Each tap is guarded: on throw, log and keep the prior value (treat the tap as identity).
-async function runWaterfall(app, name, value, ctx) {
+async function runWaterfall(name, value, ctx) {
+  const app = getApp();                                      // ambient framework app (02 · §4)
   for (const fn of hooks.get(name) ?? []) {
     try { value = await fn(value, ctx); }
     catch (e) { app.logger.error(`resize waterfall ${name} tap failed (skipped)`, e); }
   }
   return value;
 }
-async function runObservers(app, name, ...args) {
+async function runObservers(name, ...args) {
+  const app = getApp();
   try { app.events?.emit(`resize:${name}`, ...args); }       // fire-and-forget mirror onto the framework bus
   catch (e) { app.logger.error(`resize event ${name} listener failed`, e); }
   for (const fn of hooks.get(name) ?? []) {                  // primary: typed, awaited, error-isolated
@@ -137,5 +139,6 @@ async function runObservers(app, name, ...args) {
 }
 ```
 
-The pipeline registry, queue transport, and storage are **NOT** hooks — each is a single
-active strategy registered via its own method.
+The pipeline registry, queue transport, storage, media store, and lock provider are **NOT**
+hooks — each is a single active strategy registered via its own method (the last two with
+framework-backed defaults — [05 · §10.6](./05-transport-and-storage.md)).

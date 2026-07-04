@@ -10,14 +10,14 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
 
 ## §17. Read-path algorithm (`ResizeEngine.resolve` + `src/engine.ts`)
 
-1. `sizes = await runWaterfall(app, 'resolveSizes', opts.sizes, ctx)` — host size magic
+1. `sizes = await runWaterfall('resolveSizes', opts.sizes, ctx)` — host size magic
    (expand/inject/map/dedupe; e.g. add `{ fit:true }` for entity `event`). `runWaterfall`
    guards each host tap (a throwing tap is logged and skipped — [04 · Hooks](./04-pipelines-and-hooks.md) §9).
 2. `formats = opts.formats ?? requiredFormats(config)`.
 3. `storage = getActiveStorage()`. If **none is registered**, log a clear error and return the
    safe empty decision (`{ decision: { ready: [], missing: [] }, output: … }`) — without storage
    no URL can be built (see the never-throw guarantee below). All URLs below come from
-   `storage.publicUrl(app, ref)`, which is **pure / I/O-free** (the driver owns the base URL — see
+   `storage.publicUrl(ref)`, which is **pure / I/O-free** (the driver owns the base URL — see
    [05 · §10.4](./05-transport-and-storage.md)).
 4. `pipeline = opts.pipeline ?? 'default'`; `mediaId = media.id ?? String(media._id)`.
 5. Build `previewMap: Map<identity, Preview>` from `media.previews` (only entries with
@@ -27,7 +27,7 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
    requested `size × format` (skip a size whose `getSizeKey` throws, as in step 7), push a
    `ready` entry with **`preview` omitted and `isOriginal: true`** (`ReadyEntry` —
    [02 · Types](./02-types-and-api.md#5-data-shapes-srctypesdts)), whose `url` is the
-   **original's** public URL (`storage.publicUrl(app, media.original)` — the same rule as below),
+   **original's** public URL (`storage.publicUrl(media.original)` — the same rule as below),
    **ignoring the requested `format`** — an SVG renders crisply at any size and is always served
    as `image/svg+xml`. Leave
    `decision.missing` empty: SVG is **never enqueued and never rasterized** (vector resize is
@@ -41,7 +41,7 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
    > The module never inspects SVG bytes.
 7. For each `size`: `sizeKey = getSizeKey(size)` (skip on throw), for each `format`:
    - `identity = getPreviewIdentity(sizeKey, format, size.filters)`.
-   - **exists** (`previewMap` hit) → push to `decision.ready` with `url = storage.publicUrl(app, preview)`
+   - **exists** (`previewMap` hit) → push to `decision.ready` with `url = storage.publicUrl(preview)`
      and `preview` set (`publicUrl` is pure string-building, so the read path stays I/O-free).
    - **original already fits** (optional fast-path; serve the original instead of generating).
      Apply **only when ALL** hold: (a) `size` has **no `filters`**; (b) `size` is a plain
@@ -50,18 +50,18 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
      original is **not larger** than the box: `origW <= size.width && origH <= size.height`
      (so serving it never up- or down-scales below request — it already fits). Then push a
      `ready` entry with **`preview` omitted and `isOriginal: true`**, `url` =
-     `storage.publicUrl(app, media.original)` (or `storage.signedUrl(app, media.original, ttl)`
+     `storage.publicUrl(media.original)` (or `storage.signedUrl(media.original, ttl)`
      when `ctx.isOwner || ctx.isAdmin` and `signedUrl` exists). Skip generation. If any
      condition fails, fall through to **exists/missing** (do not serve the original).
    - **missing** → push `{ sizeKey, filters?, requestedWidth?, requestedHeight?, format,
      fit? }` (deduped by identity) to `decision.missing`.
-8. `missing = await runWaterfall(app, 'beforeEnqueue', decision.missing, ctx)`; **assign it
+8. `missing = await runWaterfall('beforeEnqueue', decision.missing, ctx)`; **assign it
    back to `decision.missing`** so steps 9–10 and the host's `formatPublicUrls` see the same
    (post-hook) set that was enqueued.
-9. If `enqueueMissing` (default true) and `decision.missing.length` → `await enqueue(app,
+9. If `enqueueMissing` (default true) and `decision.missing.length` → `await enqueue(
    mediaId, pipeline, decision.missing)` (§18) inside try/catch — enqueue must never throw
    into the read.
-10. `output = await runWaterfall(app, 'formatPublicUrls', decision, ctx)` — the host turns the
+10. `output = await runWaterfall('formatPublicUrls', decision, ctx)` — the host turns the
     decision into its response shape and renders placeholders/signed-originals for
     `decision.missing` (where `ready:false`/`isPlaceholder` is produced for the frontend).
     If no tap, `output === decision`.
@@ -77,23 +77,27 @@ host's job, driven off `decision`.
 > and `resolve` returns the safe value `{ decision: { ready, missing: [] }, output: decision }`
 > (the `ready` entries built so far, nothing enqueued) instead of rejecting into the caller's read.
 > `signedUrl` (the only I/O in the read, owner/admin-gated) is also caught and falls back to the
-> public URL via `storage.publicUrl`.
+> public URL via `storage.publicUrl`. Edge case: if `getApp()` itself throws (resolve called
+> before the Server exists), the outer catch cannot reach `app.logger` — it falls back to
+> `console.error` and still returns the safe empty decision.
 
 ---
 
 ## §18. Enqueue algorithm (`src/enqueue.ts`)
 
 ```ts
-async function enqueue(app, mediaId, pipeline: string, missing: MissingPreview[]): Promise<void>
+async function enqueue(mediaId: string, pipeline: string, missing: MissingPreview[]): Promise<void>
 ```
 
 1. Dedup `missing` by `getPreviewIdentity(sizeKey, format, filters)`.
-2. For each, acquire the **dispatch lock** `resize_dispatch:${mediaId}:${identity}`, TTL
-   `config.queue.lockTtlMs.dispatch` (default 60s, converted to seconds for `acquireLock`). Keep
+2. For each, acquire the **dispatch lock** `resize_dispatch:${mediaId}:${identity}` via the
+   active `LockProvider` — `lockProvider.acquire(key, config.queue.lockTtlMs.dispatch)`
+   (default 60s; the framework default driver converts ms→seconds for `Lock.acquireLock` —
+   [05 · §10.6](./05-transport-and-storage.md)). Keep
    only variants whose lock was acquired (others are already in flight — collapses a read
    fan-out into one task).
 3. If none survive → return.
-4. `const { taskId } = await transport.enqueue(app, { mediaId, pipeline, previews: survivors })`.
+4. `const { taskId } = await transport.enqueue({ mediaId, pipeline, previews: survivors })`.
 5. On enqueue failure — a **throw** OR a returned **`taskId === null`** (soft failure): log,
    and **release the survivors' dispatch locks** so a later read retries instead of waiting
    out the TTL. Never throw to the caller. (A non-null `taskId` = success; the dispatch locks

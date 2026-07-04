@@ -4,7 +4,7 @@
 > truth is [`BUILD-SPEC.md`](./BUILD-SPEC.md) + [`spec/`](./spec/); this file tracks *what is
 > built* and *how to build the rest*. Keep the status table below in sync as modules land.
 >
-> **Last updated:** 2026-06-28.
+> **Last updated:** 2026-07-04.
 
 ---
 
@@ -58,16 +58,17 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 1 | Foundation | `package.json`, `tsconfig.json`, `biome.json`, `preBuild.ts`, `postBuild.ts`, `.gitignore`, `.npmignore`, `LICENSE` | spec/09 | ✅ done | build green |
 | 1 | Type contract | `src/types.d.ts` | spec/02, spec/08 | ✅ done | — |
 | 2 | Identity helpers | `src/images.ts` | spec/03 | ✅ done (TDD) | 31 |
-| 3 | Config | `src/config/resize.ts` | spec/08 §13 | ✅ done (TDD) | 8 |
-| 4 | Registry + hooks | `src/registry.ts`, `src/hooks.ts` | spec/04 | ⬜ next | — |
+| 3 | Config | `src/config/resize.ts` | spec/08 §13 | ✅ done (TDD) | 9 |
+| 3 | Ambient app gateway | `src/app.ts` | spec/02 §4 | ✅ done (TDD) | 2 |
+| 4 | Registry + hooks + defaulted seams | `src/registry.ts`, `src/hooks.ts`, `src/mediaStore.ts`, `src/locks.ts` | spec/04, spec/05 §10.6 | ⬜ next | — |
 | 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ⬜ | — |
 | 6 | Models | `src/models/ResizeTask.ts`, `src/models/mediaFragment.ts` | spec/08 §12 | ⬜ | — |
-| 7 | Transports | `src/transports/mongo.ts`, `src/transports/sqs.ts` | spec/05 | ⬜ | — |
+| 7 | Transports + storage driver | `src/transports/mongo.ts`, `src/transports/sqs.ts`, `src/storage/s3.ts` | spec/05 | ⬜ | — |
 | 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ⬜ | — |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ⬜ | — |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
 
-**Suite total so far: 39 tests, all green.** Full target test plan is spec/09 §20.
+**Suite total so far: 42 tests, all green.** Full target test plan is spec/09 §20.
 
 ---
 
@@ -75,15 +76,21 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 
 Each step lists the spec section to implement against and the key behaviors to test.
 
-**4 — `src/registry.ts` + `src/hooks.ts` (spec/04).** Pure logic, no infra.
+**4 — `src/registry.ts` + `src/hooks.ts` + `src/mediaStore.ts` + `src/locks.ts` (spec/04, spec/05 §10.6).** Pure logic, no infra.
 - registry: module-scope maps for the single-active **transport** + **storage**
   (`register*`/`getActive*`; last-wins; `getActive*` returns the value or `undefined`, never
   throws) and named **pipelines** (`registerPipeline`/`getPipeline`; last-wins per name;
   unknown name → empty pipeline `{}`). Define `Pipeline`/`BeforeStep`/`VariantStep` here.
-- hooks: `hook(name, fn)` appends; `runWaterfall(app,name,value,ctx)` threads value through
+- **defaulted seams** (spec/05 §10.6): `MediaStore` + `frameworkMediaStore` (load via
+  `getModel(config.mediaModelName)`; `appendPreviews` = ONE `findByIdAndUpdate` `$push {$each}`
+  + optional `$set` dims) and `LockProvider` + `frameworkLockProvider` (framework `Lock`,
+  ms→seconds conversion inside). Registry slots for both are **pre-filled with the defaults**
+  (`getActive*` never returns `undefined` for these); `registerMediaStore`/`registerLockProvider`
+  replace (last-wins). Test with a fake `app.getModel`.
+- hooks: `hook(name, fn)` appends; `runWaterfall(name,value,ctx)` threads value through
   taps in registration order, **guarding each tap** (throw → log + skip, keep prior value);
-  `runObservers(app,name,...args)` fires `app.events?.emit('resize:'+name, …)` (fire-and-forget)
-  then awaits each typed tap **error-isolated**.
+  `runObservers(name,...args)` fires `events?.emit('resize:'+name, …)` (fire-and-forget)
+  then awaits each typed tap **error-isolated**. Both read logger/events via `getApp()`.
 
 **5 — `src/engine.ts` + `src/enqueue.ts` (spec/06, spec/02 §6).**
 - `enqueue`: dedup by `getPreviewIdentity`; per-identity **dispatch lock**
@@ -92,7 +99,7 @@ Each step lists the spec section to implement against and the key behaviors to t
   survivors' locks; never throw to caller.
 - `ResizeEngine.resolve`: the read-path algorithm (spec/06 §17) incl. SVG pass-through
   (`isOriginal:true`, `preview` omitted), "original already fits" fast-path, URLs via
-  `storage.publicUrl(app, ref)` (driver required — log + safe-empty if absent), `runWaterfall`
+  `storage.publicUrl(ref)` (driver required — log + safe-empty if absent), `runWaterfall`
   for `resolveSizes`/`beforeEnqueue`/`formatPublicUrls`, and the **never-throw** wrapper.
   `ResizeEngine` also holds the static registration methods (delegates to registry/hooks).
 
@@ -105,16 +112,20 @@ Each step lists the spec section to implement against and the key behaviors to t
 - `mediaFragment.ts`: optional `as const` POJO schema fragment (String/Number/Boolean globals,
   **no mongoose import**) the host spreads into File/Media.
 
-**7 — `src/transports/mongo.ts` + `src/transports/sqs.ts` (spec/05).**
+**7 — `src/transports/mongo.ts` + `src/transports/sqs.ts` + `src/storage/s3.ts` (spec/05).**
 - `QueueTransport`/`LeasedTask`/`ResizeStorage`/`StorageRef` interfaces (StorageRef already in
   types.d.ts). Mongo: lease (fencing `leaseToken`) / complete / fail (backoff→dead-letter) /
   renew / dead-letter sweep (per-row `findOneAndUpdate` so one worker fires the observer).
   `mongoTransport` = option-less singleton. SQS: `sqsTransport({queueUrl,region?,endpoint?})`
   **factory**, lazy-loads `@aws-sdk/client-sqs` + `sqs-consumer`. Test mongo against
   `mongodb-memory-server`; SQS against mocked SDK.
+- `s3Storage({bucketPublic,bucketPrivate?,publicUrl?,region?,endpoint?,forcePathStyle?})`
+  **factory** (spec/05 §10.5): upload routes by `visibility` (no per-object ACL), pure
+  `publicUrl` string-building (3 URL forms), presigner-backed `signedUrl`; lazy-loads
+  `@aws-sdk/client-s3`/`@aws-sdk/s3-request-presigner`. Test against mocked SDK.
 
 **8 — `src/worker.ts` + `src/resizeTask.ts` + `src/commands/ResizeWorker.ts` (spec/07, spec/11).**
-- `runResizeWorker(app)` (sharp globals, transport loop) + `processTask` (download once →
+- `runResizeWorker()` (sharp globals, transport loop) + `processTask` (download once →
   EXIF display-orientation math → beforeSteps → decode-once `base.clone()` per variant bounded
   by `config.worker.concurrency` → rotate/resize/colorspace/sharpen/variantSteps/flatten/encode
   → `storage.upload({…,visibility:'public'})` persist returned ref → single `$push` → locks →
@@ -155,6 +166,49 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
    sub-object; arrays stay whole (they REPLACE via `getResizeConfig`'s `arrayMerge`).
 6. `defaultResizeConfig` is typed `Omit<ResizeConfig,'mediaModelName'>` so the compiler
    enforces a default for every tunable.
+7. **Shipped `s3Storage` driver (2026-07-04).** Storage now mirrors the queue seam: abstract
+   interface + shipped drivers (v1: S3; filesystem/GCS/R2 possible later), instead of
+   interface-only with a docs example. `s3Storage(opts)` factory per spec/05 §10.5. Custom
+   backends remain host-implemented against `ResizeStorage`. Driver-abstraction direction
+   confirmed by the user: core = resize logic only; every integration (storage, queue, …)
+   must stay swappable.
+8. **AWS deps are optional PEERS, not `optionalDependencies` (2026-07-04).** npm installs
+   `optionalDependencies` by default, which forced the SQS SDK onto every host. Moved
+   `@aws-sdk/client-sqs`/`sqs-consumer` (+ new `@aws-sdk/client-s3`/`s3-request-presigner`)
+   to `peerDependencies` + `peerDependenciesMeta:{optional:true}`; also added as devDeps for
+   local tests. Dynamic `import()` in the drivers stays the runtime guard.
+9. **MediaStore + LockProvider seams (2026-07-04).** The last two DB touchpoints became
+   registered strategies (spec/05 §10.6) with framework-backed defaults active out of the box
+   (`frameworkMediaStore`, `frameworkLockProvider`) — the core is now fully DB-free; a host can
+   swap the media persistence (other DB/ORM) and the locks (Redis) without touching the module.
+   Worker/enqueue/generate now speak `mediaStore.load/appendPreviews` + `lockProvider.acquire/release`.
+   User direction: core = main resize logic only; every integration abstract, multiple shipped
+   drivers over time.
+10. **AST-codegen compliance VERIFIED against framework v5 source (2026-07-04).** `npm run gen`
+    is pure AST (oxc-parser) and resolves bare-package `extends` ancestors via
+    `createRequire().resolve()` (`codegen/astModel.ts`) → the scaffolded
+    `class ResizeTask extends ResizeTaskModel {}` is detected and fully typed (inherited
+    `modelSchema` included). Commands are never AST-parsed → re-export shim safe. No module
+    auto-discovery exists → host shims are the only integration path (as designed). Package
+    obligations, all already satisfied: framework + mongoose as **peerDeps** (single-copy
+    dedupe for `server.ts:423` `instanceof BaseModel` and the mongoose singleton in
+    `BaseModel.ts`), `exports` subpaths, `declaration:true`, literal `extends BaseModel`
+    (no mixin/factory). Spec §22.7 + 01 §2.3/§16 now carve out the one deliberate framework
+    import (`src/models/ResizeTask.ts`). Optional FRAMEWORK-side improvements (our repo, not
+    blockers): duck-typed brand check instead of nominal `instanceof` at `server.ts:423`;
+    opt-in `modules:[…]` extra scan roots in `folderConfig` to eliminate host shims entirely.
+11. **The app is ambient — no `app` parameter anywhere (2026-07-04).** The framework exports a
+    process-wide `appInstance` singleton (`helpers/appInstance.js`, set at Server construction,
+    one-server-per-process ENFORCED, `setAppInstance`/`resetAppInstance` test hooks; present in
+    published 5.0.1). The module reads it through ONE gateway — `src/app.ts` `getApp()` (clear
+    error before Server exists) — so `resolve(opts)`, `generate(opts)`, `runResizeWorker()`,
+    `getResizeConfig()` and every driver method (`enqueue(task)`, `download(ref)`,
+    `load(mediaId)`, `acquire(key,ttlMs)`, …) lost their `app` argument. `TMinimalResizeApp`
+    remains as the documented SLICE getApp() returns + the test-fake shape. Framework import
+    surface = exactly 2 files (`src/app.ts`, `src/models/ResizeTask.ts`). Tests install fakes
+    via `setAppInstance` (node:test = per-file process isolation). Cost accepted: a duplicated
+    framework copy now also breaks `appInstance` (peer-dep single-copy was already mandatory).
+    Added `@types/express` devDep (framework's d.ts graph needs it once we import its helpers).
 
 ---
 
