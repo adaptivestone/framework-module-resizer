@@ -66,15 +66,18 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 7 | Transports + storage driver | `src/transports/{AbstractTransport,mongo,sqs}.ts`, `src/storage/{AbstractStorage,s3}.ts` | spec/05 | ✅ done (TDD) | 36 (17 mongo + 7 sqs + 12 s3) |
 | 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ✅ done (TDD, worktree build + squash-merge) | 29 |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ✅ done (TDD) | 17 |
-| 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
+| 10 | Public entry | `src/index.ts` | spec/02 §6 | ✅ done (TDD) | 8 |
 
-**Suite total so far: 224 tests, all green (222 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
+**Suite total so far: 232 tests, all green (230 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
+
+**All build steps complete — the module is feature-complete (build + dist import smoke green).**
 
 ---
 
-## Remaining build order (dependency-first)
+## Build order (dependency-first) — ALL STEPS COMPLETE ✅
 
-Each step lists the spec section to implement against and the key behaviors to test.
+Every step below is built and green (see the status table above). Each lists the spec section
+it was implemented against and the key behaviors tested. Kept as the historical build record.
 
 **4 — `src/resizer.ts` + `src/mediaStore.ts` + `src/locks.ts` (spec/02 §6, spec/04, spec/05 §10.6).** Pure logic, no infra.
 - **`Resizer` class** (spec/02 §6): constructor takes `ResizerOptions` (`storage` REQUIRED;
@@ -145,7 +148,12 @@ Each step lists the spec section to implement against and the key behaviors to t
   command re-export, and an editable `src/config/resize.ts`; `--check`/`--eject`/`--force`/
   `--out`. Resolves paths from `process.cwd()`. Templates copied to dist by `postBuild.ts`.
 
-**10 — `src/index.ts` (spec/02 §6).** Re-export the public surface exactly as listed there.
+**10 — `src/index.ts` (spec/02 §6). ✅ done (TDD, 8 tests).** Re-exports the public surface per
+spec/02 §6, reconciled with the real file layout: `ResizeWorker` from `./commands/ResizeWorker.ts`
+(not `./worker.ts`); `resetResizerForTests` IS re-exported (host test suites construct Resizers —
+documented deviation from §6's "not re-exported" note). Drivers stay subpath-only. The test snapshots
+the 17-value export surface, asserts the driver names are absent, and walks the relative import graph
+to prove the AWS SDKs are never reachable from the main entry.
 
 ---
 
