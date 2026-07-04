@@ -62,21 +62,33 @@ async function runResizeWorker() {
 2. **Download the original once** — `storage = getResizer().storage` (always present: the
    required constructor option). `buf = await storage.download(media.original)` (`Original` is a
    `StorageRef`, so it passes straight through — see [05 · §10.4](./05-transport-and-storage.md)).
-3. `origMeta = await sharp(buf).metadata()`. **Use DISPLAY orientation for ALL dimension math** —
-   `.rotate()` auto-orients before resize, and EXIF orientations 5–8 swap width/height, so the
-   *stored* dims are wrong for rotated phone photos:
-   `const o = origMeta.orientation ?? 1; const [dispW, dispH] = o >= 5 ? [origMeta.height, origMeta.width] : [origMeta.width, origMeta.height]`.
+3. `origMeta = await sharp(buf).metadata()`. If metadata has no `width`/`height` → **throw**
+   (unreadable source; the transport retries → dead-letters — a `||0` fallback would feed NaN
+   into the dimension math, a real bug in a prior implementation).
    **Source-/animation-pixel guard (before any decode/resize):** `const frames = config.animated ?
    Math.min(origMeta.pages ?? 1, config.limits.animationFrames) : 1`; if
    `origMeta.width * origMeta.height * frames > config.limits.sourcePixels` → **throw** (image-/animation-bomb
    defense at the metadata stage, à la imgproxy — cheaper than the decoder-level `limitInputPixels`);
    the transport fails it → retries → dead-letters (a fixed-size oversized source won't recover, so
-   surfacing it as dead is correct). **Backfill the DISPLAY dims** if missing:
-   `$set: { 'original.width': dispW, 'original.height': dispH }` in the final update.
+   surfacing it as dead is correct).
+   **Normalize orientation ONCE, before `beforeSteps` (review 2026-07-04):** if
+   `(origMeta.orientation ?? 1) > 1` → `buf = await sharp(buf, { limitInputPixels: config.limits.inputPixels }).rotate().toBuffer()`.
+   Two host-bug classes die here: (a) a pixel-modifying `beforeStep` that round-trips
+   `sharp(buf)…toBuffer()` **strips the EXIF orientation tag** — the later per-variant `.rotate()`
+   would silently become a no-op and every variant of a rotated phone photo would render sideways
+   (latent in a prior implementation's plate-blur path); (b) a detector's display-space
+   coordinates would mismatch the storage-orientation pixel grid. After this step the buffer IS
+   display orientation: `dispW/dispH` = the normalized buffer's own dims (EXIF 5–8 swap included).
+   **Backfill the DISPLAY dims** if missing, via the step-8 `appendPreviews` backfill:
+   `{ width: dispW, height: dispH }`.
 4. Resolve the named pipeline (`getPipeline(pipeline)`); run its **`beforeSteps`** chain
-   over `buf` once: `buf = await step(buf, { media, metadata: origMeta, ctx })`.
-5. `procMeta = await sharp(buf).metadata()`; derive **display** `procW/procH` the same way (swap when
-   `procMeta.orientation >= 5`) and use those for resize math (since `.rotate()` runs before `.resize()`).
+   over `buf` once: `buf = await step(buf, { media, metadata: origMeta, ctx })` — steps always
+   receive **display-orientation pixels** (step 3), so detector coordinates and redaction
+   regions need no orientation math.
+5. `procMeta = await sharp(buf).metadata()` (post-`beforeSteps` — for `hasAlpha` and the resize
+   math off the possibly-step-modified buffer); `procW/procH = procMeta.width/height` **directly** —
+   orientation was normalized in step 3, so no swap logic exists here, and a `beforeStep`
+   stripping metadata is harmless.
 6. Build the existing-preview set from `media.previews` (identity
    `getPreviewIdentity(sizeKey, format, filters)`).
 7. **Decode the original ONCE** into a base pipeline, then process each requested preview
@@ -100,7 +112,7 @@ async function runResizeWorker() {
    - Build the per-variant pipeline by **cloning the base** (`.rotate()` on **every** branch, normalize colorspace **before** `variantSteps`, sharpen after downscale, flatten alpha only when the output is jpeg):
      ```ts
      let img = base.clone()
-       .rotate()                                  // autoOrient by EXIF then strip — MANDATORY, every branch
+       .rotate()                                  // kept on EVERY branch as defense-in-depth (a no-op after step 3's normalization)
        .resize(width, height,
          variant.fit ? { fit: 'inside', withoutEnlargement: true } : { fit: 'cover', position: 'center' })
        .toColorspace('srgb');                     // normalize BEFORE variantSteps so composited overlay colors are predictable

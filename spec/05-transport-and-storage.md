@@ -136,11 +136,21 @@ resolve via the standard AWS provider chain (env / instance role). The transport
 constructs (and memoizes) one `SQSClient` from its options on first use.
 
 ```ts
-export function sqsTransport(opts: { queueUrl: string; region?: string; endpoint?: string }): QueueTransport;
+export function sqsTransport(opts: {
+  queueUrl: string;
+  region?: string;
+  endpoint?: string;
+  visibilityTimeout?: number;   // seconds; passed to sqs-consumer (else the queue default applies)
+  heartbeatInterval?: number;   // seconds; sqs-consumer extends visibility while processing —
+                                // the SQS analog of the Mongo lease heartbeat (long resizes
+                                // otherwise get redelivered mid-task; idempotency saves
+                                // correctness but the work is done twice)
+}): QueueTransport;
 ```
 
 - `enqueue` → `SendMessageCommand` to `opts.queueUrl`, body `{ mediaId, pipeline, previews }`; returns `{ taskId: MessageId ?? null }`.
-- `startWorker` → `sqs-consumer` `Consumer.create({ queueUrl: opts.queueUrl, sqs: client, handleMessage })`;
+- `startWorker` → `sqs-consumer` `Consumer.create({ queueUrl: opts.queueUrl, sqs: client,
+  handleMessage, visibilityTimeout?, heartbeatInterval? })`;
   per message parse → `handleTask` → on resolve ack/delete + fire `afterTaskComplete`; on throw,
   fire `onTaskFailed` and let SQS redeliver after the queue's visibility timeout. Wire
   `opts.signal` → `consumer.stop()`.
