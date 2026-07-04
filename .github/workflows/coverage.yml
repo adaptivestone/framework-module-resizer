@@ -1,0 +1,106 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+# GitHub Code Quality -- Code Coverage
+# Implements the native GitHub setup from:
+#   https://docs.github.com/en/code-security/how-tos/maintain-quality-code/set-up-code-coverage
+#
+# GitHub Code Quality ingests coverage in Cobertura XML ONLY. Our tests run on node:test,
+# whose built-in coverage reporter emits LCOV (not Cobertura). So this workflow:
+#   1. runs the suite with --experimental-test-coverage + node:test's `lcov` reporter -> lcov.info
+#   2. converts LCOV -> Cobertura with the tiny single-file `lcov_cobertura` tool, run via
+#      `pipx` (preinstalled on GitHub-hosted ubuntu runners -> no repo/npm dependency added)
+#   3. uploads coverage.xml with the GitHub-native actions/upload-code-coverage action
+# (No heavyweight coverage tooling and no package.json changes are introduced by this path.)
+#
+# ── MANUAL STEPS the maintainer must do (cannot be set from the repo) ──────────────────
+#   * A repo admin must ENABLE the feature:
+#       repo Settings > Security > Code quality > "Enable code quality"
+#     (or an org owner enables it org-wide under org Settings > Security > Code quality).
+#   * On GitHub Enterprise, an enterprise owner must first ALLOW Code Quality for the enterprise.
+#   * Code Quality is in PUBLIC PREVIEW (GA 2026-07-20). It is not billed during preview, but
+#     these runs still consume Actions minutes; standard billing applies after GA.
+#   * Once enabled, github-code-quality[bot] posts a coverage summary on each PR automatically;
+#     no further config is needed here.
+# Until the feature is enabled, `fail-on-error: false` (below) keeps the upload a warning
+# instead of failing the workflow. Flip it to true (or drop it) once Code Quality is enabled.
+
+name: Code Coverage
+
+# Per the docs: run on default-branch pushes to establish the coverage baseline, and on PRs
+# so Code Quality can compare the PR branch against that baseline.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+
+    # `code-quality: write` is the only elevated permission the upload action needs.
+    permissions:
+      contents: read
+      code-quality: write
+
+    # Mirror ci.yml's install note: keep the mongod binary download OUT of `npm ci`
+    # (mongodb-memory-server's postinstall) and let the first test run fetch it into the
+    # cached dir restored below.
+    env:
+      MONGOMS_DISABLE_POSTINSTALL: '1'
+
+    steps:
+      # Check out the PR HEAD commit (not the merge commit) so coverage line numbers map onto
+      # the PR diff; fall back to the pushed SHA on push events. fetch-depth: 0 mirrors ci.yml.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'latest'
+          cache: 'npm'
+
+      # Restore the ~150 MB mongod binary (mongodb-memory-server v11, PREFER_GLOBAL_PATH) before
+      # install + test so a cache hit skips the download. Keyed on runner OS + the mms major (11),
+      # matching ci.yml.
+      - name: Cache mongod binary (mongodb-memory-server)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongod-${{ runner.os }}-mms11
+
+      - name: npm clean install
+        run: npm ci
+
+      # Same suite as `npm test` (= node --experimental-strip-types --test), invoked via
+      # `node --run test -- <flags>` so the strip-types flag stays single-sourced in package.json.
+      # Two reporter pairs: `spec` -> stdout keeps the human-readable table + results in the log;
+      # `lcov` -> lcov.info writes the machine-readable report. --experimental-test-coverage feeds both.
+      - name: Run tests (coverage -> lcov.info)
+        run: >-
+          node --run test --
+          --experimental-test-coverage
+          --test-reporter=spec --test-reporter-destination=stdout
+          --test-reporter=lcov --test-reporter-destination=lcov.info
+
+      # GitHub Code Quality accepts Cobertura XML only. Convert node:test's LCOV to Cobertura with
+      # `lcov_cobertura`. `pipx` (preinstalled on ubuntu-latest) runs it in a throwaway venv, so
+      # nothing lands in package.json / node_modules. `-b .` sets the source root to the repo root
+      # (lcov SF: paths are already repo-root-relative, e.g. src/app.ts).
+      - name: Convert LCOV -> Cobertura XML
+        run: pipx run --spec lcov_cobertura lcov_cobertura lcov.info -b . -o coverage.xml
+
+      # Upload to GitHub Code Quality. The `if:` guard skips PRs from forks, whose GITHUB_TOKEN is
+      # read-only and lacks code-quality:write (the upload would otherwise error). `language` is a
+      # Linguist language name; `label` tags the report in the Code Quality UI.
+      - name: Upload coverage report
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: coverage.xml
+          language: TypeScript
+          label: code-coverage/node-test
+          # Keep the upload non-blocking until Code Quality is enabled on the repo (see header).
+          fail-on-error: false
