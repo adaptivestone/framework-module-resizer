@@ -67,6 +67,7 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ✅ done (TDD, worktree build + squash-merge) | 29 |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ✅ done (TDD) | 17 |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ✅ done (TDD) | 8 |
+| — | README | `README.md` | spec §22.9 | ✅ done | — |
 
 **Suite total so far: 232 tests, all green (230 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
 
