@@ -78,7 +78,7 @@
   "devDependencies": {
     "@adaptivestone/framework": "^5.0.0",
     "@aws-sdk/client-s3": "^3.0.0",
-    "@aws-sdk/client-sqs": "^3.0.0",
+    "@aws-sdk/client-sqs": "^3.1079.0",
     "@aws-sdk/s3-request-presigner": "^3.0.0",
     "@biomejs/biome": "^2.5.2",
     "@types/express": "^5.0.6",
