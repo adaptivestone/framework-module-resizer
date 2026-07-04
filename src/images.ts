@@ -1,7 +1,13 @@
 // Pure identity + dimension helpers. ONE identity, built one way, used everywhere
 // (read map, dedup, dispatch lock, worker lock). No external deps — see 03 · Identity.
 import { isPositiveFinite } from './helpers/guards.ts';
-import type { Filters, PreviewFormat, SizeInput } from './types.d.ts';
+import type {
+  Filters,
+  MediaLike,
+  MissingPreview,
+  PreviewFormat,
+  SizeInput,
+} from './types.d.ts';
 
 /**
  * Canonical size key (size only — never format or filters). `fit` wins; a dimension
@@ -77,6 +83,58 @@ export function getPreviewIdentity(
   filters?: Filters,
 ): string {
   return `${sizeKey}:${format}:${getFilterSig(filters)}`;
+}
+
+/**
+ * Expand `sizes × formats` into a deduped `MissingPreview[]`, skipping any size whose key can't
+ * be built (`getSizeKey` throws) and any identity already present in `media.previews`. This is
+ * the SHARED expansion for the two modes that queue/generate the WHOLE catalog up front — eager
+ * `generateImpl` (11 · §11.1 step 2–3) and pre-warm `prewarmImpl` (11 · §11.1b step 2–3): both
+ * skip-existing + dedup into the exact same `MissingPreview` shapes. The read path (06 · §17
+ * step 7) does NOT use this: its per-cell loop interleaves expansion with ready/fast-path serving,
+ * so it keeps its own inline version.
+ */
+export function expandMissingPreviews(
+  media: MediaLike,
+  sizes: SizeInput[],
+  formats: PreviewFormat[],
+): MissingPreview[] {
+  const existing = new Set<string>();
+  for (const p of media.previews ?? []) {
+    existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+  }
+  const requested: MissingPreview[] = [];
+  const seen = new Set<string>();
+  for (const size of sizes) {
+    let sizeKey: string;
+    try {
+      sizeKey = getSizeKey(size);
+    } catch {
+      continue; // a size with nothing usable is skipped
+    }
+    for (const format of formats) {
+      const identity = getPreviewIdentity(sizeKey, format, size.filters);
+      if (existing.has(identity) || seen.has(identity)) {
+        continue;
+      }
+      seen.add(identity);
+      const mp: MissingPreview = { sizeKey, format };
+      if (size.filters && Object.keys(size.filters).length > 0) {
+        mp.filters = size.filters;
+      }
+      if (isPositiveFinite(size.width)) {
+        mp.requestedWidth = size.width;
+      }
+      if (isPositiveFinite(size.height)) {
+        mp.requestedHeight = size.height;
+      }
+      if (size.fit) {
+        mp.fit = true;
+      }
+      requested.push(mp);
+    }
+  }
+  return requested;
 }
 
 /**

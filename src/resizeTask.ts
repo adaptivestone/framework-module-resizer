@@ -11,12 +11,11 @@ import sharp from 'sharp';
 import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
 import { runBounded } from './helpers/concurrency.ts';
-import { isPositiveFinite } from './helpers/guards.ts';
 import { randomHex } from './helpers/random.ts';
 import {
   calculateResizedDimensions,
+  expandMissingPreviews,
   getPreviewIdentity,
-  getSizeKey,
 } from './images.ts';
 import { getResizer, type LeasedTask, type Resizer } from './resizer.ts';
 import type {
@@ -439,42 +438,8 @@ export async function generateImpl(
   const formats = opts.formats ?? requiredFormats(config);
 
   // Expand sizes × formats into MissingPreview variants; skip unbuildable sizes + existing
-  // identities (idempotent re-run) and dedup.
-  const existing = new Set<string>();
-  for (const p of media.previews ?? []) {
-    existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
-  }
-  const requested: MissingPreview[] = [];
-  const seen = new Set<string>();
-  for (const size of sizes) {
-    let sizeKey: string;
-    try {
-      sizeKey = getSizeKey(size);
-    } catch {
-      continue;
-    }
-    for (const format of formats) {
-      const identity = getPreviewIdentity(sizeKey, format, size.filters);
-      if (existing.has(identity) || seen.has(identity)) {
-        continue;
-      }
-      seen.add(identity);
-      const mp: MissingPreview = { sizeKey, format };
-      if (size.filters && Object.keys(size.filters).length > 0) {
-        mp.filters = size.filters;
-      }
-      if (isPositiveFinite(size.width)) {
-        mp.requestedWidth = size.width;
-      }
-      if (isPositiveFinite(size.height)) {
-        mp.requestedHeight = size.height;
-      }
-      if (size.fit) {
-        mp.fit = true;
-      }
-      requested.push(mp);
-    }
-  }
+  // identities (idempotent re-run) and dedup — the shared expansion (also used by prewarm).
+  const requested = expandMissingPreviews(media, sizes, formats);
 
   const { generated } = await generatePreviews(resizer, {
     media,

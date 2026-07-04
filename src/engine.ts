@@ -9,7 +9,12 @@ import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
 import { enqueue } from './enqueue.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
-import { getFilterSig, getPreviewIdentity, getSizeKey } from './images.ts';
+import {
+  expandMissingPreviews,
+  getFilterSig,
+  getPreviewIdentity,
+  getSizeKey,
+} from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   MediaLike,
@@ -29,6 +34,14 @@ export interface ResolveOpts {
   formats?: PreviewFormat[]; // default = requiredFormats(config)
   ctx?: Record<string, unknown>; // threaded to read-path hooks; ctx.isOwner/isAdmin gate signedUrl
   enqueueMissing?: boolean; // default true
+}
+
+export interface PrewarmOpts {
+  media: MediaLike;
+  sizes: SizeInput[];
+  pipeline?: string; // selects a registered pipeline; default 'default'
+  formats?: PreviewFormat[]; // default = requiredFormats(config)
+  ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
 }
 
 // Owner/admin private-original reads: short-lived by design (the only read-path I/O). A
@@ -219,6 +232,81 @@ export async function resolveImpl(
 }
 
 /**
+ * §11.1b — pre-warm the catalog at UPLOAD by queueing its variants without blocking on any image
+ * work. Shares the read path's machinery: the same `resolveSizes`/`beforeEnqueue` waterfalls, the
+ * same `expandMissingPreviews` skip-existing/dedup expansion, and the same dispatch-lock
+ * `enqueue()`. Differences from `resolve`: no ready/URL building, and the "original already fits"
+ * fast-path is NOT consulted (that is a read-time serving decision — a fits-eligible size still
+ * generates a preview a later read may ignore). Like `resolve`, the ENTIRE body runs in a
+ * never-throw guard (an upload must not fail because pre-warming hiccuped) and returns the safe
+ * `{ enqueued: 0 }` on any internal error. `enqueued` = the count handed to `transport.enqueue`
+ * (dispatch-lock survivors; lock losers are already in flight elsewhere and are not counted).
+ */
+export async function prewarmImpl(
+  resizer: Resizer,
+  opts: PrewarmOpts,
+): Promise<{ enqueued: number }> {
+  try {
+    const ctx = opts.ctx ?? {};
+    const { media } = opts;
+    const pipeline = opts.pipeline ?? 'default';
+    const mediaId = media.id ?? String(media._id);
+
+    // 1. Host size magic (same waterfall as resolve; real ctx reaches the taps).
+    const sizes = (await resizer.runWaterfall(
+      'resolveSizes',
+      opts.sizes,
+      ctx,
+    )) as SizeInput[];
+
+    // 2. SVG originals are pass-through — never resized or enqueued (06 · §17 step 6). No-op.
+    const original = media.original;
+    if (
+      original &&
+      (original.contentType === 'image/svg+xml' || original.format === 'svg')
+    ) {
+      getApp().logger.info(
+        `resize prewarm: media ${mediaId} original is SVG — pass-through, nothing to warm`,
+      );
+      return { enqueued: 0 };
+    }
+
+    // 2. Expand sizes × formats → deduped MissingPreview[], skipping unbuildable sizes + existing
+    //    identities. The fast-path is deliberately NOT consulted here (see the doc comment).
+    const formats = opts.formats ?? requiredFormats(getResizeConfig());
+    const expanded = expandMissingPreviews(media, sizes, formats);
+
+    // 3. beforeEnqueue — REASSIGN the (post-hook) set so the enqueue sees exactly what a host tap
+    //    left (same assign-back semantics as resolve step 8).
+    const missing = (await resizer.runWaterfall(
+      'beforeEnqueue',
+      expanded,
+      ctx,
+    )) as MissingPreview[];
+    if (missing.length === 0) {
+      return { enqueued: 0 };
+    }
+
+    // 4. No transport → this host is eager-only; warn once and enqueue nothing.
+    if (!resizer.transport) {
+      getApp().logger.warn(
+        'resize prewarm: previews to warm but no transport is registered — nothing enqueued (eager-only host? construct the Resizer with a transport for pre-warm/lazy mode)',
+      );
+      return { enqueued: 0 };
+    }
+
+    // 4. Hand the survivors to the SAME dispatch-lock enqueue as the read path; its return value
+    //    is the count actually queued (post lock-loser filtering, 0 on any failure).
+    const enqueued = await enqueue(resizer, mediaId, pipeline, missing);
+    return { enqueued };
+  } catch (err) {
+    // 5. Never-throw guard (same guarantee as resolve): an upload must not fail on a prewarm hiccup.
+    logPrewarmError(err);
+    return { enqueued: 0 };
+  }
+}
+
+/**
  * The public URL for an original-backed ready entry. Owner/admin reads get a signed URL
  * when the driver supports it — the ONLY read-path I/O, so it is caught and falls back to
  * the pure publicUrl on any error (the read must not break on a presign hiccup).
@@ -253,6 +341,21 @@ function logResolveError(err: unknown): void {
     // getApp() threw (resolve called before the Server exists) — last-resort console.
     console.error(
       'resize resolve: unexpected internal error (no app for logger)',
+      err,
+    );
+  }
+}
+
+/** As logResolveError, for prewarm's never-throw catch (11 · §11.1b step 5). */
+function logPrewarmError(err: unknown): void {
+  try {
+    getApp().logger.error(
+      'resize prewarm: unexpected internal error — nothing enqueued',
+      err,
+    );
+  } catch {
+    console.error(
+      'resize prewarm: unexpected internal error (no app for logger)',
       err,
     );
   }

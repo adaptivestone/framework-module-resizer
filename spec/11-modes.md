@@ -118,6 +118,53 @@ exactly like the worker.
 
 ---
 
+## §11.1b Pre-warm — `resizer.prewarm()` (queue at upload, don't block)
+
+The middle mode (2026-07-04, user request): at **upload** time, push the catalog's variants
+into the **queue** immediately and return — the worker generates in the background, so by the
+first real read the previews are (usually) already there. No sharp work on the request path,
+no waiting for the first reader.
+
+```ts
+class Resizer {
+  // Expand sizes × formats → identities, skip ones already in media.previews, enqueue the
+  // rest via the NORMAL dispatch-lock path. Never blocks on image work; NEVER throws
+  // (same guarantee as resolve). Returns how many variants were handed to the transport.
+  async prewarm(opts: {
+    media: MediaLike;
+    sizes: SizeInput[];
+    pipeline?: string;              // default 'default'
+    formats?: PreviewFormat[];      // default requiredFormats(config)
+    ctx?: Record<string, unknown>;  // reaches the read-path waterfalls only (worker ctx stays {})
+  }): Promise<{ enqueued: number }>;
+}
+
+// upload handler, after the media doc is created:
+await resizer.prewarm({ media: fileDoc, sizes: getListingSizes(), pipeline: 'listing' });
+```
+
+### Behavior (`prewarm`)
+1. Runs the `resolveSizes` waterfall (host size magic applies, exactly like `resolve`).
+2. Expands sizes × formats into identities (`getSizeKey`/`getPreviewIdentity`; a size whose
+   key can't be built is skipped). **SVG originals → no-op** (`{ enqueued: 0 }` — pass-through
+   media never enqueues, [06 · §17 step 6](./06-read-and-enqueue.md)). The "original already
+   fits" fast-path is **not** consulted (it is a read-time serving decision, not a generation
+   decision; a fast-path-eligible size simply generates a preview that reads may then ignore —
+   hosts can exclude such sizes from the prewarm catalog if they care).
+3. Skips identities already present in `media.previews`; runs the `beforeEnqueue` waterfall
+   over the remainder.
+4. **No transport** on the instance → log once + `{ enqueued: 0 }` (eager-only wiring).
+   Else hand the survivors to the same `enqueue()` as the read path (dispatch locks, lock
+   release on failure — [06 · §18](./06-read-and-enqueue.md)); `enqueued` = the count passed
+   to `transport.enqueue` (lock losers are already in flight elsewhere and not counted).
+5. The entire body is wrapped in the same never-throw guard as `resolve` — an upload must
+   not fail because pre-warming hiccuped.
+
+**Three modes, one `previews[]`:** lazy (read-triggered, default), **pre-warm** (upload-queued),
+eager (upload-blocking `generate`). They compose freely — see §11.2.
+
+---
+
 ## §11.2 Hybrid — eager for some, lazy for the rest
 
 The two modes compose, because both write the same `previews[]` shape:

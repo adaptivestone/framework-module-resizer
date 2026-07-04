@@ -103,10 +103,11 @@ describe('enqueue', () => {
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant(), variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant(), variant()]);
     assert.equal(acquired.length, 1);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].previews.length, 1);
+    assert.equal(enqueued, 1); // returns the count handed to the transport
   });
 
   test('acquires a dispatch lock per identity with the configured TTL', async () => {
@@ -132,12 +133,16 @@ describe('enqueue', () => {
       (key) => key.endsWith(':jpeg:none'), // only the jpeg lock is won
     );
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant(), variant({ format: 'webp' })]);
+    const enqueued = await enqueue(r, 'm1', 'default', [
+      variant(),
+      variant({ format: 'webp' }),
+    ]);
     assert.equal(calls.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => p.format),
       ['jpeg'],
     );
+    assert.equal(enqueued, 1); // only the surviving winner is counted
   });
 
   test('does not call the transport when no lock survives', async () => {
@@ -145,8 +150,9 @@ describe('enqueue', () => {
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(false);
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
     assert.equal(calls.length, 0);
+    assert.equal(enqueued, 0); // no survivor → nothing handed over
   });
 
   test('on success (non-null taskId) the survivor locks are NOT released', async () => {
@@ -154,8 +160,9 @@ describe('enqueue', () => {
     const { transport } = makeTransport();
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
     assert.equal(released.length, 0);
+    assert.equal(enqueued, 1); // success → the one survivor is counted
   });
 
   test('releases survivor locks when the transport throws (never rethrows)', async () => {
@@ -165,9 +172,10 @@ describe('enqueue', () => {
     });
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
     assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
     assert.ok(errors.length >= 1);
+    assert.equal(enqueued, 0); // a throw released the locks → nothing durably queued
   });
 
   test('releases survivor locks when taskId is null (soft failure)', async () => {
@@ -175,9 +183,10 @@ describe('enqueue', () => {
     const { transport } = makeTransport(() => ({ taskId: null }));
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
     assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
     assert.ok(errors.length >= 1);
+    assert.equal(enqueued, 0); // null taskId → soft failure → not counted
   });
 
   test('passes mediaId + pipeline + survivors through to the transport', async () => {

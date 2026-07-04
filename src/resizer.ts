@@ -6,7 +6,7 @@
 // can install a fake per run.
 import type { Metadata, Sharp } from 'sharp';
 import { getApp } from './app.ts';
-import { resolveImpl } from './engine.ts';
+import { prewarmImpl, resolveImpl } from './engine.ts';
 import type { LockProvider } from './locks/AbstractLockProvider.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
@@ -217,6 +217,26 @@ export class Resizer {
     enqueueMissing?: boolean; // default true
   }): Promise<{ decision: ReadDecision; output: unknown }> {
     return resolveImpl(this, opts);
+  }
+
+  /**
+   * Pre-warm mode (11 · Modes §11.1b) — queue the catalog's variants at UPLOAD without blocking
+   * on image work, so the previews are (usually) already there by the first real read. Delegates
+   * to the engine (src/engine.ts): the `resolveSizes` waterfall (real ctx reaches the taps) →
+   * expand sizes × formats, skipping identities already in `media.previews` and SVG originals
+   * (pass-through → no-op) → `beforeEnqueue` waterfall → hand the survivors to the SAME
+   * dispatch-lock `enqueue()` as the read path. NEVER throws (same guarantee as `resolve`); with
+   * no transport it logs once and returns `{ enqueued: 0 }`. `enqueued` = variants handed to the
+   * transport (dispatch-lock survivors).
+   */
+  async prewarm(opts: {
+    media: MediaLike;
+    sizes: SizeInput[];
+    pipeline?: string; // selects a registered pipeline; default 'default'
+    formats?: PreviewFormat[]; // default = requiredFormats(config)
+    ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
+  }): Promise<{ enqueued: number }> {
+    return prewarmImpl(this, opts);
   }
 
   /**

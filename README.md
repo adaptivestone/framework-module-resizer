@@ -179,21 +179,35 @@ return output; // your own shape, produced by formatPublicUrls
 
 ---
 
-## Modes: lazy vs eager
+## Modes: lazy vs pre-warm vs eager
 
-Both modes drive the **same resize core** and write the same `previews[]` shape, so you can switch
-later with no data migration, or mix them.
+All three modes drive the **same resize core** and write the same `previews[]` shape, so you can
+switch later with no data migration, or mix them.
 
-| | **Lazy** (queued, on read) — default | **Eager** (sync, at upload) |
-|---|---|---|
-| Generate | on first read; `resolve()` enqueues missing | inline at upload via `resizer.generate(...)` |
-| Needs | transport + `ResizeWorker` + `ResizeTask` + locks | storage + media model only — **no** queue/worker |
-| Best for | high volume, fast uploads, large/open-ended catalogs | low/bursty volume, small fully-used catalogs, single-process |
+| | **Lazy** (queued, on read) — default | **Pre-warm** (queued, at upload) | **Eager** (sync, at upload) |
+|---|---|---|---|
+| Generate | on first read; `resolve()` enqueues missing | at upload; `prewarm()` enqueues the catalog | inline at upload via `resizer.generate(...)` |
+| Needs | transport + `ResizeWorker` + `ResizeTask` + locks | same as lazy (transport + worker) | storage + media model only — **no** queue/worker |
+| Best for | high volume, fast uploads, large/open-ended catalogs | fast uploads **and** a warm cache by first read | low/bursty volume, small fully-used catalogs, single-process |
 
 > **Default to lazy.** It keeps uploads fast and only does work that's actually needed. **Choose
 > eager** when your app is low-volume, your size catalog is small and fully used, you don't want to
 > run a worker, and you'd rather every image be ready the instant an upload finishes. You can
-> switch later — the stored shape is identical — or mix the two.
+> switch later — the stored shape is identical — or mix the three.
+
+**Pre-warm** — keep the lazy wiring (transport + worker), but push the catalog into the **queue**
+at upload so the previews are usually ready by the first read: no `sharp` on the request path, no
+waiting for the first reader. Never blocks and never throws (same guarantee as `resolve`); `ctx`
+reaches the read-path waterfalls (the worker still runs with `ctx === {}`):
+
+```ts
+// upload handler, after the media doc is created:
+await resizer.prewarm({ media: fileDoc, sizes: getListingSizes(), pipeline: 'listing' });
+// → { enqueued } = how many variants were handed to the queue
+```
+
+Choose pre-warm when you want **fast uploads and a warm cache** — the request returns immediately
+while the worker fills the catalog in the background.
 
 **Eager** — construct the Resizer **without** a `transport` and call `generate` from your
 upload handler (`ctx` reaches pipeline steps here, unlike the queued worker):
@@ -208,7 +222,8 @@ const { previews } = await resizer.generate({
 ```
 
 **Hybrid:** `generate` the above-the-fold sizes at upload and let `resolve` lazily fill the heavy
-ones on demand. A host that starts eager can graduate to lazy with no migration.
+ones on demand — or `prewarm` the whole catalog at upload and let `resolve` cover anything added
+later. A host that starts eager can graduate to lazy (or pre-warm) with no migration.
 
 ---
 

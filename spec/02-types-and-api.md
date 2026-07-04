@@ -222,6 +222,15 @@ class Resizer {
     enqueueMissing?: boolean;       // default true
   }): Promise<{ decision: ReadDecision; output: unknown /* whatever formatPublicUrls returns */ }>;
 
+  // --- pre-warm (queue the catalog at upload, non-blocking) — see 11 · §11.1b ---
+  async prewarm(opts: {
+    media: MediaLike;
+    sizes: SizeInput[];
+    pipeline?: string;
+    formats?: PreviewFormat[];
+    ctx?: Record<string, unknown>;
+  }): Promise<{ enqueued: number }>;
+
   // --- eager mode (synchronous generate at upload; no queue/worker) — see 11 · Modes ---
   async generate(opts: {
     media: MediaLike;

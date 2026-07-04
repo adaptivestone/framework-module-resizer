@@ -62,14 +62,16 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 3 | Ambient app gateway | `src/app.ts` | spec/02 §4 | ✅ done (TDD) | 2 |
 | 4 | Resizer class + hook bus + defaulted seams | `src/resizer.ts`, `src/mediaStore/{AbstractMediaStore,framework}.ts`, `src/locks/{AbstractLockProvider,framework}.ts` | spec/02 §6, spec/04, spec/05 §10.6 | ✅ done (TDD) | 32 |
 | 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ✅ done (TDD) | 31 (23 engine + 8 enqueue) |
+| 5b | Pre-warm mode | `src/engine.ts` (`prewarmImpl`), `src/resizer.ts` (`.prewarm`), `src/images.ts` (shared `expandMissingPreviews`), `src/enqueue.ts` (returns survivor count) | spec/11 §11.1b, spec/02 §6 | ✅ done (TDD) | 17 (prewarm) + enqueue return asserts |
 | 6 | Models | `src/models/ResizeTask.ts`, `src/models/mediaFragment.ts` | spec/08 §12 | ✅ done (TDD) | 24 (23 + 1 skip) |
 | 7 | Transports + storage driver | `src/transports/{AbstractTransport,mongo,sqs}.ts`, `src/storage/{AbstractStorage,s3}.ts` | spec/05 | ✅ done (TDD) | 36 (17 mongo + 7 sqs + 12 s3) |
 | 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ✅ done (TDD, worktree build + squash-merge) | 29 |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ✅ done (TDD) | 17 |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ✅ done (TDD) | 8 |
 | — | README | `README.md` | spec §22.9 | ✅ done | — |
+| — | CI / packaging / release-prep | `.github/workflows/{ci,packaging}.yml`, `.github/dependabot.yml`, `smokeTest.ts`, `RELEASE.md` | mirrors framework + email repos | ✅ done | smoke green |
 
-**Suite total so far: 232 tests, all green (230 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
+**Suite total so far: 249 tests, all green (247 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
 
 **All build steps complete — the module is feature-complete (build + dist import smoke green).**
 
@@ -156,6 +158,22 @@ documented deviation from §6's "not re-exported" note). Drivers stay subpath-on
 the 17-value export surface, asserts the driver names are absent, and walks the relative import graph
 to prove the AWS SDKs are never reachable from the main entry.
 
+**CI / packaging / release-prep — `.github/` + `smokeTest.ts` + `RELEASE.md`.** Mirrors the org's two
+sibling repos (`@adaptivestone/framework`, `@adaptivestone/framework-module-email`).
+- `.github/workflows/ci.yml` (email module's shape): checkout@v6 → setup-node@v6 (node latest + npm
+  cache) → `npm ci` → `node --run types:check` / `check` / `build` → `node --run test -- --experimental-test-coverage`
+  (coverage verified to work alongside `--experimental-strip-types`). Caches `~/.cache/mongodb-binaries`
+  (mongodb-memory-server v11 default download dir — `PREFER_GLOBAL_PATH` defaults `true`) keyed on
+  runner OS + mms major; `MONGOMS_DISABLE_POSTINSTALL=1` defers the download to the test step. sharp
+  needs nothing (prebuilt `@img/sharp-linux-*` via `npm ci`).
+- `.github/workflows/packaging.yml` (framework's packaging smoke, adapted): `npm run smoke`.
+- `smokeTest.ts` (repo tooling, like preBuild/postBuild — strip-types, top-level await, no test
+  framework): builds → `npm pack` → throwaway consumer → asserts the 17 core exports, the sqs/s3
+  subpaths' loud-fail without their AWS SDKs, the six always-safe subpaths, the `resize-scaffold` bin
+  (+`--check`), then installs the AWS SDKs and re-asserts the sqs/s3 subpaths expose their classes.
+- `RELEASE.md`: manual-release checklist (no publish workflow — mirrors both siblings); first publish
+  of the scoped package needs `npm publish --access public` (no `publishConfig.access` in any sibling).
+
 ---
 
 ## Design decisions made during the build (deltas folded into the spec)
@@ -211,12 +229,22 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     dedupe for `server.ts:423` `instanceof BaseModel` and the mongoose singleton in
     `BaseModel.ts`), `exports` subpaths, `declaration:true`, literal `extends BaseModel`
     (no mixin/factory). Spec §22.7 + 01 §2.3/§16 now carve out the one deliberate framework
-    import (`src/models/ResizeTask.ts`). Optional FRAMEWORK-side improvements (our repo, not
-    blockers): duck-typed brand check instead of nominal `instanceof` at `server.ts:423`;
-    opt-in `modules:[…]` extra scan roots in `folderConfig` to eliminate host shims entirely;
-    a throwing `getAppInstance()` getter next to `appInstance` in `helpers/appInstance.ts`
-    (framework-side "not initialized" guard for every consumer — this module keeps `src/app.ts`
-    for the `TMinimalResizeApp` type-slice cast either way, but its guard then becomes redundant).
+    import (`src/models/ResizeTask.ts`). FRAMEWORK-side improvements — decided 2026-07-04:
+    - **DOING (small framework PR):** (a) throwing `getAppInstance()` getter next to
+      `appInstance` in `helpers/appInstance.ts` (clear "not initialized" failure for every
+      consumer); (b) duplicate-framework-copy DIAGNOSIS at the model loader (`server.ts:423`):
+      when `instanceof BaseModel` fails but the class is BaseModel-shaped, throw a
+      "duplicate @adaptivestone/framework copies — dedupe your lockfile" error instead of
+      silently misrouting to the legacy branch. (Not a tolerate-two-copies brand check — two
+      copies is a broken install; fail loudly with a diagnosis.)
+    - **PARKED — `modules:[…]` scan roots:** revisit only when ≥3 modules ship models/commands
+      or third-party module authors appear. Rationale: today it would delete two ONE-LINE
+      shim files while adding a framework subsystem; the scaffold stays regardless (config +
+      resizer.ts are host-owned), shims can't drift (re-exports, `--check`-gated), and
+      file-based selectivity already solves the "SQS host must not get the ResizeTask
+      collection+indexes" problem that module-scanning would need a granular manifest
+      (`{ package, models: [], commands: [...] }`, host opt-in per contribution, default all)
+      to reintroduce. Keep that manifest design if revived.
 11. **The app is ambient — no `app` parameter anywhere (2026-07-04).** The framework exports a
     process-wide `appInstance` singleton (`helpers/appInstance.js`, set at Server construction,
     one-server-per-process ENFORCED, `setAppInstance`/`resetAppInstance` test hooks; present in

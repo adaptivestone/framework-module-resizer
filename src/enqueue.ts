@@ -15,18 +15,23 @@ import type { MissingPreview } from './types.d.ts';
  * lock-winners as one task, and release those locks only on failure (a throw OR a
  * `taskId === null` soft failure). On success the locks are deliberately left to expire
  * — they collapse concurrent read fan-out into this single task.
+ *
+ * Returns the number of variants HANDED TO the transport — the lock-winners on a successful
+ * enqueue (prewarm's `enqueued`, 11 · §11.1b step 4). Every non-success path returns 0: no
+ * transport, no surviving lock, a throw, or a `taskId === null` soft failure (the released
+ * locks let a later read retry, so nothing durable was queued). resolve() ignores the count.
  */
 export async function enqueue(
   resizer: Resizer,
   mediaId: string,
   pipeline: string,
   missing: MissingPreview[],
-): Promise<void> {
+): Promise<number> {
   // Defensive: resolve guarantees a transport before calling us (§17 step 9), but never
   // assume — bail before grabbing any lock we could not use.
   const { transport } = resizer;
   if (!transport) {
-    return;
+    return 0;
   }
 
   // 1. Dedup by identity — the one lookup/lock key, built one way (03 · Identity).
@@ -53,7 +58,7 @@ export async function enqueue(
 
   // 3. None survive → nothing to dispatch.
   if (survivors.length === 0) {
-    return;
+    return 0;
   }
 
   // 4/5. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
@@ -69,14 +74,17 @@ export async function enqueue(
         `resize enqueue: transport returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       );
       await releaseAll(resizer, survivorLockKeys);
+      return 0;
     }
     // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
+    return survivors.length;
   } catch (err) {
     getApp().logger.error(
       `resize enqueue: transport.enqueue threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       err,
     );
     await releaseAll(resizer, survivorLockKeys);
+    return 0;
   }
 }
 
