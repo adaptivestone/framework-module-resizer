@@ -5,8 +5,8 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { enqueue } from './enqueue.ts';
-import type { LockProvider } from './locks.ts';
 import {
+  type LockProvider,
   type QueueTransport,
   Resizer,
   type ResizeStorage,

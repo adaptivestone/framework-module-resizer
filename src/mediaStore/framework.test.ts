@@ -4,8 +4,12 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { frameworkMediaStore } from './mediaStore.ts';
-import type { Preview } from './types.d.ts';
+import type { Preview } from '../types.d.ts';
+import { FrameworkMediaStore } from './framework.ts';
+
+// One stateless instance drives the whole file (option-less constructor; every
+// method reaches the model/config ambiently through getApp()).
+const store = new FrameworkMediaStore();
 
 // Install a fake ambient app whose getConfig('resize') carries mediaModelName and whose
 // getModel returns the given (recording) model. mediaModelName is required or
@@ -34,7 +38,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-describe('frameworkMediaStore.load', () => {
+describe('FrameworkMediaStore.load', () => {
   test('resolves the model by config.mediaModelName and returns findById(mediaId)', async () => {
     const doc = { id: 'm1' };
     const findByIdCalls: string[] = [];
@@ -53,7 +57,7 @@ describe('frameworkMediaStore.load', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
 
-    const out = await frameworkMediaStore.load('m1');
+    const out = await store.load('m1');
     assert.equal(modelAsked, 'Media');
     assert.deepEqual(findByIdCalls, ['m1']);
     assert.equal(out, doc);
@@ -61,13 +65,13 @@ describe('frameworkMediaStore.load', () => {
 
   test('unknown model (getModel → false) returns null and logs an error', async () => {
     const { errors } = installApp(false, { mediaModelName: 'Nope' });
-    const out = await frameworkMediaStore.load('x');
+    const out = await store.load('x');
     assert.equal(out, null);
     assert.equal(errors.length, 1);
   });
 });
 
-describe('frameworkMediaStore.appendPreviews', () => {
+describe('FrameworkMediaStore.appendPreviews', () => {
   test('issues exactly ONE findByIdAndUpdate with $push {$each} and no $set without dims', async () => {
     const calls: Array<[string, Record<string, unknown>]> = [];
     const model = {
@@ -81,7 +85,7 @@ describe('frameworkMediaStore.appendPreviews', () => {
       { sizeKey: '100x100', format: 'webp' },
     ] as unknown as Preview[];
 
-    await frameworkMediaStore.appendPreviews('m1', previews);
+    await store.appendPreviews('m1', previews);
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], 'm1');
@@ -101,7 +105,7 @@ describe('frameworkMediaStore.appendPreviews', () => {
     };
     installApp(model);
 
-    await frameworkMediaStore.appendPreviews('m1', [] as Preview[], {
+    await store.appendPreviews('m1', [] as Preview[], {
       width: 800,
       height: 600,
     });

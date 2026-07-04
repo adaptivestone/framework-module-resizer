@@ -15,12 +15,12 @@ worker, the upload-time dims capture, and the real per-entity size catalogs the 
 // ALL wiring in one visible literal — drivers are fixed at construction (02 · §6).
 import { Resizer } from '@adaptivestone/framework-module-resize';
 // Drivers come from their own subpaths (uniform rule — 02 · §6); bootstrap declares what it uses:
-import { mongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
-import { s3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js'; // optional AWS peers resolved only here
+import { MongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js'; // optional AWS peers resolved only here
 
 export const resizer = new Resizer({
-  transport: mongoTransport,                 // or sqsTransport({ queueUrl, region }); omit entirely for eager-only (11)
-  storage: s3Storage({                       // REQUIRED — shipped driver (05 · §10.5) or any custom ResizeStorage (05 · §10.4)
+  transport: new MongoTransport(),           // or new SqsTransport({ queueUrl, region }); omit entirely for eager-only (11)
+  storage: new S3Storage({                   // REQUIRED — shipped driver (05 · §10.5) or any custom ResizeStorage (05 · §10.4)
     bucketPublic: 'my-cdn', bucketPrivate: 'my-originals', publicUrl: 'https://cdn.example.com',
   }),
   // mediaStore / lockProvider omitted → framework defaults (05 · §10.6)

@@ -154,14 +154,19 @@ export { default as defaultResizeConfig, getResizeConfig, requiredFormats } from
 // file. Bootstrap imports exactly what it uses; the main entry never resolves any driver's
 // dependencies (for the AWS drivers, a missing optional-peer SDK fails LOUDLY at the host's
 // own import line at bootstrap, not at the first I/O call):
-//   import { mongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
-//   import { sqsTransport }   from '@adaptivestone/framework-module-resize/transports/sqs.js';
-//   import { s3Storage }      from '@adaptivestone/framework-module-resize/storage/s3.js';
-//   import { frameworkMediaStore }   from '@adaptivestone/framework-module-resize/mediaStore/framework.js';
-//   import { frameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
-// (The core imports the two framework DEFAULTS internally — omitting mediaStore/lockProvider
-// in ResizerOptions still needs zero host imports. Driver CONTRACT types re-export from the
-// main entry via resizer.ts: QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider.)
+//   import { MongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+//   import { SqsTransport }   from '@adaptivestone/framework-module-resize/transports/sqs.js';
+//   import { S3Storage }      from '@adaptivestone/framework-module-resize/storage/s3.js';
+//   import { FrameworkMediaStore }   from '@adaptivestone/framework-module-resize/mediaStore/framework.js';
+//   import { FrameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
+// HOUSE STYLE (user decision 2026-07-04): shipped drivers are CLASSES implementing the
+// Abstract* contract interfaces, constructed with `new X(opts?)` — e.g.
+// `new Resizer({ transport: new MongoTransport(), storage: new S3Storage({...}) })`.
+// The contracts stay INTERFACES (structural), so a CUSTOM host driver may be a class OR a
+// plain object literal — both satisfy the seam. (The core constructs the two framework
+// DEFAULTS internally — omitting mediaStore/lockProvider in ResizerOptions still needs zero
+// host imports. Contract types re-export from the main entry via resizer.ts:
+// QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider.)
 export type {
   QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider,
   Pipeline, BeforeStep, VariantStep, HookName, HookFn, ResizerOptions,

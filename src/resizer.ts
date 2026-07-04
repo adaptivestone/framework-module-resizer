@@ -7,8 +7,20 @@
 import type { Metadata, Sharp } from 'sharp';
 import { getApp } from './app.ts';
 import { resolveImpl } from './engine.ts';
-import { frameworkLockProvider, type LockProvider } from './locks.ts';
-import { frameworkMediaStore, type MediaStore } from './mediaStore.ts';
+import type { LockProvider } from './locks/AbstractLockProvider.ts';
+import { FrameworkLockProvider } from './locks/framework.ts';
+import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
+import { FrameworkMediaStore } from './mediaStore/framework.ts';
+// Transport + storage contracts (05 · §10.1, §10.4) now live in their own files —
+// transports/AbstractTransport.ts + storage/AbstractStorage.ts — so the optional-peer drivers
+// import them WITHOUT depending on this module. Imported here for the local annotations below
+// and re-exported so every existing import site (engine.ts, mongo.ts, tests, …) keeps importing
+// them from resizer.ts unchanged.
+import type { ResizeStorage } from './storage/AbstractStorage.ts';
+import type {
+  LeasedTask,
+  QueueTransport,
+} from './transports/AbstractTransport.ts';
 import type {
   MediaLike,
   MissingPreview,
@@ -16,8 +28,11 @@ import type {
   PreviewFormat,
   ReadDecision,
   SizeInput,
-  StorageRef,
 } from './types.d.ts';
+
+export type { LockProvider } from './locks/AbstractLockProvider.ts';
+export type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
+export type { LeasedTask, QueueTransport, ResizeStorage };
 
 // ---------------------------------------------------------------------------
 // Named pipeline types (04 · §8) — the per-media-type pixel work. sharp is a hard dep;
@@ -37,53 +52,6 @@ export type VariantStep = (
 export interface Pipeline {
   beforeSteps?: BeforeStep[]; // async; run ONCE on the original buffer, before any resize
   variantSteps?: VariantStep[]; // run PER variant, after resize, before encode
-}
-
-// ---------------------------------------------------------------------------
-// Transport + storage interfaces (05 · §10.1, §10.4) — NO `app` parameter anywhere;
-// shipped drivers reach the framework through getApp(), custom ones close over their own.
-// ---------------------------------------------------------------------------
-
-export interface LeasedTask {
-  taskId: string;
-  mediaId: string;
-  pipeline: string;
-  previews: MissingPreview[];
-}
-
-export interface QueueTransport {
-  enqueue(task: {
-    mediaId: string;
-    pipeline: string;
-    previews: MissingPreview[];
-  }): Promise<{ taskId: string | null }>;
-
-  // The transport drives consumption its own way (poll OR push): it calls handleTask per
-  // task and owns completion/redelivery. taskOpts.signal aborts THIS task if its lease is
-  // lost (best-effort); opts.signal is worker-wide shutdown (05 · §10.1).
-  startWorker(
-    handleTask: (
-      task: LeasedTask,
-      taskOpts?: { signal: AbortSignal },
-    ) => Promise<void>,
-    opts: { signal: AbortSignal },
-  ): Promise<void>;
-}
-
-export interface ResizeStorage {
-  // Download an existing object by its stored locator (the worker's original).
-  download(ref: StorageRef): Promise<Buffer | Uint8Array>;
-  // Upload a NEW object; the DRIVER picks physical placement + returns the locator to persist.
-  upload(args: {
-    key: string;
-    body: Buffer | Uint8Array;
-    contentType: string;
-    visibility: 'public' | 'private';
-  }): Promise<StorageRef>;
-  // PURE, synchronous, NO I/O — the read path calls this to build public URLs (05 · §10.4).
-  publicUrl(ref: StorageRef): string;
-  // Optional: a time-limited signed URL for owner/admin reads of a private original.
-  signedUrl?(ref: StorageRef, ttlSeconds: number): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,8 +86,8 @@ export type HookFn = (...args: any[]) => unknown;
 export interface ResizerOptions {
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
-  mediaStore?: MediaStore; // default: frameworkMediaStore (05 · §10.6)
-  lockProvider?: LockProvider; // default: frameworkLockProvider (05 · §10.6)
+  mediaStore?: MediaStore; // default: new FrameworkMediaStore() (05 · §10.6)
+  lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   hooks?: Partial<Record<HookName, HookFn | HookFn[]>>; // initial taps (04 · §9)
 }
@@ -159,8 +127,8 @@ export class Resizer {
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
-    this.mediaStore = opts.mediaStore ?? frameworkMediaStore;
-    this.lockProvider = opts.lockProvider ?? frameworkLockProvider;
+    this.mediaStore = opts.mediaStore ?? new FrameworkMediaStore();
+    this.lockProvider = opts.lockProvider ?? new FrameworkLockProvider();
     this.pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().

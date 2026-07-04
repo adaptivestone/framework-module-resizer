@@ -35,7 +35,7 @@ export interface QueueTransport {
 Exactly **one** transport is active. The worker ([07](./07-worker.md)) just calls
 `transport.startWorker((task, taskOpts) => processTask(task, taskOpts), { signal })`
 (`taskOpts` threads the per-task lease-loss signal — see `handleTask` above). The wiring is
-the constructor option: `new Resizer({ transport: mongoTransport, … })` ([02 · §6](./02-types-and-api.md));
+the constructor option: `new Resizer({ transport: new MongoTransport(), … })` ([02 · §6](./02-types-and-api.md));
 the mongo transport reaches the `ResizeTask` model through `getApp()`. `transport` is
 optional — an eager-only host omits it ([11 · Modes](./11-modes.md)).
 
@@ -47,10 +47,11 @@ optional — an eager-only host omits it ([11 · Modes](./11-modes.md)).
 
 ### 10.2 Mongo transport (`src/transports/mongo.ts`) — DEFAULT
 
-Backed by a host-scaffolded `ResizeTask` model (see
-[08 · Config & scaffold](./08-config-and-scaffold.md)). `lease/complete/fail` are
-transport-internal (exported on the mongo object for unit tests; not part of the
-interface). Like every driver it is a **subpath entry**
+**`class MongoTransport implements QueueTransport`** (house style — [02 · §6](./02-types-and-api.md)),
+option-less: `new MongoTransport()`. Backed by a host-scaffolded `ResizeTask` model (see
+[08 · Config & scaffold](./08-config-and-scaffold.md)). `lease/complete/fail/renew/sweep` are
+transport-internal **methods** (public so unit tests can drive them; not part of the
+`QueueTransport` interface). Like every driver it is a **subpath entry**
 (`@adaptivestone/framework-module-resize/transports/mongo.js` — the uniform rule,
 [02 · §6](./02-types-and-api.md)); it has no optional deps, so importing it is always safe.
 
@@ -132,15 +133,17 @@ mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.
 
 ### 10.3 SQS transport (`src/transports/sqs.ts`) — OPTIONAL
 
-**Driver-owned options.** `sqsTransport` is a **factory** (not a singleton): the host passes
-`transport: sqsTransport({ queueUrl, region?, endpoint? })` to the `Resizer` constructor and
-the returned transport closes over those options — they are **not** in `ResizeConfig`. `queueUrl`
+**Driver-owned options.** `SqsTransport` is a **class** (house style — [02 · §6](./02-types-and-api.md)):
+the host passes `transport: new SqsTransport({ queueUrl, region?, endpoint? })` to the
+`Resizer` constructor and the instance keeps those options in private fields — they are
+**not** in `ResizeConfig`. `queueUrl`
 is required; `region` / `endpoint` are optional. Credentials are **never** options — they
 resolve via the standard AWS provider chain (env / instance role). The transport lazily
 constructs (and memoizes) one `SQSClient` from its options on first use.
 
 ```ts
-export function sqsTransport(opts: {
+export class SqsTransport implements QueueTransport { constructor(opts: SqsTransportOptions) {…} }
+export interface SqsTransportOptions {
   queueUrl: string;
   region?: string;
   endpoint?: string;
@@ -151,9 +154,9 @@ export function sqsTransport(opts: {
                                 // correctness but the work is done twice)
   client?: SQSClient;           // bring-your-own configured client (credentials provider,
                                 // proxy, retry strategy, a shared instance). When absent the
-                                // driver lazily constructs one from region/endpoint. Also the
-                                // TEST injection point — drivers ship NO test-only seams.
-}): QueueTransport;
+                                // driver constructs one from region/endpoint on first use.
+                                // Also the TEST injection point — drivers ship NO test-only seams.
+}
 ```
 
 - `enqueue` → `SendMessageCommand` to `opts.queueUrl`, body `{ mediaId, pipeline, previews }`; returns `{ taskId: MessageId ?? null }`.
@@ -173,9 +176,9 @@ export function sqsTransport(opts: {
   ([02 · §6](./02-types-and-api.md)). The optional peers are only resolved when that subpath
   is imported; a missing SDK fails loudly at the host's own import line at bootstrap.
 
-> The Mongo transport (`mongoTransport`) needs **no options** — it uses the host-scaffolded
-> `ResizeTask` model and the lease/retry knobs under `config.queue` — so it stays a plain
-> singleton: `new Resizer({ transport: mongoTransport, … })`.
+> The Mongo transport needs **no options** — it uses the host-scaffolded
+> `ResizeTask` model and the lease/retry knobs under `config.queue`:
+> `new Resizer({ transport: new MongoTransport(), … })`.
 
 ### 10.4 Storage interface — the required `storage` option
 
@@ -183,7 +186,7 @@ The one seam that lets the worker (and the read path's URL building) reach stora
 the module importing host helpers or knowing what a "bucket" is. **The driver owns all
 storage-specific options** (buckets, base URL, region, credentials) — they live in the driver,
 not `ResizeConfig`. Storage mirrors the queue seam: this abstract interface plus **shipped
-drivers** (v1 ships `s3Storage` — §10.5; filesystem/GCS/R2 drivers can be added later without
+drivers** (v1 ships `S3Storage` — §10.5; filesystem/GCS/R2 drivers can be added later without
 touching the core). A host on anything not shipped implements the interface itself — a small
 object closing over its own client + buckets (no `app` parameter — see the file intro).
 
@@ -217,7 +220,7 @@ boot, in **every** process that constructs the Resizer (the "no storage register
 degradation class from the registry design no longer exists).
 
 A custom driver is just a small object (host-implemented — e.g. GCS or a filesystem; for
-plain S3 use the shipped `s3Storage`, §10.5):
+plain S3 use the shipped `S3Storage`, §10.5):
 
 ```ts
 new Resizer({ …, storage: {
@@ -234,13 +237,17 @@ new Resizer({ …, storage: {
 
 ### 10.5 S3 storage driver (`src/storage/s3.ts`) — SHIPPED (optional deps)
 
-**Driver-owned options, factory-shaped** (exactly like `sqsTransport`): the host calls
-`storage: s3Storage({ … })` in the `Resizer` constructor and the returned driver closes over
-its options — nothing storage-specific enters `ResizeConfig`. Credentials are **never** options (standard AWS
-provider chain). The factory lazily constructs (and memoizes) one `S3Client` on first I/O use.
+**Driver-owned options, class-shaped** (exactly like `SqsTransport`): the host passes
+`storage: new S3Storage({ … })` to the `Resizer` constructor and the instance keeps its
+options in private fields — nothing storage-specific enters `ResizeConfig`. Credentials are
+**never** options (standard AWS provider chain). The instance constructs (and memoizes) one
+`S3Client` on first I/O use — unless `opts.client` was provided. (House-style note: driver
+constructors are cheap + synchronous; a driver that ever needs ASYNC setup adds a
+`static async init(opts)` helper instead — none of the shipped drivers do.)
 
 ```ts
-export function s3Storage(opts: {
+export class S3Storage implements ResizeStorage { constructor(opts: S3StorageOptions) {…} }
+export interface S3StorageOptions {
   bucketPublic: string;    // previews land here (upload visibility 'public')
   bucketPrivate?: string;  // originals ('private'); defaults to bucketPublic
   publicUrl?: string;      // CDN/base URL for public objects, e.g. 'https://cdn.example.com'
@@ -249,9 +256,9 @@ export function s3Storage(opts: {
   forcePathStyle?: boolean;
   client?: S3Client;       // bring-your-own configured client (credentials provider, proxy,
                            // retry strategy, a shared instance). When absent the driver
-                           // lazily constructs one from region/endpoint/forcePathStyle. Also
-                           // the TEST injection point — drivers ship NO test-only seams.
-}): ResizeStorage;
+                           // constructs one from region/endpoint/forcePathStyle on first use.
+                           // Also the TEST injection point — drivers ship NO test-only seams.
+}
 ```
 
 - `upload` → `PutObjectCommand` to `bucketPublic`/`bucketPrivate` by `visibility`; returns
@@ -277,16 +284,16 @@ export function s3Storage(opts: {
 
 Uniform driver layout ([02 · §6](./02-types-and-api.md)): each seam directory holds the
 contract + the shipped driver(s) — `mediaStore/AbstractMediaStore.ts` (the `MediaStore`
-interface) + `mediaStore/framework.ts` (`frameworkMediaStore`), and
+interface) + `mediaStore/framework.ts` (`FrameworkMediaStore`), and
 `locks/AbstractLockProvider.ts` (the `LockProvider` interface) + `locks/framework.ts`
-(`frameworkLockProvider`). Hosts wrapping a default import it from its subpath
+(`FrameworkLockProvider`). Hosts wrapping a default import it from its subpath
 (`…/mediaStore/framework.js`, `…/locks/framework.js`); contract types re-export from the
 main entry.
 
 The last two DB touchpoints, behind the same single-active-strategy pattern — so the **core
 is fully DB-free**: with a non-Mongo transport plus custom drivers here, nothing in the module
 touches Mongo. Both are **optional constructor options with framework-backed defaults**
-([02 · §6](./02-types-and-api.md)): omit them and `frameworkMediaStore`/`frameworkLockProvider`
+([02 · §6](./02-types-and-api.md)): omit them and `FrameworkMediaStore`/`FrameworkLockProvider`
 are used; pass your own to swap the DB layer. Fixed at construction, like every driver.
 
 ```ts
@@ -310,14 +317,16 @@ export interface LockProvider {
 }
 ```
 
-- **`frameworkMediaStore` (default):** `load` →
+- **`FrameworkMediaStore` (default; `class … implements MediaStore`):** `load` →
   `getApp().getModel(config.mediaModelName).findById(mediaId)`;
   `appendPreviews` → **one** `findByIdAndUpdate` combining `$push: { previews: { $each } }`
   with the optional `$set: { 'original.width', 'original.height' }`.
-- **`frameworkLockProvider` (default):** `acquire` →
+- **`FrameworkLockProvider` (default; `class … implements LockProvider`):** `acquire` →
   `getApp().getModel('Lock').acquireLock(key, Math.ceil(ttlMs / 1000))` — the framework Lock
   TTL is **seconds**, so the ms→s conversion lives *here*, never at call sites; `release` →
   `Lock.releaseLock(key)`.
+- The `Resizer` constructor builds the defaults when the options are omitted:
+  `opts.mediaStore ?? new FrameworkMediaStore()`, `opts.lockProvider ?? new FrameworkLockProvider()`.
 - **Used by:** `enqueue` (dispatch locks — [06 · §18](./06-read-and-enqueue.md)), `processTask`
   (media load, worker locks, the single preview write — [07](./07-worker.md)), `generate`
   (persist — [11](./11-modes.md)). Lock **keys** stay module-owned and identity-derived

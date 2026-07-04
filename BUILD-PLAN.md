@@ -129,6 +129,7 @@ Each step lists the spec section to implement against and the key behaviors to t
   `@aws-sdk/client-s3`/`@aws-sdk/s3-request-presigner`. Test against mocked SDK.
 - 2026-07-04 review fix: `_setSdkForTests` seams removed; `client?` factory option (spec/05) is the injection point.
 - 2026-07-04 review fix 2: drivers are subpath-only entries with STATIC SDK imports (no dynamic import()); contracts split into transports/AbstractTransport.ts + storage/AbstractStorage.ts (interfaces, re-exported from resizer.ts).
+- 2026-07-04 review fix 4 (house style): drivers converted to classes — MongoTransport/SqsTransport/S3Storage/FrameworkMediaStore/FrameworkLockProvider, exported directly; Resizer builds defaults via new Framework*().
 
 **8 — `src/worker.ts` + `src/resizeTask.ts` + `src/commands/ResizeWorker.ts` (spec/07, spec/11).**
 - `runResizeWorker()` (sharp globals, transport loop) + `processTask` (download once →
@@ -218,6 +219,14 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     via `setAppInstance` (node:test = per-file process isolation). Cost accepted: a duplicated
     framework copy now also breaks `appInstance` (peer-dep single-copy was already mandatory).
     Added `@types/express` devDep (framework's d.ts graph needs it once we import its helpers).
+13. **House style: drivers are CLASSES (2026-07-04, user decision, step-7 review round 5).**
+    Shipped drivers are `class X implements <Abstract contract>` exported directly (no factory
+    wrappers): `MongoTransport` (option-less `new MongoTransport()`), `SqsTransport(opts)`,
+    `S3Storage(opts)`, `FrameworkMediaStore`, `FrameworkLockProvider`. Resizer defaults become
+    `opts.mediaStore ?? new FrameworkMediaStore()` etc. Contracts STAY interfaces (custom host
+    drivers may be classes OR literals — the seam is structural). Constructors cheap +
+    synchronous; a driver needing async setup adds `static async init(opts)` (none do today).
+    Options interfaces (`SqsTransportOptions`, `S3StorageOptions` incl. `client?`) unchanged.
 12a. **Uniform driver-entry rule (2026-07-04, user decision, step-7 review rounds 3–4).** The
     main entry is the CORE only; EVERY driver (mongo/sqs transports, s3 storage, framework
     mediaStore/lockProvider) is a package **subpath entry** with plain **static imports**

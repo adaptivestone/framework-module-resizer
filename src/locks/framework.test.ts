@@ -4,7 +4,11 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { frameworkLockProvider } from './locks.ts';
+import { FrameworkLockProvider } from './framework.ts';
+
+// One stateless instance drives the whole file (option-less constructor; the
+// driver reaches the framework `Lock` model ambiently through getApp()).
+const provider = new FrameworkLockProvider();
 
 // A recording fake `Lock` model installed via getModel('Lock'). The ms→seconds
 // conversion is the framework's Lock TTL contract (02 · §4) and must live here.
@@ -23,7 +27,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-describe('frameworkLockProvider.acquire', () => {
+describe('FrameworkLockProvider.acquire', () => {
   test('passes SECONDS to Lock.acquireLock (60000ms → 60) and returns the boolean', async () => {
     const calls: Array<[string, number]> = [];
     installLock({
@@ -32,7 +36,7 @@ describe('frameworkLockProvider.acquire', () => {
         return true;
       },
     });
-    const ok = await frameworkLockProvider.acquire('dispatch:1', 60000);
+    const ok = await provider.acquire('dispatch:1', 60000);
     assert.equal(ok, true);
     assert.deepEqual(calls, [['dispatch:1', 60]]);
   });
@@ -45,19 +49,19 @@ describe('frameworkLockProvider.acquire', () => {
         return true;
       },
     });
-    await frameworkLockProvider.acquire('k', 1500);
+    await provider.acquire('k', 1500);
     assert.equal(calls[0][1], 2);
   });
 
   test('coerces a falsy acquireLock result to boolean false', async () => {
     installLock({ acquireLock: () => 0 });
-    const ok = await frameworkLockProvider.acquire('k', 1000);
+    const ok = await provider.acquire('k', 1000);
     assert.strictEqual(ok, false);
     assert.equal(typeof ok, 'boolean');
   });
 });
 
-describe('frameworkLockProvider.release', () => {
+describe('FrameworkLockProvider.release', () => {
   test('calls Lock.releaseLock with the key', async () => {
     const released: string[] = [];
     installLock({
@@ -66,7 +70,7 @@ describe('frameworkLockProvider.release', () => {
         released.push(key);
       },
     });
-    await frameworkLockProvider.release('dispatch:1');
+    await provider.release('dispatch:1');
     assert.deepEqual(released, ['dispatch:1']);
   });
 });

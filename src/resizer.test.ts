@@ -4,10 +4,12 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { frameworkLockProvider, type LockProvider } from './locks.ts';
-import { frameworkMediaStore, type MediaStore } from './mediaStore.ts';
+import { FrameworkLockProvider } from './locks/framework.ts';
+import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import {
   getResizer,
+  type LockProvider,
+  type MediaStore,
   type Pipeline,
   type QueueTransport,
   Resizer,
@@ -16,9 +18,10 @@ import {
 } from './resizer.ts';
 
 // ---------------------------------------------------------------------------
-// Fakes. The Resizer stores driver references verbatim, so identity is all we
-// check; the hook bus needs a recording ambient app (logger/events) read via
-// getApp() at CALL time — stolen from the old hooks.test.ts harness.
+// Fakes. The Resizer stores passed driver references verbatim (identity checks);
+// omitted defaults are fresh framework-driver instances (instanceof checks). The
+// hook bus needs a recording ambient app (logger/events) read via getApp() at
+// CALL time — stolen from the old hooks.test.ts harness.
 // ---------------------------------------------------------------------------
 
 const fakeTransport = (): QueueTransport => ({
@@ -87,8 +90,8 @@ afterEach(() => {
 describe('Resizer constructor — driver wiring', () => {
   test('fills mediaStore/lockProvider defaults when omitted', () => {
     const r = new Resizer(baseOpts());
-    assert.equal(r.mediaStore, frameworkMediaStore);
-    assert.equal(r.lockProvider, frameworkLockProvider);
+    assert.ok(r.mediaStore instanceof FrameworkMediaStore);
+    assert.ok(r.lockProvider instanceof FrameworkLockProvider);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
