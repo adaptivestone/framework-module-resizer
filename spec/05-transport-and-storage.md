@@ -50,10 +50,14 @@ optional — an eager-only host omits it ([11 · Modes](./11-modes.md)).
 Backed by a host-scaffolded `ResizeTask` model (see
 [08 · Config & scaffold](./08-config-and-scaffold.md)). `lease/complete/fail` are
 transport-internal (exported on the mongo object for unit tests; not part of the
-interface).
+interface). Like every driver it is a **subpath entry**
+(`@adaptivestone/framework-module-resize/transports/mongo.js` — the uniform rule,
+[02 · §6](./02-types-and-api.md)); it has no optional deps, so importing it is always safe.
 
-- `enqueue` → `ResizeTask.create({ fileId: mediaId, pipeline, previews, status:'pending', attempts:0 }, { writeConcern:{ w:'majority' } })`,
-  returns `{ taskId }`.  *(maps generic `mediaId` → host-owned `fileId`; durable enqueue.)*
+- `enqueue` → `ResizeTask.create([{ fileId: mediaId, pipeline, previews, status:'pending', attempts:0 }], { writeConcern:{ w:'majority' } })`,
+  returns `{ taskId }`.  *(maps generic `mediaId` → host-owned `fileId`; durable enqueue. The
+  **array form is required on mongoose 9**: `create(doc, options)` mis-reads the options object
+  as a second document — verified against mongoose source, 2026-07-04.)*
 - `startWorker` → poll loop: **dead-letter sweep → lease → handleTask (+ heartbeat) → complete (fire `afterTaskComplete`) | fail**,
   sleeping `config.queue.idlePollMs` on an empty lease, until `opts.signal` aborts. `leasedBy =
   "resizer-" + process.pid`. While a task runs, a heartbeat timer calls `renew` every
@@ -145,6 +149,10 @@ export function sqsTransport(opts: {
                                 // the SQS analog of the Mongo lease heartbeat (long resizes
                                 // otherwise get redelivered mid-task; idempotency saves
                                 // correctness but the work is done twice)
+  client?: SQSClient;           // bring-your-own configured client (credentials provider,
+                                // proxy, retry strategy, a shared instance). When absent the
+                                // driver lazily constructs one from region/endpoint. Also the
+                                // TEST injection point — drivers ship NO test-only seams.
 }): QueueTransport;
 ```
 
@@ -159,8 +167,11 @@ export function sqsTransport(opts: {
   failure, SQS redelivers up to the cap, then moves the message to the DLQ. There is no
   Mongo-style `dead` status or sweep here, so `onTaskDeadLettered` does **not** fire for SQS
   (the host may attach a small consumer to the DLQ to surface it; the module doesn't require it).
-- Lazy-load `@aws-sdk/client-sqs` / `sqs-consumer` (dynamic `import()`), so the module
-  works without them installed.
+- **Subpath-only entry, plain static imports.** The driver imports `@aws-sdk/client-sqs` /
+  `sqs-consumer` normally at the top of its module and is **not** re-exported from the main
+  entry — hosts import `@adaptivestone/framework-module-resize/transports/sqs.js` directly
+  ([02 · §6](./02-types-and-api.md)). The optional peers are only resolved when that subpath
+  is imported; a missing SDK fails loudly at the host's own import line at bootstrap.
 
 > The Mongo transport (`mongoTransport`) needs **no options** — it uses the host-scaffolded
 > `ResizeTask` model and the lease/retry knobs under `config.queue` — so it stays a plain
@@ -236,6 +247,10 @@ export function s3Storage(opts: {
   region?: string;
   endpoint?: string;       // S3-compatible: MinIO / localstack / R2
   forcePathStyle?: boolean;
+  client?: S3Client;       // bring-your-own configured client (credentials provider, proxy,
+                           // retry strategy, a shared instance). When absent the driver
+                           // lazily constructs one from region/endpoint/forcePathStyle. Also
+                           // the TEST injection point — drivers ship NO test-only seams.
 }): ResizeStorage;
 ```
 
@@ -247,11 +262,26 @@ export function s3Storage(opts: {
   set; else path-style `${endpoint}/${bucket}/${key}` when `endpoint`/`forcePathStyle`, else
   virtual-hosted `https://${bucket}.s3.${region}.amazonaws.com/${key}`.
 - `signedUrl` → `@aws-sdk/s3-request-presigner` `getSignedUrl` with `expiresIn: ttlSeconds`.
-- Lazy-load `@aws-sdk/client-s3` / `@aws-sdk/s3-request-presigner` via dynamic `import()` —
-  they are optional **peer** deps ([09 · Packaging](./09-packaging-and-tests.md)), so the
-  module installs and runs without them unless this driver is used.
+- **Subpath-only entry, plain static imports.** The driver imports `@aws-sdk/client-s3` /
+  `@aws-sdk/s3-request-presigner` normally at the top of its module and is **not**
+  re-exported from the main entry — hosts import
+  `@adaptivestone/framework-module-resize/storage/s3.js` directly ([02 · §6](./02-types-and-api.md)).
+  They stay optional **peer** deps ([09 · Packaging](./09-packaging-and-tests.md)): the main
+  entry never resolves them, and a missing SDK fails loudly at the host's own import line.
+- The `ResizeStorage` interface lives in `src/storage/AbstractStorage.ts` (interface, not an
+  abstract class — drivers are plain object literals; re-exported from `resizer.ts` for
+  convenience). Transports mirror this with `src/transports/AbstractTransport.ts`
+  (`QueueTransport`/`LeasedTask`).
 
-### 10.6 Media store & lock provider (`src/mediaStore.ts`, `src/locks.ts`) — DEFAULTED seams
+### 10.6 Media store & lock provider (`src/mediaStore/`, `src/locks/`) — DEFAULTED seams
+
+Uniform driver layout ([02 · §6](./02-types-and-api.md)): each seam directory holds the
+contract + the shipped driver(s) — `mediaStore/AbstractMediaStore.ts` (the `MediaStore`
+interface) + `mediaStore/framework.ts` (`frameworkMediaStore`), and
+`locks/AbstractLockProvider.ts` (the `LockProvider` interface) + `locks/framework.ts`
+(`frameworkLockProvider`). Hosts wrapping a default import it from its subpath
+(`…/mediaStore/framework.js`, `…/locks/framework.js`); contract types re-export from the
+main entry.
 
 The last two DB touchpoints, behind the same single-active-strategy pattern — so the **core
 is fully DB-free**: with a non-Mongo transport plus custom drivers here, nothing in the module

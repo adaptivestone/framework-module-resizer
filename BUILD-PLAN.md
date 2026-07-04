@@ -60,15 +60,15 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 2 | Identity helpers | `src/images.ts` | spec/03 | ✅ done (TDD) | 31 |
 | 3 | Config | `src/config/resize.ts` | spec/08 §13 | ✅ done (TDD) | 9 |
 | 3 | Ambient app gateway | `src/app.ts` | spec/02 §4 | ✅ done (TDD) | 2 |
-| 4 | Resizer class + hook bus + defaulted seams | `src/resizer.ts`, `src/mediaStore.ts`, `src/locks.ts` | spec/02 §6, spec/04, spec/05 §10.6 | ✅ done (TDD) | 32 |
+| 4 | Resizer class + hook bus + defaulted seams | `src/resizer.ts`, `src/mediaStore/{AbstractMediaStore,framework}.ts`, `src/locks/{AbstractLockProvider,framework}.ts` | spec/02 §6, spec/04, spec/05 §10.6 | ✅ done (TDD) | 32 |
 | 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ✅ done (TDD) | 31 (23 engine + 8 enqueue) |
 | 6 | Models | `src/models/ResizeTask.ts`, `src/models/mediaFragment.ts` | spec/08 §12 | ✅ done (TDD) | 24 (23 + 1 skip) |
-| 7 | Transports + storage driver | `src/transports/mongo.ts`, `src/transports/sqs.ts`, `src/storage/s3.ts` | spec/05 | ⬜ | — |
+| 7 | Transports + storage driver | `src/transports/{AbstractTransport,mongo,sqs}.ts`, `src/storage/{AbstractStorage,s3}.ts` | spec/05 | ✅ done (TDD) | 36 (17 mongo + 7 sqs + 12 s3) |
 | 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ⬜ | — |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ⬜ | — |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
 
-**Suite total so far: 129 tests, all green (128 pass + 1 skipped live round-trip).** Full target test plan is spec/09 §20.
+**Suite total so far: 165 tests, all green (164 pass + 1 skipped live round-trip).** Full target test plan is spec/09 §20.
 
 ---
 
@@ -94,6 +94,7 @@ Each step lists the spec section to implement against and the key behaviors to t
   `getModel(config.mediaModelName)`; `appendPreviews` = ONE `findByIdAndUpdate` `$push {$each}`
   + optional `$set` dims) and `LockProvider` + `frameworkLockProvider` (framework `Lock`,
   ms→seconds conversion inside). Test with a fake `app.getModel` via setAppInstance.
+- 2026-07-04 review fix (uniform driver layout): mediaStore/locks split into Abstract contract + framework driver subpath entries; mongo imports its contract from AbstractTransport.
 
 **5 — `src/engine.ts` + `src/enqueue.ts` (spec/06, spec/02 §6).**
 - `enqueue`: dedup by `getPreviewIdentity`; per-identity **dispatch lock**
@@ -126,6 +127,8 @@ Each step lists the spec section to implement against and the key behaviors to t
   **factory** (spec/05 §10.5): upload routes by `visibility` (no per-object ACL), pure
   `publicUrl` string-building (3 URL forms), presigner-backed `signedUrl`; lazy-loads
   `@aws-sdk/client-s3`/`@aws-sdk/s3-request-presigner`. Test against mocked SDK.
+- 2026-07-04 review fix: `_setSdkForTests` seams removed; `client?` factory option (spec/05) is the injection point.
+- 2026-07-04 review fix 2: drivers are subpath-only entries with STATIC SDK imports (no dynamic import()); contracts split into transports/AbstractTransport.ts + storage/AbstractStorage.ts (interfaces, re-exported from resizer.ts).
 
 **8 — `src/worker.ts` + `src/resizeTask.ts` + `src/commands/ResizeWorker.ts` (spec/07, spec/11).**
 - `runResizeWorker()` (sharp globals, transport loop) + `processTask` (download once →
@@ -215,6 +218,15 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     via `setAppInstance` (node:test = per-file process isolation). Cost accepted: a duplicated
     framework copy now also breaks `appInstance` (peer-dep single-copy was already mandatory).
     Added `@types/express` devDep (framework's d.ts graph needs it once we import its helpers).
+12a. **Uniform driver-entry rule (2026-07-04, user decision, step-7 review rounds 3–4).** The
+    main entry is the CORE only; EVERY driver (mongo/sqs transports, s3 storage, framework
+    mediaStore/lockProvider) is a package **subpath entry** with plain **static imports**
+    (no dynamic `import()` anywhere) and its contract in a sibling `Abstract*.ts` interface
+    file (interfaces, not abstract classes — drivers are object literals). Layout:
+    `transports/{AbstractTransport,mongo,sqs}.ts`, `storage/{AbstractStorage,s3}.ts`,
+    `mediaStore/{AbstractMediaStore,framework}.ts`, `locks/{AbstractLockProvider,framework}.ts`.
+    Contract types re-export from the main entry via resizer.ts; exports map lists every
+    driver subpath; the core imports the two framework defaults internally.
 12. **Constructor-wired public API (2026-07-04, user decision).** `ResizeEngine` static
     registries → **`new Resizer(opts)`**: all drivers in ONE visible options literal, fixed at
     construction; `storage` REQUIRED (boot-time enforcement kills the "forgot to register

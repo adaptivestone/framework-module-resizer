@@ -13,7 +13,10 @@ worker, the upload-time dims capture, and the real per-entity size catalogs the 
 ```ts
 // src/resizer.ts (scaffolded; imported by src/server.ts so it runs in every process — API and worker)
 // ALL wiring in one visible literal — drivers are fixed at construction (02 · §6).
-import { Resizer, mongoTransport, s3Storage } from '@adaptivestone/framework-module-resize';
+import { Resizer } from '@adaptivestone/framework-module-resize';
+// Drivers come from their own subpaths (uniform rule — 02 · §6); bootstrap declares what it uses:
+import { mongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+import { s3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js'; // optional AWS peers resolved only here
 
 export const resizer = new Resizer({
   transport: mongoTransport,                 // or sqsTransport({ queueUrl, region }); omit entirely for eager-only (11)

@@ -127,8 +127,15 @@ async function runResizeWorker() {
      `webp({ quality: config.encode.quality.webp, effort: config.encode.effort.webp, smartSubsample: config.encode.chromaSubsampling === '4:4:4' })`,
      `avif({ quality: config.encode.quality.avif, effort: config.encode.effort.avif })`. Encode via
      `toBuffer({ resolveWithObject: true })` and set `contentType` from the **actual encoded**
-     `info.format` (`image/${info.format}`), not the requested format. (Never reuse one quality int
-     across codecs — see [08 · Config](./08-config-and-scaffold.md).)
+     `info.format` (`image/${info.format}`), not the requested format — with ONE container
+     normalization: sharp reports AVIF output as `info.format === 'heif'` (AVIF = AV1 in a HEIF
+     container), and the web MIME type is `image/avif`, **not** `image/heif` (browser `<picture
+     type="image/avif">` negotiation breaks otherwise). So map `'heif'` → `'avif'` when the AVIF
+     encoder produced it — operatively: **the requested format was `avif`** (sharp 0.34's
+     encode-time `OutputInfo` carries no `compression` field — verified 2026-07-04; it appears
+     only on readback `metadata()` — so an `info.compression === 'av1'` check is a
+     forward-compatibility extra, not the load-bearing arm).
+     (Never reuse one quality int across codecs — see [08 · Config](./08-config-and-scaffold.md).)
      > **Color note:** `toColorspace('srgb')` sets the working space but does **not** ICC-transform a
      > tagged **Display-P3 / Adobe RGB / CMYK** source — and sharp strips ICC by default, so such a
      > source would be reinterpreted as sRGB (visible shift). Verify against a P3 and a CMYK sample;

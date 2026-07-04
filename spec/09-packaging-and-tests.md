@@ -26,8 +26,12 @@ framework-module-resize/
 │   ├── resizer.ts         # Resizer class (constructor-wired drivers, pipelines, hook bus) + the
 │   │                      #   one-per-process active-instance slot + getResizer() (02 · §6)
 │   ├── engine.ts          # resolve/generate read-path implementation (called by Resizer methods)
-│   ├── mediaStore.ts      # MediaStore seam + frameworkMediaStore DEFAULT (media load / single preview write) — 05 · §10.6
-│   ├── locks.ts           # LockProvider seam + frameworkLockProvider DEFAULT (framework Lock, ms→s) — 05 · §10.6
+│   ├── mediaStore/
+│   │   ├── AbstractMediaStore.ts # MediaStore interface (re-exported via resizer.ts)
+│   │   └── framework.ts    # frameworkMediaStore DEFAULT (media load / single preview write) — 05 · §10.6
+│   ├── locks/
+│   │   ├── AbstractLockProvider.ts # LockProvider interface (re-exported via resizer.ts)
+│   │   └── framework.ts    # frameworkLockProvider DEFAULT (framework Lock, ms→s) — 05 · §10.6
 │   ├── enqueue.ts         # dedup + dispatch-lock + transport.enqueue
 │   ├── worker.ts          # runResizeWorker / ResizeWorker (transport-agnostic loop)
 │   ├── resizeTask.ts      # processTask: download once, beforeSteps, sharp+variantSteps, upload, $push, locks
@@ -39,10 +43,14 @@ framework-module-resize/
 │   ├── commands/
 │   │   └── ResizeWorker.ts # AbstractCommand: run() → runResizeWorker(this.app); isShouldInitModels=true
 │   ├── transports/
-│   │   ├── mongo.ts        # DEFAULT transport (Mongo queue + lease). No new infra.
-│   │   └── sqs.ts          # OPTIONAL transport (AWS SQS + sqs-consumer). Optional peer deps.
+│   │   ├── AbstractTransport.ts # QueueTransport + LeasedTask interfaces (re-exported via resizer.ts)
+│   │   ├── mongo.ts        # DEFAULT transport (Mongo queue + lease). No new infra. Subpath entry.
+│   │   └── sqs.ts          # OPTIONAL transport (AWS SQS + sqs-consumer). SUBPATH-ONLY entry,
+│   │                       #   plain static SDK imports (optional peers — 05 · §10.3).
 │   ├── storage/
-│   │   └── s3.ts           # SHIPPED storage driver (S3/S3-compatible). Optional peer deps, lazy-loaded.
+│   │   ├── AbstractStorage.ts   # ResizeStorage interface (re-exported via resizer.ts)
+│   │   └── s3.ts           # SHIPPED storage driver (S3/S3-compatible). SUBPATH-ONLY entry,
+│   │                       #   plain static SDK imports (optional peers — 05 · §10.5).
 │   ├── config/
 │   │   └── resize.ts       # default config + getResizeConfig() + requiredFormats(config)
 │   ├── scaffold/
@@ -68,7 +76,12 @@ framework-module-resize/
     ".": "./dist/index.js",
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
-    "./config/resize.js": "./dist/config/resize.js"
+    "./config/resize.js": "./dist/config/resize.js",
+    "./transports/mongo.js": "./dist/transports/mongo.js",
+    "./transports/sqs.js": "./dist/transports/sqs.js",
+    "./storage/s3.js": "./dist/storage/s3.js",
+    "./mediaStore/framework.js": "./dist/mediaStore/framework.js",
+    "./locks/framework.js": "./dist/locks/framework.js"
   },
   "bin": { "resize-scaffold": "./dist/scaffold/command.js" },   // npx @adaptivestone/framework-module-resize resize-scaffold (08 · §12)
   "engines": { "node": ">=24.0.0" },

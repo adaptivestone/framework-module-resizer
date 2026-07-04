@@ -11,7 +11,12 @@
     ".": "./dist/index.js",
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
-    "./config/resize.js": "./dist/config/resize.js"
+    "./config/resize.js": "./dist/config/resize.js",
+    "./transports/mongo.js": "./dist/transports/mongo.js",
+    "./transports/sqs.js": "./dist/transports/sqs.js",
+    "./storage/s3.js": "./dist/storage/s3.js",
+    "./mediaStore/framework.js": "./dist/mediaStore/framework.js",
+    "./locks/framework.js": "./dist/locks/framework.js"
   },
   "bin": {
     "resize-scaffold": "./dist/scaffold/command.js"

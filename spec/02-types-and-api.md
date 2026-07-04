@@ -148,11 +148,24 @@ export {
   calculateResizedDimensions, getImageContentType,
 } from './images.ts';
 export { default as defaultResizeConfig, getResizeConfig, requiredFormats } from './config/resize.ts';
-export { mongoTransport } from './transports/mongo.ts';
-export { sqsTransport } from './transports/sqs.ts';   // optional (lazy-loads aws sdk)
-export { s3Storage } from './storage/s3.ts';          // shipped storage driver (lazy-loads aws sdk)
-export { frameworkMediaStore } from './mediaStore.ts';    // DEFAULT media store (used when the option is omitted)
-export { frameworkLockProvider } from './locks.ts';       // DEFAULT lock provider (used when the option is omitted)
+// DRIVERS ARE NOT IN THE MAIN ENTRY — the uniform rule (2026-07-04): the main entry is the
+// CORE only; EVERY driver lives behind its own package subpath with plain STATIC imports
+// inside (no dynamic-import ceremony) and its contract in a sibling Abstract*.ts interface
+// file. Bootstrap imports exactly what it uses; the main entry never resolves any driver's
+// dependencies (for the AWS drivers, a missing optional-peer SDK fails LOUDLY at the host's
+// own import line at bootstrap, not at the first I/O call):
+//   import { mongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+//   import { sqsTransport }   from '@adaptivestone/framework-module-resize/transports/sqs.js';
+//   import { s3Storage }      from '@adaptivestone/framework-module-resize/storage/s3.js';
+//   import { frameworkMediaStore }   from '@adaptivestone/framework-module-resize/mediaStore/framework.js';
+//   import { frameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
+// (The core imports the two framework DEFAULTS internally — omitting mediaStore/lockProvider
+// in ResizerOptions still needs zero host imports. Driver CONTRACT types re-export from the
+// main entry via resizer.ts: QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider.)
+export type {
+  QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider,
+  Pipeline, BeforeStep, VariantStep, HookName, HookFn, ResizerOptions,
+} from './resizer.ts';   // contract types for custom-driver authors (values live at the subpaths)
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';  // BaseModel subclass; the host's scaffolded model `extends` it (Mongo transport)
 export type { TResizeTask } from './models/ResizeTask.ts';            // = GetModelTypeFromClass<typeof ResizeTaskModel>
 export { resizeMediaSchemaFragment } from './models/mediaFragment.ts';  // optional `as const` schema fragment the host spreads into File/Media (08 · §12)
