@@ -10,9 +10,10 @@
 // Subpath entry `…/transports/mongo.js` (uniform rule 02 · §6): the QueueTransport/LeasedTask
 // contract comes from ./AbstractTransport.ts (not resizer.ts); no optional deps, so importing
 // this driver is always safe (05 · §10.2).
-import { randomBytes } from 'node:crypto';
 import { getApp } from '../app.ts';
 import { getResizeConfig } from '../config/resize.ts';
+import { randomHex } from '../helpers/random.ts';
+import { sleep } from '../helpers/sleep.ts';
 import { getResizer } from '../resizer.ts';
 import type { MissingPreview } from '../types.d.ts';
 import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';
@@ -48,10 +49,6 @@ function taskModel(): ReturnType<ReturnType<typeof getApp>['getModel']> | null {
   return model;
 }
 
-function randomToken(): string {
-  return randomBytes(16).toString('hex');
-}
-
 // The fencing filter shared by complete/fail/renew: a 0-match means the lease was lost.
 function fence(taskId: string, leaseToken: string, now: Date) {
   return {
@@ -60,25 +57,6 @@ function fence(taskId: string, leaseToken: string, now: Date) {
     status: 'processing',
     leaseExpiresAt: { $gt: now },
   };
-}
-
-// Abortable sleep so a shutdown during the idle poll returns promptly.
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 /** The default transport — an option-less class (`new MongoTransport()`) (05 · §10.2). */
@@ -124,7 +102,7 @@ export class MongoTransport implements QueueTransport {
         $set: {
           status: 'processing',
           leasedBy: `resizer-${process.pid}`,
-          leaseToken: randomToken(),
+          leaseToken: randomHex(),
           leaseExpiresAt: new Date(now.getTime() + leaseMs),
         },
         $inc: { attempts: 1 },

@@ -11,6 +11,7 @@ import type { LockProvider } from './locks/AbstractLockProvider.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
 import { FrameworkMediaStore } from './mediaStore/framework.ts';
+import { generateImpl } from './resizeTask.ts';
 // Transport + storage contracts (05 · §10.1, §10.4) now live in their own files —
 // transports/AbstractTransport.ts + storage/AbstractStorage.ts — so the optional-peer drivers
 // import them WITHOUT depending on this module. Imported here for the local annotations below
@@ -219,10 +220,14 @@ export class Resizer {
   }
 
   /**
-   * Eager mode (11 · Modes) — synchronous generate at upload; no queue/worker.
-   * STUB: shares the worker core, lands in build step 5+8.
+   * Eager mode (11 · Modes §11.1) — synchronous generate at upload; no queue/worker/locks.
+   * Delegates to the SHARED resize core (src/resizeTask.ts): resolveSizes waterfall with the
+   * caller's REAL ctx → expand sizes × formats, skipping identities already in media.previews
+   * (idempotent) → download once → beforeSteps once → per-variant resize/encode/upload
+   * (bounded by config.worker.concurrency, NO locks). `persist !== false` → one
+   * mediaStore.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
    */
-  async generate(_opts: {
+  async generate(opts: {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string;
@@ -230,7 +235,7 @@ export class Resizer {
     ctx?: Record<string, unknown>;
     persist?: boolean; // default true → $push previews + backfill dims
   }): Promise<{ previews: Preview[] }> {
-    throw new Error('not implemented yet (build step 5)');
+    return generateImpl(this, opts);
   }
 }
 

@@ -1,9 +1,7 @@
 // Pure identity + dimension helpers. ONE identity, built one way, used everywhere
 // (read map, dedup, dispatch lock, worker lock). No external deps — see 03 · Identity.
+import { isPositiveFinite } from './helpers/guards.ts';
 import type { Filters, PreviewFormat, SizeInput } from './types.d.ts';
-
-const isPositiveFinite = (n: number | undefined): n is number =>
-  typeof n === 'number' && Number.isFinite(n) && n > 0;
 
 /**
  * Canonical size key (size only — never format or filters). `fit` wins; a dimension

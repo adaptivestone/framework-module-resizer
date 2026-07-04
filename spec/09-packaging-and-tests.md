@@ -36,7 +36,12 @@ framework-module-resize/
 │   ├── worker.ts          # runResizeWorker / ResizeWorker (transport-agnostic loop)
 │   ├── resizeTask.ts      # processTask: download once, beforeSteps, sharp+variantSteps, upload, $push, locks
 │   ├── images.ts          # getSizeKey / parseSizeKey / getFilterSig / getPreviewIdentity /
-│   │                      #   calculateResizedDimensions / getImageContentType
+│   │                      #   calculateResizedDimensions / getImageContentType  (PUBLIC identity API — 03)
+│   ├── helpers/           # INTERNAL generic utilities (single definitions; NOT in the main entry)
+│   │   ├── guards.ts      # isPositiveFinite
+│   │   ├── random.ts      # randomHex() — lease fencing tokens + unguessable preview keys
+│   │   ├── sleep.ts       # abortable sleep(ms, signal)
+│   │   └── concurrency.ts # bounded promise pool (worker variant fan-out)
 │   ├── models/
 │   │   ├── ResizeTask.ts   # ResizeTaskModel — BaseModel subclass + TResizeTask type (host `extends` it)
 │   │   └── mediaFragment.ts # optional `as const` media schema fragment (host spreads into File/Media — 08 · §12)

@@ -64,11 +64,11 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 5 | Engine read-path + enqueue | `src/engine.ts`, `src/enqueue.ts` | spec/06, spec/02 | ✅ done (TDD) | 31 (23 engine + 8 enqueue) |
 | 6 | Models | `src/models/ResizeTask.ts`, `src/models/mediaFragment.ts` | spec/08 §12 | ✅ done (TDD) | 24 (23 + 1 skip) |
 | 7 | Transports + storage driver | `src/transports/{AbstractTransport,mongo,sqs}.ts`, `src/storage/{AbstractStorage,s3}.ts` | spec/05 | ✅ done (TDD) | 36 (17 mongo + 7 sqs + 12 s3) |
-| 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ⬜ | — |
+| 8 | Worker | `src/worker.ts`, `src/resizeTask.ts`, `src/commands/ResizeWorker.ts` | spec/07, spec/11 | ✅ done (TDD, worktree build + squash-merge) | 29 |
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ⬜ | — |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
 
-**Suite total so far: 165 tests, all green (164 pass + 1 skipped live round-trip).** Full target test plan is spec/09 §20.
+**Suite total so far: 206 tests, all green (205 pass + 1 skipped live round-trip).** Full target test plan is spec/09 §20.
 
 ---
 
@@ -138,6 +138,7 @@ Each step lists the spec section to implement against and the key behaviors to t
   → `storage.upload({…,visibility:'public'})` persist returned ref → single `$push` → locks →
   poison-variant guard). Command is an `AbstractCommand` with `isShouldInitModels=true`.
   `resizer.generate` (eager mode, spec/11) shares this core.
+- 2026-07-04 review fix: generic internal utilities deduped into src/helpers/ (guards/random/sleep/concurrency).
 
 **9 — `src/scaffold/command.ts` + `templates/` (spec/08 §12, spec/09 §3).**
 - `resize-scaffold` package bin (shebang). Emits the `extends ResizeTaskModel` model shim, the

@@ -341,11 +341,15 @@ describe('resolve/generate stubs', () => {
     assert.equal(output, decision);
   });
 
-  test('generate rejects with a not-implemented error', async () => {
+  test('generate is wired (no longer a stub): empty sizes → empty previews', async () => {
+    // A config WITH mediaModelName so getResizeConfig() inside generateImpl does not throw.
+    setAppInstance({
+      getConfig: () => ({ mediaModelName: 'File' }),
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
     const r = new Resizer(baseOpts());
-    await assert.rejects(
-      () => r.generate({ media: {}, sizes: [] }),
-      /not implemented/,
-    );
+    const { previews } = await r.generate({ media: {}, sizes: [] });
+    assert.deepEqual(previews, []);
   });
 });

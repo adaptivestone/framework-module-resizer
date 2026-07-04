@@ -8,6 +8,7 @@
 import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
 import { enqueue } from './enqueue.ts';
+import { isPositiveFinite } from './helpers/guards.ts';
 import { getFilterSig, getPreviewIdentity, getSizeKey } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
@@ -34,9 +35,6 @@ export interface ResolveOpts {
 // small constant is fine — the URL is re-minted on every read, so it never needs to outlive
 // one response.
 const SIGNED_ORIGINAL_TTL_SECONDS = 300; // 5 minutes
-
-const isPositiveFinite = (n: number | undefined): n is number =>
-  typeof n === 'number' && Number.isFinite(n) && n > 0;
 
 /**
  * §17 steps 1–11. See the module header for the shape. The ENTIRE body runs inside a
