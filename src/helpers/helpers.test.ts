@@ -67,6 +67,15 @@ describe('sleep', () => {
     await p;
     assert.ok(Date.now() - start < 100);
   });
+
+  // The wrapper swallows ONLY the AbortError and re-throws anything else. That re-throw path is not
+  // cleanly reachable: node:timers/promises rejects exclusively with an AbortError (even a custom
+  // controller.abort(reason) still surfaces as name 'AbortError' / code 'ABORT_ERR', verified on
+  // Node 26), so forcing a non-abort rejection needs experimental module mocking. Skipped, not
+  // silently dropped.
+  test.skip(
+    're-throws non-AbortError rejections (only reachable by mocking node:timers/promises)',
+  );
 });
 
 describe('runBounded', () => {

@@ -68,7 +68,7 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 9 | Scaffold | `src/scaffold/command.ts` + `templates/` | spec/08 §12, spec/09 §3 | ⬜ | — |
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ⬜ | — |
 
-**Suite total so far: 206 tests, all green (205 pass + 1 skipped live round-trip).** Full target test plan is spec/09 §20.
+**Suite total so far: 207 tests, all green (205 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
 
 ---
 
@@ -138,7 +138,7 @@ Each step lists the spec section to implement against and the key behaviors to t
   → `storage.upload({…,visibility:'public'})` persist returned ref → single `$push` → locks →
   poison-variant guard). Command is an `AbstractCommand` with `isShouldInitModels=true`.
   `resizer.generate` (eager mode, spec/11) shares this core.
-- 2026-07-04 review fix: generic internal utilities deduped into src/helpers/ (guards/random/sleep/concurrency).
+- 2026-07-04 review fix: generic internal utilities deduped into src/helpers/ (guards/random/sleep/concurrency); sleep delegates to node:timers/promises (resolve-on-abort wrapper).
 
 **9 — `src/scaffold/command.ts` + `templates/` (spec/08 §12, spec/09 §3).**
 - `resize-scaffold` package bin (shebang). Emits the `extends ResizeTaskModel` model shim, the
