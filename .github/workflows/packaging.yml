@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Packaging smoke test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'latest'
+          cache: 'npm'
+
+      - name: npm clean install
+        run: npm ci
+
+      # Builds dist, packs the tarball, installs it into a throwaway consumer and verifies
+      # the PUBLISHED surface (17 core exports, the exports map, the optional subpaths'
+      # loud-fail without their AWS SDKs, the always-safe subpaths, the resize-scaffold bin)
+      # — dist-only breakage the TS-source test suite can't see.
+      - name: Packaging smoke test
+        run: npm run smoke

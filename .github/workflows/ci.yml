@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    # Mirror the repo's documented install note (BUILD-PLAN "Install notes"): keep the
+    # mongod binary download OUT of `npm ci` (mongodb-memory-server's postinstall) and
+    # let the first test run fetch it into the cached dir restored below.
+    env:
+      MONGOMS_DISABLE_POSTINSTALL: '1'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'latest'
+          cache: 'npm'
+
+      # mongodb-memory-server downloads a ~150 MB mongod binary on the first test run.
+      # v11 defaults to PREFER_GLOBAL_PATH=true, so the download lands in
+      # ~/.cache/mongodb-binaries. Restore it BEFORE install + test so a cache hit skips
+      # the download entirely. Keyed on runner OS + the mongodb-memory-server major (11).
+      - name: Cache mongod binary (mongodb-memory-server)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongod-${{ runner.os }}-mms11
+
+      # sharp needs no special handling: `npm ci` pulls the prebuilt @img/sharp-linux-*
+      # platform package via sharp's optionalDependencies on ubuntu-latest.
+      - name: npm clean install
+        run: npm ci
+
+      - run: node --run types:check
+      - run: node --run check
+      - run: node --run build
+
+      # `npm test` = `node --experimental-strip-types --test`; append --experimental-test-coverage
+      # (verified locally to work alongside type stripping). `node --run test -- <args>` forwards
+      # the flag onto the repo's own test script, so the strip-types flag stays single-sourced.
+      - name: Run tests (with coverage)
+        run: node --run test -- --experimental-test-coverage
