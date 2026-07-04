@@ -59,11 +59,17 @@ function commentOutTransport(content: string): string {
   return content
     .split('\n')
     .map((line) => {
-      if (!line.trimStart().startsWith('transport:')) {
-        return line;
+      const trimmed = line.trimStart();
+      const indent = line.slice(0, line.length - trimmed.length);
+      if (trimmed.startsWith('transport:')) {
+        return `${indent}// eager mode (11 · Modes): no transport — generate() runs synchronously at upload\n${indent}// ${trimmed}`;
       }
-      const indent = line.slice(0, line.length - line.trimStart().length);
-      return `${indent}// eager mode (11 · Modes): no transport — generate() runs synchronously at upload\n${indent}// ${line.trimStart()}`;
+      // The MongoTransport import is now unused (its only use, the transport line, is commented) —
+      // comment it too so a host tsc with noUnusedLocals stays clean.
+      if (trimmed.startsWith('import { MongoTransport }')) {
+        return `${indent}// eager mode (11 · Modes): MongoTransport unused (no transport)\n${indent}// ${trimmed}`;
+      }
+      return line;
     })
     .join('\n');
 }

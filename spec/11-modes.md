@@ -79,6 +79,10 @@ const { previews } = await resizer.generate({
 ```
 
 ### Behavior (`generate`)
+0. **SVG guard (2026-07-05 review fix):** an SVG original (`contentType === 'image/svg+xml'` /
+   `format === 'svg'`) → log + return `{ previews: [] }` immediately — SVG is NEVER rasterized
+   in any mode (the guard previously lived only in the queued `processTask`, letting eager
+   `generate` rasterize an SVG).
 1. Resolve config + storage + the named pipeline. **Storage is required** (throws if none).
 2. `sizes = await runWaterfall('resolveSizes', sizes, ctx)`; expand to `sizes × formats × filters`
    identities via `getPreviewIdentity` (same as the read path). In eager mode `ctx` **is** the

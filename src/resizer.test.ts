@@ -16,6 +16,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
 // Fakes. The Resizer stores passed driver references verbatim (identity checks);
@@ -109,6 +110,14 @@ describe('Resizer constructor — driver wiring', () => {
   test('transport is undefined when omitted (eager-only host)', () => {
     const r = new Resizer(baseOpts());
     assert.equal(r.transport, undefined);
+  });
+
+  test('throws a named error when storage is missing (JS host / half-filled scaffold)', () => {
+    // A JS host or half-filled scaffold could omit the required `storage` — fail loudly at
+    // construction with a NAMED error, not a downstream TypeError (02 · §6 review fix).
+    assert.throws(() => new Resizer({} as never), /storage/);
+    // The bad construction must NOT have claimed the active slot.
+    assert.throws(() => getResizer(), /no Resizer constructed/);
   });
 
   test('seeds pipelines from options', () => {
@@ -325,6 +334,39 @@ describe('runObservers', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Typed taps (04 · §9) — HookSignatures infers each tap; runtime behavior unchanged.
+// (Type-level enforcement is compile-only; test files are excluded from tsc, so these
+//  assert the RUNTIME contract with correctly-typed signatures.)
+// ---------------------------------------------------------------------------
+
+describe('typed hooks', () => {
+  test('a correctly-typed constructor hook + late .hook() both run through the bus', async () => {
+    installFakeApp();
+    const injected: SizeInput = { width: 10, height: 10 };
+    const r = new Resizer({
+      ...baseOpts(),
+      hooks: {
+        resolveSizes: (sizes: SizeInput[]) => [...sizes, injected],
+      },
+    });
+    // A second, late tap over the SAME name — typed (missing: MissingPreview[]).
+    let seenMissing: MissingPreview[] | undefined;
+    r.hook('beforeEnqueue', (missing: MissingPreview[]) => {
+      seenMissing = missing;
+      return missing;
+    });
+    const sizes = (await r.runWaterfall('resolveSizes', [], {})) as SizeInput[];
+    assert.deepEqual(sizes, [injected]);
+    await r.runWaterfall(
+      'beforeEnqueue',
+      [{ sizeKey: 'fit', format: 'webp' }],
+      {},
+    );
+    assert.deepEqual(seenMissing, [{ sizeKey: 'fit', format: 'webp' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Read/eager stubs — resolve landed in build step 5; generate lands in step 8
 // ---------------------------------------------------------------------------
 
@@ -349,7 +391,7 @@ describe('resolve/generate stubs', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
     const r = new Resizer(baseOpts());
-    const { previews } = await r.generate({ media: {}, sizes: [] });
+    const { previews } = await r.generate({ media: { id: 'm1' }, sizes: [] });
     assert.deepEqual(previews, []);
   });
 });

@@ -48,7 +48,7 @@ describe('getResizeConfig', () => {
     assert.equal(config.encode.quality.avif, 50); // overridden
     assert.equal(config.encode.quality.jpeg, 80); // sibling default kept
     assert.equal(config.encode.mozjpeg, true); // sibling default kept
-    assert.equal(config.queue.maxAttempts, 3); // unrelated default kept
+    assert.equal(config.queue.maxAttempts, 5); // unrelated default kept (delivery-count default)
   });
 
   test('host arrays REPLACE the default (no concat)', () => {
@@ -59,6 +59,30 @@ describe('getResizeConfig', () => {
   test('throws when the required mediaModelName is missing', () => {
     useHostConfig({});
     assert.throws(() => getResizeConfig(), /mediaModelName/);
+  });
+
+  test('throws when lockTtlMs.worker > leaseMs (doneness invariant)', () => {
+    useHostConfig({
+      mediaModelName: 'File',
+      queue: { lockTtlMs: { worker: 120000 }, leaseMs: 60000 },
+    });
+    assert.throws(() => getResizeConfig(), /lockTtlMs\.worker|leaseMs/);
+  });
+
+  test('accepts lockTtlMs.worker <= leaseMs', () => {
+    useHostConfig({
+      mediaModelName: 'File',
+      queue: { lockTtlMs: { worker: 30000 }, leaseMs: 60000 },
+    });
+    assert.doesNotThrow(() => getResizeConfig());
+    // The shipped default (worker 60000 == leaseMs 60000) also passes.
+    resetAppInstance();
+    setAppInstance({
+      getConfig: () => ({ mediaModelName: 'File' }),
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.doesNotThrow(() => getResizeConfig());
   });
 
   test('throws a clear error when no app is initialized at all', () => {

@@ -26,6 +26,8 @@ export {
   getResizeConfig,
   requiredFormats,
 } from './config/resize.ts';
+// --- read-path / eager option types (type-only) — hosts annotate their call sites ---
+export type { PrewarmOpts, ResolveOpts } from './engine.ts';
 // --- pure identity + dimension helpers (03 · Identity) ---
 export {
   calculateResizedDimensions,
@@ -43,8 +45,10 @@ export { default as ResizeTaskModel } from './models/ResizeTask.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,
+  GenerateOpts,
   HookFn,
   HookName,
+  HookSignatures,
   LeasedTask,
   LockProvider,
   MediaStore,

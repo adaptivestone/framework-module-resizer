@@ -129,6 +129,21 @@ describe('getFilterSig', () => {
       'sharpen:true|tone:warm',
     );
   });
+
+  test('plain filters keep their prior (unescaped) signatures', () => {
+    // Regression guard: values/keys with no `\`, `|`, `:` are unchanged by the escaping.
+    assert.equal(getFilterSig({ blur: 40 }), 'blur:40');
+    assert.equal(getFilterSig({ b: 2, a: 1 }), 'a:1|b:2');
+  });
+
+  test('escapes | : \\ so distinct filter bags never collide', () => {
+    // Before escaping, `{ a: '1|b:2' }` and `{ a: 1, b: 2 }` both produced 'a:1|b:2'.
+    assert.notEqual(getFilterSig({ a: '1|b:2' }), getFilterSig({ a: 1, b: 2 }));
+    assert.equal(getFilterSig({ a: '1|b:2' }), 'a:1\\|b\\:2');
+    assert.equal(getFilterSig({ a: 1, b: 2 }), 'a:1|b:2');
+    // a backslash in a value is itself escaped (and escaped BEFORE | / :).
+    assert.equal(getFilterSig({ a: 'x\\y' }), 'a:x\\\\y');
+  });
 });
 
 describe('getPreviewIdentity', () => {

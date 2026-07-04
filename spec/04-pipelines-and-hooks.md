@@ -104,10 +104,19 @@ bootstrap, taps run **in registration order**, **awaited sequentially**.
 | `formatPublicUrls` | `(decision: ReadDecision, ctx) => unknown \| Promise<unknown>` | returns `decision` |
 
 **Observer** (side effects; return ignored; errors logged via `app.logger`, never thrown
-into the flow): `onPreviewGenerated(preview, ctx)`, `afterTaskComplete(task, ctx)`,
+into the flow): `onPreviewGenerated(preview: Preview, ctx)`, `afterTaskComplete(task, ctx)`,
 `onTaskFailed(task, error, ctx)` (per failed *attempt*, will retry),
 `onTaskDeadLettered(task, error, ctx)` (task exhausted `config.queue.maxAttempts` → dead-letter;
 host can alert/page — see [05 · Transport](./05-transport-and-storage.md)).
+**`task` is ALWAYS the transport-agnostic `LeasedTask`** (`{ taskId, mediaId, pipeline,
+previews }`) — 2026-07-05 review fix: the Mongo transport previously passed its raw document
+(`fileId`, no `mediaId`), making host taps non-portable across transports.
+
+**Typed taps (2026-07-05 review fix).** `HookFn` is no longer `(...args: any[])`: the hook bus
+carries a per-name signature map (`HookSignatures`) so `resizer.hook('resolveSizes', fn)` and
+the `hooks:` constructor option infer `fn: (sizes: SizeInput[], ctx: Record<string,unknown>) =>
+SizeInput[] | Promise<SizeInput[]>` etc. — typos in tap bodies and wrong return shapes become
+compile errors instead of silent `any`.
 
 > The **worker/transport-fired** observers (`onPreviewGenerated`, `afterTaskComplete`,
 > `onTaskFailed`, `onTaskDeadLettered`) run in the worker process and receive **`ctx === {}`**

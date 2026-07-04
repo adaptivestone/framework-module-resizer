@@ -230,6 +230,61 @@ describe('SqsTransport.startWorker', () => {
     await p;
   });
 
+  test('a recurring consumer error is logged EVERY time (on, not once)', async () => {
+    // Recurring consumer errors (e.g. heartbeat ChangeMessageVisibility failures) must all be
+    // logged: `once` would capture only the FIRST and drop every later one (05 · §10.3 fix a).
+    const { errors } = installFakeApp();
+    let polls = 0;
+    const client = {
+      async send(command: FakeCommand) {
+        if (command.constructor.name === 'ReceiveMessageCommand') {
+          polls += 1;
+          throw new Error(`poll fail ${polls}`);
+        }
+        return {};
+      },
+    };
+    const t = new SqsTransport({ queueUrl: 'q', client });
+    makeRecordingResizer(t);
+    const ctrl = new AbortController();
+    const p = t.startWorker(async () => {}, { signal: ctrl.signal });
+    const consumerErrors = () =>
+      errors.filter((e) => e[0] === 'resize sqs consumer error');
+    await waitForReal(() => consumerErrors().length >= 2);
+    assert.ok(consumerErrors().length >= 2);
+    ctrl.abort();
+    await p;
+  });
+
+  test('a malformed message body fires onTaskFailed then rethrows (no ack; SQS redelivers)', async () => {
+    // The body JSON.parse runs INSIDE the guarded region (05 · §10.3 fix b): a malformed body
+    // fires onTaskFailed before rethrowing, consistent with a handler throw.
+    installFakeApp();
+    const message: FakeMessage = {
+      MessageId: 'mid',
+      ReceiptHandle: 'rh',
+      Body: 'not json{{{',
+    };
+    const { client, deletes } = makeFakeSqsClient({ message });
+    let handlerCalls = 0;
+    const t = new SqsTransport({ queueUrl: 'q', client });
+    const rec = makeRecordingResizer(t);
+    const ctrl = new AbortController();
+    const p = t.startWorker(
+      async () => {
+        handlerCalls += 1;
+      },
+      { signal: ctrl.signal },
+    );
+    await waitForReal(() => rec.failed.length >= 1);
+    assert.equal(handlerCalls, 0); // parse failed before the handler ran
+    assert.equal(rec.completed.length, 0);
+    await sleep(20);
+    assert.equal(deletes.length, 0); // not acked → left for SQS to redeliver
+    ctrl.abort();
+    await p;
+  });
+
   test('aborting opts.signal stops the consumer and resolves startWorker', async () => {
     installFakeApp();
     const { client, receiveParams } = makeFakeSqsClient({});

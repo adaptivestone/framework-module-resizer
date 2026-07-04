@@ -67,7 +67,10 @@ const fakeStorage = {
 // QueueTransport interface) precisely so these unit tests can drive them.
 const transport = new MongoTransport();
 
-function installFakeApp(getModelImpl?: (name: string) => unknown) {
+function installFakeApp(
+  getModelImpl?: (name: string) => unknown,
+  queueOverride: Record<string, unknown> = {},
+) {
   const errors: unknown[][] = [];
   setAppInstance({
     getConfig: () => ({
@@ -77,7 +80,8 @@ function installFakeApp(getModelImpl?: (name: string) => unknown) {
         idlePollMs: 20,
         maxAttempts: 3,
         retryBackoffMs: { base: 50, max: 200 },
-        lockTtlMs: { dispatch: 60000, worker: 60000 },
+        lockTtlMs: { dispatch: 60000, worker: 300 }, // worker ≤ leaseMs (doneness invariant, 08 · §13)
+        ...queueOverride,
       },
     }),
     getModel:
@@ -241,10 +245,10 @@ describe('MongoTransport.lease', () => {
 // ---------------------------------------------------------------------------
 
 describe('MongoTransport.complete (fencing)', () => {
-  test('a valid token completes the task and fires afterTaskComplete', async () => {
+  test('a valid token completes the task and fires afterTaskComplete with a LeasedTask', async () => {
     const rec = makeResizer();
     installFakeApp();
-    await insert();
+    const inserted = await insert();
     const leased = await transport.lease();
     assert.ok(leased);
     const ok = await transport.complete(
@@ -256,6 +260,57 @@ describe('MongoTransport.complete (fencing)', () => {
     assert.equal(doc?.status, 'completed');
     assert.ok(doc?.completedAt);
     assert.equal(rec.completed.length, 1);
+    // The observer receives the transport-agnostic LeasedTask (mediaId present, NO raw fileId).
+    const task = rec.completed[0][0] as Record<string, unknown>;
+    assert.equal(task.mediaId, String(inserted.fileId));
+    assert.equal(task.taskId, String(leased._id));
+    assert.equal('fileId' in task, false);
+    assert.equal('leaseToken' in task, false);
+  });
+
+  test('a lapsed-but-unreclaimed lease CAN still complete (token is the fence, not expiry)', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert();
+    const leased = await transport.lease();
+    assert.ok(leased);
+    // The lease lapsed (expiry in the past) but NO other worker re-claimed it — same token,
+    // still 'processing'. The worker that finished its work MUST be able to complete it (2.1).
+    await M.collection.updateOne(
+      { _id: leased._id },
+      { $set: { leaseExpiresAt: past() } },
+    );
+    const ok = await transport.complete(
+      String(leased._id),
+      String(leased.leaseToken),
+    );
+    assert.equal(ok, true);
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'completed');
+    assert.equal(rec.completed.length, 1);
+  });
+
+  test('a re-claimed lease (new token) still 0-matches the old token', async () => {
+    makeResizer();
+    installFakeApp();
+    await insert();
+    const first = await transport.lease();
+    assert.ok(first);
+    // Expire the lease, then re-lease → a NEW token is minted. The OLD token must lose.
+    await M.collection.updateOne(
+      { _id: first._id },
+      { $set: { leaseExpiresAt: past() } },
+    );
+    const second = await transport.lease();
+    assert.ok(second);
+    assert.notEqual(String(second.leaseToken), String(first.leaseToken));
+    const ok = await transport.complete(
+      String(first._id),
+      String(first.leaseToken),
+    );
+    assert.equal(ok, false); // old token lost the lease to the re-claim
+    const doc = await M.findById(first._id).lean();
+    assert.equal(doc?.status, 'processing'); // still owned by the new lease
   });
 
   test('a STALE token 0-matches: no state change and afterTaskComplete NOT fired', async () => {
@@ -373,6 +428,10 @@ describe('MongoTransport.sweepDeadLetters', () => {
     assert.equal(dead.length, 1);
     assert.match(String(dead[0].error), /crash loop/);
     assert.equal(rec.dead.length, 1);
+    // The dead-letter observer also receives a LeasedTask (mediaId present, no raw fileId).
+    const deadTask = rec.dead[0][0] as Record<string, unknown>;
+    assert.ok(deadTask.mediaId);
+    assert.equal('fileId' in deadTask, false);
     // A second sweep finds nothing new → no double-fire.
     await transport.sweepDeadLetters();
     assert.equal(rec.dead.length, 1);
@@ -454,6 +513,106 @@ describe('MongoTransport.startWorker', () => {
     const doc = await M.findById(taskId).lean();
     assert.equal(doc?.status, 'completed'); // in-flight task finished + was completed
     assert.equal(rec.completed.length, 1);
+  });
+
+  test('a hung handleTask is timed out → failed (loop continues), never completed (taskTimeoutMs)', async () => {
+    const rec = makeResizer();
+    installFakeApp(undefined, { taskTimeoutMs: 40 }); // fires before the leaseMs/2 heartbeat
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const { taskId } = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '1x1', format: 'jpeg' }],
+    });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    const ctrl = new AbortController();
+    const p = transport.startWorker(
+      async () => {
+        await gate; // hang well past taskTimeoutMs
+      },
+      { signal: ctrl.signal },
+    );
+    // The timeout fires → fail() runs → onTaskFailed, the task returns to pending (attempts<max).
+    await waitFor(() => rec.failed.length >= 1);
+    // The loop survived the timeout and is still responsive: it stops cleanly on abort.
+    ctrl.abort();
+    releaseGate();
+    await p;
+    assert.equal(rec.completed.length, 0); // the hung task was never completed
+    const doc = await M.findById(taskId).lean();
+    assert.notEqual(doc?.status, 'completed');
+  });
+
+  test('a rejecting lease is logged, then the loop survives and processes the next task (F11)', async () => {
+    // A transient DB error in the poll (sweep/lease) must NOT kill the daemon: log + sleep +
+    // retry. Wrap the transport so lease() rejects EXACTLY once, then delegates normally (05 · §10.2).
+    const rec = makeResizer();
+    const { errors } = installFakeApp();
+    const realLease = transport.lease.bind(transport);
+    let leaseCalls = 0;
+    const spied = transport as unknown as { lease: () => Promise<unknown> };
+    spied.lease = async () => {
+      leaseCalls += 1;
+      if (leaseCalls === 1) {
+        throw new Error('transient mongo blip');
+      }
+      return realLease();
+    };
+    try {
+      const mediaId = new mongoose.Types.ObjectId().toString();
+      const { taskId } = await transport.enqueue({
+        mediaId,
+        pipeline: 'default',
+        previews: [{ sizeKey: '1x1', format: 'jpeg' }],
+      });
+      const ctrl = new AbortController();
+      const p = transport.startWorker(async () => {}, { signal: ctrl.signal });
+      // The loop logged the blip and kept going, eventually leasing + completing the task.
+      await waitFor(async () => {
+        const d = await M.findById(taskId).lean();
+        return d?.status === 'completed';
+      });
+      ctrl.abort();
+      await p;
+      assert.ok(leaseCalls >= 2); // rejected once, then succeeded
+      assert.ok(errors.length >= 1); // the blip was logged
+      assert.equal(rec.completed.length, 1);
+    } finally {
+      spied.lease = realLease; // restore for the rest of the file
+    }
+  });
+
+  test('worker-wide shutdown aborts the in-flight task signal (05 · §10.2 shutdown wiring)', async () => {
+    makeResizer();
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '1x1', format: 'jpeg' }],
+    });
+    let capturedSignal: AbortSignal | undefined;
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    const ctrl = new AbortController();
+    const p = transport.startWorker(
+      async (_task, taskOpts) => {
+        capturedSignal = taskOpts?.signal;
+        await gate;
+      },
+      { signal: ctrl.signal },
+    );
+    await waitFor(() => capturedSignal !== undefined);
+    assert.equal(capturedSignal?.aborted, false);
+    ctrl.abort(); // worker-wide shutdown
+    await waitFor(() => capturedSignal?.aborted === true); // per-task signal aborted by shutdown
+    releaseGate();
+    await p;
   });
 
   test('idle worker stops promptly when the signal aborts', async () => {

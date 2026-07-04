@@ -42,6 +42,9 @@ implementation fixed):
 getFilterSig(filters?): string
 // undefined / {} / no own keys → "none"
 // else: sort keys; join "k:v" with "|"   e.g. { blur:40 } → "blur:40"; { b:2, a:1 } → "a:1|b:2"
+// ESCAPING (2026-07-05 review fix): in keys and stringified values, escape `\` → `\\`,
+// `|` → `\|`, `:` → `\:` BEFORE joining — otherwise { a:"1|b:2" } collides with { a:1, b:2 }
+// (same identity → cache confusion + lock shadowing within one media's variants).
 ```
 
 **Preview identity** — the one lookup/lock key used everywhere:

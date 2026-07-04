@@ -270,6 +270,26 @@ describe('processTask — source handling', () => {
     assert.equal(uploads.length, 0);
   });
 
+  test('inputPixels < source → rejected consistently at the guarded decode (orientation-6 source)', async () => {
+    // inputPixels below the source pixel count, but sourcePixels stays huge (default) so the
+    // sourcePixels guard does NOT catch it — every worker sharp() call must carry
+    // limitInputPixels (01 · §16), so the guarded metadata/normalize decode rejects it.
+    installApp({ limits: { inputPixels: 100 } }); // orientedJpeg 64×48 = 3072 px > 100
+    const { storage, uploads } = makeStorage(orientedJpeg);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      /pixel limit/i,
+    );
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+  });
+
   test('beforeSteps run ONCE and see DISPLAY-orientation pixels (orientation-6 source)', async () => {
     installApp();
     const { storage } = makeStorage(orientedJpeg);
@@ -354,6 +374,40 @@ describe('processTask — variants', () => {
     assert.deepEqual(acquired, ['resize_worker:m1:20x20:jpeg:none']);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
+  });
+
+  test('a rejecting worker-lock acquire skips only that variant; others generate + persist + release', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    const released: string[] = [];
+    const lockProvider: LockProvider = {
+      // The webp worker-lock acquire REJECTS — treated exactly like a not-acquired lock: skip the
+      // variant (leave it missing), never reject the pool or skip persist/finally. The jpeg variant
+      // is unaffected: generated, persisted, and its locks released (1.2a).
+      acquire: async (key: string) => {
+        if (key === 'resize_worker:m1:20x20:webp:none') {
+          throw new Error('lock backend down');
+        }
+        return true;
+      },
+      release: async (key: string) => {
+        released.push(key);
+      },
+    };
+    new Resizer({ storage, mediaStore, lockProvider });
+    await processTask(
+      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].key.split('.').pop(), 'jpeg');
+    assert.equal(appendCalls.length, 1);
+    assert.deepEqual(
+      appendCalls[0].previews.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.ok(released.includes('resize_worker:m1:20x20:jpeg:none'));
+    assert.ok(released.includes('resize_dispatch:m1:20x20:jpeg:none'));
   });
 
   test('variantSteps receive { variant } (with filters) and run in registration order', async () => {
@@ -843,6 +897,40 @@ describe('generate (eager)', () => {
     assert.equal(appendCalls.length, 0);
   });
 
+  test('throws a named error when media has neither id nor _id (host-facing)', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: { original: { key: 'uploads/o', contentType: 'image/jpeg' } },
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+        }),
+      /media has neither/,
+    );
+  });
+
+  test('SVG original → log + { previews: [] }, nothing uploaded or persisted (never rasterized)', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const { previews } = await r.generate({
+      media: mediaDoc({
+        original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
+      }),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(previews, []);
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+    assert.ok(logs.info.some((l) => String(l[0]).includes('SVG')));
+  });
+
   test('real ctx reaches beforeSteps and variantSteps', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
@@ -899,8 +987,8 @@ describe('runResizeWorker', () => {
     },
   });
 
-  test('worker.enabled=false → clean no-op (startWorker NOT called)', async () => {
-    installApp(); // default worker.enabled is false
+  test('worker.enabled=false → clean no-op (startWorker NOT called); log says how to enable', async () => {
+    const { logs } = installApp(); // default worker.enabled is false
     let started = false;
     new Resizer({
       storage: makeStorage(redPng).storage,
@@ -910,6 +998,9 @@ describe('runResizeWorker', () => {
     });
     await runResizeWorker();
     assert.equal(started, false);
+    assert.ok(
+      logs.info.some((l) => String(l[0]).includes('worker.enabled=true')),
+    );
   });
 
   test('no transport → logs an error and returns', async () => {

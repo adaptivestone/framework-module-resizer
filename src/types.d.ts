@@ -161,11 +161,12 @@ export interface ResizeConfig {
 
   // Queue/lease tuning (used by the Mongo transport; harmless for SQS, which has native redrive).
   queue: {
-    lockTtlMs: { dispatch: number; worker: number }; // default { 60000, 60000 }; worker MUST be ≤ leaseMs
+    lockTtlMs: { dispatch: number; worker: number }; // default { 60000, 60000 }; worker MUST be ≤ leaseMs (ENFORCED by getResizeConfig)
     leaseMs: number; // default 60000 — heartbeat renews at leaseMs/2
     retryBackoffMs: { base: number; max: number }; // default { base:5000, max:300000 }
-    maxAttempts: number; // default 3 — retries before dead-letter
+    maxAttempts: number; // default 5 — DELIVERY count before dead-letter (increments on every lease incl. reclaims, like SQS maxReceiveCount)
     idlePollMs: number; // default 1000
+    taskTimeoutMs: number; // default 600000 — handleTask raced against this; on timeout: heartbeat stopped, task signal aborted, fail() fired (05 · §10.2)
   };
 
   // Worker runtime tuning.

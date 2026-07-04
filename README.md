@@ -274,7 +274,10 @@ Credentials are never options — they resolve via the standard AWS provider cha
 | `client` | optional | bring-your-own configured `S3Client` |
 
 `publicUrl()` is **pure and I/O-free** (called on the read path). No per-object ACL — public access
-is a bucket policy. Credentials via the AWS provider chain.
+is a bucket policy. Credentials via the AWS provider chain. `download`/`publicUrl`/`signedUrl`
+enforce a **bucket allowlist**: a stored `ref.bucket` must be one of the configured
+`bucketPublic`/`bucketPrivate`, else they throw a named error — so a tampered media-doc `bucket`
+can never become a cross-bucket read or an attacker-controlled hostname in a URL.
 
 ### Custom driver = implement the interface
 
@@ -349,6 +352,12 @@ observer is **also** mirrored on the framework event bus as `resize:<name>` (e.g
 `resize:onTaskDeadLettered`), fire-and-forget, for ecosystem subscribers — but the typed `hook()`
 registry stays the primary contract because it is awaited and error-isolated.
 
+Taps are **typed** (`HookSignatures`): `hooks:` and `hook(name, fn)` infer each tap's exact
+signature from its name, so autocomplete works and a wrong argument/return shape is a compile error
+instead of a silent `any`. In every observer the `task` argument is the transport-agnostic
+`LeasedTask` (`{ taskId, mediaId, pipeline, previews }`) on **both** the Mongo and SQS transports —
+never a raw driver document — so a host tap is portable across transports.
+
 ---
 
 ## Sizes & identity
@@ -409,8 +418,9 @@ them by `getResizeConfig()` — override any knob at any depth. **Arrays REPLACE
 | `queue.lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | worker ≤ `leaseMs` |
 | `queue.leaseMs` | `60000` | heartbeat renews at `leaseMs/2`; set ≥ ~2× worst-case encode |
 | `queue.retryBackoffMs` | `{ base: 5000, max: 300000 }` | delayed re-lease on fail |
-| `queue.maxAttempts` | `3` | retries before dead-letter |
+| `queue.maxAttempts` | `5` | delivery count before dead-letter (increments on every lease incl. reclaims, like SQS `maxReceiveCount`) |
 | `queue.idlePollMs` | `1000` | empty-lease sleep |
+| `queue.taskTimeoutMs` | `600000` | `handleTask` is raced against this; on timeout the task is failed and the slot freed (Mongo transport) |
 | `worker.enabled` | `false` | gate the worker process (env-driven in host) |
 | `worker.concurrency` | `4` | variants resized in parallel per task |
 | `worker.sharpConcurrency` | `1` | `sharp.concurrency()`; keep `concurrency × sharpConcurrency ≈ nCPU` |
@@ -468,7 +478,8 @@ The module owns the resize core; the host owns everything domain-specific (spec 
 
 The framework enforces one app instance per process; tests install a fake via `setAppInstance(fake)`
 / `resetAppInstance()` (the `node:test` runner isolates each file in its own process). Build fresh
-Resizers with `resetResizerForTests()` between constructions. Current suite: **232 tests, all green**.
+Resizers with `resetResizerForTests()` between constructions. Run the full `node:test` suite with
+`npm test`.
 
 ## License
 

@@ -70,8 +70,9 @@ npm run build                 # preBuild → tsc → postBuild (emits dist/)
 | 10 | Public entry | `src/index.ts` | spec/02 §6 | ✅ done (TDD) | 8 |
 | — | README | `README.md` | spec §22.9 | ✅ done | — |
 | — | CI / packaging / release-prep | `.github/workflows/{ci,packaging}.yml`, `.github/dependabot.yml`, `smokeTest.ts`, `RELEASE.md` | mirrors framework + email repos | ✅ done | smoke green |
+| — | Review fix round (4 tiers + F11) | `resizeTask`, `enqueue`, `transports/{mongo,sqs}`, `storage/s3`, `config/resize`, `engine`, `images`, `resizer`, `index`, `worker`, `scaffold`, README/RELEASE/package.json | spec 01/03/04/05/06/07/08/09/11 (2026-07-05 review) | ✅ done (TDD) | +23 tests |
 
-**Suite total so far: 249 tests, all green (247 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
+**Suite total so far: 272 tests, all green (270 pass + 2 skipped: the live round-trip + a documented non-abort-rejection case).** Full target test plan is spec/09 §20.
 
 **All build steps complete — the module is feature-complete (build + dist import smoke green).**
 
@@ -284,6 +285,21 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     mirroring setAppInstance); worker + late taps use `getResizer()`. Scaffold gains an
     editable `src/resizer.ts` construction-site template. Step 4 reworked accordingly
     (registry.ts + hooks.ts fold into the Resizer class).
+14. **Consolidated review fix round (2026-07-05, 4 tiers + F11).** Correctness + hardening +
+    DX pass folded into the spec first, then implemented TDD. Key design deltas: the Mongo
+    **fence dropped its `leaseExpiresAt: {$gt}` clause** — token+status ARE the fence, so a
+    lapsed-but-unreclaimed worker can still `complete` (a re-claim mints a new token, so the old
+    one still 0-matches); **`queue.taskTimeoutMs`** (default 600000) added — `startWorker` races
+    `handleTask` against it, and worker-wide shutdown now aborts the in-flight task signal;
+    **typed hooks** via an exported `HookSignatures` map (`hook<N>` + `hooks:` infer each tap);
+    **all transport observers fire a transport-agnostic `LeasedTask`** (never a raw doc);
+    **S3 bucket allowlist** on download/publicUrl/signedUrl (tampered `ref.bucket` → named throw);
+    **`maxAttempts` default 3 → 5** (delivery-count semantics) + `getResizeConfig` now enforces
+    `lockTtlMs.worker ≤ leaseMs`; **`getFilterSig` escapes `\`/`|`/`:`** (collision fix); plus:
+    `limitInputPixels` on every worker `sharp()` call, guarded lock acquires (enqueue + worker),
+    SQS `on('error')` + guarded JSON.parse, mongo loop resilience, eager SVG guard, SVG signed
+    original, `requireMediaId`, `GenerateOpts`/`ResolveOpts`/`PrewarmOpts` type exports,
+    `package.json` `types` + `./package.json` export, `.npmignore` removed.
 
 ---
 

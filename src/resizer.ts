@@ -72,9 +72,47 @@ export type ObserverName =
   | 'onTaskDeadLettered';
 export type HookName = WaterfallName | ObserverName;
 
-// Deliberately loose: waterfall taps `(value, ctx) => value` and observer taps
-// `(...args) => void` have different shapes and are typed precisely at the public
-// Resizer.hook call site (10 · index). The bus stores them uniformly.
+// Per-hook tap signatures (04 · §9 review fix). The public `hook(name, fn)` + the `hooks:`
+// constructor option infer `fn`'s exact shape from `name`, so a typo'd tap body or a wrong
+// return shape is a COMPILE error instead of silent `any`. Waterfalls thread + return their
+// value; observers are fire-and-forget (return ignored). `task` is always the transport-agnostic
+// LeasedTask, and the worker/transport observers receive `ctx === {}`.
+export interface HookSignatures {
+  resolveSizes: (
+    sizes: SizeInput[],
+    ctx: Record<string, unknown>,
+  ) => SizeInput[] | Promise<SizeInput[]>;
+  beforeEnqueue: (
+    missing: MissingPreview[],
+    ctx: Record<string, unknown>,
+  ) => MissingPreview[] | Promise<MissingPreview[]>;
+  formatPublicUrls: (
+    decision: ReadDecision,
+    ctx: Record<string, unknown>,
+  ) => unknown | Promise<unknown>;
+  onPreviewGenerated: (
+    preview: Preview,
+    ctx: Record<string, unknown>,
+  ) => unknown;
+  afterTaskComplete: (
+    task: LeasedTask,
+    ctx: Record<string, unknown>,
+  ) => unknown;
+  onTaskFailed: (
+    task: LeasedTask,
+    error: unknown,
+    ctx: Record<string, unknown>,
+  ) => unknown;
+  onTaskDeadLettered: (
+    task: LeasedTask,
+    error: unknown,
+    ctx: Record<string, unknown>,
+  ) => unknown;
+}
+
+// Deliberately loose: the bus stores heterogeneous taps uniformly. The PUBLIC surface
+// (`hook<N>`, `ResizerOptions.hooks`) is typed via HookSignatures above; internal storage +
+// runWaterfall/runObservers keep this loose type with contained casts.
 // biome-ignore lint/suspicious/noExplicitAny: heterogeneous tap signatures; typed at Resizer.hook
 export type HookFn = (...args: any[]) => unknown;
 
@@ -90,7 +128,19 @@ export interface ResizerOptions {
   mediaStore?: MediaStore; // default: new FrameworkMediaStore() (05 · §10.6)
   lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
-  hooks?: Partial<Record<HookName, HookFn | HookFn[]>>; // initial taps (04 · §9)
+  // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
+  hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
+}
+
+// Options for eager `generate` (11 · Modes §11.1) — a NAMED type so hosts can annotate their
+// call sites and the method signature stays DRY (ResolveOpts / PrewarmOpts live in engine.ts).
+export interface GenerateOpts {
+  media: MediaLike;
+  sizes: SizeInput[];
+  pipeline?: string; // selects a registered pipeline; default 'default'
+  formats?: PreviewFormat[]; // default = requiredFormats(config)
+  ctx?: Record<string, unknown>; // real ctx reaches pipeline steps (eager mode, 04 · §8)
+  persist?: boolean; // default true → $push previews + backfill dims
 }
 
 // Unknown pipeline name → the shared, frozen empty pipeline (no steps). One frozen
@@ -118,6 +168,15 @@ export class Resizer {
   private readonly hooks: Map<HookName, HookFn[]>;
 
   constructor(opts: ResizerOptions) {
+    // Runtime storage validation (02 · §6 review fix): `storage` is the ONE required option —
+    // both modes need it (05 · §10.4). The type system enforces it for TS hosts, but a JS host or
+    // a half-filled scaffold would otherwise fail with a downstream TypeError at the first
+    // publicUrl/download — throw a NAMED error at construction instead.
+    if (!opts?.storage) {
+      throw new Error(
+        'resize: `storage` is required — construct `new Resizer({ storage: … })` with a ResizeStorage driver (e.g. new S3Storage({ … })); both the read path (publicUrl) and the worker (download/upload) need it (05 · §10.4)',
+      );
+    }
     // One-per-process ENFORCED, mirroring the framework's setAppInstance: a second
     // construction is a bootstrap bug (two competing driver sets), so throw loudly.
     if (activeResizer) {
@@ -135,18 +194,22 @@ export class Resizer {
     // COPY them, so a caller mutating its own array later cannot bypass hook().
     this.hooks = new Map();
     for (const [name, fns] of Object.entries(opts.hooks ?? {})) {
-      this.hooks.set(name as HookName, Array.isArray(fns) ? [...fns] : [fns]);
+      const arr = (Array.isArray(fns) ? [...fns] : [fns]) as HookFn[];
+      this.hooks.set(name as HookName, arr);
     }
     activeResizer = this;
   }
 
-  /** Register a tap. Multiple taps per name are allowed; registration order is preserved. */
-  hook(name: HookName, fn: HookFn): void {
+  /**
+   * Register a tap — `fn` is inferred from `name` via HookSignatures (04 · §9). Multiple taps per
+   * name are allowed; registration order is preserved. (Internal storage stays loosely typed.)
+   */
+  hook<N extends HookName>(name: N, fn: HookSignatures[N]): void {
     const taps = this.hooks.get(name);
     if (taps) {
-      taps.push(fn);
+      taps.push(fn as HookFn);
     } else {
-      this.hooks.set(name, [fn]);
+      this.hooks.set(name, [fn as HookFn]);
     }
   }
 
@@ -247,14 +310,7 @@ export class Resizer {
    * (bounded by config.worker.concurrency, NO locks). `persist !== false` → one
    * mediaStore.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
    */
-  async generate(opts: {
-    media: MediaLike;
-    sizes: SizeInput[];
-    pipeline?: string;
-    formats?: PreviewFormat[];
-    ctx?: Record<string, unknown>;
-    persist?: boolean; // default true → $push previews + backfill dims
-  }): Promise<{ previews: Preview[] }> {
+  async generate(opts: GenerateOpts): Promise<{ previews: Preview[] }> {
     return generateImpl(this, opts);
   }
 }

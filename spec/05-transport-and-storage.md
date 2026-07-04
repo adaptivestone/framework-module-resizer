@@ -65,6 +65,22 @@ transport-internal **methods** (public so unit tests can drive them; not part of
   `config.queue.leaseMs/2` so a long resize doesn't lose its lease. The `leaseToken` and `attempts`
   needed by `complete`/`fail` are retained from the `lease` result in the loop's **own
   closure** — they are not part of `LeasedTask` and never reach `handleTask`/`processTask`.
+  **Task timeout (2026-07-05 review fix):** `handleTask` is raced against
+  `config.queue.taskTimeoutMs` (default 600000). On timeout: stop the heartbeat, abort the
+  per-task `taskOpts.signal`, `fail(...)` the task, and continue the loop — the slot is freed
+  and the lease lapses; a still-running detached handler is harmless (its `complete`/`fail`
+  are token-fenced, its `$push` writes valid previews). Without this, one hung I/O call wedges
+  the slot forever — the heartbeat keeps renewing, so even the sweep can't reclaim it.
+  **Shutdown wiring:** `opts.signal` (worker-wide) also aborts the CURRENT task's
+  `taskOpts.signal`, so an in-flight task finishes its current variant, skips the rest, and
+  the loop exits promptly instead of hanging until SIGKILL.
+  **Loop resilience (2026-07-05 review fix):** each poll iteration (sweep + lease) is guarded —
+  a thrown DB error is logged and the loop sleeps `idlePollMs` and retries, forever. A worker
+  daemon must survive transient Mongo outages (mongoose buffers short blips; hard rejections
+  must not kill `startWorker`). Sustained outage = perpetual log-and-retry, by design.
+  **Observer payload (2026-07-05 review fix):** ALL observers fired by ANY transport receive
+  the transport-agnostic **`LeasedTask`** shape (`{ taskId, mediaId, pipeline, previews }`) —
+  never a raw Mongo document — so host taps are portable across transports.
 - **dead-letter sweep** (each poll, cheap + indexed) — moves crash-looped tasks out of
   rotation (a worker that died never called `fail`, so the task is stuck `processing`):
 
@@ -106,10 +122,17 @@ ResizeTask.findOneAndUpdate(
 
 The claim mints a fresh random **`leaseToken`** (the fencing token;
 `randomToken() = randomBytes(16).toString('hex')`). `complete`/`fail`/`renew`
-all filter on `{ _id, leaseToken, status:'processing', leaseExpiresAt:{ $gt: now } }` — a
-0-matched update means this worker **lost the lease** (its lease expired and another worker
-re-claimed), so it drops the result instead of clobbering the new owner. (Validated against
-mongodb-queue's `ack`-token guard and mongomq2 — see [Appendix C1](./appendix.md).)
+all filter on `{ _id, leaseToken, status:'processing' }` — a
+0-matched update means this worker **lost the lease** (another worker re-claimed and minted a
+new token, or the sweep dead-lettered it), so it drops the result instead of clobbering the
+new owner. (Validated against mongodb-queue's `ack`-token guard and mongomq2 — see
+[Appendix C1](./appendix.md).) **The fence deliberately does NOT require an unexpired
+`leaseExpiresAt`** (2026-07-05 review fix): the token is the real fence — a worker whose lease
+merely *lapsed* without being re-claimed still holds the winning token and MUST be able to
+`complete` its finished work; requiring `$gt: now` turned a just-expired successful task into
+a spurious re-process/dead-letter. **`attempts` is a DELIVERY count** (incremented on every
+lease, including reclaims — the same semantics as SQS `maxReceiveCount`): lease churn counts
+toward `maxAttempts`, which is why the default is 5 (see [08 · §13](./08-config-and-scaffold.md)).
 
 - `renew(taskId, leaseToken)` → extend the lease: guarded `$set: { leaseExpiresAt: now+leaseMs }`.
   Called by the worker heartbeat. If it **0-matches, the lease was lost** (another worker
@@ -164,7 +187,12 @@ export interface SqsTransportOptions {
   handleMessage, visibilityTimeout?, heartbeatInterval? })`;
   per message parse → `handleTask` → on resolve ack/delete + fire `afterTaskComplete`; on throw,
   fire `onTaskFailed` and let SQS redeliver after the queue's visibility timeout. Wire
-  `opts.signal` → `consumer.stop()`.
+  `opts.signal` → `consumer.stop()`. **Two 2026-07-05 review fixes:** (a) the consumer error
+  listener MUST be `consumer.on('error', …)` — `once` leaves the SECOND recurring error
+  unhandled, which crashes the process (heartbeat `ChangeMessageVisibility` failures emit
+  exactly such recurring errors); (b) the message-body `JSON.parse` runs INSIDE the guarded
+  region so a malformed body also fires `onTaskFailed` before SQS redelivery, consistent with
+  handler throws.
 - **Dead-letter is native** — no module code. The host configures the queue's redrive
   policy (`maxReceiveCount = config.queue.maxAttempts`) with a DLQ; the transport just throws on
   failure, SQS redelivers up to the cap, then moves the message to the DLQ. There is no
@@ -264,7 +292,13 @@ export interface S3StorageOptions {
 - `upload` → `PutObjectCommand` to `bucketPublic`/`bucketPrivate` by `visibility`; returns
   `{ bucket, key }`. **No per-object ACL** — public access is bucket policy (every prior
   implementation works this way).
-- `download` → `GetObjectCommand(ref.bucket ?? opts.bucketPrivate ?? opts.bucketPublic, ref.key)` → `Buffer`.
+- **Bucket allowlist (2026-07-05 review fix):** every method that consumes a stored
+  `ref.bucket` (download / publicUrl / signedUrl) MUST verify it is one of the driver's
+  configured buckets (`bucketPublic`/`bucketPrivate`) and THROW a named error otherwise — a
+  tampered media-doc `bucket` string must not become a cross-bucket read or an
+  attacker-controlled hostname in a public URL (the virtual-hosted form interpolates the
+  bucket into the host). `resolve`'s never-throw wrapper absorbs the read-path throw.
+- `download` → `GetObjectCommand(ref.bucket ?? opts.bucketPrivate ?? opts.bucketPublic, ref.key)` → `Buffer` (ref.bucket allowlisted first).
 - `publicUrl` → **pure string building, no SDK, no I/O**: `${opts.publicUrl}/${ref.key}` when
   set; else path-style `${endpoint}/${bucket}/${key}` when `endpoint`/`forcePathStyle`, else
   virtual-hosted `https://${bucket}.s3.${region}.amazonaws.com/${key}`.

@@ -50,7 +50,19 @@ export async function enqueue(
   const survivorLockKeys: string[] = [];
   for (const [identity, m] of byIdentity) {
     const lockKey = `resize_dispatch:${mediaId}:${identity}`;
-    if (await resizer.lockProvider.acquire(lockKey, dispatchTtlMs)) {
+    // A rejecting acquire = this variant is NOT a survivor (log + continue); earlier survivors are
+    // unaffected and still reach the transport. enqueue must never throw into the read (1.2b).
+    let acquired: boolean;
+    try {
+      acquired = await resizer.lockProvider.acquire(lockKey, dispatchTtlMs);
+    } catch (err) {
+      getApp().logger.error(
+        `resize enqueue: dispatch-lock acquire failed for ${lockKey} on media ${mediaId} — skipping this variant`,
+        err,
+      );
+      continue;
+    }
+    if (acquired) {
       survivors.push(m);
       survivorLockKeys.push(lockKey);
     }

@@ -93,18 +93,28 @@ export class SqsTransport implements QueueTransport {
       // SQS to redeliver after the visibility timeout (→ DLQ via redrive policy).
       // Arrow function: sqs-consumer invokes it detached, so `this` stays instance-bound.
       handleMessage: async (message) => {
-        const body = JSON.parse(message.Body ?? '{}') as {
-          mediaId: string;
-          pipeline: string;
-          previews: LeasedTask['previews'];
-        };
-        const task: LeasedTask = {
+        // The body JSON.parse is INSIDE the guarded region (05 · §10.3 fix b): a malformed body
+        // fires onTaskFailed before rethrowing, consistent with a handler throw → SQS redelivers.
+        // `task` starts as a minimal LeasedTask (fields unknown until the body parses) so the
+        // observer always receives a task-shaped payload.
+        let task: LeasedTask = {
           taskId: message.MessageId ?? '',
-          mediaId: body.mediaId,
-          pipeline: body.pipeline,
-          previews: body.previews ?? [],
+          mediaId: '',
+          pipeline: '',
+          previews: [],
         };
         try {
+          const body = JSON.parse(message.Body ?? '{}') as {
+            mediaId: string;
+            pipeline: string;
+            previews: LeasedTask['previews'];
+          };
+          task = {
+            taskId: message.MessageId ?? '',
+            mediaId: body.mediaId,
+            pipeline: body.pipeline,
+            previews: body.previews ?? [],
+          };
           await handleTask(task);
         } catch (err) {
           await getResizer().runObservers('onTaskFailed', task, err, {});
@@ -127,7 +137,10 @@ export class SqsTransport implements QueueTransport {
     // workerOpts.signal → consumer.stop() (graceful: sqs-consumer finishes in-flight first).
     await new Promise<void>((resolve) => {
       consumer.once('stopped', () => resolve());
-      consumer.once('error', (err) => {
+      // `on`, NOT `once`: recurring consumer errors (e.g. heartbeat ChangeMessageVisibility
+      // failures) must ALL be logged — a `once` listener drops every error after the first,
+      // leaving later ones unhandled (05 · §10.3 fix a).
+      consumer.on('error', (err) => {
         getApp().logger.error('resize sqs consumer error', err);
       });
       const stop = () => consumer.stop();

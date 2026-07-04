@@ -119,17 +119,18 @@ describe('S3Storage.upload', () => {
 // ---------------------------------------------------------------------------
 
 describe('S3Storage.download', () => {
-  test('uses ref.bucket when present and returns a Buffer', async () => {
+  test('uses ref.bucket when present (allowlisted) and returns a Buffer', async () => {
     const { client, sent } = makeFakeS3();
     const s = new S3Storage({
       bucketPublic: 'pub',
       bucketPrivate: 'priv',
       client,
     });
-    const buf = await s.download({ bucket: 'explicit', key: 'orig.jpg' });
+    // ref.bucket wins over the private fallback — must be one of the configured buckets.
+    const buf = await s.download({ bucket: 'pub', key: 'orig.jpg' });
     assert.ok(Buffer.isBuffer(buf));
     assert.deepEqual([...buf], [1, 2, 3]);
-    assert.equal(sent[0].input.Bucket, 'explicit');
+    assert.equal(sent[0].input.Bucket, 'pub');
     assert.equal(sent[0].input.Key, 'orig.jpg');
   });
 
@@ -183,7 +184,12 @@ describe('S3Storage.publicUrl (pure — no client)', () => {
   });
 
   test('virtual-hosted form uses region (defaulting to us-east-1) and ref.bucket ?? bucketPublic', () => {
-    const s = new S3Storage({ bucketPublic: 'pub', region: 'eu-west-1' });
+    // `other` is an allowlisted bucket here (bucketPrivate) so ref.bucket can select it.
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'other',
+      region: 'eu-west-1',
+    });
     assert.equal(
       s.publicUrl({ key: 'a/b.jpg' }),
       'https://pub.s3.eu-west-1.amazonaws.com/a/b.jpg',
@@ -198,6 +204,50 @@ describe('S3Storage.publicUrl (pure — no client)', () => {
       sDefault.publicUrl({ key: 'k' }),
       'https://pub.s3.us-east-1.amazonaws.com/k',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bucket allowlist — a tampered ref.bucket is refused (05 · §10.5)
+// ---------------------------------------------------------------------------
+
+describe('S3Storage bucket allowlist', () => {
+  test('download/publicUrl/signedUrl throw a named error for a bucket ∉ {public,private}', async () => {
+    const client = new S3Client({
+      region: 'us-east-1',
+      credentials: { accessKeyId: 'x', secretAccessKey: 'y' },
+    });
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    const tampered = { bucket: 'attacker-bucket', key: 'k' };
+    await assert.rejects(() => s.download(tampered), /attacker-bucket/);
+    assert.throws(() => s.publicUrl(tampered), /attacker-bucket/);
+    await assert.rejects(
+      () => s.signedUrl?.(tampered, 900) as Promise<string>,
+      /attacker-bucket/,
+    );
+  });
+
+  test('the configured buckets pass; a ref without a bucket is unchanged', async () => {
+    const { client } = makeFakeS3();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    // configured buckets pass
+    await s.download({ bucket: 'pub', key: 'k' });
+    await s.download({ bucket: 'priv', key: 'k' });
+    assert.equal(
+      s.publicUrl({ bucket: 'pub', key: 'k' }).includes('pub'),
+      true,
+    );
+    // no ref.bucket → fallbacks, no throw
+    assert.doesNotThrow(() => s.publicUrl({ key: 'k' }));
+    await s.download({ key: 'k' });
   });
 });
 

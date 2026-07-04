@@ -169,8 +169,10 @@ export { default as defaultResizeConfig, getResizeConfig, requiredFormats } from
 // QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider.)
 export type {
   QueueTransport, LeasedTask, ResizeStorage, MediaStore, LockProvider,
-  Pipeline, BeforeStep, VariantStep, HookName, HookFn, ResizerOptions,
+  Pipeline, BeforeStep, VariantStep, HookName, HookFn, HookSignatures,
+  ResizerOptions, GenerateOpts,
 } from './resizer.ts';   // contract types for custom-driver authors (values live at the subpaths)
+export type { ResolveOpts, PrewarmOpts } from './engine.ts';  // read-path / pre-warm option types
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';  // BaseModel subclass; the host's scaffolded model `extends` it (Mongo transport)
 export type { TResizeTask } from './models/ResizeTask.ts';            // = GetModelTypeFromClass<typeof ResizeTaskModel>
 export { resizeMediaSchemaFragment } from './models/mediaFragment.ts';  // optional `as const` schema fragment the host spreads into File/Media (08 · §12)
@@ -206,7 +208,10 @@ export interface ResizerOptions {
 }
 
 class Resizer {
-  constructor(opts: ResizerOptions);     // fills defaults; sets the active instance (throws on a second construction)
+  constructor(opts: ResizerOptions);     // fills defaults; sets the active instance (throws on a second construction).
+                                         // ALSO validates at RUNTIME that opts.storage is present (2026-07-05 review
+                                         // fix — protects JS hosts and half-filled scaffolds with a NAMED error,
+                                         // not a downstream TypeError)
 
   // --- incremental extension (other modules can tap in via getResizer()) ---
   hook(name: HookName, fn: HookFn): void;             // appends (04 · §9)

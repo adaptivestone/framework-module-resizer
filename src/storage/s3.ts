@@ -63,6 +63,23 @@ export class S3Storage implements ResizeStorage {
     return this.client;
   }
 
+  // Bucket allowlist (05 · §10.5): a stored `ref.bucket` MUST be one of the driver's configured
+  // buckets. A tampered media-doc `bucket` must never become a cross-bucket read or an
+  // attacker-controlled hostname in a public URL (the virtual-hosted form interpolates the bucket
+  // into the host). ref.bucket === undefined is fine — the caller uses the configured fallbacks.
+  private assertAllowedBucket(bucket: string | undefined): void {
+    if (
+      bucket === undefined ||
+      bucket === this.opts.bucketPublic ||
+      bucket === this.opts.bucketPrivate
+    ) {
+      return;
+    }
+    throw new Error(
+      `resize s3: ref.bucket "${bucket}" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access (05 · §10.5)`,
+    );
+  }
+
   // Upload a NEW object. Route by visibility (NO per-object ACL — public access is a
   // bucket policy). The driver owns the physical bucket; returns the ref to persist.
   async upload({
@@ -94,6 +111,7 @@ export class S3Storage implements ResizeStorage {
   // Download by stored locator (the worker's original). ref.bucket wins, then the
   // private/public fallbacks.
   async download(ref: StorageRef): Promise<Buffer> {
+    this.assertAllowedBucket(ref.bucket);
     const bucket =
       ref.bucket ?? this.opts.bucketPrivate ?? this.opts.bucketPublic;
     const out = await this.getClient().send(
@@ -111,6 +129,7 @@ export class S3Storage implements ResizeStorage {
   // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
   // virtual-hosted. bucket = ref.bucket ?? bucketPublic.
   publicUrl(ref: StorageRef): string {
+    this.assertAllowedBucket(ref.bucket);
     const bucket = ref.bucket ?? this.opts.bucketPublic;
     if (this.opts.publicUrl) {
       return `${this.opts.publicUrl.replace(/\/+$/, '')}/${ref.key}`;
@@ -124,6 +143,7 @@ export class S3Storage implements ResizeStorage {
 
   // Time-limited signed URL for owner/admin reads of a private original.
   async signedUrl(ref: StorageRef, ttlSeconds: number): Promise<string> {
+    this.assertAllowedBucket(ref.bucket);
     const bucket =
       ref.bucket ?? this.opts.bucketPrivate ?? this.opts.bucketPublic;
     return getSignedUrl(

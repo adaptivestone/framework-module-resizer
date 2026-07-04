@@ -64,6 +64,14 @@ export function parseSizeKey(key: string): ParsedSizeKey {
   return { sizeKey: key, fit: false };
 }
 
+// Escape the `|` (pair separator) and `:` (key/value separator) so a filter key/value that
+// contains them cannot forge a boundary — otherwise `{ a: '1|b:2' }` collides with
+// `{ a: 1, b: 2 }` (same identity → cache confusion + lock shadowing). Backslash is escaped
+// FIRST so the escapes we then add for `|`/`:` are not themselves re-escaped. (03 · §7 review fix)
+function escapeFilterPart(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/:/g, '\\:');
+}
+
 /** Canonical, order-independent filter signature. Empty / undefined → "none". */
 export function getFilterSig(filters?: Filters): string {
   if (!filters) {
@@ -73,7 +81,28 @@ export function getFilterSig(filters?: Filters): string {
   if (keys.length === 0) {
     return 'none';
   }
-  return keys.map((k) => `${k}:${filters[k]}`).join('|');
+  return keys
+    .map(
+      (k) => `${escapeFilterPart(k)}:${escapeFilterPart(String(filters[k]))}`,
+    )
+    .join('|');
+}
+
+/**
+ * The media id, by the precedence `media.id ?? String(media._id)` (02 · §5). THROWS a named error
+ * when neither is present — a media with no id cannot be identified, enqueued, or persisted, and
+ * `String(undefined)` would silently produce the literal `'undefined'` as a lock/queue key. Eager
+ * `generate` surfaces this to the host; `resolve`/`prewarm` let their never-throw wrapper log it +
+ * return the safe value. (04 · papercut)
+ */
+export function requireMediaId(media: MediaLike): string {
+  const id = media.id ?? (media._id != null ? String(media._id) : undefined);
+  if (!id) {
+    throw new Error(
+      'resize: media has neither `id` nor `_id` — cannot identify the media document',
+    );
+  }
+  return id;
 }
 
 /** The one lookup/lock key used everywhere: `${sizeKey}:${format}:${filterSig}`. */

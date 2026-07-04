@@ -26,8 +26,11 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
    (`original.contentType === 'image/svg+xml'`, or `original.format === 'svg'`): for every
    requested `size × format` (skip a size whose `getSizeKey` throws, as in step 7), push a
    `ready` entry with **`preview` omitted and `isOriginal: true`** (`ReadyEntry` —
-   [02 · Types](./02-types-and-api.md#5-data-shapes-srctypesdts)), whose `url` is the
-   **original's** public URL (`storage.publicUrl(media.original)` — the same rule as below),
+   [02 · Types](./02-types-and-api.md#5-data-shapes-srctypesdts)), whose `url` follows **the
+   same original-URL rule as the fast-path below** (2026-07-05 review fix — the previous
+   inline `publicUrl` snippet contradicted "the same rule as below"): `storage.publicUrl(media.original)`,
+   OR `storage.signedUrl(media.original, ttl)` when `ctx.isOwner || ctx.isAdmin` and the
+   driver supports it (so a private-bucket SVG read by its owner works),
    **ignoring the requested `format`** — an SVG renders crisply at any size and is always served
    as `image/svg+xml`. Leave
    `decision.missing` empty: SVG is **never enqueued and never rasterized** (vector resize is

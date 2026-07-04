@@ -77,8 +77,10 @@ framework-module-resize/
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
+    "./package.json": "./package.json",
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
     "./config/resize.js": "./dist/config/resize.js",

@@ -14,6 +14,7 @@ import {
   getFilterSig,
   getPreviewIdentity,
   getSizeKey,
+  requireMediaId,
 } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
@@ -68,7 +69,9 @@ export async function resolveImpl(
     const ctx = opts.ctx ?? {};
     const storage = resizer.storage; // required constructor option — always present (§17.3)
     const pipeline = opts.pipeline ?? 'default';
-    const mediaId = media.id ?? String(media._id);
+    // Inside the never-throw try: a media with no id/_id logs + returns the safe empty decision
+    // rather than enqueueing under the literal 'undefined' key (04 · papercut).
+    const mediaId = requireMediaId(media);
 
     // 1. Host size magic (expand/inject/map/dedupe). Guarded per-tap inside runWaterfall.
     const sizes = (await resizer.runWaterfall(
@@ -97,8 +100,10 @@ export async function resolveImpl(
       (original.contentType === 'image/svg+xml' || original.format === 'svg')
     ) {
       // 6. SVG pass-through — served at every size×format from the ORIGINAL url, never
-      // resized or enqueued (vector resize is a no-op); the requested format is ignored.
-      const url = storage.publicUrl(original);
+      // resized or enqueued (vector resize is a no-op); the requested format is ignored. Routes
+      // through the SAME original-URL rule as the fast-path (06 · §17 step 6): signedUrl for an
+      // owner/admin when the driver supports it (private-bucket SVG read), else pure publicUrl.
+      const url = await originalUrl(resizer, original, ctx);
       for (const size of sizes) {
         let sizeKey: string;
         try {
@@ -250,7 +255,8 @@ export async function prewarmImpl(
     const ctx = opts.ctx ?? {};
     const { media } = opts;
     const pipeline = opts.pipeline ?? 'default';
-    const mediaId = media.id ?? String(media._id);
+    // Inside the never-throw try: no id/_id logs + returns { enqueued: 0 } (04 · papercut).
+    const mediaId = requireMediaId(media);
 
     // 1. Host size magic (same waterfall as resolve; real ctx reaches the taps).
     const sizes = (await resizer.runWaterfall(

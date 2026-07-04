@@ -16,13 +16,18 @@ import {
   calculateResizedDimensions,
   expandMissingPreviews,
   getPreviewIdentity,
+  requireMediaId,
 } from './images.ts';
-import { getResizer, type LeasedTask, type Resizer } from './resizer.ts';
+import {
+  type GenerateOpts,
+  getResizer,
+  type LeasedTask,
+  type Resizer,
+} from './resizer.ts';
 import type {
   MediaLike,
   MissingPreview,
   Preview,
-  PreviewFormat,
   SizeInput,
 } from './types.d.ts';
 
@@ -98,8 +103,12 @@ export async function generatePreviews(
   // 2. Download the original ONCE.
   let buf = asBuffer(await storage.download(original));
 
-  // 3. Metadata + decode-bomb guards + orientation normalization (07 · §11 step 3).
-  const origMeta = await sharp(buf).metadata();
+  // 3. Metadata + decode-bomb guards + orientation normalization (07 · §11 step 3). EVERY worker
+  // sharp() call carries limitInputPixels (01 · §16), so an oversized-for-inputPixels source is
+  // rejected consistently at this first probe rather than slipping through to a per-variant decode.
+  const origMeta = await sharp(buf, {
+    limitInputPixels: config.limits.inputPixels,
+  }).metadata();
   if (origMeta.width === undefined || origMeta.height === undefined) {
     throw new Error(
       `resize: source metadata missing width/height for media ${mediaId} — cannot size safely`,
@@ -124,8 +133,15 @@ export async function generatePreviews(
   // orientation and desync the result). Per-variant `.rotate()` below is then defense-in-depth.
   let displayMeta = origMeta;
   if (orientation > 1) {
-    buf = await sharp(buf, { failOn: 'none' }).rotate().toBuffer();
-    displayMeta = await sharp(buf).metadata();
+    buf = await sharp(buf, {
+      failOn: 'none',
+      limitInputPixels: config.limits.inputPixels,
+    })
+      .rotate()
+      .toBuffer();
+    displayMeta = await sharp(buf, {
+      limitInputPixels: config.limits.inputPixels,
+    }).metadata();
   }
 
   // 4. beforeSteps — the ordered, awaited chain, ONCE, over the display-orientation buffer.
@@ -135,7 +151,9 @@ export async function generatePreviews(
   }
 
   // 5. Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
-  const procMeta = await sharp(buf).metadata();
+  const procMeta = await sharp(buf, {
+    limitInputPixels: config.limits.inputPixels,
+  }).metadata();
   const procW = procMeta.width ?? dispW;
   const procH = procMeta.height ?? dispH;
 
@@ -173,11 +191,23 @@ export async function generatePreviews(
 
     // Best-effort worker lock (queued mode only) — dedup, not correctness. Not acquired →
     // leave the variant MISSING (do NOT treat as done); the next read re-detects + re-enqueues.
+    // An acquire REJECTION behaves EXACTLY like "not acquired": log + skip; it must never reject
+    // the bounded pool (that would skip persist + the held-lock release) — a lock-infra hiccup is
+    // not a poison variant, so it does NOT count toward the poison-guard's failedCount (1.2a).
     if (useLocks) {
-      const acquired = await resizer.lockProvider.acquire(
-        workerKey,
-        config.queue.lockTtlMs.worker,
-      );
+      let acquired: boolean;
+      try {
+        acquired = await resizer.lockProvider.acquire(
+          workerKey,
+          config.queue.lockTtlMs.worker,
+        );
+      } catch (err) {
+        app.logger.error(
+          `resize worker: worker-lock acquire failed for ${identity} on media ${mediaId} — leaving variant missing`,
+          err,
+        );
+        return;
+      }
       if (!acquired) {
         return;
       }
@@ -414,20 +444,29 @@ export async function processTask(
 
 export async function generateImpl(
   resizer: Resizer,
-  opts: {
-    media: MediaLike;
-    sizes: SizeInput[];
-    pipeline?: string;
-    formats?: PreviewFormat[];
-    ctx?: Record<string, unknown>;
-    persist?: boolean;
-  },
+  opts: GenerateOpts,
 ): Promise<{ previews: Preview[] }> {
   const config = getResizeConfig();
   const ctx = opts.ctx ?? {};
   const { media } = opts;
   const pipeline = opts.pipeline ?? 'default';
-  const mediaId = media.id ?? String(media._id);
+  // Eager mode is host-facing: a media with no id/_id is a caller bug → throw a named error
+  // (04 · papercut) rather than silently keying on the literal 'undefined'.
+  const mediaId = requireMediaId(media);
+
+  // 0. SVG guard (11 · §11.1 step 0): SVG originals are pass-through — NEVER rasterized in ANY
+  // mode. Log + return empty so eager `generate` matches the read path + queued worker (the
+  // guard previously lived only in processTask, letting eager generate rasterize an SVG).
+  const original = media.original;
+  if (
+    original &&
+    (original.contentType === 'image/svg+xml' || original.format === 'svg')
+  ) {
+    getApp().logger.info(
+      `resize generate: media ${mediaId} original is SVG — pass-through, nothing to generate`,
+    );
+    return { previews: [] };
+  }
 
   // Host size magic (real ctx in eager mode), then the active format list.
   const sizes = (await resizer.runWaterfall(

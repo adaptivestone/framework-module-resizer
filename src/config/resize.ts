@@ -28,8 +28,9 @@ const defaultResizeConfig: Omit<ResizeConfig, 'mediaModelName'> = {
     lockTtlMs: { dispatch: 60000, worker: 60000 },
     leaseMs: 60000,
     retryBackoffMs: { base: 5000, max: 300000 },
-    maxAttempts: 3,
+    maxAttempts: 5,
     idlePollMs: 1000,
+    taskTimeoutMs: 600000,
   },
   worker: {
     enabled: false,
@@ -59,6 +60,14 @@ export function getResizeConfig(): ResizeConfig {
   if (!merged.mediaModelName) {
     throw new Error(
       'resize config: `mediaModelName` is required — set it in the host src/config/resize.ts',
+    );
+  }
+  // Doneness invariant (07 · Worker): a worker lock MUST expire within the lease window, else a
+  // crashed worker's lock outlives its lease and blocks the re-leased task from regenerating the
+  // skipped variant. Enforce lockTtlMs.worker ≤ leaseMs at config resolution (08 · §13).
+  if (merged.queue.lockTtlMs.worker > merged.queue.leaseMs) {
+    throw new Error(
+      `resize config: queue.lockTtlMs.worker (${merged.queue.lockTtlMs.worker}) must be ≤ queue.leaseMs (${merged.queue.leaseMs}) — a worker lock must expire within the lease window (07 · doneness invariant)`,
     );
   }
   return merged;

@@ -12,7 +12,9 @@ export async function runResizeWorker(): Promise<void> {
   const app = getApp();
   const config = getResizeConfig();
   if (config.worker.enabled === false) {
-    app.logger.info('resize worker disabled (worker.enabled=false)');
+    app.logger.info(
+      'resize worker disabled — set config.worker.enabled=true (env-gated in the host config) to run it',
+    );
     return;
   }
   const { transport } = getResizer();

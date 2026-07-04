@@ -4,11 +4,13 @@
   "description": "Adaptive stone node js framework module: lazy image resize (sharp)",
   "main": "./dist/index.js",
   "type": "module",
+  "types": "./dist/index.d.ts",
   "engines": {
     "node": ">=24.0.0"
   },
   "exports": {
     ".": "./dist/index.js",
+    "./package.json": "./package.json",
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
     "./config/resize.js": "./dist/config/resize.js",

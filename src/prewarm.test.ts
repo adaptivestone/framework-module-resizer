@@ -428,6 +428,21 @@ describe('prewarm — never throws', () => {
     assert.equal(calls[0].previews[0].sizeKey, '300x300');
     assert.ok(errors.length >= 1);
   });
+
+  test('media with no id/_id → logged { enqueued: 0 } (never-throw wrapper absorbs requireMediaId)', async () => {
+    const { errors } = installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const { enqueued } = await r.prewarm({
+      media: { original: { key: 'orig.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(enqueued, 0);
+    assert.equal(calls.length, 0);
+    assert.ok(errors.length >= 1);
+  });
 });
 
 describe('prewarm — fast-path is NOT consulted', () => {

@@ -427,6 +427,37 @@ describe('resolve — SVG pass-through', () => {
     ]);
   });
 
+  test('a private SVG served to an owner uses signedUrl (same original-URL rule as the fast-path)', async () => {
+    installFakeApp();
+    const storage = makeStorage({
+      signedUrl: async (ref, ttl) => `https://signed/${ref.key}?ttl=${ttl}`,
+    });
+    const r = new Resizer({ storage });
+    const media: MediaLike = {
+      id: 'm1',
+      original: { key: 'private/logo.svg', contentType: 'image/svg+xml' },
+    };
+    const owned = await r.resolve({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      ctx: { isOwner: true },
+      enqueueMissing: false,
+    });
+    assert.equal(
+      owned.decision.ready[0].url,
+      'https://signed/private/logo.svg?ttl=300',
+    );
+    // No owner ctx → the pure public URL.
+    const anon = await r.resolve({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      enqueueMissing: false,
+    });
+    assert.equal(anon.decision.ready[0].url, 'https://cdn/private/logo.svg');
+  });
+
   test('detects SVG via original.format === "svg" too', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
@@ -641,6 +672,19 @@ describe('resolve — never throws', () => {
     assert.equal(decision.ready.length, 1);
     assert.equal(decision.ready[0].url, 'https://cdn/p1');
     assert.equal(decision.missing.length, 0);
+    assert.equal(output, decision);
+    assert.ok(errors.length >= 1);
+  });
+
+  test('media with no id/_id → logged safe empty decision (never-throw wrapper absorbs requireMediaId)', async () => {
+    const { errors } = installFakeApp();
+    const r = new Resizer({ storage: makeStorage() });
+    const { decision, output } = await r.resolve({
+      media: { original: { key: 'orig.jpg', contentType: 'image/jpeg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(decision, { ready: [], missing: [] });
     assert.equal(output, decision);
     assert.ok(errors.length >= 1);
   });

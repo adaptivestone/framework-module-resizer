@@ -14,7 +14,7 @@ npm ci                 # reproducible install from the lockfile
 node --run types:check # tsc --noEmit
 node --run check       # biome
 node --run build       # preBuild → tsc → postBuild (emits dist/)
-npm test               # node --experimental-strip-types --test  (232 tests)
+npm test               # node --experimental-strip-types --test  (the full node:test suite)
 npm run smoke          # builds, packs, installs into a throwaway consumer, verifies the
                        # published surface + the resize-scaffold bin end-to-end
 ```

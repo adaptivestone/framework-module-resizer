@@ -145,6 +145,34 @@ describe('enqueue', () => {
     assert.equal(enqueued, 1); // only the surviving winner is counted
   });
 
+  test('a rejecting dispatch-lock acquire skips that variant; earlier survivors still enqueue', async () => {
+    const { errors } = installFakeApp();
+    const { transport, calls } = makeTransport();
+    const lockProvider: LockProvider = {
+      // jpeg acquires fine; the webp acquire REJECTS — that variant is not a survivor (log +
+      // continue), and the earlier jpeg survivor still reaches the transport (1.2b).
+      acquire: async (key) => {
+        if (key.endsWith(':webp:none')) {
+          throw new Error('lock backend down');
+        }
+        return true;
+      },
+      release: async () => {},
+    };
+    const r = makeResizer({ transport, lockProvider });
+    const enqueued = await enqueue(r, 'm1', 'default', [
+      variant(),
+      variant({ format: 'webp' }),
+    ]);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.equal(enqueued, 1);
+    assert.ok(errors.length >= 1);
+  });
+
   test('does not call the transport when no lock survives', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();

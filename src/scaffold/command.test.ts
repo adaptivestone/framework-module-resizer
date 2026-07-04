@@ -148,6 +148,9 @@ describe('runScaffold — --eager', () => {
     const resizer = await read(RESIZER);
     assert.doesNotMatch(resizer, /^\s*transport: new MongoTransport/m);
     assert.match(resizer, /\/\/\s*transport/);
+    // The now-unused MongoTransport import is commented too (4.3).
+    assert.doesNotMatch(resizer, /^\s*import \{ MongoTransport \}/m);
+    assert.match(resizer, /\/\/\s*import \{ MongoTransport \}/);
   });
 });
 
