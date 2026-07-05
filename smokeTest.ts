@@ -16,6 +16,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -176,6 +177,19 @@ try {
     consumer,
   );
 
+  // (a0) AGENTS.md must ship inside the installed package (package.json "files").
+  const installedAgents = join(
+    consumer,
+    'node_modules',
+    '@adaptivestone',
+    'framework-module-resize',
+    'AGENTS.md',
+  );
+  if (!existsSync(installedAgents)) {
+    throw new Error('installed package is missing AGENTS.md');
+  }
+  console.log('  ok  AGENTS.md ships with the package');
+
   // (a) main entry imports + exposes the 17 core exports, (b) optional subpaths fail loudly
   // without their SDKs, (c) the always-safe subpaths import. Runs INSIDE the consumer so
   // module resolution is the consumer's, exercising the real published resolution.
@@ -204,6 +218,18 @@ try {
     }
   }
   console.log(`  ok  scaffold emitted ${scaffoldFiles.length} files`);
+  const agentsPointer = join(scaffoldDir, 'AGENTS.md');
+  if (!existsSync(agentsPointer)) {
+    throw new Error('resize-scaffold did not write the AGENTS.md pointer');
+  }
+  if (
+    !readFileSync(agentsPointer, 'utf8').includes(
+      'framework-module-resize:agents:start',
+    )
+  ) {
+    throw new Error('AGENTS.md pointer is missing its idempotency marker');
+  }
+  console.log('  ok  scaffold wrote the AGENTS.md pointer');
   run('npx', ['--no-install', 'resize-scaffold', '--check'], scaffoldDir);
   console.log('  ok  resize-scaffold --check exited 0');
 

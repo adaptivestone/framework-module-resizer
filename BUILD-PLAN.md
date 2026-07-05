@@ -300,6 +300,13 @@ These were decided while implementing and are already reflected in `BUILD-SPEC.m
     SQS `on('error')` + guarded JSON.parse, mongo loop resilience, eager SVG guard, SVG signed
     original, `requireMediaId`, `GenerateOpts`/`ResolveOpts`/`PrewarmOpts` type exports,
     `package.json` `types` + `./package.json` export, `.npmignore` removed.
+15. **Shipped agent guide (2026-07-05).** `AGENTS.md` at the package root ships via
+    `files: ["dist", "AGENTS.md"]` — a machine-oriented integration guide (install/wiring,
+    usage patterns, pitfalls; NO api dump — `dist/index.d.ts` stays the reference). Guarded by
+    `src/agentsDoc.test.ts` (subpath mentions must exist in the exports map; main-entry snippet
+    imports must be real exports). `resize-scaffold` writes a marker-idempotent, append-only
+    pointer into the host's `AGENTS.md` (`--agents agents|claude|print|skip`, default `agents`);
+    `--check` ignores it. Smoke asserts the doc ships + the pointer is written.
 
 ---
 

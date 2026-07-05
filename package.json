@@ -47,7 +47,8 @@
     "smoke": "node smokeTest.ts"
   },
   "files": [
-    "dist"
+    "dist",
+    "AGENTS.md"
   ],
   "author": "Andrei Lahunou",
   "license": "MIT",

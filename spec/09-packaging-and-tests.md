@@ -92,7 +92,7 @@ framework-module-resize/
   },
   "bin": { "resize-scaffold": "./dist/scaffold/command.js" },   // npx @adaptivestone/framework-module-resize resize-scaffold (08 · §12)
   "engines": { "node": ">=24.0.0" },
-  "files": ["dist"],
+  "files": ["dist", "AGENTS.md"],
   "scripts": {
     "prepublishOnly": "npm run build",
     "build": "node preBuild.ts && tsc && node postBuild.ts",
@@ -143,7 +143,7 @@ module; `postBuild` copies `['types.d.ts', 'assets', 'scaffold/templates']` from
 - `tsc` → `dist`; `preBuild.ts` removes `dist`; `postBuild.ts` copies `src/types.d.ts`,
   `src/assets/**`, `src/scaffold/templates/**` into `dist` (they are not emitted by `tsc`).
   Mirror the email module's `preBuild.ts`/`postBuild.ts`.
-- `package.json` `files: ["dist"]`; `prepublishOnly: npm run build`.
+- `package.json` `files: ["dist", "AGENTS.md"]` (the agent guide ships with the package); `prepublishOnly: npm run build`.
 - `npm run check` (biome), `npm run types:check` (tsc --noEmit), and `npm test`
   (`node --experimental-strip-types --test`, so the `.ts` test files run directly on Node ≥22.12)
   must pass.

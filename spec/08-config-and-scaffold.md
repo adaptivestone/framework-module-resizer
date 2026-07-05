@@ -137,6 +137,11 @@ export { default } from '@adaptivestone/framework-module-resize/commands/ResizeW
 - `src/config/resize.ts` — a **real editable copy** (config is *meant* to be tuned; this is the
   one place drift is intended). The framework does NOT auto-merge module defaults, so this file
   spreads the module's defaults and the module's `getResizeConfig()` deep-merges again.
+- a pointer block in the host's `AGENTS.md` (created if missing) directing coding agents to the
+  package's shipped `AGENTS.md` guide — append-only, marker-idempotent
+  (`<!-- framework-module-resize:agents:start/end -->`); `--agents claude|print|skip` redirects
+  it to `CLAUDE.md`, prints it to stdout, or suppresses it. `--force` never rewrites an existing
+  pointer block, and `--check` ignores the pointer entirely (its absence must not fail a host CI).
 - `src/assets/placeholders/*` — optional local placeholders.
 
 > **Eager-mode hosts** ([11 · Modes](./11-modes.md)) skip the model + command entirely — they
@@ -157,6 +162,9 @@ Never silently overwrites.
 `resize-scaffold --eject` — writes the **full editable model** (not the re-export) from the
 `ResizeTask.model.full.ts.tpl` template ([09 · §3](./09-packaging-and-tests.md)), for hosts
 needing custom fields/indexes. `--force` overwrites existing scaffolded files.
+
+`resize-scaffold --agents <agents|claude|print|skip>` — where the agent-guide pointer goes
+(default `agents`). See the emits list above for the append/idempotency contract.
 
 > **Customizing the scaffolded model in a host project.** The `extends ResizeTaskModel` shim is a
 > first-class extension point — same rules as customizing the framework's own `User` model:

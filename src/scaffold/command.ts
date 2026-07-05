@@ -29,6 +29,22 @@ const MODEL_MARKER = 'extends ResizeTaskModel';
 const COMMAND_MARKER =
   '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
 
+// --agents pointer: make the shipped AGENTS.md discoverable from the host's own agent file.
+// Append-only + marker-idempotent — the scaffold NEVER rewrites host-authored content.
+const AGENTS_MODES = ['agents', 'claude', 'print', 'skip'] as const;
+type AgentsMode = (typeof AGENTS_MODES)[number];
+
+const AGENTS_START = '<!-- framework-module-resize:agents:start -->';
+const AGENTS_END = '<!-- framework-module-resize:agents:end -->';
+const AGENTS_SNIPPET = `${AGENTS_START}
+## Image resizing
+
+This app uses @adaptivestone/framework-module-resize. BEFORE changing resize-related code,
+read the version-matched agent guide shipped with the installed package:
+node_modules/@adaptivestone/framework-module-resize/AGENTS.md
+${AGENTS_END}
+`;
+
 interface FileSpec {
   target: string; // host-relative path
   template: string; // template file name (in ./templates)
@@ -121,12 +137,6 @@ async function writeFiles(
     await writeFile(dest, content);
     console.log(`${pad(already ? 'overwrote' : 'created')}${spec.target}`);
   }
-  console.log(
-    '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
-  );
-  console.log(
-    'src/config/resize.ts, and `import ./resizer.ts` from src/server.ts (runs in every process).',
-  );
   return 0;
 }
 
@@ -170,6 +180,38 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
   return failed ? 1 : 0;
 }
 
+/** Pointer step (write mode only; --check never calls this). `exists (skipped)` = the marker
+ * is already present — to refresh, the host deletes the marked block and re-runs. */
+async function writeAgentsPointer(
+  root: string,
+  mode: AgentsMode,
+): Promise<void> {
+  if (mode === 'skip') {
+    return;
+  }
+  if (mode === 'print') {
+    console.log(
+      `\nAdd this to your agent instructions file (AGENTS.md / CLAUDE.md):\n\n${AGENTS_SNIPPET}`,
+    );
+    return;
+  }
+  const target = mode === 'claude' ? 'CLAUDE.md' : 'AGENTS.md';
+  const dest = join(root, target);
+  const existing = (await fileExists(dest))
+    ? await readFile(dest, 'utf8')
+    : null;
+  if (existing?.includes(AGENTS_START)) {
+    console.log(`${pad('exists (skipped)')}${target}`);
+    return;
+  }
+  const content =
+    existing === null
+      ? AGENTS_SNIPPET
+      : `${existing.trimEnd()}\n\n${AGENTS_SNIPPET}`;
+  await writeFile(dest, content);
+  console.log(`${pad(existing === null ? 'created' : 'appended')}${target}`);
+}
+
 const USAGE = `resize-scaffold — vendor the resize module's integration files into a host project.
 
 Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
@@ -185,6 +227,9 @@ Options:
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
   --eager      eager-mode hosts: emit only src/resizer.ts (no transport) + src/config/resize.ts
   --force      overwrite existing files (default: never overwrite)
+  --agents <m> host pointer to the shipped AGENTS.md: agents (default: append to the host
+               AGENTS.md, create if missing), claude (CLAUDE.md), print (stdout only), skip.
+               Append-only + marker-idempotent — never rewrites host content
   --out <dir>  project root to write into (default: current working directory)
   --help       show this help`;
 
@@ -203,6 +248,7 @@ export async function runScaffold(
     force?: boolean;
     out?: string;
     help?: boolean;
+    agents?: string;
   };
   try {
     ({ values } = parseArgs({
@@ -215,6 +261,7 @@ export async function runScaffold(
         force: { type: 'boolean', default: false },
         out: { type: 'string' },
         help: { type: 'boolean', default: false },
+        agents: { type: 'string', default: 'agents' },
       },
     }));
   } catch (err) {
@@ -228,6 +275,15 @@ export async function runScaffold(
     return 0;
   }
 
+  const agents = values.agents as string;
+  if (!(AGENTS_MODES as readonly string[]).includes(agents)) {
+    console.log(USAGE);
+    console.error(
+      `\nresize-scaffold: invalid --agents value '${agents}' (expected ${AGENTS_MODES.join('|')})`,
+    );
+    return 1;
+  }
+
   // --out may be absolute or relative-to-cwd; resolve() handles both.
   const root = values.out ? resolve(cwd, values.out) : cwd;
 
@@ -239,7 +295,15 @@ export async function runScaffold(
     eject: Boolean(values.eject),
     eager: Boolean(values.eager),
   });
-  return writeFiles(root, specs, Boolean(values.force));
+  const code = await writeFiles(root, specs, Boolean(values.force));
+  await writeAgentsPointer(root, agents as AgentsMode);
+  console.log(
+    '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
+  );
+  console.log(
+    'src/config/resize.ts, and `import ./resizer.ts` from src/server.ts (runs in every process).',
+  );
+  return code;
 }
 
 // Auto-run ONLY when executed directly as the bin (realpath-safe), not when imported by tests.

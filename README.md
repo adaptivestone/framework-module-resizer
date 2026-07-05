@@ -11,6 +11,9 @@ literal. The core owns only the identity, the read decision, and the resize pipe
 Distilled from several prior production implementations of upload-time resizing, minus their
 synchronous all-or-nothing cost and their three incompatible response shapes.
 
+> **Coding agents** (Claude Code, Cursor, Codex, …): read [`AGENTS.md`](./AGENTS.md) — the
+> machine-oriented integration guide that ships with this package.
+
 ---
 
 ## How it works
@@ -81,7 +84,10 @@ no drift). On completion the command prints its 3 remaining TODOs:
 
 Other flags: `--check` (CI-gatable drift check; exits 1 on missing/drift, no writes), `--eject`
 (write the full editable model instead of the shim, for custom fields/indexes), `--eager`
-(eager-mode hosts: emit only `src/resizer.ts` + `src/config/resize.ts`), `--force`, `--out <dir>`.
+(eager-mode hosts: emit only `src/resizer.ts` + `src/config/resize.ts`), `--agents
+<agents|claude|print|skip>` (where to write the append-only, marker-idempotent pointer to the
+shipped [`AGENTS.md`](./AGENTS.md); default `agents` = the host `AGENTS.md`), `--force`,
+`--out <dir>`.
 
 ---
 

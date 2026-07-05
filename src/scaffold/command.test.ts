@@ -219,6 +219,96 @@ describe('runScaffold — --help', () => {
   });
 });
 
+describe('runScaffold — --agents pointer', () => {
+  const START = '<!-- framework-module-resize:agents:start -->';
+  const POINTER_PATH =
+    'node_modules/@adaptivestone/framework-module-resize/AGENTS.md';
+
+  test('default run creates AGENTS.md with the marked pointer', async () => {
+    const { code, out } = await run([]);
+    assert.equal(code, 0);
+    assert.match(out, /AGENTS\.md/);
+    const doc = await read('AGENTS.md');
+    assert.ok(doc.includes(START));
+    assert.ok(doc.includes(POINTER_PATH));
+    assert.ok(doc.includes('framework-module-resize:agents:end'));
+  });
+
+  test('re-run is idempotent: marker detected, file byte-identical, reported skipped', async () => {
+    await run([]);
+    const before = await read('AGENTS.md');
+    const { code, out } = await run([]);
+    assert.equal(code, 0);
+    assert.match(out, /exists \(skipped\)\s*AGENTS\.md/);
+    assert.equal(await read('AGENTS.md'), before);
+  });
+
+  test('existing host AGENTS.md is appended to, never rewritten', async () => {
+    await writeFile(
+      join(root, 'AGENTS.md'),
+      '# Host rules\n\nDo not break prod.\n',
+    );
+    const { code, out } = await run([]);
+    assert.equal(code, 0);
+    assert.match(out, /appended\s*AGENTS\.md/);
+    const doc = await read('AGENTS.md');
+    assert.ok(doc.startsWith('# Host rules')); // host content stays first and intact
+    assert.match(doc, /Do not break prod\./);
+    assert.ok(doc.includes(START));
+  });
+
+  test('--agents claude targets CLAUDE.md instead', async () => {
+    const { code } = await run(['--agents', 'claude']);
+    assert.equal(code, 0);
+    assert.equal(await exists('AGENTS.md'), false);
+    assert.ok((await read('CLAUDE.md')).includes(START));
+  });
+
+  test('--agents print writes no file and prints the snippet', async () => {
+    const { code, out } = await run(['--agents', 'print']);
+    assert.equal(code, 0);
+    assert.equal(await exists('AGENTS.md'), false);
+    assert.ok(out.includes(START));
+    assert.ok(out.includes(POINTER_PATH));
+  });
+
+  test('--agents skip writes no file and prints no snippet', async () => {
+    const { code, out } = await run(['--agents', 'skip']);
+    assert.equal(code, 0);
+    assert.equal(await exists('AGENTS.md'), false);
+    assert.ok(!out.includes(START));
+  });
+
+  test('invalid --agents value → usage + exit 1, nothing written', async () => {
+    const { code, out } = await run(['--agents', 'bogus']);
+    assert.equal(code, 1);
+    assert.match(out, /resize-scaffold/); // usage text
+    assert.equal(await exists('src'), false);
+    assert.equal(await exists('AGENTS.md'), false);
+  });
+
+  test('--force does not rewrite an existing pointer block', async () => {
+    await run([]);
+    const before = await read('AGENTS.md');
+    const { out } = await run(['--force']);
+    assert.match(out, /exists \(skipped\)\s*AGENTS\.md/);
+    assert.equal(await read('AGENTS.md'), before);
+  });
+
+  test('--eager runs also get the pointer', async () => {
+    const { code } = await run(['--eager']);
+    assert.equal(code, 0);
+    assert.ok((await read('AGENTS.md')).includes(START));
+  });
+
+  test('--check ignores the pointer entirely (no write, no failure without it)', async () => {
+    await run(['--agents', 'skip']); // scaffold WITHOUT a pointer
+    const { code } = await run(['--check']);
+    assert.equal(code, 0); // absence of the pointer must never fail a host CI
+    assert.equal(await exists('AGENTS.md'), false); // and --check never writes one
+  });
+});
+
 // Build/packaging smoke — cheap source assertions (no real build in the unit suite).
 describe('packaging smoke', () => {
   test('command.ts starts with the node shebang', async () => {
