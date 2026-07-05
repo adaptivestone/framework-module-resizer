@@ -148,7 +148,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import | optional peer not installed — see step 1 |
 | a second `new Resizer()` throws | by design: one per process — import the single construction site; elsewhere `getResizer()` |
-| framework boot reports a duplicate framework copy (model not recognized as a BaseModel subclass) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
+| models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
 | boot throws `queue.lockTtlMs.worker … must be ≤ queue.leaseMs` | raise `queue.leaseMs` or lower `queue.lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |

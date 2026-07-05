@@ -103,7 +103,7 @@ framework-module-resize/
   },
   "dependencies": { "sharp": "^0.34.0", "deepmerge": "^4.3.1" },
   "peerDependencies": {
-    "mongoose": "*", "@adaptivestone/framework": "*",
+    "mongoose": "*", "@adaptivestone/framework": "^5.0.1",
     "@aws-sdk/client-sqs": "*", "sqs-consumer": "*",
     "@aws-sdk/client-s3": "*", "@aws-sdk/s3-request-presigner": "*"
   },
@@ -120,8 +120,10 @@ framework-module-resize/
 > AWS SDKs there would force them onto every host. An optional *peer*
 > (`peerDependenciesMeta.optional`) is never auto-installed: a host installs
 > `@aws-sdk/client-sqs`+`sqs-consumer` only to use the SQS transport, and
-> `@aws-sdk/client-s3`(+presigner) only to use the shipped `s3Storage` driver. The dynamic
-> `import()` in each driver is the runtime guard.
+> `@aws-sdk/client-s3`(+presigner) only to use the shipped S3 driver. The plain static import at
+> the top of each driver subpath is the runtime guard — a missing SDK fails loudly at the host's
+> own import line. (`@adaptivestone/framework` floor: `^5.0.1` — the first version that ships
+> `helpers/appInstance.js`, which `src/app.ts` imports.)
 
 `tsconfig.json` — copy the email module verbatim: `target esnext`, `module nodenext`,
 `allowImportingTsExtensions`, `rewriteRelativeImportExtensions`, `verbatimModuleSyntax`,

@@ -53,7 +53,8 @@ npm publish
 ```
 
 `prepublishOnly` runs `npm run build` automatically, so `dist/` is always rebuilt from source at
-publish time; `files: ["dist"]` (plus the auto-included `README.md` + `LICENSE`) is all that ships.
+publish time; `files: ["dist", "AGENTS.md"]` (plus the auto-included `README.md` + `LICENSE`) is
+all that ships.
 
 > If the org later decides to standardize access in-manifest, add `"publishConfig": { "access":
 > "public" }` to `package.json` and drop the flag. As of this release the siblings rely on the
