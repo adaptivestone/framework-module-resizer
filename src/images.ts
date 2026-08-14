@@ -167,6 +167,26 @@ export function expandMissingPreviews(
 }
 
 /**
+ * True when every `sizes × formats` identity is already stored on `media.previews`
+ * (or the original is SVG, which is pass-through and never needs a preview). Hosts
+ * use this to skip a no-op `generate` / `prewarm`.
+ */
+export function isCatalogCovered(
+  media: MediaLike,
+  sizes: SizeInput[],
+  formats: PreviewFormat[],
+): boolean {
+  const original = media.original;
+  if (
+    original &&
+    (original.contentType === 'image/svg+xml' || original.format === 'svg')
+  ) {
+    return true;
+  }
+  return expandMissingPreviews(media, sizes, formats).length === 0;
+}
+
+/**
  * Content type for a raster PREVIEW format only. Never pass an original's format —
  * originals carry their own `original.contentType` (e.g. 'image/svg+xml').
  */

@@ -62,7 +62,7 @@ class Resizer {
     formats?: PreviewFormat[];      // default requiredFormats(config)
     ctx?: Record<string, unknown>;
     persist?: boolean;              // default true → $push previews + backfill original dims on the media doc
-  }): Promise<{ previews: Preview[] }>;
+  }): Promise<{ created: Preview[]; failed: number }>;
 }
 ```
 
@@ -70,26 +70,27 @@ Host usage (e.g. inside a file-upload controller):
 
 ```ts
 // after the original is uploaded and the media doc created:
-const { previews } = await resizer.generate({
+const { created, failed } = await resizer.generate({
   media: fileDoc,
   sizes: getEventMediaSizes(),         // host's catalog
   pipeline: 'listing',
 });
-// persist:true already $push'd them; the read path now returns them all as ready.
+// persist:true already $push'd `created`; the read path now returns them all as ready.
 ```
 
 ### Behavior (`generate`)
 0. **SVG guard (2026-07-05 review fix):** an SVG original (`contentType === 'image/svg+xml'` /
-   `format === 'svg'`) → log + return `{ previews: [] }` immediately — SVG is NEVER rasterized
-   in any mode (the guard previously lived only in the queued `processTask`, letting eager
-   `generate` rasterize an SVG).
+   `format === 'svg'`) → log + return `{ created: [], failed: 0 }` — SVG is
+   NEVER rasterized in any mode.
+0b. **No `media.original`** → throw `ResizeNoOriginalError`.
 1. Resolve config + storage + the named pipeline. **Storage is required** (throws if none).
 2. `sizes = await runWaterfall('resolveSizes', sizes, ctx)`; expand to `sizes × formats × filters`
    identities via `getPreviewIdentity` (same as the read path). In eager mode `ctx` **is** the
    caller's real ctx (same process) — so pipeline steps here receive it, unlike the queued
    worker where `ctx === {}` ([04 · Pipelines](./04-pipelines-and-hooks.md) §8).
 3. **Skip identities already present** in `media.previews` (idempotent — safe to re-run; e.g.
-   re-upload, or adding new sizes later).
+   re-upload, or adding new sizes later). All already stored →
+   `{ created: [], failed: 0 }`.
 4. Run the **same core as `processTask`** ([07 · Worker](./07-worker.md) steps 2–8):
    download the original once, source-pixel guard, `beforeSteps` (once), then per-variant
    (bounded by `config.worker.concurrency`) `.rotate()` → `cover|fit` → `variantSteps` → encode
@@ -97,7 +98,9 @@ const { previews } = await resizer.generate({
 5. If `persist` → one `mediaStore.appendPreviews(...)` call (all generated previews +
    `original.width/height` backfill — [05 · §10.6](./05-transport-and-storage.md));
    else return them for the host to store.
-6. Return `{ previews }`.
+6. Every requested variant failed → throw `ResizeGenerateError`. Some fail → no throw,
+   `failed > 0`. Return `{ created, failed }`. After persist, append `created` onto
+   the caller's `media.previews` so a same-request `resolve` sees them.
 
 > **Implementation note:** write the resize core ONCE (`generatePreviews(...)` in
 > `resizeTask.ts`). The lazy worker's `processTask` = this core **plus** lease / locks /

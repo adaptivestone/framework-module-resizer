@@ -10,6 +10,7 @@
 import sharp from 'sharp';
 import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
+import { ResizeGenerateError, ResizeNoOriginalError } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { randomHex } from './helpers/random.ts';
 import {
@@ -20,6 +21,7 @@ import {
 } from './images.ts';
 import {
   type GenerateOpts,
+  type GenerateResult,
   getResizer,
   type LeasedTask,
   type Resizer,
@@ -445,7 +447,7 @@ export async function processTask(
 export async function generateImpl(
   resizer: Resizer,
   opts: GenerateOpts,
-): Promise<{ previews: Preview[] }> {
+): Promise<GenerateResult> {
   const config = getResizeConfig();
   const ctx = opts.ctx ?? {};
   const { media } = opts;
@@ -454,18 +456,9 @@ export async function generateImpl(
   // (04 · papercut) rather than silently keying on the literal 'undefined'.
   const mediaId = requireMediaId(media);
 
-  // 0. SVG guard (11 · §11.1 step 0): SVG originals are pass-through — NEVER rasterized in ANY
-  // mode. Log + return empty so eager `generate` matches the read path + queued worker (the
-  // guard previously lived only in processTask, letting eager generate rasterize an SVG).
   const original = media.original;
-  if (
-    original &&
-    (original.contentType === 'image/svg+xml' || original.format === 'svg')
-  ) {
-    getApp().logger.info(
-      `resize generate: media ${mediaId} original is SVG — pass-through, nothing to generate`,
-    );
-    return { previews: [] };
+  if (!original) {
+    throw new ResizeNoOriginalError(mediaId);
   }
 
   // Host size magic (real ctx in eager mode), then the active format list.
@@ -476,18 +469,41 @@ export async function generateImpl(
   )) as SizeInput[];
   const formats = opts.formats ?? requiredFormats(config);
 
-  // Expand sizes × formats into MissingPreview variants; skip unbuildable sizes + existing
-  // identities (idempotent re-run) and dedup — the shared expansion (also used by prewarm).
+  // SVG originals are pass-through — never rasterized in any mode.
+  if (original.contentType === 'image/svg+xml' || original.format === 'svg') {
+    getApp().logger.info(
+      `resize generate: media ${mediaId} original is SVG — pass-through, nothing to generate`,
+    );
+    return { created: [], failed: 0 };
+  }
+
+  // Expand sizes × formats; skip unbuildable sizes + existing identities (idempotent).
   const requested = expandMissingPreviews(media, sizes, formats);
 
-  const { generated } = await generatePreviews(resizer, {
+  const persist = opts.persist !== false;
+  const { generated, failedCount } = await generatePreviews(resizer, {
     media,
     mediaId,
     requested,
     pipeline,
     ctx,
     useLocks: false,
-    persist: opts.persist !== false,
+    persist,
   });
-  return { previews: generated };
+
+  if (requested.length > 0 && generated.length === 0 && failedCount > 0) {
+    throw new ResizeGenerateError({
+      mediaId,
+      failed: failedCount,
+      requested: requested.length,
+    });
+  }
+
+  // Persist is a $push; also append onto the caller's in-memory doc so a same-request
+  // resolve() sees the new rows without a reload.
+  if (persist && generated.length > 0) {
+    media.previews = [...(media.previews ?? []), ...generated];
+  }
+
+  return { created: generated, failed: failedCount };
 }

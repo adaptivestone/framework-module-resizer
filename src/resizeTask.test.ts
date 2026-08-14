@@ -8,6 +8,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import { ResizeGenerateError, ResizeNoOriginalError } from './errors.ts';
 import type { LockProvider } from './locks.ts';
 import type { MediaStore } from './mediaStore.ts';
 import {
@@ -850,14 +851,30 @@ describe('generate (eager)', () => {
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null); // load unused in eager mode
     const r = new Resizer({ storage, mediaStore });
-    const { previews } = await r.generate({
+    const result = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
       formats: ['jpeg'],
     });
-    assert.equal(previews.length, 1);
+    assert.equal(result.created.length, 1);
+    assert.equal(result.failed, 0);
     assert.equal(uploads.length, 1);
     assert.equal(appendCalls.length, 1);
+  });
+
+  test('appends created onto media.previews so a same-request resolve sees them', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const media = mediaDoc();
+    const { created } = await r.generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(media.previews?.length, 1);
+    assert.equal(media.previews?.[0], created[0]);
   });
 
   test('persist:false → returns previews without persisting (but still uploads)', async () => {
@@ -865,13 +882,15 @@ describe('generate (eager)', () => {
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
-    const { previews } = await r.generate({
-      media: mediaDoc(),
+    const media = mediaDoc();
+    const { created } = await r.generate({
+      media,
       sizes: [{ width: 20, height: 20 }],
       formats: ['jpeg'],
       persist: false,
     });
-    assert.equal(previews.length, 1);
+    assert.equal(created.length, 1);
+    assert.equal(media.previews?.length ?? 0, 0);
     assert.equal(uploads.length, 1);
     assert.equal(appendCalls.length, 0);
   });
@@ -887,12 +906,13 @@ describe('generate (eager)', () => {
     } as unknown as Preview;
     const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
-    const { previews } = await r.generate({
+    const result = await r.generate({
       media: mediaDoc({ previews: [existing] }),
       sizes: [{ width: 20, height: 20 }],
       formats: ['jpeg'],
     });
-    assert.equal(previews.length, 0);
+    assert.deepEqual(result.created, []);
+    assert.equal(result.failed, 0);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
   });
@@ -913,22 +933,101 @@ describe('generate (eager)', () => {
     );
   });
 
-  test('SVG original → log + { previews: [] }, nothing uploaded or persisted (never rasterized)', async () => {
+  test('SVG original → log + { created: [], failed: 0 }, nothing uploaded or persisted', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
-    const { previews } = await r.generate({
+    const result = await r.generate({
       media: mediaDoc({
         original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
       }),
       sizes: [{ width: 20, height: 20 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(previews, []);
+    assert.deepEqual(result.created, []);
+    assert.equal(result.failed, 0);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
     assert.ok(logs.info.some((l) => String(l[0]).includes('SVG')));
+  });
+
+  test('no original → ResizeNoOriginalError', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: { id: 'm1' },
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeNoOriginalError);
+        assert.equal(err.mediaId, 'm1');
+        return true;
+      },
+    );
+  });
+
+  test('every requested variant fails → ResizeGenerateError', async () => {
+    installApp();
+    const { mediaStore } = makeMediaStore(null);
+    const storage: ResizeStorage = {
+      download: async () => redPng,
+      upload: async () => {
+        throw new Error('upload down');
+      },
+      publicUrl: () => '',
+    };
+    const r = new Resizer({ storage, mediaStore });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeGenerateError);
+        assert.equal(err.failed, 1);
+        assert.equal(err.requested, 1);
+        return true;
+      },
+    );
+  });
+
+  test('partial failure: no throw, failed > 0, created has the successes', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new Resizer({
+      storage,
+      mediaStore,
+      pipelines: {
+        default: {
+          variantSteps: [
+            async (img, { variant }) => {
+              if (variant.format === 'webp') {
+                throw new Error('webp boom');
+              }
+              return img;
+            },
+          ],
+        },
+      },
+    });
+    const result = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(result.created.length, 1);
+    assert.equal(result.created[0].format, 'jpeg');
+    assert.equal(result.failed, 1);
+    assert.equal(appendCalls.length, 1);
   });
 
   test('real ctx reaches beforeSteps and variantSteps', async () => {

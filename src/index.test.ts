@@ -13,20 +13,25 @@ const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 // re-exports (contract interfaces, TResizeTask, types.d.ts) are erased and never appear here.
 const EXPECTED_VALUE_EXPORTS = [
   'Resizer',
+  'ResizeGenerateError',
+  'ResizeNoOriginalError',
   'ResizeTaskModel',
   'ResizeWorker',
   'calculateResizedDimensions',
   'defaultResizeConfig',
+  'formatPictureUrls',
   'getFilterSig',
   'getImageContentType',
   'getPreviewIdentity',
   'getResizeConfig',
   'getResizer',
   'getSizeKey',
+  'isCatalogCovered',
   'parseSizeKey',
   'processTask',
   'requiredFormats',
   'resetResizerForTests',
+  'resizeMediaPaths',
   'resizeMediaSchemaFragment',
   'runResizeWorker',
 ];
@@ -36,6 +41,7 @@ const DRIVER_NAMES = [
   'MongoTransport',
   'SqsTransport',
   'S3Storage',
+  'LocalFsStorage',
   'FrameworkMediaStore',
   'FrameworkLockProvider',
 ];
@@ -75,6 +81,8 @@ describe('public API surface (src/index.ts)', () => {
       'getImageContentType',
       'getResizeConfig',
       'requiredFormats',
+      'formatPictureUrls',
+      'isCatalogCovered',
     ]) {
       assert.equal(
         typeof asRecord[name],
@@ -88,6 +96,7 @@ describe('public API surface (src/index.ts)', () => {
     assert.equal(typeof api.defaultResizeConfig, 'object');
     assert.equal(api.defaultResizeConfig.formats[0], 'jpeg'); // it's the actual default, not a stub
     assert.equal(typeof api.resizeMediaSchemaFragment, 'object');
+    assert.deepEqual(api.resizeMediaPaths, ['original', 'previews']);
   });
 
   test('a pure helper actually works through the re-export', () => {

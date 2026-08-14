@@ -122,6 +122,7 @@ describe('resolve — partitioning', () => {
       format: 'jpeg',
       url: 'https://cdn/p1',
       preview: media.previews?.[0],
+      contentType: 'image/jpeg',
     });
     assert.equal(decision.missing.length, 1);
     assert.deepEqual(decision.missing[0], {
@@ -228,7 +229,7 @@ describe('resolve — waterfall hooks', () => {
     assert.deepEqual(decision, { ready: [], missing: [] });
   });
 
-  test('with no formatPublicUrls tap, output === decision', async () => {
+  test('with no formatPublicUrls tap, output === undefined', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const { decision, output } = await r.resolve({
@@ -237,7 +238,29 @@ describe('resolve — waterfall hooks', () => {
       formats: ['jpeg'],
       enqueueMissing: false,
     });
-    assert.equal(output, decision);
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(output, undefined);
+  });
+
+  test('a throwing formatPublicUrls tap yields output === undefined (does not leak the decision)', async () => {
+    const { errors } = installFakeApp();
+    const r = new Resizer({
+      storage: makeStorage(),
+      hooks: {
+        formatPublicUrls: () => {
+          throw new Error('dto boom');
+        },
+      },
+    });
+    const { decision, output } = await r.resolve({
+      media: { id: 'm1' },
+      sizes: [],
+      formats: ['jpeg'],
+      enqueueMissing: false,
+    });
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(output, undefined);
+    assert.ok(errors.length >= 1);
   });
 
   test('a throwing beforeEnqueue tap is skipped (missing kept intact)', async () => {
@@ -372,7 +395,7 @@ describe('resolve — enqueue wiring', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolve — no transport (eager-only host)', () => {
-  test('keeps missing intact, warns exactly once, never touches a transport', async () => {
+  test('defaults enqueueMissing to false: missing intact, no warn', async () => {
     const { warn } = installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
@@ -384,6 +407,19 @@ describe('resolve — no transport (eager-only host)', () => {
       formats: ['jpeg'],
     });
     assert.equal(decision.missing.length, 2);
+    assert.equal(warn.length, 0);
+  });
+
+  test('explicit enqueueMissing:true with no transport still warns once', async () => {
+    const { warn } = installFakeApp();
+    const r = new Resizer({ storage: makeStorage() });
+    const { decision } = await r.resolve({
+      media: { id: 'm1' },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      enqueueMissing: true,
+    });
+    assert.equal(decision.missing.length, 1);
     assert.equal(warn.length, 1);
   });
 });
@@ -509,6 +545,7 @@ describe('resolve — original-fits fast-path', () => {
       format: 'jpeg',
       url: 'https://cdn/orig.jpg',
       isOriginal: true,
+      contentType: 'image/jpeg',
     });
   });
 
@@ -672,7 +709,7 @@ describe('resolve — never throws', () => {
     assert.equal(decision.ready.length, 1);
     assert.equal(decision.ready[0].url, 'https://cdn/p1');
     assert.equal(decision.missing.length, 0);
-    assert.equal(output, decision);
+    assert.equal(output, undefined);
     assert.ok(errors.length >= 1);
   });
 
@@ -685,7 +722,7 @@ describe('resolve — never throws', () => {
       formats: ['jpeg'],
     });
     assert.deepEqual(decision, { ready: [], missing: [] });
-    assert.equal(output, decision);
+    assert.equal(output, undefined);
     assert.ok(errors.length >= 1);
   });
 });

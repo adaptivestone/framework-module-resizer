@@ -3,10 +3,19 @@ import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import mongoose from 'mongoose';
-import { resizeMediaSchemaFragment } from './mediaFragment.ts';
+import {
+  resizeMediaPaths,
+  resizeMediaSchemaFragment,
+} from './mediaFragment.ts';
 
 // mongoose is a devDep here (the no-mongoose rule is for runtime module code — 01 · §16);
 // building a real Schema from the spread fragment is the point of the smoke test.
+
+describe('resizeMediaPaths', () => {
+  test('lists the module fields resolve/generate read', () => {
+    assert.deepEqual(resizeMediaPaths, ['original', 'previews']);
+  });
+});
 
 describe('resizeMediaSchemaFragment — shape', () => {
   test('exposes `original` + `previews` keys', () => {

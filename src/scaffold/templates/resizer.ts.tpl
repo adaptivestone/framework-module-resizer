@@ -8,17 +8,19 @@
 // Everything below is wired EXCEPT `storage` (REQUIRED): fill the storage TODO and you're done.
 import { Resizer } from '@adaptivestone/framework-module-resize';
 import { MongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
-// S3 / S3-compatible storage (install the optional AWS peers first — 05 · §10.5):
+// Local filesystem (tests / first-week local) or S3 (install the optional AWS peers first):
+// import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
 // import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js';
 
 export const resizer = new Resizer({
   transport: new MongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)
-  // TODO(REQUIRED): provide a storage driver — e.g. `new S3Storage({ bucketPublic: '…', publicUrl: '…' })`
-  // (uncomment the import above) or your own ResizeStorage (05 · §10.4). Until then tsc fails with
+  // TODO(REQUIRED): provide a storage driver — e.g. `new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' })`
+  // or `new S3Storage({ bucketPublic: '…', publicBaseUrl: '…', client })` (uncomment an import above)
+  // or your own ResizeStorage (05 · §10.4). Until then tsc fails with
   // "Cannot find name 'PROVIDE_YOUR_STORAGE_DRIVER'" — a loud, named reminder (see README).
   storage: PROVIDE_YOUR_STORAGE_DRIVER,
   pipelines: {
     default: {}, // add named pipelines, e.g. listing: { beforeSteps: [...] }, premium: { variantSteps: [...] }
   },
-  // hooks: { resolveSizes: (sizes, ctx) => sizes, formatPublicUrls: (decision, ctx) => decision },
+  // hooks: { formatPublicUrls: (decision, ctx) => formatPictureUrls(decision, { id: String(ctx.id) }) },
 });

@@ -62,7 +62,7 @@ Not the module’s job (stay on the host):
 ### 1. Honest `generate`
 
 ```ts
-const { created, requested, failed, skipped } = await resizer.generate({
+const { created, failed } = await resizer.generate({
   media,
   sizes, // host allowlist — never raw client width/height
 });
@@ -71,12 +71,13 @@ const { created, requested, failed, skipped } = await resizer.generate({
 | Case | Behavior |
 |---|---|
 | no `media.original` | throw `ResizeNoOriginalError` |
-| SVG original | `{ created: [], requested: 0, skipped: N }` — success |
+| SVG original | `{ created: [], failed: 0 }` — success |
 | every requested variant fails | throw `ResizeGenerateError` |
 | some fail | no throw, `failed > 0` |
-| all identities already stored | `{ created: [], requested: 0, skipped: N }` |
+| all identities already stored | `{ created: [], failed: 0 }` |
 
-Name the array **`created`** (only this call). Keep `previews` as a deprecated alias for one minor.
+Name the array **`created`** (only this call). After persist, also append onto `media.previews`
+so a same-request `resolve` sees the new rows.
 
 Export the error classes. Any host can `instanceof` without string-matching logs.
 
@@ -90,7 +91,7 @@ Export the error classes. Any host can `instanceof` without string-matching logs
 ```ts
 {
   mediaType?: string,
-  handle?: string, // media id
+  id?: string,
   sizes: {
     [sizeKey: string]: {
       [format: string]: { url: string, contentType: string }
@@ -203,15 +204,11 @@ Nice when a host must not load `ResizeTask`. Not required if peer is framework �
 
 ---
 
-## PRs
+## Ship
 
-1. `generate` result + named errors + tests (empty original, all-fail, partial, idempotent, SVG).  
-2. `resolve`: hook failure → `output === undefined`; no-transport ⇒ `enqueueMissing: false`; `formatPictureUrls`.  
-3. `LocalFsStorage` + S3 `publicBaseUrl` alias + README eager+FS first, `client` example.  
-4. `isCatalogCovered` + `resizeMediaPaths`.  
-5. Publish **0.2.0**. Scaffold `--eager` uses FS placeholder, not a Mongo transport TODO.
+One PR on this branch — not five, no extra GitHub workflow. `npm test` + `types:check`, then publish **0.2.0** the usual manual way (`RELEASE.md`).
 
-Each PR: `npm test` + `types:check`.
+In that PR: honest `generate` / `resolve`, `LocalFsStorage`, S3 `publicBaseUrl`, `isCatalogCovered` + `resizeMediaPaths`, README eager+FS first, scaffold `--eager` uses FS (not a Mongo transport TODO).
 
 ---
 

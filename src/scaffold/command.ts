@@ -48,7 +48,7 @@ ${AGENTS_END}
 interface FileSpec {
   target: string; // host-relative path
   template: string; // template file name (in ./templates)
-  transform?: (content: string) => string; // optional post-read edit (eager mode)
+  transform?: (content: string) => string; // optional post-read edit
 }
 
 /** Templates resolve relative to THIS file → works in src (tests) and dist (postBuild copy). */
@@ -69,34 +69,14 @@ async function fileExists(abs: string): Promise<boolean> {
   }
 }
 
-// Eager-mode hosts (11 · Modes) generate synchronously at upload — no queue/worker. So the emitted
-// resizer.ts must NOT wire a transport: comment out the `transport:` line in place.
-function commentOutTransport(content: string): string {
-  return content
-    .split('\n')
-    .map((line) => {
-      const trimmed = line.trimStart();
-      const indent = line.slice(0, line.length - trimmed.length);
-      if (trimmed.startsWith('transport:')) {
-        return `${indent}// eager mode (11 · Modes): no transport — generate() runs synchronously at upload\n${indent}// ${trimmed}`;
-      }
-      // The MongoTransport import is now unused (its only use, the transport line, is commented) —
-      // comment it too so a host tsc with noUnusedLocals stays clean.
-      if (trimmed.startsWith('import { MongoTransport }')) {
-        return `${indent}// eager mode (11 · Modes): MongoTransport unused (no transport)\n${indent}// ${trimmed}`;
-      }
-      return line;
-    })
-    .join('\n');
-}
-
 /** The files a run emits, given the flags. Eager mode drops the model + command shims. */
 function planFiles(opts: { eject: boolean; eager: boolean }): FileSpec[] {
-  const resizer: FileSpec = {
-    target: RESIZER,
-    template: 'resizer.ts.tpl',
-    transform: opts.eager ? commentOutTransport : undefined,
-  };
+  const resizer: FileSpec = opts.eager
+    ? { target: RESIZER, template: 'resizer.eager.ts.tpl' }
+    : {
+        target: RESIZER,
+        template: 'resizer.ts.tpl',
+      };
   const config: FileSpec = { target: CONFIG, template: 'resize.config.ts.tpl' };
   if (opts.eager) {
     return [resizer, config];
@@ -225,7 +205,7 @@ Emits (into process.cwd(), or --out <dir>):
 Options:
   --check      verify the shims exist + reference the module; exit 1 on missing/drift (no writes)
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
-  --eager      eager-mode hosts: emit only src/resizer.ts (no transport) + src/config/resize.ts
+  --eager      eager-mode hosts: emit only src/resizer.ts (LocalFsStorage, no transport) + src/config/resize.ts
   --force      overwrite existing files (default: never overwrite)
   --agents <m> host pointer to the shipped AGENTS.md: agents (default: append to the host
                AGENTS.md, create if missing), claude (CLAUDE.md), print (stdout only), skip.
@@ -297,12 +277,21 @@ export async function runScaffold(
   });
   const code = await writeFiles(root, specs, Boolean(values.force));
   await writeAgentsPointer(root, agents as AgentsMode);
-  console.log(
-    '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
-  );
-  console.log(
-    'src/config/resize.ts, and `import ./resizer.ts` from src/server.ts (runs in every process).',
-  );
+  if (values.eager) {
+    console.log(
+      '\nDone. Next: set `mediaModelName` in src/config/resize.ts, construct the',
+    );
+    console.log(
+      'Resizer after Server.init() (or lazily), and call generate() at upload.',
+    );
+  } else {
+    console.log(
+      '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
+    );
+    console.log(
+      'src/config/resize.ts, and `import ./resizer.ts` from src/server.ts (runs in every process).',
+    );
+  }
   return code;
 }
 

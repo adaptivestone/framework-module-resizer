@@ -52,3 +52,7 @@ export const resizeMediaSchemaFragment = {
     },
   ],
 } as const;
+
+/** Module fields `resolve`/`generate` read. Hosts append their own:
+ *  `.select(['mediaType', ...resizeMediaPaths])`. */
+export const resizeMediaPaths = ['original', 'previews'] as const;
