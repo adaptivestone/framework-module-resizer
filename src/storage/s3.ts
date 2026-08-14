@@ -22,7 +22,9 @@ import type { ResizeStorage } from './AbstractStorage.ts';
 export interface S3StorageOptions {
   bucketPublic: string; // previews land here (upload visibility 'public')
   bucketPrivate?: string; // originals ('private'); defaults to bucketPublic
-  publicUrl?: string; // CDN/base URL for public objects, e.g. 'https://cdn.example.com'
+  publicBaseUrl?: string; // CDN/base URL for public objects, e.g. 'https://cdn.example.com'
+  /** @deprecated Use `publicBaseUrl`. Same string; kept for one minor. */
+  publicUrl?: string;
   region?: string;
   endpoint?: string; // S3-compatible: MinIO / localstack / R2
   forcePathStyle?: boolean;
@@ -131,8 +133,9 @@ export class S3Storage implements ResizeStorage {
   publicUrl(ref: StorageRef): string {
     this.assertAllowedBucket(ref.bucket);
     const bucket = ref.bucket ?? this.opts.bucketPublic;
-    if (this.opts.publicUrl) {
-      return `${this.opts.publicUrl.replace(/\/+$/, '')}/${ref.key}`;
+    const publicBase = this.opts.publicBaseUrl ?? this.opts.publicUrl;
+    if (publicBase) {
+      return `${publicBase.replace(/\/+$/, '')}/${ref.key}`;
     }
     if (this.opts.endpoint !== undefined || this.opts.forcePathStyle) {
       const base = (this.opts.endpoint ?? '').replace(/\/+$/, '');

@@ -61,15 +61,15 @@ missing variants to `enqueue`. Neither may throw into the caller's read.
 8. `missing = await runWaterfall('beforeEnqueue', decision.missing, ctx)`; **assign it
    back to `decision.missing`** so steps 9–10 and the host's `formatPublicUrls` see the same
    (post-hook) set that was enqueued.
-9. If `enqueueMissing` (default true) and `decision.missing.length`: when the instance has
-   **no `transport`** (eager-only construction — [11 · Modes](./11-modes.md)), log once and
-   skip (missing variants simply stay placeholders); else `await enqueue(
+9. If `enqueueMissing` (default **true when a transport is set, false otherwise**) and
+   `decision.missing.length`: when the instance has **no `transport`** (eager-only
+   construction — [11 · Modes](./11-modes.md)), log once and skip (only if the host
+   passed `enqueueMissing: true` explicitly); else `await enqueue(
    mediaId, pipeline, decision.missing)` (§18) inside try/catch — enqueue must never throw
    into the read.
-10. `output = await runWaterfall('formatPublicUrls', decision, ctx)` — the host turns the
-    decision into its response shape and renders placeholders/signed-originals for
-    `decision.missing` (where `ready:false`/`isPlaceholder` is produced for the frontend).
-    If no tap, `output === decision`.
+10. `output = await runWaterfall('formatPublicUrls', decision, ctx, 'optional')` — the host
+    turns the decision into its response shape. If no tap, or every tap throws,
+    `output === undefined`. Never pass the raw `{ ready, missing }` off as a DTO.
 11. Return `{ decision, output }`.
 
 The engine never builds a response shape and never renders a placeholder; both are the
@@ -79,7 +79,7 @@ host's job, driven off `decision`.
 > (1) each waterfall tap is guarded inside `runWaterfall` (throws logged + skipped — §9);
 > (2) `enqueue` is wrapped (step 9); (3) the **entire `resolve` body** runs inside a
 > try/catch — any unexpected internal error is logged
-> and `resolve` returns the safe value `{ decision: { ready, missing: [] }, output: decision }`
+> and `resolve` returns the safe value `{ decision: { ready, missing: [] }, output: undefined }`
 > (the `ready` entries built so far, nothing enqueued) instead of rejecting into the caller's read.
 > `signedUrl` (the only I/O in the read, owner/admin-gated) is also caught and falls back to the
 > public URL via `storage.publicUrl`. Edge case: if `getApp()` itself throws (resolve called

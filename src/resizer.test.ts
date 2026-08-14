@@ -380,10 +380,10 @@ describe('resolve/generate stubs', () => {
       formats: ['jpeg'],
     });
     assert.deepEqual(decision, { ready: [], missing: [] });
-    assert.equal(output, decision);
+    assert.equal(output, undefined);
   });
 
-  test('generate is wired (no longer a stub): empty sizes → empty previews', async () => {
+  test('generate is wired (no longer a stub): empty sizes → empty created', async () => {
     // A config WITH mediaModelName so getResizeConfig() inside generateImpl does not throw.
     setAppInstance({
       getConfig: () => ({ mediaModelName: 'File' }),
@@ -391,7 +391,11 @@ describe('resolve/generate stubs', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
     const r = new Resizer(baseOpts());
-    const { previews } = await r.generate({ media: { id: 'm1' }, sizes: [] });
-    assert.deepEqual(previews, []);
+    const result = await r.generate({
+      media: { id: 'm1', original: { key: 'o', contentType: 'image/jpeg' } },
+      sizes: [],
+    });
+    assert.deepEqual(result.created, []);
+    assert.equal(result.failed, 0);
   });
 });

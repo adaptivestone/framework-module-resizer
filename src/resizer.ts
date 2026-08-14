@@ -143,6 +143,13 @@ export interface GenerateOpts {
   persist?: boolean; // default true → $push previews + backfill dims
 }
 
+// `created` is only the rows THIS call produced. Empty + `failed === 0` is success
+// (already stored, SVG pass-through, or an empty catalog). Total failure throws.
+export interface GenerateResult {
+  created: Preview[];
+  failed: number;
+}
+
 // Unknown pipeline name → the shared, frozen empty pipeline (no steps). One frozen
 // constant avoids per-call allocation + accidental mutation of a "default" (04 · §8).
 const EMPTY_PIPELINE: Pipeline = Object.freeze({});
@@ -232,14 +239,26 @@ export class Resizer {
     name: WaterfallName,
     value: unknown,
     ctx: Record<string, unknown>,
+    // `optional` (0.2 formatPublicUrls): no taps / every tap throws → `undefined`
+    // instead of leaking the raw decision as a DTO. Other waterfalls stay `identity`.
+    mode: 'identity' | 'optional' = 'identity',
   ): Promise<unknown> {
+    const taps = this.hooks.get(name) ?? [];
+    if (mode === 'optional' && taps.length === 0) {
+      return undefined;
+    }
     const app = getApp();
-    for (const fn of this.hooks.get(name) ?? []) {
+    let succeeded = false;
+    for (const fn of taps) {
       try {
         value = await fn(value, ctx);
+        succeeded = true;
       } catch (e) {
         app.logger.error(`resize waterfall ${name} tap failed (skipped)`, e);
       }
+    }
+    if (mode === 'optional' && !succeeded) {
+      return undefined;
     }
     return value;
   }
@@ -277,7 +296,7 @@ export class Resizer {
     pipeline?: string; // selects a registered pipeline; default 'default'
     formats?: PreviewFormat[]; // default = requiredFormats(config)
     ctx?: Record<string, unknown>; // threaded to read-path hooks (04 · §8)
-    enqueueMissing?: boolean; // default true
+    enqueueMissing?: boolean; // default true when a transport is set, false otherwise
   }): Promise<{ decision: ReadDecision; output: unknown }> {
     return resolveImpl(this, opts);
   }
@@ -310,7 +329,7 @@ export class Resizer {
    * (bounded by config.worker.concurrency, NO locks). `persist !== false` → one
    * mediaStore.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
    */
-  async generate(opts: GenerateOpts): Promise<{ previews: Preview[] }> {
+  async generate(opts: GenerateOpts): Promise<GenerateResult> {
     return generateImpl(this, opts);
   }
 }

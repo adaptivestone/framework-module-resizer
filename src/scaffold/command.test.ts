@@ -135,7 +135,7 @@ describe('runScaffold — --eject', () => {
 });
 
 describe('runScaffold — --eager', () => {
-  test('emits only resizer.ts + config, with the transport commented out', async () => {
+  test('emits only resizer.ts + config, wired to LocalFsStorage (no Mongo transport)', async () => {
     const { code } = await run(['--eager']);
     assert.equal(code, 0);
 
@@ -144,13 +144,12 @@ describe('runScaffold — --eager', () => {
     assert.equal(await exists(MODEL), false);
     assert.equal(await exists(COMMAND), false);
 
-    // The transport line is commented (eager mode never enqueues).
     const resizer = await read(RESIZER);
-    assert.doesNotMatch(resizer, /^\s*transport: new MongoTransport/m);
-    assert.match(resizer, /\/\/\s*transport/);
-    // The now-unused MongoTransport import is commented too (4.3).
-    assert.doesNotMatch(resizer, /^\s*import \{ MongoTransport \}/m);
-    assert.match(resizer, /\/\/\s*import \{ MongoTransport \}/);
+    assert.doesNotMatch(resizer, /MongoTransport/);
+    assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
+    assert.match(resizer, /LocalFsStorage/);
+    assert.match(resizer, /storage\/fs\.js/);
+    assert.match(resizer, /publicBaseUrl/);
   });
 });
 

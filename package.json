@@ -1,7 +1,7 @@
 {
   "name": "@adaptivestone/framework-module-resize",
-  "version": "0.1.0",
-  "description": "Adaptive stone node js framework module: lazy image resize (sharp)",
+  "version": "0.2.0",
+  "description": "Adaptive stone node js framework module: image resize (sharp)",
   "main": "./dist/index.js",
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -17,6 +17,7 @@
     "./transports/mongo.js": "./dist/transports/mongo.js",
     "./transports/sqs.js": "./dist/transports/sqs.js",
     "./storage/s3.js": "./dist/storage/s3.js",
+    "./storage/fs.js": "./dist/storage/fs.js",
     "./mediaStore/framework.js": "./dist/mediaStore/framework.js",
     "./locks/framework.js": "./dist/locks/framework.js"
   },

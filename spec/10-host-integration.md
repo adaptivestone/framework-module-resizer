@@ -21,7 +21,7 @@ import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js'
 export const resizer = new Resizer({
   transport: new MongoTransport(),           // or new SqsTransport({ queueUrl, region }); omit entirely for eager-only (11)
   storage: new S3Storage({                   // REQUIRED — shipped driver (05 · §10.5) or any custom ResizeStorage (05 · §10.4)
-    bucketPublic: 'my-cdn', bucketPrivate: 'my-originals', publicUrl: 'https://cdn.example.com',
+    bucketPublic: 'my-cdn', bucketPrivate: 'my-originals', publicBaseUrl: 'https://cdn.example.com',
   }),
   // mediaStore / lockProvider omitted → framework defaults (05 · §10.6)
   pipelines: {

@@ -34,7 +34,7 @@ export interface ResolveOpts {
   pipeline?: string; // selects a registered pipeline; default 'default'
   formats?: PreviewFormat[]; // default = requiredFormats(config)
   ctx?: Record<string, unknown>; // threaded to read-path hooks; ctx.isOwner/isAdmin gate signedUrl
-  enqueueMissing?: boolean; // default true
+  enqueueMissing?: boolean; // default true when a transport is set, false otherwise
 }
 
 export interface PrewarmOpts {
@@ -53,7 +53,7 @@ const SIGNED_ORIGINAL_TTL_SECONDS = 300; // 5 minutes
 /**
  * §17 steps 1–11. See the module header for the shape. The ENTIRE body runs inside a
  * try/catch (the never-throw guarantee, layer 3): on any unexpected internal error it logs
- * and returns the safe value `{ decision: { ready-so-far, missing: [] }, output: <that> }`
+ * and returns the safe value `{ decision: { ready-so-far, missing: [] }, output: undefined }`
  * instead of rejecting into the caller's read.
  */
 export async function resolveImpl(
@@ -113,6 +113,9 @@ export async function resolveImpl(
         }
         for (const format of formats) {
           const entry: ReadyEntry = { sizeKey, format, url, isOriginal: true };
+          if (original.contentType) {
+            entry.contentType = original.contentType;
+          }
           if (size.filters) {
             entry.filters = size.filters;
           }
@@ -139,6 +142,7 @@ export async function resolveImpl(
               format,
               url: storage.publicUrl(existing),
               preview: existing,
+              contentType: existing.contentType,
             };
             if (size.filters) {
               entry.filters = size.filters;
@@ -159,12 +163,16 @@ export async function resolveImpl(
             original.width <= size.width && // (d) not larger than the box
             original.height <= size.height
           ) {
-            ready.push({
+            const fits: ReadyEntry = {
               sizeKey,
               format,
               url: await originalUrl(resizer, original, ctx),
               isOriginal: true,
-            });
+            };
+            if (original.contentType) {
+              fits.contentType = original.contentType;
+            }
+            ready.push(fits);
             continue;
           }
 
@@ -199,9 +207,10 @@ export async function resolveImpl(
       ctx,
     )) as MissingPreview[];
 
-    // 9. Enqueue the missing variants (default on). No transport → log ONCE and skip
-    // (eager-only host — missing variants stay placeholders); else enqueue, guarded.
-    if (opts.enqueueMissing !== false && decision.missing.length > 0) {
+    // 9. Enqueue the missing variants. Default follows construction: a transport means
+    // lazy mode (enqueue), no transport means eager-only (do not log-on-every-read).
+    const enqueueMissing = opts.enqueueMissing ?? resizer.transport != null;
+    if (enqueueMissing && decision.missing.length > 0) {
       if (!resizer.transport) {
         getApp().logger.warn(
           'resize resolve: missing previews but no transport is registered — they stay placeholders (eager-only host? construct the Resizer with a transport for lazy mode)',
@@ -219,11 +228,13 @@ export async function resolveImpl(
       }
     }
 
-    // 10. Host turns the decision into its response shape. No tap → output === decision.
+    // 10. Host turns the decision into its response shape. No tap / tap throws →
+    // `output === undefined` (never leak `{ ready, missing }` as a DTO).
     const output = await resizer.runWaterfall(
       'formatPublicUrls',
       decision,
       ctx,
+      'optional',
     );
 
     // 11.
@@ -232,7 +243,7 @@ export async function resolveImpl(
     // Never-throw guarantee (layer 3): the read must not break on an internal error.
     logResolveError(err);
     const safe: ReadDecision = { ready, missing: [] };
-    return { decision: safe, output: safe };
+    return { decision: safe, output: undefined };
   }
 }
 

@@ -6,6 +6,7 @@ import {
   getImageContentType,
   getPreviewIdentity,
   getSizeKey,
+  isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
 
@@ -250,5 +251,58 @@ describe('calculateResizedDimensions', () => {
     );
     assert.equal(r.width, 1600);
     assert.equal(r.height, 1200);
+  });
+});
+
+describe('isCatalogCovered', () => {
+  const sizes = [{ width: 20, height: 20 }];
+  const formats = ['jpeg'] as const;
+
+  test('false when no matching preview is stored', () => {
+    assert.equal(
+      isCatalogCovered({ original: { key: 'o' }, previews: [] }, sizes, [
+        ...formats,
+      ]),
+      false,
+    );
+  });
+
+  test('true when every size×format identity is already stored', () => {
+    assert.equal(
+      isCatalogCovered(
+        {
+          original: { key: 'o' },
+          previews: [
+            {
+              key: 'p',
+              sizeKey: '20x20',
+              format: 'jpeg',
+              contentType: 'image/jpeg',
+            },
+          ],
+        },
+        sizes,
+        [...formats],
+      ),
+      true,
+    );
+  });
+
+  test('SVG original is covered without previews (pass-through)', () => {
+    assert.equal(
+      isCatalogCovered(
+        { original: { key: 'x.svg', contentType: 'image/svg+xml' } },
+        sizes,
+        [...formats],
+      ),
+      true,
+    );
+  });
+
+  test('empty sizes is covered (nothing to generate)', () => {
+    assert.equal(
+      isCatalogCovered({ original: { key: 'o' } }, [], ['jpeg']),
+      true,
+    );
   });
 });

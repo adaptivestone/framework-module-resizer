@@ -171,6 +171,26 @@ describe('S3Storage.publicUrl (pure — no client)', () => {
     );
   });
 
+  test('publicBaseUrl is the preferred option (alias of the deprecated publicUrl)', () => {
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      publicBaseUrl: 'https://cdn.example.com/',
+    });
+    assert.equal(
+      s.publicUrl({ key: 'a/b.jpg' }),
+      'https://cdn.example.com/a/b.jpg',
+    );
+  });
+
+  test('publicBaseUrl wins when both publicBaseUrl and publicUrl are set', () => {
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      publicBaseUrl: 'https://new.example.com',
+      publicUrl: 'https://old.example.com',
+    });
+    assert.equal(s.publicUrl({ key: 'k' }), 'https://new.example.com/k');
+  });
+
   test('endpoint + forcePathStyle → path-style URL', () => {
     const s = new S3Storage({
       bucketPublic: 'pub',

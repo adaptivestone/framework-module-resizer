@@ -117,11 +117,24 @@ export interface ReadyEntry {
   url: string;
   preview?: Preview; // present for generated previews; ABSENT for original-backed entries
   isOriginal?: boolean; // true when `url` points at the untouched original
+  contentType?: string; // preview.contentType, or original.contentType when isOriginal
 }
 
 export interface ReadDecision {
   ready: ReadyEntry[];
   missing: MissingPreview[];
+}
+
+// Generic `<picture>` map produced by `formatPictureUrls` (0.2). A convenience — not
+// "the" host contract. `sizeKey` is whatever identity already is (`720x720`, `620w`, `fit`).
+export interface PictureUrls {
+  mediaType?: string;
+  id?: string;
+  sizes: {
+    [sizeKey: string]: {
+      [format: string]: { url: string; contentType?: string };
+    };
+  };
 }
 
 // ---------------------------------------------------------------------------

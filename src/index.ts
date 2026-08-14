@@ -4,11 +4,12 @@
 // static imports inside; the main entry never resolves any driver's (optional-peer)
 // dependencies — so `import '@adaptivestone/framework-module-resize'` never loads the AWS
 // SDKs, and a missing optional peer fails LOUDLY at the host's own driver import line at
-// bootstrap, not at the first I/O call. The five driver subpaths (house style: CLASSES
+// bootstrap, not at the first I/O call. The six driver subpaths (house style: CLASSES
 // implementing the Abstract* contracts, constructed `new X(opts?)`):
 //   import { MongoTransport }        from '@adaptivestone/framework-module-resize/transports/mongo.js';
 //   import { SqsTransport }          from '@adaptivestone/framework-module-resize/transports/sqs.js';
 //   import { S3Storage }             from '@adaptivestone/framework-module-resize/storage/s3.js';
+//   import { LocalFsStorage }        from '@adaptivestone/framework-module-resize/storage/fs.js';
 //   import { FrameworkMediaStore }   from '@adaptivestone/framework-module-resize/mediaStore/framework.js';
 //   import { FrameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
 // The contract INTERFACES for custom-driver authors re-export below (the VALUES live at the
@@ -29,16 +30,22 @@ export {
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type { PrewarmOpts, ResolveOpts } from './engine.ts';
 // --- pure identity + dimension helpers (03 · Identity) ---
+export { ResizeGenerateError, ResizeNoOriginalError } from './errors.ts';
+export { formatPictureUrls } from './formatPictureUrls.ts';
 export {
   calculateResizedDimensions,
   getFilterSig,
   getImageContentType,
   getPreviewIdentity,
   getSizeKey,
+  isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
 // --- optional `as const` media schema fragment the host spreads into File/Media (08 · §12) ---
-export { resizeMediaSchemaFragment } from './models/mediaFragment.ts';
+export {
+  resizeMediaPaths,
+  resizeMediaSchemaFragment,
+} from './models/mediaFragment.ts';
 export type { TResizeTask } from './models/ResizeTask.ts';
 // --- Mongo-transport model class (the host's scaffolded model `extends` it) + its doc type ---
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';
@@ -46,6 +53,7 @@ export { default as ResizeTaskModel } from './models/ResizeTask.ts';
 export type {
   BeforeStep,
   GenerateOpts,
+  GenerateResult,
   HookFn,
   HookName,
   HookSignatures,

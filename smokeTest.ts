@@ -32,7 +32,7 @@ const CHECK_CORE = `import assert from 'node:assert/strict';
 
 const PKG = '@adaptivestone/framework-module-resize';
 
-// (a) main entry: exactly the 17 runtime exports, and no driver class leaks into it.
+// (a) main entry: exactly the expected runtime exports, and no driver class leaks into it.
 const mod = await import(PKG);
 const expected = [
   'ResizeWorker',
@@ -40,12 +40,17 @@ const expected = [
   'getResizeConfig',
   'requiredFormats',
   'calculateResizedDimensions',
+  'formatPictureUrls',
   'getFilterSig',
   'getImageContentType',
   'getPreviewIdentity',
   'getSizeKey',
+  'isCatalogCovered',
   'parseSizeKey',
+  'resizeMediaPaths',
   'resizeMediaSchemaFragment',
+  'ResizeGenerateError',
+  'ResizeNoOriginalError',
   'ResizeTaskModel',
   'getResizer',
   'Resizer',
@@ -67,6 +72,7 @@ for (const driver of [
   'MongoTransport',
   'SqsTransport',
   'S3Storage',
+  'LocalFsStorage',
   'FrameworkMediaStore',
   'FrameworkLockProvider',
 ]) {
@@ -98,6 +104,7 @@ for (const [sub, sdk] of optional) {
 // (c) always-safe subpaths import successfully.
 const safe = [
   ['/transports/mongo.js', 'MongoTransport'],
+  ['/storage/fs.js', 'LocalFsStorage'],
   ['/mediaStore/framework.js', 'FrameworkMediaStore'],
   ['/locks/framework.js', 'FrameworkLockProvider'],
   ['/config/resize.js', 'getResizeConfig'],
@@ -190,7 +197,7 @@ try {
   }
   console.log('  ok  AGENTS.md ships with the package');
 
-  // (a) main entry imports + exposes the 17 core exports, (b) optional subpaths fail loudly
+  // (a) main entry imports + exposes the core exports, (b) optional subpaths fail loudly
   // without their SDKs, (c) the always-safe subpaths import. Runs INSIDE the consumer so
   // module resolution is the consumer's, exercising the real published resolution.
   writeFileSync(join(consumer, 'checkCore.mjs'), CHECK_CORE);

@@ -224,8 +224,8 @@ class Resizer {
     pipeline?: string;              // selects a registered pipeline; default 'default'
     formats?: PreviewFormat[];      // default = requiredFormats(config)
     ctx?: Record<string, unknown>;  // threaded to read-path hooks; reaches pipeline steps ONLY in eager mode (04 · §8). Keys read by the engine: ctx.isOwner / ctx.isAdmin gate signedUrl originals. e.g. { entity:'event', isOwner:true }
-    enqueueMissing?: boolean;       // default true
-  }): Promise<{ decision: ReadDecision; output: unknown /* whatever formatPublicUrls returns */ }>;
+    enqueueMissing?: boolean;       // default true when a transport is set, false otherwise
+  }): Promise<{ decision: ReadDecision; output: unknown /* formatPublicUrls; undefined if none / throws */ }>;
 
   // --- pre-warm (queue the catalog at upload, non-blocking) — see 11 · §11.1b ---
   async prewarm(opts: {
@@ -244,7 +244,7 @@ class Resizer {
     formats?: PreviewFormat[];
     ctx?: Record<string, unknown>;
     persist?: boolean;              // default true → $push previews + backfill dims
-  }): Promise<{ previews: Preview[] }>;
+  }): Promise<{ created: Preview[]; failed: number }>;
 }
 
 export function getResizer(): Resizer;        // the active instance; THROWS a clear error if none constructed
