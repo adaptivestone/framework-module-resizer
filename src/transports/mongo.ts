@@ -12,6 +12,7 @@
 // this driver is always safe (05 · §10.2).
 import { getApp } from '../app.ts';
 import { getResizeConfig } from '../config/resize.ts';
+import { ResizeError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
 import { getResizer } from '../resizer.ts';
@@ -410,8 +411,11 @@ export class MongoTransport implements QueueTransport {
         await this.fail(
           task.taskId,
           leaseToken,
-          new Error(
+          // Base ResizeError, not a subclass: this never reaches a host `catch` — it is stored
+          // as the task's failure reason — so no `instanceof` will ever discriminate it.
+          new ResizeError(
             `resize mongo transport: task ${task.taskId} exceeded taskTimeoutMs (${taskTimeoutMs}ms)`,
+            { code: 'RESIZE_TASK_TIMEOUT' },
           ),
           attempts,
         );

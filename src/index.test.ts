@@ -13,8 +13,14 @@ const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 // re-exports (contract interfaces, TResizeTask, types.d.ts) are erased and never appear here.
 const EXPECTED_VALUE_EXPORTS = [
   'Resizer',
+  'ResizeConfigError',
+  'ResizeError',
   'ResizeGenerateError',
+  'ResizeMediaError',
   'ResizeNoOriginalError',
+  'ResizeSecurityError',
+  'ResizeSetupError',
+  'ResizeStorageError',
   'ResizeTaskModel',
   'ResizeWorker',
   'calculateResizedDimensions',

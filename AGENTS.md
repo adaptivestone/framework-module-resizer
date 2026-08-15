@@ -131,6 +131,27 @@ No original throws `ResizeNoOriginalError`; every requested variant failing thro
 `generate` also appends `created` onto `media.previews` (when persist is on) so a same-request
 `resolve({ media })` sees them.
 
+Errors: EVERY throw from this module extends `ResizeError`, so one check separates a module
+rejection from a sharp/S3/mongo failure. Subclasses say what to do — `ResizeSetupError` (wiring
+is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this record;
+`ResizeNoOriginalError` extends it), `ResizeGenerateError` (produced nothing),
+`ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
+Every instance carries a stable `err.code`. Use `ResizeError.isResizeError(err)` rather than
+`instanceof` when the error may cross a package boundary — duplicate copies of the package
+break `instanceof` but not the symbol brand.
+
+```ts
+import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
+
+try {
+  await getResizer().generate({ media: fileDoc, sizes: catalog });
+} catch (err) {
+  if (err instanceof ResizeNoOriginalError) return badRequest('upload the image first');
+  if (ResizeError.isResizeError(err)) return badRequest(err.message);
+  throw err; // not ours
+}
+```
+
 Listing queries:
 
 ```ts

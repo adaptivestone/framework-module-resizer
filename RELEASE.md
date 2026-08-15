@@ -28,12 +28,18 @@ rewritten relative import paths, the optional-subpath loud-fail contract, and th
 Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
 
 - `0.x.y` → `0.x.(y+1)` — fixes / additive, backward-compatible.
-- `0.x.y` → `0.(x+1).0` — any breaking change to the public surface (the 17 core exports, the
+- `0.x.y` → `0.(x+1).0` — any breaking change to the public surface (the 28 core exports, the
   driver subpaths, the config shape, the `ResizeTask` schema, or the scaffold output).
 - Cut `1.0.0` once the public API is committed-to.
 
 Bump with `npm version <patch|minor|major>` (updates `package.json` + creates the git tag — see
 §4), or edit `version` by hand and tag manually.
+
+**Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
+heading, with `**Breaking changes**` / `**Features**` / `**Internal**` groups — the format the
+sibling `framework-module-email` uses. It is NOT in `files`, so it stays on GitHub and never
+ships in the tarball (same as the sibling). Write it for a host developer deciding whether to
+upgrade: what breaks, what is new, and what they must change.
 
 ## 3. Publish
 
@@ -70,6 +76,21 @@ git push origin main --tags
 ```
 
 `npm version <…>` creates this tag for you (prefix `v` is npm's default).
+
+**If the tag already exists** (e.g. it was cut before the release commit landed), do NOT publish
+against it — move it, so the tag and the published tarball describe the same code:
+
+```bash
+git tag -f vX.Y.Z            # repoint at the release commit
+git push --force origin vX.Y.Z
+```
+
+Then **publish a GitHub Release** for the tag, as both sibling repos do for every version — paste
+the matching `CHANGELOG.md` section as the body:
+
+```bash
+gh release create vX.Y.Z --title "X.Y.Z" --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '$d')
+```
 
 ## 5. Manual post-publish verification — try in a real host backend
 

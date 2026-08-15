@@ -1,5 +1,6 @@
 import merge from 'deepmerge';
 import { getApp } from '../app.ts';
+import { ResizeConfigError } from '../errors.ts';
 import type { PreviewFormat, ResizeConfig } from '../types.d.ts';
 
 // Every TUNABLE is defaulted (and completeness-checked by the Omit type). Only the
@@ -58,16 +59,18 @@ export function getResizeConfig(): ResizeConfig {
     arrayMerge: overwrite,
   }) as ResizeConfig;
   if (!merged.mediaModelName) {
-    throw new Error(
+    throw new ResizeConfigError(
       'resize config: `mediaModelName` is required — set it in the host src/config/resize.ts',
+      { code: 'RESIZE_CONFIG_MEDIA_MODEL_MISSING' },
     );
   }
   // Doneness invariant (07 · Worker): a worker lock MUST expire within the lease window, else a
   // crashed worker's lock outlives its lease and blocks the re-leased task from regenerating the
   // skipped variant. Enforce lockTtlMs.worker ≤ leaseMs at config resolution (08 · §13).
   if (merged.queue.lockTtlMs.worker > merged.queue.leaseMs) {
-    throw new Error(
+    throw new ResizeConfigError(
       `resize config: queue.lockTtlMs.worker (${merged.queue.lockTtlMs.worker}) must be ≤ queue.leaseMs (${merged.queue.leaseMs}) — a worker lock must expire within the lease window (07 · doneness invariant)`,
+      { code: 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE' },
     );
   }
   return merged;

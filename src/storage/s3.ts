@@ -1,5 +1,7 @@
 // S3 storage driver (05 · §10.5) — SHIPPED, optional peer deps. A class that keeps its
-// bucket/URL options in a private field and constructs (and memoizes) ONE `S3Client` on first
+// bucket/URL options in a `#private` field (engine-enforced, not a compile-time convention, so a
+// JS host cannot read the bucket config off the instance) and constructs (and memoizes) ONE
+// `S3Client` on first
 // I/O use — unless the host brings its own via `opts.client`. `publicUrl` is PURE (no client,
 // no I/O — the read path calls it). Credentials are NEVER options — they resolve via the
 // standard AWS provider chain.
@@ -16,6 +18,7 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
 import type { StorageRef } from '../types.d.ts';
 import type { ResizeStorage } from './AbstractStorage.ts';
 
@@ -36,49 +39,50 @@ export interface S3StorageOptions {
 }
 
 export class S3Storage implements ResizeStorage {
-  private readonly opts: S3StorageOptions;
+  readonly #opts: S3StorageOptions;
   // Memoized per instance (a host may construct more than one driver). A host-provided
   // `opts.client` short-circuits construction. Synchronous now that the SDK is a static
   // import — built lazily on first I/O use.
-  private client: S3Client | undefined;
+  #client: S3Client | undefined;
 
   constructor(opts: S3StorageOptions) {
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
-    this.opts = opts;
+    this.#opts = opts;
   }
 
-  private getClient(): S3Client {
-    if (this.opts.client) {
-      return this.opts.client;
+  #getClient(): S3Client {
+    if (this.#opts.client) {
+      return this.#opts.client;
     }
-    this.client ??= new S3Client({
+    this.#client ??= new S3Client({
       // region/endpoint/forcePathStyle only when provided (else the SDK's own defaults
       // / the AWS provider chain apply).
-      ...(this.opts.region !== undefined ? { region: this.opts.region } : {}),
-      ...(this.opts.endpoint !== undefined
-        ? { endpoint: this.opts.endpoint }
+      ...(this.#opts.region !== undefined ? { region: this.#opts.region } : {}),
+      ...(this.#opts.endpoint !== undefined
+        ? { endpoint: this.#opts.endpoint }
         : {}),
-      ...(this.opts.forcePathStyle !== undefined
-        ? { forcePathStyle: this.opts.forcePathStyle }
+      ...(this.#opts.forcePathStyle !== undefined
+        ? { forcePathStyle: this.#opts.forcePathStyle }
         : {}),
     });
-    return this.client;
+    return this.#client;
   }
 
   // Bucket allowlist (05 · §10.5): a stored `ref.bucket` MUST be one of the driver's configured
   // buckets. A tampered media-doc `bucket` must never become a cross-bucket read or an
   // attacker-controlled hostname in a public URL (the virtual-hosted form interpolates the bucket
   // into the host). ref.bucket === undefined is fine — the caller uses the configured fallbacks.
-  private assertAllowedBucket(bucket: string | undefined): void {
+  #assertAllowedBucket(bucket: string | undefined): void {
     if (
       bucket === undefined ||
-      bucket === this.opts.bucketPublic ||
-      bucket === this.opts.bucketPrivate
+      bucket === this.#opts.bucketPublic ||
+      bucket === this.#opts.bucketPrivate
     ) {
       return;
     }
-    throw new Error(
+    throw new ResizeSecurityError(
       `resize s3: ref.bucket "${bucket}" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access (05 · §10.5)`,
+      { code: 'RESIZE_S3_BUCKET_NOT_ALLOWED' },
     );
   }
 
@@ -97,9 +101,9 @@ export class S3Storage implements ResizeStorage {
   }): Promise<StorageRef> {
     const bucket =
       visibility === 'public'
-        ? this.opts.bucketPublic
-        : (this.opts.bucketPrivate ?? this.opts.bucketPublic);
-    await this.getClient().send(
+        ? this.#opts.bucketPublic
+        : (this.#opts.bucketPrivate ?? this.#opts.bucketPublic);
+    await this.#getClient().send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: key,
@@ -113,15 +117,18 @@ export class S3Storage implements ResizeStorage {
   // Download by stored locator (the worker's original). ref.bucket wins, then the
   // private/public fallbacks.
   async download(ref: StorageRef): Promise<Buffer> {
-    this.assertAllowedBucket(ref.bucket);
+    this.#assertAllowedBucket(ref.bucket);
     const bucket =
-      ref.bucket ?? this.opts.bucketPrivate ?? this.opts.bucketPublic;
-    const out = await this.getClient().send(
+      ref.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
+    const out = await this.#getClient().send(
       new GetObjectCommand({ Bucket: bucket, Key: ref.key }),
     );
     const stream = out.Body;
     if (!stream) {
-      throw new Error(`resize s3: empty body for ${bucket}/${ref.key}`);
+      throw new ResizeStorageError(
+        `resize s3: empty body for ${bucket}/${ref.key}`,
+        { code: 'RESIZE_S3_EMPTY_BODY' },
+      );
     }
     const bytes = await stream.transformToByteArray();
     return Buffer.from(bytes);
@@ -131,26 +138,26 @@ export class S3Storage implements ResizeStorage {
   // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
   // virtual-hosted. bucket = ref.bucket ?? bucketPublic.
   publicUrl(ref: StorageRef): string {
-    this.assertAllowedBucket(ref.bucket);
-    const bucket = ref.bucket ?? this.opts.bucketPublic;
-    const publicBase = this.opts.publicBaseUrl ?? this.opts.publicUrl;
+    this.#assertAllowedBucket(ref.bucket);
+    const bucket = ref.bucket ?? this.#opts.bucketPublic;
+    const publicBase = this.#opts.publicBaseUrl ?? this.#opts.publicUrl;
     if (publicBase) {
       return `${publicBase.replace(/\/+$/, '')}/${ref.key}`;
     }
-    if (this.opts.endpoint !== undefined || this.opts.forcePathStyle) {
-      const base = (this.opts.endpoint ?? '').replace(/\/+$/, '');
+    if (this.#opts.endpoint !== undefined || this.#opts.forcePathStyle) {
+      const base = (this.#opts.endpoint ?? '').replace(/\/+$/, '');
       return `${base}/${bucket}/${ref.key}`;
     }
-    return `https://${bucket}.s3.${this.opts.region ?? 'us-east-1'}.amazonaws.com/${ref.key}`;
+    return `https://${bucket}.s3.${this.#opts.region ?? 'us-east-1'}.amazonaws.com/${ref.key}`;
   }
 
   // Time-limited signed URL for owner/admin reads of a private original.
   async signedUrl(ref: StorageRef, ttlSeconds: number): Promise<string> {
-    this.assertAllowedBucket(ref.bucket);
+    this.#assertAllowedBucket(ref.bucket);
     const bucket =
-      ref.bucket ?? this.opts.bucketPrivate ?? this.opts.bucketPublic;
+      ref.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
     return getSignedUrl(
-      this.getClient(),
+      this.#getClient(),
       new GetObjectCommand({ Bucket: bucket, Key: ref.key }),
       { expiresIn: ttlSeconds },
     );

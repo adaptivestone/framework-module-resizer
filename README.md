@@ -15,14 +15,6 @@ synchronous all-or-nothing cost and their three incompatible response shapes.
 > **Coding agents** (Claude Code, Cursor, Codex, …): read [`AGENTS.md`](./AGENTS.md) — the
 > machine-oriented integration guide that ships with this package.
 
-### Migrating from 0.1
-
-- `generate` returns `{ created, failed }` (not `{ previews }`). No original →
-  `ResizeNoOriginalError`. Every requested variant failed → `ResizeGenerateError`.
-- `resolve` `output` is **`undefined`** unless you registered `formatPublicUrls` (or if that
-  hook threw). Map `decision`, or call `formatPictureUrls(decision, { id })`.
-- No `transport` → `enqueueMissing` defaults to **`false`** (no warn-on-every-read).
-
 ---
 
 ## How it works
@@ -248,9 +240,53 @@ const { created, failed } = await resizer.generate({
 // Some fail → no throw, failed > 0. created is this call only.
 ```
 
+`created` is **only what this call made**. A second `generate` with the same catalog returns
+`{ created: [], failed: 0 }` because everything already exists — treat an empty `created` as
+"nothing new was needed", never as failure. An SVG original is the same: pass-through, never
+rasterized, `{ created: [], failed: 0 }`.
+
 **Hybrid:** `generate` the above-the-fold sizes at upload and let `resolve` lazily fill the heavy
 ones on demand — or `prewarm` the whole catalog at upload and let `resolve` cover anything added
 later. A host that starts eager can graduate to lazy (or pre-warm) with no migration.
+
+---
+
+## Errors
+
+Every error this module throws extends **`ResizeError`**, so one check separates "the resize
+module rejected this" from a `sharp` crash or an S3 timeout. The subclass answers the only
+question a catch block actually has — what to do about it:
+
+| Class | Means | Do |
+|---|---|---|
+| `ResizeSetupError` | wiring/bootstrap is wrong | fix your code; retrying never helps |
+| `ResizeConfigError` | host config invalid or violates an invariant | crash at boot |
+| `ResizeMediaError` | this media record is unusable | skip it; don't retry |
+| ↳ `ResizeNoOriginalError` | `generate` called with no `original` | upload the source first |
+| `ResizeGenerateError` | the operation produced nothing | inspect `failed` / `requested` |
+| `ResizeStorageError` | transient storage I/O | a retry may help |
+| `ResizeSecurityError` | a refusal (path traversal, cross-bucket) | never retry; log loudly |
+
+```ts
+import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
+
+try {
+  await resizer.generate({ media, sizes });
+} catch (err) {
+  if (err instanceof ResizeNoOriginalError) return badRequest('upload the image first');
+  if (ResizeError.isResizeError(err)) return badRequest(err.message);  // any module rejection
+  throw err;                                                           // not ours — let it bubble
+}
+```
+
+Each error also carries a stable, machine-readable `err.code` (`RESIZE_NO_ORIGINAL`,
+`RESIZE_STORAGE_REQUIRED`, `RESIZE_FS_PATH_TRAVERSAL`, …) for logging and alerting, plus the
+usual `err.name` and `err.cause`.
+
+**Prefer `ResizeError.isResizeError(err)` over `instanceof` across a package boundary.** If two
+copies of this package end up in one `node_modules` tree the class identities differ and
+`instanceof` silently returns `false` — exactly when you most need the check to work.
+`isResizeError` tests a registered symbol instead of the prototype chain, so it keeps working.
 
 ---
 

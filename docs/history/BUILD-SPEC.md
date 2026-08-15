@@ -53,8 +53,9 @@ identity helper (03) underpins everything; build and test it first.
 The substantive decisions baked in here, settled against real usage across the prior implementations:
 
 1. **Storage is a registered strategy**, not part of the app interface — the abstract
-   `ResizeStorage` interface plus shipped drivers (v1: `s3Storage`; more can be added without
-   touching the core), injected as the **required `storage:` option** of `new Resizer({…})`. The injected
+   `ResizeStorage` interface plus shipped driver CLASSES (`S3Storage`, `LocalFsStorage`; more can
+   be added without touching the core), injected as the **required `storage:` option** of
+   `new Resizer({…})`. The injected
    driver is required in **every** process: the worker for `download`/`upload`, the read path
    for the pure, I/O-free `publicUrl` (no storage I/O ever happens on a read).
 2. **The queue transport owns consumption.** Its interface is `enqueue` + `startWorker`;
@@ -135,9 +136,12 @@ wins — all folded into `04`/`05`/`07`/`08`. Remaining open gaps are flagged ho
    `beforeSteps` once, then generates avif/webp/(jpeg) previews with EXIF rotation, `fit`
    inside/no-upscale, per-variant `variantSteps`/filters, bounded concurrency, random keys,
    `$push`, original-dims backfill, both-tier lock release; clean no-op when disabled.
-5. Storage strategy (shipped `s3Storage` or a custom driver) registered and used by the
-   worker (`download`/`upload`) and by the read path (pure `publicUrl`); `resolve` degrades
-   to the safe-empty decision — never throws — when none is registered.
+5. Storage strategy (shipped `S3Storage` / `LocalFsStorage`, or a custom driver) injected at
+   construction and used by the worker (`download`/`upload`) and by the read path (pure
+   `publicUrl`). There is no "none registered" state: `storage` is REQUIRED, and `new Resizer()`
+   throws a `ResizeSetupError` without it — see settled decision #1 above. (Corrected 2026-08-15:
+   this line previously claimed `resolve` "degrades to the safe-empty decision — never throws —
+   when none is registered", which the required-storage redesign had already made impossible.)
 6. `resize-scaffold` (package bin) emits an editable `ResizeTask` model (+ `pipeline`/`filters`/`fit`) +
    config into a host app; `--check` reports drift.
 7. No `mongoose` import anywhere; `@adaptivestone/framework` imported in exactly two files —

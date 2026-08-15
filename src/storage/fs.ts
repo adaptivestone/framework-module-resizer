@@ -3,6 +3,7 @@
 // (`…/storage/fs.js`), same as the other drivers.
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { ResizeSecurityError } from '../errors.ts';
 import type { StorageRef } from '../types.d.ts';
 import type { ResizeStorage } from './AbstractStorage.ts';
 
@@ -14,30 +15,33 @@ export interface LocalFsStorageOptions {
 /** Resolve `key` under `rootDir`; throw if it escapes the root (path traversal). */
 function resolveInsideRoot(rootDir: string, key: string): string {
   if (!key || key.includes('\0')) {
-    throw new Error('resize fs: invalid storage key');
+    throw new ResizeSecurityError('resize fs: invalid storage key', {
+      code: 'RESIZE_FS_KEY_INVALID',
+    });
   }
   const root = resolve(rootDir);
   const abs = resolve(root, key);
   const rel = relative(root, abs);
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
-    throw new Error(
+    throw new ResizeSecurityError(
       `resize fs: key "${key}" escapes rootDir — refusing path traversal`,
+      { code: 'RESIZE_FS_PATH_TRAVERSAL' },
     );
   }
   return abs;
 }
 
 export class LocalFsStorage implements ResizeStorage {
-  private readonly rootDir: string;
-  private readonly publicBaseUrl: string;
+  readonly #rootDir: string;
+  readonly #publicBaseUrl: string;
 
   constructor(opts: LocalFsStorageOptions) {
-    this.rootDir = opts.rootDir;
-    this.publicBaseUrl = opts.publicBaseUrl;
+    this.#rootDir = opts.rootDir;
+    this.#publicBaseUrl = opts.publicBaseUrl;
   }
 
   async download(ref: StorageRef): Promise<Buffer> {
-    return readFile(resolveInsideRoot(this.rootDir, ref.key));
+    return readFile(resolveInsideRoot(this.#rootDir, ref.key));
   }
 
   async upload({
@@ -50,7 +54,7 @@ export class LocalFsStorage implements ResizeStorage {
     // Accepted to match ResizeStorage; local/dev shares one tree (not a private store).
     visibility: 'public' | 'private';
   }): Promise<StorageRef> {
-    const abs = resolveInsideRoot(this.rootDir, key);
+    const abs = resolveInsideRoot(this.#rootDir, key);
     await mkdir(dirname(abs), { recursive: true });
     await writeFile(abs, body);
     return { key };
@@ -59,7 +63,7 @@ export class LocalFsStorage implements ResizeStorage {
   // PURE string building — no I/O (called on the read path). Option is publicBaseUrl
   // (never `publicUrl`) so it cannot shadow this method name.
   publicUrl(ref: StorageRef): string {
-    const base = this.publicBaseUrl.replace(/\/+$/, '');
+    const base = this.#publicBaseUrl.replace(/\/+$/, '');
     const key = ref.key.replace(/^\/+/, '');
     return `${base}/${key}`;
   }

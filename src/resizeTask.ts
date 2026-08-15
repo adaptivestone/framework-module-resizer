@@ -10,7 +10,11 @@
 import sharp from 'sharp';
 import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
-import { ResizeGenerateError, ResizeNoOriginalError } from './errors.ts';
+import {
+  ResizeGenerateError,
+  ResizeMediaError,
+  ResizeNoOriginalError,
+} from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { randomHex } from './helpers/random.ts';
 import {
@@ -112,8 +116,9 @@ export async function generatePreviews(
     limitInputPixels: config.limits.inputPixels,
   }).metadata();
   if (origMeta.width === undefined || origMeta.height === undefined) {
-    throw new Error(
+    throw new ResizeMediaError(
       `resize: source metadata missing width/height for media ${mediaId} — cannot size safely`,
+      { mediaId, code: 'RESIZE_SOURCE_METADATA_MISSING' },
     );
   }
   const orientation = origMeta.orientation ?? 1;
@@ -126,8 +131,9 @@ export async function generatePreviews(
     ? Math.min(origMeta.pages ?? 1, config.limits.animationFrames)
     : 1;
   if (origMeta.width * origMeta.height * frames > config.limits.sourcePixels) {
-    throw new Error(
+    throw new ResizeMediaError(
       `resize: source ${origMeta.width}×${origMeta.height}×${frames}f exceeds limits.sourcePixels (${config.limits.sourcePixels}) for media ${mediaId}`,
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE' },
     );
   }
   // Normalize orientation ONCE, before beforeSteps, so every step + variant sees DISPLAY-
@@ -433,9 +439,13 @@ export async function processTask(
   // 10. Poison-variant guard: zero new previews AND ≥1 variant errored → THROW (after the core
   // already released its locks) so the transport's retry → backoff → dead-letter path engages.
   if (generated.length === 0 && failedCount > 0) {
-    throw new Error(
-      `resize worker: task for media ${task.mediaId} produced 0 previews with ${failedCount} variant error(s) — failing for retry/dead-letter`,
-    );
+    throw new ResizeGenerateError({
+      mediaId: task.mediaId,
+      failed: failedCount,
+      requested: task.previews.length,
+      message: `resize worker: task for media ${task.mediaId} produced 0 previews with ${failedCount} variant error(s) — failing for retry/dead-letter`,
+      code: 'RESIZE_WORKER_ALL_VARIANTS_FAILED',
+    });
   }
 }
 

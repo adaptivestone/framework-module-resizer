@@ -7,6 +7,7 @@
 import type { Metadata, Sharp } from 'sharp';
 import { getApp } from './app.ts';
 import { prewarmImpl, resolveImpl } from './engine.ts';
+import { ResizeSetupError } from './errors.ts';
 import type { LockProvider } from './locks/AbstractLockProvider.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
@@ -170,9 +171,9 @@ export class Resizer {
   readonly mediaStore: MediaStore;
   readonly lockProvider: LockProvider;
   // Named pipelines: last-wins per name (04 · §8).
-  private readonly pipelines: Map<string, Pipeline>;
+  readonly #pipelines: Map<string, Pipeline>;
   // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
-  private readonly hooks: Map<HookName, HookFn[]>;
+  readonly #hooks: Map<HookName, HookFn[]>;
 
   constructor(opts: ResizerOptions) {
     // Runtime storage validation (02 · §6 review fix): `storage` is the ONE required option —
@@ -180,15 +181,17 @@ export class Resizer {
     // a half-filled scaffold would otherwise fail with a downstream TypeError at the first
     // publicUrl/download — throw a NAMED error at construction instead.
     if (!opts?.storage) {
-      throw new Error(
+      throw new ResizeSetupError(
         'resize: `storage` is required — construct `new Resizer({ storage: … })` with a ResizeStorage driver (e.g. new S3Storage({ … })); both the read path (publicUrl) and the worker (download/upload) need it (05 · §10.4)',
+        { code: 'RESIZE_STORAGE_REQUIRED' },
       );
     }
     // One-per-process ENFORCED, mirroring the framework's setAppInstance: a second
     // construction is a bootstrap bug (two competing driver sets), so throw loudly.
     if (activeResizer) {
-      throw new Error(
+      throw new ResizeSetupError(
         'resize: only one Resizer per process — use resetResizerForTests() in tests',
+        { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
@@ -196,13 +199,13 @@ export class Resizer {
     this.transport = opts.transport;
     this.mediaStore = opts.mediaStore ?? new FrameworkMediaStore();
     this.lockProvider = opts.lockProvider ?? new FrameworkLockProvider();
-    this.pipelines = new Map(Object.entries(opts.pipelines ?? {}));
+    this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().
-    this.hooks = new Map();
+    this.#hooks = new Map();
     for (const [name, fns] of Object.entries(opts.hooks ?? {})) {
       const arr = (Array.isArray(fns) ? [...fns] : [fns]) as HookFn[];
-      this.hooks.set(name as HookName, arr);
+      this.#hooks.set(name as HookName, arr);
     }
     activeResizer = this;
   }
@@ -212,22 +215,22 @@ export class Resizer {
    * name are allowed; registration order is preserved. (Internal storage stays loosely typed.)
    */
   hook<N extends HookName>(name: N, fn: HookSignatures[N]): void {
-    const taps = this.hooks.get(name);
+    const taps = this.#hooks.get(name);
     if (taps) {
       taps.push(fn as HookFn);
     } else {
-      this.hooks.set(name, [fn as HookFn]);
+      this.#hooks.set(name, [fn as HookFn]);
     }
   }
 
   /** Register a named pipeline — last-wins per name (04 · §8). */
   registerPipeline(name: string, p: Pipeline): void {
-    this.pipelines.set(name, p);
+    this.#pipelines.set(name, p);
   }
 
   /** Look up a pipeline; an unknown name → the shared frozen empty pipeline (no steps). */
   getPipeline(name: string): Pipeline {
-    return this.pipelines.get(name) ?? EMPTY_PIPELINE;
+    return this.#pipelines.get(name) ?? EMPTY_PIPELINE;
   }
 
   /**
@@ -243,7 +246,7 @@ export class Resizer {
     // instead of leaking the raw decision as a DTO. Other waterfalls stay `identity`.
     mode: 'identity' | 'optional' = 'identity',
   ): Promise<unknown> {
-    const taps = this.hooks.get(name) ?? [];
+    const taps = this.#hooks.get(name) ?? [];
     if (mode === 'optional' && taps.length === 0) {
       return undefined;
     }
@@ -276,7 +279,7 @@ export class Resizer {
     } catch (e) {
       app.logger.error(`resize event ${name} listener failed`, e);
     }
-    for (const fn of this.hooks.get(name) ?? []) {
+    for (const fn of this.#hooks.get(name) ?? []) {
       try {
         await fn(...args);
       } catch (e) {
@@ -337,8 +340,9 @@ export class Resizer {
 /** The active instance (worker command, module internals, late taps from other modules). */
 export function getResizer(): Resizer {
   if (!activeResizer) {
-    throw new Error(
+    throw new ResizeSetupError(
       'resize: no Resizer constructed yet — `new Resizer({ storage, … })` in bootstrap code that runs in both the API and worker processes (02 · §6)',
+      { code: 'RESIZE_NO_RESIZER' },
     );
   }
   return activeResizer;

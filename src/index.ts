@@ -29,8 +29,21 @@ export {
 } from './config/resize.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type { PrewarmOpts, ResolveOpts } from './engine.ts';
+// --- error hierarchy: every module throw is a `ResizeError`; the subclass says what to DO ---
+// Hosts catch `ResizeError` to separate "this module rejected it" from a sharp/S3/mongo failure,
+// then branch on the subclass (or the stable `err.code`). `ResizeError.isResizeError(err)` is the
+// duplicate-package-safe form of `instanceof` — prefer it across package boundaries.
+export {
+  ResizeConfigError,
+  ResizeError,
+  ResizeGenerateError,
+  ResizeMediaError,
+  ResizeNoOriginalError,
+  ResizeSecurityError,
+  ResizeSetupError,
+  ResizeStorageError,
+} from './errors.ts';
 // --- pure identity + dimension helpers (03 · Identity) ---
-export { ResizeGenerateError, ResizeNoOriginalError } from './errors.ts';
 export { formatPictureUrls } from './formatPictureUrls.ts';
 export {
   calculateResizedDimensions,

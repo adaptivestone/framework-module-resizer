@@ -1,5 +1,6 @@
 // Pure identity + dimension helpers. ONE identity, built one way, used everywhere
 // (read map, dedup, dispatch lock, worker lock). No external deps — see 03 · Identity.
+import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import type {
   Filters,
@@ -29,7 +30,10 @@ export function getSizeKey({ width, height, fit }: SizeInput): string {
   if (h !== undefined) {
     return `${h}h`;
   }
-  throw new Error('getSizeKey: a size needs `fit`, a width, and/or a height');
+  throw new ResizeSetupError(
+    'getSizeKey: a size needs `fit`, a width, and/or a height',
+    { code: 'RESIZE_SIZE_INVALID' },
+  );
 }
 
 export interface ParsedSizeKey {
@@ -98,8 +102,9 @@ export function getFilterSig(filters?: Filters): string {
 export function requireMediaId(media: MediaLike): string {
   const id = media.id ?? (media._id != null ? String(media._id) : undefined);
   if (!id) {
-    throw new Error(
+    throw new ResizeMediaError(
       'resize: media has neither `id` nor `_id` — cannot identify the media document',
+      { code: 'RESIZE_MEDIA_NO_ID' },
     );
   }
   return id;

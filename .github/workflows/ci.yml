@@ -13,7 +13,7 @@ jobs:
     permissions:
       contents: read
 
-    # Mirror the repo's documented install note (BUILD-PLAN "Install notes"): keep the
+    # Mirror the repo's documented install note (docs/history/BUILD-PLAN.md "Install notes"): keep the
     # mongod binary download OUT of `npm ci` (mongodb-memory-server's postinstall) and
     # let the first test run fetch it into the cached dir restored below.
     env:

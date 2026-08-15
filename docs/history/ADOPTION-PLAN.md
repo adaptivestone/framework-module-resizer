@@ -1,12 +1,11 @@
 # Adoption plan — any framework host
 
 `@adaptivestone/framework-module-resize@0.1.0` is a **shared** package. It must stay
-comfortable in a greenfield app, a second product, and Insailing — not a private
-adapter for one backend.
+comfortable in a greenfield app, a second product, and the first production host —
+not a private adapter for one backend.
 
-Insailing was only the first production probe. Lessons below are generalized.
-Insailing-specific rollout lives in that app’s `docs/resize-module-host-plan.md`,
-not in this module’s API.
+That host was only the first production probe. Lessons below are generalized.
+Host-specific rollout lives in that app’s own docs, not in this module’s API.
 
 ---
 
@@ -24,7 +23,7 @@ belong here.
 
 ## What every host hit (or will)
 
-These are product bugs, not “Insailing quirks”:
+These are product bugs, not “one host’s quirks”:
 
 | Problem | Why any host cares |
 |---|---|
@@ -42,7 +41,7 @@ Not the module’s job (stay on the host):
 - Mapping `originalMetadata` → `original` (legacy schema).
 - A named `generateAvatarPreviews` / Event helper.
 - `resolveMany` (listings: `find().select(…).lean()` + a loop).
-- Per-entity size lists (avatar vs boat vs “product card”).
+- Per-entity size lists (avatar vs banner vs “product card”).
 
 ---
 
@@ -101,7 +100,7 @@ Export the error classes. Any host can `instanceof` without string-matching logs
 ```
 
 `sizeKey` is whatever identity already is (`720x720`, `620w`, `fit`).  
-This is a convenience, **not** “the Insailing contract”. Another app uses its own hook.
+This is a convenience, **not** “one host’s contract”. Another app uses its own hook.
 
 ### 3. `LocalFsStorage`
 
@@ -141,7 +140,7 @@ resizeMediaSelect = 'original previews' // plus host fields they already need
 ```
 
 `resizeMediaSelect` is the **module** fields `resolve`/`generate` read. Hosts append
-`mediaType`, `name`, … themselves. Do not bake Insailing’s `mediaType` into the
+`mediaType`, `name`, … themselves. Do not bake one host’s `mediaType` into the
 constant as if every app has it — document:
 
 ```ts
@@ -193,7 +192,7 @@ Nice when a host must not load `ResizeTask`. Not required if peer is framework �
 
 ## Do not do
 
-- Insailing field names, catalogs, or `getPublicUrls` shape as the only DTO.
+- One host’s field names, catalogs, or public-URL shape as the only DTO.
 - `app` on every method.
 - Storage delete / CDN purge.
 - Watermark, NSFW, plate blur in core (host `pipeline` steps).
@@ -226,11 +225,11 @@ If the next product still needs a 150-line wrapper, 0.2 failed.
 
 ---
 
-## Appendix — Insailing (evidence only)
+## Appendix — first host (evidence only)
 
 First probe: profile avatar, eager, dual schema, custom FS + S3 wrapper.
 
-Next **in that app** (not module work): Auth → `resizeImageByHandle` (four catalogs,
+Next **in that app** (not module work): auth → a host-side image helper (four catalogs,
 including `620w`) → listing `.select` must include `original`/`previews`.  
 Sitemap `uploadRaw` and video are out of scope.
 
