@@ -49,6 +49,12 @@
 - The build specification (`spec/`, `BUILD-SPEC.md`, `BUILD-PLAN.md`, `ADOPTION-PLAN.md`) moved to
   `docs/history/` and is explicitly unmaintained. `README.md`, `AGENTS.md` and the docs site are
   the living documentation. Nothing under `docs/` has ever shipped to npm.
+- Encode defaults were validated against the Kodak reference image set before release and left
+  unchanged at `{ jpeg: 80, webp: 82, avif: 64 }`. At the sizes this module generates, raising
+  AVIF to 90 cost +135% bytes for no difference visible at 1:1.
+- Toolchain and dev dependencies refreshed (TypeScript 7.0.2; lockfile updates for mongoose, the
+  AWS SDKs and the framework peer). **No consumer-facing dependency change** — `dependencies`,
+  `peerDependencies`, `peerDependenciesMeta` and `engines` are identical to 0.1.0.
 
 # 0.1.0
 

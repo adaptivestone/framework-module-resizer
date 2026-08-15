@@ -68,7 +68,12 @@ all that ships.
 
 ## 4. Git tag convention
 
-Tag the release commit `vX.Y.Z` (matches the framework/email repos):
+Tag the release commit `vX.Y.Z`.
+
+> **Note:** the sibling repos actually tag **without** the `v` prefix (`framework` uses `5.3.1`,
+> `framework-module-email` uses `2.0.0`) — an earlier version of this file claimed otherwise. This
+> repo already published `v0.1.0` and `v0.2.0` with the prefix, so it keeps `v` for internal
+> consistency rather than switching mid-stream. Use `v` here; don't "fix" it to match the siblings.
 
 ```bash
 git tag v0.1.0
@@ -89,7 +94,10 @@ Then **publish a GitHub Release** for the tag, as both sibling repos do for ever
 the matching `CHANGELOG.md` section as the body:
 
 ```bash
-gh release create vX.Y.Z --title "X.Y.Z" --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '$d')
+# `1d;$d` drops the `# X.Y.Z` heading and the next version's heading — the body starts at
+# **Breaking changes**, matching how the sibling repos' release bodies read.
+gh release create vX.Y.Z --title "X.Y.Z" \
+  --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d')
 ```
 
 ## 5. Manual post-publish verification — try in a real host backend
