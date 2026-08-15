@@ -90,6 +90,6 @@
     "mongodb-memory-server": "^11.0.0",
     "mongoose": "^9.0.0",
     "sqs-consumer": "^15.0.2",
-    "typescript": "7.0.1-rc"
+    "typescript": "^7.0.2"
   }
 }
