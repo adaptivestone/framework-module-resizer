@@ -178,11 +178,14 @@ describe('MongoTransport.enqueue', () => {
     });
     assert.ok(taskId);
     const doc = await M.findById(taskId).lean();
-    assert.equal(String(doc?.fileId), mediaId);
-    assert.equal(doc?.pipeline, 'photo');
-    assert.equal(doc?.status, 'pending');
-    assert.equal(doc?.attempts, 0);
-    assert.equal((doc?.previews as unknown[]).length, 1);
+    // Assert the doc exists BEFORE reading through it: `doc?.previews as unknown[]` would
+    // short-circuit to undefined and throw a TypeError on `.length`, masking the real failure.
+    assert.ok(doc, 'enqueued task doc should exist');
+    assert.equal(String(doc.fileId), mediaId);
+    assert.equal(doc.pipeline, 'photo');
+    assert.equal(doc.status, 'pending');
+    assert.equal(doc.attempts, 0);
+    assert.equal((doc.previews as unknown[]).length, 1);
   });
 
   test('returns { taskId: null } and logs when getModel is falsy (no TypeError)', async () => {
@@ -342,10 +345,11 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
       1,
     );
     const doc = await M.findById(leased._id).lean();
-    assert.equal(doc?.status, 'pending');
-    assert.equal(doc?.leaseToken, null);
+    assert.ok(doc, 'failed task doc should exist');
+    assert.equal(doc.status, 'pending');
+    assert.equal(doc.leaseToken, null);
     // backoff(1) = base(50) * 2**0 = +50ms → strictly ahead of the fail time.
-    assert.ok((doc?.leaseExpiresAt as Date).getTime() > before);
+    assert.ok((doc.leaseExpiresAt as Date).getTime() > before);
     assert.equal(rec.failed.length, 1);
     assert.equal(rec.dead.length, 0);
   });
@@ -406,7 +410,8 @@ describe('MongoTransport.renew (fencing)', () => {
       true,
     );
     const doc = await M.findById(leased._id).lean();
-    assert.ok((doc?.leaseExpiresAt as Date).getTime() > firstExpiry);
+    assert.ok(doc, 'renewed task doc should exist');
+    assert.ok((doc.leaseExpiresAt as Date).getTime() > firstExpiry);
     assert.equal(
       await transport.renew(String(leased._id), 'stale-token'),
       false,
