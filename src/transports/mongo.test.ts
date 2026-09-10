@@ -13,6 +13,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { MongoTransport } from './mongo.ts';
@@ -352,6 +353,46 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
     assert.ok((doc.leaseExpiresAt as Date).getTime() > before);
     assert.equal(rec.failed.length, 1);
     assert.equal(rec.dead.length, 0);
+  });
+
+  test('RESIZE_NO_ORIGINAL is dead-lettered on the first failure', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert();
+    const leased = await transport.lease();
+    assert.ok(leased);
+    assert.equal(leased.attempts, 1);
+    await transport.fail(
+      String(leased._id),
+      String(leased.leaseToken),
+      new ResizeNoOriginalError(String(leased.fileId)),
+      leased.attempts as number,
+    );
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'dead');
+    assert.ok(doc?.deadAt);
+    assert.match(String(doc?.error), /no original/i);
+    assert.equal(rec.dead.length, 1);
+    assert.equal(rec.failed.length, 0);
+  });
+
+  test('RESIZE_NO_ORIGINAL with a stale token is a fenced no-op', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert();
+    const leased = await transport.lease();
+    assert.ok(leased);
+    await transport.fail(
+      String(leased._id),
+      'stale-token',
+      new ResizeNoOriginalError(String(leased.fileId)),
+      leased.attempts as number,
+    );
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'processing');
+    assert.equal(doc?.deadAt, undefined);
+    assert.equal(rec.dead.length, 0);
+    assert.equal(rec.failed.length, 0);
   });
 
   test('at maxAttempts → dead with stored error + onTaskDeadLettered', async () => {

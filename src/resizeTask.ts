@@ -407,13 +407,19 @@ export async function processTask(
   // ctx does NOT cross the queue (04 · §8) — the worker's pipeline steps depend on media/metadata.
   const ctx: Record<string, unknown> = {};
 
-  // 1. Load the media doc. No doc / no original → logged no-op success (transport completes it).
+  // 1. Load the media doc. A deleted media row is a logged no-op success (the transport
+  // completes it), but a live row whose persisted original is absent/malformed is a terminal
+  // media error. In particular, `{ original: {} }` must not reach storage.download: it has no
+  // usable locator and retrying it cannot make the source appear.
   const media = await resizer.mediaStore.load(task.mediaId);
-  if (!media?.original) {
+  if (!media) {
     app.logger.info(
-      `resize worker: media ${task.mediaId} missing (no doc/original) — no-op complete`,
+      `resize worker: media ${task.mediaId} missing (no doc) — no-op complete`,
     );
     return;
+  }
+  if (!media.original?.key) {
+    throw new ResizeNoOriginalError(task.mediaId);
   }
   // Defensive SVG guard — SVG is pass-through and should never be enqueued (06 step 6); this
   // only stops a stray task from rasterizing it or looping.
@@ -467,7 +473,7 @@ export async function generateImpl(
   const mediaId = requireMediaId(media);
 
   const original = media.original;
-  if (!original) {
+  if (!original?.key) {
     throw new ResizeNoOriginalError(mediaId);
   }
 

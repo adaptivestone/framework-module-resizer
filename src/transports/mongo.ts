@@ -170,7 +170,17 @@ export class MongoTransport implements QueueTransport {
     }
     const { maxAttempts } = getResizeConfig().queue;
     const now = new Date();
-    if (attempts < maxAttempts) {
+    // A persisted media row without an original is a deterministic terminal failure. Keep the
+    // normal retry policy for every other error (including errors that merely happen to expose a
+    // different `code` field). ResizeNoOriginalError crosses the transport boundary as an
+    // ordinary error object, so discriminate by its stable machine-readable code rather than
+    // by instanceof.
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+    const terminalNoOriginal = code === 'RESIZE_NO_ORIGINAL' && attempts >= 1;
+    if (!terminalNoOriginal && attempts < maxAttempts) {
       const doc = (await model.findOneAndUpdate(
         fence(taskId, leaseToken),
         {
