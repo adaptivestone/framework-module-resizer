@@ -36,6 +36,7 @@ before(async () => {
   });
   ResizeTaskModel.initHooks(schema);
   M = mongoose.model('ResizeTask', schema);
+  await M.init();
 });
 
 after(async () => {
@@ -187,6 +188,163 @@ describe('MongoTransport.enqueue', () => {
     assert.equal(doc.status, 'pending');
     assert.equal(doc.attempts, 0);
     assert.equal((doc.previews as unknown[]).length, 1);
+    assert.equal(typeof doc.requestKey, 'string');
+  });
+
+  test('identical requests with reordered variants/filter keys return one active task', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const first = {
+      sizeKey: '300x300',
+      format: 'jpeg' as const,
+      filters: { tone: { z: 2, a: 1 } } as never,
+      requestedWidth: 300,
+    };
+    const second = { sizeKey: 'fit', format: 'webp' as const, fit: true };
+    const a = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews: [
+        first,
+        second,
+        { ...first, filters: { tone: { a: 1, z: 2 } } as never },
+      ],
+    });
+    const b = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews: [
+        second,
+        { ...first, filters: { tone: { a: 1, z: 2 } } as never },
+      ],
+    });
+    assert.ok(a.taskId);
+    assert.equal(b.taskId, a.taskId);
+    assert.equal(
+      await M.countDocuments({
+        fileId: mediaId,
+        pipeline: 'photo',
+        status: 'pending',
+      }),
+      1,
+    );
+  });
+
+  test('concurrent identical enqueue calls create one active row', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const task = {
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '640w', format: 'avif' as const }],
+    };
+    const results = await Promise.all(
+      Array.from({ length: 12 }, () => transport.enqueue(task)),
+    );
+    const ids = new Set(results.map((result) => result.taskId));
+    assert.equal(ids.size, 1);
+    assert.ok(results[0].taskId);
+    assert.equal(
+      await M.countDocuments({
+        fileId: mediaId,
+        pipeline: 'default',
+        status: 'pending',
+      }),
+      1,
+    );
+  });
+
+  test('different variants and pipelines remain separate requests', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const a = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    const b = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '600x600', format: 'jpeg' }],
+    });
+    const c = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    assert.notEqual(a.taskId, b.taskId);
+    assert.notEqual(a.taskId, c.taskId);
+    assert.notEqual(b.taskId, c.taskId);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 3);
+  });
+
+  test('processing request is returned unchanged, including attempts and payload', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const original = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    const leased = await transport.lease();
+    assert.ok(leased);
+    const repeated = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    assert.equal(repeated.taskId, original.taskId);
+    const doc = await M.findById(original.taskId).lean();
+    assert.equal(doc?.status, 'processing');
+    assert.equal(doc?.attempts, 1);
+    assert.equal((doc?.previews as unknown[]).length, 1);
+  });
+
+  test('retry reuses active row, while completed and dead rows permit a new request', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const payload = {
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' as const }],
+    };
+    const first = await transport.enqueue(payload);
+    const leased = await transport.lease();
+    assert.ok(leased);
+    await transport.fail(
+      String(leased._id),
+      String(leased.leaseToken),
+      new Error('retry'),
+      1,
+    );
+    const retry = await transport.enqueue(payload);
+    assert.equal(retry.taskId, first.taskId);
+    assert.equal((await M.findById(first.taskId).lean())?.attempts, 1);
+
+    await M.updateOne({ _id: first.taskId }, { $set: { status: 'completed' } });
+    const afterCompleted = await transport.enqueue(payload);
+    assert.notEqual(afterCompleted.taskId, first.taskId);
+    await M.updateOne(
+      { _id: afterCompleted.taskId },
+      { $set: { status: 'dead' } },
+    );
+    const afterDead = await transport.enqueue(payload);
+    assert.notEqual(afterDead.taskId, afterCompleted.taskId);
+    assert.equal(rec.failed.length, 1);
+  });
+
+  test('legacy row without requestKey remains compatible', async () => {
+    installFakeApp();
+    const legacy = await insert();
+    const created = await transport.enqueue({
+      mediaId: String(legacy.fileId),
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    assert.ok(created.taskId);
+    assert.notEqual(created.taskId, String(legacy._id));
+    assert.equal(await M.countDocuments({ fileId: legacy.fileId }), 2);
   });
 
   test('returns { taskId: null } and logs when getModel is falsy (no TypeError)', async () => {

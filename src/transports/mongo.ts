@@ -12,6 +12,7 @@
 // this driver is always safe (05 · §10.2).
 import { getApp } from '../app.ts';
 import { getResizeConfig } from '../config/resize.ts';
+import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
 import { ResizeError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
@@ -26,6 +27,7 @@ interface TaskDoc {
   _id: { toString(): string };
   fileId: { toString(): string };
   pipeline: string;
+  requestKey?: string;
   previews: MissingPreview[];
   status: string;
   attempts: number;
@@ -74,6 +76,31 @@ function toLeasedTask(doc: TaskDoc): LeasedTask {
     pipeline: doc.pipeline,
     previews: doc.previews ?? [],
   };
+}
+
+function activeRequestFilter(
+  mediaId: string,
+  pipeline: string,
+  requestKey: string,
+) {
+  return {
+    fileId: mediaId,
+    pipeline,
+    requestKey,
+    status: { $in: ['pending', 'processing'] },
+  };
+}
+
+function isDuplicateKeyError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  return (
+    (error as { code?: unknown }).code === 11000 ||
+    /duplicate key/i.test(
+      String((error as { message?: unknown }).message ?? error),
+    )
+  );
 }
 
 /** The default transport — an option-less class (`new MongoTransport()`) (05 · §10.2). */
@@ -291,24 +318,72 @@ export class MongoTransport implements QueueTransport {
     if (!model) {
       return { taskId: null };
     }
+    const previews = canonicalizeVariants(task.previews);
+    const requestKey = buildRequestKey(task.mediaId, task.pipeline, previews);
+    const filter = activeRequestFilter(task.mediaId, task.pipeline, requestKey);
     try {
-      // Array form + options is the correct mongoose 9 shape for a durable single-doc create
-      // with a write concern (a plain `create(doc, options)` mis-reads the options as a second
-      // document). Maps the generic `mediaId` → host-owned `fileId`.
-      const [doc] = await model.create(
-        [
-          {
+      // `$setOnInsert` makes this an atomic active-request upsert. Existing pending
+      // and processing rows are returned unchanged: in particular, a retry does not
+      // reset attempts/backoff or replace the payload already leased by a worker.
+      const doc = await model.findOneAndUpdate(
+        filter,
+        {
+          $setOnInsert: {
             fileId: task.mediaId,
             pipeline: task.pipeline,
-            previews: task.previews,
+            requestKey,
+            previews,
             status: 'pending',
             attempts: 0,
           },
-        ],
-        { writeConcern: { w: 'majority' } },
+        },
+        {
+          upsert: true,
+          returnDocument: 'after',
+          setDefaultsOnInsert: true,
+          writeConcern: { w: 'majority' },
+        },
       );
-      return { taskId: String(doc._id) };
+      return { taskId: doc ? String(doc._id) : null };
     } catch (err) {
+      // Two workers can both miss the active row before the unique index is
+      // consulted. The loser receives E11000; reread the winner instead of
+      // reporting a soft failure. If that row completed between the conflict and
+      // reread, retry the upsert once so completed/dead rows remain repeatable.
+      if (isDuplicateKeyError(err)) {
+        try {
+          const existing = await model.findOne(filter);
+          if (existing) {
+            return { taskId: String(existing._id) };
+          }
+          const retried = await model.findOneAndUpdate(
+            filter,
+            {
+              $setOnInsert: {
+                fileId: task.mediaId,
+                pipeline: task.pipeline,
+                requestKey,
+                previews,
+                status: 'pending',
+                attempts: 0,
+              },
+            },
+            {
+              upsert: true,
+              returnDocument: 'after',
+              setDefaultsOnInsert: true,
+              writeConcern: { w: 'majority' },
+            },
+          );
+          return { taskId: retried ? String(retried._id) : null };
+        } catch (raceError) {
+          getApp().logger.error(
+            `resize mongo transport: enqueue duplicate-key reread failed for media ${task.mediaId}`,
+            raceError,
+          );
+          return { taskId: null };
+        }
+      }
       getApp().logger.error(
         `resize mongo transport: enqueue failed for media ${task.mediaId}`,
         err,

@@ -4,11 +4,110 @@
 // transport failure it logs + releases the survivors' locks so a later read can retry.
 // Takes the Resizer type-only (the resizer.ts → engine.ts → enqueue.ts value chain never
 // closes back on this module at runtime — 05 · design delta).
+import { createHash } from 'node:crypto';
 import { getApp } from './app.ts';
 import { getResizeConfig } from './config/resize.ts';
 import { getPreviewIdentity } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type { MissingPreview } from './types.d.ts';
+
+/**
+ * Return a JSON-safe value with object keys in lexical order.
+ *
+ * Filters are currently typed as a flat primitive bag, but hosts can persist richer
+ * values through Mongo's Mixed field. Sorting recursively here makes the durable
+ * request key independent of both the caller's object insertion order and any nested
+ * filter object order. Arrays intentionally keep their order: array order can be a
+ * meaningful part of a host-defined filter.
+ */
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableValue);
+  }
+  if (value !== null && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const child = (value as Record<string, unknown>)[key];
+      // JSON.stringify omits undefined object values. Do the same explicitly so the
+      // canonical object itself has the same semantics as the key it represents.
+      if (child !== undefined) {
+        result[key] = stableValue(child);
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+function normalizeVariant(variant: MissingPreview): MissingPreview {
+  const normalized: MissingPreview = {
+    sizeKey: variant.sizeKey,
+    format: variant.format,
+  };
+  if (variant.filters && Object.keys(variant.filters).length > 0) {
+    normalized.filters = stableValue(
+      variant.filters,
+    ) as MissingPreview['filters'];
+  }
+  if (variant.requestedWidth !== undefined) {
+    normalized.requestedWidth = variant.requestedWidth;
+  }
+  if (variant.requestedHeight !== undefined) {
+    normalized.requestedHeight = variant.requestedHeight;
+  }
+  if (variant.fit !== undefined) {
+    normalized.fit = variant.fit;
+  }
+  return normalized;
+}
+
+/**
+ * Canonicalize a complete queue payload: normalize nested filter keys, remove exact
+ * duplicate variants, and sort the result by the canonical representation. The
+ * stable result is used by Mongo enqueue so list permutation cannot create another
+ * durable task.
+ */
+export function canonicalizeVariants(
+  variants: readonly MissingPreview[],
+): MissingPreview[] {
+  const byKey = new Map<string, MissingPreview>();
+  for (const variant of variants) {
+    const normalized = normalizeVariant(variant);
+    const key = JSON.stringify(normalized);
+    if (!byKey.has(key)) {
+      byKey.set(key, normalized);
+    }
+  }
+  return (
+    [...byKey.entries()]
+      // Do not use localeCompare: durable identity ordering must be independent of
+      // the host process locale.
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([, variant]) => variant)
+  );
+}
+
+/**
+ * Build a bounded request identity for the durable Mongo dedupe index. The complete
+ * file + pipeline identity is included before hashing; the hash keeps the indexed
+ * value small even when filters or the variant catalog are large.
+ */
+export function buildRequestKey(
+  mediaId: string,
+  pipeline: string,
+  variants: readonly MissingPreview[],
+): string {
+  const canonical = canonicalizeVariants(variants);
+  // FNV-style string hashing would be shorter but collision-prone for a durable
+  // correctness key. Web Crypto is not guaranteed in every supported Node runtime,
+  // so use the built-in SHA-256 implementation.
+  const json = JSON.stringify({
+    fileId: mediaId,
+    pipeline,
+    variants: canonical,
+  });
+  return `v1:${createHash('sha256').update(json).digest('hex')}`;
+}
 
 /**
  * §18. Dedup `missing` by identity, acquire a per-variant dispatch lock, enqueue the
@@ -34,16 +133,22 @@ export async function enqueue(
     return 0;
   }
 
-  // 1. Dedup by identity — the one lookup/lock key, built one way (03 · Identity).
+  // 1. Canonicalize first so equivalent nested filter objects and list permutations
+  // reach the transport in a stable form. The dispatch lock remains per preview
+  // identity (not per whole catalog) by design; durable Mongo dedupe handles the
+  // complete request key.
+  const canonical = canonicalizeVariants(missing);
+
+  // 2. Dedup by identity — the one lookup/lock key, built one way (03 · Identity).
   const byIdentity = new Map<string, MissingPreview>();
-  for (const m of missing) {
+  for (const m of canonical) {
     const identity = getPreviewIdentity(m.sizeKey, m.format, m.filters);
     if (!byIdentity.has(identity)) {
       byIdentity.set(identity, m);
     }
   }
 
-  // 2. Acquire the dispatch lock per identity; keep only the winners (others are already
+  // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
   // in flight from a concurrent read). TTL in ms — the framework driver converts to s.
   const dispatchTtlMs = getResizeConfig().queue.lockTtlMs.dispatch;
   const survivors: MissingPreview[] = [];
@@ -68,12 +173,12 @@ export async function enqueue(
     }
   }
 
-  // 3. None survive → nothing to dispatch.
+  // 4. None survive → nothing to dispatch.
   if (survivors.length === 0) {
     return 0;
   }
 
-  // 4/5. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
+  // 5/6. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
   // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
   try {
     const { taskId } = await transport.enqueue({
