@@ -46,6 +46,9 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
     download: async () => Buffer.alloc(0),
     upload: async () => ({ key: 'k' }),
     publicUrl: (ref: StorageRef) => `https://cdn/${ref.key}`,
+    // The default fake models a storage driver whose originals are public. Tests that need to
+    // exercise private-original behavior override this explicitly with `false` or omit it.
+    canServeOriginalPublicly: () => true,
     ...o,
   };
 }
@@ -512,6 +515,28 @@ describe('resolve — SVG pass-through', () => {
     assert.equal(decision.ready[0].url, 'https://cdn/logo');
     assert.equal(decision.missing.length, 0);
   });
+
+  test('does not expose a private SVG anonymously, enqueue it, or invent raster work', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const r = new Resizer({
+      storage: makeStorage({ canServeOriginalPublicly: () => false }),
+      transport,
+      lockProvider,
+    });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'm1',
+        original: { key: 'private/logo.svg', contentType: 'image/svg+xml' },
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.deepEqual(decision.ready, []);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(calls.length, 0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -643,7 +668,7 @@ describe('resolve — original-fits fast-path', () => {
     assert.equal(signedCalls[0].ref.key, 'orig.jpg');
   });
 
-  test('falls back to publicUrl when signedUrl throws (still ready)', async () => {
+  test('falls back to publicUrl when signedUrl throws for a public original', async () => {
     installFakeApp();
     const storage = makeStorage({
       signedUrl: async () => {
@@ -661,6 +686,67 @@ describe('resolve — original-fits fast-path', () => {
     assert.equal(decision.ready.length, 1);
     assert.equal(decision.ready[0].url, 'https://cdn/orig.jpg');
     assert.equal(decision.ready[0].isOriginal, true);
+  });
+
+  test('a private raster original stays missing for an anonymous reader', async () => {
+    installFakeApp();
+    const r = new Resizer({
+      storage: makeStorage({ canServeOriginalPublicly: () => false }),
+    });
+    const { decision } = await r.resolve({
+      media: fitsMedia(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      enqueueMissing: false,
+    });
+    assert.equal(decision.ready.length, 0);
+    assert.equal(decision.missing.length, 1);
+    assert.equal(decision.missing[0].sizeKey, '300x300');
+  });
+
+  test('a private original does not fall back to publicUrl when signing fails', async () => {
+    installFakeApp();
+    let publicUrlCalls = 0;
+    const r = new Resizer({
+      storage: makeStorage({
+        canServeOriginalPublicly: () => false,
+        signedUrl: async () => {
+          throw new Error('presign down');
+        },
+        publicUrl: (ref: StorageRef) => {
+          publicUrlCalls += 1;
+          return `https://cdn/${ref.key}`;
+        },
+      }),
+    });
+    const { decision } = await r.resolve({
+      media: fitsMedia(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      ctx: { isAdmin: true },
+      enqueueMissing: false,
+    });
+    assert.equal(decision.ready.length, 0);
+    assert.equal(decision.missing.length, 1);
+    assert.equal(publicUrlCalls, 0);
+  });
+
+  test('a custom storage without canServeOriginalPublicly has no original fast-path', async () => {
+    installFakeApp();
+    const storage: ResizeStorage = {
+      download: async () => Buffer.alloc(0),
+      upload: async () => ({ key: 'k' }),
+      publicUrl: (ref: StorageRef) => `https://cdn/${ref.key}`,
+    };
+    const r = new Resizer({ storage });
+    const { decision } = await r.resolve({
+      media: fitsMedia(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      enqueueMissing: false,
+    });
+    assert.equal(decision.ready.length, 0);
+    assert.equal(decision.missing.length, 1);
   });
 });
 

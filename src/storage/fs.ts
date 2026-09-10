@@ -31,6 +31,11 @@ function resolveInsideRoot(rootDir: string, key: string): string {
   return abs;
 }
 
+/** URL refs may carry a leading slash; treat it as a URL separator, not an absolute FS path. */
+function normalizePublicKey(key: string): string {
+  return key.replace(/^\/+/, '');
+}
+
 export class LocalFsStorage implements ResizeStorage {
   readonly #rootDir: string;
   readonly #publicBaseUrl: string;
@@ -63,8 +68,17 @@ export class LocalFsStorage implements ResizeStorage {
   // PURE string building — no I/O (called on the read path). Option is publicBaseUrl
   // (never `publicUrl`) so it cannot shadow this method name.
   publicUrl(ref: StorageRef): string {
+    // Keep the same path-traversal validation for this pure URL builder as for I/O. Local
+    // development intentionally uses one shared tree for originals and previews, so a validated
+    // key is considered publicly servable.
+    resolveInsideRoot(this.#rootDir, normalizePublicKey(ref.key));
     const base = this.#publicBaseUrl.replace(/\/+$/, '');
-    const key = ref.key.replace(/^\/+/, '');
+    const key = normalizePublicKey(ref.key);
     return `${base}/${key}`;
+  }
+
+  canServeOriginalPublicly(ref: StorageRef): boolean {
+    resolveInsideRoot(this.#rootDir, normalizePublicKey(ref.key));
+    return true;
   }
 }

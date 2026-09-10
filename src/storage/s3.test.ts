@@ -203,8 +203,7 @@ describe('S3Storage.publicUrl (pure — no client)', () => {
     );
   });
 
-  test('virtual-hosted form uses region (defaulting to us-east-1) and ref.bucket ?? bucketPublic', () => {
-    // `other` is an allowlisted bucket here (bucketPrivate) so ref.bucket can select it.
+  test('virtual-hosted form uses region and only allows public originals through publicUrl', () => {
     const s = new S3Storage({
       bucketPublic: 'pub',
       bucketPrivate: 'other',
@@ -215,14 +214,47 @@ describe('S3Storage.publicUrl (pure — no client)', () => {
       'https://pub.s3.eu-west-1.amazonaws.com/a/b.jpg',
     );
     assert.equal(
-      s.publicUrl({ bucket: 'other', key: 'k' }),
-      'https://other.s3.eu-west-1.amazonaws.com/k',
+      s.publicUrl({ bucket: 'pub', key: 'k' }),
+      'https://pub.s3.eu-west-1.amazonaws.com/k',
+    );
+    assert.throws(
+      () => s.publicUrl({ bucket: 'other', key: 'k' }),
+      /private bucket "other"/,
     );
 
     const sDefault = new S3Storage({ bucketPublic: 'pub' });
     assert.equal(
       sDefault.publicUrl({ key: 'k' }),
       'https://pub.s3.us-east-1.amazonaws.com/k',
+    );
+  });
+});
+
+describe('S3Storage.canServeOriginalPublicly', () => {
+  test('uses ref.bucket ?? bucketPrivate ?? bucketPublic and returns true only for bucketPublic', () => {
+    const withPrivate = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+    });
+    assert.equal(
+      withPrivate.canServeOriginalPublicly({ bucket: 'pub', key: 'k' }),
+      true,
+    );
+    assert.equal(
+      withPrivate.canServeOriginalPublicly({ bucket: 'priv', key: 'k' }),
+      false,
+    );
+    assert.equal(withPrivate.canServeOriginalPublicly({ key: 'k' }), false);
+
+    const withoutPrivate = new S3Storage({ bucketPublic: 'pub' });
+    assert.equal(withoutPrivate.canServeOriginalPublicly({ key: 'k' }), true);
+  });
+
+  test('rejects an unallowlisted bucket before answering visibility', () => {
+    const s = new S3Storage({ bucketPublic: 'pub', bucketPrivate: 'priv' });
+    assert.throws(
+      () => s.canServeOriginalPublicly({ bucket: 'attacker', key: 'k' }),
+      /attacker/,
     );
   });
 });
