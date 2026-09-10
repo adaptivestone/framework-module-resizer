@@ -126,6 +126,12 @@ S3 when you have buckets; a queue when listings are huge — both are later sect
 Add a `transport` and run `ResizeWorker`. Missing variants are enqueued on `resolve()` (or
 pushed at upload with `prewarm()`).
 
+Repeated active enqueue requests are durable-idempotent: variants are canonicalized and the
+Mongo transport stores a SHA-256 `requestKey` under a partial unique index for `pending`/
+`processing` rows. Reordering the same catalog returns the existing task; a different
+pipeline, filter, or catalog remains a separate request. Rows created before `requestKey`
+was introduced remain valid.
+
 ```ts
 // src/resizer.ts — construct after Server.init(); import from API and worker processes
 import { Resizer } from '@adaptivestone/framework-module-resize';
@@ -227,7 +233,7 @@ await resizer.prewarm({ media: fileDoc, sizes: getListingSizes(), pipeline: 'lis
 Choose pre-warm when you want **fast uploads and a warm cache** — the request returns immediately
 while the worker fills the catalog in the background.
 
-**Eager** — construct the Resizer **without** a `transport` and call `generate` from your
+**Eager** — call `generate` from your
 upload handler (`ctx` reaches pipeline steps here, unlike the queued worker):
 
 ```ts
@@ -549,8 +555,14 @@ ResizeTask.updateOne({ _id }, { $set: { status: 'pending', attempts: 0, leaseExp
 for an already-generated identity skips via the existing-preview check, never duplicates.
 
 **SVG originals are pass-through** — when `original.contentType === 'image/svg+xml'` the read path
-serves the original at every requested size/format and never resizes or enqueues. **SVG
-sanitization is host-owned** (sanitize at upload before storing).
+serves a public original at every requested size/format and never resizes or enqueues. A private
+original is served only through a successful authorized `signedUrl`; anonymous reads return no
+original URL. **SVG sanitization is host-owned** (sanitize at upload before storing).
+
+**Original visibility is explicit.** Storage drivers that can prove an original is public should
+implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's
+`publicUrl` as proof and never falls back from a failed private presign to a public URL. Existing
+previews remain the preferred public read path.
 
 **Deleting media / storage cleanup is host-owned.** The module appends previews but does not delete
 them; removing a media doc's storage objects (originals + derivatives) is your lifecycle.

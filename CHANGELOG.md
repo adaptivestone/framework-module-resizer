@@ -1,3 +1,17 @@
+# 0.2.1
+
+**Fixes**
+
+- `ResizeWorker` now exposes the `getMongoConnectionName` static required by the framework
+  CLI without importing framework internals.
+- Missing persisted originals raise `ResizeNoOriginalError`; Mongo tasks dead-letter this
+  terminal condition immediately instead of retrying a download with no key.
+- Original visibility is explicit: public URLs are never fabricated for private S3 originals;
+  authorized reads use signed URLs and local storage validates paths.
+- Mongo enqueue canonicalizes variants and atomically deduplicates identical active requests
+  with a partial unique index and SHA-256 request key. Different pipelines/catalogs remain
+  independent and legacy rows without a key remain valid.
+
 # 0.2.0
 
 **Breaking changes**
