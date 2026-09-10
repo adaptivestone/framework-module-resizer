@@ -136,6 +136,37 @@ describe('resolve — partitioning', () => {
     });
   });
 
+  test('serves an existing preview without checking an unusable original locator', async () => {
+    installFakeApp();
+    const r = new Resizer({
+      storage: makeStorage({
+        canServeOriginalPublicly: () => {
+          throw new Error('original bucket is no longer allowlisted');
+        },
+      }),
+    });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'm1',
+        original: { key: 'legacy-origin.jpg', bucket: 'retired-bucket' },
+        previews: [
+          {
+            key: 'public-preview.jpg',
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+          },
+        ],
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      enqueueMissing: false,
+    });
+
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0]?.url, 'https://cdn/public-preview.jpg');
+  });
+
   test('a filtered variant is distinct from the unfiltered same size', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });

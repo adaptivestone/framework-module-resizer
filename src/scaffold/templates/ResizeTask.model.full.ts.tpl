@@ -29,6 +29,9 @@ export default class ResizeTask extends BaseModel {
       },
       // Which registered pipeline the worker runs for this task.
       pipeline: { type: String, default: 'default' },
+      // SHA-256 identity of the complete enqueue request. Keep this optional so
+      // rows created by older module versions remain readable during upgrades.
+      requestKey: { type: String },
       // The REQUESTED variants to generate (NOT the full stored Preview — the worker computes
       // key/dims/contentType and $pushes those to the media doc).
       previews: [
@@ -86,6 +89,18 @@ export default class ResizeTask extends BaseModel {
     );
     // Per-media task lookup, newest first.
     schema.index({ fileId: 1, createdAt: -1 });
+    // One active row per exact canonical request. Completed/dead and old rows
+    // without requestKey do not block a later explicit enqueue.
+    schema.index(
+      { fileId: 1, pipeline: 1, requestKey: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          status: { $in: ['pending', 'processing'] },
+          requestKey: { $exists: true },
+        },
+      },
+    );
     // 👉 Add your custom indexes here.
   }
 }

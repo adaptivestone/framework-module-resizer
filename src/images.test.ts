@@ -145,6 +145,14 @@ describe('getFilterSig', () => {
     // a backslash in a value is itself escaped (and escaped BEFORE | / :).
     assert.equal(getFilterSig({ a: 'x\\y' }), 'a:x\\\\y');
   });
+
+  test('keeps nested runtime filter values deterministic and distinct', () => {
+    const first = { crop: { x: 0, y: 0 } } as never;
+    const reordered = { crop: { y: 0, x: 0 } } as never;
+    const second = { crop: { x: 10, y: 0 } } as never;
+    assert.equal(getFilterSig(first), getFilterSig(reordered));
+    assert.notEqual(getFilterSig(first), getFilterSig(second));
+  });
 });
 
 describe('getPreviewIdentity', () => {

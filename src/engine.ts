@@ -97,11 +97,19 @@ export async function resolveImpl(
     const originalIsSvg =
       original !== undefined &&
       (original.contentType === 'image/svg+xml' || original.format === 'svg');
+    // Compute this lazily. A generated preview is independently public and must remain
+    // readable even when a legacy original now points to a retired/unavailable bucket.
     // A driver that does not implement the check is deliberately conservative: a public URL
     // from an arbitrary custom driver is not enough proof that an original is safe to expose.
-    const originalIsPublic =
-      original !== undefined &&
-      storage.canServeOriginalPublicly?.(original) === true;
+    let originalIsPublic: boolean | undefined;
+    const isOriginalPublic = (): boolean => {
+      if (originalIsPublic === undefined) {
+        originalIsPublic =
+          original !== undefined &&
+          storage.canServeOriginalPublicly?.(original) === true;
+      }
+      return originalIsPublic;
+    };
     const authorizedOriginalRead = Boolean(
       (ctx.isOwner || ctx.isAdmin) && storage.signedUrl,
     );
@@ -113,7 +121,7 @@ export async function resolveImpl(
       // owner/admin when the driver supports it (private-bucket SVG read), else pure publicUrl.
       // A private SVG has no raster fallback: anonymous reads and failed owner/admin signing stay
       // empty instead of exposing the private original or enqueueing impossible raster work.
-      const url = await originalUrl(resizer, original, ctx, originalIsPublic);
+      const url = await originalUrl(resizer, original, ctx, isOriginalPublic());
       if (url !== undefined) {
         for (const size of sizes) {
           let sizeKey: string;
@@ -171,7 +179,7 @@ export async function resolveImpl(
           // "original already fits" fast-path — ALL of (a)–(d) must hold (§17 step 7).
           if (
             original &&
-            (originalIsPublic || authorizedOriginalRead) &&
+            (isOriginalPublic() || authorizedOriginalRead) &&
             getFilterSig(size.filters) === 'none' && // (a) no filters
             !size.fit &&
             isPositiveFinite(size.width) && // (b) plain cover WxH
@@ -185,7 +193,7 @@ export async function resolveImpl(
               resizer,
               original,
               ctx,
-              originalIsPublic,
+              isOriginalPublic(),
             );
             if (url !== undefined) {
               const fits: ReadyEntry = {

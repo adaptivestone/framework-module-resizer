@@ -545,11 +545,28 @@ reclaims a task past the cap, so no crash-loop runs forever. (SQS uses its nativ
 **Retention TTLs:** `completed` rows evict after 24h; `dead` rows are kept ~30 days for
 inspection/replay (edit the `expireAfterSeconds` in the scaffolded model to taste).
 
-**Dead-letter replay** is a host op — reset the row:
+**Dead-letter replay** is a host op. First look for an active row with the same
+`fileId` + `pipeline` + `requestKey`; if it exists, keep that row — it already represents
+the same work. Otherwise reset the dead row:
 
 ```ts
-ResizeTask.updateOne({ _id }, { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } });
+const active = await ResizeTask.findOne({
+  fileId: row.fileId,
+  pipeline: row.pipeline,
+  requestKey: row.requestKey,
+  status: { $in: ['pending', 'processing'] },
+});
+if (!active) {
+  await ResizeTask.updateOne(
+    { _id: row._id, status: 'dead' },
+    { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } },
+  );
+}
 ```
+
+The active-row lookup is important because the partial unique index rejects two live copies
+of the same request. If a concurrent operator creates one after the lookup, an `E11000` on
+the update is safe: re-read that active row instead of retrying the dead row.
 
 **Delivery is at-least-once** (both transports); the worker is **idempotent** — re-running a task
 for an already-generated identity skips via the existing-preview check, never duplicates.

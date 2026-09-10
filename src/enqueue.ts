@@ -7,37 +7,9 @@
 import { createHash } from 'node:crypto';
 import { getApp } from './app.ts';
 import { getResizeConfig } from './config/resize.ts';
-import { getPreviewIdentity } from './images.ts';
+import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type { MissingPreview } from './types.d.ts';
-
-/**
- * Return a JSON-safe value with object keys in lexical order.
- *
- * Filters are currently typed as a flat primitive bag, but hosts can persist richer
- * values through Mongo's Mixed field. Sorting recursively here makes the durable
- * request key independent of both the caller's object insertion order and any nested
- * filter object order. Arrays intentionally keep their order: array order can be a
- * meaningful part of a host-defined filter.
- */
-function stableValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(stableValue);
-  }
-  if (value !== null && typeof value === 'object') {
-    const result: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      const child = (value as Record<string, unknown>)[key];
-      // JSON.stringify omits undefined object values. Do the same explicitly so the
-      // canonical object itself has the same semantics as the key it represents.
-      if (child !== undefined) {
-        result[key] = stableValue(child);
-      }
-    }
-    return result;
-  }
-  return value;
-}
 
 function normalizeVariant(variant: MissingPreview): MissingPreview {
   const normalized: MissingPreview = {
@@ -45,7 +17,7 @@ function normalizeVariant(variant: MissingPreview): MissingPreview {
     format: variant.format,
   };
   if (variant.filters && Object.keys(variant.filters).length > 0) {
-    normalized.filters = stableValue(
+    normalized.filters = canonicalizeFilterValue(
       variant.filters,
     ) as MissingPreview['filters'];
   }

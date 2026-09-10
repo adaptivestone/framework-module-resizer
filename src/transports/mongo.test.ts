@@ -254,6 +254,40 @@ describe('MongoTransport.enqueue', () => {
     );
   });
 
+  test('rereads the winner when a second duplicate-key race follows completion', async () => {
+    const winner = { _id: new mongoose.Types.ObjectId() };
+    let upsertCalls = 0;
+    let readCalls = 0;
+    const duplicate = Object.assign(new Error('E11000 duplicate key'), {
+      code: 11000,
+    });
+    const model = {
+      findOneAndUpdate: async () => {
+        upsertCalls++;
+        if (upsertCalls <= 2) {
+          throw duplicate;
+        }
+        return winner;
+      },
+      findOne: async () => {
+        readCalls++;
+        // The first winner has already completed; a concurrent retry then wins
+        // the next active row before this caller retries its own upsert.
+        return readCalls === 1 ? null : winner;
+      },
+    };
+    installFakeApp((name) => (name === 'ResizeTask' ? model : null));
+
+    const result = await transport.enqueue({
+      mediaId: new mongoose.Types.ObjectId().toString(),
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+
+    assert.equal(String(result.taskId), String(winner._id));
+    assert.equal(readCalls, 2, 'each duplicate race rereads the active winner');
+  });
+
   test('different variants and pipelines remain separate requests', async () => {
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();

@@ -76,18 +76,60 @@ function escapeFilterPart(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/:/g, '\\:');
 }
 
+/**
+ * Return a JSON-safe filter value with nested object keys in lexical order.
+ *
+ * Runtime Mongo `Mixed` fields can contain richer values than the public flat
+ * filter type. This is shared by queue request keys and preview identities so
+ * they cannot disagree about equivalent nested filter objects.
+ */
+export function canonicalizeFilterValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeFilterValue);
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(record).sort()) {
+      // JSON.stringify omits undefined object values. The request-key payload
+      // does too, so omit them here before identity construction.
+      if (record[key] !== undefined) {
+        result[key] = canonicalizeFilterValue(record[key]);
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+/** Convert a canonical runtime filter value into a deterministic identity fragment. */
+function getFilterValueSig(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(getFilterValueSig).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .map((key) => `${JSON.stringify(key)}:${getFilterValueSig(record[key])}`)
+      .join(',')}}`;
+  }
+  return String(value);
+}
+
 /** Canonical, order-independent filter signature. Empty / undefined → "none". */
 export function getFilterSig(filters?: Filters): string {
   if (!filters) {
     return 'none';
   }
-  const keys = Object.keys(filters).sort();
+  const canonical = canonicalizeFilterValue(filters) as Record<string, unknown>;
+  const keys = Object.keys(canonical);
   if (keys.length === 0) {
     return 'none';
   }
   return keys
     .map(
-      (k) => `${escapeFilterPart(k)}:${escapeFilterPart(String(filters[k]))}`,
+      (k) =>
+        `${escapeFilterPart(k)}:${escapeFilterPart(getFilterValueSig(canonical[k]))}`,
     )
     .join('|');
 }

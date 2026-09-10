@@ -321,11 +321,8 @@ export class MongoTransport implements QueueTransport {
     const previews = canonicalizeVariants(task.previews);
     const requestKey = buildRequestKey(task.mediaId, task.pipeline, previews);
     const filter = activeRequestFilter(task.mediaId, task.pipeline, requestKey);
-    try {
-      // `$setOnInsert` makes this an atomic active-request upsert. Existing pending
-      // and processing rows are returned unchanged: in particular, a retry does not
-      // reset attempts/backoff or replace the payload already leased by a worker.
-      const doc = await model.findOneAndUpdate(
+    const upsert = () =>
+      model.findOneAndUpdate(
         filter,
         {
           $setOnInsert: {
@@ -344,38 +341,29 @@ export class MongoTransport implements QueueTransport {
           writeConcern: { w: 'majority' },
         },
       );
-      return { taskId: doc ? String(doc._id) : null };
-    } catch (err) {
-      // Two workers can both miss the active row before the unique index is
-      // consulted. The loser receives E11000; reread the winner instead of
-      // reporting a soft failure. If that row completed between the conflict and
-      // reread, retry the upsert once so completed/dead rows remain repeatable.
-      if (isDuplicateKeyError(err)) {
+
+    // An E11000 winner can finish between our conflict and reread. In that
+    // narrow window another caller may win the replacement active row before
+    // our retry, producing another E11000. Reread after each duplicate race;
+    // three attempts bound contention without turning enqueue into an unbounded
+    // retry loop when the database is unhealthy.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const doc = await upsert();
+        return { taskId: doc ? String(doc._id) : null };
+      } catch (err) {
+        if (!isDuplicateKeyError(err)) {
+          getApp().logger.error(
+            `resize mongo transport: enqueue failed for media ${task.mediaId}`,
+            err,
+          );
+          return { taskId: null };
+        }
         try {
           const existing = await model.findOne(filter);
           if (existing) {
             return { taskId: String(existing._id) };
           }
-          const retried = await model.findOneAndUpdate(
-            filter,
-            {
-              $setOnInsert: {
-                fileId: task.mediaId,
-                pipeline: task.pipeline,
-                requestKey,
-                previews,
-                status: 'pending',
-                attempts: 0,
-              },
-            },
-            {
-              upsert: true,
-              returnDocument: 'after',
-              setDefaultsOnInsert: true,
-              writeConcern: { w: 'majority' },
-            },
-          );
-          return { taskId: retried ? String(retried._id) : null };
         } catch (raceError) {
           getApp().logger.error(
             `resize mongo transport: enqueue duplicate-key reread failed for media ${task.mediaId}`,
@@ -384,12 +372,12 @@ export class MongoTransport implements QueueTransport {
           return { taskId: null };
         }
       }
-      getApp().logger.error(
-        `resize mongo transport: enqueue failed for media ${task.mediaId}`,
-        err,
-      );
-      return { taskId: null };
     }
+
+    getApp().logger.error(
+      `resize mongo transport: enqueue remained contended after duplicate-key retries for media ${task.mediaId}`,
+    );
+    return { taskId: null };
   }
 
   async startWorker(

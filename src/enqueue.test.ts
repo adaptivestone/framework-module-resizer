@@ -139,6 +139,23 @@ describe('enqueue', () => {
     assert.equal(enqueued, 1); // returns the count handed to the transport
   });
 
+  test('keeps distinct nested filter values as distinct preview identities', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = makeResizer({ transport, lockProvider });
+
+    const enqueued = await enqueue(r, 'm1', 'default', [
+      variant({ filters: { crop: { x: 0, y: 0 } } as never }),
+      variant({ filters: { crop: { x: 10, y: 0 } } as never }),
+    ]);
+
+    assert.equal(acquired.length, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 2);
+    assert.equal(enqueued, 2);
+  });
+
   test('acquires a dispatch lock per identity with the configured TTL', async () => {
     installFakeApp();
     const { transport } = makeTransport();
