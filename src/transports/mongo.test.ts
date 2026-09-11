@@ -16,6 +16,7 @@ import mongoose from 'mongoose';
 import { ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
+import type { MissingPreview } from '../types.d.ts';
 import { MongoTransport } from './mongo.ts';
 
 // Against mongodb-memory-server (real atomic semantics for lease/complete/fail/renew/sweep).
@@ -190,6 +191,36 @@ describe('MongoTransport.enqueue', () => {
     assert.equal((doc.previews as unknown[]).length, 1);
     assert.equal(typeof doc.requestKey, 'string');
   });
+
+  for (const { name, preview, errorPath } of [
+    {
+      name: 'empty size key',
+      preview: { sizeKey: '', format: 'jpeg' },
+      errorPath: 'previews.0.sizeKey',
+    },
+    {
+      name: 'unsupported format',
+      preview: { sizeKey: '300w', format: 'png' },
+      errorPath: 'previews.0.format',
+    },
+  ]) {
+    test(`rejects an invalid queued variant (${name}) without persisting a task`, async () => {
+      const { errors } = installFakeApp();
+      const result = await transport.enqueue({
+        mediaId: new mongoose.Types.ObjectId().toString(),
+        pipeline: 'default',
+        // Exercise runtime validation for JavaScript callers and host hooks.
+        previews: [preview as MissingPreview],
+      });
+
+      assert.deepEqual(result, { taskId: null });
+      assert.equal(await M.countDocuments({}), 0);
+      assert.equal(errors.length, 1);
+      const error = errors[0][1];
+      assert.ok(error instanceof mongoose.Error.ValidationError);
+      assert.ok(error.errors[errorPath]);
+    });
+  }
 
   test('identical requests with reordered variants/filter keys return one active task', async () => {
     installFakeApp();

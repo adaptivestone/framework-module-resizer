@@ -17,10 +17,12 @@ no queue/worker — start here), lazy (on read, worker fills `previews[]`), pre-
 filters whether a preview is ready or missing.
 
 The Mongo transport deduplicates identical active enqueue requests using a canonical SHA-256
-`requestKey` and a partial unique index. Different pipelines/catalogs remain independent;
-legacy rows without a key remain valid. Storage drivers that can prove original visibility
-implement `canServeOriginalPublicly`; the engine never fabricates a public URL for a private
-original.
+`requestKey` and a partial unique index. Its key includes the pipeline and surviving variant
+catalog. Dispatch locks, worker locks, and stored previews share media + size + format + filters
+across pipelines; use distinct filters for different renderings of the same media, including
+on reads. Legacy rows without a key remain valid. Storage drivers that can prove original
+visibility implement `canServeOriginalPublicly`; the engine never fabricates a public URL for
+a private original.
 
 ## Integrate (in order)
 

@@ -95,7 +95,7 @@ export async function resolveImpl(
     const missing: MissingPreview[] = [];
     const missingSeen = new Set<string>();
     const originalIsSvg =
-      original !== undefined &&
+      original != null &&
       (original.contentType === 'image/svg+xml' || original.format === 'svg');
     // Compute this lazily. A generated preview is independently public and must remain
     // readable even when a legacy original now points to a retired/unavailable bucket.
@@ -106,7 +106,7 @@ export async function resolveImpl(
       if (originalIsPublic === undefined) {
         try {
           originalIsPublic =
-            original !== undefined &&
+            original != null &&
             storage.canServeOriginalPublicly?.(original) === true;
         } catch (err) {
           getApp().logger.error(

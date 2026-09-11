@@ -136,6 +136,55 @@ describe('resolve — partitioning', () => {
     });
   });
 
+  test('a null original preserves cached previews, missing variants, and the formatting hook', async () => {
+    const { errors } = installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = new Resizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+      hooks: {
+        formatPublicUrls: (decision) =>
+          decision.ready.map((entry) => entry.url),
+      },
+    });
+    // Plain/lean Mongo records can carry BSON null for this optional nested field.
+    const media = {
+      id: 'm1',
+      original: null,
+      previews: [
+        {
+          key: 'cached.jpg',
+          contentType: 'image/jpeg',
+          sizeKey: '300x300',
+          format: 'jpeg',
+        },
+      ],
+    } as unknown as MediaLike;
+
+    const { decision, output } = await r.resolve({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].url, 'https://cdn/cached.jpg');
+    assert.deepEqual(decision.missing, [
+      {
+        sizeKey: '300x300',
+        format: 'webp',
+        requestedWidth: 300,
+        requestedHeight: 300,
+      },
+    ]);
+    assert.deepEqual(output, ['https://cdn/cached.jpg']);
+    assert.equal(calls.length, 0);
+    assert.equal(acquired.length, 0);
+    assert.equal(errors.length, 0);
+  });
+
   test('a throwing original visibility check behaves like a private original and later missing variants enqueue', async () => {
     const run = async (check: () => boolean) => {
       resetResizerForTests();

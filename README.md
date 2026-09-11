@@ -126,11 +126,12 @@ S3 when you have buckets; a queue when listings are huge — both are later sect
 Add a `transport` and run `ResizeWorker`. Missing variants are enqueued on `resolve()` (or
 pushed at upload with `prewarm()`).
 
-Repeated active enqueue requests are durable-idempotent: variants are canonicalized and the
-Mongo transport stores a SHA-256 `requestKey` under a partial unique index for `pending`/
-`processing` rows. Reordering the same catalog returns the existing task; a different
-pipeline, filter, or catalog remains a separate request. Rows created before `requestKey`
-was introduced remain valid.
+The Mongo transport deduplicates identical active tasks: variants are canonicalized and a
+SHA-256 `requestKey` is stored under a partial unique index for `pending`/`processing` rows.
+The key includes the pipeline and the complete variant payload handed to the transport;
+reordering that payload returns the existing task. Before this stage, shared dispatch locks
+can remove overlapping variants from a request. Rows created before `requestKey` was introduced
+remain valid.
 
 ```ts
 // src/resizer.ts — construct after Server.init(); import from API and worker processes
@@ -401,6 +402,11 @@ from the main entry for custom-driver authors.
 **Pipelines** are named per-media-type pixel work, selected per read call by name. The worker runs
 in a separate process, so the task carries only the pipeline **name** — the worker resolves the
 functions from its own registry (bootstrap runs in both processes).
+
+Pipeline names are not part of preview identity. For the same media, dispatch locks, worker
+locks, and stored previews are shared by size + format + filters across all pipelines. Use a
+consistent pipeline for each media record. If the same media needs multiple renderings at the
+same size and format, give each rendering distinct `filters` and pass those filters on reads too.
 
 ```ts
 pipelines: {

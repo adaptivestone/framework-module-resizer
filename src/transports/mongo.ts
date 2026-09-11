@@ -338,6 +338,7 @@ export class MongoTransport implements QueueTransport {
           upsert: true,
           returnDocument: 'after',
           setDefaultsOnInsert: true,
+          runValidators: true,
           writeConcern: { w: 'majority' },
         },
       );
