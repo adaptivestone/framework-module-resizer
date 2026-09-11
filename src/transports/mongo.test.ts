@@ -329,9 +329,10 @@ describe('MongoTransport.enqueue', () => {
     });
     assert.equal(repeated.taskId, original.taskId);
     const doc = await M.findById(original.taskId).lean();
-    assert.equal(doc?.status, 'processing');
-    assert.equal(doc?.attempts, 1);
-    assert.equal((doc?.previews as unknown[]).length, 1);
+    assert.ok(doc);
+    assert.equal(doc.status, 'processing');
+    assert.equal(doc.attempts, 1);
+    assert.equal((doc.previews as unknown[]).length, 1);
   });
 
   test('retry reuses active row, while completed and dead rows permit a new request', async () => {
