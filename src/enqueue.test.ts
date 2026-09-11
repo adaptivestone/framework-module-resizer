@@ -156,6 +156,23 @@ describe('enqueue', () => {
     assert.equal(enqueued, 2);
   });
 
+  test('keeps nested string and number filter leaves distinct', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = makeResizer({ transport, lockProvider });
+
+    const enqueued = await enqueue(r, 'm1', 'default', [
+      variant({ filters: { crop: { x: 1 } } as never }),
+      variant({ filters: { crop: { x: '1' } } as never }),
+    ]);
+
+    assert.equal(acquired.length, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 2);
+    assert.equal(enqueued, 2);
+  });
+
   test('acquires a dispatch lock per identity with the configured TTL', async () => {
     installFakeApp();
     const { transport } = makeTransport();

@@ -102,18 +102,13 @@ export function canonicalizeFilterValue(value: unknown): unknown {
   return value;
 }
 
-/** Convert a canonical runtime filter value into a deterministic identity fragment. */
+/**
+ * Convert a canonical runtime filter value into a deterministic, type-preserving
+ * identity fragment. This deliberately uses the same JSON value representation as
+ * the durable request key: `1` and `'1'` are different filter values.
+ */
 function getFilterValueSig(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(getFilterValueSig).join(',')}]`;
-  }
-  if (value !== null && typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .map((key) => `${JSON.stringify(key)}:${getFilterValueSig(record[key])}`)
-      .join(',')}}`;
-  }
-  return String(value);
+  return JSON.stringify(value) ?? 'undefined';
 }
 
 /** Canonical, order-independent filter signature. Empty / undefined → "none". */

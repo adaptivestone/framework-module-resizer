@@ -550,23 +550,31 @@ inspection/replay (edit the `expireAfterSeconds` in the scaffolded model to tast
 the same work. Otherwise reset the dead row:
 
 ```ts
-const active = await ResizeTask.findOne({
+const activeFilter = {
   fileId: row.fileId,
   pipeline: row.pipeline,
   requestKey: row.requestKey,
   status: { $in: ['pending', 'processing'] },
-});
+};
+let active = await ResizeTask.findOne(activeFilter);
 if (!active) {
-  await ResizeTask.updateOne(
-    { _id: row._id, status: 'dead' },
-    { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } },
-  );
+  try {
+    await ResizeTask.updateOne(
+      { _id: row._id, status: 'dead' },
+      { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } },
+    );
+  } catch (error) {
+    // Another operator created the same active request after our first read.
+    if ((error as { code?: number }).code !== 11000) throw error;
+    active = await ResizeTask.findOne(activeFilter);
+    if (!active) throw error;
+  }
 }
 ```
 
 The active-row lookup is important because the partial unique index rejects two live copies
-of the same request. If a concurrent operator creates one after the lookup, an `E11000` on
-the update is safe: re-read that active row instead of retrying the dead row.
+of the same request. If a concurrent operator creates one after the lookup, the example
+re-reads that active row instead of retrying the dead row.
 
 **Delivery is at-least-once** (both transports); the worker is **idempotent** — re-running a task
 for an already-generated identity skips via the existing-preview check, never duplicates.

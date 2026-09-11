@@ -124,15 +124,15 @@ describe('getFilterSig', () => {
     assert.equal(getFilterSig({ a: 1, b: 2 }), getFilterSig({ b: 2, a: 1 }));
   });
 
-  test('boolean and string values stringify', () => {
+  test('boolean and string values retain their JSON types', () => {
     assert.equal(
       getFilterSig({ sharpen: true, tone: 'warm' }),
-      'sharpen:true|tone:warm',
+      'sharpen:true|tone:"warm"',
     );
   });
 
-  test('plain filters keep their prior (unescaped) signatures', () => {
-    // Regression guard: values/keys with no `\`, `|`, `:` are unchanged by the escaping.
+  test('numeric filters keep their prior signatures', () => {
+    // JSON preserves the existing representation for numbers.
     assert.equal(getFilterSig({ blur: 40 }), 'blur:40');
     assert.equal(getFilterSig({ b: 2, a: 1 }), 'a:1|b:2');
   });
@@ -140,10 +140,10 @@ describe('getFilterSig', () => {
   test('escapes | : \\ so distinct filter bags never collide', () => {
     // Before escaping, `{ a: '1|b:2' }` and `{ a: 1, b: 2 }` both produced 'a:1|b:2'.
     assert.notEqual(getFilterSig({ a: '1|b:2' }), getFilterSig({ a: 1, b: 2 }));
-    assert.equal(getFilterSig({ a: '1|b:2' }), 'a:1\\|b\\:2');
+    assert.equal(getFilterSig({ a: '1|b:2' }), 'a:"1\\|b\\:2"');
     assert.equal(getFilterSig({ a: 1, b: 2 }), 'a:1|b:2');
     // a backslash in a value is itself escaped (and escaped BEFORE | / :).
-    assert.equal(getFilterSig({ a: 'x\\y' }), 'a:x\\\\y');
+    assert.equal(getFilterSig({ a: 'x\\y' }), `a:"x${'\\'.repeat(4)}y"`);
   });
 
   test('keeps nested runtime filter values deterministic and distinct', () => {
@@ -152,6 +152,13 @@ describe('getFilterSig', () => {
     const second = { crop: { x: 10, y: 0 } } as never;
     assert.equal(getFilterSig(first), getFilterSig(reordered));
     assert.notEqual(getFilterSig(first), getFilterSig(second));
+  });
+
+  test('keeps scalar leaf types distinct in nested runtime filters', () => {
+    assert.notEqual(
+      getFilterSig({ crop: { x: 1 } } as never),
+      getFilterSig({ crop: { x: '1' } } as never),
+    );
   });
 });
 
