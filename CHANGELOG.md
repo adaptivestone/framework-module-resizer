@@ -6,6 +6,9 @@
   CLI without importing framework internals.
 - Missing persisted originals raise `ResizeNoOriginalError`; Mongo tasks dead-letter this
   terminal condition immediately instead of retrying a download with no key.
+- Resolve treats throwing original-visibility checks as private and continues enqueueing missing
+  variants.
+- Resolve and prewarm no longer enqueue variants when the media original has no storage key.
 - Original visibility is explicit: public URLs are never fabricated for private S3 originals;
   authorized reads use signed URLs and local storage validates paths.
 - Mongo enqueue canonicalizes variants and atomically deduplicates identical active requests

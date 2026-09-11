@@ -100,7 +100,7 @@ describe('prewarm — happy path', () => {
     const { lockProvider } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [
         { width: 300, height: 300 },
         { width: 100, height: 100 },
@@ -125,7 +125,7 @@ describe('prewarm — happy path', () => {
     const { lockProvider } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [
         { width: 300, height: 300, filters: { blur: 40 } },
         { fit: true },
@@ -181,7 +181,7 @@ describe('prewarm — skip existing & dedup', () => {
     const { lockProvider } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [
         { width: 300, height: 300 },
         { width: 300, height: 300 },
@@ -198,7 +198,7 @@ describe('prewarm — skip existing & dedup', () => {
     const { lockProvider } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{}, { width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -258,7 +258,7 @@ describe('prewarm — waterfall hooks', () => {
       },
     });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [],
       formats: ['jpeg'],
     });
@@ -284,7 +284,7 @@ describe('prewarm — waterfall hooks', () => {
       },
     });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [
         { width: 300, height: 300 },
         { width: 100, height: 100 },
@@ -309,7 +309,7 @@ describe('prewarm — waterfall hooks', () => {
       hooks: { beforeEnqueue: () => [] },
     });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -323,7 +323,7 @@ describe('prewarm — no transport (eager-only host)', () => {
     const { warn } = installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [
         { width: 300, height: 300 },
         { width: 100, height: 100 },
@@ -343,7 +343,7 @@ describe('prewarm — dispatch-lock survivors only', () => {
     const { lockProvider } = makeLocks((key) => key.endsWith(':jpeg:none'));
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
@@ -360,7 +360,7 @@ describe('prewarm — dispatch-lock survivors only', () => {
     const { lockProvider } = makeLocks(false);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -378,7 +378,7 @@ describe('prewarm — never throws', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -397,7 +397,7 @@ describe('prewarm — never throws', () => {
     };
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -420,7 +420,7 @@ describe('prewarm — never throws', () => {
       },
     });
     const { enqueued } = await r.prewarm({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });

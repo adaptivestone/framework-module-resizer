@@ -136,35 +136,62 @@ describe('resolve — partitioning', () => {
     });
   });
 
-  test('serves an existing preview without checking an unusable original locator', async () => {
-    installFakeApp();
-    const r = new Resizer({
-      storage: makeStorage({
-        canServeOriginalPublicly: () => {
-          throw new Error('original bucket is no longer allowlisted');
+  test('a throwing original visibility check behaves like a private original and later missing variants enqueue', async () => {
+    const run = async (check: () => boolean) => {
+      resetResizerForTests();
+      resetAppInstance();
+      const { errors } = installFakeApp();
+      const { transport, calls } = makeTransport();
+      const { lockProvider } = makeLocks(true);
+      const r = new Resizer({
+        storage: makeStorage({ canServeOriginalPublicly: check }),
+        transport,
+        lockProvider,
+      });
+      const { decision } = await r.resolve({
+        media: {
+          id: 'm1',
+          original: { key: 'legacy-origin.jpg', bucket: 'retired-bucket' },
+          previews: [
+            {
+              key: 'public-preview.jpg',
+              contentType: 'image/jpeg',
+              sizeKey: '300x300',
+              format: 'jpeg',
+            },
+          ],
         },
-      }),
-    });
-    const { decision } = await r.resolve({
-      media: {
-        id: 'm1',
-        original: { key: 'legacy-origin.jpg', bucket: 'retired-bucket' },
-        previews: [
-          {
-            key: 'public-preview.jpg',
-            contentType: 'image/jpeg',
-            sizeKey: '300x300',
-            format: 'jpeg',
-          },
+        sizes: [
+          { width: 300, height: 300 },
+          { width: 100, height: 100 },
         ],
-      },
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      enqueueMissing: false,
-    });
+        formats: ['jpeg'],
+      });
+      return { calls, decision, errors };
+    };
 
-    assert.equal(decision.ready.length, 1);
-    assert.equal(decision.ready[0]?.url, 'https://cdn/public-preview.jpg');
+    const throwing = await run(() => {
+      throw new Error('original bucket is no longer allowlisted');
+    });
+    const privateOriginal = await run(() => false);
+
+    assert.deepEqual(throwing.decision, privateOriginal.decision);
+    assert.equal(throwing.decision.ready.length, 1);
+    assert.equal(
+      throwing.decision.ready[0]?.url,
+      'https://cdn/public-preview.jpg',
+    );
+    assert.deepEqual(
+      throwing.decision.missing.map((m) => m.sizeKey),
+      ['100x100'],
+    );
+    assert.deepEqual(throwing.calls, privateOriginal.calls);
+    assert.deepEqual(
+      throwing.calls[0]?.previews.map((p) => p.sizeKey),
+      ['100x100'],
+    );
+    assert.equal(throwing.errors.length, 1);
+    assert.equal(privateOriginal.errors.length, 0);
   });
 
   test('a filtered variant is distinct from the unfiltered same size', async () => {
@@ -386,7 +413,10 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     await r.resolve({
-      media: { _id: { toString: () => 'abc123' } },
+      media: {
+        _id: { toString: () => 'abc123' },
+        original: { key: 'orig.jpg' },
+      },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -402,7 +432,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { decision } = await r.resolve({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -416,11 +446,61 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     await r.resolve({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
     assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
+  });
+
+  test('an original without a key leaves variants missing without enqueueing or locking', async () => {
+    const { info } = installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const { decision } = await r.resolve({
+      media: { id: 'm1', original: {} as MediaLike['original'] },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(decision.missing.length, 1);
+    assert.equal(calls.length, 0);
+    assert.equal(acquired.length, 0);
+    assert.equal(info.length, 1);
+  });
+
+  test('an absent original leaves variants missing without enqueueing or locking', async () => {
+    const { info } = installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const { decision } = await r.resolve({
+      media: { id: 'm1' },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(decision.missing.length, 1);
+    assert.equal(calls.length, 0);
+    assert.equal(acquired.length, 0);
+    assert.equal(info.length, 1);
+  });
+});
+
+describe('prewarm — missing original key', () => {
+  test('returns zero without enqueueing or locking', async () => {
+    const { info } = installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: {} as MediaLike['original'] },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(result, { enqueued: 0 });
+    assert.equal(calls.length, 0);
+    assert.equal(acquired.length, 0);
+    assert.equal(info.length, 1);
   });
 });
 
@@ -448,7 +528,7 @@ describe('resolve — no transport (eager-only host)', () => {
     const { warn } = installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
-      media: { id: 'm1' },
+      media: { id: 'm1', original: { key: 'orig.jpg' } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
       enqueueMissing: true,

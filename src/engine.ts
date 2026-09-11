@@ -104,9 +104,17 @@ export async function resolveImpl(
     let originalIsPublic: boolean | undefined;
     const isOriginalPublic = (): boolean => {
       if (originalIsPublic === undefined) {
-        originalIsPublic =
-          original !== undefined &&
-          storage.canServeOriginalPublicly?.(original) === true;
+        try {
+          originalIsPublic =
+            original !== undefined &&
+            storage.canServeOriginalPublicly?.(original) === true;
+        } catch (err) {
+          getApp().logger.error(
+            'resize resolve: canServeOriginalPublicly threw — treating original as private',
+            err,
+          );
+          originalIsPublic = false;
+        }
       }
       return originalIsPublic;
     };
@@ -245,7 +253,11 @@ export async function resolveImpl(
     // lazy mode (enqueue), no transport means eager-only (do not log-on-every-read).
     const enqueueMissing = opts.enqueueMissing ?? resizer.transport != null;
     if (enqueueMissing && decision.missing.length > 0) {
-      if (!resizer.transport) {
+      if (!media.original?.key) {
+        getApp().logger.info(
+          `resize resolve: media ${mediaId} has no original key — nothing enqueued`,
+        );
+      } else if (!resizer.transport) {
         getApp().logger.warn(
           'resize resolve: missing previews but no transport is registered — they stay placeholders (eager-only host? construct the Resizer with a transport for lazy mode)',
         );
@@ -335,6 +347,13 @@ export async function prewarmImpl(
       ctx,
     )) as MissingPreview[];
     if (missing.length === 0) {
+      return { enqueued: 0 };
+    }
+
+    if (!media.original?.key) {
+      getApp().logger.info(
+        `resize prewarm: media ${mediaId} has no original key — nothing enqueued`,
+      );
       return { enqueued: 0 };
     }
 
