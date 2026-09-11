@@ -4,6 +4,71 @@ import { formatPictureUrls } from './formatPictureUrls.ts';
 import type { ReadDecision } from './types.d.ts';
 
 describe('formatPictureUrls', () => {
+  test('treats inherited size keys as data without modifying shared prototypes', () => {
+    const sizeKeys = ['__proto__', 'constructor', 'toString', 'hasOwnProperty'];
+    const targets = [
+      Object.prototype,
+      Object,
+      Object.prototype.toString,
+      Object.prototype.hasOwnProperty,
+    ];
+    const descriptors = targets.map((target) =>
+      Object.getOwnPropertyDescriptor(target, 'webp'),
+    );
+    try {
+      const out = formatPictureUrls({
+        ready: sizeKeys.map((sizeKey) => ({
+          sizeKey,
+          format: 'webp',
+          url: `https://cdn/${sizeKey}.webp`,
+        })),
+        missing: [],
+      });
+      assert.deepEqual(
+        targets.map((target) =>
+          Object.getOwnPropertyDescriptor(target, 'webp'),
+        ),
+        descriptors,
+      );
+      assert.equal(Object.getPrototypeOf(out.sizes), Object.prototype);
+      for (const sizeKey of sizeKeys) {
+        assert.ok(Object.hasOwn(out.sizes, sizeKey));
+        assert.deepEqual(out.sizes[sizeKey], {
+          webp: { url: `https://cdn/${sizeKey}.webp` },
+        });
+      }
+      assert.deepEqual(JSON.parse(JSON.stringify(out)), out);
+    } finally {
+      // Keep a regressing implementation from polluting subsequent tests.
+      targets.forEach((target, index) => {
+        if (descriptors[index]) {
+          Object.defineProperty(target, 'webp', descriptors[index]);
+        } else {
+          Reflect.deleteProperty(target, 'webp');
+        }
+      });
+    }
+  });
+
+  test('treats special format keys from untyped callers as own data properties', () => {
+    const formatKeys = ['__proto__', 'constructor', 'toString'];
+    const out = formatPictureUrls({
+      ready: formatKeys.map((format) => ({
+        sizeKey: '320w',
+        format: format as ReadDecision['ready'][number]['format'],
+        url: `https://cdn/${format}`,
+      })),
+      missing: [],
+    });
+    const byFormat = out.sizes['320w'];
+    assert.equal(Object.getPrototypeOf(byFormat), Object.prototype);
+    for (const format of formatKeys) {
+      assert.ok(Object.hasOwn(byFormat, format));
+      assert.deepEqual(byFormat[format], { url: `https://cdn/${format}` });
+    }
+    assert.deepEqual(JSON.parse(JSON.stringify(out)), out);
+  });
+
   test('groups ready entries by sizeKey then format', () => {
     const decision: ReadDecision = {
       ready: [

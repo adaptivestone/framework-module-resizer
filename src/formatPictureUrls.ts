@@ -7,24 +7,37 @@ export function formatPictureUrls(
   decision: ReadDecision,
   opts: { id?: string; mediaType?: string } = {},
 ): PictureUrls {
-  const sizes: PictureUrls['sizes'] = {};
+  // Group in Maps so caller-provided keys never resolve inherited properties.
+  const sizes = new Map<
+    string,
+    Map<string, PictureUrls['sizes'][string][string]>
+  >();
   for (const entry of decision.ready) {
     if (getFilterSig(entry.filters) !== 'none') {
       continue;
     }
-    let byFormat = sizes[entry.sizeKey];
+    let byFormat = sizes.get(entry.sizeKey);
     if (!byFormat) {
-      byFormat = {};
-      sizes[entry.sizeKey] = byFormat;
+      byFormat = new Map();
+      sizes.set(entry.sizeKey, byFormat);
     }
     const contentType = entry.contentType ?? entry.preview?.contentType;
     const cell: { url: string; contentType?: string } = { url: entry.url };
     if (contentType) {
       cell.contentType = contentType;
     }
-    byFormat[entry.format] = cell;
+    byFormat.set(entry.format, cell);
   }
-  const out: PictureUrls = { sizes };
+  const out: PictureUrls = {
+    // fromEntries creates own data properties, including for '__proto__', while
+    // preserving the public DTO's ordinary object shape and JSON serialization.
+    sizes: Object.fromEntries(
+      Array.from(sizes, ([sizeKey, byFormat]) => [
+        sizeKey,
+        Object.fromEntries(byFormat),
+      ]),
+    ),
+  };
   if (opts.mediaType !== undefined) {
     out.mediaType = opts.mediaType;
   }
