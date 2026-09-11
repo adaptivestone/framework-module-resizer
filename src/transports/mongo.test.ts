@@ -13,8 +13,10 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
+import type { MissingPreview } from '../types.d.ts';
 import { MongoTransport } from './mongo.ts';
 
 // Against mongodb-memory-server (real atomic semantics for lease/complete/fail/renew/sweep).
@@ -35,6 +37,7 @@ before(async () => {
   });
   ResizeTaskModel.initHooks(schema);
   M = mongoose.model('ResizeTask', schema);
+  await M.init();
 });
 
 after(async () => {
@@ -186,6 +189,228 @@ describe('MongoTransport.enqueue', () => {
     assert.equal(doc.status, 'pending');
     assert.equal(doc.attempts, 0);
     assert.equal((doc.previews as unknown[]).length, 1);
+    assert.equal(typeof doc.requestKey, 'string');
+  });
+
+  for (const { name, preview, errorPath } of [
+    {
+      name: 'empty size key',
+      preview: { sizeKey: '', format: 'jpeg' },
+      errorPath: 'previews.0.sizeKey',
+    },
+    {
+      name: 'unsupported format',
+      preview: { sizeKey: '300w', format: 'png' },
+      errorPath: 'previews.0.format',
+    },
+  ]) {
+    test(`rejects an invalid queued variant (${name}) without persisting a task`, async () => {
+      const { errors } = installFakeApp();
+      const result = await transport.enqueue({
+        mediaId: new mongoose.Types.ObjectId().toString(),
+        pipeline: 'default',
+        // Exercise runtime validation for JavaScript callers and host hooks.
+        previews: [preview as MissingPreview],
+      });
+
+      assert.deepEqual(result, { taskId: null });
+      assert.equal(await M.countDocuments({}), 0);
+      assert.equal(errors.length, 1);
+      const error = errors[0][1];
+      assert.ok(error instanceof mongoose.Error.ValidationError);
+      assert.ok(error.errors[errorPath]);
+    });
+  }
+
+  test('identical requests with reordered variants/filter keys return one active task', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const first = {
+      sizeKey: '300x300',
+      format: 'jpeg' as const,
+      filters: { tone: { z: 2, a: 1 } } as never,
+      requestedWidth: 300,
+    };
+    const second = { sizeKey: 'fit', format: 'webp' as const, fit: true };
+    const a = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews: [
+        first,
+        second,
+        { ...first, filters: { tone: { a: 1, z: 2 } } as never },
+      ],
+    });
+    const b = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews: [
+        second,
+        { ...first, filters: { tone: { a: 1, z: 2 } } as never },
+      ],
+    });
+    assert.ok(a.taskId);
+    assert.equal(b.taskId, a.taskId);
+    assert.equal(
+      await M.countDocuments({
+        fileId: mediaId,
+        pipeline: 'photo',
+        status: 'pending',
+      }),
+      1,
+    );
+  });
+
+  test('concurrent identical enqueue calls create one active row', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const task = {
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '640w', format: 'avif' as const }],
+    };
+    const results = await Promise.all(
+      Array.from({ length: 12 }, () => transport.enqueue(task)),
+    );
+    const ids = new Set(results.map((result) => result.taskId));
+    assert.equal(ids.size, 1);
+    assert.ok(results[0].taskId);
+    assert.equal(
+      await M.countDocuments({
+        fileId: mediaId,
+        pipeline: 'default',
+        status: 'pending',
+      }),
+      1,
+    );
+  });
+
+  test('rereads the winner when a second duplicate-key race follows completion', async () => {
+    const winner = { _id: new mongoose.Types.ObjectId() };
+    let upsertCalls = 0;
+    let readCalls = 0;
+    const duplicate = Object.assign(new Error('E11000 duplicate key'), {
+      code: 11000,
+    });
+    const model = {
+      findOneAndUpdate: async () => {
+        upsertCalls++;
+        if (upsertCalls <= 2) {
+          throw duplicate;
+        }
+        return winner;
+      },
+      findOne: async () => {
+        readCalls++;
+        // The first winner has already completed; a concurrent retry then wins
+        // the next active row before this caller retries its own upsert.
+        return readCalls === 1 ? null : winner;
+      },
+    };
+    installFakeApp((name) => (name === 'ResizeTask' ? model : null));
+
+    const result = await transport.enqueue({
+      mediaId: new mongoose.Types.ObjectId().toString(),
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+
+    assert.equal(String(result.taskId), String(winner._id));
+    assert.equal(readCalls, 2, 'each duplicate race rereads the active winner');
+  });
+
+  test('different variants and pipelines remain separate requests', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const a = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    const b = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '600x600', format: 'jpeg' }],
+    });
+    const c = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    assert.notEqual(a.taskId, b.taskId);
+    assert.notEqual(a.taskId, c.taskId);
+    assert.notEqual(b.taskId, c.taskId);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 3);
+  });
+
+  test('processing request is returned unchanged, including attempts and payload', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const original = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    const leased = await transport.lease();
+    assert.ok(leased);
+    const repeated = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    assert.equal(repeated.taskId, original.taskId);
+    const doc = await M.findById(original.taskId).lean();
+    assert.ok(doc);
+    assert.equal(doc.status, 'processing');
+    assert.equal(doc.attempts, 1);
+    assert.equal((doc.previews as unknown[]).length, 1);
+  });
+
+  test('retry reuses active row, while completed and dead rows permit a new request', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const payload = {
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' as const }],
+    };
+    const first = await transport.enqueue(payload);
+    const leased = await transport.lease();
+    assert.ok(leased);
+    await transport.fail(
+      String(leased._id),
+      String(leased.leaseToken),
+      new Error('retry'),
+      1,
+    );
+    const retry = await transport.enqueue(payload);
+    assert.equal(retry.taskId, first.taskId);
+    assert.equal((await M.findById(first.taskId).lean())?.attempts, 1);
+
+    await M.updateOne({ _id: first.taskId }, { $set: { status: 'completed' } });
+    const afterCompleted = await transport.enqueue(payload);
+    assert.notEqual(afterCompleted.taskId, first.taskId);
+    await M.updateOne(
+      { _id: afterCompleted.taskId },
+      { $set: { status: 'dead' } },
+    );
+    const afterDead = await transport.enqueue(payload);
+    assert.notEqual(afterDead.taskId, afterCompleted.taskId);
+    assert.equal(rec.failed.length, 1);
+  });
+
+  test('legacy row without requestKey remains compatible', async () => {
+    installFakeApp();
+    const legacy = await insert();
+    const created = await transport.enqueue({
+      mediaId: String(legacy.fileId),
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' }],
+    });
+    assert.ok(created.taskId);
+    assert.notEqual(created.taskId, String(legacy._id));
+    assert.equal(await M.countDocuments({ fileId: legacy.fileId }), 2);
   });
 
   test('returns { taskId: null } and logs when getModel is falsy (no TypeError)', async () => {
@@ -352,6 +577,46 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
     assert.ok((doc.leaseExpiresAt as Date).getTime() > before);
     assert.equal(rec.failed.length, 1);
     assert.equal(rec.dead.length, 0);
+  });
+
+  test('RESIZE_NO_ORIGINAL is dead-lettered on the first failure', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert();
+    const leased = await transport.lease();
+    assert.ok(leased);
+    assert.equal(leased.attempts, 1);
+    await transport.fail(
+      String(leased._id),
+      String(leased.leaseToken),
+      new ResizeNoOriginalError(String(leased.fileId)),
+      leased.attempts as number,
+    );
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'dead');
+    assert.ok(doc?.deadAt);
+    assert.match(String(doc?.error), /no original/i);
+    assert.equal(rec.dead.length, 1);
+    assert.equal(rec.failed.length, 0);
+  });
+
+  test('RESIZE_NO_ORIGINAL with a stale token is a fenced no-op', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert();
+    const leased = await transport.lease();
+    assert.ok(leased);
+    await transport.fail(
+      String(leased._id),
+      'stale-token',
+      new ResizeNoOriginalError(String(leased.fileId)),
+      leased.attempts as number,
+    );
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'processing');
+    assert.equal(doc?.deadAt, undefined);
+    assert.equal(rec.dead.length, 0);
+    assert.equal(rec.failed.length, 0);
   });
 
   test('at maxAttempts → dead with stored error + onTaskDeadLettered', async () => {

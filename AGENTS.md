@@ -16,6 +16,14 @@ no queue/worker — start here), lazy (on read, worker fills `previews[]`), pre-
 (`prewarm()` queues the catalog at upload). The read path decides per size + format +
 filters whether a preview is ready or missing.
 
+The Mongo transport deduplicates identical active enqueue requests using a canonical SHA-256
+`requestKey` and a partial unique index. Its key includes the pipeline and surviving variant
+catalog. Dispatch locks, worker locks, and stored previews share media + size + format + filters
+across pipelines; use distinct filters for different renderings of the same media, including
+on reads. Legacy rows without a key remain valid. Storage drivers that can prove original
+visibility implement `canServeOriginalPublicly`; the engine never fabricates a public URL for
+a private original.
+
 ## Integrate (in order)
 
 1. Install. The framework and mongoose are REQUIRED peers; the AWS SDKs are OPTIONAL peers —
@@ -117,7 +125,7 @@ Upload handler, pre-warm mode (non-blocking; the worker fills the cache before t
 const { enqueued } = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
 ```
 
-Upload handler, eager mode (blocking; requires a Resizer constructed WITHOUT `transport`):
+Upload handler, eager mode (blocking; a transport-backed Resizer is also supported):
 
 ```ts
 const { created, failed } = await getResizer().generate({
@@ -181,7 +189,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
 - SVG originals pass through untouched at every requested size (never rasterized, never
-  enqueued). Sanitizing SVG at upload is the HOST's job.
+  enqueued). Private originals require an authorized signed URL; anonymous reads do not
+  receive a fabricated public URL. Sanitizing SVG at upload is the HOST's job.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
 
 ## Troubleshooting

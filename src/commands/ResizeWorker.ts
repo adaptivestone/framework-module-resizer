@@ -13,6 +13,15 @@ export default class ResizeWorker {
   // Load + init models (the media model, ResizeTask, Lock) before run() — the worker needs them.
   static isShouldInitModels = true;
 
+  // BaseCli calls this before initializing models. Keep the connection name short and stable;
+  // the worker has no command-specific Mongo options that need to be part of the name.
+  static getMongoConnectionName(
+    _commandName: string,
+    _args: Record<string, unknown>,
+  ): string {
+    return 'CLI: ResizeWorker';
+  }
+
   // What BaseCli passes: `new Command(this.app, this.commands, parsedArgs.values)`. Stored to
   // mirror AbstractCommand's shape; the resize worker itself reaches the app via getApp().
   app: unknown;

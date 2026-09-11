@@ -94,32 +94,65 @@ export async function resolveImpl(
     const original = media.original;
     const missing: MissingPreview[] = [];
     const missingSeen = new Set<string>();
+    const originalIsSvg =
+      original != null &&
+      (original.contentType === 'image/svg+xml' || original.format === 'svg');
+    // Compute this lazily. A generated preview is independently public and must remain
+    // readable even when a legacy original now points to a retired/unavailable bucket.
+    // A driver that does not implement the check is deliberately conservative: a public URL
+    // from an arbitrary custom driver is not enough proof that an original is safe to expose.
+    let originalIsPublic: boolean | undefined;
+    const isOriginalPublic = (): boolean => {
+      if (originalIsPublic === undefined) {
+        try {
+          originalIsPublic =
+            original != null &&
+            storage.canServeOriginalPublicly?.(original) === true;
+        } catch (err) {
+          getApp().logger.error(
+            'resize resolve: canServeOriginalPublicly threw — treating original as private',
+            err,
+          );
+          originalIsPublic = false;
+        }
+      }
+      return originalIsPublic;
+    };
+    const authorizedOriginalRead = Boolean(
+      (ctx.isOwner || ctx.isAdmin) && storage.signedUrl,
+    );
 
-    if (
-      original &&
-      (original.contentType === 'image/svg+xml' || original.format === 'svg')
-    ) {
+    if (original && originalIsSvg) {
       // 6. SVG pass-through — served at every size×format from the ORIGINAL url, never
       // resized or enqueued (vector resize is a no-op); the requested format is ignored. Routes
       // through the SAME original-URL rule as the fast-path (06 · §17 step 6): signedUrl for an
       // owner/admin when the driver supports it (private-bucket SVG read), else pure publicUrl.
-      const url = await originalUrl(resizer, original, ctx);
-      for (const size of sizes) {
-        let sizeKey: string;
-        try {
-          sizeKey = getSizeKey(size);
-        } catch {
-          continue; // a size with nothing usable is skipped (as in step 7)
-        }
-        for (const format of formats) {
-          const entry: ReadyEntry = { sizeKey, format, url, isOriginal: true };
-          if (original.contentType) {
-            entry.contentType = original.contentType;
+      // A private SVG has no raster fallback: anonymous reads and failed owner/admin signing stay
+      // empty instead of exposing the private original or enqueueing impossible raster work.
+      const url = await originalUrl(resizer, original, ctx, isOriginalPublic());
+      if (url !== undefined) {
+        for (const size of sizes) {
+          let sizeKey: string;
+          try {
+            sizeKey = getSizeKey(size);
+          } catch {
+            continue; // a size with nothing usable is skipped (as in step 7)
           }
-          if (size.filters) {
-            entry.filters = size.filters;
+          for (const format of formats) {
+            const entry: ReadyEntry = {
+              sizeKey,
+              format,
+              url,
+              isOriginal: true,
+            };
+            if (original.contentType) {
+              entry.contentType = original.contentType;
+            }
+            if (size.filters) {
+              entry.filters = size.filters;
+            }
+            ready.push(entry);
           }
-          ready.push(entry);
         }
       }
       // missing stays empty; skip step 7.
@@ -154,6 +187,7 @@ export async function resolveImpl(
           // "original already fits" fast-path — ALL of (a)–(d) must hold (§17 step 7).
           if (
             original &&
+            (isOriginalPublic() || authorizedOriginalRead) &&
             getFilterSig(size.filters) === 'none' && // (a) no filters
             !size.fit &&
             isPositiveFinite(size.width) && // (b) plain cover WxH
@@ -163,17 +197,25 @@ export async function resolveImpl(
             original.width <= size.width && // (d) not larger than the box
             original.height <= size.height
           ) {
-            const fits: ReadyEntry = {
-              sizeKey,
-              format,
-              url: await originalUrl(resizer, original, ctx),
-              isOriginal: true,
-            };
-            if (original.contentType) {
-              fits.contentType = original.contentType;
+            const url = await originalUrl(
+              resizer,
+              original,
+              ctx,
+              isOriginalPublic(),
+            );
+            if (url !== undefined) {
+              const fits: ReadyEntry = {
+                sizeKey,
+                format,
+                url,
+                isOriginal: true,
+              };
+              if (original.contentType) {
+                fits.contentType = original.contentType;
+              }
+              ready.push(fits);
+              continue;
             }
-            ready.push(fits);
-            continue;
           }
 
           // missing → deduped by identity.
@@ -211,7 +253,11 @@ export async function resolveImpl(
     // lazy mode (enqueue), no transport means eager-only (do not log-on-every-read).
     const enqueueMissing = opts.enqueueMissing ?? resizer.transport != null;
     if (enqueueMissing && decision.missing.length > 0) {
-      if (!resizer.transport) {
+      if (!media.original?.key) {
+        getApp().logger.info(
+          `resize resolve: media ${mediaId} has no original key — nothing enqueued`,
+        );
+      } else if (!resizer.transport) {
         getApp().logger.warn(
           'resize resolve: missing previews but no transport is registered — they stay placeholders (eager-only host? construct the Resizer with a transport for lazy mode)',
         );
@@ -304,6 +350,13 @@ export async function prewarmImpl(
       return { enqueued: 0 };
     }
 
+    if (!media.original?.key) {
+      getApp().logger.info(
+        `resize prewarm: media ${mediaId} has no original key — nothing enqueued`,
+      );
+      return { enqueued: 0 };
+    }
+
     // 4. No transport → this host is eager-only; warn once and enqueue nothing.
     if (!resizer.transport) {
       getApp().logger.warn(
@@ -325,26 +378,30 @@ export async function prewarmImpl(
 
 /**
  * The public URL for an original-backed ready entry. Owner/admin reads get a signed URL
- * when the driver supports it — the ONLY read-path I/O, so it is caught and falls back to
- * the pure publicUrl on any error (the read must not break on a presign hiccup).
+ * when the driver supports it — the ONLY read-path I/O. A private original has no public URL
+ * fallback: if signing fails, return undefined so raster callers leave the variant missing.
  */
 async function originalUrl(
   resizer: Resizer,
   original: Original,
   ctx: Record<string, unknown>,
-): Promise<string> {
+  originalIsPublic: boolean,
+): Promise<string | undefined> {
   const storage = resizer.storage;
   if ((ctx.isOwner || ctx.isAdmin) && storage.signedUrl) {
     try {
       return await storage.signedUrl(original, SIGNED_ORIGINAL_TTL_SECONDS);
     } catch (err) {
       getApp().logger.error(
-        'resize resolve: signedUrl failed — falling back to the public URL',
+        'resize resolve: signedUrl failed — private original stays unavailable',
         err,
       );
+      if (!originalIsPublic) {
+        return undefined;
+      }
     }
   }
-  return storage.publicUrl(original);
+  return originalIsPublic ? storage.publicUrl(original) : undefined;
 }
 
 /** Log the never-throw catch; if getApp() itself threw (called pre-Server), use console. */

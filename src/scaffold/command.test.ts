@@ -121,6 +121,16 @@ describe('runScaffold — --eject', () => {
     assert.match(model, /initHooks/);
     assert.match(model, /extends BaseModel/);
     assert.match(model, /@adaptivestone\/framework\/modules\/BaseModel\.js/);
+    assert.match(
+      model,
+      /requestKey:\s*\{\s*type:\s*String\s*\}/,
+      'the ejected schema accepts the transport request identity',
+    );
+    assert.match(
+      model,
+      /\{ fileId: 1, pipeline: 1, requestKey: 1 \}/,
+      'the ejected schema carries the active-request dedupe index',
+    );
     // Still the full set of files.
     assert.equal(await exists(COMMAND), true);
     assert.equal(await exists(CONFIG), true);

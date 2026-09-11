@@ -223,6 +223,39 @@ describe('processTask — source handling', () => {
     assert.equal(appendCalls.length, 0);
   });
 
+  test('persisted original without a key → ResizeNoOriginalError before download', async () => {
+    installApp();
+    const base = makeStorage(redPng);
+    let downloadCalls = 0;
+    const storage: ResizeStorage = {
+      ...base.storage,
+      download: async () => {
+        downloadCalls += 1;
+        return redPng;
+      },
+    };
+    const { mediaStore } = makeMediaStore({
+      id: 'm1',
+      original: {},
+      previews: [],
+    } as MediaLike);
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeNoOriginalError);
+        assert.equal(err.code, 'RESIZE_NO_ORIGINAL');
+        assert.equal(err.mediaId, 'm1');
+        return true;
+      },
+    );
+    assert.equal(downloadCalls, 0);
+  });
+
   test('SVG original → no-op success (never rasterized)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
@@ -970,6 +1003,39 @@ describe('generate (eager)', () => {
         return true;
       },
     );
+  });
+
+  test('truthy but unpersisted original object → ResizeNoOriginalError before download', async () => {
+    installApp();
+    let downloadCalls = 0;
+    const { mediaStore } = makeMediaStore(null);
+    const storage: ResizeStorage = {
+      download: async () => {
+        downloadCalls += 1;
+        return redPng;
+      },
+      upload: async () => ({ key: 'unused' }),
+      publicUrl: () => '',
+    };
+    const r = new Resizer({ storage, mediaStore });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: {
+            id: 'm1',
+            original: {},
+          },
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeNoOriginalError);
+        assert.equal(err.code, 'RESIZE_NO_ORIGINAL');
+        assert.equal(err.mediaId, 'm1');
+        return true;
+      },
+    );
+    assert.equal(downloadCalls, 0);
   });
 
   test('every requested variant fails → ResizeGenerateError', async () => {

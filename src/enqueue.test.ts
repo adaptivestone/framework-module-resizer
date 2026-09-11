@@ -4,7 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { enqueue } from './enqueue.ts';
+import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
 import {
   type LockProvider,
   type QueueTransport,
@@ -98,6 +98,35 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('enqueue', () => {
+  test('canonicalizes variants by payload, nested filter keys, and stable sort', () => {
+    const first = variant({
+      format: 'webp',
+      filters: { nested: { z: 2, a: 1 } } as never,
+      requestedWidth: 300,
+    });
+    const second = variant({ format: 'jpeg', fit: false });
+    const canonical = canonicalizeVariants([
+      first,
+      second,
+      { ...first, filters: { nested: { a: 1, z: 2 } } as never },
+    ]);
+    assert.equal(canonical.length, 2);
+    assert.deepEqual(canonical[0], second);
+    assert.deepEqual(canonical[1], {
+      sizeKey: '300x300',
+      format: 'webp',
+      filters: { nested: { a: 1, z: 2 } },
+      requestedWidth: 300,
+    });
+    assert.equal(
+      buildRequestKey('m1', 'default', [first, second]),
+      buildRequestKey('m1', 'default', [
+        second,
+        { ...first, filters: { nested: { a: 1, z: 2 } } as never },
+      ]),
+    );
+  });
+
   test('dedups variants by identity before acquiring locks', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
@@ -108,6 +137,40 @@ describe('enqueue', () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].previews.length, 1);
     assert.equal(enqueued, 1); // returns the count handed to the transport
+  });
+
+  test('keeps distinct nested filter values as distinct preview identities', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = makeResizer({ transport, lockProvider });
+
+    const enqueued = await enqueue(r, 'm1', 'default', [
+      variant({ filters: { crop: { x: 0, y: 0 } } as never }),
+      variant({ filters: { crop: { x: 10, y: 0 } } as never }),
+    ]);
+
+    assert.equal(acquired.length, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 2);
+    assert.equal(enqueued, 2);
+  });
+
+  test('keeps nested string and number filter leaves distinct', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider, acquired } = makeLocks(true);
+    const r = makeResizer({ transport, lockProvider });
+
+    const enqueued = await enqueue(r, 'm1', 'default', [
+      variant({ filters: { crop: { x: 1 } } as never }),
+      variant({ filters: { crop: { x: '1' } } as never }),
+    ]);
+
+    assert.equal(acquired.length, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 2);
+    assert.equal(enqueued, 2);
   });
 
   test('acquires a dispatch lock per identity with the configured TTL', async () => {

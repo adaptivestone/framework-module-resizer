@@ -18,6 +18,11 @@ export interface ResizeStorage {
   }): Promise<StorageRef>;
   // PURE, synchronous, NO I/O — the read path calls this to build public URLs (05 · §10.4).
   publicUrl(ref: StorageRef): string;
+  // Optional, PURE, synchronous check used before serving an original directly from a public
+  // read. Drivers that can distinguish public previews from private originals should implement
+  // this method; a custom driver that omits it is treated conservatively by the engine and will
+  // never use the original fast-path for anonymous reads.
+  canServeOriginalPublicly?(ref: StorageRef): boolean;
   // Optional: a time-limited signed URL for owner/admin reads of a private original.
   signedUrl?(ref: StorageRef, ttlSeconds: number): Promise<string>;
 }

@@ -134,11 +134,36 @@ export class S3Storage implements ResizeStorage {
     return Buffer.from(bytes);
   }
 
+  // PURE, synchronous visibility check for originals. A missing ref.bucket follows the same
+  // effective-original-bucket rule as download/signedUrl: private first, then public. This means
+  // a legacy original without a persisted bucket stays private when bucketPrivate is configured.
+  canServeOriginalPublicly(ref: StorageRef): boolean {
+    this.#assertAllowedBucket(ref.bucket);
+    const bucket =
+      ref.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
+    return bucket === this.#opts.bucketPublic;
+  }
+
   // PURE string building — no SDK, no I/O (called on the read path). Three forms:
   // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
   // virtual-hosted. bucket = ref.bucket ?? bucketPublic.
   publicUrl(ref: StorageRef): string {
     this.#assertAllowedBucket(ref.bucket);
+    // A ref explicitly pointing at the configured private bucket must never be turned into a
+    // public CDN URL. The engine normally prevents this call; keep the driver safe when a host
+    // calls publicUrl directly too. If both buckets are the same, that bucket is intentionally
+    // public and the check below does not reject it.
+    if (
+      ref.bucket !== undefined &&
+      this.#opts.bucketPrivate !== undefined &&
+      ref.bucket === this.#opts.bucketPrivate &&
+      ref.bucket !== this.#opts.bucketPublic
+    ) {
+      throw new ResizeSecurityError(
+        `resize s3: refusing public URL for private bucket "${ref.bucket}"`,
+        { code: 'RESIZE_S3_PRIVATE_ORIGINAL_PUBLIC_URL' },
+      );
+    }
     const bucket = ref.bucket ?? this.#opts.bucketPublic;
     const publicBase = this.#opts.publicBaseUrl ?? this.#opts.publicUrl;
     if (publicBase) {

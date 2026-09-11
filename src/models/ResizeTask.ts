@@ -42,6 +42,9 @@ export default class ResizeTaskModel extends BaseModel {
       },
       // Which registered pipeline the worker runs for this task.
       pipeline: { type: String, default: 'default' },
+      // SHA-256 identity of the complete enqueue request (file + pipeline + canonical
+      // variants). Optional so legacy rows written before durable dedupe remain valid.
+      requestKey: { type: String },
       // The REQUESTED variants to generate (the MissingPreview shape — NOT the full stored
       // Preview; the worker computes key/dims/contentType and $pushes those to the media doc).
       previews: [
@@ -76,7 +79,8 @@ export default class ResizeTaskModel extends BaseModel {
     } as const;
   }
 
-  // Exactly the five indexes from spec/08 §12. The schema param reuses the framework's
+  // The five lifecycle indexes from spec/08 §12 plus the active-request dedupe index below.
+  // The schema param reuses the framework's
   // mongoose `Schema` type (via Parameters<…>) so no mongoose import is needed here.
   static initHooks(schema: Parameters<typeof BaseModel.initHooks>[0]) {
     // Evict completed rows after 24h (TTL, scoped to status:'completed').
@@ -106,6 +110,18 @@ export default class ResizeTaskModel extends BaseModel {
     );
     // Per-media task lookup, newest first.
     schema.index({ fileId: 1, createdAt: -1 });
+    // Exact durable enqueue dedupe. Legacy rows without requestKey are intentionally
+    // excluded, and completed/dead rows do not block a fresh explicit request.
+    schema.index(
+      { fileId: 1, pipeline: 1, requestKey: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          status: { $in: ['pending', 'processing'] },
+          requestKey: { $exists: true },
+        },
+      },
+    );
   }
 }
 

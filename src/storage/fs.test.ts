@@ -51,6 +51,27 @@ describe('LocalFsStorage.publicUrl', () => {
   });
 });
 
+describe('LocalFsStorage.canServeOriginalPublicly', () => {
+  test('returns true for a validated key', () => {
+    const s = new LocalFsStorage({
+      rootDir: '/tmp/x',
+      publicBaseUrl: '/media',
+    });
+    assert.equal(s.canServeOriginalPublicly({ key: 'uploads/a.jpg' }), true);
+  });
+
+  test('validates the original key before declaring it public', () => {
+    const s = new LocalFsStorage({
+      rootDir: '/tmp/x',
+      publicBaseUrl: '/media',
+    });
+    assert.throws(
+      () => s.canServeOriginalPublicly({ key: '../outside.jpg' }),
+      /escapes rootDir/,
+    );
+  });
+});
+
 describe('LocalFsStorage path traversal', () => {
   test('refuses a key that escapes rootDir', async () => {
     const dir = await fresh();

@@ -126,6 +126,13 @@ S3 when you have buckets; a queue when listings are huge — both are later sect
 Add a `transport` and run `ResizeWorker`. Missing variants are enqueued on `resolve()` (or
 pushed at upload with `prewarm()`).
 
+The Mongo transport deduplicates identical active tasks: variants are canonicalized and a
+SHA-256 `requestKey` is stored under a partial unique index for `pending`/`processing` rows.
+The key includes the pipeline and the complete variant payload handed to the transport;
+reordering that payload returns the existing task. Before this stage, shared dispatch locks
+can remove overlapping variants from a request. Rows created before `requestKey` was introduced
+remain valid.
+
 ```ts
 // src/resizer.ts — construct after Server.init(); import from API and worker processes
 import { Resizer } from '@adaptivestone/framework-module-resize';
@@ -227,7 +234,7 @@ await resizer.prewarm({ media: fileDoc, sizes: getListingSizes(), pipeline: 'lis
 Choose pre-warm when you want **fast uploads and a warm cache** — the request returns immediately
 while the worker fills the catalog in the background.
 
-**Eager** — construct the Resizer **without** a `transport` and call `generate` from your
+**Eager** — call `generate` from your
 upload handler (`ctx` reaches pipeline steps here, unlike the queued worker):
 
 ```ts
@@ -396,6 +403,11 @@ from the main entry for custom-driver authors.
 in a separate process, so the task carries only the pipeline **name** — the worker resolves the
 functions from its own registry (bootstrap runs in both processes).
 
+Pipeline names are not part of preview identity. For the same media, dispatch locks, worker
+locks, and stored previews are shared by size + format + filters across all pipelines. Use a
+consistent pipeline for each media record. If the same media needs multiple renderings at the
+same size and format, give each rendering distinct `filters` and pass those filters on reads too.
+
 ```ts
 pipelines: {
   photo: {
@@ -539,18 +551,49 @@ reclaims a task past the cap, so no crash-loop runs forever. (SQS uses its nativ
 **Retention TTLs:** `completed` rows evict after 24h; `dead` rows are kept ~30 days for
 inspection/replay (edit the `expireAfterSeconds` in the scaffolded model to taste).
 
-**Dead-letter replay** is a host op — reset the row:
+**Dead-letter replay** is a host op. First look for an active row with the same
+`fileId` + `pipeline` + `requestKey`; if it exists, keep that row — it already represents
+the same work. Otherwise reset the dead row:
 
 ```ts
-ResizeTask.updateOne({ _id }, { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } });
+const activeFilter = {
+  fileId: row.fileId,
+  pipeline: row.pipeline,
+  requestKey: row.requestKey,
+  status: { $in: ['pending', 'processing'] },
+};
+let active = await ResizeTask.findOne(activeFilter);
+if (!active) {
+  try {
+    await ResizeTask.updateOne(
+      { _id: row._id, status: 'dead' },
+      { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } },
+    );
+  } catch (error) {
+    // Another operator created the same active request after our first read.
+    if ((error as { code?: number }).code !== 11000) throw error;
+    active = await ResizeTask.findOne(activeFilter);
+    if (!active) throw error;
+  }
+}
 ```
+
+The active-row lookup is important because the partial unique index rejects two live copies
+of the same request. If a concurrent operator creates one after the lookup, the example
+re-reads that active row instead of retrying the dead row.
 
 **Delivery is at-least-once** (both transports); the worker is **idempotent** — re-running a task
 for an already-generated identity skips via the existing-preview check, never duplicates.
 
 **SVG originals are pass-through** — when `original.contentType === 'image/svg+xml'` the read path
-serves the original at every requested size/format and never resizes or enqueues. **SVG
-sanitization is host-owned** (sanitize at upload before storing).
+serves a public original at every requested size/format and never resizes or enqueues. A private
+original is served only through a successful authorized `signedUrl`; anonymous reads return no
+original URL. **SVG sanitization is host-owned** (sanitize at upload before storing).
+
+**Original visibility is explicit.** Storage drivers that can prove an original is public should
+implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's
+`publicUrl` as proof and never falls back from a failed private presign to a public URL. Existing
+previews remain the preferred public read path.
 
 **Deleting media / storage cleanup is host-owned.** The module appends previews but does not delete
 them; removing a media doc's storage objects (originals + derivatives) is your lifecycle.

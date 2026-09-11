@@ -46,6 +46,12 @@ describe('ResizeTaskModel.modelSchema — spec/08 §12 fields', () => {
     assert.equal(p.default, 'default');
   });
 
+  test('requestKey is an optional String for active-request dedupe', () => {
+    const requestKey = ResizeTaskModel.modelSchema.requestKey;
+    assert.equal(requestKey.type, String);
+    assert.equal('required' in requestKey, false);
+  });
+
   test('status is the four-state enum defaulting to "pending"', () => {
     const st = ResizeTaskModel.modelSchema.status;
     assert.deepEqual(
@@ -99,8 +105,8 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     fields: Record<string, number>,
   ) => indexes.find(([f]) => JSON.stringify(f) === JSON.stringify(fields));
 
-  test('adds exactly five indexes', () => {
-    assert.equal(buildIndexes().length, 5);
+  test('adds exactly six indexes', () => {
+    assert.equal(buildIndexes().length, 6);
   });
 
   test('completedAt TTL 86400 partial to status:completed', () => {
@@ -141,6 +147,22 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     const idx = byFields(buildIndexes(), { fileId: 1, createdAt: -1 });
     assert.ok(idx);
     assert.deepEqual(idx[1], {});
+  });
+
+  test('{ fileId:1, pipeline:1, requestKey:1 } dedupes active rows only', () => {
+    const idx = byFields(buildIndexes(), {
+      fileId: 1,
+      pipeline: 1,
+      requestKey: 1,
+    });
+    assert.ok(idx);
+    assert.deepEqual(idx[1], {
+      unique: true,
+      partialFilterExpression: {
+        status: { $in: ['pending', 'processing'] },
+        requestKey: { $exists: true },
+      },
+    });
   });
 });
 

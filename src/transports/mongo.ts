@@ -12,6 +12,7 @@
 // this driver is always safe (05 · §10.2).
 import { getApp } from '../app.ts';
 import { getResizeConfig } from '../config/resize.ts';
+import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
 import { ResizeError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
@@ -26,6 +27,7 @@ interface TaskDoc {
   _id: { toString(): string };
   fileId: { toString(): string };
   pipeline: string;
+  requestKey?: string;
   previews: MissingPreview[];
   status: string;
   attempts: number;
@@ -74,6 +76,31 @@ function toLeasedTask(doc: TaskDoc): LeasedTask {
     pipeline: doc.pipeline,
     previews: doc.previews ?? [],
   };
+}
+
+function activeRequestFilter(
+  mediaId: string,
+  pipeline: string,
+  requestKey: string,
+) {
+  return {
+    fileId: mediaId,
+    pipeline,
+    requestKey,
+    status: { $in: ['pending', 'processing'] },
+  };
+}
+
+function isDuplicateKeyError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  return (
+    (error as { code?: unknown }).code === 11000 ||
+    /duplicate key/i.test(
+      String((error as { message?: unknown }).message ?? error),
+    )
+  );
 }
 
 /** The default transport — an option-less class (`new MongoTransport()`) (05 · §10.2). */
@@ -170,7 +197,17 @@ export class MongoTransport implements QueueTransport {
     }
     const { maxAttempts } = getResizeConfig().queue;
     const now = new Date();
-    if (attempts < maxAttempts) {
+    // A persisted media row without an original is a deterministic terminal failure. Keep the
+    // normal retry policy for every other error (including errors that merely happen to expose a
+    // different `code` field). ResizeNoOriginalError crosses the transport boundary as an
+    // ordinary error object, so discriminate by its stable machine-readable code rather than
+    // by instanceof.
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+    const terminalNoOriginal = code === 'RESIZE_NO_ORIGINAL' && attempts >= 1;
+    if (!terminalNoOriginal && attempts < maxAttempts) {
       const doc = (await model.findOneAndUpdate(
         fence(taskId, leaseToken),
         {
@@ -281,30 +318,67 @@ export class MongoTransport implements QueueTransport {
     if (!model) {
       return { taskId: null };
     }
-    try {
-      // Array form + options is the correct mongoose 9 shape for a durable single-doc create
-      // with a write concern (a plain `create(doc, options)` mis-reads the options as a second
-      // document). Maps the generic `mediaId` → host-owned `fileId`.
-      const [doc] = await model.create(
-        [
-          {
+    const previews = canonicalizeVariants(task.previews);
+    const requestKey = buildRequestKey(task.mediaId, task.pipeline, previews);
+    const filter = activeRequestFilter(task.mediaId, task.pipeline, requestKey);
+    const upsert = () =>
+      model.findOneAndUpdate(
+        filter,
+        {
+          $setOnInsert: {
             fileId: task.mediaId,
             pipeline: task.pipeline,
-            previews: task.previews,
+            requestKey,
+            previews,
             status: 'pending',
             attempts: 0,
           },
-        ],
-        { writeConcern: { w: 'majority' } },
+        },
+        {
+          upsert: true,
+          returnDocument: 'after',
+          setDefaultsOnInsert: true,
+          runValidators: true,
+          writeConcern: { w: 'majority' },
+        },
       );
-      return { taskId: String(doc._id) };
-    } catch (err) {
-      getApp().logger.error(
-        `resize mongo transport: enqueue failed for media ${task.mediaId}`,
-        err,
-      );
-      return { taskId: null };
+
+    // An E11000 winner can finish between our conflict and reread. In that
+    // narrow window another caller may win the replacement active row before
+    // our retry, producing another E11000. Reread after each duplicate race;
+    // three attempts bound contention without turning enqueue into an unbounded
+    // retry loop when the database is unhealthy.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const doc = await upsert();
+        return { taskId: doc ? String(doc._id) : null };
+      } catch (err) {
+        if (!isDuplicateKeyError(err)) {
+          getApp().logger.error(
+            `resize mongo transport: enqueue failed for media ${task.mediaId}`,
+            err,
+          );
+          return { taskId: null };
+        }
+        try {
+          const existing = await model.findOne(filter);
+          if (existing) {
+            return { taskId: String(existing._id) };
+          }
+        } catch (raceError) {
+          getApp().logger.error(
+            `resize mongo transport: enqueue duplicate-key reread failed for media ${task.mediaId}`,
+            raceError,
+          );
+          return { taskId: null };
+        }
+      }
     }
+
+    getApp().logger.error(
+      `resize mongo transport: enqueue remained contended after duplicate-key retries for media ${task.mediaId}`,
+    );
+    return { taskId: null };
   }
 
   async startWorker(
