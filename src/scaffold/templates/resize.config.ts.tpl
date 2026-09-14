@@ -10,5 +10,6 @@ export default {
   // Example overrides (delete if unused):
   // formats: ['webp', 'avif'],            // arrays REPLACE the default (no concat)
   // encode: { ...defaultResizeConfig.encode, quality: { ...defaultResizeConfig.encode.quality, avif: 55 } },
-  // worker: { ...defaultResizeConfig.worker, enabled: process.env.RESIZE_WORKER === 'true', concurrency: 4 },
+  // Lazy/pre-warm: enable the worker command, then run `npm run cli ResizeWorker`.
+  // worker: { ...defaultResizeConfig.worker, enabled: true, concurrency: 4 },
 };

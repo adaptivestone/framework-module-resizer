@@ -1,3 +1,9 @@
+# Unreleased
+
+- Worker setup uses an explicit `worker.enabled: true` in host config instead of an
+  environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
+  message; the module default remains `false`.
+
 # 0.2.1
 
 **Fixes**

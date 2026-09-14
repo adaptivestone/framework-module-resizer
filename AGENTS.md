@@ -96,9 +96,10 @@ a private original.
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
 
-7. Lazy / pre-warm modes: run the worker as its own process — `npm run cli ResizeWorker` —
-   gated by config `worker.enabled` (default `false`; enable it via env in the worker process
-   only). Eager mode needs no worker.
+7. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
+   (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
+   The flag permits the command to run; it does not start a worker in the API.
+   Eager mode needs no worker.
 
 ## Use
 

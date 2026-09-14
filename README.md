@@ -161,11 +161,25 @@ export const resizer = new Resizer({
 });
 ```
 
-**Run the worker** as a separate process (gated by `worker.enabled`):
+**Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
+
+```ts
+import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+
+export default {
+  ...defaultResizeConfig,
+  mediaModelName: 'File',
+  worker: { ...defaultResizeConfig.worker, enabled: true },
+};
+```
+
+**Run the worker** as a separate process:
 
 ```bash
 npm run cli ResizeWorker
 ```
+
+`worker.enabled` permits the command to run; it does not start a worker inside the API.
 
 Your media model (`File`/`Media`) must carry `original` (incl. `width`/`height`) and `previews[]`
 (incl. `filters`/`fit`). That schema is host-owned; to avoid hand-written drift the module exports
@@ -532,7 +546,7 @@ them by `getResizeConfig()` — override any knob at any depth. **Arrays REPLACE
 | `queue.maxAttempts` | `5` | delivery count before dead-letter (increments on every lease incl. reclaims, like SQS `maxReceiveCount`) |
 | `queue.idlePollMs` | `1000` | empty-lease sleep |
 | `queue.taskTimeoutMs` | `600000` | `handleTask` is raced against this; on timeout the task is failed and the slot freed (Mongo transport) |
-| `worker.enabled` | `false` | gate the worker process (env-driven in host) |
+| `worker.enabled` | `false` | set `true` in host config to permit the worker command to run |
 | `worker.concurrency` | `4` | variants resized in parallel per task |
 | `worker.sharpConcurrency` | `1` | `sharp.concurrency()`; keep `concurrency × sharpConcurrency ≈ nCPU` |
 | `worker.sharpCache` | `false` | a worker processes distinct images; the op-cache mostly wastes memory |

@@ -184,7 +184,7 @@ export interface ResizeConfig {
 
   // Worker runtime tuning.
   worker: {
-    enabled: boolean; // default false (env-driven in host)
+    enabled: boolean; // default false; set true to enable the worker command
     concurrency: number; // default 4 — variants resized in parallel per task
     sharpConcurrency: number; // default 1 — sharp.concurrency(); concurrency × this ≈ nCPU
     sharpCache: boolean; // default false — sharp.cache()

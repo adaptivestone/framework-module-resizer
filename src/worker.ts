@@ -13,7 +13,7 @@ export async function runResizeWorker(): Promise<void> {
   const config = getResizeConfig();
   if (config.worker.enabled === false) {
     app.logger.info(
-      'resize worker disabled — set config.worker.enabled=true (env-gated in the host config) to run it',
+      'resize worker disabled — set config.worker.enabled=true in the host src/config/resize.ts to run it',
     );
     return;
   }
