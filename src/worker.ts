@@ -17,13 +17,15 @@ export async function runResizeWorker(): Promise<void> {
     );
     return;
   }
-  const { transport } = getResizer();
+  const resizer = getResizer();
+  const { transport } = resizer;
   if (!transport) {
     app.logger.error(
       'resize worker: Resizer was constructed without a transport (eager-only wiring)',
     );
     return;
   }
+  await resizer.prepareQueue();
   // Tune sharp ONCE for a concurrent worker: keep worker.concurrency × sharp.concurrency ≈ nCPU
   // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
   sharp.concurrency(config.worker.sharpConcurrency);

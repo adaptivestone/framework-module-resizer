@@ -74,7 +74,9 @@ const orientedJpeg = await sharp({
 
 function installApp(configOverride: Record<string, unknown> = {}): {
   logs: { info: unknown[][]; warn: unknown[][]; error: unknown[][] };
+  getModelCalls: () => number;
 } {
+  let modelCalls = 0;
   const logs = {
     info: [] as unknown[][],
     warn: [] as unknown[][],
@@ -82,7 +84,10 @@ function installApp(configOverride: Record<string, unknown> = {}): {
   };
   setAppInstance({
     getConfig: () => ({ mediaModelName: 'File', ...configOverride }),
-    getModel: () => ({}),
+    getModel: () => {
+      modelCalls += 1;
+      return {};
+    },
     logger: {
       info(...a: unknown[]) {
         logs.info.push(a);
@@ -95,7 +100,7 @@ function installApp(configOverride: Record<string, unknown> = {}): {
       },
     },
   } as never);
-  return { logs };
+  return { logs, getModelCalls: () => modelCalls };
 }
 
 type Upload = {
@@ -1282,24 +1287,101 @@ describe('runResizeWorker', () => {
   test('worker.enabled=false → clean no-op (startWorker NOT called); log says how to enable', async () => {
     const { logs } = installApp(); // default worker.enabled is false
     let started = false;
+    let prepared = false;
     new Resizer({
       storage: makeStorage(redPng).storage,
-      transport: fakeTransport(() => {
-        started = true;
-      }),
+      transport: {
+        ...fakeTransport(() => {
+          started = true;
+        }),
+        prepare: async () => {
+          prepared = true;
+        },
+      },
     });
     await runResizeWorker();
     assert.equal(started, false);
+    assert.equal(prepared, false);
     assert.ok(
       logs.info.some((l) => String(l[0]).includes('worker.enabled=true')),
     );
   });
 
-  test('no transport → logs an error and returns', async () => {
-    const { logs } = installApp({ worker: { enabled: true } });
+  test('no transport → logs an error and returns without preparing framework drivers', async () => {
+    const { logs, getModelCalls } = installApp({
+      worker: { enabled: true },
+    });
     new Resizer({ storage: makeStorage(redPng).storage });
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
+    assert.equal(getModelCalls(), 0);
+  });
+
+  test('awaits queue preparation completely before starting the transport worker', async () => {
+    installApp({ worker: { enabled: true } });
+    let releasePreparation: (() => void) | undefined;
+    const preparationPending = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+    const order: string[] = [];
+    const transport: QueueTransport = {
+      ...fakeTransport(() => {
+        order.push('worker:start');
+      }),
+      prepare: async () => {
+        order.push('prepare:start');
+        await preparationPending;
+        order.push('prepare:end');
+      },
+    };
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    const running = runResizeWorker();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(order, ['prepare:start']);
+
+    releasePreparation?.();
+    await running;
+    assert.deepEqual(order, ['prepare:start', 'prepare:end', 'worker:start']);
+  });
+
+  test('preparation rejection reaches the caller and prevents worker start and stop logging', async () => {
+    const { logs } = installApp({ worker: { enabled: true } });
+    const cause = new Error('queue unavailable');
+    let started = false;
+    const transport: QueueTransport = {
+      ...fakeTransport(() => {
+        started = true;
+      }),
+      prepare: async () => {
+        throw cause;
+      },
+    };
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    await assert.rejects(runResizeWorker(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as { code?: unknown }).code,
+        'RESIZE_QUEUE_PREPARE_FAILED',
+      );
+      assert.equal(error.cause, cause);
+      return true;
+    });
+    assert.equal(started, false);
+    assert.equal(
+      logs.info.some((entry) => entry[0] === 'resize worker stopped'),
+      false,
+    );
   });
 
   test('enabled + transport → startWorker gets a handler that reaches processTask', async () => {
@@ -1314,6 +1396,7 @@ describe('runResizeWorker', () => {
         handle = h;
       }),
       mediaStore,
+      lockProvider: makeLocks().lockProvider,
     });
     await runResizeWorker();
     assert.equal(typeof handle, 'function');
