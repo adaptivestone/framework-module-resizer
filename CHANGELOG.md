@@ -1,5 +1,8 @@
 # Unreleased
 
+- Added idempotent `resizer.prepareQueue()` plus optional driver `prepare()` hooks. Producers can
+  create Mongo queue/lock indexes after model registration; the standard worker prepares them
+  automatically before consumption.
 - Added `resizer.uploadOriginal({ body, visibility })`: byte-sniffed, unchanged original storage
   with typed metadata/errors and explicit SVG-as-SVG handling. New `upload.maxBytes` and
   `upload.formats` controls bound accepted inputs.

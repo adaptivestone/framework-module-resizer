@@ -96,9 +96,31 @@ a private original.
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
 
-7. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
+7. Lazy / pre-warm producer processes: after the database is connected and the framework + host
+   models (including `Lock` and `ResizeTask`) are registered, but before exposing a code path that
+   can enqueue (`resolve`, `prewarm`, `enqueueRequired`), prepare the infrastructure:
+
+   ```ts
+   await resizer.prepareQueue();
+   ```
+
+   Preparation is idempotent. `MongoTransport` and the default `FrameworkLockProvider` call
+   `createIndexes()`, which requires database privileges and may take time. Index conflicts and
+   errors are surfaced; the module does not list/sync/drop/repair conflicting indexes. Hosts whose
+   migrations already guarantee the indexes may skip producer preparation. Eager-only without a
+   transport needs no preparation: `prepareQueue()` is a no-op and does not touch locks or the
+   framework app. SQS/custom transports without `prepare()` still prepare the default framework
+   Lock because a transport exists; SQS queues/redrive/credentials remain externally provisioned.
+   Preparation neither health-checks nor creates SQS, S3, buckets, IAM, or other external
+   resources.
+   Custom `QueueTransport` and `LockProvider` objects may implement optional, idempotent
+   `prepare(): Promise<void>`.
+
+8. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
-   The flag permits the command to run; it does not start a worker in the API.
+   The flag permits the command to run; it does not start a worker in the API. The standard
+   `runResizeWorker()` / scaffolded `ResizeWorker` prepares queue + lock infrastructure itself
+   before consumption; do not add a separate worker-side preparation call.
    Eager mode needs no worker.
 
 ## Use

@@ -25,6 +25,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
+const manifest = JSON.parse(
+  readFileSync(join(ROOT, 'package.json'), 'utf8'),
+) as { name: string; version: string };
 
 // --- consumer-side assertion scripts (plain ESM, run in the consumer's resolution context).
 // Kept template-literal-safe: single quotes + string concatenation only, no backticks / ${}.
@@ -57,6 +60,7 @@ const expected = [
   'ResizeSecurityError',
   'ResizeGenerateError',
   'ResizeNoOriginalError',
+  'ResizeOriginalError',
   'ResizeTaskModel',
   'getResizer',
   'Resizer',
@@ -84,7 +88,13 @@ for (const driver of [
 ]) {
   assert.ok(!(driver in mod), 'driver must stay subpath-only, not on main entry: ' + driver);
 }
+assert.equal(
+  typeof mod.Resizer.prototype.prepareQueue,
+  'function',
+  'Resizer.prototype.prepareQueue must exist at runtime',
+);
 console.log('  ok  main entry: ' + expected.length + ' core exports, no driver leakage');
+console.log('  ok  Resizer.prototype.prepareQueue exists');
 
 // (b) optional AWS-backed subpaths must FAIL loudly (module-not-found naming the SDK).
 const optional = [
@@ -122,6 +132,19 @@ for (const [sub, exp] of safe) {
   assert.ok(exp in m, sub + ' should export ' + exp);
   console.log('  ok  ' + sub + ' imports (exports ' + exp + ')');
 }
+const { MongoTransport } = await import(PKG + '/transports/mongo.js');
+const { FrameworkLockProvider } = await import(PKG + '/locks/framework.js');
+assert.equal(
+  typeof MongoTransport.prototype.prepare,
+  'function',
+  'MongoTransport.prototype.prepare must exist at runtime',
+);
+assert.equal(
+  typeof FrameworkLockProvider.prototype.prepare,
+  'function',
+  'FrameworkLockProvider.prototype.prepare must exist at runtime',
+);
+console.log('  ok  MongoTransport + FrameworkLockProvider runtime prepare methods exist');
 `;
 
 const CHECK_AWS = `import assert from 'node:assert/strict';
@@ -165,7 +188,8 @@ try {
     throw new Error('npm pack did not report a tarball name');
   }
   const tarballPath = join(scratch, tarball);
-  console.log(`  ${tarball}`);
+  console.log(`  source: ${manifest.name}@${manifest.version} from ${ROOT}`);
+  console.log(`  artifact: ${tarball}`);
 
   // A throwaway consumer. Install the tarball + the REQUIRED peers the import graph needs
   // at module-load time: `@adaptivestone/framework` (the ambient appInstance gateway + the
@@ -191,17 +215,65 @@ try {
   );
 
   // (a0) AGENTS.md must ship inside the installed package (package.json "files").
-  const installedAgents = join(
+  const installedPackage = join(
     consumer,
     'node_modules',
     '@adaptivestone',
     'framework-module-resize',
-    'AGENTS.md',
   );
+  const installedAgents = join(installedPackage, 'AGENTS.md');
   if (!existsSync(installedAgents)) {
     throw new Error('installed package is missing AGENTS.md');
   }
   console.log('  ok  AGENTS.md ships with the package');
+
+  // The declarations must come from the package installed in the throwaway consumer, not
+  // from src/ or the repository's dist/ directory. Keep the matches structural so harmless
+  // declaration-printer whitespace changes do not weaken this contract.
+  const declarationChecks = [
+    [
+      'dist/index.d.ts',
+      /export\s*\{[^}]*\bResizer\b[^}]*\}\s*from\s*['"]\.\/resizer\.(?:ts|js)['"]/s,
+      'main declarations re-export Resizer',
+    ],
+    [
+      'dist/resizer.d.ts',
+      /\bprepareQueue\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
+      'Resizer.prepareQueue declaration',
+    ],
+    [
+      'dist/transports/AbstractTransport.d.ts',
+      /\bprepare\?\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
+      'QueueTransport optional prepare declaration',
+    ],
+    [
+      'dist/locks/AbstractLockProvider.d.ts',
+      /\bprepare\?\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
+      'LockProvider optional prepare declaration',
+    ],
+    [
+      'dist/transports/mongo.d.ts',
+      /\bprepare\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
+      'MongoTransport.prepare declaration',
+    ],
+    [
+      'dist/locks/framework.d.ts',
+      /\bprepare\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
+      'FrameworkLockProvider.prepare declaration',
+    ],
+  ] as const;
+  for (const [relativePath, pattern, label] of declarationChecks) {
+    const declaration = readFileSync(
+      join(installedPackage, relativePath),
+      'utf8',
+    );
+    if (!pattern.test(declaration)) {
+      throw new Error(`installed ${relativePath} is missing ${label}`);
+    }
+  }
+  console.log(
+    `  ok  installed declarations expose prepareQueue + optional/concrete prepare methods (${declarationChecks.length} checks)`,
+  );
 
   // (a) main entry imports + exposes the core exports, (b) optional subpaths fail loudly
   // without their SDKs, (c) the always-safe subpaths import. Runs INSIDE the consumer so

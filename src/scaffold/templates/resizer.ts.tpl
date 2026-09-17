@@ -24,3 +24,7 @@ export const resizer = new Resizer({
   },
   // hooks: { formatPublicUrls: (decision, ctx) => formatPictureUrls(decision, { id: String(ctx.id) }) },
 });
+
+// Producer bootstrap: AFTER the DB is connected and models are registered, but BEFORE exposing
+// resolve/prewarm/enqueueRequired handlers, call `await resizer.prepareQueue()`. The scaffolded
+// ResizeWorker performs the same preparation itself before it starts consuming.

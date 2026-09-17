@@ -188,6 +188,32 @@ export const resizer = new Resizer({
 });
 ```
 
+In each **producer** process, prepare the queue after the database is connected and the host has
+registered its `ResizeTask` and framework `Lock` models, but before serving any code path that may
+enqueue (`resolve()`, `prewarm()`, or `enqueueRequired()`):
+
+```ts
+// Generic producer bootstrap: DB connected; framework + host models registered.
+await resizer.prepareQueue();
+// Only now expose handlers that can enqueue resize work.
+```
+
+`prepareQueue()` is idempotent, so custom transports and lock providers may expose their own
+optional, idempotent `prepare()` implementations. The built-in Mongo transport and default
+`FrameworkLockProvider` call their models' `createIndexes()`. That requires database privileges
+and may take time on an existing collection; index conflicts and other errors are surfaced for
+the host to handle, never repaired by listing, syncing, dropping, or replacing indexes. A host
+whose migration system already guarantees these indexes may deliberately skip producer-side
+preparation.
+
+The standard `runResizeWorker()` / scaffolded `ResizeWorker` performs this preparation before it
+starts consuming, so worker bootstrap must not call it separately. With no transport (the normal
+eager-only setup), `prepareQueue()` is a no-op and does not touch the default lock provider or the
+framework app. With SQS or a custom transport that omits `prepare()`, the default framework lock
+indexes are still prepared because a transport is configured. This API does **not** create or
+health-check SQS queues/redrive policies, S3 buckets, IAM, credentials, or any other external
+resource; provision those outside this module.
+
 **Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
 
 ```ts
@@ -206,7 +232,8 @@ export default {
 npm run cli ResizeWorker
 ```
 
-`worker.enabled` permits the command to run; it does not start a worker inside the API.
+`worker.enabled` permits the command to run; it does not start a worker inside the API. The
+command prepares the configured queue/lock drivers before consumption.
 
 Your media model (`File`/`Media`) must carry `original` (incl. `width`/`height`) and `previews[]`
 (incl. `filters`/`fit`). That schema is host-owned; to avoid hand-written drift the module exports

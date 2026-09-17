@@ -59,6 +59,7 @@ describe('runScaffold — default run', () => {
     assert.equal(code, 0);
 
     assert.match(await read(RESIZER), /new Resizer\(/);
+    assert.match(await read(RESIZER), /await resizer\.prepareQueue\(\)/);
     assert.match(await read(MODEL), /extends ResizeTaskModel/);
     assert.match(
       await read(COMMAND),
@@ -160,6 +161,7 @@ describe('runScaffold — --eager', () => {
     assert.match(resizer, /LocalFsStorage/);
     assert.match(resizer, /storage\/fs\.js/);
     assert.match(resizer, /publicBaseUrl/);
+    assert.match(resizer, /queue preparation is unnecessary/);
   });
 });
 
