@@ -404,7 +404,10 @@ describe('processTask — variants', () => {
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const { lockProvider, acquired } = makeLocks(false); // acquire always fails
     new Resizer({ storage, mediaStore, lockProvider });
-    await processTask(task({ previews: [variant()] }));
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      /incomplete/,
+    );
     assert.deepEqual(acquired, ['resize_worker:m1:20x20:jpeg:none']);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -430,8 +433,12 @@ describe('processTask — variants', () => {
       },
     };
     new Resizer({ storage, mediaStore, lockProvider });
-    await processTask(
-      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    await assert.rejects(
+      () =>
+        processTask(
+          task({ previews: [variant(), variant({ format: 'webp' })] }),
+        ),
+      /incomplete/,
     );
     assert.equal(uploads.length, 1);
     assert.equal(uploads[0].key.split('.').pop(), 'jpeg');
@@ -704,7 +711,7 @@ describe('processTask — persistence & failure handling', () => {
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
-      /produced 0 previews/,
+      /incomplete/,
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -715,7 +722,7 @@ describe('processTask — persistence & failure handling', () => {
     ]);
   });
 
-  test('partial success (one good + one poison) → returns normally, good preview persisted', async () => {
+  test('partial success persists the good preview but throws so the task is retried', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const pipeline: Pipeline = {
@@ -735,13 +742,129 @@ describe('processTask — persistence & failure handling', () => {
       lockProvider: makeLocks().lockProvider,
       pipelines: { default: pipeline },
     });
-    await processTask(
-      task({ previews: [variant(), variant({ filters: { poison: true } })] }),
+    await assert.rejects(
+      () =>
+        processTask(
+          task({
+            previews: [variant(), variant({ filters: { poison: true } })],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof ResizeGenerateError &&
+        error.code === 'RESIZE_WORKER_INCOMPLETE' &&
+        error.missing.includes('20x20:jpeg:poison:true'),
     );
     assert.equal(uploads.length, 1);
     assert.equal(appendCalls.length, 1);
     assert.equal(appendCalls[0].previews.length, 1);
     assert.equal(appendCalls[0].previews[0].filters, undefined);
+  });
+
+  test('the next delivery generates only variants still missing after partial persistence', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    let poison = true;
+    const pipeline: Pipeline = {
+      variantSteps: [
+        async (img, { variant: v }) => {
+          if (poison && v.filters?.retry) {
+            throw new Error('temporary encoder failure');
+          }
+          return img;
+        },
+      ],
+    };
+    const media = mediaDoc();
+    const mediaStore: MediaStore = {
+      load: async () => media,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [...(media.previews ?? []), ...previews];
+      },
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+      pipelines: { default: pipeline },
+    });
+    const queued = task({
+      previews: [variant(), variant({ filters: { retry: true } })],
+    });
+
+    await assert.rejects(() => processTask(queued), /incomplete/);
+    assert.equal(media.previews?.length, 1);
+    assert.equal(uploads.length, 1);
+
+    poison = false;
+    await processTask(queued);
+    assert.equal(media.previews?.length, 2);
+    assert.equal(uploads.length, 2, 'ready identity was not uploaded again');
+    assert.equal(
+      new Set(
+        media.previews?.map(
+          (preview) =>
+            `${preview.sizeKey}:${preview.format}:${JSON.stringify(preview.filters ?? {})}`,
+        ),
+      ).size,
+      2,
+    );
+  });
+
+  test('a worker-lock loser is complete only after a concurrent preview becomes visible', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const media = mediaDoc();
+    let loads = 0;
+    const concurrent = {
+      key: 'concurrent.jpg',
+      contentType: 'image/jpeg',
+      sizeKey: '20x20',
+      format: 'jpeg' as const,
+    };
+    const mediaStore: MediaStore = {
+      load: async () => {
+        loads++;
+        if (loads >= 2) {
+          media.previews = [concurrent];
+        }
+        return media;
+      },
+      appendPreviews: async () => {},
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks(false).lockProvider,
+    });
+    await processTask(task({ previews: [variant()] }));
+    assert.equal(uploads.length, 0);
+  });
+
+  test('deduplicates malformed task payloads by preview identity', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const media = mediaDoc();
+    const mediaStore: MediaStore = {
+      load: async () => media,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [...(media.previews ?? []), ...previews];
+      },
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+    await processTask(
+      task({
+        previews: [
+          variant(),
+          variant({ requestedWidth: 999, requestedHeight: 999 }),
+        ],
+      }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(media.previews?.length, 1);
   });
 
   test('abort signal between variants stops launching new ones', async () => {
@@ -754,27 +877,31 @@ describe('processTask — persistence & failure handling', () => {
       mediaStore,
       lockProvider: makeLocks().lockProvider,
     });
-    await processTask(
-      task({
-        previews: [
-          variant({
-            sizeKey: '10x10',
-            requestedWidth: 10,
-            requestedHeight: 10,
+    await assert.rejects(
+      () =>
+        processTask(
+          task({
+            previews: [
+              variant({
+                sizeKey: '10x10',
+                requestedWidth: 10,
+                requestedHeight: 10,
+              }),
+              variant({
+                sizeKey: '11x11',
+                requestedWidth: 11,
+                requestedHeight: 11,
+              }),
+              variant({
+                sizeKey: '12x12',
+                requestedWidth: 12,
+                requestedHeight: 12,
+              }),
+            ],
           }),
-          variant({
-            sizeKey: '11x11',
-            requestedWidth: 11,
-            requestedHeight: 11,
-          }),
-          variant({
-            sizeKey: '12x12',
-            requestedWidth: 12,
-            requestedHeight: 12,
-          }),
-        ],
-      }),
-      { signal: controller.signal },
+          { signal: controller.signal },
+        ),
+      /incomplete/,
     );
     assert.equal(uploads.length, 1); // aborted after the first, launched no more
   });

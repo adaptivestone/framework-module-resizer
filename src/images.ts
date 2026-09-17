@@ -174,6 +174,19 @@ export function expandMissingPreviews(
   for (const p of media.previews ?? []) {
     existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
   }
+  return expandPreviewRequests(sizes, formats).filter(
+    (preview) =>
+      !existing.has(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      ),
+  );
+}
+
+/** Expand a size catalog without consulting stored previews. */
+export function expandPreviewRequests(
+  sizes: SizeInput[],
+  formats: PreviewFormat[],
+): MissingPreview[] {
   const requested: MissingPreview[] = [];
   const seen = new Set<string>();
   for (const size of sizes) {
@@ -185,7 +198,7 @@ export function expandMissingPreviews(
     }
     for (const format of formats) {
       const identity = getPreviewIdentity(sizeKey, format, size.filters);
-      if (existing.has(identity) || seen.has(identity)) {
+      if (seen.has(identity)) {
         continue;
       }
       seen.add(identity);

@@ -28,7 +28,7 @@ rewritten relative import paths, the optional-subpath loud-fail contract, and th
 Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
 
 - `0.x.y` → `0.x.(y+1)` — fixes / additive, backward-compatible.
-- `0.x.y` → `0.(x+1).0` — any breaking change to the public surface (the 28 core exports, the
+- `0.x.y` → `0.(x+1).0` — any breaking change to the public surface (the core exports, the
   driver subpaths, the config shape, the `ResizeTask` schema, or the scaffold output).
 - Cut `1.0.0` once the public API is committed-to.
 

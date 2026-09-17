@@ -10,6 +10,7 @@
 import sharp from 'sharp';
 import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
+import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
@@ -168,7 +169,9 @@ export async function generatePreviews(
   // 6. Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6).
   const existing = new Set<string>();
   for (const p of media.previews ?? []) {
-    existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+    if (p.key && p.contentType) {
+      existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+    }
   }
 
   // 7. Decode the original ONCE; clone the base per variant so the decode is shared.
@@ -431,10 +434,22 @@ export async function processTask(
     return;
   }
 
+  const requestedByIdentity = new Map<string, MissingPreview>();
+  for (const preview of canonicalizeVariants(task.previews)) {
+    const identity = getPreviewIdentity(
+      preview.sizeKey,
+      preview.format,
+      preview.filters,
+    );
+    if (!requestedByIdentity.has(identity)) {
+      requestedByIdentity.set(identity, preview);
+    }
+  }
+  const requested = [...requestedByIdentity.values()];
   const { generated, failedCount } = await generatePreviews(resizer, {
     media,
     mediaId: task.mediaId,
-    requested: task.previews,
+    requested,
     pipeline: task.pipeline,
     ctx,
     useLocks: true,
@@ -442,15 +457,45 @@ export async function processTask(
     signal: taskOpts?.signal,
   });
 
-  // 10. Poison-variant guard: zero new previews AND ≥1 variant errored → THROW (after the core
-  // already released its locks) so the transport's retry → backoff → dead-letter path engages.
-  if (generated.length === 0 && failedCount > 0) {
+  // 10. A queued task is complete only when every requested identity is now persisted. Re-read
+  // once so a worker-lock loser can observe a concurrent worker's write. Our own generated rows
+  // are included too: appendPreviews returned successfully before generatePreviews returned.
+  const refreshed = await resizer.mediaStore.load(task.mediaId);
+  if (!refreshed) {
+    app.logger.info(
+      `resize worker: media ${task.mediaId} was deleted while processing — no-op complete`,
+    );
+    return;
+  }
+  const covered = new Set<string>();
+  for (const preview of [
+    ...(media.previews ?? []),
+    ...(refreshed.previews ?? []),
+    ...generated,
+  ]) {
+    if (preview.key && preview.contentType) {
+      covered.add(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      );
+    }
+  }
+  const missing = requested.filter(
+    (preview) =>
+      !covered.has(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      ),
+  );
+  if (missing.length > 0) {
+    const missingIdentities = missing.map((preview) =>
+      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+    );
     throw new ResizeGenerateError({
       mediaId: task.mediaId,
-      failed: failedCount,
-      requested: task.previews.length,
-      message: `resize worker: task for media ${task.mediaId} produced 0 previews with ${failedCount} variant error(s) — failing for retry/dead-letter`,
-      code: 'RESIZE_WORKER_ALL_VARIANTS_FAILED',
+      failed: Math.max(failedCount, missing.length),
+      requested: requested.length,
+      missing: missingIdentities,
+      message: `resize worker: task for media ${task.mediaId} is incomplete; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
+      code: 'RESIZE_WORKER_INCOMPLETE',
     });
   }
 }

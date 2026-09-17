@@ -18,6 +18,7 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeGenerateError',
   'ResizeMediaError',
   'ResizeNoOriginalError',
+  'ResizeOriginalError',
   'ResizeSecurityError',
   'ResizeSetupError',
   'ResizeStorageError',

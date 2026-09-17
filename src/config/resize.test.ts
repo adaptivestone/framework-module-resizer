@@ -36,6 +36,18 @@ describe('defaultResizeConfig', () => {
   test('worker is disabled by default', () => {
     assert.equal(defaultResizeConfig.worker?.enabled, false);
   });
+
+  test('original uploads have byte and format allowlists', () => {
+    assert.equal(defaultResizeConfig.upload.maxBytes, 25 * 1024 * 1024);
+    assert.deepEqual(defaultResizeConfig.upload.formats, [
+      'jpeg',
+      'png',
+      'webp',
+      'avif',
+      'gif',
+      'svg',
+    ]);
+  });
 });
 
 describe('getResizeConfig', () => {
@@ -67,6 +79,16 @@ describe('getResizeConfig', () => {
       queue: { lockTtlMs: { worker: 120000 }, leaseMs: 60000 },
     });
     assert.throws(() => getResizeConfig(), /lockTtlMs\.worker|leaseMs/);
+  });
+
+  test('validates original upload byte and format allowlists', () => {
+    useHostConfig({ mediaModelName: 'File', upload: { maxBytes: 0 } });
+    assert.throws(() => getResizeConfig(), /upload\.maxBytes/);
+    useHostConfig({
+      mediaModelName: 'File',
+      upload: { formats: [] },
+    });
+    assert.throws(() => getResizeConfig(), /upload\.formats/);
   });
 
   test('accepts lockTtlMs.worker <= leaseMs', () => {

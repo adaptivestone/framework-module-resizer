@@ -13,7 +13,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import { ResizeNoOriginalError } from '../errors.ts';
+import { ResizeGenerateError, ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import type { MissingPreview } from '../types.d.ts';
@@ -423,6 +423,52 @@ describe('MongoTransport.enqueue', () => {
     assert.equal(res.taskId, null);
     assert.ok(errors.length >= 1);
   });
+
+  test('findActive returns persisted payloads that can prove strict-enqueue coverage', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const previews = [{ sizeKey: '300x300', format: 'jpeg' as const }];
+    const enqueued = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews,
+    });
+    const active = await transport.findActive({
+      mediaId,
+      pipeline: 'photo',
+      previews,
+    });
+    assert.deepEqual(active, [{ taskId: enqueued.taskId, previews }]);
+  });
+
+  test('enqueueRequired confirms an existing Mongo task after losing its dispatch lock', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const existing = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [
+        {
+          sizeKey: '300x300',
+          format: 'jpeg',
+          requestedWidth: 300,
+          requestedHeight: 300,
+        },
+      ],
+    });
+    const r = new Resizer({
+      storage: fakeStorage,
+      transport,
+      lockProvider: { acquire: async () => false, release: async () => {} },
+    });
+    const result = await r.enqueueRequired({
+      media: { id: mediaId, original: { key: 'original.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.tasks[0].taskId, existing.taskId);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -638,6 +684,32 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
     assert.match(String(doc?.error), /permanent/);
     assert.equal(rec.dead.length, 1);
     assert.equal(rec.failed.length, 0);
+  });
+
+  test('a permanently incomplete variant reaches dead-letter with its identity', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert({ attempts: 2 });
+    const leased = await transport.lease();
+    assert.ok(leased);
+    const error = new ResizeGenerateError({
+      mediaId: String(leased.fileId),
+      failed: 1,
+      requested: 2,
+      missing: ['300x300:webp:none'],
+      message: 'resize worker incomplete: 300x300:webp:none',
+      code: 'RESIZE_WORKER_INCOMPLETE',
+    });
+    await transport.fail(
+      String(leased._id),
+      String(leased.leaseToken),
+      error,
+      leased.attempts as number,
+    );
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'dead');
+    assert.match(String(doc?.error), /300x300:webp:none/);
+    assert.equal(rec.dead.length, 1);
   });
 
   test('a pending task in its backoff window is NOT re-leasable until the backoff elapses', async () => {
