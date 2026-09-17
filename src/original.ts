@@ -416,9 +416,10 @@ function displayDimensions(metadata: Metadata): {
   if (metadata.width === undefined || metadata.height === undefined) {
     return {};
   }
+  const height = metadata.pageHeight ?? metadata.height;
   return (metadata.orientation ?? 1) >= 5
-    ? { width: metadata.height, height: metadata.width }
-    : { width: metadata.width, height: metadata.height };
+    ? { width: height, height: metadata.width }
+    : { width: metadata.width, height };
 }
 
 async function prepareOriginal(body: Buffer): Promise<PreparedOriginal> {
@@ -465,9 +466,11 @@ async function prepareOriginal(body: Buffer): Promise<PreparedOriginal> {
     );
   }
   const pages = metadata.pages ?? 1;
-  if (metadata.width * metadata.height * pages > config.limits.sourcePixels) {
+  // animated:true reports a stacked height; count each frame only once.
+  const frameHeight = metadata.pageHeight ?? metadata.height;
+  if (metadata.width * frameHeight * pages > config.limits.sourcePixels) {
     throw new ResizeOriginalError(
-      `resize uploadOriginal: image ${metadata.width}x${metadata.height}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
+      `resize uploadOriginal: image ${metadata.width}x${frameHeight}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
       { code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' },
     );
   }

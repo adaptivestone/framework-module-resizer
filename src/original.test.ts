@@ -39,6 +39,16 @@ const orientedJpeg = await sharp({
 const webp = await sharp(png).webp().toBuffer();
 const avif = await sharp(png).avif().toBuffer();
 
+// Distinct frames prevent the encoder from collapsing the animation into one frame.
+const animation = sharp(
+  Buffer.concat([Buffer.alloc(300, 0), Buffer.alloc(300, 255)]),
+  { raw: { width: 10, height: 20, channels: 3, pageHeight: 10 } },
+);
+const animatedOriginals = {
+  gif: await animation.clone().gif({ delay: [100, 100] }).toBuffer(),
+  webp: await animation.clone().webp({ delay: [100, 100] }).toBuffer(),
+};
+
 function installApp(config: Record<string, unknown> = {}) {
   setAppInstance({
     getConfig: () => ({ mediaModelName: 'File', ...config }),
@@ -71,6 +81,35 @@ afterEach(() => {
 });
 
 describe('uploadOriginal — raster bytes and metadata', () => {
+  for (const [format, body] of Object.entries(animatedOriginals)) {
+    test(`${format} animation reports frame dimensions and preserves bytes`, async () => {
+      installApp();
+      const { storage, uploads } = recordingStorage();
+      const r = new Resizer({ storage });
+      const original = await r.uploadOriginal({ body, visibility: 'public' });
+      assert.equal(original.width, 10);
+      assert.equal(original.height, 10);
+      assert.deepEqual(uploads[0].body, body);
+    });
+
+    test(`${format} animation counts each frame once at the pixel limit`, async () => {
+      installApp({ limits: { sourcePixels: 200 } });
+      const { storage } = recordingStorage();
+      const r = new Resizer({ storage });
+      await r.uploadOriginal({ body, visibility: 'public' });
+    });
+
+    test(`${format} animation rejects total pixels above the limit before storage`, async () => {
+      installApp({ limits: { sourcePixels: 199 } });
+      const { storage, uploads } = recordingStorage();
+      const r = new Resizer({ storage });
+      await assert.rejects(r.uploadOriginal({ body, visibility: 'public' }), {
+        code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
+      });
+      assert.equal(uploads.length, 0);
+    });
+  }
+
   test('stores JPEG bytes unchanged and reports display dimensions without rotating EXIF', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
