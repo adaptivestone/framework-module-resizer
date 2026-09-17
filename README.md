@@ -188,12 +188,15 @@ export const resizer = new Resizer({
 });
 ```
 
-In each **producer** process, prepare the queue after the database is connected and the host has
-registered its `ResizeTask` and framework `Lock` models, but before serving any code path that may
-enqueue (`resolve()`, `prewarm()`, or `enqueueRequired()`):
+In each **producer** process, prepare the queue after the dependencies required by its configured
+transport and lock provider are ready, but before serving any code path that may enqueue
+(`resolve()`, `prewarm()`, or `enqueueRequired()`). For the built-in Mongo transport this means a
+connected database and a registered `ResizeTask` model; the default `FrameworkLockProvider` also
+requires the framework `Lock` model. SQS/custom transport plus a custom lock provider may require
+neither model.
 
 ```ts
-// Generic producer bootstrap: DB connected; framework + host models registered.
+// Generic producer bootstrap: configured driver dependencies are ready.
 await resizer.prepareQueue();
 // Only now expose handlers that can enqueue resize work.
 ```
@@ -207,12 +210,12 @@ whose migration system already guarantees these indexes may deliberately skip pr
 preparation.
 
 The standard `runResizeWorker()` / scaffolded `ResizeWorker` performs this preparation before it
-starts consuming, so worker bootstrap must not call it separately. With no transport (the normal
-eager-only setup), `prepareQueue()` is a no-op and does not touch the default lock provider or the
-framework app. With SQS or a custom transport that omits `prepare()`, the default framework lock
-indexes are still prepared because a transport is configured. This API does **not** create or
-health-check SQS queues/redrive policies, S3 buckets, IAM, credentials, or any other external
-resource; provision those outside this module.
+starts consuming, so a separate worker-side call is redundant (though safe). With no transport
+(the normal eager-only setup), `prepareQueue()` is a no-op and does not touch the default lock
+provider or the framework app. With SQS or a custom transport that omits `prepare()`, the default
+framework lock indexes are still prepared because a transport is configured. This API does
+**not** create or health-check SQS queues/redrive policies, S3 buckets, IAM, credentials, or any
+other external resource; provision those outside this module.
 
 **Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
 

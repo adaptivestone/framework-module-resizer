@@ -96,9 +96,11 @@ a private original.
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
 
-7. Lazy / pre-warm producer processes: after the database is connected and the framework + host
-   models (including `Lock` and `ResizeTask`) are registered, but before exposing a code path that
-   can enqueue (`resolve`, `prewarm`, `enqueueRequired`), prepare the infrastructure:
+7. Lazy / pre-warm producer processes: after the dependencies required by the configured
+   transport and lock provider are ready, but before exposing a code path that can enqueue
+   (`resolve`, `prewarm`, `enqueueRequired`), prepare the infrastructure. `MongoTransport` needs a
+   connected database and registered `ResizeTask`; the default `FrameworkLockProvider` needs the
+   registered framework `Lock`. SQS/custom transport with a custom lock provider may need neither:
 
    ```ts
    await resizer.prepareQueue();
@@ -120,7 +122,7 @@ a private original.
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
    The flag permits the command to run; it does not start a worker in the API. The standard
    `runResizeWorker()` / scaffolded `ResizeWorker` prepares queue + lock infrastructure itself
-   before consumption; do not add a separate worker-side preparation call.
+   before consumption; a separate worker-side call is redundant but safe.
    Eager mode needs no worker.
 
 ## Use

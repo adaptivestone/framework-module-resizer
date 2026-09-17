@@ -158,6 +158,45 @@ assert.equal(typeof s3.S3Storage, 'function', 'S3Storage should be a class');
 console.log('  ok  sqs + s3 subpaths import; SqsTransport + S3Storage are classes');
 `;
 
+// Compiled inside the throwaway consumer so package resolution and declarations come from the
+// installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
+const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
+import type {
+  LockProvider,
+  QueueTransport,
+} from '@adaptivestone/framework-module-resize';
+import { FrameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
+import { MongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+type OptionalPrepare = (() => Promise<void>) | undefined;
+
+declare const resizer: Resizer;
+declare const mongo: MongoTransport;
+declare const frameworkLock: FrameworkLockProvider;
+
+const resizerPreparation: Promise<void> = resizer.prepareQueue();
+const mongoPreparation: Promise<void> = mongo.prepare();
+const lockPreparation: Promise<void> = frameworkLock.prepare();
+
+const queuePrepareType: Equal<QueueTransport['prepare'], OptionalPrepare> = true;
+const lockPrepareType: Equal<LockProvider['prepare'], OptionalPrepare> = true;
+const queuePrepareIsOptional: {} extends Pick<QueueTransport, 'prepare'> ? true : false = true;
+const lockPrepareIsOptional: {} extends Pick<LockProvider, 'prepare'> ? true : false = true;
+
+void [
+  resizerPreparation,
+  mongoPreparation,
+  lockPreparation,
+  queuePrepareType,
+  lockPrepareType,
+  queuePrepareIsOptional,
+  lockPrepareIsOptional,
+];
+`;
+
 /** Run a command inheriting stdio; throws (failing the smoke) on a non-zero exit. */
 function run(cmd: string, args: string[], cwd: string): void {
   execFileSync(cmd, args, { cwd, stdio: 'inherit' });
@@ -227,52 +266,52 @@ try {
   }
   console.log('  ok  AGENTS.md ships with the package');
 
-  // The declarations must come from the package installed in the throwaway consumer, not
-  // from src/ or the repository's dist/ directory. Keep the matches structural so harmless
-  // declaration-printer whitespace changes do not weaken this contract.
-  const declarationChecks = [
-    [
-      'dist/index.d.ts',
-      /export\s*\{[^}]*\bResizer\b[^}]*\}\s*from\s*['"]\.\/resizer\.(?:ts|js)['"]/s,
-      'main declarations re-export Resizer',
-    ],
-    [
-      'dist/resizer.d.ts',
-      /\bprepareQueue\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
-      'Resizer.prepareQueue declaration',
-    ],
-    [
-      'dist/transports/AbstractTransport.d.ts',
-      /\bprepare\?\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
-      'QueueTransport optional prepare declaration',
-    ],
-    [
-      'dist/locks/AbstractLockProvider.d.ts',
-      /\bprepare\?\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
-      'LockProvider optional prepare declaration',
-    ],
-    [
-      'dist/transports/mongo.d.ts',
-      /\bprepare\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
-      'MongoTransport.prepare declaration',
-    ],
-    [
-      'dist/locks/framework.d.ts',
-      /\bprepare\s*\(\s*\)\s*:\s*Promise<void>\s*;/,
-      'FrameworkLockProvider.prepare declaration',
-    ],
-  ] as const;
-  for (const [relativePath, pattern, label] of declarationChecks) {
-    const declaration = readFileSync(
-      join(installedPackage, relativePath),
-      'utf8',
+  // Compile a real TypeScript consumer against the installed package. Use this repository's
+  // pinned compiler directly; do not install or resolve another TypeScript in the consumer.
+  const typescriptCompiler = join(
+    ROOT,
+    'node_modules',
+    'typescript',
+    'bin',
+    'tsc',
+  );
+  if (!existsSync(typescriptCompiler)) {
+    throw new Error(
+      `repository TypeScript compiler is missing: ${typescriptCompiler}`,
     );
-    if (!pattern.test(declaration)) {
-      throw new Error(`installed ${relativePath} is missing ${label}`);
-    }
   }
+  writeFileSync(join(consumer, 'checkTypes.mts'), CHECK_TYPES);
+  writeFileSync(
+    join(consumer, 'tsconfig.smoke.json'),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          lib: ['ESNext'],
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          noEmit: true,
+          skipLibCheck: false,
+          strict: true,
+          target: 'ES2022',
+          typeRoots: [join(ROOT, 'node_modules', '@types')],
+          types: ['node'],
+        },
+        files: ['./checkTypes.mts'],
+      },
+      null,
+      2,
+    ),
+  );
   console.log(
-    `  ok  installed declarations expose prepareQueue + optional/concrete prepare methods (${declarationChecks.length} checks)`,
+    '→ Type-checking a consumer against the installed package declarations',
+  );
+  run(
+    process.execPath,
+    [typescriptCompiler, '--project', 'tsconfig.smoke.json'],
+    consumer,
+  );
+  console.log(
+    '  ok  installed declarations type-check prepareQueue + optional/concrete prepare methods',
   );
 
   // (a) main entry imports + exposes the core exports, (b) optional subpaths fail loudly

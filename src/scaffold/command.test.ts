@@ -58,8 +58,12 @@ describe('runScaffold — default run', () => {
     const { code } = await run([]);
     assert.equal(code, 0);
 
-    assert.match(await read(RESIZER), /new Resizer\(/);
-    assert.match(await read(RESIZER), /await resizer\.prepareQueue\(\)/);
+    const resizer = await read(RESIZER);
+    assert.match(resizer, /new Resizer\(/);
+    assert.match(
+      resizer,
+      /AFTER the configured driver dependencies[\s\S]+MongoTransport needs[\s\S]+BEFORE exposing[\s\S]+await resizer\.prepareQueue\(\)[\s\S]+before consumption/,
+    );
     assert.match(await read(MODEL), /extends ResizeTaskModel/);
     assert.match(
       await read(COMMAND),
