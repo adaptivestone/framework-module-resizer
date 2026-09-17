@@ -45,8 +45,14 @@ const animation = sharp(
   { raw: { width: 10, height: 20, channels: 3, pageHeight: 10 } },
 );
 const animatedOriginals = {
-  gif: await animation.clone().gif({ delay: [100, 100] }).toBuffer(),
-  webp: await animation.clone().webp({ delay: [100, 100] }).toBuffer(),
+  gif: await animation
+    .clone()
+    .gif({ delay: [100, 100] })
+    .toBuffer(),
+  webp: await animation
+    .clone()
+    .webp({ delay: [100, 100] })
+    .toBuffer(),
 };
 
 function installApp(config: Record<string, unknown> = {}) {
