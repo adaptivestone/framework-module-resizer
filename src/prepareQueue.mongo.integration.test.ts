@@ -18,6 +18,10 @@ const fakeStorage = {
   publicUrl: () => '',
 };
 
+function hasExactKey(key: unknown, expected: Record<string, number>): boolean {
+  return JSON.stringify(key) === JSON.stringify(expected);
+}
+
 test('prepareQueue creates real Mongo queue and lock indexes idempotently', async (t) => {
   let server: MongoMemoryServer | undefined;
   let connection: mongoose.Connection | undefined;
@@ -102,10 +106,11 @@ test('prepareQueue creates real Mongo queue and lock indexes idempotently', asyn
   await resizer.prepareQueue();
 
   const taskIndexes = await taskModel.collection.listIndexes().toArray();
-  const dedupe = taskIndexes.find(
-    ({ key }) => key.fileId === 1 && key.pipeline === 1 && key.requestKey === 1,
+  const dedupe = taskIndexes.find(({ key }) =>
+    hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
   );
   assert.ok(dedupe, 'active-request dedupe index should exist');
+  assert.deepEqual(dedupe.key, { fileId: 1, pipeline: 1, requestKey: 1 });
   assert.equal(dedupe.unique, true);
   assert.deepEqual(dedupe.partialFilterExpression, {
     status: { $in: ['pending', 'processing'] },
@@ -113,8 +118,9 @@ test('prepareQueue creates real Mongo queue and lock indexes idempotently', asyn
   });
 
   const lockIndexes = await lockModel.collection.listIndexes().toArray();
-  const ttl = lockIndexes.find(({ key }) => key.expiredAt === 1);
+  const ttl = lockIndexes.find(({ key }) => hasExactKey(key, { expiredAt: 1 }));
   assert.ok(ttl, 'framework Lock TTL index should exist');
+  assert.deepEqual(ttl.key, { expiredAt: 1 });
   assert.equal(ttl.expireAfterSeconds, 0);
 
   const mediaId = new mongoose.Types.ObjectId().toString();
@@ -148,16 +154,14 @@ test('prepareQueue creates real Mongo queue and lock indexes idempotently', asyn
   assert.ok(
     intactTaskIndexes.some(
       ({ key, unique }) =>
-        key.fileId === 1 &&
-        key.pipeline === 1 &&
-        key.requestKey === 1 &&
+        hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }) &&
         unique === true,
     ),
   );
   assert.ok(
     (await lockModel.collection.listIndexes().toArray()).some(
       ({ key, expireAfterSeconds }) =>
-        key.expiredAt === 1 && expireAfterSeconds === 0,
+        hasExactKey(key, { expiredAt: 1 }) && expireAfterSeconds === 0,
     ),
   );
 });
