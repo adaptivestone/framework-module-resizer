@@ -6,6 +6,9 @@
 // resizer.ts so every existing import site keeps working unchanged.
 
 export interface LockProvider {
+  /** Prepare driver-specific infrastructure; safe to call repeatedly. */
+  prepare?(): Promise<void>;
+
   acquire(key: string, ttlMs: number): Promise<boolean>; // true if acquired
   release(key: string): Promise<void>;
 }

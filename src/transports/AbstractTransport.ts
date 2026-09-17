@@ -14,6 +14,9 @@ export interface LeasedTask {
 }
 
 export interface QueueTransport {
+  /** Prepare driver-specific infrastructure; safe to call repeatedly. */
+  prepare?(): Promise<void>;
+
   enqueue(task: {
     mediaId: string;
     pipeline: string;
