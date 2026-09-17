@@ -13,7 +13,12 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import { ResizeNoOriginalError } from '../errors.ts';
+import {
+  ResizeError,
+  ResizeGenerateError,
+  ResizeNoOriginalError,
+  ResizeSetupError,
+} from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import type { MissingPreview } from '../types.d.ts';
@@ -164,6 +169,79 @@ async function waitFor(
   }
   throw new Error('waitFor timed out');
 }
+
+// ---------------------------------------------------------------------------
+// prepare
+// ---------------------------------------------------------------------------
+
+describe('MongoTransport.prepare', () => {
+  test('requests ResizeTask and waits for its createIndexes call', async () => {
+    const names: string[] = [];
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    let completed = false;
+    installFakeApp((name) => {
+      names.push(name);
+      return {
+        createIndexes: async () => {
+          await pending;
+          completed = true;
+        },
+      };
+    });
+
+    const preparing = transport.prepare();
+    await Promise.resolve();
+    assert.deepEqual(names, ['ResizeTask']);
+    assert.equal(completed, false);
+    finish();
+    await preparing;
+    assert.equal(completed, true);
+  });
+
+  for (const [name, model] of [
+    ['missing model', undefined],
+    ['model without createIndexes', {}],
+  ] as const) {
+    test(`rejects a ${name} as a setup error`, async () => {
+      installFakeApp(() => model);
+      await assert.rejects(transport.prepare(), (error: unknown) => {
+        assert.ok(error instanceof ResizeSetupError);
+        assert.equal(error.code, 'RESIZE_QUEUE_MODEL_REQUIRED');
+        assert.match(error.message, /scaffold.*register|register.*scaffold/i);
+        return true;
+      });
+    });
+  }
+
+  test('wraps an operational createIndexes failure and retains its cause', async () => {
+    const cause = new Error('database unavailable');
+    installFakeApp(() => ({
+      createIndexes: async () => {
+        throw cause;
+      },
+    }));
+    await assert.rejects(transport.prepare(), (error: unknown) => {
+      assert.ok(error instanceof ResizeError);
+      assert.equal(error.code, 'RESIZE_QUEUE_PREPARE_FAILED');
+      assert.equal(error.cause, cause);
+      assert.match(error.message, /MongoTransport.*ResizeTask/);
+      return true;
+    });
+  });
+
+  test('preserves an existing ResizeError from createIndexes', async () => {
+    const existing = new ResizeError('known failure', { code: 'KNOWN' });
+    installFakeApp(() => ({
+      createIndexes: async () => {
+        throw existing;
+      },
+    }));
+    await assert.rejects(transport.prepare(), (error) => error === existing);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // enqueue (05 · §10.2)
@@ -423,6 +501,52 @@ describe('MongoTransport.enqueue', () => {
     assert.equal(res.taskId, null);
     assert.ok(errors.length >= 1);
   });
+
+  test('findActive returns persisted payloads that can prove strict-enqueue coverage', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const previews = [{ sizeKey: '300x300', format: 'jpeg' as const }];
+    const enqueued = await transport.enqueue({
+      mediaId,
+      pipeline: 'photo',
+      previews,
+    });
+    const active = await transport.findActive({
+      mediaId,
+      pipeline: 'photo',
+      previews,
+    });
+    assert.deepEqual(active, [{ taskId: enqueued.taskId, previews }]);
+  });
+
+  test('enqueueRequired confirms an existing Mongo task after losing its dispatch lock', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const existing = await transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [
+        {
+          sizeKey: '300x300',
+          format: 'jpeg',
+          requestedWidth: 300,
+          requestedHeight: 300,
+        },
+      ],
+    });
+    const r = new Resizer({
+      storage: fakeStorage,
+      transport,
+      lockProvider: { acquire: async () => false, release: async () => {} },
+    });
+    const result = await r.enqueueRequired({
+      media: { id: mediaId, original: { key: 'original.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.tasks[0].taskId, existing.taskId);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -638,6 +762,32 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
     assert.match(String(doc?.error), /permanent/);
     assert.equal(rec.dead.length, 1);
     assert.equal(rec.failed.length, 0);
+  });
+
+  test('a permanently incomplete variant reaches dead-letter with its identity', async () => {
+    const rec = makeResizer();
+    installFakeApp();
+    await insert({ attempts: 2 });
+    const leased = await transport.lease();
+    assert.ok(leased);
+    const error = new ResizeGenerateError({
+      mediaId: String(leased.fileId),
+      failed: 1,
+      requested: 2,
+      missing: ['300x300:webp:none'],
+      message: 'resize worker incomplete: 300x300:webp:none',
+      code: 'RESIZE_WORKER_INCOMPLETE',
+    });
+    await transport.fail(
+      String(leased._id),
+      String(leased.leaseToken),
+      error,
+      leased.attempts as number,
+    );
+    const doc = await M.findById(leased._id).lean();
+    assert.equal(doc?.status, 'dead');
+    assert.match(String(doc?.error), /300x300:webp:none/);
+    assert.equal(rec.dead.length, 1);
   });
 
   test('a pending task in its backoff window is NOT re-leasable until the backoff elapses', async () => {

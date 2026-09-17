@@ -7,10 +7,11 @@
 // TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
 import { getApp } from './app.ts';
 import { getResizeConfig, requiredFormats } from './config/resize.ts';
-import { enqueue } from './enqueue.ts';
+import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import {
   expandMissingPreviews,
+  expandPreviewRequests,
   getFilterSig,
   getPreviewIdentity,
   getSizeKey,
@@ -18,6 +19,7 @@ import {
 } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
+  EnqueueRequiredResult,
   MediaLike,
   MissingPreview,
   Original,
@@ -44,6 +46,8 @@ export interface PrewarmOpts {
   formats?: PreviewFormat[]; // default = requiredFormats(config)
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
 }
+
+export type EnqueueRequiredOpts = PrewarmOpts;
 
 // Owner/admin private-original reads: short-lived by design (the only read-path I/O). A
 // small constant is fine — the URL is re-minted on every read, so it never needs to outlive
@@ -374,6 +378,139 @@ export async function prewarmImpl(
     logPrewarmError(err);
     return { enqueued: 0 };
   }
+}
+
+/** Strict pre-warm: every missing identity is either confirmed by a task receipt or explicit. */
+export async function enqueueRequiredImpl(
+  resizer: Resizer,
+  opts: EnqueueRequiredOpts,
+): Promise<EnqueueRequiredResult> {
+  const ctx = opts.ctx ?? {};
+  const { media } = opts;
+  const pipeline = opts.pipeline ?? 'default';
+  const mediaId = requireMediaId(media);
+  const sizes = (await resizer.runWaterfall(
+    'resolveSizes',
+    opts.sizes,
+    ctx,
+  )) as SizeInput[];
+  const formats = opts.formats ?? requiredFormats(getResizeConfig());
+  const requestedBeforePolicy = expandPreviewRequests(sizes, formats);
+  const empty = (): EnqueueRequiredResult => ({
+    status: 'not-required',
+    reason: 'empty-request',
+    requested: [],
+    ready: [],
+    accepted: [],
+    notRequired: [],
+    unconfirmed: [],
+    tasks: [],
+    issues: [],
+  });
+  if (requestedBeforePolicy.length === 0) {
+    return empty();
+  }
+
+  const original = media.original;
+  if (
+    original &&
+    (original.contentType === 'image/svg+xml' || original.format === 'svg')
+  ) {
+    return {
+      ...empty(),
+      reason: 'svg',
+      requested: requestedBeforePolicy,
+      notRequired: requestedBeforePolicy,
+    };
+  }
+
+  const readyIdentities = new Set<string>();
+  for (const preview of media.previews ?? []) {
+    if (preview.key && preview.contentType) {
+      readyIdentities.add(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      );
+    }
+  }
+  const ready = requestedBeforePolicy.filter((preview) =>
+    readyIdentities.has(
+      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+    ),
+  );
+  const missingBeforePolicy = requestedBeforePolicy.filter(
+    (preview) =>
+      !readyIdentities.has(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      ),
+  );
+  const required = canonicalizeVariants(
+    (await resizer.runWaterfall(
+      'beforeEnqueue',
+      missingBeforePolicy,
+      ctx,
+    )) as MissingPreview[],
+  ).filter(
+    (preview) =>
+      !readyIdentities.has(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      ),
+  );
+  const requiredIdentities = new Set(
+    required.map((preview) =>
+      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+    ),
+  );
+  const notRequired = missingBeforePolicy.filter(
+    (preview) =>
+      !requiredIdentities.has(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      ),
+  );
+  const requested = [...ready, ...required, ...notRequired];
+  if (required.length === 0) {
+    return {
+      status: ready.length > 0 ? 'ready' : 'not-required',
+      ...(ready.length === 0 ? { reason: 'filtered' as const } : {}),
+      requested,
+      ready,
+      accepted: [],
+      notRequired,
+      unconfirmed: [],
+      tasks: [],
+      issues: [],
+    };
+  }
+  if (!media.original?.key) {
+    return {
+      status: 'incomplete',
+      requested,
+      ready,
+      accepted: [],
+      notRequired,
+      unconfirmed: required,
+      tasks: [],
+      issues: [
+        {
+          code: 'RESIZE_ENQUEUE_NO_ORIGINAL',
+          message: `media ${mediaId} has no original key`,
+          retryable: false,
+          previews: required,
+        },
+      ],
+    };
+  }
+
+  const attempt = await enqueueConfirmed(resizer, mediaId, pipeline, required);
+  return {
+    status: attempt.unconfirmed.length > 0 ? 'incomplete' : 'accepted',
+    requested,
+    ready,
+    accepted: attempt.accepted,
+    notRequired,
+    unconfirmed: attempt.unconfirmed,
+    tasks: attempt.tasks,
+    issues: attempt.issues,
+  };
 }
 
 /**

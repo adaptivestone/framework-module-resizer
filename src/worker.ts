@@ -17,27 +17,43 @@ export async function runResizeWorker(): Promise<void> {
     );
     return;
   }
-  const { transport } = getResizer();
+  const resizer = getResizer();
+  const { transport } = resizer;
   if (!transport) {
     app.logger.error(
       'resize worker: Resizer was constructed without a transport (eager-only wiring)',
     );
     return;
   }
-  // Tune sharp ONCE for a concurrent worker: keep worker.concurrency × sharp.concurrency ≈ nCPU
-  // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
-  sharp.concurrency(config.worker.sharpConcurrency);
-  sharp.cache(config.worker.sharpCache);
-
   const controller = new AbortController();
-  process.once('SIGTERM', () => controller.abort());
-  process.once('SIGINT', () => controller.abort());
+  const abort = () => controller.abort();
+  process.once('SIGTERM', abort);
+  process.once('SIGINT', abort);
 
-  // The transport drives consumption its own way (poll OR push), owns completion/redelivery,
-  // and passes each task a per-task lease-loss signal. processTask SUCCEEDS by returning, FAILS
-  // by throwing. opts.signal is worker-wide graceful shutdown (finish in-flight, then stop).
-  await transport.startWorker((task, taskOpts) => processTask(task, taskOpts), {
-    signal: controller.signal,
-  });
-  app.logger.info('resize worker stopped');
+  try {
+    await resizer.prepareQueue();
+    // A shutdown received while infrastructure was preparing must not begin consumption.
+    if (controller.signal.aborted) {
+      return;
+    }
+
+    // Tune sharp ONCE for a concurrent worker: keep worker.concurrency × sharp.concurrency ≈ nCPU
+    // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
+    sharp.concurrency(config.worker.sharpConcurrency);
+    sharp.cache(config.worker.sharpCache);
+
+    // The transport drives consumption its own way (poll OR push), owns completion/redelivery,
+    // and passes each task a per-task lease-loss signal. processTask SUCCEEDS by returning, FAILS
+    // by throwing. opts.signal is worker-wide graceful shutdown (finish in-flight, then stop).
+    await transport.startWorker(
+      (task, taskOpts) => processTask(task, taskOpts),
+      {
+        signal: controller.signal,
+      },
+    );
+    app.logger.info('resize worker stopped');
+  } finally {
+    process.removeListener('SIGTERM', abort);
+    process.removeListener('SIGINT', abort);
+  }
 }

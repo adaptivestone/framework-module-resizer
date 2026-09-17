@@ -1,5 +1,18 @@
 # Unreleased
 
+- Added idempotent `resizer.prepareQueue()` plus optional driver `prepare()` hooks. Producers can
+  create Mongo queue/lock indexes after model registration; the standard worker prepares them
+  automatically before consumption.
+- Added `resizer.uploadOriginal({ body, visibility })`: byte-sniffed, unchanged original storage
+  with typed metadata/errors and explicit SVG-as-SVG handling. New `upload.maxBytes` and
+  `upload.formats` controls bound accepted inputs.
+- Added strict `enqueueRequired()`, which partitions ready, accepted, not-required, and
+  unconfirmed variants. A held lock is no longer treated as a task receipt; Mongo can prove
+  exact canonical active-payload coverage, while SQS/custom transports report non-queryable
+  races as incomplete. Conflicting payloads with one preview identity are explicit.
+- Queued raster tasks now retry any missing identities after partial generation. Successful
+  previews remain persisted, retries skip them, and permanent gaps use existing backoff and
+  dead-letter handling. Deleted media and SVG tasks remain successful no-ops.
 - Worker setup uses an explicit `worker.enabled: true` in host config instead of an
   environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
   message; the module default remains `false`.

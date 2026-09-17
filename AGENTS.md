@@ -96,12 +96,48 @@ a private original.
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
 
-7. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
+7. Lazy / pre-warm producer processes: after the dependencies required by the configured
+   transport and lock provider are ready, but before exposing a code path that can enqueue
+   (`resolve`, `prewarm`, `enqueueRequired`), prepare the infrastructure. `MongoTransport` needs a
+   connected database and registered `ResizeTask`; the default `FrameworkLockProvider` needs the
+   registered framework `Lock`. SQS/custom transport with a custom lock provider may need neither:
+
+   ```ts
+   await resizer.prepareQueue();
+   ```
+
+   Preparation is idempotent. `MongoTransport` and the default `FrameworkLockProvider` call
+   `createIndexes()`, which requires database privileges and may take time. Index conflicts and
+   errors are surfaced; the module does not list/sync/drop/repair conflicting indexes. Hosts whose
+   migrations already guarantee the indexes may skip producer preparation. Eager-only without a
+   transport needs no preparation: `prepareQueue()` is a no-op and does not touch locks or the
+   framework app. SQS/custom transports without `prepare()` still prepare the default framework
+   Lock because a transport exists; SQS queues/redrive/credentials remain externally provisioned.
+   Preparation neither health-checks nor creates SQS, S3, buckets, IAM, or other external
+   resources.
+   Custom `QueueTransport` and `LockProvider` objects may implement optional, idempotent
+   `prepare(): Promise<void>`.
+
+8. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
-   The flag permits the command to run; it does not start a worker in the API.
+   The flag permits the command to run; it does not start a worker in the API. The standard
+   `runResizeWorker()` / scaffolded `ResizeWorker` prepares queue + lock infrastructure itself
+   before consumption; a separate worker-side call is redundant but safe.
    Eager mode needs no worker.
 
 ## Use
+
+Store an original (no model creation and no queue work; persist the returned value in the host):
+
+```ts
+const original = await getResizer().uploadOriginal({
+  body: buffer,
+  visibility: 'private',
+});
+```
+
+The format comes from bytes. Raster bytes are metadata-probed but stored unchanged; SVG is parsed
+without Sharp and stays SVG (`.svg`, `image/svg+xml`). The host sanitizes SVG before this call.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
@@ -126,6 +162,18 @@ Upload handler, pre-warm mode (non-blocking; the worker fills the cache before t
 const { enqueued } = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
 ```
 
+When every required variant needs a confirmed receipt, use the separate strict operation:
+
+```ts
+const result = await getResizer().enqueueRequired({ media: fileDoc, sizes: catalog });
+// ready | accepted | not-required | incomplete; inspect unconfirmed/tasks/issues
+```
+
+`prewarm` stays best-effort. A held lock is not accepted proof. Mongo confirms only an exact
+canonical active payload; conflicting payloads with one preview identity are explicit errors.
+SQS/custom transports without `findActive` report lock races as retryable `incomplete`. Delivery
+remains at-least-once, not exactly-once.
+
 Upload handler, eager mode (blocking; a transport-backed Resizer is also supported):
 
 ```ts
@@ -143,7 +191,8 @@ No original throws `ResizeNoOriginalError`; every requested variant failing thro
 Errors: EVERY throw from this module extends `ResizeError`, so one check separates a module
 rejection from a sharp/S3/mongo failure. Subclasses say what to do — `ResizeSetupError` (wiring
 is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this record;
-`ResizeNoOriginalError` extends it), `ResizeGenerateError` (produced nothing),
+`ResizeNoOriginalError` and `ResizeOriginalError` extend it), `ResizeGenerateError` (eager produced
+nothing or queued coverage is incomplete),
 `ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
 Every instance carries a stable `err.code`. Use `ResizeError.isResizeError(err)` rather than
 `instanceof` when the error may cross a package boundary — duplicate copies of the package
@@ -186,13 +235,16 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 - Config arrays REPLACE defaults: `formats: ['webp','avif']` means exactly two formats.
 - Per-format `encode.quality` values are NOT comparable (defaults: jpeg 80 ≈ webp 82 ≈ avif 64).
   Never copy one quality number across formats.
-- Never run sharp on the request path — preventing that is this module's reason to exist.
+- Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
+  raster `metadata()` inspection only; it never emits transformed bytes. SVG never enters Sharp.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
 - SVG originals pass through untouched at every requested size (never rasterized, never
   enqueued). Private originals require an authorized signed URL; anonymous reads do not
   receive a fabricated public URL. Sanitizing SVG at upload is the HOST's job.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
+- A queued raster task completes only with full identity coverage. Partial successes are persisted,
+  then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.
 
 ## Troubleshooting
 

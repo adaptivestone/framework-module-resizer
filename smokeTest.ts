@@ -25,6 +25,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
+const manifest = JSON.parse(
+  readFileSync(join(ROOT, 'package.json'), 'utf8'),
+) as { name: string; version: string };
 
 // --- consumer-side assertion scripts (plain ESM, run in the consumer's resolution context).
 // Kept template-literal-safe: single quotes + string concatenation only, no backticks / ${}.
@@ -57,6 +60,7 @@ const expected = [
   'ResizeSecurityError',
   'ResizeGenerateError',
   'ResizeNoOriginalError',
+  'ResizeOriginalError',
   'ResizeTaskModel',
   'getResizer',
   'Resizer',
@@ -84,7 +88,13 @@ for (const driver of [
 ]) {
   assert.ok(!(driver in mod), 'driver must stay subpath-only, not on main entry: ' + driver);
 }
+assert.equal(
+  typeof mod.Resizer.prototype.prepareQueue,
+  'function',
+  'Resizer.prototype.prepareQueue must exist at runtime',
+);
 console.log('  ok  main entry: ' + expected.length + ' core exports, no driver leakage');
+console.log('  ok  Resizer.prototype.prepareQueue exists');
 
 // (b) optional AWS-backed subpaths must FAIL loudly (module-not-found naming the SDK).
 const optional = [
@@ -122,6 +132,19 @@ for (const [sub, exp] of safe) {
   assert.ok(exp in m, sub + ' should export ' + exp);
   console.log('  ok  ' + sub + ' imports (exports ' + exp + ')');
 }
+const { MongoTransport } = await import(PKG + '/transports/mongo.js');
+const { FrameworkLockProvider } = await import(PKG + '/locks/framework.js');
+assert.equal(
+  typeof MongoTransport.prototype.prepare,
+  'function',
+  'MongoTransport.prototype.prepare must exist at runtime',
+);
+assert.equal(
+  typeof FrameworkLockProvider.prototype.prepare,
+  'function',
+  'FrameworkLockProvider.prototype.prepare must exist at runtime',
+);
+console.log('  ok  MongoTransport + FrameworkLockProvider runtime prepare methods exist');
 `;
 
 const CHECK_AWS = `import assert from 'node:assert/strict';
@@ -133,6 +156,45 @@ assert.equal(typeof sqs.SqsTransport, 'function', 'SqsTransport should be a clas
 const s3 = await import(PKG + '/storage/s3.js');
 assert.equal(typeof s3.S3Storage, 'function', 'S3Storage should be a class');
 console.log('  ok  sqs + s3 subpaths import; SqsTransport + S3Storage are classes');
+`;
+
+// Compiled inside the throwaway consumer so package resolution and declarations come from the
+// installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
+const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
+import type {
+  LockProvider,
+  QueueTransport,
+} from '@adaptivestone/framework-module-resize';
+import { FrameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
+import { MongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+type OptionalPrepare = (() => Promise<void>) | undefined;
+
+declare const resizer: Resizer;
+declare const mongo: MongoTransport;
+declare const frameworkLock: FrameworkLockProvider;
+
+const resizerPreparation: Promise<void> = resizer.prepareQueue();
+const mongoPreparation: Promise<void> = mongo.prepare();
+const lockPreparation: Promise<void> = frameworkLock.prepare();
+
+const queuePrepareType: Equal<QueueTransport['prepare'], OptionalPrepare> = true;
+const lockPrepareType: Equal<LockProvider['prepare'], OptionalPrepare> = true;
+const queuePrepareIsOptional: {} extends Pick<QueueTransport, 'prepare'> ? true : false = true;
+const lockPrepareIsOptional: {} extends Pick<LockProvider, 'prepare'> ? true : false = true;
+
+void [
+  resizerPreparation,
+  mongoPreparation,
+  lockPreparation,
+  queuePrepareType,
+  lockPrepareType,
+  queuePrepareIsOptional,
+  lockPrepareIsOptional,
+];
 `;
 
 /** Run a command inheriting stdio; throws (failing the smoke) on a non-zero exit. */
@@ -165,7 +227,8 @@ try {
     throw new Error('npm pack did not report a tarball name');
   }
   const tarballPath = join(scratch, tarball);
-  console.log(`  ${tarball}`);
+  console.log(`  source: ${manifest.name}@${manifest.version} from ${ROOT}`);
+  console.log(`  artifact: ${tarball}`);
 
   // A throwaway consumer. Install the tarball + the REQUIRED peers the import graph needs
   // at module-load time: `@adaptivestone/framework` (the ambient appInstance gateway + the
@@ -191,17 +254,65 @@ try {
   );
 
   // (a0) AGENTS.md must ship inside the installed package (package.json "files").
-  const installedAgents = join(
+  const installedPackage = join(
     consumer,
     'node_modules',
     '@adaptivestone',
     'framework-module-resize',
-    'AGENTS.md',
   );
+  const installedAgents = join(installedPackage, 'AGENTS.md');
   if (!existsSync(installedAgents)) {
     throw new Error('installed package is missing AGENTS.md');
   }
   console.log('  ok  AGENTS.md ships with the package');
+
+  // Compile a real TypeScript consumer against the installed package. Use this repository's
+  // pinned compiler directly; do not install or resolve another TypeScript in the consumer.
+  const typescriptCompiler = join(
+    ROOT,
+    'node_modules',
+    'typescript',
+    'bin',
+    'tsc',
+  );
+  if (!existsSync(typescriptCompiler)) {
+    throw new Error(
+      `repository TypeScript compiler is missing: ${typescriptCompiler}`,
+    );
+  }
+  writeFileSync(join(consumer, 'checkTypes.mts'), CHECK_TYPES);
+  writeFileSync(
+    join(consumer, 'tsconfig.smoke.json'),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          lib: ['ESNext'],
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          noEmit: true,
+          skipLibCheck: false,
+          strict: true,
+          target: 'ES2022',
+          typeRoots: [join(ROOT, 'node_modules', '@types')],
+          types: ['node'],
+        },
+        files: ['./checkTypes.mts'],
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(
+    '→ Type-checking a consumer against the installed package declarations',
+  );
+  run(
+    process.execPath,
+    [typescriptCompiler, '--project', 'tsconfig.smoke.json'],
+    consumer,
+  );
+  console.log(
+    '  ok  installed declarations type-check prepareQueue + optional/concrete prepare methods',
+  );
 
   // (a) main entry imports + exposes the core exports, (b) optional subpaths fail loudly
   // without their SDKs, (c) the always-safe subpaths import. Runs INSIDE the consumer so

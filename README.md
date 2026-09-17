@@ -96,9 +96,16 @@ export const resizer = new Resizer({
 });
 ```
 
-**2. At upload**, after the original is on `media.original`:
+**2. At upload**, store the untouched original, persist the returned `Original` on your host
+media document, then generate the catalog:
 
 ```ts
+media.original = await resizer.uploadOriginal({
+  body: buffer,                         // Buffer or Uint8Array
+  visibility: 'private',
+});
+await media.save();                     // host-owned model lifecycle
+
 const { created, failed } = await resizer.generate({
   media,
   sizes: [{ width: 320, height: 320 }],
@@ -118,6 +125,26 @@ File.find().select(['mediaType', ...resizeMediaPaths]);
 ```
 
 S3 when you have buckets; a queue when listings are huge — both are later sections.
+
+### Original upload
+
+`uploadOriginal()` sniffs the actual bytes, creates a random `originals/<hex>.<ext>` suggested
+key, writes through the configured `storage.upload()`, and returns a complete `Original` locator with
+`format`, `contentType`, byte `size`, and reliable display dimensions when known. It does not
+create a media document, enqueue variants, or know anything about users, owners, routes, or DTOs.
+Built-in filesystem/S3 drivers preserve the suggested extension; a custom content-addressed
+driver may return its own opaque locator key.
+
+Input bytes are stored unchanged. Raster metadata is probed with `sharp.metadata()` under the
+configured pixel guard, but no decode-to-output, rotation, EXIF rewrite, re-encode, or animation
+collapse occurs. SVG is parsed by a non-rendering XML scanner and is never passed to Sharp.
+DTD/entity declarations are rejected; sanitizing otherwise-valid SVG content remains the host's
+responsibility before calling this method. Percentage/relative SVG dimensions and a lone
+`viewBox` are not reported as pixel dimensions.
+
+Failures are typed: malformed/unsupported/over-limit input throws `ResizeOriginalError`; storage
+I/O throws `ResizeStorageError` with code `RESIZE_ORIGINAL_UPLOAD_FAILED` and the driver error as
+`cause`. The byte and format allowlists are `upload.maxBytes` and `upload.formats`.
 
 ---
 
@@ -161,6 +188,35 @@ export const resizer = new Resizer({
 });
 ```
 
+In each **producer** process, prepare the queue after the dependencies required by its configured
+transport and lock provider are ready, but before serving any code path that may enqueue
+(`resolve()`, `prewarm()`, or `enqueueRequired()`). For the built-in Mongo transport this means a
+connected database and a registered `ResizeTask` model; the default `FrameworkLockProvider` also
+requires the framework `Lock` model. SQS/custom transport plus a custom lock provider may require
+neither model.
+
+```ts
+// Generic producer bootstrap: configured driver dependencies are ready.
+await resizer.prepareQueue();
+// Only now expose handlers that can enqueue resize work.
+```
+
+`prepareQueue()` is idempotent, so custom transports and lock providers may expose their own
+optional, idempotent `prepare()` implementations. The built-in Mongo transport and default
+`FrameworkLockProvider` call their models' `createIndexes()`. That requires database privileges
+and may take time on an existing collection; index conflicts and other errors are surfaced for
+the host to handle, never repaired by listing, syncing, dropping, or replacing indexes. A host
+whose migration system already guarantees these indexes may deliberately skip producer-side
+preparation.
+
+The standard `runResizeWorker()` / scaffolded `ResizeWorker` performs this preparation before it
+starts consuming, so a separate worker-side call is redundant (though safe). With no transport
+(the normal eager-only setup), `prepareQueue()` is a no-op and does not touch the default lock
+provider or the framework app. With SQS or a custom transport that omits `prepare()`, the default
+framework lock indexes are still prepared because a transport is configured. This API does
+**not** create or health-check SQS queues/redrive policies, S3 buckets, IAM, credentials, or any
+other external resource; provision those outside this module.
+
 **Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
 
 ```ts
@@ -179,7 +235,8 @@ export default {
 npm run cli ResizeWorker
 ```
 
-`worker.enabled` permits the command to run; it does not start a worker inside the API.
+`worker.enabled` permits the command to run; it does not start a worker inside the API. The
+command prepares the configured queue/lock drivers before consumption.
 
 Your media model (`File`/`Media`) must carry `original` (incl. `width`/`height`) and `previews[]`
 (incl. `filters`/`fit`). That schema is host-owned; to avoid hand-written drift the module exports
@@ -193,8 +250,9 @@ class File extends BaseModel {
 }
 ```
 
-At **upload** capture `original.width/height` (from sharp metadata) onto the media doc; if you
-don't, the worker backfills them on first process.
+At **upload**, prefer `uploadOriginal()` and persist its returned metadata on the media doc. Legacy
+hosts may still populate `original` themselves; if dimensions are absent, the worker backfills
+display dimensions on first processing.
 
 **Read** from your DTO builders. No `app` argument — the module reads the ambient app instance.
 `resolve` returns the raw `decision` and the `output` of your `formatPublicUrls` hook (`undefined`
@@ -248,6 +306,26 @@ await resizer.prewarm({ media: fileDoc, sizes: getListingSizes(), pipeline: 'lis
 Choose pre-warm when you want **fast uploads and a warm cache** — the request returns immediately
 while the worker fills the catalog in the background.
 
+When the upload workflow must know whether every required identity has a confirmed queue receipt,
+use the separate strict API:
+
+```ts
+const result = await resizer.enqueueRequired({ media, sizes: catalog, pipeline: 'listing' });
+// result.status: 'ready' | 'accepted' | 'not-required' | 'incomplete'
+// ready / accepted / notRequired / unconfirmed partition the resolved catalog.
+// tasks contains non-null transport receipts; issues is a machine-readable retry guide.
+```
+
+`prewarm()` remains best-effort and never throws for compatibility. In contrast,
+`enqueueRequired()` never treats a held dispatch lock as proof that a task exists. Mongo can query
+active task payloads through `findActive()` and prove coverage after a lock race only when the
+complete canonical variant payload matches. Two different payloads that collapse to one preview
+identity are reported as a non-retryable conflict instead of being guessed. SQS confirms a
+successful send by its `MessageId`, but cannot query another producer's message; a lock loser is
+therefore `incomplete` and safely retryable. Custom transports may implement `findActive()` or
+accept the same explicit limitation. These are at-least-once systems—this API does not promise
+exactly-once delivery.
+
 **Eager** — call `generate` from your
 upload handler (`ctx` reaches pipeline steps here, unlike the queued worker):
 
@@ -284,7 +362,8 @@ question a catch block actually has — what to do about it:
 | `ResizeConfigError` | host config invalid or violates an invariant | crash at boot |
 | `ResizeMediaError` | this media record is unusable | skip it; don't retry |
 | ↳ `ResizeNoOriginalError` | `generate` called with no `original` | upload the source first |
-| `ResizeGenerateError` | the operation produced nothing | inspect `failed` / `requested` |
+| ↳ `ResizeOriginalError` | upload bytes are invalid, unsupported, or over limit | reject/fix the input |
+| `ResizeGenerateError` | eager produced nothing, or queued coverage is incomplete | inspect `failed` / `requested` / `missing` |
 | `ResizeStorageError` | transient storage I/O | a retry may help |
 | `ResizeSecurityError` | a refusal (path traversal, cross-bucket) | never retry; log loudly |
 
@@ -331,7 +410,8 @@ instance anywhere via `getResizer()` (throws a clear error if none was construct
 ### `MongoTransport`
 
 Option-less: `new MongoTransport()`. Backed by the scaffolded `ResizeTask` model; uses the
-`config.queue` lease/retry knobs. No optional deps.
+`config.queue` lease/retry knobs. It also implements the optional `findActive()` capability used
+by `enqueueRequired()` to prove coverage after dispatch-lock races. No optional deps.
 
 ### `SqsTransport({ … })`
 
@@ -527,6 +607,8 @@ them by `getResizeConfig()` — override any knob at any depth. **Arrays REPLACE
 |---|---|---|
 | `mediaModelName` | — (**required**) | your host media model name (`'File'`/`'Media'`) |
 | `formats` | `['jpeg','webp','avif']` | generated formats |
+| `upload.maxBytes` | `26214400` (25 MiB) | maximum original byte length checked before storage |
+| `upload.formats` | `['jpeg','png','webp','avif','gif','svg']` | allowed formats, determined from bytes |
 | `webpAvifOnly` | `false` | when `true`, `requiredFormats()` drops `jpeg` (read + worker must agree) |
 | `maxSize` | `{ width: 2000, height: 1200 }` | the `fit` cap |
 | `animated` | `false` | `true` keeps GIF/WebP frames |
@@ -597,9 +679,16 @@ of the same request. If a concurrent operator creates one after the lookup, the 
 re-reads that active row instead of retrying the dead row.
 
 **Delivery is at-least-once** (both transports); the worker is **idempotent** — re-running a task
-for an already-generated identity skips via the existing-preview check, never duplicates.
+for an already-generated identity skips via the existing-preview check, never duplicates. A
+raster task completes only when every requested identity is covered. Successfully uploaded
+variants are persisted before an incomplete task is failed into the existing backoff/retry path;
+the next delivery generates only the missing identities, and permanent gaps reach dead-letter.
+`afterTaskComplete` fires only after full coverage. A deleted media row and a stray SVG task remain
+successful no-ops; a live row without `original.key` is an observable terminal media error.
 
-**SVG originals are pass-through** — when `original.contentType === 'image/svg+xml'` the read path
+**SVG originals are pass-through** — `uploadOriginal()` supplies storage with a `.svg` key and
+stores SVG bytes as SVG and `image/svg+xml`; when `original.contentType === 'image/svg+xml'` the
+read path
 serves a public original at every requested size/format and never resizes or enqueues. A private
 original is served only through a successful authorized `signedUrl`; anonymous reads return no
 original URL. **SVG sanitization is host-owned** (sanitize at upload before storing).

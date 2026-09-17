@@ -9,7 +9,11 @@ import { getApp } from './app.ts';
 import { getResizeConfig } from './config/resize.ts';
 import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
 import type { Resizer } from './resizer.ts';
-import type { MissingPreview } from './types.d.ts';
+import type {
+  EnqueueIssue,
+  EnqueueReceipt,
+  MissingPreview,
+} from './types.d.ts';
 
 function normalizeVariant(variant: MissingPreview): MissingPreview {
   const normalized: MissingPreview = {
@@ -175,6 +179,236 @@ export async function enqueue(
     await releaseAll(resizer, survivorLockKeys);
     return 0;
   }
+}
+
+export interface ConfirmedEnqueueResult {
+  accepted: MissingPreview[];
+  unconfirmed: MissingPreview[];
+  tasks: EnqueueReceipt[];
+  issues: EnqueueIssue[];
+}
+
+function variantPayloadKey(variant: MissingPreview): string {
+  return JSON.stringify(canonicalizeVariants([variant])[0]);
+}
+
+/**
+ * Strict counterpart to enqueue(). A dispatch lock is only an optimization: losing it is
+ * never reported as accepted. Coverage is accepted only from a non-null enqueue receipt or
+ * from an optional transport findActive() proof.
+ */
+export async function enqueueConfirmed(
+  resizer: Resizer,
+  mediaId: string,
+  pipeline: string,
+  missing: MissingPreview[],
+): Promise<ConfirmedEnqueueResult> {
+  const transport = resizer.transport;
+  const canonical = canonicalizeVariants(missing);
+  if (!transport) {
+    return {
+      accepted: [],
+      unconfirmed: canonical,
+      tasks: [],
+      issues: [
+        {
+          code: 'RESIZE_ENQUEUE_NO_TRANSPORT',
+          message: 'no queue transport is configured',
+          retryable: false,
+          previews: canonical,
+        },
+      ],
+    };
+  }
+
+  const grouped = new Map<string, MissingPreview[]>();
+  for (const preview of canonical) {
+    const identity = getPreviewIdentity(
+      preview.sizeKey,
+      preview.format,
+      preview.filters,
+    );
+    const variants = grouped.get(identity);
+    if (variants) {
+      variants.push(preview);
+    } else {
+      grouped.set(identity, [preview]);
+    }
+  }
+  const byIdentity = new Map<string, MissingPreview>();
+  const conflicts: MissingPreview[] = [];
+  for (const [identity, variants] of grouped) {
+    if (variants.length === 1) {
+      byIdentity.set(identity, variants[0]);
+    } else {
+      conflicts.push(...variants);
+    }
+  }
+  const winners: MissingPreview[] = [];
+  const winnerKeys: string[] = [];
+  const unresolved = new Map(byIdentity);
+  const issues: EnqueueIssue[] = [];
+  if (conflicts.length > 0) {
+    issues.push({
+      code: 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
+      message:
+        'multiple variant payloads share one preview identity; none can be confirmed safely',
+      retryable: false,
+      previews: conflicts,
+    });
+  }
+  const lockContended: MissingPreview[] = [];
+  const lockFailed: MissingPreview[] = [];
+  const dispatchTtlMs = getResizeConfig().queue.lockTtlMs.dispatch;
+
+  for (const [identity, preview] of byIdentity) {
+    const lockKey = `resize_dispatch:${mediaId}:${identity}`;
+    try {
+      if (await resizer.lockProvider.acquire(lockKey, dispatchTtlMs)) {
+        winners.push(preview);
+        winnerKeys.push(lockKey);
+      } else {
+        lockContended.push(preview);
+      }
+    } catch (error) {
+      getApp().logger.error(
+        `resize enqueueRequired: dispatch-lock acquire failed for ${lockKey}`,
+        error,
+      );
+      lockFailed.push(preview);
+    }
+  }
+
+  const accepted = new Map<string, MissingPreview>();
+  const tasks: EnqueueReceipt[] = [];
+  if (winners.length > 0) {
+    try {
+      const { taskId } = await transport.enqueue({
+        mediaId,
+        pipeline,
+        previews: winners,
+      });
+      if (typeof taskId !== 'string' || taskId.length === 0) {
+        issues.push({
+          code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+          message: 'transport returned a null taskId',
+          retryable: true,
+          previews: winners,
+        });
+        await releaseAll(resizer, winnerKeys);
+      } else {
+        const receipt = { taskId, previews: winners };
+        tasks.push(receipt);
+        for (const preview of winners) {
+          const identity = getPreviewIdentity(
+            preview.sizeKey,
+            preview.format,
+            preview.filters,
+          );
+          accepted.set(identity, preview);
+          unresolved.delete(identity);
+        }
+      }
+    } catch (error) {
+      getApp().logger.error(
+        `resize enqueueRequired: transport.enqueue threw for media ${mediaId}`,
+        error,
+      );
+      issues.push({
+        code: 'RESIZE_ENQUEUE_TRANSPORT_FAILED',
+        message: 'transport enqueue failed; outcome is unconfirmed',
+        retryable: true,
+        previews: winners,
+      });
+      await releaseAll(resizer, winnerKeys);
+    }
+  }
+
+  if (unresolved.size > 0 && transport.findActive) {
+    try {
+      const confirmations = await transport.findActive({
+        mediaId,
+        pipeline,
+        previews: [...unresolved.values()],
+      });
+      const unresolvedByPayload = new Map(
+        [...unresolved.entries()].map(([identity, preview]) => [
+          variantPayloadKey(preview),
+          { identity, preview },
+        ]),
+      );
+      for (const receipt of confirmations) {
+        if (!receipt.taskId) {
+          continue;
+        }
+        const covered: MissingPreview[] = [];
+        for (const preview of canonicalizeVariants(receipt.previews)) {
+          const requested = unresolvedByPayload.get(variantPayloadKey(preview));
+          if (requested) {
+            accepted.set(requested.identity, requested.preview);
+            unresolved.delete(requested.identity);
+            unresolvedByPayload.delete(variantPayloadKey(preview));
+            covered.push(requested.preview);
+          }
+        }
+        if (covered.length > 0) {
+          tasks.push({ taskId: receipt.taskId, previews: covered });
+        }
+      }
+    } catch (error) {
+      getApp().logger.error(
+        `resize enqueueRequired: active-task confirmation failed for media ${mediaId}`,
+        error,
+      );
+      issues.push({
+        code: 'RESIZE_ENQUEUE_CONFIRM_FAILED',
+        message: 'transport could not confirm active task coverage',
+        retryable: true,
+        previews: [...unresolved.values()],
+      });
+    }
+  }
+
+  const unconfirmed = [...unresolved.values(), ...conflicts];
+  const unresolvedIdentities = new Set(
+    unconfirmed.map((preview) =>
+      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+    ),
+  );
+  const remainingContended = lockContended.filter((preview) =>
+    unresolvedIdentities.has(
+      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+    ),
+  );
+  const remainingFailed = lockFailed.filter((preview) =>
+    unresolvedIdentities.has(
+      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+    ),
+  );
+  if (remainingContended.length > 0) {
+    issues.push({
+      code: 'RESIZE_ENQUEUE_LOCK_CONTENDED',
+      message:
+        'dispatch lock is held but no active task coverage was confirmed',
+      retryable: true,
+      previews: remainingContended,
+    });
+  }
+  if (remainingFailed.length > 0) {
+    issues.push({
+      code: 'RESIZE_ENQUEUE_LOCK_FAILED',
+      message: 'dispatch lock could not be acquired or confirmed',
+      retryable: true,
+      previews: remainingFailed,
+    });
+  }
+
+  return {
+    accepted: [...accepted.values()],
+    unconfirmed,
+    tasks,
+    issues,
+  };
 }
 
 /** Best-effort release of every given lock key; a failing release is logged, not thrown. */

@@ -51,6 +51,7 @@ export type TMinimalResizeApp = {
 // ---------------------------------------------------------------------------
 
 export type PreviewFormat = 'jpeg' | 'webp' | 'avif';
+export type OriginalFormat = 'jpeg' | 'png' | 'webp' | 'avif' | 'gif' | 'svg';
 
 // Canonical filter bag. Host-defined semantics; the module only canonicalizes it
 // into the identity. e.g. { blur: 40 }. Empty / undefined → 'none' in the identity.
@@ -71,6 +72,11 @@ export interface Original extends StorageRef {
   contentType?: string;
   width?: number; // captured at upload; backfilled by the worker if missing
   height?: number;
+}
+
+export interface UploadOriginalOpts {
+  body: Buffer | Uint8Array;
+  visibility: 'public' | 'private';
 }
 
 export interface Preview extends StorageRef {
@@ -125,6 +131,44 @@ export interface ReadDecision {
   missing: MissingPreview[];
 }
 
+export type EnqueueRequiredStatus =
+  | 'ready'
+  | 'accepted'
+  | 'not-required'
+  | 'incomplete';
+
+export interface EnqueueReceipt {
+  taskId: string;
+  previews: MissingPreview[];
+}
+
+export interface EnqueueIssue {
+  code:
+    | 'RESIZE_ENQUEUE_NO_ORIGINAL'
+    | 'RESIZE_ENQUEUE_NO_TRANSPORT'
+    | 'RESIZE_ENQUEUE_LOCK_CONTENDED'
+    | 'RESIZE_ENQUEUE_LOCK_FAILED'
+    | 'RESIZE_ENQUEUE_TRANSPORT_FAILED'
+    | 'RESIZE_ENQUEUE_UNCONFIRMED'
+    | 'RESIZE_ENQUEUE_CONFIRM_FAILED'
+    | 'RESIZE_ENQUEUE_VARIANT_CONFLICT';
+  message: string;
+  retryable: boolean;
+  previews: MissingPreview[];
+}
+
+export interface EnqueueRequiredResult {
+  status: EnqueueRequiredStatus;
+  reason?: 'empty-request' | 'filtered' | 'svg';
+  requested: MissingPreview[];
+  ready: MissingPreview[];
+  accepted: MissingPreview[];
+  notRequired: MissingPreview[];
+  unconfirmed: MissingPreview[];
+  tasks: EnqueueReceipt[];
+  issues: EnqueueIssue[];
+}
+
 // Generic `<picture>` map produced by `formatPictureUrls` (0.2). A convenience — not
 // "the" host contract. `sizeKey` is whatever identity already is (`720x720`, `620w`, `fit`).
 export interface PictureUrls {
@@ -151,6 +195,10 @@ export interface ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   formats: PreviewFormat[]; // default ['jpeg','webp','avif']
   webpAvifOnly?: boolean; // when true, requiredFormats() drops 'jpeg' (read + worker MUST agree)
+  upload: {
+    maxBytes: number;
+    formats: OriginalFormat[];
+  };
   maxSize: { width: number; height: number }; // default { 2000, 1200 } (the `fit` cap)
   animated: boolean; // default false — true keeps GIF/WebP frames
 

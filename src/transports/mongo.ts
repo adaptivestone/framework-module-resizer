@@ -13,11 +13,11 @@
 import { getApp } from '../app.ts';
 import { getResizeConfig } from '../config/resize.ts';
 import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
-import { ResizeError } from '../errors.ts';
+import { ResizeError, ResizeSetupError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
 import { getResizer } from '../resizer.ts';
-import type { MissingPreview } from '../types.d.ts';
+import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
 import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';
 
 // The subset of the ResizeTask document the transport reads. The model itself is dynamic
@@ -105,6 +105,28 @@ function isDuplicateKeyError(error: unknown): boolean {
 
 /** The default transport — an option-less class (`new MongoTransport()`) (05 · §10.2). */
 export class MongoTransport implements QueueTransport {
+  /** Ensure the scaffolded ResizeTask model's indexes exist. */
+  async prepare(): Promise<void> {
+    try {
+      const model = getApp().getModel('ResizeTask');
+      if (!model || typeof model.createIndexes !== 'function') {
+        throw new ResizeSetupError(
+          'MongoTransport.prepare: ResizeTask model is not registered correctly — scaffold and register the ResizeTask model before preparing the queue',
+          { code: 'RESIZE_QUEUE_MODEL_REQUIRED' },
+        );
+      }
+      await model.createIndexes();
+    } catch (error) {
+      if (ResizeError.isResizeError(error)) {
+        throw error;
+      }
+      throw new ResizeError(
+        'MongoTransport.prepare: failed to create indexes for ResizeTask',
+        { code: 'RESIZE_QUEUE_PREPARE_FAILED', cause: error },
+      );
+    }
+  }
+
   /** `min(max, base * 2 ** (n - 1))` from config.queue.retryBackoffMs (05 · §10.2). */
   backoff(attempts: number): number {
     const { base, max } = getResizeConfig().queue.retryBackoffMs;
@@ -379,6 +401,26 @@ export class MongoTransport implements QueueTransport {
       `resize mongo transport: enqueue remained contended after duplicate-key retries for media ${task.mediaId}`,
     );
     return { taskId: null };
+  }
+
+  async findActive(task: {
+    mediaId: string;
+    pipeline: string;
+    previews: MissingPreview[];
+  }): Promise<EnqueueReceipt[]> {
+    const model = taskModel();
+    if (!model) {
+      return [];
+    }
+    const docs = (await model.find({
+      fileId: task.mediaId,
+      pipeline: task.pipeline,
+      status: { $in: ['pending', 'processing'] },
+    })) as TaskDoc[];
+    return docs.map((doc) => ({
+      taskId: String(doc._id),
+      previews: canonicalizeVariants(doc.previews ?? []),
+    }));
   }
 
   async startWorker(

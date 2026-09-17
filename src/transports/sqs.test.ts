@@ -163,6 +163,51 @@ describe('SqsTransport.enqueue', () => {
     const res = await t.enqueue({ mediaId: 'm1', pipeline: 'p', previews: [] });
     assert.equal(res.taskId, null);
   });
+
+  test('enqueueRequired accepts a successful SQS MessageId receipt', async () => {
+    installFakeApp();
+    const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
+    const transport = new SqsTransport({ queueUrl: 'q', client });
+    const r = new Resizer({
+      storage: {
+        download: async () => Buffer.alloc(0),
+        upload: async ({ key }) => ({ key }),
+        publicUrl: () => '',
+      },
+      transport,
+      lockProvider: { acquire: async () => true, release: async () => {} },
+    });
+    const result = await r.enqueueRequired({
+      media: { id: 'm1', original: { key: 'original.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.tasks[0].taskId, 'mid-strict');
+  });
+
+  test('enqueueRequired leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
+    installFakeApp();
+    const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
+    const transport = new SqsTransport({ queueUrl: 'q', client });
+    const r = new Resizer({
+      storage: {
+        download: async () => Buffer.alloc(0),
+        upload: async ({ key }) => ({ key }),
+        publicUrl: () => '',
+      },
+      transport,
+      lockProvider: { acquire: async () => false, release: async () => {} },
+    });
+    const result = await r.enqueueRequired({
+      media: { id: 'm1', original: { key: 'original.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
+    assert.equal(sent.length, 0);
+  });
 });
 
 // ---------------------------------------------------------------------------

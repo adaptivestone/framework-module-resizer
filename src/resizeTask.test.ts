@@ -74,7 +74,9 @@ const orientedJpeg = await sharp({
 
 function installApp(configOverride: Record<string, unknown> = {}): {
   logs: { info: unknown[][]; warn: unknown[][]; error: unknown[][] };
+  getModelCalls: () => number;
 } {
+  let modelCalls = 0;
   const logs = {
     info: [] as unknown[][],
     warn: [] as unknown[][],
@@ -82,7 +84,10 @@ function installApp(configOverride: Record<string, unknown> = {}): {
   };
   setAppInstance({
     getConfig: () => ({ mediaModelName: 'File', ...configOverride }),
-    getModel: () => ({}),
+    getModel: () => {
+      modelCalls += 1;
+      return {};
+    },
     logger: {
       info(...a: unknown[]) {
         logs.info.push(a);
@@ -95,7 +100,7 @@ function installApp(configOverride: Record<string, unknown> = {}): {
       },
     },
   } as never);
-  return { logs };
+  return { logs, getModelCalls: () => modelCalls };
 }
 
 type Upload = {
@@ -404,7 +409,10 @@ describe('processTask — variants', () => {
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const { lockProvider, acquired } = makeLocks(false); // acquire always fails
     new Resizer({ storage, mediaStore, lockProvider });
-    await processTask(task({ previews: [variant()] }));
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      /incomplete/,
+    );
     assert.deepEqual(acquired, ['resize_worker:m1:20x20:jpeg:none']);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -430,8 +438,12 @@ describe('processTask — variants', () => {
       },
     };
     new Resizer({ storage, mediaStore, lockProvider });
-    await processTask(
-      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    await assert.rejects(
+      () =>
+        processTask(
+          task({ previews: [variant(), variant({ format: 'webp' })] }),
+        ),
+      /incomplete/,
     );
     assert.equal(uploads.length, 1);
     assert.equal(uploads[0].key.split('.').pop(), 'jpeg');
@@ -704,7 +716,7 @@ describe('processTask — persistence & failure handling', () => {
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
-      /produced 0 previews/,
+      /incomplete/,
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -715,7 +727,7 @@ describe('processTask — persistence & failure handling', () => {
     ]);
   });
 
-  test('partial success (one good + one poison) → returns normally, good preview persisted', async () => {
+  test('partial success persists the good preview but throws so the task is retried', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const pipeline: Pipeline = {
@@ -735,13 +747,129 @@ describe('processTask — persistence & failure handling', () => {
       lockProvider: makeLocks().lockProvider,
       pipelines: { default: pipeline },
     });
-    await processTask(
-      task({ previews: [variant(), variant({ filters: { poison: true } })] }),
+    await assert.rejects(
+      () =>
+        processTask(
+          task({
+            previews: [variant(), variant({ filters: { poison: true } })],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof ResizeGenerateError &&
+        error.code === 'RESIZE_WORKER_INCOMPLETE' &&
+        error.missing.includes('20x20:jpeg:poison:true'),
     );
     assert.equal(uploads.length, 1);
     assert.equal(appendCalls.length, 1);
     assert.equal(appendCalls[0].previews.length, 1);
     assert.equal(appendCalls[0].previews[0].filters, undefined);
+  });
+
+  test('the next delivery generates only variants still missing after partial persistence', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    let poison = true;
+    const pipeline: Pipeline = {
+      variantSteps: [
+        async (img, { variant: v }) => {
+          if (poison && v.filters?.retry) {
+            throw new Error('temporary encoder failure');
+          }
+          return img;
+        },
+      ],
+    };
+    const media = mediaDoc();
+    const mediaStore: MediaStore = {
+      load: async () => media,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [...(media.previews ?? []), ...previews];
+      },
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+      pipelines: { default: pipeline },
+    });
+    const queued = task({
+      previews: [variant(), variant({ filters: { retry: true } })],
+    });
+
+    await assert.rejects(() => processTask(queued), /incomplete/);
+    assert.equal(media.previews?.length, 1);
+    assert.equal(uploads.length, 1);
+
+    poison = false;
+    await processTask(queued);
+    assert.equal(media.previews?.length, 2);
+    assert.equal(uploads.length, 2, 'ready identity was not uploaded again');
+    assert.equal(
+      new Set(
+        media.previews?.map(
+          (preview) =>
+            `${preview.sizeKey}:${preview.format}:${JSON.stringify(preview.filters ?? {})}`,
+        ),
+      ).size,
+      2,
+    );
+  });
+
+  test('a worker-lock loser is complete only after a concurrent preview becomes visible', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const media = mediaDoc();
+    let loads = 0;
+    const concurrent = {
+      key: 'concurrent.jpg',
+      contentType: 'image/jpeg',
+      sizeKey: '20x20',
+      format: 'jpeg' as const,
+    };
+    const mediaStore: MediaStore = {
+      load: async () => {
+        loads++;
+        if (loads >= 2) {
+          media.previews = [concurrent];
+        }
+        return media;
+      },
+      appendPreviews: async () => {},
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks(false).lockProvider,
+    });
+    await processTask(task({ previews: [variant()] }));
+    assert.equal(uploads.length, 0);
+  });
+
+  test('deduplicates malformed task payloads by preview identity', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const media = mediaDoc();
+    const mediaStore: MediaStore = {
+      load: async () => media,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [...(media.previews ?? []), ...previews];
+      },
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+    await processTask(
+      task({
+        previews: [
+          variant(),
+          variant({ requestedWidth: 999, requestedHeight: 999 }),
+        ],
+      }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(media.previews?.length, 1);
   });
 
   test('abort signal between variants stops launching new ones', async () => {
@@ -754,27 +882,31 @@ describe('processTask — persistence & failure handling', () => {
       mediaStore,
       lockProvider: makeLocks().lockProvider,
     });
-    await processTask(
-      task({
-        previews: [
-          variant({
-            sizeKey: '10x10',
-            requestedWidth: 10,
-            requestedHeight: 10,
+    await assert.rejects(
+      () =>
+        processTask(
+          task({
+            previews: [
+              variant({
+                sizeKey: '10x10',
+                requestedWidth: 10,
+                requestedHeight: 10,
+              }),
+              variant({
+                sizeKey: '11x11',
+                requestedWidth: 11,
+                requestedHeight: 11,
+              }),
+              variant({
+                sizeKey: '12x12',
+                requestedWidth: 12,
+                requestedHeight: 12,
+              }),
+            ],
           }),
-          variant({
-            sizeKey: '11x11',
-            requestedWidth: 11,
-            requestedHeight: 11,
-          }),
-          variant({
-            sizeKey: '12x12',
-            requestedWidth: 12,
-            requestedHeight: 12,
-          }),
-        ],
-      }),
-      { signal: controller.signal },
+          { signal: controller.signal },
+        ),
+      /incomplete/,
     );
     assert.equal(uploads.length, 1); // aborted after the first, launched no more
   });
@@ -1155,24 +1287,157 @@ describe('runResizeWorker', () => {
   test('worker.enabled=false → clean no-op (startWorker NOT called); log says how to enable', async () => {
     const { logs } = installApp(); // default worker.enabled is false
     let started = false;
+    let prepared = false;
     new Resizer({
       storage: makeStorage(redPng).storage,
-      transport: fakeTransport(() => {
-        started = true;
-      }),
+      transport: {
+        ...fakeTransport(() => {
+          started = true;
+        }),
+        prepare: async () => {
+          prepared = true;
+        },
+      },
     });
     await runResizeWorker();
     assert.equal(started, false);
+    assert.equal(prepared, false);
     assert.ok(
       logs.info.some((l) => String(l[0]).includes('worker.enabled=true')),
     );
   });
 
-  test('no transport → logs an error and returns', async () => {
-    const { logs } = installApp({ worker: { enabled: true } });
+  test('no transport → logs an error and returns without preparing framework drivers', async () => {
+    const { logs, getModelCalls } = installApp({
+      worker: { enabled: true },
+    });
     new Resizer({ storage: makeStorage(redPng).storage });
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
+    assert.equal(getModelCalls(), 0);
+  });
+
+  test('awaits queue preparation completely before starting the transport worker', async () => {
+    installApp({ worker: { enabled: true } });
+    let markPreparationStarted: (() => void) | undefined;
+    const preparationStarted = new Promise<void>((resolve) => {
+      markPreparationStarted = resolve;
+    });
+    let releasePreparation: (() => void) | undefined;
+    const preparationPending = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+    const order: string[] = [];
+    const transport: QueueTransport = {
+      ...fakeTransport(() => {
+        order.push('worker:start');
+      }),
+      prepare: async () => {
+        order.push('prepare:start');
+        markPreparationStarted?.();
+        await preparationPending;
+        order.push('prepare:end');
+      },
+    };
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    const sigtermListenersBefore = process.listenerCount('SIGTERM');
+    const sigintListenersBefore = process.listenerCount('SIGINT');
+    const running = runResizeWorker();
+    await preparationStarted;
+    assert.deepEqual(order, ['prepare:start']);
+
+    releasePreparation?.();
+    await running;
+    assert.deepEqual(order, ['prepare:start', 'prepare:end', 'worker:start']);
+    assert.equal(process.listenerCount('SIGTERM'), sigtermListenersBefore);
+    assert.equal(process.listenerCount('SIGINT'), sigintListenersBefore);
+  });
+
+  test('shutdown during preparation skips consumption and removes signal listeners', async () => {
+    installApp({ worker: { enabled: true } });
+    let markPreparationStarted: (() => void) | undefined;
+    const preparationStarted = new Promise<void>((resolve) => {
+      markPreparationStarted = resolve;
+    });
+    let releasePreparation: (() => void) | undefined;
+    const preparationPending = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+    let started = false;
+    const transport: QueueTransport = {
+      ...fakeTransport(() => {
+        started = true;
+      }),
+      prepare: async () => {
+        markPreparationStarted?.();
+        await preparationPending;
+      },
+    };
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    const sigtermListenersBefore = process.listeners('SIGTERM');
+    const sigintCountBefore = process.listenerCount('SIGINT');
+    const running = runResizeWorker();
+    await preparationStarted;
+    const registeredShutdownHandlers = process
+      .listeners('SIGTERM')
+      .filter((listener) => !sigtermListenersBefore.includes(listener));
+    assert.equal(registeredShutdownHandlers.length, 1);
+
+    registeredShutdownHandlers[0]?.();
+    releasePreparation?.();
+    await running;
+
+    assert.equal(started, false);
+    assert.deepEqual(process.listeners('SIGTERM'), sigtermListenersBefore);
+    assert.equal(process.listenerCount('SIGINT'), sigintCountBefore);
+  });
+
+  test('preparation rejection reaches the caller and prevents worker start and stop logging', async () => {
+    const { logs } = installApp({ worker: { enabled: true } });
+    const cause = new Error('queue unavailable');
+    let started = false;
+    const transport: QueueTransport = {
+      ...fakeTransport(() => {
+        started = true;
+      }),
+      prepare: async () => {
+        throw cause;
+      },
+    };
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    const sigtermListenersBefore = process.listenerCount('SIGTERM');
+    const sigintListenersBefore = process.listenerCount('SIGINT');
+    await assert.rejects(runResizeWorker(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as { code?: unknown }).code,
+        'RESIZE_QUEUE_PREPARE_FAILED',
+      );
+      assert.equal(error.cause, cause);
+      return true;
+    });
+    assert.equal(started, false);
+    assert.equal(
+      logs.info.some((entry) => entry[0] === 'resize worker stopped'),
+      false,
+    );
+    assert.equal(process.listenerCount('SIGTERM'), sigtermListenersBefore);
+    assert.equal(process.listenerCount('SIGINT'), sigintListenersBefore);
   });
 
   test('enabled + transport → startWorker gets a handler that reaches processTask', async () => {
@@ -1187,6 +1452,7 @@ describe('runResizeWorker', () => {
         handle = h;
       }),
       mediaStore,
+      lockProvider: makeLocks().lockProvider,
     });
     await runResizeWorker();
     assert.equal(typeof handle, 'function');

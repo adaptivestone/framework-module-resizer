@@ -9,6 +9,10 @@ import type { PreviewFormat, ResizeConfig } from '../types.d.ts';
 // options passed at registerStorage()/registerQueueTransport() — see 05.
 const defaultResizeConfig: Omit<ResizeConfig, 'mediaModelName'> = {
   formats: ['jpeg', 'webp', 'avif'],
+  upload: {
+    maxBytes: 25 * 1024 * 1024,
+    formats: ['jpeg', 'png', 'webp', 'avif', 'gif', 'svg'],
+  },
   maxSize: { width: 2000, height: 1200 },
   animated: false,
   encode: {
@@ -62,6 +66,32 @@ export function getResizeConfig(): ResizeConfig {
     throw new ResizeConfigError(
       'resize config: `mediaModelName` is required — set it in the host src/config/resize.ts',
       { code: 'RESIZE_CONFIG_MEDIA_MODEL_MISSING' },
+    );
+  }
+  if (
+    !Number.isSafeInteger(merged.upload.maxBytes) ||
+    merged.upload.maxBytes <= 0
+  ) {
+    throw new ResizeConfigError(
+      'resize config: upload.maxBytes must be a positive safe integer',
+      { code: 'RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID' },
+    );
+  }
+  const originalFormats = new Set([
+    'jpeg',
+    'png',
+    'webp',
+    'avif',
+    'gif',
+    'svg',
+  ]);
+  if (
+    merged.upload.formats.length === 0 ||
+    merged.upload.formats.some((format) => !originalFormats.has(format))
+  ) {
+    throw new ResizeConfigError(
+      'resize config: upload.formats must contain supported original formats',
+      { code: 'RESIZE_CONFIG_UPLOAD_FORMATS_INVALID' },
     );
   }
   // Doneness invariant (07 · Worker): a worker lock MUST expire within the lease window, else a
