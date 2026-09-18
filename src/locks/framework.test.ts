@@ -4,7 +4,6 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { ResizeError, ResizeSetupError } from '../errors.ts';
 import { FrameworkLockProvider } from './framework.ts';
 
 // One stateless instance drives the whole file (option-less constructor; the
@@ -14,7 +13,6 @@ const provider = new FrameworkLockProvider();
 // A recording fake `Lock` model installed via getModel('Lock'). The ms→seconds
 // conversion is the framework's Lock TTL contract (02 · §4) and must live here.
 function installLock(lock: {
-  createIndexes?: () => unknown;
   acquireLock?: (key: string, ttl: number) => unknown;
   releaseLock?: (key: string) => unknown;
 }) {
@@ -27,83 +25,6 @@ function installLock(lock: {
 
 afterEach(() => {
   resetAppInstance();
-});
-
-describe('FrameworkLockProvider.prepare', () => {
-  test('requests Lock and waits for its createIndexes call', async () => {
-    const names: string[] = [];
-    let finish!: () => void;
-    const pending = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    let completed = false;
-    setAppInstance({
-      getConfig: () => ({}),
-      getModel: (name: string) => {
-        names.push(name);
-        return {
-          createIndexes: async () => {
-            await pending;
-            completed = true;
-          },
-        };
-      },
-      logger: { info() {}, warn() {}, error() {} },
-    } as never);
-
-    const preparing = provider.prepare();
-    await Promise.resolve();
-    assert.deepEqual(names, ['Lock']);
-    assert.equal(completed, false);
-    finish();
-    await preparing;
-    assert.equal(completed, true);
-  });
-
-  for (const [name, model] of [
-    ['missing model', undefined],
-    ['model without createIndexes', {}],
-  ] as const) {
-    test(`rejects a ${name} as a setup error`, async () => {
-      setAppInstance({
-        getConfig: () => ({}),
-        getModel: () => model,
-        logger: { info() {}, warn() {}, error() {} },
-      } as never);
-      await assert.rejects(provider.prepare(), (error: unknown) => {
-        assert.ok(error instanceof ResizeSetupError);
-        assert.equal(error.code, 'RESIZE_LOCK_MODEL_REQUIRED');
-        assert.match(error.message, /register.*Lock/i);
-        return true;
-      });
-    });
-  }
-
-  test('wraps an operational createIndexes failure and retains its cause', async () => {
-    const cause = new Error('database unavailable');
-    installLock({
-      createIndexes: async () => {
-        throw cause;
-      },
-    });
-    await assert.rejects(provider.prepare(), (error: unknown) => {
-      assert.ok(error instanceof ResizeError);
-      assert.equal(error.code, 'RESIZE_QUEUE_PREPARE_FAILED');
-      assert.equal(error.cause, cause);
-      assert.match(error.message, /FrameworkLockProvider.*Lock/);
-      return true;
-    });
-  });
-
-  test('preserves an existing ResizeError from createIndexes', async () => {
-    const existing = new ResizeError('known failure', { code: 'KNOWN' });
-    installLock({
-      createIndexes: async () => {
-        throw existing;
-      },
-    });
-    await assert.rejects(provider.prepare(), (error) => error === existing);
-  });
 });
 
 describe('FrameworkLockProvider.acquire', () => {

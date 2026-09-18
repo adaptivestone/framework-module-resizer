@@ -55,6 +55,7 @@
   "license": "MIT",
   "dependencies": {
     "deepmerge": "^4.3.1",
+    "saxes": "^5.0.1",
     "sharp": "^0.35.3"
   },
   "peerDependencies": {

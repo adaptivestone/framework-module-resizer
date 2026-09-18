@@ -13,12 +13,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import {
-  ResizeError,
-  ResizeGenerateError,
-  ResizeNoOriginalError,
-  ResizeSetupError,
-} from '../errors.ts';
+import { ResizeGenerateError, ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import type { MissingPreview } from '../types.d.ts';
@@ -169,79 +164,6 @@ async function waitFor(
   }
   throw new Error('waitFor timed out');
 }
-
-// ---------------------------------------------------------------------------
-// prepare
-// ---------------------------------------------------------------------------
-
-describe('MongoTransport.prepare', () => {
-  test('requests ResizeTask and waits for its createIndexes call', async () => {
-    const names: string[] = [];
-    let finish!: () => void;
-    const pending = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    let completed = false;
-    installFakeApp((name) => {
-      names.push(name);
-      return {
-        createIndexes: async () => {
-          await pending;
-          completed = true;
-        },
-      };
-    });
-
-    const preparing = transport.prepare();
-    await Promise.resolve();
-    assert.deepEqual(names, ['ResizeTask']);
-    assert.equal(completed, false);
-    finish();
-    await preparing;
-    assert.equal(completed, true);
-  });
-
-  for (const [name, model] of [
-    ['missing model', undefined],
-    ['model without createIndexes', {}],
-  ] as const) {
-    test(`rejects a ${name} as a setup error`, async () => {
-      installFakeApp(() => model);
-      await assert.rejects(transport.prepare(), (error: unknown) => {
-        assert.ok(error instanceof ResizeSetupError);
-        assert.equal(error.code, 'RESIZE_QUEUE_MODEL_REQUIRED');
-        assert.match(error.message, /scaffold.*register|register.*scaffold/i);
-        return true;
-      });
-    });
-  }
-
-  test('wraps an operational createIndexes failure and retains its cause', async () => {
-    const cause = new Error('database unavailable');
-    installFakeApp(() => ({
-      createIndexes: async () => {
-        throw cause;
-      },
-    }));
-    await assert.rejects(transport.prepare(), (error: unknown) => {
-      assert.ok(error instanceof ResizeError);
-      assert.equal(error.code, 'RESIZE_QUEUE_PREPARE_FAILED');
-      assert.equal(error.cause, cause);
-      assert.match(error.message, /MongoTransport.*ResizeTask/);
-      return true;
-    });
-  });
-
-  test('preserves an existing ResizeError from createIndexes', async () => {
-    const existing = new ResizeError('known failure', { code: 'KNOWN' });
-    installFakeApp(() => ({
-      createIndexes: async () => {
-        throw existing;
-      },
-    }));
-    await assert.rejects(transport.prepare(), (error) => error === existing);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // enqueue (05 · §10.2)

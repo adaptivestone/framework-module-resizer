@@ -192,6 +192,43 @@ function variantPayloadKey(variant: MissingPreview): string {
   return JSON.stringify(canonicalizeVariants([variant])[0]);
 }
 
+interface VariantGroups {
+  unique: Map<string, MissingPreview>;
+  conflicts: Map<string, MissingPreview[]>;
+}
+
+/**
+ * Canonicalize a complete payload before grouping it by preview identity. Exact duplicate
+ * payloads are harmless; different payloads sharing an identity are not safe to confirm.
+ */
+function groupVariants(variants: readonly MissingPreview[]): VariantGroups {
+  const grouped = new Map<string, MissingPreview[]>();
+  for (const preview of canonicalizeVariants(variants)) {
+    const identity = getPreviewIdentity(
+      preview.sizeKey,
+      preview.format,
+      preview.filters,
+    );
+    const group = grouped.get(identity);
+    if (group) {
+      group.push(preview);
+    } else {
+      grouped.set(identity, [preview]);
+    }
+  }
+
+  const unique = new Map<string, MissingPreview>();
+  const conflicts = new Map<string, MissingPreview[]>();
+  for (const [identity, previews] of grouped) {
+    if (previews.length === 1) {
+      unique.set(identity, previews[0]);
+    } else {
+      conflicts.set(identity, previews);
+    }
+  }
+  return { unique, conflicts };
+}
+
 /**
  * Strict counterpart to enqueue(). A dispatch lock is only an optimization: losing it is
  * never reported as accepted. Coverage is accepted only from a non-null enqueue receipt or
@@ -221,29 +258,9 @@ export async function enqueueConfirmed(
     };
   }
 
-  const grouped = new Map<string, MissingPreview[]>();
-  for (const preview of canonical) {
-    const identity = getPreviewIdentity(
-      preview.sizeKey,
-      preview.format,
-      preview.filters,
-    );
-    const variants = grouped.get(identity);
-    if (variants) {
-      variants.push(preview);
-    } else {
-      grouped.set(identity, [preview]);
-    }
-  }
-  const byIdentity = new Map<string, MissingPreview>();
-  const conflicts: MissingPreview[] = [];
-  for (const [identity, variants] of grouped) {
-    if (variants.length === 1) {
-      byIdentity.set(identity, variants[0]);
-    } else {
-      conflicts.push(...variants);
-    }
-  }
+  const requestedGroups = groupVariants(canonical);
+  const byIdentity = requestedGroups.unique;
+  const conflicts = [...requestedGroups.conflicts.values()].flat();
   const winners: MissingPreview[] = [];
   const winnerKeys: string[] = [];
   const unresolved = new Map(byIdentity);
@@ -281,6 +298,7 @@ export async function enqueueConfirmed(
 
   const accepted = new Map<string, MissingPreview>();
   const tasks: EnqueueReceipt[] = [];
+  const activeReceiptConflicts = new Map<string, MissingPreview>();
   if (winners.length > 0) {
     try {
       const { taskId } = await transport.enqueue({
@@ -338,11 +356,24 @@ export async function enqueueConfirmed(
         ]),
       );
       for (const receipt of confirmations) {
-        if (!receipt.taskId) {
+        if (
+          typeof receipt.taskId !== 'string' ||
+          receipt.taskId.trim().length === 0
+        ) {
           continue;
         }
+        // Inspect the complete receipt before matching any requested payload. Filtering to
+        // the requested payload first would hide a second payload that makes the identity
+        // ambiguous in the active task.
+        const receiptGroups = groupVariants(receipt.previews);
+        for (const identity of receiptGroups.conflicts.keys()) {
+          const requested = unresolved.get(identity);
+          if (requested && !activeReceiptConflicts.has(identity)) {
+            activeReceiptConflicts.set(identity, requested);
+          }
+        }
         const covered: MissingPreview[] = [];
-        for (const preview of canonicalizeVariants(receipt.previews)) {
+        for (const preview of receiptGroups.unique.values()) {
           const requested = unresolvedByPayload.get(variantPayloadKey(preview));
           if (requested) {
             accepted.set(requested.identity, requested.preview);
@@ -370,6 +401,18 @@ export async function enqueueConfirmed(
   }
 
   const unconfirmed = [...unresolved.values(), ...conflicts];
+  const receiptConflictPreviews = [...activeReceiptConflicts.entries()]
+    .filter(([identity]) => unresolved.has(identity))
+    .map(([, preview]) => preview);
+  if (receiptConflictPreviews.length > 0) {
+    issues.push({
+      code: 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
+      message:
+        'multiple active-task payloads share one preview identity; none can be confirmed safely',
+      retryable: false,
+      previews: receiptConflictPreviews,
+    });
+  }
   const unresolvedIdentities = new Set(
     unconfirmed.map((preview) =>
       getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),

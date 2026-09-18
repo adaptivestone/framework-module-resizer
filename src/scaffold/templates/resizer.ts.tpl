@@ -25,8 +25,7 @@ export const resizer = new Resizer({
   // hooks: { formatPublicUrls: (decision, ctx) => formatPictureUrls(decision, { id: String(ctx.id) }) },
 });
 
-// Producer bootstrap: AFTER the configured driver dependencies are ready (MongoTransport needs
-// registered ResizeTask; the default lock provider needs framework Lock), but BEFORE exposing
-// resolve/prewarm/enqueueRequired handlers, call `await resizer.prepareQueue()`. The scaffolded
-// ResizeWorker performs this preparation itself before consumption; a separate call there is safe
-// but redundant.
+// Queue indexes are declared by the scaffolded ResizeTask model and the framework Lock model.
+// Prepare those indexes in the host's normal migration/lifecycle process before exposing
+// producers or starting the separate ResizeWorker CLI. The resizer runtime does not create or
+// synchronize indexes.

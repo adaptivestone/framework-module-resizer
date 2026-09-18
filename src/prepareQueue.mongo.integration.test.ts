@@ -7,14 +7,16 @@ import {
 import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { getPreviewIdentity } from './images.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import ResizeTaskModel from './models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
+import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import { MongoTransport } from './transports/mongo.ts';
 
-const fakeStorage = {
+const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
-  upload: async () => ({ key: 'unused' }),
+  upload: async ({ key }) => ({ key }),
   publicUrl: () => '',
 };
 
@@ -22,25 +24,13 @@ function hasExactKey(key: unknown, expected: Record<string, number>): boolean {
   return JSON.stringify(key) === JSON.stringify(expected);
 }
 
-test('prepareQueue creates real Mongo queue and lock indexes idempotently', async (t) => {
-  let server: MongoMemoryServer | undefined;
-  let connection: mongoose.Connection | undefined;
-
-  t.after(async () => {
-    resetResizerForTests();
-    resetAppInstance();
-    await connection?.close().catch(() => {});
-    await server?.stop().catch(() => {});
-  });
-
-  server = await MongoMemoryServer.create();
-  const dbName = `prepare_queue_${process.pid}_${Date.now()}`;
-  connection = await mongoose
+async function createFixture(name: string) {
+  const server = await MongoMemoryServer.create();
+  const dbName = `resize_${name}_${process.pid}_${Date.now()}`;
+  const connection = await mongoose
     .createConnection(server.getUri(), { autoIndex: false, dbName })
     .asPromise();
 
-  // Mirror BaseModel.initialize with the real package/framework model definitions.
-  // autoIndex stays explicitly disabled so only prepareQueue may create secondaries.
   const taskSchema = new mongoose.Schema(ResizeTaskModel.modelSchema, {
     timestamps: true,
     minimize: false,
@@ -57,36 +47,27 @@ test('prepareQueue creates real Mongo queue and lock indexes idempotently', asyn
   LockModel.initHooks(lockSchema);
 
   const taskModel = connection.model(
-    `PrepareQueueResizeTask_${process.pid}`,
+    `ResizeTask_${name}_${process.pid}`,
     taskSchema,
-    'resize_tasks',
+    `resize_tasks_${name}_${process.pid}`,
   );
   const lockModel = connection.model(
-    `PrepareQueueLock_${process.pid}`,
+    `Lock_${name}_${process.pid}`,
     lockSchema,
-    'locks',
+    `locks_${name}_${process.pid}`,
   );
   await Promise.all([
     taskModel.createCollection(),
     lockModel.createCollection(),
   ]);
 
-  assert.deepEqual(
-    (await taskModel.collection.listIndexes().toArray()).map(({ key }) => key),
-    [{ _id: 1 }],
-  );
-  assert.deepEqual(
-    (await lockModel.collection.listIndexes().toArray()).map(({ key }) => key),
-    [{ _id: 1 }],
-  );
-
   setAppInstance({
     getConfig: () => ({ mediaModelName: 'File' }),
-    getModel: (name: string) => {
-      if (name === 'ResizeTask') {
+    getModel: (modelName: string) => {
+      if (modelName === 'ResizeTask') {
         return taskModel;
       }
-      if (name === 'Lock') {
+      if (modelName === 'Lock') {
         return lockModel;
       }
       return undefined;
@@ -94,74 +75,144 @@ test('prepareQueue creates real Mongo queue and lock indexes idempotently', asyn
     logger: { info() {}, warn() {}, error() {} },
   } as never);
 
-  const transport = new MongoTransport();
-  const makeResizer = () =>
-    new Resizer({
-      storage: fakeStorage,
-      transport,
-      lockProvider: new FrameworkLockProvider(),
+  return {
+    server,
+    connection,
+    taskModel,
+    lockModel,
+    transport: new MongoTransport(),
+    lockProvider: new FrameworkLockProvider(),
+  };
+}
+
+async function closeFixture(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+) {
+  resetResizerForTests();
+  resetAppInstance();
+  await fixture.connection.close().catch(() => {});
+  await fixture.server.stop().catch(() => {});
+}
+
+test('resizer operations do not create secondary indexes when autoIndex is disabled', async () => {
+  const fixture = await createFixture('no_effects');
+  try {
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    await fixture.transport.enqueue({
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '640x480', format: 'webp' }],
+    });
+    await fixture.lockProvider.acquire('resize_dispatch:test', 60_000);
+
+    assert.deepEqual(
+      (await fixture.taskModel.collection.listIndexes().toArray()).map(
+        ({ key }) => key,
+      ),
+      [{ _id: 1 }],
+    );
+    assert.deepEqual(
+      (await fixture.lockModel.collection.listIndexes().toArray()).map(
+        ({ key }) => key,
+      ),
+      [{ _id: 1 }],
+    );
+  } finally {
+    await closeFixture(fixture);
+  }
+});
+
+test('prepared indexes preserve concurrent enqueue deduplication', async () => {
+  const fixture = await createFixture('prepared');
+  try {
+    await Promise.all([
+      fixture.taskModel.createIndexes(),
+      fixture.lockModel.createIndexes(),
+    ]);
+
+    const taskIndexes = await fixture.taskModel.collection
+      .listIndexes()
+      .toArray();
+    const dedupe = taskIndexes.find(({ key }) =>
+      hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
+    );
+    assert.ok(dedupe, 'fixture should create the active-request dedupe index');
+    assert.equal(dedupe.unique, true);
+    assert.deepEqual(dedupe.partialFilterExpression, {
+      status: { $in: ['pending', 'processing'] },
+      requestKey: { $exists: true },
     });
 
-  const resizer = makeResizer();
-  await resizer.prepareQueue();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const request = {
+      mediaId,
+      pipeline: 'default',
+      previews: [{ sizeKey: '640x480', format: 'webp' as const }],
+    };
+    const receipts = await Promise.all(
+      Array.from({ length: 20 }, () => fixture.transport.enqueue(request)),
+    );
+    const taskIds = receipts.map(({ taskId }) => taskId);
+    assert.ok(taskIds.every((taskId) => typeof taskId === 'string' && taskId));
+    assert.equal(new Set(taskIds).size, 1);
+    assert.equal(
+      await fixture.taskModel.countDocuments({
+        fileId: mediaId,
+        status: { $in: ['pending', 'processing'] },
+      }),
+      1,
+    );
+  } finally {
+    await closeFixture(fixture);
+  }
+});
 
-  const taskIndexes = await taskModel.collection.listIndexes().toArray();
-  const dedupe = taskIndexes.find(({ key }) =>
-    hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
-  );
-  assert.ok(dedupe, 'active-request dedupe index should exist');
-  assert.deepEqual(dedupe.key, { fileId: 1, pipeline: 1, requestKey: 1 });
-  assert.equal(dedupe.unique, true);
-  assert.deepEqual(dedupe.partialFilterExpression, {
-    status: { $in: ['pending', 'processing'] },
-    requestKey: { $exists: true },
-  });
-
-  const lockIndexes = await lockModel.collection.listIndexes().toArray();
-  const ttl = lockIndexes.find(({ key }) => hasExactKey(key, { expiredAt: 1 }));
-  assert.ok(ttl, 'framework Lock TTL index should exist');
-  assert.deepEqual(ttl.key, { expiredAt: 1 });
-  assert.equal(ttl.expireAfterSeconds, 0);
-
-  const mediaId = new mongoose.Types.ObjectId().toString();
-  const request = {
-    mediaId,
-    pipeline: 'default',
-    previews: [{ sizeKey: '640x480', format: 'webp' as const }],
-  };
-  const receipts = await Promise.all(
-    Array.from({ length: 20 }, () => transport.enqueue(request)),
-  );
-  const taskIds = receipts.map(({ taskId }) => taskId);
-  assert.ok(taskIds.every((taskId) => typeof taskId === 'string' && taskId));
-  assert.equal(new Set(taskIds).size, 1);
-  assert.equal(
-    await taskModel.countDocuments({
+test('strict enqueue does not confirm a payload from a conflicting Mongo task', async () => {
+  const fixture = await createFixture('strict_conflict');
+  try {
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const conflictingPreviews = [
+      { sizeKey: '30w', format: 'webp' as const, requestedWidth: 20 },
+      { sizeKey: '30w', format: 'webp' as const, requestedWidth: 30 },
+    ];
+    await fixture.taskModel.create({
       fileId: mediaId,
-      status: { $in: ['pending', 'processing'] },
-    }),
-    1,
-  );
+      pipeline: 'default',
+      requestKey: 'legacy-conflicting-payload',
+      status: 'pending',
+      previews: conflictingPreviews,
+    });
 
-  // Same instance memoizes preparation; a fresh singleton must exercise both
-  // drivers again against the already-indexed database and remain successful.
-  await resizer.prepareQueue();
-  resetResizerForTests();
-  const secondResizer = makeResizer();
-  await secondResizer.prepareQueue();
+    const identity = getPreviewIdentity('30w', 'webp');
+    assert.equal(
+      await fixture.lockProvider.acquire(
+        `resize_dispatch:${mediaId}:${identity}`,
+        60_000,
+      ),
+      true,
+    );
 
-  const intactTaskIndexes = await taskModel.collection.listIndexes().toArray();
-  assert.ok(
-    intactTaskIndexes.some(
-      ({ key, unique }) =>
-        hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }) &&
-        unique === true,
-    ),
-  );
-  assert.ok(
-    (await lockModel.collection.listIndexes().toArray()).some(
-      ({ key, expireAfterSeconds }) =>
-        hasExactKey(key, { expiredAt: 1 }) && expireAfterSeconds === 0,
-    ),
-  );
+    const resizer = new Resizer({
+      storage,
+      transport: fixture.transport,
+      lockProvider: fixture.lockProvider,
+    });
+    const result = await resizer.enqueueRequired({
+      media: { id: mediaId, original: { key: 'original.jpg' } },
+      sizes: [{ width: 30 }],
+      formats: ['webp'],
+    });
+
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.accepted.length, 0);
+    assert.equal(result.unconfirmed.length, 1);
+    assert.equal(result.tasks.length, 0);
+    assert.ok(
+      result.issues.some(
+        (issue) => issue.code === 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
+      ),
+    );
+  } finally {
+    await closeFixture(fixture);
+  }
 });

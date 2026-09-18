@@ -96,33 +96,18 @@ a private original.
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
 
-7. Lazy / pre-warm producer processes: after the dependencies required by the configured
-   transport and lock provider are ready, but before exposing a code path that can enqueue
-   (`resolve`, `prewarm`, `enqueueRequired`), prepare the infrastructure. `MongoTransport` needs a
-   connected database and registered `ResizeTask`; the default `FrameworkLockProvider` needs the
-   registered framework `Lock`. SQS/custom transport with a custom lock provider may need neither:
-
-   ```ts
-   await resizer.prepareQueue();
-   ```
-
-   Preparation is idempotent. `MongoTransport` and the default `FrameworkLockProvider` call
-   `createIndexes()`, which requires database privileges and may take time. Index conflicts and
-   errors are surfaced; the module does not list/sync/drop/repair conflicting indexes. Hosts whose
-   migrations already guarantee the indexes may skip producer preparation. Eager-only without a
-   transport needs no preparation: `prepareQueue()` is a no-op and does not touch locks or the
-   framework app. SQS/custom transports without `prepare()` still prepare the default framework
-   Lock because a transport exists; SQS queues/redrive/credentials remain externally provisioned.
-   Preparation neither health-checks nor creates SQS, S3, buckets, IAM, or other external
-   resources.
-   Custom `QueueTransport` and `LockProvider` objects may implement optional, idempotent
-   `prepare(): Promise<void>`.
+7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model and
+   the framework's `Lock` model declare their indexes; the host's normal lifecycle or an explicit
+   migration must create them before `resolve`, `prewarm`, `enqueueRequired`, or the worker can
+   run. The module does not create, synchronize, drop, or repair indexes, and it has no
+   `prepareQueue()` API. The partial unique active-request index on `{ fileId, pipeline,
+   requestKey }` is required for the Mongo deduplication guarantee; verify it in the host's DB
+   rollout. Never add index creation to HTTP bootstrap or the first enqueue.
 
 8. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
-   The flag permits the command to run; it does not start a worker in the API. The standard
-   `runResizeWorker()` / scaffolded `ResizeWorker` prepares queue + lock infrastructure itself
-   before consumption; a separate worker-side call is redundant but safe.
+   The flag permits the command to run; it does not start a worker in the API. The worker consumes
+   indexes prepared by the host lifecycle; it does not create them.
    Eager mode needs no worker.
 
 ## Use

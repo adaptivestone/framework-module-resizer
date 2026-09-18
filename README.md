@@ -137,10 +137,12 @@ driver may return its own opaque locator key.
 
 Input bytes are stored unchanged. Raster metadata is probed with `sharp.metadata()` under the
 configured pixel guard, but no decode-to-output, rotation, EXIF rewrite, re-encode, or animation
-collapse occurs. SVG is parsed by a non-rendering XML scanner and is never passed to Sharp.
-DTD/entity declarations are rejected; sanitizing otherwise-valid SVG content remains the host's
-responsibility before calling this method. Percentage/relative SVG dimensions and a lone
-`viewBox` are not reported as pixel dimensions.
+collapse occurs. SVG is parsed by a strict, non-rendering XML parser and is never passed to Sharp.
+Malformed XML, duplicate attributes, unknown/invalid entities, trailing document data, and all
+DTD/entity declarations are rejected before storage; sanitizing otherwise-valid SVG content
+remains the host's responsibility before calling this method. Pixel dimensions come from valid
+`width`/`height` values, falling back to the width/height components of `viewBox` when needed;
+percentage and other relative lengths remain unset.
 
 Failures are typed: malformed/unsupported/over-limit input throws `ResizeOriginalError`; storage
 I/O throws `ResizeStorageError` with code `RESIZE_ORIGINAL_UPLOAD_FAILED` and the driver error as
@@ -188,34 +190,18 @@ export const resizer = new Resizer({
 });
 ```
 
-In each **producer** process, prepare the queue after the dependencies required by its configured
-transport and lock provider are ready, but before serving any code path that may enqueue
-(`resolve()`, `prewarm()`, or `enqueueRequired()`). For the built-in Mongo transport this means a
-connected database and a registered `ResizeTask` model; the default `FrameworkLockProvider` also
-requires the framework `Lock` model. SQS/custom transport plus a custom lock provider may require
-neither model.
+Queue indexes are a lifecycle concern, not a resizer runtime operation. The package declares the
+required `ResizeTask` indexes, and the framework declares the `Lock` indexes; the host's normal
+model lifecycle or an explicit database migration must create them before producers and workers
+run. The module does not expose `prepareQueue()`, call `createIndexes()`, synchronize/drop indexes,
+or create any external queue/storage resource. In particular, do not put index creation in HTTP
+bootstrap, the first enqueue, or the worker command.
 
-```ts
-// Generic producer bootstrap: configured driver dependencies are ready.
-await resizer.prepareQueue();
-// Only now expose handlers that can enqueue resize work.
-```
-
-`prepareQueue()` is idempotent, so custom transports and lock providers may expose their own
-optional, idempotent `prepare()` implementations. The built-in Mongo transport and default
-`FrameworkLockProvider` call their models' `createIndexes()`. That requires database privileges
-and may take time on an existing collection; index conflicts and other errors are surfaced for
-the host to handle, never repaired by listing, syncing, dropping, or replacing indexes. A host
-whose migration system already guarantees these indexes may deliberately skip producer-side
-preparation.
-
-The standard `runResizeWorker()` / scaffolded `ResizeWorker` performs this preparation before it
-starts consuming, so a separate worker-side call is redundant (though safe). With no transport
-(the normal eager-only setup), `prepareQueue()` is a no-op and does not touch the default lock
-provider or the framework app. With SQS or a custom transport that omits `prepare()`, the default
-framework lock indexes are still prepared because a transport is configured. This API does
-**not** create or health-check SQS queues/redrive policies, S3 buckets, IAM, credentials, or any
-other external resource; provision those outside this module.
+The active-request partial unique index on `{ fileId, pipeline, requestKey }` is what guarantees
+deduplication of identical active tasks. Without that index, enqueue remains at-least-once and
+concurrent identical requests are not guaranteed to collapse to one row. Prepare the database
+through the host's migration/lifecycle process and verify the exact model declarations there;
+never run a destructive global `syncIndexes()` automatically.
 
 **Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
 
@@ -319,8 +305,9 @@ const result = await resizer.enqueueRequired({ media, sizes: catalog, pipeline: 
 `prewarm()` remains best-effort and never throws for compatibility. In contrast,
 `enqueueRequired()` never treats a held dispatch lock as proof that a task exists. Mongo can query
 active task payloads through `findActive()` and prove coverage after a lock race only when the
-complete canonical variant payload matches. Two different payloads that collapse to one preview
-identity are reported as a non-retryable conflict instead of being guessed. SQS confirms a
+complete canonical variant payload matches. Each active receipt is checked in full before any
+requested payload is matched: two different payloads that collapse to one preview identity are
+reported as a non-retryable conflict instead of being guessed. SQS confirms a
 successful send by its `MessageId`, but cannot query another producer's message; a lock loser is
 therefore `incomplete` and safely retryable. Custom transports may implement `findActive()` or
 accept the same explicit limitation. These are at-least-once systems—this API does not promise

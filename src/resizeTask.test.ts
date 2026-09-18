@@ -1287,21 +1287,16 @@ describe('runResizeWorker', () => {
   test('worker.enabled=false → clean no-op (startWorker NOT called); log says how to enable', async () => {
     const { logs } = installApp(); // default worker.enabled is false
     let started = false;
-    let prepared = false;
     new Resizer({
       storage: makeStorage(redPng).storage,
       transport: {
         ...fakeTransport(() => {
           started = true;
         }),
-        prepare: async () => {
-          prepared = true;
-        },
       },
     });
     await runResizeWorker();
     assert.equal(started, false);
-    assert.equal(prepared, false);
     assert.ok(
       logs.info.some((l) => String(l[0]).includes('worker.enabled=true')),
     );
@@ -1315,129 +1310,6 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
     assert.equal(getModelCalls(), 0);
-  });
-
-  test('awaits queue preparation completely before starting the transport worker', async () => {
-    installApp({ worker: { enabled: true } });
-    let markPreparationStarted: (() => void) | undefined;
-    const preparationStarted = new Promise<void>((resolve) => {
-      markPreparationStarted = resolve;
-    });
-    let releasePreparation: (() => void) | undefined;
-    const preparationPending = new Promise<void>((resolve) => {
-      releasePreparation = resolve;
-    });
-    const order: string[] = [];
-    const transport: QueueTransport = {
-      ...fakeTransport(() => {
-        order.push('worker:start');
-      }),
-      prepare: async () => {
-        order.push('prepare:start');
-        markPreparationStarted?.();
-        await preparationPending;
-        order.push('prepare:end');
-      },
-    };
-    new Resizer({
-      storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
-    });
-
-    const sigtermListenersBefore = process.listenerCount('SIGTERM');
-    const sigintListenersBefore = process.listenerCount('SIGINT');
-    const running = runResizeWorker();
-    await preparationStarted;
-    assert.deepEqual(order, ['prepare:start']);
-
-    releasePreparation?.();
-    await running;
-    assert.deepEqual(order, ['prepare:start', 'prepare:end', 'worker:start']);
-    assert.equal(process.listenerCount('SIGTERM'), sigtermListenersBefore);
-    assert.equal(process.listenerCount('SIGINT'), sigintListenersBefore);
-  });
-
-  test('shutdown during preparation skips consumption and removes signal listeners', async () => {
-    installApp({ worker: { enabled: true } });
-    let markPreparationStarted: (() => void) | undefined;
-    const preparationStarted = new Promise<void>((resolve) => {
-      markPreparationStarted = resolve;
-    });
-    let releasePreparation: (() => void) | undefined;
-    const preparationPending = new Promise<void>((resolve) => {
-      releasePreparation = resolve;
-    });
-    let started = false;
-    const transport: QueueTransport = {
-      ...fakeTransport(() => {
-        started = true;
-      }),
-      prepare: async () => {
-        markPreparationStarted?.();
-        await preparationPending;
-      },
-    };
-    new Resizer({
-      storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
-    });
-
-    const sigtermListenersBefore = process.listeners('SIGTERM');
-    const sigintCountBefore = process.listenerCount('SIGINT');
-    const running = runResizeWorker();
-    await preparationStarted;
-    const registeredShutdownHandlers = process
-      .listeners('SIGTERM')
-      .filter((listener) => !sigtermListenersBefore.includes(listener));
-    assert.equal(registeredShutdownHandlers.length, 1);
-
-    registeredShutdownHandlers[0]?.();
-    releasePreparation?.();
-    await running;
-
-    assert.equal(started, false);
-    assert.deepEqual(process.listeners('SIGTERM'), sigtermListenersBefore);
-    assert.equal(process.listenerCount('SIGINT'), sigintCountBefore);
-  });
-
-  test('preparation rejection reaches the caller and prevents worker start and stop logging', async () => {
-    const { logs } = installApp({ worker: { enabled: true } });
-    const cause = new Error('queue unavailable');
-    let started = false;
-    const transport: QueueTransport = {
-      ...fakeTransport(() => {
-        started = true;
-      }),
-      prepare: async () => {
-        throw cause;
-      },
-    };
-    new Resizer({
-      storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
-    });
-
-    const sigtermListenersBefore = process.listenerCount('SIGTERM');
-    const sigintListenersBefore = process.listenerCount('SIGINT');
-    await assert.rejects(runResizeWorker(), (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.equal(
-        (error as { code?: unknown }).code,
-        'RESIZE_QUEUE_PREPARE_FAILED',
-      );
-      assert.equal(error.cause, cause);
-      return true;
-    });
-    assert.equal(started, false);
-    assert.equal(
-      logs.info.some((entry) => entry[0] === 'resize worker stopped'),
-      false,
-    );
-    assert.equal(process.listenerCount('SIGTERM'), sigtermListenersBefore);
-    assert.equal(process.listenerCount('SIGINT'), sigintListenersBefore);
   });
 
   test('enabled + transport → startWorker gets a handler that reaches processTask', async () => {

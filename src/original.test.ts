@@ -190,7 +190,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
 });
 
 describe('uploadOriginal — SVG pass-through', () => {
-  test('parses XML SVG without rasterizing and omits relative/viewBox-only dimensions', async () => {
+  test('parses XML SVG without rasterizing and uses viewBox for missing dimensions', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
     let queueCalls = 0;
@@ -210,11 +210,70 @@ describe('uploadOriginal — SVG pass-through', () => {
     assert.equal(original.format, 'svg');
     assert.equal(original.contentType, 'image/svg+xml');
     assert.equal(original.width, 120);
-    assert.equal(original.height, undefined);
+    assert.equal(original.height, 100);
     assert.equal(original.size, body.byteLength);
     assert.match(original.key, /^originals\/[a-f0-9]{32}\.svg$/);
     assert.deepEqual(uploads[0].body, body);
     assert.equal(queueCalls, 0);
+  });
+
+  test('rejects malformed XML before storage', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const fixtures = [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="10"height="10"/>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><text>&unknown;</text></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><text>A & B</text></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg" data-label="A & B"/>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><g></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg"/><svg xmlns="http://www.w3.org/2000/svg"/>',
+      '<svg xmlns="http://www.w3.org/2000/svg" width="10" width="20"/>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><text>&#x110000;</text></svg>',
+      '<!DOCTYPE svg [<!ENTITY xxe "blocked">]><svg>&xxe;</svg>',
+      '<!DOCTYPE svg SYSTEM "file:///etc/passwd"><svg/>',
+      '<svg xmlns="http://www.w3.org/2000/svg"/>trailing',
+    ];
+
+    for (const fixture of fixtures) {
+      await assert.rejects(
+        () =>
+          r.uploadOriginal({
+            body: Buffer.from(fixture),
+            visibility: 'private',
+          }),
+        (error: unknown) =>
+          error instanceof ResizeOriginalError &&
+          error.code ===
+            (fixture.startsWith('<!DOCTYPE')
+              ? 'RESIZE_ORIGINAL_SVG_DTD_FORBIDDEN'
+              : 'RESIZE_ORIGINAL_SVG_INVALID'),
+      );
+    }
+    assert.equal(uploads.length, 0);
+  });
+
+  test('accepts standard and numeric entities, comments, CDATA, and a prefixed SVG namespace', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const body = Buffer.from(
+      '<svg:svg xmlns:svg="http://www.w3.org/2000/svg" viewBox="0,0,40,20"><!-- comment --><svg:text><![CDATA[A & B]]></svg:text><svg:title>&amp; &#x42;</svg:title></svg:svg>',
+    );
+    const original = await r.uploadOriginal({ body, visibility: 'public' });
+
+    assert.equal(original.width, 40);
+    assert.equal(original.height, 20);
+    assert.deepEqual(uploads[0].body, body);
+
+    const legacyBody = Buffer.from('<svg width="13" height="8"/>');
+    const legacyOriginal = await r.uploadOriginal({
+      body: legacyBody,
+      visibility: 'public',
+    });
+    assert.equal(legacyOriginal.width, 13);
+    assert.equal(legacyOriginal.height, 8);
+    assert.deepEqual(uploads[1].body, legacyBody);
   });
 
   test('rejects DTD/entities and malformed non-SVG XML before storage', async () => {

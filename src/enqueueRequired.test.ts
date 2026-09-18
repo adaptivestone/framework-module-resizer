@@ -334,6 +334,175 @@ describe('enqueueRequired — lock races and retries', () => {
     assert.equal(enqueueCalls, 0);
   });
 
+  for (const [label, override] of [
+    ['requestedHeight', { requestedHeight: 301 }],
+    ['fit', { fit: true }],
+  ] as const) {
+    test(`rejects a ${label} conflict for one preview identity`, async () => {
+      installApp();
+      let enqueueCalls = 0;
+      const transport: QueueTransport = {
+        enqueue: async () => {
+          enqueueCalls++;
+          return { taskId: 'unexpected' };
+        },
+        startWorker: async () => {},
+      };
+      const r = new Resizer({
+        storage,
+        transport,
+        lockProvider: locks().lockProvider,
+        hooks: {
+          beforeEnqueue: (missing) =>
+            missing[0] ? [...missing, { ...missing[0], ...override }] : missing,
+        },
+      });
+
+      const result = await r.enqueueRequired({
+        media: { id: `m-${label}`, original: { key: 'x.jpg' } },
+        sizes: [{ width: 300, height: 300 }],
+        formats: ['jpeg'],
+      });
+
+      assert.equal(result.status, 'incomplete');
+      assert.equal(result.accepted.length, 0);
+      assert.equal(result.unconfirmed.length, 2);
+      assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_VARIANT_CONFLICT');
+      assert.equal(enqueueCalls, 0);
+    });
+  }
+
+  test('deduplicates identical payloads before strict confirmation', async () => {
+    installApp();
+    const calls: MissingPreview[][] = [];
+    const transport: QueueTransport = {
+      enqueue: async ({ previews }) => {
+        calls.push(previews);
+        return { taskId: 'same-payload' };
+      },
+      startWorker: async () => {},
+    };
+    const r = new Resizer({
+      storage,
+      transport,
+      lockProvider: locks().lockProvider,
+      hooks: {
+        beforeEnqueue: (missing) =>
+          missing[0] ? [...missing, missing[0]] : missing,
+      },
+    });
+
+    const result = await r.enqueueRequired({
+      media: { id: 'm-same', original: { key: 'x.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.accepted.length, 1);
+    assert.equal(calls[0]?.length, 1);
+    assert.equal(result.issues.length, 0);
+  });
+
+  test('keeps different filter payloads as separate identities', async () => {
+    installApp();
+    const transport: QueueTransport = {
+      enqueue: async () => ({ taskId: 'filtered' }),
+      startWorker: async () => {},
+    };
+    const r = new Resizer({
+      storage,
+      transport,
+      lockProvider: locks().lockProvider,
+      hooks: {
+        beforeEnqueue: (missing) =>
+          missing[0]
+            ? [...missing, { ...missing[0], filters: { tone: 'warm' } }]
+            : missing,
+      },
+    });
+
+    const result = await r.enqueueRequired({
+      media: { id: 'm-filters', original: { key: 'x.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.accepted.length, 2);
+    assert.equal(result.issues.length, 0);
+  });
+
+  test('does not confirm a requested payload from a conflicting active receipt', async () => {
+    installApp();
+    const requested = taskPreview('webp');
+    const transport: QueueTransport = {
+      enqueue: async () => ({ taskId: 'unexpected' }),
+      findActive: async () => [
+        {
+          taskId: 'active-conflict',
+          previews: [requested, { ...requested, requestedWidth: 20 }],
+        },
+      ],
+      startWorker: async () => {},
+    };
+    const r = new Resizer({
+      storage,
+      transport,
+      lockProvider: locks(false).lockProvider,
+    });
+
+    const result = await r.enqueueRequired({
+      media: { id: 'm1', original: { key: 'x.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['webp'],
+    });
+
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.accepted.length, 0);
+    assert.equal(result.unconfirmed.length, 1);
+    assert.equal(result.tasks.length, 0);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_VARIANT_CONFLICT');
+    assert.deepEqual(result.issues[0].previews, [requested]);
+  });
+
+  test('conflicting receipt does not block a separate correct active receipt', async () => {
+    installApp();
+    const jpeg = taskPreview('jpeg');
+    const webp = taskPreview('webp');
+    const transport: QueueTransport = {
+      enqueue: async () => ({ taskId: 'unexpected' }),
+      findActive: async () => [
+        {
+          taskId: 'active-conflict',
+          previews: [jpeg, { ...jpeg, requestedWidth: 20 }],
+        },
+        { taskId: 'active-correct', previews: [webp] },
+      ],
+      startWorker: async () => {},
+    };
+    const r = new Resizer({
+      storage,
+      transport,
+      lockProvider: locks(false).lockProvider,
+    });
+
+    const result = await r.enqueueRequired({
+      media: { id: 'm-separate', original: { key: 'x.jpg' } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.accepted, [webp]);
+    assert.deepEqual(result.unconfirmed, [jpeg]);
+    assert.deepEqual(result.tasks, [
+      { taskId: 'active-correct', previews: [webp] },
+    ]);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_VARIANT_CONFLICT');
+    assert.deepEqual(result.issues[0].previews, [jpeg]);
+  });
+
   test('an enqueue failure releases its lock and a later call can safely retry', async () => {
     installApp();
     let calls = 0;

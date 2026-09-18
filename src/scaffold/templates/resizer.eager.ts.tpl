@@ -22,5 +22,4 @@ export const resizer = new Resizer({
   // hooks: { formatPublicUrls: (decision, ctx) => formatPictureUrls(decision, { id: String(ctx.id) }) },
 });
 
-// Eager-only has no transport, so queue preparation is unnecessary. Calling
-// `await resizer.prepareQueue()` would be a no-op and would not touch framework locks/app state.
+// Eager-only has no transport or worker. Queue indexes are not involved in this mode.

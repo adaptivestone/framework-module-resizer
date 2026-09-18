@@ -31,12 +31,6 @@ export async function runResizeWorker(): Promise<void> {
   process.once('SIGINT', abort);
 
   try {
-    await resizer.prepareQueue();
-    // A shutdown received while infrastructure was preparing must not begin consumption.
-    if (controller.signal.aborted) {
-      return;
-    }
-
     // Tune sharp ONCE for a concurrent worker: keep worker.concurrency × sharp.concurrency ≈ nCPU
     // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
     sharp.concurrency(config.worker.sharpConcurrency);

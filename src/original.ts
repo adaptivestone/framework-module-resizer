@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import sharp, { type Metadata } from 'sharp';
 import { getResizeConfig } from './config/resize.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
@@ -18,178 +19,28 @@ interface PreparedOriginal {
   height?: number;
 }
 
-interface ParsedTag {
-  name: string;
-  attributes: Map<string, string>;
-  end: number;
-  selfClosing: boolean;
+interface StrictXmlTag {
+  local?: string;
+  uri?: string;
+  attributes: Record<string, { value: string }>;
 }
 
-const XML_NAME = /^[A-Za-z_][A-Za-z0-9_.:-]*/;
+interface StrictXmlParser {
+  on(name: 'doctype', handler: () => void): void;
+  on(name: 'opentag', handler: (tag: StrictXmlTag) => void): void;
+  on(name: 'error', handler: (error: Error) => void): void;
+  write(chunk: string): this;
+  close(): this;
+}
+
+const { SaxesParser } = createRequire(import.meta.url)('saxes') as {
+  SaxesParser: new (options: { xmlns: true }) => StrictXmlParser;
+};
+
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 
 function asBuffer(body: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(body) ? body : Buffer.from(body);
-}
-
-function skipWhitespace(text: string, from: number): number {
-  let i = from;
-  while (i < text.length && /\s/u.test(text[i])) {
-    i++;
-  }
-  return i;
-}
-
-function markupEnd(text: string, from: number): number {
-  let quote: '"' | "'" | undefined;
-  for (let i = from; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (ch === quote) {
-        quote = undefined;
-      }
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-    } else if (ch === '>') {
-      return i;
-    }
-  }
-  throw new ResizeOriginalError('resize uploadOriginal: unterminated XML tag', {
-    code: 'RESIZE_ORIGINAL_SVG_INVALID',
-  });
-}
-
-function parseStartTag(text: string, start: number): ParsedTag {
-  const end = markupEnd(text, start + 1);
-  let inner = text.slice(start + 1, end);
-  const selfClosing = /\/\s*$/u.test(inner);
-  if (selfClosing) {
-    inner = inner.replace(/\/\s*$/u, '');
-  }
-  let at = skipWhitespace(inner, 0);
-  const nameMatch = XML_NAME.exec(inner.slice(at));
-  if (!nameMatch) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: invalid XML element name',
-      {
-        code: 'RESIZE_ORIGINAL_SVG_INVALID',
-      },
-    );
-  }
-  const name = nameMatch[0];
-  at += name.length;
-  const attributes = new Map<string, string>();
-  while (at < inner.length) {
-    at = skipWhitespace(inner, at);
-    if (at >= inner.length) {
-      break;
-    }
-    const attributeMatch = XML_NAME.exec(inner.slice(at));
-    if (!attributeMatch) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: invalid SVG attribute syntax',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    const attribute = attributeMatch[0];
-    at += attribute.length;
-    at = skipWhitespace(inner, at);
-    if (inner[at] !== '=') {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: SVG attributes must have quoted values',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    at = skipWhitespace(inner, at + 1);
-    const quote = inner[at];
-    if (quote !== '"' && quote !== "'") {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: SVG attributes must have quoted values',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    const valueEnd = inner.indexOf(quote, at + 1);
-    if (valueEnd < 0) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: unterminated SVG attribute value',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    if (attributes.has(attribute)) {
-      throw new ResizeOriginalError(
-        `resize uploadOriginal: duplicate SVG attribute ${attribute}`,
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    attributes.set(attribute, inner.slice(at + 1, valueEnd));
-    at = valueEnd + 1;
-  }
-  return { name, attributes, end: end + 1, selfClosing };
-}
-
-function parseEndTag(
-  text: string,
-  start: number,
-): { name: string; end: number } {
-  const close = text.indexOf('>', start + 2);
-  if (close < 0) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: unterminated XML closing tag',
-      {
-        code: 'RESIZE_ORIGINAL_SVG_INVALID',
-      },
-    );
-  }
-  const body = text.slice(start + 2, close).trim();
-  if (!XML_NAME.test(body) || XML_NAME.exec(body)?.[0] !== body) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: invalid XML closing tag',
-      {
-        code: 'RESIZE_ORIGINAL_SVG_INVALID',
-      },
-    );
-  }
-  return { name: body, end: close + 1 };
-}
-
-function skipSpecialMarkup(text: string, start: number): number | undefined {
-  if (text.startsWith('<!--', start)) {
-    const end = text.indexOf('-->', start + 4);
-    if (end < 0) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: unterminated XML comment',
-        {
-          code: 'RESIZE_ORIGINAL_SVG_INVALID',
-        },
-      );
-    }
-    return end + 3;
-  }
-  if (text.startsWith('<?', start)) {
-    const end = text.indexOf('?>', start + 2);
-    if (end < 0) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: unterminated XML processing instruction',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    return end + 2;
-  }
-  if (text.startsWith('<![CDATA[', start)) {
-    const end = text.indexOf(']]>', start + 9);
-    if (end < 0) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: unterminated CDATA section',
-        {
-          code: 'RESIZE_ORIGINAL_SVG_INVALID',
-        },
-      );
-    }
-    return end + 3;
-  }
-  return undefined;
 }
 
 function parsePixelLength(value: string | undefined): number | undefined {
@@ -206,132 +57,79 @@ function parsePixelLength(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function parseViewBox(value: string | undefined): {
+  width?: number;
+  height?: number;
+} {
+  if (value === undefined) {
+    return {};
+  }
+  const numbers = value
+    .trim()
+    .split(/[\s,]+/u)
+    .map(Number);
+  if (
+    numbers.length !== 4 ||
+    numbers.some((number) => !Number.isFinite(number)) ||
+    numbers[2] <= 0 ||
+    numbers[3] <= 0
+  ) {
+    return {};
+  }
+  return { width: numbers[2], height: numbers[3] };
+}
+
 function parseSvg(text: string): PreparedOriginal {
-  if (/<!DOCTYPE\b|<!ENTITY\b/iu.test(text)) {
+  let root: StrictXmlTag | undefined;
+  try {
+    const parser = new SaxesParser({ xmlns: true });
+    parser.on('doctype', () => {
+      throw new ResizeOriginalError(
+        'resize uploadOriginal: SVG DTD and entity declarations are not allowed',
+        { code: 'RESIZE_ORIGINAL_SVG_DTD_FORBIDDEN' },
+      );
+    });
+    parser.on('opentag', (tag) => {
+      if (root === undefined) {
+        root = tag;
+      }
+    });
+    parser.on('error', (error) => {
+      throw error;
+    });
+    parser.write(text).close();
+  } catch (cause) {
+    if (cause instanceof ResizeOriginalError) {
+      throw cause;
+    }
     throw new ResizeOriginalError(
-      'resize uploadOriginal: SVG DTD and entity declarations are not allowed',
-      { code: 'RESIZE_ORIGINAL_SVG_DTD_FORBIDDEN' },
-    );
-  }
-  if (text.includes('\0')) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: SVG contains NUL bytes',
-      {
-        code: 'RESIZE_ORIGINAL_SVG_INVALID',
-      },
+      'resize uploadOriginal: SVG XML is not well-formed',
+      { code: 'RESIZE_ORIGINAL_SVG_INVALID', cause },
     );
   }
 
-  let at = skipWhitespace(text.replace(/^\uFEFF/u, ''), 0);
-  const source = text.replace(/^\uFEFF/u, '');
-  for (;;) {
-    const skipped = skipSpecialMarkup(source, at);
-    if (skipped === undefined || source.startsWith('<![CDATA[', at)) {
-      break;
-    }
-    at = skipWhitespace(source, skipped);
+  const parsedRoot = root;
+  if (parsedRoot === undefined) {
+    throw new ResizeOriginalError(
+      'resize uploadOriginal: XML root is not an SVG element',
+      { code: 'RESIZE_ORIGINAL_NOT_SVG' },
+    );
   }
   if (
-    source[at] !== '<' ||
-    source.startsWith('</', at) ||
-    source.startsWith('<!', at)
+    parsedRoot.local?.toLowerCase() !== 'svg' ||
+    (parsedRoot.uri !== '' && parsedRoot.uri !== SVG_NAMESPACE)
   ) {
     throw new ResizeOriginalError(
       'resize uploadOriginal: XML root is not an SVG element',
-      {
-        code: 'RESIZE_ORIGINAL_NOT_SVG',
-      },
-    );
-  }
-  const root = parseStartTag(source, at);
-  const colon = root.name.indexOf(':');
-  const localName = colon < 0 ? root.name : root.name.slice(colon + 1);
-  const namespace =
-    colon < 0
-      ? root.attributes.get('xmlns')
-      : root.attributes.get(`xmlns:${root.name.slice(0, colon)}`);
-  if (
-    localName.toLowerCase() !== 'svg' ||
-    (namespace !== undefined && namespace !== SVG_NAMESPACE) ||
-    (colon >= 0 && namespace === undefined)
-  ) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: XML root is not an SVG element',
-      {
-        code: 'RESIZE_ORIGINAL_NOT_SVG',
-      },
+      { code: 'RESIZE_ORIGINAL_NOT_SVG' },
     );
   }
 
-  const stack = root.selfClosing ? [] : [root.name];
-  at = root.end;
-  let rootClosed = root.selfClosing;
-  while (at < source.length) {
-    if (source[at] !== '<') {
-      const next = source.indexOf('<', at);
-      const end = next < 0 ? source.length : next;
-      if (rootClosed && source.slice(at, end).trim() !== '') {
-        throw new ResizeOriginalError(
-          'resize uploadOriginal: data appears after the SVG root element',
-          { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-        );
-      }
-      at = end;
-      continue;
-    }
-    const skipped = skipSpecialMarkup(source, at);
-    if (skipped !== undefined) {
-      if (rootClosed && source.startsWith('<![CDATA[', at)) {
-        throw new ResizeOriginalError(
-          'resize uploadOriginal: CDATA appears outside the SVG root element',
-          { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-        );
-      }
-      at = skipped;
-      continue;
-    }
-    if (source.startsWith('<!', at)) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: unsupported SVG declaration',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    if (source.startsWith('</', at)) {
-      const closing = parseEndTag(source, at);
-      const expected = stack.pop();
-      if (closing.name !== expected) {
-        throw new ResizeOriginalError(
-          `resize uploadOriginal: mismatched SVG closing tag ${closing.name}`,
-          { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-        );
-      }
-      rootClosed = stack.length === 0;
-      at = closing.end;
-      continue;
-    }
-    if (rootClosed) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: multiple XML root elements are not allowed',
-        { code: 'RESIZE_ORIGINAL_SVG_INVALID' },
-      );
-    }
-    const child = parseStartTag(source, at);
-    if (!child.selfClosing) {
-      stack.push(child.name);
-    }
-    at = child.end;
-  }
-  if (!rootClosed || stack.length > 0) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: unclosed SVG element',
-      {
-        code: 'RESIZE_ORIGINAL_SVG_INVALID',
-      },
-    );
-  }
-
-  const width = parsePixelLength(root.attributes.get('width'));
-  const height = parsePixelLength(root.attributes.get('height'));
+  const attribute = (name: string): string | undefined =>
+    parsedRoot.attributes[name]?.value;
+  const viewBox = parseViewBox(attribute('viewBox'));
+  const width = parsePixelLength(attribute('width')) ?? viewBox.width;
+  const height = parsePixelLength(attribute('height')) ?? viewBox.height;
   return {
     format: 'svg',
     contentType: 'image/svg+xml',
