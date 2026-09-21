@@ -222,7 +222,8 @@ npm run cli ResizeWorker
 ```
 
 `worker.enabled` permits the command to run; it does not start a worker inside the API. The
-command prepares the configured queue/lock drivers before consumption.
+command assumes the host lifecycle or an explicit migration has already prepared the configured
+queue/lock indexes before consumption.
 
 Your media model (`File`/`Media`) must carry `original` (incl. `width`/`height`) and `previews[]`
 (incl. `filters`/`fit`). That schema is host-owned; to avoid hand-written drift the module exports

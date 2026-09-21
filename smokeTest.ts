@@ -89,12 +89,12 @@ for (const driver of [
   assert.ok(!(driver in mod), 'driver must stay subpath-only, not on main entry: ' + driver);
 }
 assert.equal(
-  typeof mod.Resizer.prototype.prepareQueue,
-  'function',
-  'Resizer.prototype.prepareQueue must exist at runtime',
+  'prepareQueue' in mod.Resizer.prototype,
+  false,
+  'Resizer.prototype.prepareQueue must not exist at runtime',
 );
 console.log('  ok  main entry: ' + expected.length + ' core exports, no driver leakage');
-console.log('  ok  Resizer.prototype.prepareQueue exists');
+console.log('  ok  Resizer has no runtime queue preparation API');
 
 // (b) optional AWS-backed subpaths must FAIL loudly (module-not-found naming the SDK).
 const optional = [
@@ -135,16 +135,16 @@ for (const [sub, exp] of safe) {
 const { MongoTransport } = await import(PKG + '/transports/mongo.js');
 const { FrameworkLockProvider } = await import(PKG + '/locks/framework.js');
 assert.equal(
-  typeof MongoTransport.prototype.prepare,
-  'function',
-  'MongoTransport.prototype.prepare must exist at runtime',
+  'prepare' in MongoTransport.prototype,
+  false,
+  'MongoTransport.prototype.prepare must not exist at runtime',
 );
 assert.equal(
-  typeof FrameworkLockProvider.prototype.prepare,
-  'function',
-  'FrameworkLockProvider.prototype.prepare must exist at runtime',
+  'prepare' in FrameworkLockProvider.prototype,
+  false,
+  'FrameworkLockProvider.prototype.prepare must not exist at runtime',
 );
-console.log('  ok  MongoTransport + FrameworkLockProvider runtime prepare methods exist');
+console.log('  ok  MongoTransport + FrameworkLockProvider have no runtime preparation methods');
 `;
 
 const CHECK_AWS = `import assert from 'node:assert/strict';
@@ -171,29 +171,18 @@ import { MongoTransport } from '@adaptivestone/framework-module-resize/transport
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends
   (<T>() => T extends B ? 1 : 2) ? true : false;
-type OptionalPrepare = (() => Promise<void>) | undefined;
+type ResizerHasPrepareQueue = 'prepareQueue' extends keyof Resizer ? true : false;
+type QueueHasPrepare = 'prepare' extends keyof QueueTransport ? true : false;
+type LockHasPrepare = 'prepare' extends keyof LockProvider ? true : false;
 
-declare const resizer: Resizer;
-declare const mongo: MongoTransport;
-declare const frameworkLock: FrameworkLockProvider;
-
-const resizerPreparation: Promise<void> = resizer.prepareQueue();
-const mongoPreparation: Promise<void> = mongo.prepare();
-const lockPreparation: Promise<void> = frameworkLock.prepare();
-
-const queuePrepareType: Equal<QueueTransport['prepare'], OptionalPrepare> = true;
-const lockPrepareType: Equal<LockProvider['prepare'], OptionalPrepare> = true;
-const queuePrepareIsOptional: {} extends Pick<QueueTransport, 'prepare'> ? true : false = true;
-const lockPrepareIsOptional: {} extends Pick<LockProvider, 'prepare'> ? true : false = true;
+const resizerHasPrepareQueue: Equal<ResizerHasPrepareQueue, false> = true;
+const queueHasPrepare: Equal<QueueHasPrepare, false> = true;
+const lockHasPrepare: Equal<LockHasPrepare, false> = true;
 
 void [
-  resizerPreparation,
-  mongoPreparation,
-  lockPreparation,
-  queuePrepareType,
-  lockPrepareType,
-  queuePrepareIsOptional,
-  lockPrepareIsOptional,
+  resizerHasPrepareQueue,
+  queueHasPrepare,
+  lockHasPrepare,
 ];
 `;
 
@@ -311,7 +300,7 @@ try {
     consumer,
   );
   console.log(
-    '  ok  installed declarations type-check prepareQueue + optional/concrete prepare methods',
+    '  ok  installed declarations type-check without runtime preparation APIs',
   );
 
   // (a) main entry imports + exposes the core exports, (b) optional subpaths fail loudly
