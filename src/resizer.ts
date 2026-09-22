@@ -18,6 +18,7 @@ import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
 import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import { uploadOriginalImpl } from './original.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
 // Transport + storage contracts (05 · §10.1, §10.4) now live in their own files —
 // transports/AbstractTransport.ts + storage/AbstractStorage.ts — so the optional-peer drivers
@@ -203,6 +204,10 @@ export class Resizer {
         { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
+    // Resolve and validate the framework-loaded config before claiming the singleton.
+    // This makes configuration failures boot-time failures and leaves retry possible after
+    // the host corrects its config.
+    getResizeConfig();
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;

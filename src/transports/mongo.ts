@@ -11,11 +11,11 @@
 // contract comes from ./AbstractTransport.ts (not resizer.ts); no optional deps, so importing
 // this driver is always safe (05 · §10.2).
 import { getApp } from '../app.ts';
-import { getResizeConfig } from '../config/resize.ts';
 import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
 import { ResizeError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
+import { getResizeConfig } from '../resizeConfig.ts';
 import { getResizer } from '../resizer.ts';
 import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
 import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';

@@ -62,6 +62,11 @@ describe('runScaffold — default run', () => {
     assert.match(resizer, /new Resizer\(/);
     assert.match(
       resizer,
+      /await import\('\.\/resizer\.ts'\)/,
+      'bootstrap guidance must use a dynamic import after Server.init()',
+    );
+    assert.match(
+      resizer,
       /Queue indexes are declared[\s\S]+normal migration\/lifecycle process[\s\S]+does not create or[\s\S]+synchronize indexes/,
     );
     assert.match(await read(MODEL), /extends ResizeTaskModel/);
@@ -160,6 +165,11 @@ describe('runScaffold — --eager', () => {
     assert.equal(await exists(COMMAND), false);
 
     const resizer = await read(RESIZER);
+    assert.match(
+      resizer,
+      /await import\('\.\/resizer\.ts'\)/,
+      'eager bootstrap guidance must use a dynamic import after Server.init()',
+    );
     assert.doesNotMatch(resizer, /MongoTransport/);
     assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
     assert.match(resizer, /LocalFsStorage/);

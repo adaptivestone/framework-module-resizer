@@ -9,7 +9,6 @@
 // module load). sharp is a hard dep; this is the only place besides worker.ts that decodes.
 import sharp from 'sharp';
 import { getApp } from './app.ts';
-import { getResizeConfig, requiredFormats } from './config/resize.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
@@ -24,6 +23,7 @@ import {
   getPreviewIdentity,
   requireMediaId,
 } from './images.ts';
+import { getResizeConfig, requiredFormats } from './resizeConfig.ts';
 import {
   type GenerateOpts,
   type GenerateResult,

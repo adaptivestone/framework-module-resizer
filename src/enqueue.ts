@@ -6,8 +6,8 @@
 // closes back on this module at runtime — 05 · design delta).
 import { createHash } from 'node:crypto';
 import { getApp } from './app.ts';
-import { getResizeConfig } from './config/resize.ts';
 import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   EnqueueIssue,

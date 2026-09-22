@@ -81,8 +81,9 @@ a private original.
    (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`) — no `app` parameter;
    a driver closes over its own client.
 
-4. Import `./resizer.ts` from the process that needs it (API; and the worker, if any)
-   **after** `Server.init()`.
+4. Dynamically load the construction site from each process that needs it (API; and the worker,
+   if any) **after** `Server.init()`: `await import('./resizer.ts')`. Do not use a static import;
+   ESM evaluates it before bootstrap code.
 
 5. Set the one required config field in the scaffolded `src/config/resize.ts`:
    `mediaModelName: 'File'` (your host media model's name).

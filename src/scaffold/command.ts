@@ -282,14 +282,17 @@ export async function runScaffold(
       '\nDone. Next: set `mediaModelName` in src/config/resize.ts, construct the',
     );
     console.log(
-      'Resizer after Server.init() (or lazily), and call generate() at upload.',
+      "Resizer after Server.init() with `await import('./resizer.ts')` (or lazily), then call generate() at upload.",
     );
   } else {
     console.log(
       '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
     );
     console.log(
-      'src/config/resize.ts, and `import ./resizer.ts` from src/server.ts (runs in every process).',
+      "src/config/resize.ts, then run `await import('./resizer.ts')` only AFTER",
+    );
+    console.log(
+      '`await Server.init()` in every process (a static import runs too early).',
     );
   }
   return code;

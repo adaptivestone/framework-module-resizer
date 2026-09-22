@@ -1,7 +1,4 @@
-import merge from 'deepmerge';
-import { getApp } from '../app.ts';
-import { ResizeConfigError } from '../errors.ts';
-import type { PreviewFormat, ResizeConfig } from '../types.d.ts';
+import type { ResizeConfig } from '../types.d.ts';
 
 // Every TUNABLE is defaulted (and completeness-checked by the Omit type). Only the
 // host-required `mediaModelName` is absent — the host sets it in src/config/resize.ts.
@@ -46,67 +43,3 @@ const defaultResizeConfig: Omit<ResizeConfig, 'mediaModelName'> = {
 };
 
 export default defaultResizeConfig;
-
-// arrayMerge: a host config array REPLACES the default (so formats:['webp','avif'] does
-// not concat to five). Without this, deepmerge concatenates arrays.
-const overwrite = (_dest: unknown[], src: unknown[]): unknown[] => src;
-
-/**
- * Deep-merge the host's `resize` config (read from the ambient app — src/app.ts) over
- * the module defaults, then fail fast if the one required field is still missing.
- * Returns a fully-resolved ResizeConfig. Never mutates `defaultResizeConfig`
- * (deepmerge returns a fresh object).
- */
-export function getResizeConfig(): ResizeConfig {
-  const host = getApp().getConfig('resize') ?? {};
-  const merged = merge(defaultResizeConfig, host, {
-    arrayMerge: overwrite,
-  }) as ResizeConfig;
-  if (!merged.mediaModelName) {
-    throw new ResizeConfigError(
-      'resize config: `mediaModelName` is required — set it in the host src/config/resize.ts',
-      { code: 'RESIZE_CONFIG_MEDIA_MODEL_MISSING' },
-    );
-  }
-  if (
-    !Number.isSafeInteger(merged.upload.maxBytes) ||
-    merged.upload.maxBytes <= 0
-  ) {
-    throw new ResizeConfigError(
-      'resize config: upload.maxBytes must be a positive safe integer',
-      { code: 'RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID' },
-    );
-  }
-  const originalFormats = new Set([
-    'jpeg',
-    'png',
-    'webp',
-    'avif',
-    'gif',
-    'svg',
-  ]);
-  if (
-    merged.upload.formats.length === 0 ||
-    merged.upload.formats.some((format) => !originalFormats.has(format))
-  ) {
-    throw new ResizeConfigError(
-      'resize config: upload.formats must contain supported original formats',
-      { code: 'RESIZE_CONFIG_UPLOAD_FORMATS_INVALID' },
-    );
-  }
-  // Doneness invariant (07 · Worker): a worker lock MUST expire within the lease window, else a
-  // crashed worker's lock outlives its lease and blocks the re-leased task from regenerating the
-  // skipped variant. Enforce lockTtlMs.worker ≤ leaseMs at config resolution (08 · §13).
-  if (merged.queue.lockTtlMs.worker > merged.queue.leaseMs) {
-    throw new ResizeConfigError(
-      `resize config: queue.lockTtlMs.worker (${merged.queue.lockTtlMs.worker}) must be ≤ queue.leaseMs (${merged.queue.leaseMs}) — a worker lock must expire within the lease window (07 · doneness invariant)`,
-      { code: 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE' },
-    );
-  }
-  return merged;
-}
-
-/** The SINGLE source for the active format list (read path + worker MUST agree). */
-export function requiredFormats(config: ResizeConfig): PreviewFormat[] {
-  return config.webpAvifOnly ? ['webp', 'avif'] : config.formats;
-}

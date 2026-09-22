@@ -47,6 +47,8 @@ after(async () => {
 
 beforeEach(async () => {
   await M.deleteMany({});
+  resetAppInstance();
+  installFakeApp();
 });
 
 afterEach(() => {
@@ -75,6 +77,7 @@ function installFakeApp(
   queueOverride: Record<string, unknown> = {},
 ) {
   const errors: unknown[][] = [];
+  resetAppInstance();
   setAppInstance({
     getConfig: () => ({
       mediaModelName: 'File',

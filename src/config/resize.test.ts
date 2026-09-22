@@ -4,11 +4,13 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import type { DeepPartial, ResizeConfig } from '../types.d.ts';
+import { ResizeConfigError } from '../errors.ts';
+import * as resizeConfigRuntime from '../resizeConfig.ts';
 import defaultResizeConfig, {
   getResizeConfig,
   requiredFormats,
-} from './resize.ts';
+} from '../resizeConfigCompatibility.ts';
+import type { DeepPartial, ResizeConfig } from '../types.d.ts';
 
 // Install a fake ambient app whose getConfig('resize') returns the given override
 // (the module reads it through getApp() — src/app.ts). Per-file isolation: node:test
@@ -51,6 +53,10 @@ describe('defaultResizeConfig', () => {
 });
 
 describe('getResizeConfig', () => {
+  test('does not expose the partial validator as a full-config public assertion', () => {
+    assert.equal('validateResizeConfig' in resizeConfigRuntime, false);
+  });
+
   test('a deep override keeps every sibling default', () => {
     useHostConfig({
       mediaModelName: 'File',
@@ -89,6 +95,27 @@ describe('getResizeConfig', () => {
       upload: { formats: [] },
     });
     assert.throws(() => getResizeConfig(), /upload\.formats/);
+  });
+
+  test('rejects malformed nested values with ResizeConfigError, never TypeError', () => {
+    const malformed: unknown[] = [
+      { mediaModelName: '' },
+      { mediaModelName: 'File', upload: null },
+      { mediaModelName: 'File', upload: { maxBytes: 'nope' } },
+      { mediaModelName: 'File', upload: { formats: null } },
+      { mediaModelName: 'File', formats: ['png'] },
+      { mediaModelName: 'File', queue: null },
+      { mediaModelName: 'File', queue: { lockTtlMs: null } },
+      { mediaModelName: 'File', queue: { leaseMs: 0 } },
+      { mediaModelName: 'File', queue: { lockTtlMs: { worker: 'bad' } } },
+    ];
+    for (const config of malformed) {
+      useHostConfig(config as DeepPartial<ResizeConfig>);
+      assert.throws(
+        () => getResizeConfig(),
+        (error: unknown) => error instanceof ResizeConfigError,
+      );
+    }
   });
 
   test('accepts lockTtlMs.worker <= leaseMs', () => {

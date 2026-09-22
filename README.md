@@ -87,6 +87,15 @@ Start here. No queue, no worker, no AWS. `npx resize-scaffold --eager` emits thi
 **1. Wire the Resizer** after `Server.init()` (or lazily on first request). One Resizer per
 process — a second `new Resizer()` throws.
 
+Load the scaffolded construction site dynamically from bootstrap after initialization:
+
+```ts
+await server.init();
+const { resizer } = await import('./resizer.ts');
+```
+
+A static import is evaluated before bootstrap code and is therefore too early.
+
 ```ts
 import { Resizer } from '@adaptivestone/framework-module-resize';
 import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
@@ -587,8 +596,10 @@ formatPictureUrls(decision, { id }); // unfiltered <picture> map; filtered varia
 
 ## Config reference
 
-`src/config/resize.ts` (scaffolded, editable) spreads the module defaults and is deep-merged over
-them by `getResizeConfig()` — override any knob at any depth. **Arrays REPLACE** (so
+`src/config/resize.ts` (scaffolded, editable) is loaded by the framework, then its values are
+deep-merged over module defaults by `getResizeConfig()` when `new Resizer()` is created. Config
+errors therefore surface when the module is constructed (which must be after `Server.init()`), not
+on the first image request. **Arrays REPLACE** (so
 `formats: ['webp','avif']` doesn't concat to five); nested objects merge field-by-field.
 
 | Key | Default | Notes |

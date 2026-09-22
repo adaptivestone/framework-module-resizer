@@ -4,7 +4,7 @@
 // completion/failure observers (05 · §10.2); the worker only supplies the WORK.
 import sharp from 'sharp';
 import { getApp } from './app.ts';
-import { getResizeConfig } from './config/resize.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import { getResizer } from './resizer.ts';
 import { processTask } from './resizeTask.ts';
 

@@ -1,8 +1,8 @@
 import { createRequire } from 'node:module';
 import sharp, { type Metadata } from 'sharp';
-import { getResizeConfig } from './config/resize.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { randomHex } from './helpers/random.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   Original,

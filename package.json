@@ -13,7 +13,7 @@
     "./package.json": "./package.json",
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
-    "./config/resize.js": "./dist/config/resize.js",
+    "./config/resize.js": "./dist/resizeConfigCompatibility.js",
     "./transports/mongo.js": "./dist/transports/mongo.js",
     "./transports/sqs.js": "./dist/transports/sqs.js",
     "./storage/s3.js": "./dist/storage/s3.js",

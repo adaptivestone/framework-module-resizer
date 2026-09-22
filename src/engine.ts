@@ -6,7 +6,6 @@
 // is the owner/admin-gated signedUrl (itself caught + fallen back). Imports the Resizer
 // TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
 import { getApp } from './app.ts';
-import { getResizeConfig, requiredFormats } from './config/resize.ts';
 import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import {
@@ -17,6 +16,7 @@ import {
   getSizeKey,
   requireMediaId,
 } from './images.ts';
+import { getResizeConfig, requiredFormats } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   EnqueueRequiredResult,

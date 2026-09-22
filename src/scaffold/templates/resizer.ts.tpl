@@ -1,7 +1,8 @@
 // src/resizer.ts — the resize module's CONSTRUCTION SITE (scaffolded; edit freely).
 //
-// Import this file ONCE from src/server.ts so it runs in EVERY process (API + worker):
-//     import './resizer.ts';
+// Load this file dynamically from bootstrap ONLY AFTER `await server.init()` in EVERY process:
+//     const { resizer } = await import('./resizer.ts');
+// A static import runs before bootstrap code and is therefore too early.
 // On construction the Resizer registers itself as the one-per-process active instance, so the
 // ResizeWorker command and your DTO builders reach it via getResizer() — or `import { resizer }`.
 //

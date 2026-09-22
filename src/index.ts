@@ -21,12 +21,6 @@
 // './worker.ts'`: the ResizeWorker CLASS actually lives in ./commands/ResizeWorker.ts (a package
 // subpath the scaffold re-exports); `runResizeWorker` is the module function in ./worker.ts.
 export { default as ResizeWorker } from './commands/ResizeWorker.ts';
-// --- config: the defaults + the host-merged resolver + the active-format list ---
-export {
-  default as defaultResizeConfig,
-  getResizeConfig,
-  requiredFormats,
-} from './config/resize.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type {
   EnqueueRequiredOpts,
@@ -67,6 +61,12 @@ export {
 export type { TResizeTask } from './models/ResizeTask.ts';
 // --- Mongo-transport model class (the host's scaffolded model `extends` it) + its doc type ---
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';
+// --- config: the defaults + the host-merged resolver + the active-format list ---
+export {
+  default as defaultResizeConfig,
+  getResizeConfig,
+  requiredFormats,
+} from './resizeConfigCompatibility.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,
