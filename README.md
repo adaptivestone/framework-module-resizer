@@ -455,7 +455,7 @@ new S3Storage({
 | Option | | |
 |---|---|---|
 | `bucketPublic` | **required** | previews land here (`public` visibility) |
-| `bucketPrivate` | optional | originals (`private`); defaults to `bucketPublic` |
+| `bucketPrivate` | optional | originals (`private`); defaults to `bucketPublic`; configure a distinct private bucket when originals must stay private |
 | `publicBaseUrl` | optional | CDN/base URL for public objects |
 | `publicUrl` | optional | **deprecated** alias of `publicBaseUrl` (one minor) |
 | `region`, `endpoint`, `forcePathStyle` | optional | S3-compatible targets (MinIO / localstack / R2) |
@@ -690,13 +690,36 @@ the next delivery generates only the missing identities, and permanent gaps reac
 `afterTaskComplete` fires only after full coverage. A deleted media row and a stray SVG task remain
 successful no-ops; a live row without `original.key` is an observable terminal media error.
 
-**SVG originals are pass-through** — `uploadOriginal()` supplies storage with a `.svg` key and
-stores SVG bytes as SVG and `image/svg+xml`; when `original.contentType === 'image/svg+xml'` the
-read path
-serves a public original at every requested size/format and never resizes or enqueues. A private
-original is served only through a successful authorized `signedUrl`; anonymous reads return no
-original URL. `saxes` checks XML structure but does not remove scripts or external links.
-**SVG sanitization is host-owned** (sanitize at upload before storing).
+**SVG originals are pass-through.** They stay SVG (`image/svg+xml`) at every requested
+size/format; the read path never resizes or enqueues them. To keep originals private while
+publishing SVG to everyone, persist the private original before publishing its copy:
+
+```ts
+const original = await resizer.uploadOriginal({ body: sanitizedSvg, visibility: 'private' });
+media.original = original;
+await media.save();
+
+if (original.format === 'svg') {
+  const copy = await resizer.uploadOriginal({ body: sanitizedSvg, visibility: 'public' });
+  media.original = {
+    ...original,
+    publicCopy: { key: copy.key, bucket: copy.bucket },
+  };
+  await media.save();
+}
+```
+
+With `S3Storage`, configure distinct `bucketPrivate` and `bucketPublic` values and a bucket
+policy that keeps the private bucket inaccessible to the public. Without `bucketPrivate`, the
+driver stores both uploads in `bucketPublic`. The original locator stays in `media.original`;
+`publicCopy` holds only the public locator. `resolve()` serves the copy when
+`canServeOriginalPublicly()` confirms it and otherwise retains the existing signed URL rule for
+private originals. Save the private original first so a failed public upload leaves a durable
+source to retry from. If saving `publicCopy` fails after its upload, the host must retry that
+save or clean up the unreferenced public object. A custom storage driver must implement
+`canServeOriginalPublicly()` for anonymous SVG delivery; `LocalFsStorage` has no private area.
+The host owns cleanup of both objects. `saxes` checks XML structure but does not remove scripts
+or external links; **sanitize SVG in the host before either upload.**
 
 **Original visibility is explicit.** Storage drivers that can prove an original is public should
 implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's
@@ -704,7 +727,7 @@ implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary 
 previews remain the preferred public read path.
 
 **Deleting media / storage cleanup is host-owned.** The module appends previews but does not delete
-them; removing a media doc's storage objects (originals + derivatives) is your lifecycle.
+them; removing a media doc's storage objects (originals, public SVG copies, and derivatives) is your lifecycle.
 
 ---
 

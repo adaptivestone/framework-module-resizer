@@ -16,7 +16,8 @@ import { MongoTransport } from '@adaptivestone/framework-module-resize/transport
 export const resizer = new Resizer({
   transport: new MongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)
   // TODO(REQUIRED): provide a storage driver — e.g. `new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' })`
-  // or `new S3Storage({ bucketPublic: '…', publicBaseUrl: '…', client })` (uncomment an import above)
+  // or `new S3Storage({ bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: '…', client })`
+  // (use distinct buckets when originals must stay private; uncomment an import above)
   // or your own ResizeStorage (05 · §10.4). Until then tsc fails with
   // "Cannot find name 'PROVIDE_YOUR_STORAGE_DRIVER'" — a loud, named reminder (see README).
   storage: PROVIDE_YOUR_STORAGE_DRIVER,

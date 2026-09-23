@@ -9,8 +9,9 @@ import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/f
 // import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js';
 
 export const resizer = new Resizer({
-  // Local filesystem — swap for `new S3Storage({ bucketPublic, publicBaseUrl, client })`
-  // when you have buckets. No queue/worker in eager mode.
+  // Local filesystem — swap for `new S3Storage({ bucketPublic, bucketPrivate,
+  // publicBaseUrl, client })` with distinct buckets for private originals.
+  // No queue/worker in eager mode.
   storage: new LocalFsStorage({
     rootDir: './var/media',
     publicBaseUrl: '/media',

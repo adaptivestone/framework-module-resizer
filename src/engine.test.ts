@@ -657,6 +657,69 @@ describe('resolve — SVG pass-through', () => {
     assert.equal(anon.decision.ready[0].url, 'https://cdn/private/logo.svg');
   });
 
+  test('serves a public SVG copy while keeping the original private', async () => {
+    installFakeApp();
+    let signedCalls = 0;
+    const r = new Resizer({
+      storage: makeStorage({
+        canServeOriginalPublicly: (ref) => ref.bucket === 'public',
+        signedUrl: async () => {
+          signedCalls++;
+          return 'https://signed/private.svg';
+        },
+      }),
+    });
+    const media: MediaLike = {
+      id: 'm1',
+      original: {
+        key: 'private/logo.svg',
+        bucket: 'private',
+        contentType: 'image/svg+xml',
+        publicCopy: { key: 'published/logo.svg', bucket: 'public' },
+      },
+    };
+    for (const ctx of [{}, { isOwner: true }]) {
+      const { decision } = await r.resolve({
+        media,
+        sizes: [{ width: 300, height: 300 }, { fit: true }],
+        formats: ['jpeg', 'webp'],
+        ctx,
+      });
+      assert.equal(decision.ready.length, 4);
+      assert.deepEqual(decision.missing, []);
+      for (const entry of decision.ready) {
+        assert.equal(entry.url, 'https://cdn/published/logo.svg');
+        assert.equal(entry.contentType, 'image/svg+xml');
+      }
+    }
+    assert.equal(signedCalls, 0);
+    assert.equal(media.original?.key, 'private/logo.svg');
+  });
+
+  test('does not expose a supposed SVG copy unless storage proves it is public', async () => {
+    installFakeApp();
+    const r = new Resizer({
+      storage: makeStorage({
+        canServeOriginalPublicly: (ref) => ref.bucket === 'public',
+      }),
+    });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'm1',
+        original: {
+          key: 'private/logo.svg',
+          bucket: 'private',
+          format: 'svg',
+          publicCopy: { key: 'wrong/logo.svg', bucket: 'private' },
+        },
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(decision.ready, []);
+    assert.deepEqual(decision.missing, []);
+  });
+
   test('detects SVG via original.format === "svg" too', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });

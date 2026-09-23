@@ -127,13 +127,25 @@ export async function resolveImpl(
     );
 
     if (original && originalIsSvg) {
-      // 6. SVG pass-through — served at every size×format from the ORIGINAL url, never
-      // resized or enqueued (vector resize is a no-op); the requested format is ignored. Routes
-      // through the SAME original-URL rule as the fast-path (06 · §17 step 6): signedUrl for an
-      // owner/admin when the driver supports it (private-bucket SVG read), else pure publicUrl.
-      // A private SVG has no raster fallback: anonymous reads and failed owner/admin signing stay
-      // empty instead of exposing the private original or enqueueing impossible raster work.
-      const url = await originalUrl(resizer, original, ctx, isOriginalPublic());
+      // 6. SVG pass-through — one URL at every requested size/format, with no raster work.
+      // Prefer a separately persisted public copy when the driver proves it is public.
+      // Otherwise use the normal original URL rule: signed private access for owners/admins,
+      // or publicUrl only when the original itself is public.
+      let url: string | undefined;
+      const copy = original.publicCopy;
+      if (copy?.key) {
+        try {
+          if (storage.canServeOriginalPublicly?.(copy) === true) {
+            url = storage.publicUrl(copy);
+          }
+        } catch (err) {
+          getApp().logger.error(
+            'resize resolve: SVG public copy is unavailable',
+            err,
+          );
+        }
+      }
+      url ??= await originalUrl(resizer, original, ctx, isOriginalPublic());
       if (url !== undefined) {
         for (const size of sizes) {
           let sizeKey: string;

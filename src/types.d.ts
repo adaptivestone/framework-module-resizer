@@ -67,6 +67,8 @@ export interface StorageRef {
 }
 
 export interface Original extends StorageRef {
+  // Optional public copy of SVG bytes; the original locator above remains private.
+  publicCopy?: StorageRef;
   format?: string;
   size?: number;
   contentType?: string;

@@ -33,6 +33,7 @@ describe('resizeMediaSchemaFragment — shape', () => {
       'contentType',
       'width',
       'height',
+      'publicCopy',
     ]) {
       assert.ok(k in o, `missing original.${k}`);
     }
@@ -80,6 +81,8 @@ describe('resizeMediaSchemaFragment — host usage', () => {
     assert.ok(schema.path('previews'));
     assert.ok(schema.path('original.width'));
     assert.ok(schema.path('original.key'));
+    assert.ok(schema.path('original.publicCopy.key'));
+    assert.ok(schema.path('original.publicCopy.bucket'));
   });
 });
 

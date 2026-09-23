@@ -127,6 +127,15 @@ structurally checked with `saxes`, never enters Sharp, and stays SVG (`.svg`, `i
 Only explicit unitless/`px` width and height become pixel metadata; `viewBox` does not. The parser
 is not a sanitizer, so the host sanitizes SVG before this call.
 
+For a public SVG with a private original, persist `original` first. Upload the same sanitized
+bytes again with `visibility: 'public'`, then persist its locator as
+`media.original.publicCopy = { key: copy.key, bucket: copy.bucket }`. `resolve()` serves that
+copy to anonymous readers only when storage proves it public. If the second upload fails, the
+private original remains saved and publishing can be retried. For S3, configure distinct
+`bucketPrivate`/`bucketPublic` values and keep the private bucket private; omitting
+`bucketPrivate` places both uploads in the public bucket. `LocalFsStorage` has no private area.
+Raster originals need no copy.
+
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
 
@@ -228,9 +237,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   raster `metadata()` inspection only; it never emits transformed bytes. SVG never enters Sharp.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
-- SVG originals pass through untouched at every requested size (never rasterized, never
-  enqueued). Private originals require an authorized signed URL; anonymous reads do not
-  receive a fabricated public URL. Sanitizing SVG at upload is the HOST's job.
+- SVG bytes pass through untouched at every requested size (never rasterized or enqueued).
+  A proven-public `original.publicCopy` is served to everyone; without it, private originals
+  require an authorized signed URL. Sanitizing SVG at upload is the HOST's job.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.
