@@ -5,9 +5,8 @@
 // QueueTransport, ResizeStorage, MediaStore, LockProvider, HookName, HookFn)
 // live next to their code.
 
-// Recursive partial: every field optional at every depth, BUT arrays are kept whole
-// (a host config array REPLACES the default — it is never deep-merged element-by-element,
-// matching getResizeConfig's arrayMerge — see 08 · §13). Used for host config overrides.
+// Recursive partial for environment-specific config overrides. Arrays stay whole because
+// the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts.
 export type DeepPartial<T> = T extends readonly (infer _U)[]
   ? T
   : T extends object
@@ -24,9 +23,8 @@ export type DeepPartial<T> = T extends readonly (infer _U)[]
 // ---------------------------------------------------------------------------
 
 export type TMinimalResizeApp = {
-  // A host overrides only the fields it cares about, at any depth (DeepPartial); the
-  // module deep-merges them onto defaultResizeConfig in getResizeConfig (08 · §13).
-  getConfig(name: 'resize'): DeepPartial<ResizeConfig>;
+  // Framework config loading has already combined the base and environment files.
+  getConfig(name: 'resize'): ResizeConfig;
   // Returns a Mongoose model registered by the host. At minimum:
   //  - 'Lock'       (framework built-in: acquireLock/releaseLock/waitForUnlock)
   //  - 'ResizeTask' (scaffolded into the host app; only for the Mongo transport)
@@ -50,8 +48,10 @@ export type TMinimalResizeApp = {
 // Data shapes
 // ---------------------------------------------------------------------------
 
-export type PreviewFormat = 'jpeg' | 'webp' | 'avif';
-export type OriginalFormat = 'jpeg' | 'png' | 'webp' | 'avif' | 'gif' | 'svg';
+// Sharp format ids are deliberately open strings. A host using a custom libvips build can
+// enable additional input/output formats in config without changing this package.
+export type PreviewFormat = string;
+export type OriginalFormat = string;
 
 // Canonical filter bag. Host-defined semantics; the module only canonicalizes it
 // into the identity. e.g. { blur: 40 }. Empty / undefined → 'none' in the identity.
@@ -184,7 +184,7 @@ export interface PictureUrls {
 }
 
 // ---------------------------------------------------------------------------
-// Config (merged with app.getConfig('resize') — see 08 · §13)
+// Config (the framework returns the fully resolved value from app.getConfig('resize'))
 //
 // MODULE behavior only. Storage-specific options (buckets, base URL, signed-URL
 // settings) live in the storage driver; transport-specific options (SQS queue URL,
@@ -195,8 +195,7 @@ export interface PictureUrls {
 
 export interface ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
-  formats: PreviewFormat[]; // default ['jpeg','webp','avif']
-  webpAvifOnly?: boolean; // filters 'jpeg' from formats; adds nothing, and an empty result is invalid
+  formats: PreviewFormat[]; // generated output formats, e.g. ['jpeg','webp','avif']
   upload: {
     maxBytes: number;
     formats: OriginalFormat[];
@@ -204,14 +203,12 @@ export interface ResizeConfig {
   maxSize: { width: number; height: number }; // default { 2000, 1200 } (the `fit` cap)
   animated: boolean; // default false — true keeps GIF/WebP frames
 
-  // Per-format encode settings. JPEG q80 ≈ AVIF q64 ≈ WebP q82 — NEVER reuse one quality int.
+  // Options are passed to sharp.toFormat(format, options). Keys are format ids, so hosts with
+  // additional libvips codecs can configure them without a module code change.
   encode: {
-    quality: { jpeg: number; webp: number; avif: number }; // default { jpeg:80, webp:82, avif:64 }
-    effort: { webp: number; avif: number }; // default { webp:4, avif:4 } (raise to 5–6 for persist-once)
-    mozjpeg: boolean; // default true — jpeg({ mozjpeg:true }): progressive + trellis, ~10–20% smaller
-    chromaSubsampling: '4:2:0' | '4:4:4'; // default '4:2:0'; '4:4:4' keeps full chroma for text/logos/UI
-    sharpen: { cover: boolean; fit: boolean } | false; // default { cover:true, fit:false }
-    flattenBackground: string; // default '#ffffff' — alpha source → jpeg flattened onto this
+    formats: Record<string, Record<string, unknown>>;
+    sharpen: { cover: boolean; fit: boolean } | false;
+    flatten: { formats: string[]; background: string };
   };
 
   // Decode/decompression-bomb guards.
@@ -224,7 +221,7 @@ export interface ResizeConfig {
 
   // Queue/lease tuning (used by the Mongo transport; harmless for SQS, which has native redrive).
   queue: {
-    lockTtlMs: { dispatch: number; worker: number }; // default { 60000, 60000 }; worker MUST be ≤ leaseMs (ENFORCED by getResizeConfig)
+    lockTtlMs: { dispatch: number; worker: number }; // worker MUST be ≤ leaseMs
     leaseMs: number; // default 60000 — heartbeat renews at leaseMs/2
     retryBackoffMs: { base: number; max: number }; // default { base:5000, max:300000 }
     maxAttempts: number; // default 5 — DELIVERY count before dead-letter (increments on every lease incl. reclaims, like SQS maxReceiveCount)

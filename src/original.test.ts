@@ -12,6 +12,7 @@ import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import type { QueueTransport, ResizeStorage } from './resizer.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import { LocalFsStorage } from './storage/fs.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 
 const png = await sharp({
   create: {
@@ -57,7 +58,7 @@ const animatedOriginals = {
 
 function installApp(config: Record<string, unknown> = {}) {
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File', ...config }),
+    getConfig: () => makeResizeConfig(config),
     getModel: () => ({}),
     logger: { info() {}, warn() {}, error() {} },
   } as never);
@@ -153,6 +154,20 @@ describe('uploadOriginal — raster bytes and metadata', () => {
     assert.match(first.key, /^originals\/[a-f0-9]{32}\.png$/);
     assert.notEqual(first.key, second.key);
     assert.deepEqual(uploads[0].body, png);
+  });
+
+  test('accepts a TIFF enabled only through upload.formats', async () => {
+    installApp({ upload: { formats: ['tiff'] } });
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const body = await sharp(png).tiff().toBuffer();
+
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+
+    assert.equal(original.format, 'tiff');
+    assert.equal(original.contentType, 'image/tiff');
+    assert.match(original.key, /^originals\/[a-f0-9]{32}\.tiff$/);
+    assert.deepEqual(uploads[0].body, body);
   });
 
   test('round-trips exact original bytes through LocalFsStorage', async () => {

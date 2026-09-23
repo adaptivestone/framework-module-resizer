@@ -16,7 +16,7 @@ import {
   getSizeKey,
   requireMediaId,
 } from './images.ts';
-import { getResizeConfig, requiredFormats } from './resizeConfig.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   EnqueueRequiredResult,
@@ -34,7 +34,7 @@ export interface ResolveOpts {
   media: MediaLike;
   sizes: SizeInput[];
   pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = requiredFormats(config)
+  formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // threaded to read-path hooks; ctx.isOwner/isAdmin gate signedUrl
   enqueueMissing?: boolean; // default true when a transport is set, false otherwise
 }
@@ -43,7 +43,7 @@ export interface PrewarmOpts {
   media: MediaLike;
   sizes: SizeInput[];
   pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = requiredFormats(config)
+  formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
 }
 
@@ -84,8 +84,7 @@ export async function resolveImpl(
       ctx,
     )) as SizeInput[];
 
-    // 2. Active format list — read + worker MUST agree (requiredFormats).
-    const formats = opts.formats ?? requiredFormats(getResizeConfig());
+    const formats = opts.formats ?? getResizeConfig().formats;
 
     // 5. previewMap keyed by identity — only complete entries (both key + contentType).
     const previewMap = new Map<string, Preview>();
@@ -352,7 +351,7 @@ export async function prewarmImpl(
 
     // 2. Expand sizes × formats → deduped MissingPreview[], skipping unbuildable sizes + existing
     //    identities. The fast-path is deliberately NOT consulted here (see the doc comment).
-    const formats = opts.formats ?? requiredFormats(getResizeConfig());
+    const formats = opts.formats ?? getResizeConfig().formats;
     const expanded = expandMissingPreviews(media, sizes, formats);
 
     // 3. beforeEnqueue — REASSIGN the (post-hook) set so the enqueue sees exactly what a host tap
@@ -406,7 +405,7 @@ export async function enqueueRequiredImpl(
     opts.sizes,
     ctx,
   )) as SizeInput[];
-  const formats = opts.formats ?? requiredFormats(getResizeConfig());
+  const formats = opts.formats ?? getResizeConfig().formats;
   const requestedBeforePolicy = expandPreviewRequests(sizes, formats);
   const empty = (): EnqueueRequiredResult => ({
     status: 'not-required',

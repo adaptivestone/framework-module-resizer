@@ -5,6 +5,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MissingPreview } from '../types.d.ts';
 import { SqsTransport } from './sqs.ts';
 
@@ -71,7 +72,7 @@ const variant = (over: Partial<MissingPreview> = {}): MissingPreview => ({
 function installFakeApp() {
   const errors: unknown[][] = [];
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File' }),
+    getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
     logger: {
       info() {},

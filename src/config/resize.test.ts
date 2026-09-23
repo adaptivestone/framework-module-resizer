@@ -5,126 +5,60 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
-import * as resizeConfigRuntime from '../resizeConfig.ts';
-import defaultResizeConfig, {
-  getResizeConfig,
-  requiredFormats,
-} from '../resizeConfigCompatibility.ts';
-import type { DeepPartial, ResizeConfig } from '../types.d.ts';
+import { getResizeConfig } from '../resizeConfig.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import type { ResizeConfig } from '../types.d.ts';
 
-// Install a fake ambient app whose getConfig('resize') returns the given override
-// (the module reads it through getApp() — src/app.ts). Per-file isolation: node:test
-// runs each test file in its own process, so the singleton never leaks across files.
-const useHostConfig = (resize: DeepPartial<ResizeConfig>) => {
+function install(config: unknown) {
   resetAppInstance();
   setAppInstance({
-    getConfig: () => resize,
+    getConfig: () => config,
     getModel: () => ({}),
     logger: { info() {}, warn() {}, error() {} },
   } as never);
-};
+}
 
-afterEach(() => {
-  resetAppInstance();
-});
-
-describe('defaultResizeConfig', () => {
-  test('ships the documented codec defaults', () => {
-    assert.equal(defaultResizeConfig.encode?.quality.jpeg, 80);
-    assert.equal(defaultResizeConfig.encode?.quality.webp, 82);
-    assert.equal(defaultResizeConfig.encode?.quality.avif, 64);
-  });
-
-  test('worker is disabled by default', () => {
-    assert.equal(defaultResizeConfig.worker?.enabled, false);
-  });
-
-  test('original uploads have byte and format allowlists', () => {
-    assert.equal(defaultResizeConfig.upload.maxBytes, 25 * 1024 * 1024);
-    assert.deepEqual(defaultResizeConfig.upload.formats, [
-      'jpeg',
-      'png',
-      'webp',
-      'avif',
-      'gif',
-      'svg',
-    ]);
-  });
-});
+afterEach(resetAppInstance);
 
 describe('getResizeConfig', () => {
-  test('does not expose the partial validator as a full-config public assertion', () => {
-    assert.equal('validateResizeConfig' in resizeConfigRuntime, false);
+  test('returns the final framework config without merging another defaults object', () => {
+    const config = makeResizeConfig({ formats: ['webp'] });
+    install(config);
+    assert.strictEqual(getResizeConfig(), config);
+    assert.deepEqual(getResizeConfig().formats, ['webp']);
   });
 
-  test('a deep override keeps every sibling default', () => {
-    useHostConfig({
-      mediaModelName: 'File',
-      encode: { quality: { avif: 50 } },
+  test('accepts arbitrary non-empty Sharp format ids from config', () => {
+    const config = makeResizeConfig({
+      formats: ['tiff'],
+      upload: { formats: ['tiff', 'heif'] },
+      encode: { formats: { tiff: { compression: 'lzw' } } },
     });
-    const config = getResizeConfig();
-    assert.equal(config.encode.quality.avif, 50); // overridden
-    assert.equal(config.encode.quality.jpeg, 80); // sibling default kept
-    assert.equal(config.encode.mozjpeg, true); // sibling default kept
-    assert.equal(config.queue.maxAttempts, 5); // unrelated default kept (delivery-count default)
+    install(config);
+    assert.deepEqual(getResizeConfig().formats, ['tiff']);
+    assert.deepEqual(getResizeConfig().upload.formats, ['tiff', 'heif']);
   });
 
-  test('host arrays REPLACE the default (no concat)', () => {
-    useHostConfig({ mediaModelName: 'File', formats: ['webp', 'avif'] });
-    assert.deepEqual(getResizeConfig().formats, ['webp', 'avif']);
-  });
-
-  test('rejects an empty active format list at config resolution', () => {
-    useHostConfig({
-      mediaModelName: 'File',
-      formats: ['jpeg'],
-      webpAvifOnly: true,
-    });
+  test('rejects a partial host config because the framework config must be complete', () => {
+    install({ mediaModelName: 'File' });
     assert.throws(
       () => getResizeConfig(),
       (error: unknown) =>
         error instanceof ResizeConfigError &&
-        error.code === 'RESIZE_CONFIG_FORMATS_INVALID',
+        error.code === 'RESIZE_CONFIG_UPLOAD_INVALID',
     );
   });
 
-  test('throws when the required mediaModelName is missing', () => {
-    useHostConfig({});
-    assert.throws(() => getResizeConfig(), /mediaModelName/);
-  });
-
-  test('throws when lockTtlMs.worker > leaseMs (doneness invariant)', () => {
-    useHostConfig({
-      mediaModelName: 'File',
-      queue: { lockTtlMs: { worker: 120000 }, leaseMs: 60000 },
-    });
-    assert.throws(() => getResizeConfig(), /lockTtlMs\.worker|leaseMs/);
-  });
-
-  test('validates original upload byte and format allowlists', () => {
-    useHostConfig({ mediaModelName: 'File', upload: { maxBytes: 0 } });
-    assert.throws(() => getResizeConfig(), /upload\.maxBytes/);
-    useHostConfig({
-      mediaModelName: 'File',
-      upload: { formats: [] },
-    });
-    assert.throws(() => getResizeConfig(), /upload\.formats/);
-  });
-
-  test('rejects malformed nested values with ResizeConfigError, never TypeError', () => {
-    const malformed: unknown[] = [
-      { mediaModelName: '' },
-      { mediaModelName: 'File', upload: null },
-      { mediaModelName: 'File', upload: { maxBytes: 'nope' } },
-      { mediaModelName: 'File', upload: { formats: null } },
-      { mediaModelName: 'File', formats: ['png'] },
-      { mediaModelName: 'File', queue: null },
-      { mediaModelName: 'File', queue: { lockTtlMs: null } },
-      { mediaModelName: 'File', queue: { leaseMs: 0 } },
-      { mediaModelName: 'File', queue: { lockTtlMs: { worker: 'bad' } } },
+  test('rejects missing mediaModelName, empty format lists, and blank ids', () => {
+    const cases: unknown[] = [
+      makeResizeConfig({ mediaModelName: '' }),
+      makeResizeConfig({ formats: [] }),
+      makeResizeConfig({ formats: [''] }),
+      makeResizeConfig({ upload: { formats: [] } }),
+      makeResizeConfig({ upload: { formats: ['  '] } }),
     ];
-    for (const config of malformed) {
-      useHostConfig(config as DeepPartial<ResizeConfig>);
+    for (const config of cases) {
+      install(config);
       assert.throws(
         () => getResizeConfig(),
         (error: unknown) => error instanceof ResizeConfigError,
@@ -132,97 +66,36 @@ describe('getResizeConfig', () => {
     }
   });
 
-  test('accepts lockTtlMs.worker <= leaseMs', () => {
-    useHostConfig({
-      mediaModelName: 'File',
-      queue: { lockTtlMs: { worker: 30000 }, leaseMs: 60000 },
-    });
-    assert.doesNotThrow(() => getResizeConfig());
-    // The shipped default (worker 60000 == leaseMs 60000) also passes.
-    resetAppInstance();
-    setAppInstance({
-      getConfig: () => ({ mediaModelName: 'File' }),
-      getModel: () => ({}),
-      logger: { info() {}, warn() {}, error() {} },
-    } as never);
-    assert.doesNotThrow(() => getResizeConfig());
+  test('rejects invalid upload limits and queue lease invariants', () => {
+    for (const config of [
+      makeResizeConfig({ upload: { maxBytes: 0 } }),
+      makeResizeConfig({ queue: { leaseMs: 0 } }),
+      makeResizeConfig({
+        queue: { leaseMs: 60_000, lockTtlMs: { worker: 120_000 } },
+      }),
+    ]) {
+      install(config);
+      assert.throws(
+        () => getResizeConfig(),
+        (error: unknown) => error instanceof ResizeConfigError,
+      );
+    }
   });
 
-  test('throws a clear error when no app is initialized at all', () => {
+  test('throws clearly when the framework app is not initialized', () => {
     resetAppInstance();
     assert.throws(() => getResizeConfig(), /not initialized/);
   });
 
-  test('does NOT mutate the shared defaultResizeConfig singleton', () => {
-    useHostConfig({
-      mediaModelName: 'File',
-      encode: { quality: { avif: 10 } },
+  test('preserves the framework-provided object and nested encoder options', () => {
+    const config: ResizeConfig = makeResizeConfig({
+      encode: { formats: { webp: { quality: 71, effort: 6 } } },
     });
-    getResizeConfig();
-    assert.equal(defaultResizeConfig.encode?.quality.avif, 64);
-  });
-});
-
-describe('requiredFormats', () => {
-  test('webpAvifOnly removes jpeg without adding, sorting, or deduplicating', () => {
-    const cases: Array<{
-      formats: ResizeConfig['formats'];
-      expected: ResizeConfig['formats'];
-    }> = [
-      { formats: ['jpeg', 'webp', 'avif'], expected: ['webp', 'avif'] },
-      { formats: ['webp'], expected: ['webp'] },
-      { formats: ['avif'], expected: ['avif'] },
-      { formats: ['avif', 'jpeg', 'webp'], expected: ['avif', 'webp'] },
-      { formats: ['webp', 'webp'], expected: ['webp', 'webp'] },
-    ];
-    for (const { formats, expected } of cases) {
-      const input = [...formats];
-      const config = {
-        ...defaultResizeConfig,
-        mediaModelName: 'File',
-        formats: input,
-        webpAvifOnly: true,
-      };
-      assert.deepEqual(requiredFormats(config), expected);
-      assert.deepEqual(input, formats);
-    }
-  });
-
-  test('webpAvifOnly rejects a jpeg-only active format list', () => {
-    assert.throws(
-      () =>
-        requiredFormats({
-          ...defaultResizeConfig,
-          mediaModelName: 'File',
-          formats: ['jpeg'],
-          webpAvifOnly: true,
-        }),
-      (error: unknown) =>
-        error instanceof ResizeConfigError &&
-        error.code === 'RESIZE_CONFIG_FORMATS_INVALID',
-    );
-  });
-
-  test('rejects an empty configured list when webpAvifOnly is off', () => {
-    assert.throws(
-      () =>
-        requiredFormats({
-          ...defaultResizeConfig,
-          mediaModelName: 'File',
-          formats: [],
-        }),
-      (error: unknown) =>
-        error instanceof ResizeConfigError &&
-        error.code === 'RESIZE_CONFIG_FORMATS_INVALID',
-    );
-  });
-
-  test('otherwise returns config.formats verbatim', () => {
-    useHostConfig({ mediaModelName: 'File' });
-    assert.deepEqual(requiredFormats(getResizeConfig()), [
-      'jpeg',
-      'webp',
-      'avif',
-    ]);
+    install(config);
+    assert.strictEqual(getResizeConfig(), config);
+    assert.deepEqual(getResizeConfig().encode.formats.webp, {
+      quality: 71,
+      effort: 6,
+    });
   });
 });

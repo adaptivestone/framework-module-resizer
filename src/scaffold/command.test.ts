@@ -11,11 +11,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import {
-  resetAppInstance,
-  setAppInstance,
-} from '@adaptivestone/framework/helpers/appInstance.js';
-import { getResizeConfig } from '../resizeConfig.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -24,7 +19,6 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'resize-scaffold-'));
 });
 afterEach(async () => {
-  resetAppInstance();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -82,21 +76,15 @@ describe('runScaffold — default run', () => {
     );
     const configSource = await read(CONFIG);
     assert.doesNotMatch(configSource, /\.\.\.defaultResizeConfig/);
-    assert.match(configSource, /satisfies DeepPartial<ResizeConfig>/);
+    assert.match(configSource, /satisfies ResizeConfig/);
 
     const configModule = await import(
       `${pathToFileURL(join(root, CONFIG)).href}?test=${Date.now()}`
     );
-    assert.deepEqual(configModule.default, { mediaModelName: 'File' });
-
-    setAppInstance({
-      getConfig: () => configModule.default,
-      getModel: () => ({}),
-      logger: { info() {}, warn() {}, error() {} },
-    } as never);
-    const merged = getResizeConfig();
-    assert.deepEqual(merged.formats, ['jpeg', 'webp', 'avif']);
-    assert.equal(merged.worker.enabled, false);
+    assert.equal(configModule.default.mediaModelName, 'File');
+    assert.deepEqual(configModule.default.formats, ['jpeg', 'webp', 'avif']);
+    assert.equal(configModule.default.worker.enabled, false);
+    assert.deepEqual(configModule.default.encode.formats.tiff, undefined);
   });
 
   test('auto-creates missing directories', async () => {

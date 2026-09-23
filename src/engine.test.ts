@@ -11,6 +11,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,7 @@ function installFakeApp() {
   const warn: unknown[][] = [];
   const errors: unknown[][] = [];
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File' }),
+    getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
     logger: {
       info(...a: unknown[]) {

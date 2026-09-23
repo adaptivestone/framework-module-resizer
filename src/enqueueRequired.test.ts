@@ -11,6 +11,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MissingPreview } from './types.d.ts';
 
 const storage: ResizeStorage = {
@@ -21,7 +22,7 @@ const storage: ResizeStorage = {
 
 function installApp() {
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File' }),
+    getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
     logger: { info() {}, warn() {}, error() {} },
   } as never);

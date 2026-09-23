@@ -20,6 +20,7 @@ import {
   resetResizerForTests,
 } from './resizer.ts';
 import { processTask } from './resizeTask.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
   MissingPreview,
@@ -83,7 +84,7 @@ function installApp(configOverride: Record<string, unknown> = {}): {
     error: [] as unknown[][],
   };
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File', ...configOverride }),
+    getConfig: () => makeResizeConfig(configOverride),
     getModel: () => {
       modelCalls += 1;
       return {};
@@ -557,6 +558,26 @@ describe('processTask — variants', () => {
       assert.equal(p.actualWidth, 20);
       assert.equal(p.actualHeight, 20);
     }
+  });
+
+  test('encodes a TIFF selected and configured without a format-specific code branch', async () => {
+    installApp({
+      formats: ['tiff'],
+      encode: { formats: { tiff: { compression: 'lzw' } } },
+    });
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    await processTask(task({ previews: [variant({ format: 'tiff' })] }));
+
+    assert.equal((await sharp(uploads[0].body).metadata()).format, 'tiff');
+    assert.equal(uploads[0].contentType, 'image/tiff');
+    assert.equal(appendCalls[0].previews[0].format, 'tiff');
   });
 
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {

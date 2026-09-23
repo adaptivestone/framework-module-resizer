@@ -12,6 +12,7 @@ import { FrameworkLockProvider } from './locks/framework.ts';
 import ResizeTaskModel from './models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import type { ResizeStorage } from './storage/AbstractStorage.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import { MongoTransport } from './transports/mongo.ts';
 
 const storage: ResizeStorage = {
@@ -62,7 +63,7 @@ async function createFixture(name: string) {
   ]);
 
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File' }),
+    getConfig: () => makeResizeConfig(),
     getModel: (modelName: string) => {
       if (modelName === 'ResizeTask') {
         return taskModel;

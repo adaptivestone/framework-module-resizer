@@ -7,7 +7,7 @@
 // generatePreviews(). getResizer()/Resizer are imported for the value/type; the resizer↔
 // resizeTask cycle is runtime-safe (only hoisted functions are referenced, never called at
 // module load). sharp is a hard dep; this is the only place besides worker.ts that decodes.
-import sharp from 'sharp';
+import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
 import { getApp } from './app.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
@@ -23,7 +23,7 @@ import {
   getPreviewIdentity,
   requireMediaId,
 } from './images.ts';
-import { getResizeConfig, requiredFormats } from './resizeConfig.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import {
   type GenerateOpts,
   type GenerateResult,
@@ -270,34 +270,18 @@ export async function generatePreviews(
       for (const step of pipeline.variantSteps ?? []) {
         img = await step(img, { variant: v, ctx });
       }
-      // Flatten alpha onto the background ONLY for jpeg (transparent → black otherwise).
-      if (v.format === 'jpeg' && procMeta.hasAlpha) {
-        img = img.flatten({ background: config.encode.flattenBackground });
+      if (
+        procMeta.hasAlpha &&
+        config.encode.flatten.formats.includes(v.format)
+      ) {
+        img = img.flatten({ background: config.encode.flatten.background });
       }
 
-      // Per-format encode — NEVER reuse one quality int across codecs (08 · Config).
-      switch (v.format) {
-        case 'jpeg':
-          img = img.jpeg({
-            quality: config.encode.quality.jpeg,
-            mozjpeg: config.encode.mozjpeg,
-            chromaSubsampling: config.encode.chromaSubsampling,
-          });
-          break;
-        case 'webp':
-          img = img.webp({
-            quality: config.encode.quality.webp,
-            effort: config.encode.effort.webp,
-            smartSubsample: config.encode.chromaSubsampling === '4:4:4',
-          });
-          break;
-        case 'avif':
-          img = img.avif({
-            quality: config.encode.quality.avif,
-            effort: config.encode.effort.avif,
-          });
-          break;
-      }
+      const encodeOptions = config.encode.formats[v.format] ?? {};
+      img = img.toFormat(
+        v.format as keyof FormatEnum,
+        encodeOptions as OutputOptions,
+      );
 
       const { data, info } = await img.toBuffer({ resolveWithObject: true });
       // contentType + actual dims from the ACTUAL encoded info (box ≠ output for `fit`) —
@@ -528,7 +512,7 @@ export async function generateImpl(
     opts.sizes,
     ctx,
   )) as SizeInput[];
-  const formats = opts.formats ?? requiredFormats(config);
+  const formats = opts.formats ?? config.formats;
 
   // SVG originals are pass-through — never rasterized in any mode.
   if (original.contentType === 'image/svg+xml' || original.format === 'svg') {

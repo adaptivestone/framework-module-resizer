@@ -61,12 +61,6 @@ export {
 export type { TResizeTask } from './models/ResizeTask.ts';
 // --- Mongo-transport model class (the host's scaffolded model `extends` it) + its doc type ---
 export { default as ResizeTaskModel } from './models/ResizeTask.ts';
-// --- config: the defaults + the host-merged resolver + the active-format list ---
-export {
-  default as defaultResizeConfig,
-  getResizeConfig,
-  requiredFormats,
-} from './resizeConfigCompatibility.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,

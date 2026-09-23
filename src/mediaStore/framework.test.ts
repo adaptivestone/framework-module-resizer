@@ -4,6 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { Preview } from '../types.d.ts';
 import { FrameworkMediaStore } from './framework.ts';
 
@@ -21,7 +22,7 @@ function installApp(
   const mediaModelName = opts.mediaModelName ?? 'File';
   const errors: unknown[][] = [];
   setAppInstance({
-    getConfig: () => ({ mediaModelName }),
+    getConfig: () => makeResizeConfig({ mediaModelName }),
     getModel: () => model,
     logger: {
       info() {},
@@ -44,7 +45,7 @@ describe('FrameworkMediaStore.load', () => {
     const findByIdCalls: string[] = [];
     let modelAsked = '';
     setAppInstance({
-      getConfig: () => ({ mediaModelName: 'Media' }),
+      getConfig: () => makeResizeConfig({ mediaModelName: 'Media' }),
       getModel: (name: string) => {
         modelAsked = name;
         return {

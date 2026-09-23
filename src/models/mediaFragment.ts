@@ -51,7 +51,7 @@ export const resizeMediaSchemaFragment = {
       requestedHeight: { type: Number },
       actualWidth: { type: Number },
       actualHeight: { type: Number },
-      format: { type: String, enum: ['jpeg', 'webp', 'avif'] },
+      format: { type: String },
       contentType: { type: String },
       fit: { type: Boolean },
     },

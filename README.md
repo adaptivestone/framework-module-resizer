@@ -65,7 +65,7 @@ It emits (into `process.cwd()`, or `--out <dir>`), **never overwriting** without
 | File | What it is |
 |---|---|
 | `src/resizer.ts` | the construction site — `new Resizer({ … })` (edit freely) |
-| `src/config/resize.ts` | editable host overrides; module defaults merge at runtime |
+| `src/config/resize.ts` | complete editable base config; framework applies environment overrides |
 | `src/models/ResizeTask.ts` | thin shim (only without `--eager`) |
 | `src/commands/ResizeWorker.ts` | worker command re-export (only without `--eager`) |
 
@@ -125,7 +125,7 @@ const { decision } = await resizer.resolve({
 });
 ```
 
-**3. Set your media model name** in `src/config/resize.ts` (the one required field) and spread
+**3. Review the complete scaffolded config** in `src/config/resize.ts`, set `mediaModelName`, and spread
 `resizeMediaSchemaFragment` into the model so `original` + `previews[]` exist. Listing queries:
 
 ```ts
@@ -212,7 +212,8 @@ concurrent identical requests are not guaranteed to collapse to one row. Prepare
 through the host's migration/lifecycle process and verify the exact model declarations there;
 never run a destructive global `syncIndexes()` automatically.
 
-**Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
+**Enable the worker command** in the host `src/config/resize.ts` by changing the scaffolded
+`worker.enabled` value. For an environment-only override, add `resize.production.ts`:
 
 ```ts
 import type {
@@ -221,7 +222,6 @@ import type {
 } from '@adaptivestone/framework-module-resize';
 
 export default {
-  mediaModelName: 'File',
   worker: { enabled: true },
 } satisfies DeepPartial<ResizeConfig>;
 ```
@@ -598,13 +598,12 @@ formatPictureUrls(decision, { id }); // unfiltered <picture> map; filtered varia
 
 ## Config reference
 
-`src/config/resize.ts` (scaffolded, editable) is loaded by the framework, then its values are
-deep-merged over module defaults by `getResizeConfig()` when `new Resizer()` is created. Config
-errors therefore surface when the module is constructed (which must be after `Server.init()`), not
-on the first image request. **Arrays REPLACE** (so
-`formats: ['webp','avif']` doesn't concat to five); nested objects merge field-by-field.
-Keep only host overrides in this file: `formats` selects generated previews, while
-`upload.formats` is the independent allowlist for original input bytes.
+`src/config/resize.ts` is the complete base config produced by the scaffold. The framework loads
+it, merges `resize.<NODE_ENV>.ts` over it, and caches the final value returned by
+`getConfig('resize')`. The module validates that final value when `new Resizer()` is constructed;
+it does not import defaults or merge the config again. Framework merging replaces arrays and merges
+nested objects field by field. `formats` selects generated outputs, while `upload.formats` is the
+independent allowlist for original input bytes.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -612,15 +611,11 @@ Keep only host overrides in this file: `formats` selects generated previews, whi
 | `formats` | `['jpeg','webp','avif']` | generated formats |
 | `upload.maxBytes` | `26214400` (25 MiB) | maximum original byte length checked before storage |
 | `upload.formats` | `['jpeg','png','webp','avif','gif','svg']` | allowed formats, determined from bytes |
-| `webpAvifOnly` | `false` | filters `jpeg` from configured `formats`; adds nothing, and an empty result is invalid |
 | `maxSize` | `{ width: 2000, height: 1200 }` | the `fit` cap |
 | `animated` | `false` | `true` keeps GIF/WebP frames |
-| `encode.quality` | `{ jpeg: 80, webp: 82, avif: 64 }` | per-format — sharp codec defaults aren't perceptually comparable; never reuse one int |
-| `encode.effort` | `{ webp: 4, avif: 4 }` | encode-once + CDN-cached, so 5–6 is often worth it |
-| `encode.mozjpeg` | `true` | progressive + trellis quantization |
-| `encode.chromaSubsampling` | `'4:2:0'` | `'4:4:4'` keeps full chroma for text/logos/UI |
+| `encode.formats` | per-format Sharp options for jpeg/webp/avif | passed to `sharp.toFormat(format, options)` |
 | `encode.sharpen` | `{ cover: true, fit: false }` | mild unsharp after downscale (off for the large modal) |
-| `encode.flattenBackground` | `'#ffffff'` | alpha → jpeg flatten color |
+| `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | flatten alpha before the listed encoders |
 | `limits.inputPixels` | `268402689` | sharp decoder bomb guard |
 | `limits.sourcePixels` | `50_000_000` | rejected before decode, from metadata |
 | `limits.resultDimension` | `5000` | clamp on the cover branch |
@@ -635,6 +630,12 @@ Keep only host overrides in this file: `formats` selects generated previews, whi
 | `worker.concurrency` | `4` | variants resized in parallel per task |
 | `worker.sharpConcurrency` | `1` | `sharp.concurrency()`; keep `concurrency × sharpConcurrency ≈ nCPU` |
 | `worker.sharpCache` | `false` | a worker processes distinct images; the op-cache mostly wastes memory |
+
+Format ids are open strings rather than a package enum. To enable another format supported by the
+installed Sharp/libvips build, add it to `formats` or `upload.formats`. Output encoder options
+live under the same id in `encode.formats`; for example, TIFF can use
+`formats: ['tiff']` with `encode.formats.tiff: { compression: 'lzw' }`. Unsupported codecs fail
+through Sharp with the normal generation error path.
 
 Storage buckets/URLs and the SQS queue URL are **not** config — they are driver options passed to
 `new S3Storage({...})` / `new SqsTransport({...})`.

@@ -16,6 +16,7 @@ import mongoose from 'mongoose';
 import { ResizeGenerateError, ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MissingPreview } from '../types.d.ts';
 import { MongoTransport } from './mongo.ts';
 
@@ -79,17 +80,17 @@ function installFakeApp(
   const errors: unknown[][] = [];
   resetAppInstance();
   setAppInstance({
-    getConfig: () => ({
-      mediaModelName: 'File',
-      queue: {
-        leaseMs: 300,
-        idlePollMs: 20,
-        maxAttempts: 3,
-        retryBackoffMs: { base: 50, max: 200 },
-        lockTtlMs: { dispatch: 60000, worker: 300 }, // worker ≤ leaseMs (doneness invariant, 08 · §13)
-        ...queueOverride,
-      },
-    }),
+    getConfig: () =>
+      makeResizeConfig({
+        queue: {
+          leaseMs: 300,
+          idlePollMs: 20,
+          maxAttempts: 3,
+          retryBackoffMs: { base: 50, max: 200 },
+          lockTtlMs: { dispatch: 60000, worker: 300 },
+          ...queueOverride,
+        },
+      }),
     getModel:
       getModelImpl ?? ((name: string) => (name === 'ResizeTask' ? M : null)),
     logger: {
@@ -202,8 +203,8 @@ describe('MongoTransport.enqueue', () => {
       errorPath: 'previews.0.sizeKey',
     },
     {
-      name: 'unsupported format',
-      preview: { sizeKey: '300w', format: 'png' },
+      name: 'empty format id',
+      preview: { sizeKey: '300w', format: '' },
       errorPath: 'previews.0.format',
     },
   ]) {

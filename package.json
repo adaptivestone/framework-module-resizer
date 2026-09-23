@@ -13,7 +13,6 @@
     "./package.json": "./package.json",
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
-    "./config/resize.js": "./dist/resizeConfigCompatibility.js",
     "./transports/mongo.js": "./dist/transports/mongo.js",
     "./transports/sqs.js": "./dist/transports/sqs.js",
     "./storage/s3.js": "./dist/storage/s3.js",
@@ -41,7 +40,7 @@
   "scripts": {
     "prepublishOnly": "npm run build",
     "build": "node preBuild.ts && tsc && node postBuild.ts",
-    "types:check": "tsc --noEmit",
+    "types:check": "tsc --noEmit && tsc -p tsconfig.test-helpers.json",
     "test": "node --experimental-strip-types --test",
     "check": "biome check",
     "check:fix": "biome check --write",
@@ -54,7 +53,6 @@
   "author": "Andrei Lahunou",
   "license": "MIT",
   "dependencies": {
-    "deepmerge": "^4.3.1",
     "sharp": "^0.35.3"
   },
   "peerDependencies": {

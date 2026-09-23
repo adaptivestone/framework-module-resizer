@@ -39,9 +39,6 @@ const PKG = '@adaptivestone/framework-module-resize';
 const mod = await import(PKG);
 const expected = [
   'ResizeWorker',
-  'defaultResizeConfig',
-  'getResizeConfig',
-  'requiredFormats',
   'calculateResizedDimensions',
   'formatPictureUrls',
   'getFilterSig',
@@ -123,7 +120,6 @@ const safe = [
   ['/storage/fs.js', 'LocalFsStorage'],
   ['/mediaStore/framework.js', 'FrameworkMediaStore'],
   ['/locks/framework.js', 'FrameworkLockProvider'],
-  ['/config/resize.js', 'getResizeConfig'],
   ['/models/ResizeTask.js', 'default'],
   ['/commands/ResizeWorker.js', 'default'],
 ];

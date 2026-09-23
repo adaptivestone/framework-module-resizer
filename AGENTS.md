@@ -85,8 +85,9 @@ a private original.
    if any) **after** `Server.init()`: `await import('./resizer.ts')`. Do not use a static import;
    ESM evaluates it before bootstrap code.
 
-5. Set the one required config field in the scaffolded `src/config/resize.ts`:
-   `mediaModelName: 'File'` (your host media model's name).
+5. Review the complete scaffolded `src/config/resize.ts` and set
+   `mediaModelName: 'File'` (your host media model's name). Put environment-only changes in
+   `resize.<NODE_ENV>.ts`; the framework merges that file before this module reads the config.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
    instead of hand-writing those fields (single source of truth for schema + types):
@@ -230,10 +231,10 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants).
-- Config arrays REPLACE defaults: `formats: ['webp','avif']` means exactly two generated formats;
-  `upload.formats` separately controls accepted originals. `webpAvifOnly` only removes `jpeg`.
-- Per-format `encode.quality` values are NOT comparable (defaults: jpeg 80 ≈ webp 82 ≈ avif 64).
-  Never copy one quality number across formats.
+- The scaffolded `resize.ts` is complete. The framework merges environment overrides and the
+  module reads that final config without a second merge. Arrays in environment overrides replace.
+- Format ids are open strings. `formats` controls generated outputs, `upload.formats` controls
+  accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
@@ -258,5 +259,5 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |
 
-Config knobs: see the "Config reference" table in `README.md`; the defaults object is
-`defaultResizeConfig` (main entry).
+Config knobs and their scaffolded defaults are listed in the "Config reference" table in
+`README.md`.

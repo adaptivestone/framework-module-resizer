@@ -16,6 +16,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ function installFakeApp(
       }
     : undefined;
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File' }),
+    getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
     logger: {
       info() {},
@@ -136,7 +137,7 @@ describe('Resizer constructor — driver wiring', () => {
     assert.throws(() => getResizer(), /no Resizer constructed/);
     resetAppInstance();
     setAppInstance({
-      getConfig: () => ({ mediaModelName: 'File' }),
+      getConfig: () => makeResizeConfig(),
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
@@ -410,7 +411,7 @@ describe('resolve/generate stubs', () => {
     // A config WITH mediaModelName so getResizeConfig() inside generateImpl does not throw.
     resetAppInstance();
     setAppInstance({
-      getConfig: () => ({ mediaModelName: 'File' }),
+      getConfig: () => makeResizeConfig(),
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);

@@ -25,18 +25,15 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeTaskModel',
   'ResizeWorker',
   'calculateResizedDimensions',
-  'defaultResizeConfig',
   'formatPictureUrls',
   'getFilterSig',
   'getImageContentType',
   'getPreviewIdentity',
-  'getResizeConfig',
   'getResizer',
   'getSizeKey',
   'isCatalogCovered',
   'parseSizeKey',
   'processTask',
-  'requiredFormats',
   'resetResizerForTests',
   'resizeMediaPaths',
   'resizeMediaSchemaFragment',
@@ -86,8 +83,6 @@ describe('public API surface (src/index.ts)', () => {
       'getPreviewIdentity',
       'calculateResizedDimensions',
       'getImageContentType',
-      'getResizeConfig',
-      'requiredFormats',
       'formatPictureUrls',
       'isCatalogCovered',
     ]) {
@@ -99,9 +94,7 @@ describe('public API surface (src/index.ts)', () => {
     }
   });
 
-  test('the config default + schema fragment are plain objects (real values)', () => {
-    assert.equal(typeof api.defaultResizeConfig, 'object');
-    assert.equal(api.defaultResizeConfig.formats[0], 'jpeg'); // it's the actual default, not a stub
+  test('the schema fragment is a real plain object', () => {
     assert.equal(typeof api.resizeMediaSchemaFragment, 'object');
     assert.deepEqual(api.resizeMediaPaths, ['original', 'previews']);
   });

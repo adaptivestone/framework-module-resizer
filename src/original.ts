@@ -1,6 +1,5 @@
 import sharp, { type Metadata } from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
-import { originalFormatInfo } from './formats.ts';
 import { randomHex } from './helpers/random.ts';
 import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
@@ -18,6 +17,16 @@ interface PreparedOriginal {
   extension: string;
   width?: number;
   height?: number;
+}
+
+function originalStorageInfo(format: string): {
+  contentType: string;
+  extension: string;
+} {
+  return {
+    contentType: format === 'svg' ? 'image/svg+xml' : `image/${format}`,
+    extension: format === 'jpeg' ? 'jpg' : format,
+  };
 }
 
 function asBuffer(body: Buffer | Uint8Array): Buffer {
@@ -62,24 +71,14 @@ async function prepareOriginal(
     );
   }
 
-  let format: OriginalFormat | undefined;
-  if (
-    metadata.format === 'jpeg' ||
-    metadata.format === 'png' ||
-    metadata.format === 'webp' ||
-    metadata.format === 'gif' ||
-    metadata.format === 'svg'
-  ) {
-    format = metadata.format;
-  } else if (metadata.format === 'heif' && isAvif(body)) {
-    format = 'avif';
-  }
-  if (!format) {
+  if (!metadata.format) {
     throw new ResizeOriginalError(
-      `resize uploadOriginal: detected image format ${metadata.format ?? 'unknown'} is not supported`,
+      'resize uploadOriginal: Sharp did not identify the image format',
       { code: 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED' },
     );
   }
+  const format: OriginalFormat =
+    metadata.format === 'heif' && isAvif(body) ? 'avif' : metadata.format;
   if (metadata.width === undefined || metadata.height === undefined) {
     throw new ResizeOriginalError(
       'resize uploadOriginal: image metadata is missing width/height',
@@ -97,7 +96,7 @@ async function prepareOriginal(
   }
   return {
     format,
-    ...originalFormatInfo[format],
+    ...originalStorageInfo(format),
     ...displayDimensions(metadata),
   };
 }

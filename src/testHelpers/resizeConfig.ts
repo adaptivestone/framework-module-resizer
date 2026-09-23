@@ -1,10 +1,7 @@
-// src/config/resize.ts — complete base config loaded by @adaptivestone/framework.
-// Put environment-only changes in resize.<NODE_ENV>.ts; the framework merges that file
-// over this one before getConfig('resize') is called. Arrays replace the base arrays.
-import type { ResizeConfig } from '@adaptivestone/framework-module-resize';
+import type { DeepPartial, ResizeConfig } from '../types.d.ts';
 
-export default {
-  mediaModelName: 'File', // TODO(REQUIRED): the host media model, e.g. File or Media
+const baseResizeConfig: ResizeConfig = {
+  mediaModelName: 'File',
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
     maxBytes: 25 * 1024 * 1024,
@@ -13,8 +10,6 @@ export default {
   maxSize: { width: 2000, height: 1200 },
   animated: false,
   encode: {
-    // Each entry is passed to sharp.toFormat(format, options). Add a format here and
-    // to formats above when the installed Sharp/libvips build supports it.
     formats: {
       jpeg: { quality: 80, mozjpeg: true, chromaSubsampling: '4:2:0' },
       webp: { quality: 82, effort: 4 },
@@ -43,4 +38,31 @@ export default {
     sharpConcurrency: 1,
     sharpCache: false,
   },
-} satisfies ResizeConfig;
+};
+
+function merge(base: unknown, override: unknown): unknown {
+  if (Array.isArray(override)) {
+    return [...override];
+  }
+  if (
+    override &&
+    typeof override === 'object' &&
+    !Array.isArray(override) &&
+    base &&
+    typeof base === 'object' &&
+    !Array.isArray(base)
+  ) {
+    const result = { ...(base as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(override)) {
+      result[key] = merge(result[key], value);
+    }
+    return result;
+  }
+  return override === undefined ? base : override;
+}
+
+export function makeResizeConfig(
+  override: DeepPartial<ResizeConfig> = {},
+): ResizeConfig {
+  return merge(baseResizeConfig, override) as ResizeConfig;
+}

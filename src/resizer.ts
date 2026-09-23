@@ -149,7 +149,7 @@ export interface GenerateOpts {
   media: MediaLike;
   sizes: SizeInput[];
   pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = requiredFormats(config)
+  formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // real ctx reaches pipeline steps (eager mode, 04 · §8)
   persist?: boolean; // default true → $push previews + backfill dims
 }
@@ -311,7 +311,7 @@ export class Resizer {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = requiredFormats(config)
+    formats?: PreviewFormat[]; // default = config.formats
     ctx?: Record<string, unknown>; // threaded to read-path hooks (04 · §8)
     enqueueMissing?: boolean; // default true when a transport is set, false otherwise
   }): Promise<{ decision: ReadDecision; output: unknown }> {
@@ -332,7 +332,7 @@ export class Resizer {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = requiredFormats(config)
+    formats?: PreviewFormat[]; // default = config.formats
     ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
   }): Promise<{ enqueued: number }> {
     return prewarmImpl(this, opts);
