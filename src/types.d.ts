@@ -186,15 +186,15 @@ export interface PictureUrls {
 //
 // MODULE behavior only. Storage-specific options (buckets, base URL, signed-URL
 // settings) live in the storage driver; transport-specific options (SQS queue URL,
-// region) live in the transport driver — each is passed to the driver at registration
-// (see 05). The core config never knows what a "bucket" or "queue URL" is, so a new
+// region) live in the transport driver — both drivers are passed to the Resizer
+// constructor (see 05). The core config never knows what a "bucket" or "queue URL" is, so a new
 // storage/transport driver is self-contained and the module never changes.
 // ---------------------------------------------------------------------------
 
 export interface ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   formats: PreviewFormat[]; // default ['jpeg','webp','avif']
-  webpAvifOnly?: boolean; // when true, requiredFormats() drops 'jpeg' (read + worker MUST agree)
+  webpAvifOnly?: boolean; // filters 'jpeg' from formats; adds nothing, and an empty result is invalid
   upload: {
     maxBytes: number;
     formats: OriginalFormat[];

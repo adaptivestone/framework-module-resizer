@@ -190,7 +190,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
 });
 
 describe('uploadOriginal — SVG pass-through', () => {
-  test('parses XML SVG without rasterizing and uses viewBox for missing dimensions', async () => {
+  test('parses XML SVG without rasterizing or treating viewBox as pixel dimensions', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
     let queueCalls = 0;
@@ -210,7 +210,7 @@ describe('uploadOriginal — SVG pass-through', () => {
     assert.equal(original.format, 'svg');
     assert.equal(original.contentType, 'image/svg+xml');
     assert.equal(original.width, 120);
-    assert.equal(original.height, 100);
+    assert.equal(original.height, undefined);
     assert.equal(original.size, body.byteLength);
     assert.match(original.key, /^originals\/[a-f0-9]{32}\.svg$/);
     assert.deepEqual(uploads[0].body, body);
@@ -262,8 +262,8 @@ describe('uploadOriginal — SVG pass-through', () => {
     );
     const original = await r.uploadOriginal({ body, visibility: 'public' });
 
-    assert.equal(original.width, 40);
-    assert.equal(original.height, 20);
+    assert.equal(original.width, undefined);
+    assert.equal(original.height, undefined);
     assert.deepEqual(uploads[0].body, body);
 
     const legacyBody = Buffer.from('<svg width="13" height="8"/>');
@@ -274,6 +274,65 @@ describe('uploadOriginal — SVG pass-through', () => {
     assert.equal(legacyOriginal.width, 13);
     assert.equal(legacyOriginal.height, 8);
     assert.deepEqual(uploads[1].body, legacyBody);
+  });
+
+  test('records only explicit pixel lengths and never infers dimensions from viewBox', async () => {
+    installApp();
+    const { storage } = recordingStorage();
+    const r = new Resizer({ storage });
+    const cases = [
+      {
+        svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120px" height="80"/>',
+        width: 120,
+        height: 80,
+      },
+      {
+        svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 100"/>',
+        width: undefined,
+        height: undefined,
+      },
+      {
+        svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" viewBox="0 0 240 100"/>',
+        width: 120,
+        height: undefined,
+      },
+      {
+        svg: '<svg xmlns="http://www.w3.org/2000/svg" width="50%" height="2em" viewBox="0 0 240 100"/>',
+        width: undefined,
+        height: undefined,
+      },
+    ];
+
+    for (const expected of cases) {
+      const original = await r.uploadOriginal({
+        body: Buffer.from(expected.svg),
+        visibility: 'private',
+      });
+      assert.equal(original.width, expected.width);
+      assert.equal(original.height, expected.height);
+    }
+  });
+
+  test('rejects an uppercase SVG root and the wrong namespace before storage', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    for (const fixture of [
+      '<SVG xmlns="http://www.w3.org/2000/svg"/>',
+      '<svg xmlns="https://example.com/not-svg"/>',
+    ]) {
+      await assert.rejects(
+        () =>
+          r.uploadOriginal({
+            body: Buffer.from(fixture),
+            visibility: 'private',
+          }),
+        (error: unknown) =>
+          error instanceof ResizeOriginalError &&
+          error.code === 'RESIZE_ORIGINAL_NOT_SVG',
+      );
+    }
+    assert.equal(uploads.length, 0);
   });
 
   test('rejects DTD/entities and malformed non-SVG XML before storage', async () => {

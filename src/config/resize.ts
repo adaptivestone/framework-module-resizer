@@ -1,14 +1,18 @@
+import {
+  supportedOriginalFormats,
+  supportedPreviewFormats,
+} from '../formats.ts';
 import type { ResizeConfig } from '../types.d.ts';
 
 // Every TUNABLE is defaulted (and completeness-checked by the Omit type). Only the
 // host-required `mediaModelName` is absent — the host sets it in src/config/resize.ts.
-// Storage/transport options (buckets, URLs, queue URL) are NOT here: they are driver
-// options passed at registerStorage()/registerQueueTransport() — see 05.
+// Storage/transport options (buckets, URLs, queue URL) belong to the drivers
+// passed to new Resizer({ storage, transport }) — see 05.
 const defaultResizeConfig: Omit<ResizeConfig, 'mediaModelName'> = {
-  formats: ['jpeg', 'webp', 'avif'],
+  formats: [...supportedPreviewFormats],
   upload: {
     maxBytes: 25 * 1024 * 1024,
-    formats: ['jpeg', 'png', 'webp', 'avif', 'gif', 'svg'],
+    formats: [...supportedOriginalFormats],
   },
   maxSize: { width: 2000, height: 1200 },
   animated: false,

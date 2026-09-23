@@ -1,12 +1,14 @@
 import { createRequire } from 'node:module';
 import sharp, { type Metadata } from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
+import { originalFormatInfo } from './formats.ts';
 import { randomHex } from './helpers/random.ts';
 import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   Original,
   OriginalFormat,
+  ResizeConfig,
   StorageRef,
   UploadOriginalOpts,
 } from './types.d.ts';
@@ -57,28 +59,6 @@ function parsePixelLength(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function parseViewBox(value: string | undefined): {
-  width?: number;
-  height?: number;
-} {
-  if (value === undefined) {
-    return {};
-  }
-  const numbers = value
-    .trim()
-    .split(/[\s,]+/u)
-    .map(Number);
-  if (
-    numbers.length !== 4 ||
-    numbers.some((number) => !Number.isFinite(number)) ||
-    numbers[2] <= 0 ||
-    numbers[3] <= 0
-  ) {
-    return {};
-  }
-  return { width: numbers[2], height: numbers[3] };
-}
-
 function parseSvg(text: string): PreparedOriginal {
   let root: StrictXmlTag | undefined;
   try {
@@ -116,7 +96,7 @@ function parseSvg(text: string): PreparedOriginal {
     );
   }
   if (
-    parsedRoot.local?.toLowerCase() !== 'svg' ||
+    parsedRoot.local !== 'svg' ||
     (parsedRoot.uri !== '' && parsedRoot.uri !== SVG_NAMESPACE)
   ) {
     throw new ResizeOriginalError(
@@ -127,13 +107,11 @@ function parseSvg(text: string): PreparedOriginal {
 
   const attribute = (name: string): string | undefined =>
     parsedRoot.attributes[name]?.value;
-  const viewBox = parseViewBox(attribute('viewBox'));
-  const width = parsePixelLength(attribute('width')) ?? viewBox.width;
-  const height = parsePixelLength(attribute('height')) ?? viewBox.height;
+  const width = parsePixelLength(attribute('width'));
+  const height = parsePixelLength(attribute('height'));
   return {
     format: 'svg',
-    contentType: 'image/svg+xml',
-    extension: 'svg',
+    ...originalFormatInfo.svg,
     ...(width !== undefined ? { width } : {}),
     ...(height !== undefined ? { height } : {}),
   };
@@ -220,13 +198,15 @@ function displayDimensions(metadata: Metadata): {
     : { width: metadata.width, height };
 }
 
-async function prepareOriginal(body: Buffer): Promise<PreparedOriginal> {
+async function prepareOriginal(
+  body: Buffer,
+  config: ResizeConfig,
+): Promise<PreparedOriginal> {
   const xml = decodeXmlCandidate(body);
   if (xml !== undefined) {
     return parseSvg(xml);
   }
 
-  const config = getResizeConfig();
   let metadata: Metadata;
   try {
     metadata = await sharp(body, {
@@ -272,17 +252,9 @@ async function prepareOriginal(body: Buffer): Promise<PreparedOriginal> {
       { code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' },
     );
   }
-  const contentTypes: Record<Exclude<OriginalFormat, 'svg'>, string> = {
-    jpeg: 'image/jpeg',
-    png: 'image/png',
-    webp: 'image/webp',
-    avif: 'image/avif',
-    gif: 'image/gif',
-  };
   return {
     format,
-    contentType: contentTypes[format],
-    extension: format === 'jpeg' ? 'jpg' : format,
+    ...originalFormatInfo[format],
     ...displayDimensions(metadata),
   };
 }
@@ -319,7 +291,7 @@ export async function uploadOriginalImpl(
       { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
     );
   }
-  const prepared = await prepareOriginal(body);
+  const prepared = await prepareOriginal(body, config);
   if (!config.upload.formats.includes(prepared.format)) {
     throw new ResizeOriginalError(
       `resize uploadOriginal: format ${prepared.format} is disabled by upload.formats`,

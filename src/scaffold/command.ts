@@ -200,7 +200,7 @@ Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — new Resizer({ transport, storage, pipelines })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
   src/commands/ResizeWorker.ts  re-export of the module's worker command
-  src/config/resize.ts      editable config (spreads the module defaults)
+  src/config/resize.ts      editable host overrides (module merges defaults at runtime)
 
 Options:
   --check      verify the shims exist + reference the module; exit 1 on missing/drift (no writes)

@@ -2,10 +2,14 @@ import merge from 'deepmerge';
 import { getApp } from './app.ts';
 import defaultResizeConfig from './config/resize.ts';
 import { ResizeConfigError } from './errors.ts';
+import {
+  supportedOriginalFormats,
+  supportedPreviewFormats,
+} from './formats.ts';
 import type { PreviewFormat, ResizeConfig } from './types.d.ts';
 
-const originalFormats = new Set(['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']);
-const previewFormats = new Set(['jpeg', 'webp', 'avif']);
+const originalFormats = new Set<string>(supportedOriginalFormats);
+const previewFormats = new Set<string>(supportedPreviewFormats);
 const overwrite = (_dest: unknown[], src: unknown[]): unknown[] => src;
 
 const invalid = (message: string, code: string): never => {
@@ -132,10 +136,21 @@ export function getResizeConfig(): ResizeConfig {
   validateRequiredResizeConfigFields(merged);
   // Defaults provide the complete shape; the validator above intentionally asserts only
   // the subset checked at runtime instead of presenting itself as a universal validator.
-  return merged as ResizeConfig;
+  const config = merged as ResizeConfig;
+  requiredFormats(config);
+  return config;
 }
 
 /** The SINGLE source for the active format list (read path + worker MUST agree). */
 export function requiredFormats(config: ResizeConfig): PreviewFormat[] {
-  return config.webpAvifOnly ? ['webp', 'avif'] : config.formats;
+  const formats = config.webpAvifOnly
+    ? config.formats.filter((format) => format !== 'jpeg')
+    : config.formats;
+  if (formats.length === 0) {
+    invalid(
+      'resize config: no active preview formats remain',
+      'RESIZE_CONFIG_FORMATS_INVALID',
+    );
+  }
+  return formats;
 }

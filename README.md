@@ -65,7 +65,7 @@ It emits (into `process.cwd()`, or `--out <dir>`), **never overwriting** without
 | File | What it is |
 |---|---|
 | `src/resizer.ts` | the construction site — `new Resizer({ … })` (edit freely) |
-| `src/config/resize.ts` | editable config that spreads the module defaults |
+| `src/config/resize.ts` | editable host overrides; module defaults merge at runtime |
 | `src/models/ResizeTask.ts` | thin shim (only without `--eager`) |
 | `src/commands/ResizeWorker.ts` | worker command re-export (only without `--eager`) |
 
@@ -146,12 +146,13 @@ driver may return its own opaque locator key.
 
 Input bytes are stored unchanged. Raster metadata is probed with `sharp.metadata()` under the
 configured pixel guard, but no decode-to-output, rotation, EXIF rewrite, re-encode, or animation
-collapse occurs. SVG is parsed by a strict, non-rendering XML parser and is never passed to Sharp.
-Malformed XML, duplicate attributes, unknown/invalid entities, trailing document data, and all
-DTD/entity declarations are rejected before storage; sanitizing otherwise-valid SVG content
-remains the host's responsibility before calling this method. Pixel dimensions come from valid
-`width`/`height` values, falling back to the width/height components of `viewBox` when needed;
-percentage and other relative lengths remain unset.
+collapse occurs. SVG is parsed by the non-rendering `saxes` XML parser and is never passed to
+Sharp. Malformed XML, duplicate attributes, unknown/invalid entities, trailing document data,
+and all DTD/entity declarations are rejected before storage. This structural check is not SVG
+sanitization; the host must sanitize otherwise-valid SVG content before calling this method.
+Pixel dimensions come only from positive unitless or `px` `width`/`height` attributes. A
+`viewBox`, percentage, or relative length is not stored as a pixel dimension; unknown dimensions
+are omitted, and previously stored media rows are not rewritten automatically.
 
 Failures are typed: malformed/unsupported/over-limit input throws `ResizeOriginalError`; storage
 I/O throws `ResizeStorageError` with code `RESIZE_ORIGINAL_UPLOAD_FAILED` and the driver error as
@@ -215,13 +216,15 @@ never run a destructive global `syncIndexes()` automatically.
 **Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
 
 ```ts
-import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+import type {
+  DeepPartial,
+  ResizeConfig,
+} from '@adaptivestone/framework-module-resize';
 
 export default {
-  ...defaultResizeConfig,
   mediaModelName: 'File',
-  worker: { ...defaultResizeConfig.worker, enabled: true },
-};
+  worker: { enabled: true },
+} satisfies DeepPartial<ResizeConfig>;
 ```
 
 **Run the worker** as a separate process:
@@ -601,6 +604,8 @@ deep-merged over module defaults by `getResizeConfig()` when `new Resizer()` is 
 errors therefore surface when the module is constructed (which must be after `Server.init()`), not
 on the first image request. **Arrays REPLACE** (so
 `formats: ['webp','avif']` doesn't concat to five); nested objects merge field-by-field.
+Keep only host overrides in this file: `formats` selects generated previews, while
+`upload.formats` is the independent allowlist for original input bytes.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -608,7 +613,7 @@ on the first image request. **Arrays REPLACE** (so
 | `formats` | `['jpeg','webp','avif']` | generated formats |
 | `upload.maxBytes` | `26214400` (25 MiB) | maximum original byte length checked before storage |
 | `upload.formats` | `['jpeg','png','webp','avif','gif','svg']` | allowed formats, determined from bytes |
-| `webpAvifOnly` | `false` | when `true`, `requiredFormats()` drops `jpeg` (read + worker must agree) |
+| `webpAvifOnly` | `false` | filters `jpeg` from configured `formats`; adds nothing, and an empty result is invalid |
 | `maxSize` | `{ width: 2000, height: 1200 }` | the `fit` cap |
 | `animated` | `false` | `true` keeps GIF/WebP frames |
 | `encode.quality` | `{ jpeg: 80, webp: 82, avif: 64 }` | per-format — sharp codec defaults aren't perceptually comparable; never reuse one int |
@@ -690,7 +695,8 @@ stores SVG bytes as SVG and `image/svg+xml`; when `original.contentType === 'ima
 read path
 serves a public original at every requested size/format and never resizes or enqueues. A private
 original is served only through a successful authorized `signedUrl`; anonymous reads return no
-original URL. **SVG sanitization is host-owned** (sanitize at upload before storing).
+original URL. `saxes` checks XML structure but does not remove scripts or external links.
+**SVG sanitization is host-owned** (sanitize at upload before storing).
 
 **Original visibility is explicit.** Storage drivers that can prove an original is public should
 implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's

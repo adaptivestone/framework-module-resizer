@@ -74,6 +74,20 @@ describe('getResizeConfig', () => {
     assert.deepEqual(getResizeConfig().formats, ['webp', 'avif']);
   });
 
+  test('rejects an empty active format list at config resolution', () => {
+    useHostConfig({
+      mediaModelName: 'File',
+      formats: ['jpeg'],
+      webpAvifOnly: true,
+    });
+    assert.throws(
+      () => getResizeConfig(),
+      (error: unknown) =>
+        error instanceof ResizeConfigError &&
+        error.code === 'RESIZE_CONFIG_FORMATS_INVALID',
+    );
+  });
+
   test('throws when the required mediaModelName is missing', () => {
     useHostConfig({});
     assert.throws(() => getResizeConfig(), /mediaModelName/);
@@ -150,9 +164,57 @@ describe('getResizeConfig', () => {
 });
 
 describe('requiredFormats', () => {
-  test('webpAvifOnly drops jpeg', () => {
-    useHostConfig({ mediaModelName: 'File', webpAvifOnly: true });
-    assert.deepEqual(requiredFormats(getResizeConfig()), ['webp', 'avif']);
+  test('webpAvifOnly removes jpeg without adding, sorting, or deduplicating', () => {
+    const cases: Array<{
+      formats: ResizeConfig['formats'];
+      expected: ResizeConfig['formats'];
+    }> = [
+      { formats: ['jpeg', 'webp', 'avif'], expected: ['webp', 'avif'] },
+      { formats: ['webp'], expected: ['webp'] },
+      { formats: ['avif'], expected: ['avif'] },
+      { formats: ['avif', 'jpeg', 'webp'], expected: ['avif', 'webp'] },
+      { formats: ['webp', 'webp'], expected: ['webp', 'webp'] },
+    ];
+    for (const { formats, expected } of cases) {
+      const input = [...formats];
+      const config = {
+        ...defaultResizeConfig,
+        mediaModelName: 'File',
+        formats: input,
+        webpAvifOnly: true,
+      };
+      assert.deepEqual(requiredFormats(config), expected);
+      assert.deepEqual(input, formats);
+    }
+  });
+
+  test('webpAvifOnly rejects a jpeg-only active format list', () => {
+    assert.throws(
+      () =>
+        requiredFormats({
+          ...defaultResizeConfig,
+          mediaModelName: 'File',
+          formats: ['jpeg'],
+          webpAvifOnly: true,
+        }),
+      (error: unknown) =>
+        error instanceof ResizeConfigError &&
+        error.code === 'RESIZE_CONFIG_FORMATS_INVALID',
+    );
+  });
+
+  test('rejects an empty configured list when webpAvifOnly is off', () => {
+    assert.throws(
+      () =>
+        requiredFormats({
+          ...defaultResizeConfig,
+          mediaModelName: 'File',
+          formats: [],
+        }),
+      (error: unknown) =>
+        error instanceof ResizeConfigError &&
+        error.code === 'RESIZE_CONFIG_FORMATS_INVALID',
+    );
   });
 
   test('otherwise returns config.formats verbatim', () => {

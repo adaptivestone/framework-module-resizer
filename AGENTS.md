@@ -122,8 +122,10 @@ const original = await getResizer().uploadOriginal({
 });
 ```
 
-The format comes from bytes. Raster bytes are metadata-probed but stored unchanged; SVG is parsed
-without Sharp and stays SVG (`.svg`, `image/svg+xml`). The host sanitizes SVG before this call.
+The format comes from bytes. Raster bytes are metadata-probed but stored unchanged. SVG XML is
+structurally checked with `saxes`, never enters Sharp, and stays SVG (`.svg`, `image/svg+xml`).
+Only explicit unitless/`px` width and height become pixel metadata; `viewBox` does not. The parser
+is not a sanitizer, so the host sanitizes SVG before this call.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
@@ -218,7 +220,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants).
-- Config arrays REPLACE defaults: `formats: ['webp','avif']` means exactly two formats.
+- Config arrays REPLACE defaults: `formats: ['webp','avif']` means exactly two generated formats;
+  `upload.formats` separately controls accepted originals. `webpAvifOnly` only removes `jpeg`.
 - Per-format `encode.quality` values are NOT comparable (defaults: jpeg 80 ≈ webp 82 ≈ avif 64).
   Never copy one quality number across formats.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
