@@ -122,10 +122,11 @@ const original = await getResizer().uploadOriginal({
 });
 ```
 
-The format comes from bytes. Raster bytes are metadata-probed but stored unchanged. SVG XML is
-structurally checked with `saxes`, never enters Sharp, and stays SVG (`.svg`, `image/svg+xml`).
-Only explicit unitless/`px` width and height become pixel metadata; `viewBox` does not. The parser
-is not a sanitizer, so the host sanitizes SVG before this call.
+The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
+bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) without raster output. SVG
+sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
+is rejected. There is no separate XML validator or DTD prohibition. Metadata inspection is not
+a sanitizer, so the host sanitizes SVG before this call.
 
 For a public SVG with a private original, persist `original` first. Upload the same sanitized
 bytes again with `visibility: 'public'`, then persist its locator as
@@ -234,7 +235,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 - Per-format `encode.quality` values are NOT comparable (defaults: jpeg 80 ≈ webp 82 ≈ avif 64).
   Never copy one quality number across formats.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
-  raster `metadata()` inspection only; it never emits transformed bytes. SVG never enters Sharp.
+  `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
 - SVG bytes pass through untouched at every requested size (never rasterized or enqueued).

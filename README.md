@@ -144,15 +144,14 @@ create a media document, enqueue variants, or know anything about users, owners,
 Built-in filesystem/S3 drivers preserve the suggested extension; a custom content-addressed
 driver may return its own opaque locator key.
 
-Input bytes are stored unchanged. Raster metadata is probed with `sharp.metadata()` under the
-configured pixel guard, but no decode-to-output, rotation, EXIF rewrite, re-encode, or animation
-collapse occurs. SVG is parsed by the non-rendering `saxes` XML parser and is never passed to
-Sharp. Malformed XML, duplicate attributes, unknown/invalid entities, trailing document data,
-and all DTD/entity declarations are rejected before storage. This structural check is not SVG
-sanitization; the host must sanitize otherwise-valid SVG content before calling this method.
-Pixel dimensions come only from positive unitless or `px` `width`/`height` attributes. A
-`viewBox`, percentage, or relative length is not stored as a pixel dimension; unknown dimensions
-are omitted, and previously stored media rows are not rewritten automatically.
+Input bytes are stored unchanged. Format and dimensions for raster images and SVG are read
+with `sharp().metadata()` under the configured pixel limits. No output image is rendered,
+rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml` and never generates previews.
+SVG dimensions are those reported by Sharp, including dimensions derived from `viewBox`.
+SVG without dimensions that Sharp can determine is rejected. Previously stored rows are unchanged.
+There is no separate XML validator or DTD prohibition. Sharp metadata inspection is not
+sanitization: the host must sanitize SVG before calling this method. Inputs Sharp cannot read
+use the common `RESIZE_ORIGINAL_INVALID` error instead of the former SVG-specific XML errors.
 
 Failures are typed: malformed/unsupported/over-limit input throws `ResizeOriginalError`; storage
 I/O throws `ResizeStorageError` with code `RESIZE_ORIGINAL_UPLOAD_FAILED` and the driver error as
@@ -718,7 +717,7 @@ private originals. Save the private original first so a failed public upload lea
 source to retry from. If saving `publicCopy` fails after its upload, the host must retry that
 save or clean up the unreferenced public object. A custom storage driver must implement
 `canServeOriginalPublicly()` for anonymous SVG delivery; `LocalFsStorage` has no private area.
-The host owns cleanup of both objects. `saxes` checks XML structure but does not remove scripts
+The host owns cleanup of both objects. Metadata inspection does not remove scripts
 or external links; **sanitize SVG in the host before either upload.**
 
 **Original visibility is explicit.** Storage drivers that can prove an original is public should

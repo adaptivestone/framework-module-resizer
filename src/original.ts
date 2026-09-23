@@ -1,4 +1,3 @@
-import { createRequire } from 'node:module';
 import sharp, { type Metadata } from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { originalFormatInfo } from './formats.ts';
@@ -21,160 +20,8 @@ interface PreparedOriginal {
   height?: number;
 }
 
-interface StrictXmlTag {
-  local?: string;
-  uri?: string;
-  attributes: Record<string, { value: string }>;
-}
-
-interface StrictXmlParser {
-  on(name: 'doctype', handler: () => void): void;
-  on(name: 'opentag', handler: (tag: StrictXmlTag) => void): void;
-  on(name: 'error', handler: (error: Error) => void): void;
-  write(chunk: string): this;
-  close(): this;
-}
-
-const { SaxesParser } = createRequire(import.meta.url)('saxes') as {
-  SaxesParser: new (options: { xmlns: true }) => StrictXmlParser;
-};
-
-const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
-
 function asBuffer(body: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(body) ? body : Buffer.from(body);
-}
-
-function parsePixelLength(value: string | undefined): number | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  const match = /^\s*(\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?(?:px)?\s*$/u.exec(
-    value,
-  );
-  if (!match) {
-    return undefined;
-  }
-  const parsed = Number(value.trim().replace(/px$/iu, ''));
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-}
-
-function parseSvg(text: string): PreparedOriginal {
-  let root: StrictXmlTag | undefined;
-  try {
-    const parser = new SaxesParser({ xmlns: true });
-    parser.on('doctype', () => {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: SVG DTD and entity declarations are not allowed',
-        { code: 'RESIZE_ORIGINAL_SVG_DTD_FORBIDDEN' },
-      );
-    });
-    parser.on('opentag', (tag) => {
-      if (root === undefined) {
-        root = tag;
-      }
-    });
-    parser.on('error', (error) => {
-      throw error;
-    });
-    parser.write(text).close();
-  } catch (cause) {
-    if (cause instanceof ResizeOriginalError) {
-      throw cause;
-    }
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: SVG XML is not well-formed',
-      { code: 'RESIZE_ORIGINAL_SVG_INVALID', cause },
-    );
-  }
-
-  const parsedRoot = root;
-  if (parsedRoot === undefined) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: XML root is not an SVG element',
-      { code: 'RESIZE_ORIGINAL_NOT_SVG' },
-    );
-  }
-  if (
-    parsedRoot.local !== 'svg' ||
-    (parsedRoot.uri !== '' && parsedRoot.uri !== SVG_NAMESPACE)
-  ) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: XML root is not an SVG element',
-      { code: 'RESIZE_ORIGINAL_NOT_SVG' },
-    );
-  }
-
-  const attribute = (name: string): string | undefined =>
-    parsedRoot.attributes[name]?.value;
-  const width = parsePixelLength(attribute('width'));
-  const height = parsePixelLength(attribute('height'));
-  return {
-    format: 'svg',
-    ...originalFormatInfo.svg,
-    ...(width !== undefined ? { width } : {}),
-    ...(height !== undefined ? { height } : {}),
-  };
-}
-
-function decodeXmlCandidate(body: Buffer): string | undefined {
-  let encoding: 'utf-8' | 'utf-16le' | 'utf-16be' = 'utf-8';
-  // XML autodetection signatures that this small, non-rendering parser deliberately does not
-  // decode. Reject before Sharp: an SVG in an unfamiliar encoding must never reach a renderer.
-  const signature = body.subarray(0, 4).toString('hex');
-  if (
-    signature === '0000feff' ||
-    signature === 'fffe0000' ||
-    signature === '0000003c' ||
-    signature === '3c000000' ||
-    signature === '4c6fa794'
-  ) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: XML encoding is not supported',
-      { code: 'RESIZE_ORIGINAL_SVG_ENCODING_UNSUPPORTED' },
-    );
-  }
-  if (body[0] === 0xff && body[1] === 0xfe) {
-    encoding = 'utf-16le';
-  } else if (body[0] === 0xfe && body[1] === 0xff) {
-    encoding = 'utf-16be';
-  } else if (body[0] === 0x3c && body[1] === 0x00) {
-    encoding = 'utf-16le';
-  } else if (body[0] === 0x00 && body[1] === 0x3c) {
-    encoding = 'utf-16be';
-  }
-  let text: string;
-  try {
-    text = new TextDecoder(encoding, { fatal: true }).decode(body);
-  } catch (cause) {
-    const prefix = body
-      .subarray(0, Math.min(body.length, 1024))
-      .toString('latin1');
-    if (prefix.trimStart()[0] !== '<') {
-      return undefined;
-    }
-    const declared =
-      /^\s*<\?xml\s[^?]*\bencoding\s*=\s*(["'])([^"']+)\1/iu.exec(prefix)?.[2];
-    if (!declared) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: XML bytes are invalid UTF-8 and declare no supported encoding',
-        { code: 'RESIZE_ORIGINAL_SVG_ENCODING_UNSUPPORTED', cause },
-      );
-    }
-    try {
-      text = new TextDecoder(declared, { fatal: true }).decode(body);
-    } catch (encodingCause) {
-      throw new ResizeOriginalError(
-        `resize uploadOriginal: XML encoding ${declared} is not supported`,
-        {
-          code: 'RESIZE_ORIGINAL_SVG_ENCODING_UNSUPPORTED',
-          cause: encodingCause,
-        },
-      );
-    }
-  }
-  const first = text.replace(/^\uFEFF/u, '').trimStart()[0];
-  return first === '<' ? text : undefined;
 }
 
 function isAvif(body: Buffer): boolean {
@@ -202,11 +49,6 @@ async function prepareOriginal(
   body: Buffer,
   config: ResizeConfig,
 ): Promise<PreparedOriginal> {
-  const xml = decodeXmlCandidate(body);
-  if (xml !== undefined) {
-    return parseSvg(xml);
-  }
-
   let metadata: Metadata;
   try {
     metadata = await sharp(body, {
@@ -220,12 +62,13 @@ async function prepareOriginal(
     );
   }
 
-  let format: Exclude<OriginalFormat, 'svg'> | undefined;
+  let format: OriginalFormat | undefined;
   if (
     metadata.format === 'jpeg' ||
     metadata.format === 'png' ||
     metadata.format === 'webp' ||
-    metadata.format === 'gif'
+    metadata.format === 'gif' ||
+    metadata.format === 'svg'
   ) {
     format = metadata.format;
   } else if (metadata.format === 'heif' && isAvif(body)) {
