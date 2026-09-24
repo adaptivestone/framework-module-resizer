@@ -1,3 +1,7 @@
+// Shared SVG publication for queued processTask() and eager generate().
+// The storage driver copies the bytes; the media store saves original.publicCopy
+// conditionally on the original key. The private original stays in place.
+// engine.ts also uses the predicates below to decide whether publication is needed.
 import { getApp } from './app.ts';
 import { ResizeMediaError, ResizeStorageError } from './errors.ts';
 import type { Resizer } from './resizer.ts';
