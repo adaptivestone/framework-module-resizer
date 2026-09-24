@@ -17,6 +17,13 @@ export interface ResizeStorage {
     contentType: string;
     visibility: 'public' | 'private';
   }): Promise<StorageRef>;
+  // Optional optimized promotion of an existing private object into public storage.
+  // The core falls back to download() + upload() when a driver cannot copy server-side.
+  copyToPublic?(args: {
+    source: StorageRef;
+    key: string;
+    contentType: string;
+  }): Promise<StorageRef>;
   // PURE, synchronous, NO I/O — the read path calls this to build public URLs (05 · §10.4).
   publicUrl(ref: StorageRef): string;
   // Optional, PURE, synchronous check used before serving an original directly from a public

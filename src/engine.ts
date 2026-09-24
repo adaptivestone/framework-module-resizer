@@ -18,6 +18,7 @@ import {
 } from './images.ts';
 import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
+import { isPubliclyServeable, isSvgOriginal } from './svgPublicCopy.ts';
 import type {
   EnqueueRequiredResult,
   MediaLike,
@@ -97,9 +98,7 @@ export async function resolveImpl(
     const original = media.original;
     const missing: MissingPreview[] = [];
     const missingSeen = new Set<string>();
-    const originalIsSvg =
-      original != null &&
-      (original.contentType === 'image/svg+xml' || original.format === 'svg');
+    const originalIsSvg = isSvgOriginal(original);
     // Compute this lazily. A generated preview is independently public and must remain
     // readable even when a legacy original now points to a retired/unavailable bucket.
     // A driver that does not implement the check is deliberately conservative: a public URL
@@ -169,8 +168,12 @@ export async function resolveImpl(
             ready.push(entry);
           }
         }
+      } else {
+        // A private SVG without a public copy still needs worker work. Represent
+        // that work with the requested catalog so it uses the normal queue,
+        // locks, receipts, retries, and dead-letter handling.
+        missing.push(...expandPreviewRequests(sizes, formats));
       }
-      // missing stays empty; skip step 7.
     } else {
       // 7. Per requested size × format.
       for (const size of sizes) {
@@ -337,14 +340,16 @@ export async function prewarmImpl(
       ctx,
     )) as SizeInput[];
 
-    // 2. SVG originals are pass-through — never resized or enqueued (06 · §17 step 6). No-op.
+    // A publicly serveable SVG is already warm. A private SVG without a public
+    // copy continues through the normal queue; its worker task publishes one copy.
     const original = media.original;
     if (
-      original &&
-      (original.contentType === 'image/svg+xml' || original.format === 'svg')
+      isSvgOriginal(original) &&
+      (isPubliclyServeable(resizer, original?.publicCopy) ||
+        isPubliclyServeable(resizer, original))
     ) {
       getApp().logger.info(
-        `resize prewarm: media ${mediaId} original is SVG — pass-through, nothing to warm`,
+        `resize prewarm: media ${mediaId} SVG is publicly serveable — nothing to warm`,
       );
       return { enqueued: 0 };
     }
@@ -424,14 +429,17 @@ export async function enqueueRequiredImpl(
 
   const original = media.original;
   if (
-    original &&
-    (original.contentType === 'image/svg+xml' || original.format === 'svg')
+    isSvgOriginal(original) &&
+    (isPubliclyServeable(resizer, original?.publicCopy) ||
+      isPubliclyServeable(resizer, original))
   ) {
     return {
       ...empty(),
       reason: 'svg',
       requested: requestedBeforePolicy,
-      notRequired: requestedBeforePolicy,
+      ready: requestedBeforePolicy,
+      notRequired: [],
+      status: 'ready',
     };
   }
 

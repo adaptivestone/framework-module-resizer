@@ -8,7 +8,7 @@
 // resolve() receives `media` from the caller.
 import { getApp } from '../app.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
-import type { MediaLike, Preview } from '../types.d.ts';
+import type { MediaLike, Preview, StorageRef } from '../types.d.ts';
 import type { MediaStore } from './AbstractMediaStore.ts';
 
 export class FrameworkMediaStore implements MediaStore {
@@ -48,5 +48,21 @@ export class FrameworkMediaStore implements MediaStore {
       };
     }
     await getApp().getModel(mediaModelName).findByIdAndUpdate(mediaId, update);
+  }
+
+  async setOriginalPublicCopy(
+    mediaId: string,
+    expectedOriginalKey: string,
+    publicCopy: StorageRef,
+  ): Promise<boolean> {
+    const { mediaModelName } = getResizeConfig();
+    const result = await getApp()
+      .getModel(mediaModelName)
+      .findOneAndUpdate(
+        { _id: mediaId, 'original.key': expectedOriginalKey },
+        { $set: { 'original.publicCopy': publicCopy } },
+        { new: false },
+      );
+    return result != null;
   }
 }

@@ -111,7 +111,11 @@ describe('enqueueRequired — explicit coverage', () => {
     assert.equal(readyResult.ready.length, 1);
 
     resetResizerForTests();
-    const svg = new Resizer({ storage, transport });
+    const svg = new Resizer({
+      storage,
+      transport,
+      lockProvider: locks().lockProvider,
+    });
     const svgResult = await svg.enqueueRequired({
       media: {
         id: 'm2',
@@ -120,9 +124,8 @@ describe('enqueueRequired — explicit coverage', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(svgResult.status, 'not-required');
-    assert.equal(svgResult.reason, 'svg');
-    assert.equal(svgResult.notRequired.length, 1);
+    assert.equal(svgResult.status, 'accepted');
+    assert.equal(svgResult.accepted.length, 1);
 
     resetResizerForTests();
     const empty = new Resizer({ storage, transport });

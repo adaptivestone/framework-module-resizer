@@ -208,8 +208,8 @@ describe('prewarm — skip existing & dedup', () => {
   });
 });
 
-describe('prewarm — SVG original is a no-op', () => {
-  test('SVG (contentType) → { enqueued: 0 } and the transport is never touched', async () => {
+describe('prewarm — SVG original uses the normal queue', () => {
+  test('private SVG enqueues publication work', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
@@ -222,9 +222,9 @@ describe('prewarm — SVG original is a no-op', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(enqueued, 0);
-    assert.equal(calls.length, 0);
-    assert.equal(acquired.length, 0);
+    assert.equal(enqueued, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(acquired.length, 2);
   });
 
   test('SVG detected via original.format === "svg" too', async () => {
@@ -237,8 +237,8 @@ describe('prewarm — SVG original is a no-op', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
-    assert.equal(calls.length, 0);
+    assert.equal(enqueued, 1);
+    assert.equal(calls.length, 1);
   });
 });
 

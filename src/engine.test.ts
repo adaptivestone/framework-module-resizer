@@ -718,7 +718,7 @@ describe('resolve — SVG pass-through', () => {
       formats: ['jpeg'],
     });
     assert.deepEqual(decision.ready, []);
-    assert.deepEqual(decision.missing, []);
+    assert.equal(decision.missing.length, 1);
   });
 
   test('detects SVG via original.format === "svg" too', async () => {
@@ -740,7 +740,7 @@ describe('resolve — SVG pass-through', () => {
     assert.equal(decision.missing.length, 0);
   });
 
-  test('does not expose a private SVG anonymously, enqueue it, or invent raster work', async () => {
+  test('a private SVG is missing for anonymous reads and queues publication work', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
@@ -758,8 +758,9 @@ describe('resolve — SVG pass-through', () => {
       formats: ['jpeg', 'webp'],
     });
     assert.deepEqual(decision.ready, []);
-    assert.deepEqual(decision.missing, []);
-    assert.equal(calls.length, 0);
+    assert.equal(decision.missing.length, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 2);
   });
 });
 

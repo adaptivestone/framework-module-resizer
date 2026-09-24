@@ -323,7 +323,7 @@ export class Resizer {
    * on image work, so the previews are (usually) already there by the first real read. Delegates
    * to the engine (src/engine.ts): the `resolveSizes` waterfall (real ctx reaches the taps) →
    * expand sizes × formats, skipping identities already in `media.previews` and SVG originals
-   * (pass-through → no-op) → `beforeEnqueue` waterfall → hand the survivors to the SAME
+   * that storage proves are already public → `beforeEnqueue` waterfall → hand survivors to the SAME
    * dispatch-lock `enqueue()` as the read path. NEVER throws (same guarantee as `resolve`); with
    * no transport it logs once and returns `{ enqueued: 0 }`. `enqueued` = variants handed to the
    * transport (dispatch-lock survivors).

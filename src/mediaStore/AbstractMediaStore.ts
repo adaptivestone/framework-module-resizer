@@ -17,4 +17,12 @@ export interface MediaStore {
     previews: Preview[],
     backfillDims?: { width: number; height: number },
   ): Promise<void>;
+
+  // Persist the public pass-through copy only while the media still points at the
+  // original that was copied. False means the original changed or the media vanished.
+  setOriginalPublicCopy(
+    mediaId: string,
+    expectedOriginalKey: string,
+    publicCopy: { key: string; bucket?: string },
+  ): Promise<boolean>;
 }

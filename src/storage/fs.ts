@@ -65,6 +65,13 @@ export class LocalFsStorage implements ResizeStorage {
     return { key };
   }
 
+  async copyToPublic({ source }: { source: StorageRef }): Promise<StorageRef> {
+    // Local development intentionally has one public tree, so the original is
+    // already reachable and no second physical file is necessary.
+    resolveInsideRoot(this.#rootDir, source.key);
+    return { key: source.key };
+  }
+
   // PURE string building — no I/O (called on the read path). Option is publicBaseUrl
   // (never `publicUrl`) so it cannot shadow this method name.
   publicUrl(ref: StorageRef): string {

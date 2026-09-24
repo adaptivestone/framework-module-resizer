@@ -8,6 +8,7 @@ import { ResizeConfigError } from '../errors.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { ResizeConfig } from '../types.d.ts';
+import defaultResizeConfig from './resize.ts';
 
 function install(config: unknown) {
   resetAppInstance();
@@ -21,6 +22,20 @@ function install(config: unknown) {
 afterEach(resetAppInstance);
 
 describe('getResizeConfig', () => {
+  test('ships the canonical host defaults without assuming a media model', () => {
+    assert.equal('mediaModelName' in defaultResizeConfig, false);
+    assert.deepEqual(defaultResizeConfig.formats, ['jpeg', 'webp', 'avif']);
+    assert.deepEqual(defaultResizeConfig.upload.formats, [
+      'jpeg',
+      'png',
+      'webp',
+      'avif',
+      'gif',
+      'svg',
+    ]);
+    assert.equal(defaultResizeConfig.worker.enabled, false);
+  });
+
   test('returns the final framework config without merging another defaults object', () => {
     const config = makeResizeConfig({ formats: ['webp'] });
     install(config);

@@ -32,6 +32,7 @@ import {
   type LeasedTask,
   type Resizer,
 } from './resizer.ts';
+import { ensureSvgPublicCopy, isSvgOriginal } from './svgPublicCopy.ts';
 import type {
   MediaLike,
   MissingPreview,
@@ -403,13 +404,11 @@ export async function processTask(
   if (!media.original?.key) {
     throw new ResizeNoOriginalError(task.mediaId);
   }
-  // Defensive SVG guard — SVG is pass-through and should never be enqueued (06 step 6); this
-  // only stops a stray task from rasterizing it or looping.
+  // SVG uses the same durable task lifecycle as raster variants, but its work is
+  // one public byte-for-byte copy rather than Sharp resize/encode operations.
   const original = media.original;
-  if (original.contentType === 'image/svg+xml' || original.format === 'svg') {
-    app.logger.info(
-      `resize worker: media ${task.mediaId} original is SVG — no-op complete (should never be enqueued)`,
-    );
+  if (isSvgOriginal(original)) {
+    await ensureSvgPublicCopy(resizer, media, task.mediaId, true);
     return;
   }
 
@@ -509,10 +508,11 @@ export async function generateImpl(
   )) as SizeInput[];
   const formats = opts.formats ?? config.formats;
 
-  // SVG originals are pass-through — never rasterized in any mode.
-  if (original.contentType === 'image/svg+xml' || original.format === 'svg') {
+  // Eager SVG work publishes one unchanged copy and persists its locator.
+  if (isSvgOriginal(original)) {
+    await ensureSvgPublicCopy(resizer, media, mediaId, opts.persist !== false);
     getApp().logger.info(
-      `resize generate: media ${mediaId} original is SVG — pass-through, nothing to generate`,
+      `resize generate: media ${mediaId} SVG public copy is ready`,
     );
     return { created: [], failed: 0 };
   }

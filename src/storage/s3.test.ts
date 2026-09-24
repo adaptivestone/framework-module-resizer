@@ -114,6 +114,31 @@ describe('S3Storage.upload', () => {
   });
 });
 
+describe('S3Storage.copyToPublic', () => {
+  test('uses a server-side CopyObject from the private bucket to the public bucket', async () => {
+    const { client, sent } = makeFakeS3();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    const ref = await s.copyToPublic({
+      source: { bucket: 'priv', key: 'originals/logo one.svg' },
+      key: 'originals/logo one.svg',
+      contentType: 'image/svg+xml',
+    });
+    assert.deepEqual(ref, {
+      bucket: 'pub',
+      key: 'originals/logo one.svg',
+    });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].constructor.name, 'CopyObjectCommand');
+    assert.equal(sent[0].input.Bucket, 'pub');
+    assert.equal(sent[0].input.Key, 'originals/logo one.svg');
+    assert.equal(sent[0].input.CopySource, 'priv/originals/logo%20one.svg');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // download — ref.bucket ?? fallbacks; returns a Buffer (05 · §10.5)
 // ---------------------------------------------------------------------------

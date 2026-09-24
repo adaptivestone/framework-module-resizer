@@ -65,7 +65,7 @@ It emits (into `process.cwd()`, or `--out <dir>`), **never overwriting** without
 | File | What it is |
 |---|---|
 | `src/resizer.ts` | the construction site — `new Resizer({ … })` (edit freely) |
-| `src/config/resize.ts` | complete editable base config; framework applies environment overrides |
+| `src/config/resize.ts` | small host extension of the module defaults; framework applies environment overrides |
 | `src/models/ResizeTask.ts` | thin shim (only without `--eager`) |
 | `src/commands/ResizeWorker.ts` | worker command re-export (only without `--eager`) |
 
@@ -125,7 +125,8 @@ const { decision } = await resizer.resolve({
 });
 ```
 
-**3. Review the complete scaffolded config** in `src/config/resize.ts`, set `mediaModelName`, and spread
+**3. Review the scaffolded config** in `src/config/resize.ts`. It imports the canonical defaults
+from `…/config/resize.js`; set `mediaModelName` and only the host-specific overrides. Spread
 `resizeMediaSchemaFragment` into the model so `original` + `previews[]` exist. Listing queries:
 
 ```ts
@@ -146,12 +147,15 @@ driver may return its own opaque locator key.
 
 Input bytes are stored unchanged. Format and dimensions for raster images and SVG are read
 with `sharp().metadata()` under the configured pixel limits. No output image is rendered,
-rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml` and never generates previews.
+rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml`; its public derivative is an
+unchanged copy rather than a raster preview.
 SVG dimensions are those reported by Sharp, including dimensions derived from `viewBox`.
 SVG without dimensions that Sharp can determine is rejected. Previously stored rows are unchanged.
-There is no separate XML validator or DTD prohibition. Sharp metadata inspection is not
-sanitization: the host must sanitize SVG before calling this method. Inputs Sharp cannot read
-use the common `RESIZE_ORIGINAL_INVALID` error instead of the former SVG-specific XML errors.
+There is no separate XML validator, DTD prohibition, or sanitizer. Sharp metadata inspection does
+not remove scripts or external references. The host owns the input trust policy and may sanitize,
+reject, or accept SVG before calling this method. The module preserves the accepted bytes exactly.
+Inputs Sharp cannot read use the common `RESIZE_ORIGINAL_INVALID` error instead of the former
+SVG-specific XML errors.
 
 Failures are typed: malformed/unsupported/over-limit input throws `ResizeOriginalError`; storage
 I/O throws `ResizeStorageError` with code `RESIZE_ORIGINAL_UPLOAD_FAILED` and the driver error as
@@ -479,12 +483,17 @@ new Resizer({ /* … */, storage: {
     await s3.putObject(bucket, key, body, contentType);
     return { bucket, key };               // ← persisted onto the preview/original
   },
+  // Optional native optimization used for SVG publication. If omitted, core uses
+  // download(source) followed by upload({ visibility: 'public' }).
+  copyToPublic: ({ source, key, contentType }) => nativeCopy(source, key, contentType),
   publicUrl: (ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
   signedUrl: (ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
 }});
 ```
 
 The same pattern swaps `mediaStore` (e.g. another DB/ORM) or `lockProvider` (e.g. Redis/redlock).
+A custom media store implements `load`, `appendPreviews`, and the conditional
+`setOriginalPublicCopy` write used by SVG worker tasks.
 Contract types (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`, …) are exported
 from the main entry for custom-driver authors.
 
@@ -598,12 +607,25 @@ formatPictureUrls(decision, { id }); // unfiltered <picture> map; filtered varia
 
 ## Config reference
 
-`src/config/resize.ts` is the complete base config produced by the scaffold. The framework loads
-it, merges `resize.<NODE_ENV>.ts` over it, and caches the final value returned by
-`getConfig('resize')`. The module validates that final value when `new Resizer()` is constructed;
-it does not import defaults or merge the config again. Framework merging replaces arrays and merges
-nested objects field by field. `formats` selects generated outputs, while `upload.formats` is the
-independent allowlist for original input bytes.
+The package exports canonical defaults from
+`@adaptivestone/framework-module-resize/config/resize.js`. The scaffolded
+`src/config/resize.ts` extends that object with the required `mediaModelName` and host overrides.
+The framework then merges `resize.<NODE_ENV>.ts` over the base file and caches the final value
+returned by `getConfig('resize')`. The module validates that final value when `new Resizer()` is
+constructed; it does not perform another runtime merge. Framework merging replaces arrays and
+merges nested objects field by field. `formats` selects generated outputs, while `upload.formats`
+is the independent allowlist for original input bytes.
+
+```ts
+// src/config/resize.ts
+import type { ResizeConfig } from '@adaptivestone/framework-module-resize';
+import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+
+export default {
+  ...defaultResizeConfig,
+  mediaModelName: 'File',
+} satisfies ResizeConfig;
+```
 
 | Key | Default | Notes |
 |---|---|---|
@@ -687,39 +709,35 @@ for an already-generated identity skips via the existing-preview check, never du
 raster task completes only when every requested identity is covered. Successfully uploaded
 variants are persisted before an incomplete task is failed into the existing backoff/retry path;
 the next delivery generates only the missing identities, and permanent gaps reach dead-letter.
-`afterTaskComplete` fires only after full coverage. A deleted media row and a stray SVG task remain
-successful no-ops; a live row without `original.key` is an observable terminal media error.
+`afterTaskComplete` fires only after full coverage. A deleted media row remains a successful no-op;
+a live row without `original.key` is an observable terminal media error.
 
-**SVG originals are pass-through.** They stay SVG (`image/svg+xml`) at every requested
-size/format; the read path never resizes or enqueues them. To keep originals private while
-publishing SVG to everyone, persist the private original before publishing its copy:
+**SVG originals use the same task lifecycle.** Upload and persist the original privately, then call
+the same `prewarm()` or `enqueueRequired()` used for raster images. The worker detects SVG,
+server-side copies the same bytes into public storage when the driver supports it, and atomically
+saves the returned locator as `original.publicCopy`. It never sends SVG through Sharp output or
+creates separate files for requested sizes and formats.
 
 ```ts
-const original = await resizer.uploadOriginal({ body: sanitizedSvg, visibility: 'private' });
+const original = await resizer.uploadOriginal({ body: svgBytes, visibility: 'private' });
 media.original = original;
 await media.save();
 
-if (original.format === 'svg') {
-  const copy = await resizer.uploadOriginal({ body: sanitizedSvg, visibility: 'public' });
-  media.original = {
-    ...original,
-    publicCopy: { key: copy.key, bucket: copy.bucket },
-  };
-  await media.save();
-}
+await resizer.prewarm({ media, sizes });
 ```
 
 With `S3Storage`, configure distinct `bucketPrivate` and `bucketPublic` values and a bucket
-policy that keeps the private bucket inaccessible to the public. Without `bucketPrivate`, the
-driver stores both uploads in `bucketPublic`. The original locator stays in `media.original`;
-`publicCopy` holds only the public locator. `resolve()` serves the copy when
-`canServeOriginalPublicly()` confirms it and otherwise retains the existing signed URL rule for
-private originals. Save the private original first so a failed public upload leaves a durable
-source to retry from. If saving `publicCopy` fails after its upload, the host must retry that
-save or clean up the unreferenced public object. A custom storage driver must implement
-`canServeOriginalPublicly()` for anonymous SVG delivery; `LocalFsStorage` has no private area.
-The host owns cleanup of both objects. Metadata inspection does not remove scripts
-or external links; **sanitize SVG in the host before either upload.**
+policy that keeps the private bucket inaccessible to the public. The original locator stays in
+`media.original`; `publicCopy` holds only the public locator. `resolve()` serves that copy only
+after `canServeOriginalPublicly()` confirms it. Until then, anonymous reads queue the same durable
+publication work and an owner/admin may still receive a signed private-original URL.
+
+Custom `MediaStore` drivers must implement the conditional
+`setOriginalPublicCopy(mediaId, expectedOriginalKey, publicCopy)` write. Custom storage drivers
+may implement `copyToPublic()` for an efficient native copy; otherwise the core downloads and
+uploads the exact bytes. They must implement `canServeOriginalPublicly()` for anonymous delivery.
+`LocalFsStorage` has one public tree, so no second physical copy is needed. The host owns deletion
+of both locators. The module does not sanitize SVG; the host decides its acceptance policy.
 
 **Original visibility is explicit.** Storage drivers that can prove an original is public should
 implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's

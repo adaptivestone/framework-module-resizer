@@ -38,6 +38,7 @@ const fakeStorage = (): ResizeStorage => ({
 const fakeMediaStore = (): MediaStore => ({
   load: async () => null,
   appendPreviews: async () => {},
+  setOriginalPublicCopy: async () => true,
 });
 const fakeLockProvider = (): LockProvider => ({
   acquire: async () => true,

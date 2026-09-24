@@ -1,46 +1,10 @@
-// src/config/resize.ts — complete base config loaded by @adaptivestone/framework.
-// Put environment-only changes in resize.<NODE_ENV>.ts; the framework merges that file
-// over this one before getConfig('resize') is called. Arrays replace the base arrays.
+// src/config/resize.ts — host extension of the module defaults.
+// Put environment-only changes in resize.<NODE_ENV>.ts; @adaptivestone/framework
+// merges that file over this one before getConfig('resize') is called.
 import type { ResizeConfig } from '@adaptivestone/framework-module-resize';
+import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
 
 export default {
+  ...defaultResizeConfig,
   mediaModelName: 'File', // TODO(REQUIRED): the host media model, e.g. File or Media
-  formats: ['jpeg', 'webp', 'avif'],
-  upload: {
-    maxBytes: 25 * 1024 * 1024,
-    formats: ['jpeg', 'png', 'webp', 'avif', 'gif', 'svg'],
-  },
-  maxSize: { width: 2000, height: 1200 },
-  animated: false,
-  encode: {
-    // Each entry is passed to sharp.toFormat(format, options). Add a format here and
-    // to formats above when the installed Sharp/libvips build supports it.
-    formats: {
-      jpeg: { quality: 80, mozjpeg: true, chromaSubsampling: '4:2:0' },
-      webp: { quality: 82, effort: 4 },
-      avif: { quality: 64, effort: 4 },
-    },
-    sharpen: { cover: true, fit: false },
-    flatten: { formats: ['jpeg'], background: '#ffffff' },
-  },
-  limits: {
-    inputPixels: 268402689,
-    sourcePixels: 50_000_000,
-    resultDimension: 5000,
-    animationFrames: 64,
-  },
-  queue: {
-    lockTtlMs: { dispatch: 60000, worker: 60000 },
-    leaseMs: 60000,
-    retryBackoffMs: { base: 5000, max: 300000 },
-    maxAttempts: 5,
-    idlePollMs: 1000,
-    taskTimeoutMs: 600000,
-  },
-  worker: {
-    enabled: false,
-    concurrency: 4,
-    sharpConcurrency: 1,
-    sharpCache: false,
-  },
 } satisfies ResizeConfig;

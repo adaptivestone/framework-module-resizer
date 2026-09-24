@@ -124,6 +124,7 @@ function makeStorage(
       return { bucket: 'previews', key };
     },
     publicUrl: (ref) => `https://cdn/${ref.key}`,
+    canServeOriginalPublicly: (ref) => ref.bucket === 'previews',
   };
   return { storage, uploads };
 }
@@ -135,19 +136,36 @@ function makeMediaStore(media: MediaLike | null): {
     previews: Preview[];
     backfillDims?: { width: number; height: number };
   }>;
+  publicCopyCalls: Array<{
+    mediaId: string;
+    originalKey: string;
+    publicCopy: Original;
+  }>;
 } {
   const appendCalls: Array<{
     mediaId: string;
     previews: Preview[];
     backfillDims?: { width: number; height: number };
   }> = [];
+  const publicCopyCalls: Array<{
+    mediaId: string;
+    originalKey: string;
+    publicCopy: Original;
+  }> = [];
   const mediaStore: MediaStore = {
     load: async () => media,
     appendPreviews: async (mediaId, previews, backfillDims) => {
       appendCalls.push({ mediaId, previews, backfillDims });
     },
+    setOriginalPublicCopy: async (mediaId, originalKey, publicCopy) => {
+      publicCopyCalls.push({ mediaId, originalKey, publicCopy });
+      if (media?.original) {
+        media.original.publicCopy = publicCopy;
+      }
+      return true;
+    },
   };
-  return { mediaStore, appendCalls };
+  return { mediaStore, appendCalls, publicCopyCalls };
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
@@ -262,10 +280,10 @@ describe('processTask — source handling', () => {
     assert.equal(downloadCalls, 0);
   });
 
-  test('SVG original → no-op success (never rasterized)', async () => {
+  test('SVG original → one unchanged public copy, persisted without rasterization', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { mediaStore, appendCalls } = makeMediaStore(
+    const { mediaStore, appendCalls, publicCopyCalls } = makeMediaStore(
       mediaDoc({
         original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
       }),
@@ -276,8 +294,10 @@ describe('processTask — source handling', () => {
       lockProvider: makeLocks().lockProvider,
     });
     await processTask(task({ previews: [variant()] }));
-    assert.equal(uploads.length, 0);
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].visibility, 'public');
     assert.equal(appendCalls.length, 0);
+    assert.equal(publicCopyCalls.length, 1);
   });
 
   test('an undecodable source → throws (fails the task for retry/DLQ)', async () => {
@@ -830,6 +850,7 @@ describe('processTask — persistence & failure handling', () => {
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
+      setOriginalPublicCopy: async () => true,
     };
     new Resizer({
       storage,
@@ -880,6 +901,7 @@ describe('processTask — persistence & failure handling', () => {
         return media;
       },
       appendPreviews: async () => {},
+      setOriginalPublicCopy: async () => true,
     };
     new Resizer({
       storage,
@@ -899,6 +921,7 @@ describe('processTask — persistence & failure handling', () => {
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
+      setOriginalPublicCopy: async () => true,
     };
     new Resizer({
       storage,
@@ -1143,10 +1166,10 @@ describe('generate (eager)', () => {
     );
   });
 
-  test('SVG original → log + { created: [], failed: 0 }, nothing uploaded or persisted', async () => {
+  test('SVG original → eager publication without raster previews', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const { mediaStore, appendCalls, publicCopyCalls } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
@@ -1157,8 +1180,10 @@ describe('generate (eager)', () => {
     });
     assert.deepEqual(result.created, []);
     assert.equal(result.failed, 0);
-    assert.equal(uploads.length, 0);
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].visibility, 'public');
     assert.equal(appendCalls.length, 0);
+    assert.equal(publicCopyCalls.length, 1);
     assert.ok(logs.info.some((l) => String(l[0]).includes('SVG')));
   });
 

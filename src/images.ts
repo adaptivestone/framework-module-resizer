@@ -223,7 +223,7 @@ export function expandPreviewRequests(
 
 /**
  * True when every `sizes × formats` identity is already stored on `media.previews`
- * (or the original is SVG, which is pass-through and never needs a preview). Hosts
+ * (or the original is SVG with a persisted public copy). Hosts
  * use this to skip a no-op `generate` / `prewarm`.
  */
 export function isCatalogCovered(
@@ -234,7 +234,8 @@ export function isCatalogCovered(
   const original = media.original;
   if (
     original &&
-    (original.contentType === 'image/svg+xml' || original.format === 'svg')
+    (original.contentType === 'image/svg+xml' || original.format === 'svg') &&
+    original.publicCopy?.key
   ) {
     return true;
   }

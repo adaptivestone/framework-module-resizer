@@ -303,12 +303,26 @@ describe('isCatalogCovered', () => {
     );
   });
 
-  test('SVG original is covered without previews (pass-through)', () => {
+  test('SVG original is covered only after its public copy is persisted', () => {
     assert.equal(
       isCatalogCovered(
         { original: { key: 'x.svg', contentType: 'image/svg+xml' } },
         sizes,
         [...formats],
+      ),
+      false,
+    );
+    assert.equal(
+      isCatalogCovered(
+        {
+          original: {
+            key: 'x.svg',
+            contentType: 'image/svg+xml',
+            publicCopy: { key: 'x.svg', bucket: 'public' },
+          },
+        },
+        [{ width: 100, height: 100 }],
+        ['webp'],
       ),
       true,
     );

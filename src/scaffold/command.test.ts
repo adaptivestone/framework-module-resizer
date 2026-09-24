@@ -10,11 +10,12 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import defaultResizeConfig from '../config/resize.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
 import { runScaffold } from './command.ts';
 
@@ -81,23 +82,28 @@ describe('runScaffold — default run', () => {
       /@adaptivestone\/framework-module-resize\/commands\/ResizeWorker\.js/,
     );
     const configSource = await read(CONFIG);
-    assert.doesNotMatch(configSource, /\.\.\.defaultResizeConfig/);
+    assert.match(
+      configSource,
+      /@adaptivestone\/framework-module-resize\/config\/resize\.js/,
+    );
+    assert.match(configSource, /\.\.\.defaultResizeConfig/);
     assert.match(configSource, /satisfies ResizeConfig/);
 
-    const configModule = await import(
-      `${pathToFileURL(join(root, CONFIG)).href}?test=${Date.now()}`
-    );
-    assert.equal(configModule.default.mediaModelName, 'File');
-    assert.deepEqual(configModule.default.formats, ['jpeg', 'webp', 'avif']);
-    assert.equal(configModule.default.worker.enabled, false);
-    assert.deepEqual(configModule.default.encode.formats.tiff, undefined);
+    assert.match(configSource, /mediaModelName: 'File'/);
+    const scaffoldedConfig = {
+      ...defaultResizeConfig,
+      mediaModelName: 'File',
+    };
+    assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
+    assert.equal(scaffoldedConfig.worker.enabled, false);
+    assert.deepEqual(scaffoldedConfig.encode.formats.tiff, undefined);
 
     setAppInstance({
-      getConfig: () => configModule.default,
+      getConfig: () => scaffoldedConfig,
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.strictEqual(getResizeConfig(), configModule.default);
+    assert.strictEqual(getResizeConfig(), scaffoldedConfig);
   });
 
   test('auto-creates missing directories', async () => {

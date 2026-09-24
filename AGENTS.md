@@ -85,9 +85,11 @@ a private original.
    if any) **after** `Server.init()`: `await import('./resizer.ts')`. Do not use a static import;
    ESM evaluates it before bootstrap code.
 
-5. Review the complete scaffolded `src/config/resize.ts` and set
-   `mediaModelName: 'File'` (your host media model's name). Put environment-only changes in
-   `resize.<NODE_ENV>.ts`; the framework merges that file before this module reads the config.
+5. The scaffolded `src/config/resize.ts` extends the canonical package defaults from
+   `@adaptivestone/framework-module-resize/config/resize.js`. Set
+   `mediaModelName: 'File'` (your host media model's name) and keep only host overrides there.
+   Put environment-only changes in `resize.<NODE_ENV>.ts`; the framework merges that file before
+   this module reads and validates the resolved config. Do not add a second runtime merge.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
    instead of hand-writing those fields (single source of truth for schema + types):
@@ -126,17 +128,16 @@ const original = await getResizer().uploadOriginal({
 The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
 bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) without raster output. SVG
 sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
-is rejected. There is no separate XML validator or DTD prohibition. Metadata inspection is not
-a sanitizer, so the host sanitizes SVG before this call.
+is rejected. There is no XML sanitizer or host-specific trust policy in this module. The host
+decides whether to sanitize, reject, or accept SVG; accepted bytes remain unchanged.
 
-For a public SVG with a private original, persist `original` first. Upload the same sanitized
-bytes again with `visibility: 'public'`, then persist its locator as
-`media.original.publicCopy = { key: copy.key, bucket: copy.bucket }`. `resolve()` serves that
-copy to anonymous readers only when storage proves it public. If the second upload fails, the
-private original remains saved and publishing can be retried. For S3, configure distinct
-`bucketPrivate`/`bucketPublic` values and keep the private bucket private; omitting
-`bucketPrivate` places both uploads in the public bucket. `LocalFsStorage` has no private area.
-Raster originals need no copy.
+Persist every original privately, then call the same `prewarm()` / `enqueueRequired()` path for
+raster and SVG. The worker branches on stored format. Raster input produces the requested Sharp
+previews. SVG input is copied byte-for-byte to public storage and its locator is saved as
+`original.publicCopy`; the private `original` remains the retry source. `S3Storage.copyToPublic()`
+uses server-side CopyObject. A custom storage can implement that optional method or use the core
+download/upload fallback. A custom media store must implement the conditional
+`setOriginalPublicCopy()` write. `LocalFsStorage` has no private area and needs no physical copy.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
@@ -239,9 +240,10 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
-- SVG bytes pass through untouched at every requested size (never rasterized or enqueued).
-  A proven-public `original.publicCopy` is served to everyone; without it, private originals
-  require an authorized signed URL. Sanitizing SVG at upload is the HOST's job.
+- SVG bytes pass through untouched at every requested size. A private SVG without a proven-public
+  `original.publicCopy` is enqueued through the normal durable task lifecycle. The worker copies
+  and persists it; it never rasterizes the SVG. Input acceptance and sanitization policy belong
+  to the host.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.
