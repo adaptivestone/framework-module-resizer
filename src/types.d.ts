@@ -236,6 +236,4 @@ export interface ResizeConfig {
     sharpConcurrency: number; // default 1 — sharp.concurrency(); concurrency × this ≈ nCPU
     sharpCache: boolean; // default false — sharp.cache()
   };
-
-  placeholderPrefix?: string; // e.g. 'placeholders/loading'
 }

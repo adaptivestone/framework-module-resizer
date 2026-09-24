@@ -12,7 +12,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 
-/** Validate the complete framework-resolved config once when the Resizer is constructed. */
+/** Validate the complete framework-resolved config before it is consumed. */
 function validateRequiredResizeConfigFields(
   config: unknown,
 ): asserts config is ResizeConfig {

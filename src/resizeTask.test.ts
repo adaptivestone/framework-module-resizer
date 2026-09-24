@@ -580,6 +580,30 @@ describe('processTask — variants', () => {
     assert.equal(appendCalls[0].previews[0].format, 'tiff');
   });
 
+  test('labels HEIF configured with AV1 compression as an AVIF container', async () => {
+    installApp({
+      formats: ['heif'],
+      encode: { formats: { heif: { compression: 'av1' } } },
+    });
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    await processTask(task({ previews: [variant({ format: 'heif' })] }));
+
+    const metadata = await sharp(uploads[0].body).metadata();
+    assert.equal(metadata.format, 'heif');
+    assert.equal(metadata.compression, 'av1');
+    assert.match(uploads[0].key, /\.avif$/);
+    assert.equal(uploads[0].contentType, 'image/avif');
+    assert.equal(appendCalls[0].previews[0].format, 'heif');
+    assert.equal(appendCalls[0].previews[0].contentType, 'image/avif');
+  });
+
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(alphaPng);

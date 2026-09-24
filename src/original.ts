@@ -1,5 +1,6 @@
 import sharp, { type Metadata } from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
+import { isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
 import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
@@ -31,14 +32,6 @@ function originalStorageInfo(format: string): {
 
 function asBuffer(body: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(body) ? body : Buffer.from(body);
-}
-
-function isAvif(body: Buffer): boolean {
-  if (body.length < 16 || body.toString('ascii', 4, 8) !== 'ftyp') {
-    return false;
-  }
-  const brands = body.toString('ascii', 8, Math.min(body.length, 64));
-  return brands.includes('avif') || brands.includes('avis');
 }
 
 function displayDimensions(metadata: Metadata): {
@@ -78,7 +71,7 @@ async function prepareOriginal(
     );
   }
   const format: OriginalFormat =
-    metadata.format === 'heif' && isAvif(body) ? 'avif' : metadata.format;
+    metadata.format === 'heif' && isAvifBuffer(body) ? 'avif' : metadata.format;
   if (metadata.width === undefined || metadata.height === undefined) {
     throw new ResizeOriginalError(
       'resize uploadOriginal: image metadata is missing width/height',

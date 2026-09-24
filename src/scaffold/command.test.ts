@@ -11,6 +11,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  resetAppInstance,
+  setAppInstance,
+} from '@adaptivestone/framework/helpers/appInstance.js';
+import { getResizeConfig } from '../resizeConfig.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -19,6 +24,7 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'resize-scaffold-'));
 });
 afterEach(async () => {
+  resetAppInstance();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -85,6 +91,13 @@ describe('runScaffold — default run', () => {
     assert.deepEqual(configModule.default.formats, ['jpeg', 'webp', 'avif']);
     assert.equal(configModule.default.worker.enabled, false);
     assert.deepEqual(configModule.default.encode.formats.tiff, undefined);
+
+    setAppInstance({
+      getConfig: () => configModule.default,
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.strictEqual(getResizeConfig(), configModule.default);
   });
 
   test('auto-creates missing directories', async () => {

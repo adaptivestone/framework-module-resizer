@@ -16,6 +16,7 @@ import {
   ResizeNoOriginalError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
+import { isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
 import {
   calculateResizedDimensions,
@@ -284,19 +285,13 @@ export async function generatePreviews(
       );
 
       const { data, info } = await img.toBuffer({ resolveWithObject: true });
-      // contentType + actual dims from the ACTUAL encoded info (box ≠ output for `fit`) —
-      // with ONE container normalization: sharp reports an AVIF encode as its HEIF
-      // container ('heif'), but the registered web MIME type (and <picture type="…">
-      // negotiation) needs image/avif. Map 'heif' → 'avif' only when the AVIF encoder
-      // produced it (av1 compression, or the requested format was avif — encode info
-      // omits `compression`, so the second arm is the one that fires). Everything else
-      // keeps the plain from-encoded-format rule (spec/07 step 7).
-      const avifAsHeif =
-        info.format === 'heif' &&
-        ((info as { compression?: string }).compression === 'av1' ||
-          v.format === 'avif');
-      const contentType = `image/${avifAsHeif ? 'avif' : info.format}`;
-      const key = `${keyPrefix(original.key)}/${randomHex()}.${v.format}`;
+      // Sharp reports AVIF output through its HEIF container id and does not expose
+      // compression on OutputInfo. Inspect the produced ISO BMFF brands so configured
+      // `heif: { compression: 'av1' }` receives the correct MIME type and extension too.
+      const outputFormat =
+        info.format === 'heif' && isAvifBuffer(data) ? 'avif' : info.format;
+      const contentType = `image/${outputFormat}`;
+      const key = `${keyPrefix(original.key)}/${randomHex()}.${outputFormat}`;
       const ref = await storage.upload({
         key,
         body: data,
