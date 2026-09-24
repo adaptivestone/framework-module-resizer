@@ -126,18 +126,16 @@ const original = await getResizer().uploadOriginal({
 ```
 
 The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
-bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) without raster output. SVG
+bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) as a private original. SVG
 sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
-is rejected. There is no XML sanitizer or host-specific trust policy in this module. The host
-decides whether to sanitize, reject, or accept SVG; accepted bytes remain unchanged.
+is rejected. The module does not sanitize SVG markup. The worker rasterizes accepted SVG
+into the same configured public preview formats as other images.
 
 Persist every original privately, then call the same `prewarm()` / `enqueueRequired()` path for
-raster and SVG. The worker branches on stored format. Raster input produces the requested Sharp
-previews. SVG input is copied byte-for-byte to public storage and its locator is saved as
-`original.publicCopy`; the private `original` remains the retry source. `S3Storage.copyToPublic()`
-uses server-side CopyObject. A custom storage can implement that optional method or use the core
-download/upload fallback. A custom media store must implement the conditional
-`setOriginalPublicCopy()` write. `LocalFsStorage` has no private area and needs no physical copy.
+raster and SVG. The worker creates the requested Sharp previews for both. SVG is an input
+format only; public upload of an SVG original is rejected. Configure a distinct private S3
+bucket, or for `LocalFsStorage` keep its private root outside the static server's public root.
+Legacy `original.publicCopy` data is ignored by the read and worker paths.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
@@ -240,10 +238,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
-- SVG bytes pass through untouched at every requested size. A private SVG without a proven-public
-  `original.publicCopy` is enqueued through the normal durable task lifecycle. The worker copies
-  and persists it; it never rasterizes the SVG. Input acceptance and sanitization policy belong
-  to the host.
+- SVG originals stay private. The worker rasterizes SVG into the requested public preview
+  formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
+  shortcut returns uploaded SVG markup, even for legacy `original.publicCopy` records.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.

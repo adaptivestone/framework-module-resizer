@@ -303,7 +303,7 @@ describe('isCatalogCovered', () => {
     );
   });
 
-  test('SVG original is covered only after its public copy is persisted', () => {
+  test('SVG original is covered only after raster previews are persisted', () => {
     assert.equal(
       isCatalogCovered(
         { original: { key: 'x.svg', contentType: 'image/svg+xml' } },
@@ -324,7 +324,7 @@ describe('isCatalogCovered', () => {
         [{ width: 100, height: 100 }],
         ['webp'],
       ),
-      true,
+      false,
     );
   });
 

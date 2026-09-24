@@ -119,38 +119,3 @@ describe('FrameworkMediaStore.appendPreviews', () => {
     });
   });
 });
-
-describe('FrameworkMediaStore.setOriginalPublicCopy', () => {
-  test('conditionally writes the copy for the expected private original', async () => {
-    const calls: unknown[][] = [];
-    const model = {
-      findOneAndUpdate(...args: unknown[]) {
-        calls.push(args);
-        return Promise.resolve({ _id: 'm1' });
-      },
-    };
-    installApp(model);
-    const copy = { key: 'originals/logo.svg', bucket: 'public' };
-
-    assert.equal(
-      await store.setOriginalPublicCopy('m1', 'originals/logo.svg', copy),
-      true,
-    );
-    assert.deepEqual(calls[0], [
-      { _id: 'm1', 'original.key': 'originals/logo.svg' },
-      { $set: { 'original.publicCopy': copy } },
-      { new: false },
-    ]);
-  });
-
-  test('returns false when the media or its original changed', async () => {
-    installApp({ findOneAndUpdate: async () => null });
-    assert.equal(
-      await store.setOriginalPublicCopy('m1', 'old.svg', {
-        key: 'old.svg',
-        bucket: 'public',
-      }),
-      false,
-    );
-  });
-});

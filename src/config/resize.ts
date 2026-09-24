@@ -25,6 +25,7 @@ const defaultResizeConfig: Omit<ResizeConfig, 'mediaModelName'> = {
     sourcePixels: 50_000_000,
     resultDimension: 5000,
     animationFrames: 64,
+    processingTimeoutSeconds: 30,
   },
   queue: {
     lockTtlMs: { dispatch: 60_000, worker: 60_000 },

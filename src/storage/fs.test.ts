@@ -8,6 +8,27 @@ import { LocalFsStorage } from './fs.ts';
 const fresh = () => mkdtemp(join(tmpdir(), 'resize-fs-'));
 
 describe('LocalFsStorage.upload / download', () => {
+  test('stores a private original outside the public root', async () => {
+    const dir = await fresh();
+    const storage = new LocalFsStorage({
+      rootDir: dir,
+      publicBaseUrl: '/media',
+    });
+    const ref = await storage.upload({
+      key: 'originals/logo.svg',
+      body: Buffer.from('<svg/>'),
+      contentType: 'image/svg+xml',
+      visibility: 'private',
+    });
+    assert.equal(ref.bucket, 'local-private');
+    assert.equal((await storage.download(ref)).toString(), '<svg/>');
+    assert.equal(
+      (await readFile(join(`${dir}-private`, ref.key))).toString(),
+      '<svg/>',
+    );
+    assert.equal(storage.canServeOriginalPublicly(ref), false);
+    assert.throws(() => storage.publicUrl(ref), /private original/);
+  });
   test('round-trips a buffer under rootDir/key and creates parent dirs', async () => {
     const dir = await fresh();
     const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });

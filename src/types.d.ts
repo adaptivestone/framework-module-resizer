@@ -67,7 +67,7 @@ export interface StorageRef {
 }
 
 export interface Original extends StorageRef {
-  // Optional public copy of SVG bytes; the original locator above remains private.
+  // Legacy locator from earlier SVG pass-through releases; ignored by resize/read paths.
   publicCopy?: StorageRef;
   format?: string;
   size?: number;
@@ -161,7 +161,7 @@ export interface EnqueueIssue {
 
 export interface EnqueueRequiredResult {
   status: EnqueueRequiredStatus;
-  reason?: 'empty-request' | 'filtered' | 'svg';
+  reason?: 'empty-request' | 'filtered';
   requested: MissingPreview[];
   ready: MissingPreview[];
   accepted: MissingPreview[];
@@ -217,6 +217,7 @@ export interface ResizeConfig {
     sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)
     resultDimension: number; // default 5000 — clamp on the cover branch
     animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
+    processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
   };
 
   // Queue/lease tuning (used by the Mongo transport; harmless for SQS, which has native redrive).

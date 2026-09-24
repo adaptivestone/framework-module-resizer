@@ -155,7 +155,7 @@ export interface GenerateOpts {
 }
 
 // `created` is only the rows THIS call produced. Empty + `failed === 0` is success
-// (already stored, SVG pass-through, or an empty catalog). Total failure throws.
+// (already stored or an empty catalog). Total failure throws.
 export interface GenerateResult {
   created: Preview[];
   failed: number;

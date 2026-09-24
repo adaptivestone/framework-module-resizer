@@ -22,8 +22,9 @@
 //   }
 export const resizeMediaSchemaFragment = {
   // The stored original (Original): `key` (+ optional S3-only `bucket`, StorageRef) plus
-  // metadata. An SVG may also reference a separately uploaded public copy while
-  // its original remains private. width/height are captured at upload or backfilled.
+  // metadata. publicCopy is retained only so existing documents can be read during
+  // migration; new SVG previews never write or serve it. width/height are captured
+  // at upload or backfilled.
   original: {
     key: { type: String },
     bucket: { type: String }, // omitted by non-S3 drivers; present for S3

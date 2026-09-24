@@ -1,6 +1,6 @@
 // The read-path engine (06 · §17). `resizer.resolve` delegates here: it partitions the
-// requested size×format grid into ready (served from an existing preview, an SVG original,
-// or an "original already fits" original) vs missing (handed to enqueue), threading three
+// requested size×format grid into ready (served from an existing preview
+// or an "original already fits" raster original) vs missing (handed to enqueue), threading three
 // host waterfalls (resolveSizes / beforeEnqueue / formatPublicUrls) and never throwing into
 // the caller's read. All URLs come from the PURE, I/O-free storage.publicUrl; the only I/O
 // is the owner/admin-gated signedUrl (itself caught + fallen back). Imports the Resizer
@@ -14,11 +14,12 @@ import {
   getFilterSig,
   getPreviewIdentity,
   getSizeKey,
+  isSvgOriginal,
+  isUsablePreview,
   requireMediaId,
 } from './images.ts';
 import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
-import { isPubliclyServeable, isSvgOriginal } from './svgPublicCopy.ts';
 import type {
   EnqueueRequiredResult,
   MediaLike,
@@ -90,7 +91,7 @@ export async function resolveImpl(
     // 5. previewMap keyed by identity — only complete entries (both key + contentType).
     const previewMap = new Map<string, Preview>();
     for (const p of media.previews ?? []) {
-      if (p.key && p.contentType) {
+      if (isUsablePreview(p)) {
         previewMap.set(getPreviewIdentity(p.sizeKey, p.format, p.filters), p);
       }
     }
@@ -124,138 +125,87 @@ export async function resolveImpl(
       (ctx.isOwner || ctx.isAdmin) && storage.signedUrl,
     );
 
-    if (original && originalIsSvg) {
-      // 6. SVG pass-through — one URL at every requested size/format, with no raster work.
-      // Prefer a separately persisted public copy when the driver proves it is public.
-      // Otherwise use the normal original URL rule: signed private access for owners/admins,
-      // or publicUrl only when the original itself is public.
-      let url: string | undefined;
-      const copy = original.publicCopy;
-      if (copy?.key) {
-        try {
-          if (storage.canServeOriginalPublicly?.(copy) === true) {
-            url = storage.publicUrl(copy);
-          }
-        } catch (err) {
-          getApp().logger.error(
-            'resize resolve: SVG public copy is unavailable',
-            err,
-          );
-        }
+    // 7. Per requested size × format.
+    for (const size of sizes) {
+      let sizeKey: string;
+      try {
+        sizeKey = getSizeKey(size);
+      } catch {
+        continue; // skip a size whose key cannot be built
       }
-      url ??= await originalUrl(resizer, original, ctx, isOriginalPublic());
-      if (url !== undefined) {
-        for (const size of sizes) {
-          let sizeKey: string;
-          try {
-            sizeKey = getSizeKey(size);
-          } catch {
-            continue; // a size with nothing usable is skipped (as in step 7)
+      for (const format of formats) {
+        const identity = getPreviewIdentity(sizeKey, format, size.filters);
+        const existing = previewMap.get(identity);
+        if (existing) {
+          // exists → serve the generated preview.
+          const entry: ReadyEntry = {
+            sizeKey,
+            format,
+            url: storage.publicUrl(existing),
+            preview: existing,
+            contentType: existing.contentType,
+          };
+          if (size.filters) {
+            entry.filters = size.filters;
           }
-          for (const format of formats) {
-            const entry: ReadyEntry = {
+          ready.push(entry);
+          continue;
+        }
+
+        // "original already fits" fast-path — ALL of (a)–(d) must hold (§17 step 7).
+        if (
+          original &&
+          !originalIsSvg &&
+          (isOriginalPublic() || authorizedOriginalRead) &&
+          getFilterSig(size.filters) === 'none' && // (a) no filters
+          !size.fit &&
+          isPositiveFinite(size.width) && // (b) plain cover WxH
+          isPositiveFinite(size.height) &&
+          isPositiveFinite(original.width) && // (c) original dims known
+          isPositiveFinite(original.height) &&
+          original.width <= size.width && // (d) not larger than the box
+          original.height <= size.height
+        ) {
+          const url = await originalUrl(
+            resizer,
+            original,
+            ctx,
+            isOriginalPublic(),
+          );
+          if (url !== undefined) {
+            const fits: ReadyEntry = {
               sizeKey,
               format,
               url,
               isOriginal: true,
             };
             if (original.contentType) {
-              entry.contentType = original.contentType;
+              fits.contentType = original.contentType;
             }
-            if (size.filters) {
-              entry.filters = size.filters;
-            }
-            ready.push(entry);
-          }
-        }
-      } else {
-        // A private SVG without a public copy still needs worker work. Represent
-        // that work with the requested catalog so it uses the normal queue,
-        // locks, receipts, retries, and dead-letter handling.
-        missing.push(...expandPreviewRequests(sizes, formats));
-      }
-    } else {
-      // 7. Per requested size × format.
-      for (const size of sizes) {
-        let sizeKey: string;
-        try {
-          sizeKey = getSizeKey(size);
-        } catch {
-          continue; // skip a size whose key cannot be built
-        }
-        for (const format of formats) {
-          const identity = getPreviewIdentity(sizeKey, format, size.filters);
-          const existing = previewMap.get(identity);
-          if (existing) {
-            // exists → serve the generated preview.
-            const entry: ReadyEntry = {
-              sizeKey,
-              format,
-              url: storage.publicUrl(existing),
-              preview: existing,
-              contentType: existing.contentType,
-            };
-            if (size.filters) {
-              entry.filters = size.filters;
-            }
-            ready.push(entry);
+            ready.push(fits);
             continue;
           }
-
-          // "original already fits" fast-path — ALL of (a)–(d) must hold (§17 step 7).
-          if (
-            original &&
-            (isOriginalPublic() || authorizedOriginalRead) &&
-            getFilterSig(size.filters) === 'none' && // (a) no filters
-            !size.fit &&
-            isPositiveFinite(size.width) && // (b) plain cover WxH
-            isPositiveFinite(size.height) &&
-            isPositiveFinite(original.width) && // (c) original dims known
-            isPositiveFinite(original.height) &&
-            original.width <= size.width && // (d) not larger than the box
-            original.height <= size.height
-          ) {
-            const url = await originalUrl(
-              resizer,
-              original,
-              ctx,
-              isOriginalPublic(),
-            );
-            if (url !== undefined) {
-              const fits: ReadyEntry = {
-                sizeKey,
-                format,
-                url,
-                isOriginal: true,
-              };
-              if (original.contentType) {
-                fits.contentType = original.contentType;
-              }
-              ready.push(fits);
-              continue;
-            }
-          }
-
-          // missing → deduped by identity.
-          if (missingSeen.has(identity)) {
-            continue;
-          }
-          missingSeen.add(identity);
-          const mp: MissingPreview = { sizeKey, format };
-          if (size.filters && Object.keys(size.filters).length > 0) {
-            mp.filters = size.filters;
-          }
-          if (isPositiveFinite(size.width)) {
-            mp.requestedWidth = size.width;
-          }
-          if (isPositiveFinite(size.height)) {
-            mp.requestedHeight = size.height;
-          }
-          if (size.fit) {
-            mp.fit = true;
-          }
-          missing.push(mp);
         }
+
+        // missing → deduped by identity.
+        if (missingSeen.has(identity)) {
+          continue;
+        }
+        missingSeen.add(identity);
+        const mp: MissingPreview = { sizeKey, format };
+        if (size.filters && Object.keys(size.filters).length > 0) {
+          mp.filters = size.filters;
+        }
+        if (isPositiveFinite(size.width)) {
+          mp.requestedWidth = size.width;
+        }
+        if (isPositiveFinite(size.height)) {
+          mp.requestedHeight = size.height;
+        }
+        if (size.fit) {
+          mp.fit = true;
+        }
+        missing.push(mp);
       }
     }
 
@@ -340,20 +290,6 @@ export async function prewarmImpl(
       ctx,
     )) as SizeInput[];
 
-    // A publicly serveable SVG is already warm. A private SVG without a public
-    // copy continues through the normal queue; its worker task publishes one copy.
-    const original = media.original;
-    if (
-      isSvgOriginal(original) &&
-      (isPubliclyServeable(resizer, original?.publicCopy) ||
-        isPubliclyServeable(resizer, original))
-    ) {
-      getApp().logger.info(
-        `resize prewarm: media ${mediaId} SVG is publicly serveable — nothing to warm`,
-      );
-      return { enqueued: 0 };
-    }
-
     // 2. Expand sizes × formats → deduped MissingPreview[], skipping unbuildable sizes + existing
     //    identities. The fast-path is deliberately NOT consulted here (see the doc comment).
     const formats = opts.formats ?? getResizeConfig().formats;
@@ -427,25 +363,9 @@ export async function enqueueRequiredImpl(
     return empty();
   }
 
-  const original = media.original;
-  if (
-    isSvgOriginal(original) &&
-    (isPubliclyServeable(resizer, original?.publicCopy) ||
-      isPubliclyServeable(resizer, original))
-  ) {
-    return {
-      ...empty(),
-      reason: 'svg',
-      requested: requestedBeforePolicy,
-      ready: requestedBeforePolicy,
-      notRequired: [],
-      status: 'ready',
-    };
-  }
-
   const readyIdentities = new Set<string>();
   for (const preview of media.previews ?? []) {
-    if (preview.key && preview.contentType) {
+    if (isUsablePreview(preview)) {
       readyIdentities.add(
         getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
       );

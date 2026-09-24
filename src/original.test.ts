@@ -180,7 +180,8 @@ describe('uploadOriginal — raster bytes and metadata', () => {
       body: png,
       visibility: 'private',
     });
-    assert.deepEqual(await readFile(join(dir, original.key)), png);
+    assert.equal(original.bucket, 'local-private');
+    assert.deepEqual(await readFile(join(`${dir}-private`, original.key)), png);
   });
 
   test('recognizes WebP and AVIF containers without rewriting their bytes', async () => {
@@ -204,7 +205,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
   });
 });
 
-describe('uploadOriginal — SVG pass-through', () => {
+describe('uploadOriginal — private SVG source', () => {
   test('reads SVG metadata and stores the exact source bytes without queue work', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
@@ -232,55 +233,18 @@ describe('uploadOriginal — SVG pass-through', () => {
     assert.equal(queueCalls, 0);
   });
 
-  test('keeps an SVG original private and serves a separately uploaded public copy', async () => {
+  test('rejects a public SVG original before writing to storage', async () => {
     installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
     const body = Buffer.from(
       '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"/>',
     );
-    const uploads: Array<{
-      body: Buffer;
-      visibility: 'public' | 'private';
-      key: string;
-    }> = [];
-    const storage: ResizeStorage = {
-      download: async () => body,
-      upload: async (args) => {
-        uploads.push({ ...args, body: Buffer.from(args.body) });
-        return { key: args.key, bucket: args.visibility };
-      },
-      publicUrl: (ref) => `https://cdn/${ref.key}`,
-      canServeOriginalPublicly: (ref) => ref.bucket === 'public',
-    };
-    const r = new Resizer({ storage });
-    const original = await r.uploadOriginal({ body, visibility: 'private' });
-    const published = await r.uploadOriginal({ body, visibility: 'public' });
-    const media = {
-      id: 'file-1',
-      original: {
-        ...original,
-        publicCopy: { key: published.key, bucket: published.bucket },
-      },
-    };
-    const { decision } = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['webp'],
-    });
-
-    assert.equal(original.bucket, 'private');
-    assert.equal(media.original.key, original.key);
-    assert.equal(published.bucket, 'public');
-    assert.notEqual(published.key, original.key);
-    assert.deepEqual(
-      uploads.map((upload) => upload.visibility),
-      ['private', 'public'],
+    await assert.rejects(
+      () => r.uploadOriginal({ body, visibility: 'public' }),
+      /SVG originals must be stored privately/,
     );
-    assert.deepEqual(
-      uploads.map((upload) => upload.body),
-      [body, body],
-    );
-    assert.equal(decision.ready[0]?.url, `https://cdn/${published.key}`);
-    assert.deepEqual(decision.missing, []);
+    assert.equal(uploads.length, 0);
   });
 
   test('uses Sharp dimensions for SVG with a viewBox', async () => {

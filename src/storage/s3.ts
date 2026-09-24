@@ -13,7 +13,6 @@
 // peers are resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the
 // host's own import line at bootstrap (no dynamic import(), no lazy loaders).
 import {
-  CopyObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -25,7 +24,7 @@ import type { ResizeStorage } from './AbstractStorage.ts';
 
 export interface S3StorageOptions {
   bucketPublic: string; // previews land here (upload visibility 'public')
-  bucketPrivate?: string; // originals ('private'); defaults to bucketPublic
+  bucketPrivate?: string; // required for visibility:'private'; must differ from bucketPublic
   publicBaseUrl?: string; // CDN/base URL for public objects, e.g. 'https://cdn.example.com'
   /** @deprecated Use `publicBaseUrl`. Same string; kept for one minor. */
   publicUrl?: string;
@@ -104,6 +103,12 @@ export class S3Storage implements ResizeStorage {
       visibility === 'public'
         ? this.#opts.bucketPublic
         : (this.#opts.bucketPrivate ?? this.#opts.bucketPublic);
+    if (visibility === 'private' && bucket === this.#opts.bucketPublic) {
+      throw new ResizeSecurityError(
+        'resize s3: private upload requires a distinct private bucket',
+        { code: 'RESIZE_S3_PRIVATE_BUCKET_REQUIRED' },
+      );
+    }
     await this.#getClient().send(
       new PutObjectCommand({
         Bucket: bucket,
@@ -113,35 +118,6 @@ export class S3Storage implements ResizeStorage {
       }),
     );
     return { bucket, key };
-  }
-
-  async copyToPublic({
-    source,
-    key,
-  }: {
-    source: StorageRef;
-    key: string;
-    contentType: string;
-  }): Promise<StorageRef> {
-    this.#assertAllowedBucket(source.bucket);
-    const sourceBucket =
-      source.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
-    const destinationBucket = this.#opts.bucketPublic;
-    if (sourceBucket === destinationBucket && source.key === key) {
-      return { bucket: destinationBucket, key };
-    }
-    const copySource = `${encodeURIComponent(sourceBucket)}/${source.key
-      .split('/')
-      .map(encodeURIComponent)
-      .join('/')}`;
-    await this.#getClient().send(
-      new CopyObjectCommand({
-        Bucket: destinationBucket,
-        Key: key,
-        CopySource: copySource,
-      }),
-    );
-    return { bucket: destinationBucket, key };
   }
 
   // Download by stored locator (the worker's original). ref.bucket wins, then the

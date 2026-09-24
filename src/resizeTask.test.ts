@@ -57,6 +57,10 @@ const alphaPng = await sharp({
   .png()
   .toBuffer();
 
+const smallSvg = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>',
+);
+
 const orientedJpeg = await sharp({
   create: {
     width: 64,
@@ -136,36 +140,19 @@ function makeMediaStore(media: MediaLike | null): {
     previews: Preview[];
     backfillDims?: { width: number; height: number };
   }>;
-  publicCopyCalls: Array<{
-    mediaId: string;
-    originalKey: string;
-    publicCopy: Original;
-  }>;
 } {
   const appendCalls: Array<{
     mediaId: string;
     previews: Preview[];
     backfillDims?: { width: number; height: number };
   }> = [];
-  const publicCopyCalls: Array<{
-    mediaId: string;
-    originalKey: string;
-    publicCopy: Original;
-  }> = [];
   const mediaStore: MediaStore = {
     load: async () => media,
     appendPreviews: async (mediaId, previews, backfillDims) => {
       appendCalls.push({ mediaId, previews, backfillDims });
     },
-    setOriginalPublicCopy: async (mediaId, originalKey, publicCopy) => {
-      publicCopyCalls.push({ mediaId, originalKey, publicCopy });
-      if (media?.original) {
-        media.original.publicCopy = publicCopy;
-      }
-      return true;
-    },
   };
-  return { mediaStore, appendCalls, publicCopyCalls };
+  return { mediaStore, appendCalls };
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
@@ -280,10 +267,10 @@ describe('processTask — source handling', () => {
     assert.equal(downloadCalls, 0);
   });
 
-  test('SVG original → one unchanged public copy, persisted without rasterization', async () => {
+  test('SVG original → raster preview persisted by the normal worker', async () => {
     installApp();
-    const { storage, uploads } = makeStorage(redPng);
-    const { mediaStore, appendCalls, publicCopyCalls } = makeMediaStore(
+    const { storage, uploads } = makeStorage(smallSvg);
+    const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({
         original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
       }),
@@ -293,11 +280,23 @@ describe('processTask — source handling', () => {
       mediaStore,
       lockProvider: makeLocks().lockProvider,
     });
-    await processTask(task({ previews: [variant()] }));
+    await processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '200x200',
+            requestedWidth: 200,
+            requestedHeight: 200,
+          }),
+        ],
+      }),
+    );
     assert.equal(uploads.length, 1);
     assert.equal(uploads[0].visibility, 'public');
-    assert.equal(appendCalls.length, 0);
-    assert.equal(publicCopyCalls.length, 1);
+    assert.equal(uploads[0].contentType, 'image/jpeg');
+    assert.equal((await sharp(uploads[0].body).metadata()).width, 200);
+    assert.equal(appendCalls.length, 1);
+    assert.equal(appendCalls[0].previews[0].format, 'jpeg');
   });
 
   test('an undecodable source → throws (fails the task for retry/DLQ)', async () => {
@@ -850,7 +849,6 @@ describe('processTask — persistence & failure handling', () => {
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
-      setOriginalPublicCopy: async () => true,
     };
     new Resizer({
       storage,
@@ -901,7 +899,6 @@ describe('processTask — persistence & failure handling', () => {
         return media;
       },
       appendPreviews: async () => {},
-      setOriginalPublicCopy: async () => true,
     };
     new Resizer({
       storage,
@@ -921,7 +918,6 @@ describe('processTask — persistence & failure handling', () => {
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
-      setOriginalPublicCopy: async () => true,
     };
     new Resizer({
       storage,
@@ -1166,25 +1162,56 @@ describe('generate (eager)', () => {
     );
   });
 
-  test('SVG original → eager publication without raster previews', async () => {
-    const { logs } = installApp();
-    const { storage, uploads } = makeStorage(redPng);
-    const { mediaStore, appendCalls, publicCopyCalls } = makeMediaStore(null);
+  test('SVG original → eager JPEG/WebP/AVIF previews', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(smallSvg);
+    const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
       }),
-      sizes: [{ width: 20, height: 20 }],
-      formats: ['jpeg'],
+      sizes: [{ width: 80, height: 80 }],
+      formats: ['jpeg', 'webp', 'avif'],
     });
-    assert.deepEqual(result.created, []);
+    assert.equal(result.created.length, 3);
     assert.equal(result.failed, 0);
-    assert.equal(uploads.length, 1);
-    assert.equal(uploads[0].visibility, 'public');
-    assert.equal(appendCalls.length, 0);
-    assert.equal(publicCopyCalls.length, 1);
-    assert.ok(logs.info.some((l) => String(l[0]).includes('SVG')));
+    assert.equal(uploads.length, 3);
+    assert.deepEqual(
+      new Set(uploads.map((upload) => upload.contentType)),
+      new Set(['image/jpeg', 'image/webp', 'image/avif']),
+    );
+    for (const upload of uploads) {
+      const metadata = await sharp(upload.body).metadata();
+      assert.equal(metadata.width, 80);
+      assert.equal(metadata.height, 80);
+      assert.notEqual(metadata.format, 'svg');
+    }
+    assert.equal(appendCalls.length, 1);
+  });
+
+  test('SVG fit keeps the original size when a cover sibling needs high density', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(smallSvg);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const result = await r.generate({
+      media: mediaDoc({ original: { key: 'uploads/x.svg', format: 'svg' } }),
+      sizes: [{ width: 200, height: 200 }, { fit: true }],
+      formats: ['webp'],
+    });
+    assert.equal(result.created.length, 2);
+    const byKey = new Map(
+      result.created.map((preview) => [preview.sizeKey, preview]),
+    );
+    const cover = uploads.find(
+      (upload) => upload.key === byKey.get('200x200')?.key,
+    );
+    const fit = uploads.find((upload) => upload.key === byKey.get('fit')?.key);
+    assert.ok(cover);
+    assert.ok(fit);
+    assert.equal((await sharp(cover.body).metadata()).width, 200);
+    assert.equal((await sharp(fit.body).metadata()).width, 8);
   });
 
   test('no original → ResizeNoOriginalError', async () => {

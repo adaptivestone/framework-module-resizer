@@ -8,7 +8,8 @@ import type { StorageRef } from '../types.d.ts';
 import type { ResizeStorage } from './AbstractStorage.ts';
 
 export interface LocalFsStorageOptions {
-  rootDir: string; // files land under this directory
+  rootDir: string; // public previews land under this directory
+  privateRootDir?: string; // private originals; defaults to a sibling of rootDir
   publicBaseUrl: string; // URL prefix for publicUrl(), e.g. '/media' or 'http://localhost:3000/media'
 }
 
@@ -38,46 +39,57 @@ function normalizePublicKey(key: string): string {
 
 export class LocalFsStorage implements ResizeStorage {
   readonly #rootDir: string;
+  readonly #privateRootDir: string;
   readonly #publicBaseUrl: string;
 
   constructor(opts: LocalFsStorageOptions) {
     this.#rootDir = opts.rootDir;
+    this.#privateRootDir = opts.privateRootDir ?? `${opts.rootDir}-private`;
     this.#publicBaseUrl = opts.publicBaseUrl;
   }
 
   async download(ref: StorageRef): Promise<Buffer> {
-    return readFile(resolveInsideRoot(this.#rootDir, ref.key));
+    return readFile(
+      resolveInsideRoot(
+        ref.bucket === 'local-private' ? this.#privateRootDir : this.#rootDir,
+        ref.key,
+      ),
+    );
   }
 
   async upload({
     key,
     body,
+    visibility,
   }: {
     key: string;
     body: Buffer | Uint8Array;
     contentType: string;
-    // Accepted to match ResizeStorage; local/dev shares one tree (not a private store).
     visibility: 'public' | 'private';
   }): Promise<StorageRef> {
-    const abs = resolveInsideRoot(this.#rootDir, key);
+    const isPrivate = visibility === 'private';
+    const abs = resolveInsideRoot(
+      isPrivate ? this.#privateRootDir : this.#rootDir,
+      key,
+    );
     await mkdir(dirname(abs), { recursive: true });
     await writeFile(abs, body);
-    return { key };
-  }
-
-  async copyToPublic({ source }: { source: StorageRef }): Promise<StorageRef> {
-    // Local development intentionally has one public tree, so the original is
-    // already reachable and no second physical file is necessary.
-    resolveInsideRoot(this.#rootDir, source.key);
-    return { key: source.key };
+    return isPrivate ? { key, bucket: 'local-private' } : { key };
   }
 
   // PURE string building — no I/O (called on the read path). Option is publicBaseUrl
   // (never `publicUrl`) so it cannot shadow this method name.
   publicUrl(ref: StorageRef): string {
     // Keep the same path-traversal validation for this pure URL builder as for I/O. Local
-    // development intentionally uses one shared tree for originals and previews, so a validated
-    // key is considered publicly servable.
+    // A private locator must never be converted into a public URL.
+    if (ref.bucket === 'local-private') {
+      throw new ResizeSecurityError(
+        'resize fs: refusing public URL for private original',
+        {
+          code: 'RESIZE_FS_PRIVATE_URL',
+        },
+      );
+    }
     resolveInsideRoot(this.#rootDir, normalizePublicKey(ref.key));
     const base = this.#publicBaseUrl.replace(/\/+$/, '');
     const key = normalizePublicKey(ref.key);
@@ -86,6 +98,6 @@ export class LocalFsStorage implements ResizeStorage {
 
   canServeOriginalPublicly(ref: StorageRef): boolean {
     resolveInsideRoot(this.#rootDir, normalizePublicKey(ref.key));
-    return true;
+    return ref.bucket !== 'local-private';
   }
 }

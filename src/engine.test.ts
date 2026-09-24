@@ -589,18 +589,23 @@ describe('resolve — no transport (eager-only host)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 step 6 — SVG pass-through
+// SVG originals, including legacy public copies, require raster previews.
 // ---------------------------------------------------------------------------
 
-describe('resolve — SVG pass-through', () => {
-  test('serves the original at every size×format, missing empty, no transport call', async () => {
+describe('resolve — SVG raster previews', () => {
+  test('queues missing size×format variants instead of exposing a public original', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'logo.svg', contentType: 'image/svg+xml' },
+      original: {
+        key: 'logo.svg',
+        contentType: 'image/svg+xml',
+        width: 20,
+        height: 20,
+      },
     };
     const { decision } = await r.resolve({
       media,
@@ -610,60 +615,18 @@ describe('resolve — SVG pass-through', () => {
       ],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(decision.ready.length, 4);
-    assert.equal(decision.missing.length, 0);
-    assert.equal(calls.length, 0);
-    for (const entry of decision.ready) {
-      assert.equal(entry.url, 'https://cdn/logo.svg');
-      assert.equal(entry.isOriginal, true);
-      assert.equal(entry.preview, undefined);
-    }
-    // requested format recorded, but never used to pick a raster preview
-    assert.deepEqual(decision.ready.map((e) => e.format).sort(), [
-      'jpeg',
-      'jpeg',
-      'webp',
-      'webp',
-    ]);
+    assert.equal(decision.ready.length, 0);
+    assert.equal(decision.missing.length, 4);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 4);
   });
 
-  test('a private SVG served to an owner uses signedUrl (same original-URL rule as the fast-path)', async () => {
-    installFakeApp();
-    const storage = makeStorage({
-      signedUrl: async (ref, ttl) => `https://signed/${ref.key}?ttl=${ttl}`,
-    });
-    const r = new Resizer({ storage });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { key: 'private/logo.svg', contentType: 'image/svg+xml' },
-    };
-    const owned = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      ctx: { isOwner: true },
-      enqueueMissing: false,
-    });
-    assert.equal(
-      owned.decision.ready[0].url,
-      'https://signed/private/logo.svg?ttl=300',
-    );
-    // No owner ctx → the pure public URL.
-    const anon = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      enqueueMissing: false,
-    });
-    assert.equal(anon.decision.ready[0].url, 'https://cdn/private/logo.svg');
-  });
-
-  test('serves a public SVG copy while keeping the original private', async () => {
+  test('ignores a legacy publicCopy and never signs a private SVG original', async () => {
     installFakeApp();
     let signedCalls = 0;
     const r = new Resizer({
       storage: makeStorage({
-        canServeOriginalPublicly: (ref) => ref.bucket === 'public',
+        canServeOriginalPublicly: () => true,
         signedUrl: async () => {
           signedCalls++;
           return 'https://signed/private.svg';
@@ -674,93 +637,57 @@ describe('resolve — SVG pass-through', () => {
       id: 'm1',
       original: {
         key: 'private/logo.svg',
-        bucket: 'private',
         contentType: 'image/svg+xml',
+        width: 20,
+        height: 20,
         publicCopy: { key: 'published/logo.svg', bucket: 'public' },
       },
+      previews: [
+        {
+          key: 'published/logo.svg',
+          sizeKey: '300x300',
+          format: 'jpeg',
+          contentType: 'image/svg+xml',
+        },
+      ],
     };
     for (const ctx of [{}, { isOwner: true }]) {
       const { decision } = await r.resolve({
         media,
-        sizes: [{ width: 300, height: 300 }, { fit: true }],
-        formats: ['jpeg', 'webp'],
+        sizes: [{ width: 300, height: 300 }],
+        formats: ['jpeg'],
         ctx,
+        enqueueMissing: false,
       });
-      assert.equal(decision.ready.length, 4);
-      assert.deepEqual(decision.missing, []);
-      for (const entry of decision.ready) {
-        assert.equal(entry.url, 'https://cdn/published/logo.svg');
-        assert.equal(entry.contentType, 'image/svg+xml');
-      }
+      assert.deepEqual(decision.ready, []);
+      assert.equal(decision.missing.length, 1);
     }
     assert.equal(signedCalls, 0);
-    assert.equal(media.original?.key, 'private/logo.svg');
   });
 
-  test('does not expose a supposed SVG copy unless storage proves it is public', async () => {
-    installFakeApp();
-    const r = new Resizer({
-      storage: makeStorage({
-        canServeOriginalPublicly: (ref) => ref.bucket === 'public',
-      }),
-    });
-    const { decision } = await r.resolve({
-      media: {
-        id: 'm1',
-        original: {
-          key: 'private/logo.svg',
-          bucket: 'private',
-          format: 'svg',
-          publicCopy: { key: 'wrong/logo.svg', bucket: 'private' },
-        },
-      },
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-    });
-    assert.deepEqual(decision.ready, []);
-    assert.equal(decision.missing.length, 1);
-  });
-
-  test('detects SVG via original.format === "svg" too', async () => {
+  test('stored raster preview is returned for an SVG original', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { key: 'logo', format: 'svg' },
-    };
-    const { decision } = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      enqueueMissing: false,
-    });
-    assert.equal(decision.ready.length, 1);
-    assert.equal(decision.ready[0].isOriginal, true);
-    assert.equal(decision.ready[0].url, 'https://cdn/logo');
-    assert.equal(decision.missing.length, 0);
-  });
-
-  test('a private SVG is missing for anonymous reads and queues publication work', async () => {
-    installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
-      storage: makeStorage({ canServeOriginalPublicly: () => false }),
-      transport,
-      lockProvider,
-    });
     const { decision } = await r.resolve({
       media: {
         id: 'm1',
-        original: { key: 'private/logo.svg', contentType: 'image/svg+xml' },
+        original: { key: 'logo', format: 'svg' },
+        previews: [
+          {
+            key: 'logo.webp',
+            sizeKey: '300x300',
+            format: 'webp',
+            contentType: 'image/webp',
+          },
+        ],
       },
       sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg', 'webp'],
+      formats: ['webp'],
+      enqueueMissing: false,
     });
-    assert.deepEqual(decision.ready, []);
-    assert.equal(decision.missing.length, 2);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].previews.length, 2);
+    assert.equal(decision.ready[0].url, 'https://cdn/logo.webp');
+    assert.equal(decision.ready[0].contentType, 'image/webp');
+    assert.deepEqual(decision.missing, []);
   });
 });
 

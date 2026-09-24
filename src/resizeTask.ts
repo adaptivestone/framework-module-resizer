@@ -22,6 +22,7 @@ import {
   calculateResizedDimensions,
   expandMissingPreviews,
   getPreviewIdentity,
+  isUsablePreview,
   requireMediaId,
 } from './images.ts';
 import { getResizeConfig } from './resizeConfig.ts';
@@ -32,7 +33,6 @@ import {
   type LeasedTask,
   type Resizer,
 } from './resizer.ts';
-import { ensureSvgPublicCopy, isSvgOriginal } from './svgPublicCopy.ts';
 import type {
   MediaLike,
   MissingPreview,
@@ -117,7 +117,9 @@ export async function generatePreviews(
   // rejected consistently at this first probe rather than slipping through to a per-variant decode.
   const origMeta = await sharp(buf, {
     limitInputPixels: config.limits.inputPixels,
-  }).metadata();
+  })
+    .timeout({ seconds: config.limits.processingTimeoutSeconds })
+    .metadata();
   if (origMeta.width === undefined || origMeta.height === undefined) {
     throw new ResizeMediaError(
       `resize: source metadata missing width/height for media ${mediaId} — cannot size safely`,
@@ -164,26 +166,84 @@ export async function generatePreviews(
   // 5. Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
   const procMeta = await sharp(buf, {
     limitInputPixels: config.limits.inputPixels,
-  }).metadata();
+  })
+    .timeout({ seconds: config.limits.processingTimeoutSeconds })
+    .metadata();
   const procW = procMeta.width ?? dispW;
   const procH = procMeta.height ?? dispH;
+  if (
+    procW * procH >
+    Math.min(config.limits.sourcePixels, config.limits.inputPixels)
+  ) {
+    throw new ResizeMediaError(
+      `resize: processed source exceeds pixel limits for media ${mediaId}`,
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE' },
+    );
+  }
 
   // 6. Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6).
   const existing = new Set<string>();
   for (const p of media.previews ?? []) {
-    if (p.key && p.contentType) {
+    if (isUsablePreview(p)) {
       existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
     }
   }
 
   // 7. Decode the original ONCE; clone the base per variant so the decode is shared.
+  // SVG is decoded at the largest requested scale before the shared preview pipeline.
+  // Cap the intermediate raster by the same source/input pixel budgets as other inputs.
+  const pixelBudget = Math.min(
+    config.limits.sourcePixels,
+    config.limits.inputPixels,
+  );
+  const largestScale =
+    procMeta.format === 'svg'
+      ? Math.max(
+          1,
+          ...requested
+            .filter((variant) => !variant.fit)
+            .map((variant) =>
+              Math.max(
+                (variant.requestedWidth ?? 0) / procW,
+                (variant.requestedHeight ?? 0) / procH,
+              ),
+            ),
+        )
+      : 1;
+  const density =
+    procMeta.format === 'svg'
+      ? Math.max(
+          72,
+          Math.min(
+            100_000,
+            Math.floor(
+              72 *
+                Math.min(
+                  largestScale,
+                  Math.sqrt(pixelBudget / (procW * procH)),
+                ),
+            ),
+          ),
+        )
+      : undefined;
   const base = sharp(buf, {
-    failOn: 'none',
+    failOn: procMeta.format === 'svg' ? 'warning' : 'none',
     sequentialRead: true,
     limitInputPixels: config.limits.inputPixels,
     animated: config.animated,
     pages: config.animated ? config.limits.animationFrames : 1,
+    ...(density !== undefined ? { density } : {}),
   });
+  const fitBase =
+    density !== undefined && density > 72 && requested.some((v) => v.fit)
+      ? sharp(buf, {
+          failOn: 'warning',
+          sequentialRead: true,
+          limitInputPixels: config.limits.inputPixels,
+          animated: config.animated,
+          pages: config.animated ? config.limits.animationFrames : 1,
+        })
+      : undefined;
 
   // Locks held for processed variants; released once after the pool (success AND error).
   const heldLocks = new Set<string>();
@@ -253,7 +313,7 @@ export async function generatePreviews(
 
       // Clone the shared decode; `.rotate()` on EVERY branch (defense-in-depth); normalize the
       // working colorspace BEFORE variantSteps so composited overlay colors are predictable.
-      let img = base
+      let img = (v.fit && fitBase ? fitBase : base)
         .clone()
         .rotate()
         .resize(
@@ -285,12 +345,20 @@ export async function generatePreviews(
         encodeOptions as OutputOptions,
       );
 
-      const { data, info } = await img.toBuffer({ resolveWithObject: true });
+      const { data, info } = await img
+        .timeout({ seconds: config.limits.processingTimeoutSeconds })
+        .toBuffer({ resolveWithObject: true });
       // Sharp reports AVIF output through its HEIF container id and does not expose
       // compression on OutputInfo. Inspect the produced ISO BMFF brands so configured
       // `heif: { compression: 'av1' }` receives the correct MIME type and extension too.
       const outputFormat =
         info.format === 'heif' && isAvifBuffer(data) ? 'avif' : info.format;
+      if (outputFormat === 'svg') {
+        throw new ResizeMediaError(
+          `resize: SVG cannot be published as a preview for media ${mediaId}`,
+          { mediaId, code: 'RESIZE_SVG_PUBLIC_PREVIEW' },
+        );
+      }
       const contentType = `image/${outputFormat}`;
       const key = `${keyPrefix(original.key)}/${randomHex()}.${outputFormat}`;
       const ref = await storage.upload({
@@ -404,14 +472,6 @@ export async function processTask(
   if (!media.original?.key) {
     throw new ResizeNoOriginalError(task.mediaId);
   }
-  // SVG uses the same durable task lifecycle as raster variants, but its work is
-  // one public byte-for-byte copy rather than Sharp resize/encode operations.
-  const original = media.original;
-  if (isSvgOriginal(original)) {
-    await ensureSvgPublicCopy(resizer, media, task.mediaId, true);
-    return;
-  }
-
   const requestedByIdentity = new Map<string, MissingPreview>();
   for (const preview of canonicalizeVariants(task.previews)) {
     const identity = getPreviewIdentity(
@@ -451,7 +511,7 @@ export async function processTask(
     ...(refreshed.previews ?? []),
     ...generated,
   ]) {
-    if (preview.key && preview.contentType) {
+    if (isUsablePreview(preview)) {
       covered.add(
         getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
       );
@@ -507,15 +567,6 @@ export async function generateImpl(
     ctx,
   )) as SizeInput[];
   const formats = opts.formats ?? config.formats;
-
-  // Eager SVG work publishes one unchanged copy and persists its locator.
-  if (isSvgOriginal(original)) {
-    await ensureSvgPublicCopy(resizer, media, mediaId, opts.persist !== false);
-    getApp().logger.info(
-      `resize generate: media ${mediaId} SVG public copy is ready`,
-    );
-    return { created: [], failed: 0 };
-  }
 
   // Expand sizes × formats; skip unbuildable sizes + existing identities (idempotent).
   const requested = expandMissingPreviews(media, sizes, formats);

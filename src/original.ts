@@ -56,7 +56,9 @@ async function prepareOriginal(
     metadata = await sharp(body, {
       limitInputPixels: config.limits.inputPixels,
       animated: true,
-    }).metadata();
+    })
+      .timeout({ seconds: config.limits.processingTimeoutSeconds })
+      .metadata();
   } catch (cause) {
     throw new ResizeOriginalError(
       'resize uploadOriginal: bytes are not a supported image',
@@ -131,6 +133,12 @@ export async function uploadOriginalImpl(
     throw new ResizeOriginalError(
       `resize uploadOriginal: format ${prepared.format} is disabled by upload.formats`,
       { code: 'RESIZE_ORIGINAL_FORMAT_DISABLED' },
+    );
+  }
+  if (prepared.format === 'svg' && opts.visibility === 'public') {
+    throw new ResizeOriginalError(
+      'resize uploadOriginal: SVG originals must be stored privately',
+      { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
     );
   }
   const key = `originals/${randomHex()}.${prepared.extension}`;

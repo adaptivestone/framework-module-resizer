@@ -6,6 +6,8 @@ import type {
   Filters,
   MediaLike,
   MissingPreview,
+  Original,
+  Preview,
   PreviewFormat,
   SizeInput,
 } from './types.d.ts';
@@ -172,7 +174,9 @@ export function expandMissingPreviews(
 ): MissingPreview[] {
   const existing = new Set<string>();
   for (const p of media.previews ?? []) {
-    existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+    if (isUsablePreview(p)) {
+      existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+    }
   }
   return expandPreviewRequests(sizes, formats).filter(
     (preview) =>
@@ -223,23 +227,29 @@ export function expandPreviewRequests(
 
 /**
  * True when every `sizes × formats` identity is already stored on `media.previews`
- * (or the original is SVG with a persisted public copy). Hosts
- * use this to skip a no-op `generate` / `prewarm`.
+ * Hosts use this to skip a no-op `generate` / `prewarm`.
  */
 export function isCatalogCovered(
   media: MediaLike,
   sizes: SizeInput[],
   formats: PreviewFormat[],
 ): boolean {
-  const original = media.original;
-  if (
-    original &&
-    (original.contentType === 'image/svg+xml' || original.format === 'svg') &&
-    original.publicCopy?.key
-  ) {
-    return true;
-  }
   return expandMissingPreviews(media, sizes, formats).length === 0;
+}
+
+export function isSvgOriginal(original: Original | undefined): boolean {
+  return (
+    original?.format === 'svg' || original?.contentType === 'image/svg+xml'
+  );
+}
+
+export function isUsablePreview(preview: Preview): boolean {
+  return Boolean(
+    preview.key &&
+      preview.contentType &&
+      preview.contentType !== 'image/svg+xml' &&
+      preview.format !== 'svg',
+  );
 }
 
 /**

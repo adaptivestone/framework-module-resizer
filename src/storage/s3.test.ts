@@ -38,6 +38,21 @@ function makeFakeS3() {
 // ---------------------------------------------------------------------------
 
 describe('S3Storage.upload', () => {
+  test('requires a distinct private bucket for all private uploads', async () => {
+    const { client, sent } = makeFakeS3();
+    const storage = new S3Storage({ bucketPublic: 'pub', client });
+    await assert.rejects(
+      () =>
+        storage.upload({
+          key: 'originals/logo.svg',
+          body: Buffer.from('<svg/>'),
+          contentType: 'image/svg+xml',
+          visibility: 'private',
+        }),
+      /distinct private bucket/,
+    );
+    assert.equal(sent.length, 0);
+  });
   test('routes visibility:public → bucketPublic and returns the persisted {bucket,key}', async () => {
     const { client, sent } = makeFakeS3();
     const s = new S3Storage({
@@ -74,16 +89,20 @@ describe('S3Storage.upload', () => {
     assert.equal(sent[0].input.Bucket, 'priv');
   });
 
-  test('private falls back to bucketPublic when bucketPrivate is absent', async () => {
-    const { client } = makeFakeS3();
+  test('private raster cannot fall back to bucketPublic', async () => {
+    const { client, sent } = makeFakeS3();
     const s = new S3Storage({ bucketPublic: 'pub', client });
-    const ref = await s.upload({
-      key: 'k',
-      body: Buffer.alloc(0),
-      contentType: 'image/avif',
-      visibility: 'private',
-    });
-    assert.equal(ref.bucket, 'pub');
+    await assert.rejects(
+      () =>
+        s.upload({
+          key: 'k',
+          body: Buffer.alloc(0),
+          contentType: 'image/avif',
+          visibility: 'private',
+        }),
+      /distinct private bucket/,
+    );
+    assert.equal(sent.length, 0);
   });
 
   test('sends NO per-object ACL param', async () => {
@@ -111,31 +130,6 @@ describe('S3Storage.upload', () => {
     await s.download({ bucket: 'pub', key: 'k' });
     // Every I/O op routed through the SAME injected client (upload send + download send).
     assert.equal(sent.length, 2);
-  });
-});
-
-describe('S3Storage.copyToPublic', () => {
-  test('uses a server-side CopyObject from the private bucket to the public bucket', async () => {
-    const { client, sent } = makeFakeS3();
-    const s = new S3Storage({
-      bucketPublic: 'pub',
-      bucketPrivate: 'priv',
-      client,
-    });
-    const ref = await s.copyToPublic({
-      source: { bucket: 'priv', key: 'originals/logo one.svg' },
-      key: 'originals/logo one.svg',
-      contentType: 'image/svg+xml',
-    });
-    assert.deepEqual(ref, {
-      bucket: 'pub',
-      key: 'originals/logo one.svg',
-    });
-    assert.equal(sent.length, 1);
-    assert.equal(sent[0].constructor.name, 'CopyObjectCommand');
-    assert.equal(sent[0].input.Bucket, 'pub');
-    assert.equal(sent[0].input.Key, 'originals/logo one.svg');
-    assert.equal(sent[0].input.CopySource, 'priv/originals/logo%20one.svg');
   });
 });
 

@@ -122,7 +122,8 @@ function validateRequiredResizeConfigFields(
     !isPositiveSafeInteger(limits.inputPixels) ||
     !isPositiveSafeInteger(limits.sourcePixels) ||
     !isPositiveSafeInteger(limits.resultDimension) ||
-    !isPositiveSafeInteger(limits.animationFrames)
+    !isPositiveSafeInteger(limits.animationFrames) ||
+    !isPositiveSafeInteger(limits.processingTimeoutSeconds)
   ) {
     invalid(
       'resize config: all limits must be positive safe integers',

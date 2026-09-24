@@ -147,13 +147,13 @@ driver may return its own opaque locator key.
 
 Input bytes are stored unchanged. Format and dimensions for raster images and SVG are read
 with `sharp().metadata()` under the configured pixel limits. No output image is rendered,
-rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml`; its public derivative is an
-unchanged copy rather than a raster preview.
+rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml` as a private original. The worker
+later produces the requested raster previews through Sharp.
 SVG dimensions are those reported by Sharp, including dimensions derived from `viewBox`.
 SVG without dimensions that Sharp can determine is rejected. Previously stored rows are unchanged.
 There is no separate XML validator, DTD prohibition, or sanitizer. Sharp metadata inspection does
-not remove scripts or external references. The host owns the input trust policy and may sanitize,
-reject, or accept SVG before calling this method. The module preserves the accepted bytes exactly.
+not remove scripts or external references from the private original. The module rejects public SVG
+uploads and serves only generated raster previews for accepted SVG input.
 Inputs Sharp cannot read use the common `RESIZE_ORIGINAL_INVALID` error instead of the former
 SVG-specific XML errors.
 
@@ -344,8 +344,7 @@ const { created, failed } = await resizer.generate({
 
 `created` is **only what this call made**. A second `generate` with the same catalog returns
 `{ created: [], failed: 0 }` because everything already exists — treat an empty `created` as
-"nothing new was needed", never as failure. An SVG original is the same: pass-through, never
-rasterized, `{ created: [], failed: 0 }`.
+"nothing new was needed", never as failure. SVG input follows the same generation rule.
 
 **Hybrid:** `generate` the above-the-fold sizes at upload and let `resolve` lazily fill the heavy
 ones on demand — or `prewarm` the whole catalog at upload and let `resolve` cover anything added
@@ -434,15 +433,17 @@ Credentials are never options — they resolve via the standard AWS provider cha
 
 | Option | | |
 |---|---|---|
-| `rootDir` | **required** | files land under this directory |
+| `rootDir` | **required** | public previews land under this directory |
+| `privateRootDir` | optional | private originals; defaults to a sibling directory, `rootDir` + `-private` |
 | `publicBaseUrl` | **required** | URL prefix for `publicUrl()`, e.g. `/media` |
 
 Default story for tests and first-week local. Same `download` / `upload` / `publicUrl` contract.
 Option is `publicBaseUrl` (never `publicUrl`) so it cannot shadow the method.
 
-The host must (1) write originals under `rootDir` at `original.key`, (2) serve `rootDir` at
-`publicBaseUrl` (otherwise every URL 404s), and (3) treat this as a **local/dev** store:
-`visibility` is accepted and ignored — originals and previews share one tree.
+The host serves only `rootDir` at `publicBaseUrl`; it must not mount `privateRootDir` in the
+static server. The storage driver writes `visibility: 'private'` uploads there and records
+`bucket: 'local-private'` so the worker can download them. Existing legacy local refs without
+that marker still read from `rootDir`; move or deny any old public originals during rollout.
 
 ### `S3Storage({ … })`
 
@@ -458,7 +459,7 @@ new S3Storage({
 | Option | | |
 |---|---|---|
 | `bucketPublic` | **required** | previews land here (`public` visibility) |
-| `bucketPrivate` | optional | originals (`private`); defaults to `bucketPublic`; configure a distinct private bucket when originals must stay private |
+| `bucketPrivate` | required for private uploads | must differ from `bucketPublic`; originals land here |
 | `publicBaseUrl` | optional | CDN/base URL for public objects |
 | `publicUrl` | optional | **deprecated** alias of `publicBaseUrl` (one minor) |
 | `region`, `endpoint`, `forcePathStyle` | optional | S3-compatible targets (MinIO / localstack / R2) |
@@ -483,17 +484,14 @@ new Resizer({ /* … */, storage: {
     await s3.putObject(bucket, key, body, contentType);
     return { bucket, key };               // ← persisted onto the preview/original
   },
-  // Optional native optimization used for SVG publication. If omitted, core uses
-  // download(source) followed by upload({ visibility: 'public' }).
-  copyToPublic: ({ source, key, contentType }) => nativeCopy(source, key, contentType),
   publicUrl: (ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
   signedUrl: (ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
 }});
 ```
 
 The same pattern swaps `mediaStore` (e.g. another DB/ORM) or `lockProvider` (e.g. Redis/redlock).
-A custom media store implements `load`, `appendPreviews`, and the conditional
-`setOriginalPublicCopy` write used by SVG worker tasks.
+A custom media store implements `load` and `appendPreviews`. Older drivers may still expose
+`setOriginalPublicCopy`, but the SVG worker no longer calls it.
 Contract types (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`, …) are exported
 from the main entry for custom-driver authors.
 
@@ -642,6 +640,7 @@ export default {
 | `limits.sourcePixels` | `50_000_000` | rejected before decode, from metadata |
 | `limits.resultDimension` | `5000` | clamp on the cover branch |
 | `limits.animationFrames` | `64` | animation-bomb guard |
+| `limits.processingTimeoutSeconds` | `30` | Sharp native processing timeout |
 | `queue.lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | worker ≤ `leaseMs` |
 | `queue.leaseMs` | `60000` | heartbeat renews at `leaseMs/2`; set ≥ ~2× worst-case encode |
 | `queue.retryBackoffMs` | `{ base: 5000, max: 300000 }` | delayed re-lease on fail |
@@ -713,10 +712,8 @@ the next delivery generates only the missing identities, and permanent gaps reac
 a live row without `original.key` is an observable terminal media error.
 
 **SVG originals use the same task lifecycle.** Upload and persist the original privately, then call
-the same `prewarm()` or `enqueueRequired()` used for raster images. The worker detects SVG,
-server-side copies the same bytes into public storage when the driver supports it, and atomically
-saves the returned locator as `original.publicCopy`. It never sends SVG through Sharp output or
-creates separate files for requested sizes and formats.
+the same `prewarm()` or `enqueueRequired()` used for raster images. The worker reads the SVG through
+Sharp and creates a raster preview for every requested size and format.
 
 ```ts
 const original = await resizer.uploadOriginal({ body: svgBytes, visibility: 'private' });
@@ -728,16 +725,10 @@ await resizer.prewarm({ media, sizes });
 
 With `S3Storage`, configure distinct `bucketPrivate` and `bucketPublic` values and a bucket
 policy that keeps the private bucket inaccessible to the public. The original locator stays in
-`media.original`; `publicCopy` holds only the public locator. `resolve()` serves that copy only
-after `canServeOriginalPublicly()` confirms it. Until then, anonymous reads queue the same durable
-publication work and an owner/admin may still receive a signed private-original URL.
-
-Custom `MediaStore` drivers must implement the conditional
-`setOriginalPublicCopy(mediaId, expectedOriginalKey, publicCopy)` write. Custom storage drivers
-may implement `copyToPublic()` for an efficient native copy; otherwise the core downloads and
-uploads the exact bytes. They must implement `canServeOriginalPublicly()` for anonymous delivery.
-`LocalFsStorage` has one public tree, so no second physical copy is needed. The host owns deletion
-of both locators. The module does not sanitize SVG; the host decides its acceptance policy.
+`media.original`; generated previews are stored in the public bucket. `resolve()` ignores any
+legacy `original.publicCopy` and waits for real previews. Owner/admin context does not expose the
+uploaded SVG through the read path. `LocalFsStorage` writes private originals outside its public
+root; the host must expose only that public root through its static server.
 
 **Original visibility is explicit.** Storage drivers that can prove an original is public should
 implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's
@@ -745,7 +736,8 @@ implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary 
 previews remain the preferred public read path.
 
 **Deleting media / storage cleanup is host-owned.** The module appends previews but does not delete
-them; removing a media doc's storage objects (originals, public SVG copies, and derivatives) is your lifecycle.
+them; removing a media doc's storage objects (originals, derivatives, and any legacy SVG copies)
+is your lifecycle.
 
 ---
 
@@ -761,7 +753,7 @@ The module owns the resize core; the host owns everything domain-specific (spec 
   pipeline `beforeSteps`/`variantSteps`).
 - **Permissions** — who may delete/replace media; the host may pass `ctx.isOwner`/`ctx.isAdmin` to
   opt a read into a signed-original URL.
-- **SVG sanitization** and **deleting media / storage cleanup**.
+- **Deleting media / storage cleanup** and removing legacy public SVG copies.
 
 ---
 
