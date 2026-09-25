@@ -67,14 +67,16 @@ describe('ResizeTaskModel.modelSchema — spec/08 §12 fields', () => {
     assert.equal(a.default, 0);
   });
 
-  test('previews carries the requested-variant shape with a format enum', () => {
+  test('previews carries the requested-variant shape with an open format string', () => {
     const item = ResizeTaskModel.modelSchema.previews[0];
     assert.equal(item.sizeKey.type, String);
     assert.ok('filters' in item);
     assert.ok('requestedWidth' in item);
     assert.ok('requestedHeight' in item);
     assert.ok('fit' in item);
-    assert.deepEqual([...item.format.enum], ['jpeg', 'webp', 'avif']);
+    assert.equal(item.format.type, String);
+    assert.equal(item.format.required, true);
+    assert.equal('enum' in item.format, false);
   });
 
   test('lease / timestamp / error fields are present', () => {

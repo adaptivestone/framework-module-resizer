@@ -11,6 +11,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import {
+  resetAppInstance,
+  setAppInstance,
+} from '@adaptivestone/framework/helpers/appInstance.js';
+import defaultResizeConfig from '../config/resize.ts';
+import { getResizeConfig } from '../resizeConfig.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -19,6 +25,7 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'resize-scaffold-'));
 });
 afterEach(async () => {
+  resetAppInstance();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -58,13 +65,45 @@ describe('runScaffold — default run', () => {
     const { code } = await run([]);
     assert.equal(code, 0);
 
-    assert.match(await read(RESIZER), /new Resizer\(/);
+    const resizer = await read(RESIZER);
+    assert.match(resizer, /new Resizer\(/);
+    assert.match(
+      resizer,
+      /await import\('\.\/resizer\.ts'\)/,
+      'bootstrap guidance must use a dynamic import after Server.init()',
+    );
+    assert.match(
+      resizer,
+      /Queue indexes are declared[\s\S]+normal migration\/lifecycle process[\s\S]+does not create or[\s\S]+synchronize indexes/,
+    );
     assert.match(await read(MODEL), /extends ResizeTaskModel/);
     assert.match(
       await read(COMMAND),
       /@adaptivestone\/framework-module-resize\/commands\/ResizeWorker\.js/,
     );
-    assert.match(await read(CONFIG), /\.\.\.defaultResizeConfig/);
+    const configSource = await read(CONFIG);
+    assert.match(
+      configSource,
+      /@adaptivestone\/framework-module-resize\/config\/resize\.js/,
+    );
+    assert.match(configSource, /\.\.\.defaultResizeConfig/);
+    assert.match(configSource, /satisfies ResizeConfig/);
+
+    assert.match(configSource, /mediaModelName: 'File'/);
+    const scaffoldedConfig = {
+      ...defaultResizeConfig,
+      mediaModelName: 'File',
+    };
+    assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
+    assert.equal(scaffoldedConfig.worker.enabled, false);
+    assert.deepEqual(scaffoldedConfig.encode.formats.tiff, undefined);
+
+    setAppInstance({
+      getConfig: () => scaffoldedConfig,
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.strictEqual(getResizeConfig(), scaffoldedConfig);
   });
 
   test('auto-creates missing directories', async () => {
@@ -155,11 +194,17 @@ describe('runScaffold — --eager', () => {
     assert.equal(await exists(COMMAND), false);
 
     const resizer = await read(RESIZER);
+    assert.match(
+      resizer,
+      /await import\('\.\/resizer\.ts'\)/,
+      'eager bootstrap guidance must use a dynamic import after Server.init()',
+    );
     assert.doesNotMatch(resizer, /MongoTransport/);
     assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
     assert.match(resizer, /LocalFsStorage/);
     assert.match(resizer, /storage\/fs\.js/);
     assert.match(resizer, /publicBaseUrl/);
+    assert.match(resizer, /no transport or worker/);
   });
 });
 

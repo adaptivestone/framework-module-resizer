@@ -1,5 +1,45 @@
-# Unreleased
+# 0.3.0
 
+**Breaking changes**
+
+- Private SVG originals now use the same `resolve()` / `prewarm()` / `enqueueRequired()` and
+  worker lifecycle as raster images. The worker copies the original bytes to public storage and
+  atomically persists the locator in `original.publicCopy`; it does not rasterize or rewrite SVG.
+- Custom `MediaStore` implementations must add
+  `setOriginalPublicCopy(mediaId, expectedOriginalKey, publicCopy): Promise<boolean>`. The
+  conditional write prevents a completed worker from attaching a copy to a replaced original.
+
+**Features**
+
+- Restored the framework-style `./config/resize.js` subpath with canonical module defaults.
+  Scaffolded hosts extend that config and declare only `mediaModelName` plus their overrides;
+  framework environment merging remains the single runtime merge layer.
+- `ResizeStorage` has an optional `copyToPublic()` optimization. `S3Storage` implements it with a
+  server-side `CopyObject`; other drivers use the core download/upload fallback.
+- `resolve()` now queues publication when an anonymous read reaches a private SVG without a valid
+  public copy. After publication, every requested size and format resolves to the same SVG URL and
+  reports its real `image/svg+xml` content type.
+- `generate()` performs the same publication eagerly. `prewarm()` and `enqueueRequired()` skip it
+  only when storage proves that the SVG original or its persisted copy is already public.
+
+**Upload policy**
+
+- `uploadOriginal()` still stores the exact input bytes. The module inspects SVG metadata but does
+  not sanitize markup, remove scripts, or follow a host-specific trust policy. Hosts decide which
+  SVG inputs they accept; this release adds no sanitizer.
+
+**Also included since 0.2.1**
+
+- Added `resizer.uploadOriginal({ body, visibility })`: byte-sniffed, unchanged original storage
+  with typed metadata/errors and explicit SVG-as-SVG handling. New `upload.maxBytes` and
+  `upload.formats` controls bound accepted inputs.
+- Added strict `enqueueRequired()`, which partitions ready, accepted, not-required, and
+  unconfirmed variants. A held lock is no longer treated as a task receipt; Mongo can prove
+  exact canonical active-payload coverage, while SQS/custom transports report non-queryable
+  races as incomplete. Conflicting payloads with one preview identity are explicit.
+- Queued raster tasks now retry any missing identities after partial generation. Successful
+  previews remain persisted, retries skip them, and permanent gaps use existing backoff and
+  dead-letter handling. Deleted media tasks remain successful no-ops.
 - Worker setup uses an explicit `worker.enabled: true` in host config instead of an
   environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
   message; the module default remains `false`.

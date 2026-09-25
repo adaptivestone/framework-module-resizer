@@ -5,9 +5,8 @@
 // QueueTransport, ResizeStorage, MediaStore, LockProvider, HookName, HookFn)
 // live next to their code.
 
-// Recursive partial: every field optional at every depth, BUT arrays are kept whole
-// (a host config array REPLACES the default — it is never deep-merged element-by-element,
-// matching getResizeConfig's arrayMerge — see 08 · §13). Used for host config overrides.
+// Recursive partial for environment-specific config overrides. Arrays stay whole because
+// the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts.
 export type DeepPartial<T> = T extends readonly (infer _U)[]
   ? T
   : T extends object
@@ -24,9 +23,8 @@ export type DeepPartial<T> = T extends readonly (infer _U)[]
 // ---------------------------------------------------------------------------
 
 export type TMinimalResizeApp = {
-  // A host overrides only the fields it cares about, at any depth (DeepPartial); the
-  // module deep-merges them onto defaultResizeConfig in getResizeConfig (08 · §13).
-  getConfig(name: 'resize'): DeepPartial<ResizeConfig>;
+  // Framework config loading has already combined the base and environment files.
+  getConfig(name: 'resize'): ResizeConfig;
   // Returns a Mongoose model registered by the host. At minimum:
   //  - 'Lock'       (framework built-in: acquireLock/releaseLock/waitForUnlock)
   //  - 'ResizeTask' (scaffolded into the host app; only for the Mongo transport)
@@ -50,22 +48,20 @@ export type TMinimalResizeApp = {
 // Data shapes
 // ---------------------------------------------------------------------------
 
-export type PreviewFormat = 'jpeg' | 'webp' | 'avif';
+// Sharp format ids are deliberately open strings. A host using a custom libvips build can
+// enable additional input/output formats in config without changing this package.
+export type PreviewFormat = string;
+export type OriginalFormat = string;
 
 // Canonical filter bag. Host-defined semantics; the module only canonicalizes it
 // into the identity. e.g. { blur: 40 }. Empty / undefined → 'none' in the identity.
 export type Filters = Record<string, string | number | boolean>;
 
-// Opaque storage locator round-tripped between the module and the active storage
-// driver. `key` is always present; `bucket` is S3-specific — a filesystem/GCS/other
-// driver may omit it. The module never interprets these fields; it passes them back
-// to the driver's download/publicUrl/signedUrl (see 05 · §10.4).
-export interface StorageRef {
-  key: string;
-  bucket?: string;
-}
+// A JSON-compatible locator owned and validated by the active storage driver.
+export type StorageRef = unknown;
 
-export interface Original extends StorageRef {
+export interface Original {
+  storageRef: StorageRef;
   format?: string;
   size?: number;
   contentType?: string;
@@ -73,7 +69,14 @@ export interface Original extends StorageRef {
   height?: number;
 }
 
-export interface Preview extends StorageRef {
+export interface UploadOriginalOpts {
+  body: Buffer | Uint8Array;
+  visibility: 'public' | 'private';
+  namespace?: string;
+}
+
+export interface Preview {
+  storageRef: StorageRef;
   sizeKey: string; // canonical size key — see 03 · Identity
   filters?: Filters; // part of identity — see 03 · Identity
   requestedWidth?: number;
@@ -125,6 +128,44 @@ export interface ReadDecision {
   missing: MissingPreview[];
 }
 
+export type EnqueueRequiredStatus =
+  | 'ready'
+  | 'accepted'
+  | 'not-required'
+  | 'incomplete';
+
+export interface EnqueueReceipt {
+  taskId: string;
+  previews: MissingPreview[];
+}
+
+export interface EnqueueIssue {
+  code:
+    | 'RESIZE_ENQUEUE_NO_ORIGINAL'
+    | 'RESIZE_ENQUEUE_NO_TRANSPORT'
+    | 'RESIZE_ENQUEUE_LOCK_CONTENDED'
+    | 'RESIZE_ENQUEUE_LOCK_FAILED'
+    | 'RESIZE_ENQUEUE_TRANSPORT_FAILED'
+    | 'RESIZE_ENQUEUE_UNCONFIRMED'
+    | 'RESIZE_ENQUEUE_CONFIRM_FAILED'
+    | 'RESIZE_ENQUEUE_VARIANT_CONFLICT';
+  message: string;
+  retryable: boolean;
+  previews: MissingPreview[];
+}
+
+export interface EnqueueRequiredResult {
+  status: EnqueueRequiredStatus;
+  reason?: 'empty-request' | 'filtered';
+  requested: MissingPreview[];
+  ready: MissingPreview[];
+  accepted: MissingPreview[];
+  notRequired: MissingPreview[];
+  unconfirmed: MissingPreview[];
+  tasks: EnqueueReceipt[];
+  issues: EnqueueIssue[];
+}
+
 // Generic `<picture>` map produced by `formatPictureUrls` (0.2). A convenience — not
 // "the" host contract. `sizeKey` is whatever identity already is (`720x720`, `620w`, `fit`).
 export interface PictureUrls {
@@ -138,30 +179,31 @@ export interface PictureUrls {
 }
 
 // ---------------------------------------------------------------------------
-// Config (merged with app.getConfig('resize') — see 08 · §13)
+// Config (the framework returns the fully resolved value from app.getConfig('resize'))
 //
 // MODULE behavior only. Storage-specific options (buckets, base URL, signed-URL
 // settings) live in the storage driver; transport-specific options (SQS queue URL,
-// region) live in the transport driver — each is passed to the driver at registration
-// (see 05). The core config never knows what a "bucket" or "queue URL" is, so a new
+// region) live in the transport driver — both drivers are passed to the Resizer
+// constructor (see 05). The core config never knows what a "bucket" or "queue URL" is, so a new
 // storage/transport driver is self-contained and the module never changes.
 // ---------------------------------------------------------------------------
 
 export interface ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
-  formats: PreviewFormat[]; // default ['jpeg','webp','avif']
-  webpAvifOnly?: boolean; // when true, requiredFormats() drops 'jpeg' (read + worker MUST agree)
+  formats: PreviewFormat[]; // generated output formats, e.g. ['jpeg','webp','avif']
+  upload: {
+    maxBytes: number;
+    formats: OriginalFormat[];
+  };
   maxSize: { width: number; height: number }; // default { 2000, 1200 } (the `fit` cap)
   animated: boolean; // default false — true keeps GIF/WebP frames
 
-  // Per-format encode settings. JPEG q80 ≈ AVIF q64 ≈ WebP q82 — NEVER reuse one quality int.
+  // Options are passed to sharp.toFormat(format, options). Keys are format ids, so hosts with
+  // additional libvips codecs can configure them without a module code change.
   encode: {
-    quality: { jpeg: number; webp: number; avif: number }; // default { jpeg:80, webp:82, avif:64 }
-    effort: { webp: number; avif: number }; // default { webp:4, avif:4 } (raise to 5–6 for persist-once)
-    mozjpeg: boolean; // default true — jpeg({ mozjpeg:true }): progressive + trellis, ~10–20% smaller
-    chromaSubsampling: '4:2:0' | '4:4:4'; // default '4:2:0'; '4:4:4' keeps full chroma for text/logos/UI
-    sharpen: { cover: boolean; fit: boolean } | false; // default { cover:true, fit:false }
-    flattenBackground: string; // default '#ffffff' — alpha source → jpeg flattened onto this
+    formats: Record<string, Record<string, unknown>>;
+    sharpen: { cover: boolean; fit: boolean } | false;
+    flatten: { formats: string[]; background: string };
   };
 
   // Decode/decompression-bomb guards.
@@ -170,11 +212,12 @@ export interface ResizeConfig {
     sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)
     resultDimension: number; // default 5000 — clamp on the cover branch
     animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
+    processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
   };
 
   // Queue/lease tuning (used by the Mongo transport; harmless for SQS, which has native redrive).
   queue: {
-    lockTtlMs: { dispatch: number; worker: number }; // default { 60000, 60000 }; worker MUST be ≤ leaseMs (ENFORCED by getResizeConfig)
+    lockTtlMs: { dispatch: number; worker: number }; // worker MUST be ≤ leaseMs
     leaseMs: number; // default 60000 — heartbeat renews at leaseMs/2
     retryBackoffMs: { base: number; max: number }; // default { base:5000, max:300000 }
     maxAttempts: number; // default 5 — DELIVERY count before dead-letter (increments on every lease incl. reclaims, like SQS maxReceiveCount)
@@ -189,6 +232,4 @@ export interface ResizeConfig {
     sharpConcurrency: number; // default 1 — sharp.concurrency(); concurrency × this ≈ nCPU
     sharpCache: boolean; // default false — sharp.cache()
   };
-
-  placeholderPrefix?: string; // e.g. 'placeholders/loading'
 }

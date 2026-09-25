@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { afterEach, describe, test } from 'node:test';
+import { afterEach, beforeEach, describe, test } from 'node:test';
 import {
   resetAppInstance,
   setAppInstance,
@@ -16,6 +16,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ const fakeLockProvider = (): LockProvider => ({
 function installFakeApp(
   opts: { withEvents?: boolean; emitThrows?: boolean } = {},
 ): { errors: unknown[][]; emitted: unknown[][] } {
+  resetAppInstance();
   const errors: unknown[][] = [];
   const emitted: unknown[][] = [];
   const events = opts.withEvents
@@ -62,7 +64,7 @@ function installFakeApp(
       }
     : undefined;
   setAppInstance({
-    getConfig: () => ({}),
+    getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
     logger: {
       info() {},
@@ -78,6 +80,10 @@ function installFakeApp(
 
 // The minimal valid options: only `storage` is required.
 const baseOpts = () => ({ storage: fakeStorage() });
+
+beforeEach(() => {
+  installFakeApp();
+});
 
 afterEach(() => {
   resetResizerForTests();
@@ -118,6 +124,24 @@ describe('Resizer constructor — driver wiring', () => {
     assert.throws(() => new Resizer({} as never), /storage/);
     // The bad construction must NOT have claimed the active slot.
     assert.throws(() => getResizer(), /no Resizer constructed/);
+  });
+
+  test('rejects invalid config during construction without claiming the singleton', () => {
+    resetAppInstance();
+    setAppInstance({
+      getConfig: () => ({ mediaModelName: 'File', upload: null }),
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.throws(() => new Resizer(baseOpts()), /upload must be an object/);
+    assert.throws(() => getResizer(), /no Resizer constructed/);
+    resetAppInstance();
+    setAppInstance({
+      getConfig: () => makeResizeConfig(),
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.doesNotThrow(() => new Resizer(baseOpts()));
   });
 
   test('seeds pipelines from options', () => {
@@ -385,14 +409,18 @@ describe('resolve/generate stubs', () => {
 
   test('generate is wired (no longer a stub): empty sizes → empty created', async () => {
     // A config WITH mediaModelName so getResizeConfig() inside generateImpl does not throw.
+    resetAppInstance();
     setAppInstance({
-      getConfig: () => ({ mediaModelName: 'File' }),
+      getConfig: () => makeResizeConfig(),
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
     const r = new Resizer(baseOpts());
     const result = await r.generate({
-      media: { id: 'm1', original: { key: 'o', contentType: 'image/jpeg' } },
+      media: {
+        id: 'm1',
+        original: { storageRef: { key: 'o' }, contentType: 'image/jpeg' },
+      },
       sizes: [],
     });
     assert.deepEqual(result.created, []);

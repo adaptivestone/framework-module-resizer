@@ -20,6 +20,7 @@ import {
   resetResizerForTests,
 } from './resizer.ts';
 import { processTask } from './resizeTask.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
   MissingPreview,
@@ -56,6 +57,10 @@ const alphaPng = await sharp({
   .png()
   .toBuffer();
 
+const smallSvg = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>',
+);
+
 const orientedJpeg = await sharp({
   create: {
     width: 64,
@@ -74,15 +79,20 @@ const orientedJpeg = await sharp({
 
 function installApp(configOverride: Record<string, unknown> = {}): {
   logs: { info: unknown[][]; warn: unknown[][]; error: unknown[][] };
+  getModelCalls: () => number;
 } {
+  let modelCalls = 0;
   const logs = {
     info: [] as unknown[][],
     warn: [] as unknown[][],
     error: [] as unknown[][],
   };
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File', ...configOverride }),
-    getModel: () => ({}),
+    getConfig: () => makeResizeConfig(configOverride),
+    getModel: () => {
+      modelCalls += 1;
+      return {};
+    },
     logger: {
       info(...a: unknown[]) {
         logs.info.push(a);
@@ -95,7 +105,7 @@ function installApp(configOverride: Record<string, unknown> = {}): {
       },
     },
   } as never);
-  return { logs };
+  return { logs, getModelCalls: () => modelCalls };
 }
 
 type Upload = {
@@ -118,6 +128,7 @@ function makeStorage(
       return { bucket: 'previews', key };
     },
     publicUrl: (ref) => `https://cdn/${ref.key}`,
+    canServeOriginalPublicly: (ref) => ref.bucket === 'previews',
   };
   return { storage, uploads };
 }
@@ -172,7 +183,10 @@ function mediaDoc(
 ): MediaLike {
   return {
     id: over.id ?? 'm1',
-    original: { key: 'uploads/orig', ...(over.original ?? {}) } as Original,
+    original: {
+      storageRef: { key: 'uploads/orig' },
+      ...(over.original ?? {}),
+    } as Original,
     previews: over.previews ?? [],
   };
 }
@@ -256,12 +270,15 @@ describe('processTask — source handling', () => {
     assert.equal(downloadCalls, 0);
   });
 
-  test('SVG original → no-op success (never rasterized)', async () => {
+  test('SVG original → raster preview persisted by the normal worker', async () => {
     installApp();
-    const { storage, uploads } = makeStorage(redPng);
+    const { storage, uploads } = makeStorage(smallSvg);
     const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({
-        original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
+        original: {
+          storageRef: { key: 'uploads/x.svg' },
+          contentType: 'image/svg+xml',
+        },
       }),
     );
     new Resizer({
@@ -269,9 +286,23 @@ describe('processTask — source handling', () => {
       mediaStore,
       lockProvider: makeLocks().lockProvider,
     });
-    await processTask(task({ previews: [variant()] }));
-    assert.equal(uploads.length, 0);
-    assert.equal(appendCalls.length, 0);
+    await processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '200x200',
+            requestedWidth: 200,
+            requestedHeight: 200,
+          }),
+        ],
+      }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].visibility, 'public');
+    assert.equal(uploads[0].contentType, 'image/jpeg');
+    assert.equal((await sharp(uploads[0].body).metadata()).width, 200);
+    assert.equal(appendCalls.length, 1);
+    assert.equal(appendCalls[0].previews[0].format, 'jpeg');
   });
 
   test('an undecodable source → throws (fails the task for retry/DLQ)', async () => {
@@ -384,7 +415,7 @@ describe('processTask — variants', () => {
     const existing = {
       sizeKey: '20x20',
       format: 'jpeg',
-      key: 'e',
+      storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { mediaStore, appendCalls } = makeMediaStore(
@@ -404,7 +435,10 @@ describe('processTask — variants', () => {
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const { lockProvider, acquired } = makeLocks(false); // acquire always fails
     new Resizer({ storage, mediaStore, lockProvider });
-    await processTask(task({ previews: [variant()] }));
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      /incomplete/,
+    );
     assert.deepEqual(acquired, ['resize_worker:m1:20x20:jpeg:none']);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -430,8 +464,12 @@ describe('processTask — variants', () => {
       },
     };
     new Resizer({ storage, mediaStore, lockProvider });
-    await processTask(
-      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    await assert.rejects(
+      () =>
+        processTask(
+          task({ previews: [variant(), variant({ format: 'webp' })] }),
+        ),
+      /incomplete/,
     );
     assert.equal(uploads.length, 1);
     assert.equal(uploads[0].key.split('.').pop(), 'jpeg');
@@ -547,6 +585,50 @@ describe('processTask — variants', () => {
     }
   });
 
+  test('encodes a TIFF selected and configured without a format-specific code branch', async () => {
+    installApp({
+      formats: ['tiff'],
+      encode: { formats: { tiff: { compression: 'lzw' } } },
+    });
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    await processTask(task({ previews: [variant({ format: 'tiff' })] }));
+
+    assert.equal((await sharp(uploads[0].body).metadata()).format, 'tiff');
+    assert.equal(uploads[0].contentType, 'image/tiff');
+    assert.equal(appendCalls[0].previews[0].format, 'tiff');
+  });
+
+  test('labels HEIF configured with AV1 compression as an AVIF container', async () => {
+    installApp({
+      formats: ['heif'],
+      encode: { formats: { heif: { compression: 'av1' } } },
+    });
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+
+    await processTask(task({ previews: [variant({ format: 'heif' })] }));
+
+    const metadata = await sharp(uploads[0].body).metadata();
+    assert.equal(metadata.format, 'heif');
+    assert.equal(metadata.compression, 'av1');
+    assert.match(uploads[0].key, /\.avif$/);
+    assert.equal(uploads[0].contentType, 'image/avif');
+    assert.equal(appendCalls[0].previews[0].format, 'heif');
+    assert.equal(appendCalls[0].previews[0].contentType, 'image/avif');
+  });
+
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(alphaPng);
@@ -649,7 +731,13 @@ describe('processTask — persistence & failure handling', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(
-      mediaDoc({ original: { key: 'uploads/orig', width: 64, height: 48 } }),
+      mediaDoc({
+        original: {
+          storageRef: { key: 'uploads/orig' },
+          width: 64,
+          height: 48,
+        },
+      }),
     );
     new Resizer({
       storage,
@@ -704,7 +792,7 @@ describe('processTask — persistence & failure handling', () => {
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
-      /produced 0 previews/,
+      /incomplete/,
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -715,7 +803,7 @@ describe('processTask — persistence & failure handling', () => {
     ]);
   });
 
-  test('partial success (one good + one poison) → returns normally, good preview persisted', async () => {
+  test('partial success persists the good preview but throws so the task is retried', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const pipeline: Pipeline = {
@@ -735,13 +823,129 @@ describe('processTask — persistence & failure handling', () => {
       lockProvider: makeLocks().lockProvider,
       pipelines: { default: pipeline },
     });
-    await processTask(
-      task({ previews: [variant(), variant({ filters: { poison: true } })] }),
+    await assert.rejects(
+      () =>
+        processTask(
+          task({
+            previews: [variant(), variant({ filters: { poison: true } })],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof ResizeGenerateError &&
+        error.code === 'RESIZE_WORKER_INCOMPLETE' &&
+        error.missing.includes('20x20:jpeg:poison:true'),
     );
     assert.equal(uploads.length, 1);
     assert.equal(appendCalls.length, 1);
     assert.equal(appendCalls[0].previews.length, 1);
     assert.equal(appendCalls[0].previews[0].filters, undefined);
+  });
+
+  test('the next delivery generates only variants still missing after partial persistence', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    let poison = true;
+    const pipeline: Pipeline = {
+      variantSteps: [
+        async (img, { variant: v }) => {
+          if (poison && v.filters?.retry) {
+            throw new Error('temporary encoder failure');
+          }
+          return img;
+        },
+      ],
+    };
+    const media = mediaDoc();
+    const mediaStore: MediaStore = {
+      load: async () => media,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [...(media.previews ?? []), ...previews];
+      },
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+      pipelines: { default: pipeline },
+    });
+    const queued = task({
+      previews: [variant(), variant({ filters: { retry: true } })],
+    });
+
+    await assert.rejects(() => processTask(queued), /incomplete/);
+    assert.equal(media.previews?.length, 1);
+    assert.equal(uploads.length, 1);
+
+    poison = false;
+    await processTask(queued);
+    assert.equal(media.previews?.length, 2);
+    assert.equal(uploads.length, 2, 'ready identity was not uploaded again');
+    assert.equal(
+      new Set(
+        media.previews?.map(
+          (preview) =>
+            `${preview.sizeKey}:${preview.format}:${JSON.stringify(preview.filters ?? {})}`,
+        ),
+      ).size,
+      2,
+    );
+  });
+
+  test('a worker-lock loser is complete only after a concurrent preview becomes visible', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const media = mediaDoc();
+    let loads = 0;
+    const concurrent = {
+      storageRef: { key: 'concurrent.jpg' },
+      contentType: 'image/jpeg',
+      sizeKey: '20x20',
+      format: 'jpeg' as const,
+    };
+    const mediaStore: MediaStore = {
+      load: async () => {
+        loads++;
+        if (loads >= 2) {
+          media.previews = [concurrent];
+        }
+        return media;
+      },
+      appendPreviews: async () => {},
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks(false).lockProvider,
+    });
+    await processTask(task({ previews: [variant()] }));
+    assert.equal(uploads.length, 0);
+  });
+
+  test('deduplicates malformed task payloads by preview identity', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const media = mediaDoc();
+    const mediaStore: MediaStore = {
+      load: async () => media,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [...(media.previews ?? []), ...previews];
+      },
+    };
+    new Resizer({
+      storage,
+      mediaStore,
+      lockProvider: makeLocks().lockProvider,
+    });
+    await processTask(
+      task({
+        previews: [
+          variant(),
+          variant({ requestedWidth: 999, requestedHeight: 999 }),
+        ],
+      }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(media.previews?.length, 1);
   });
 
   test('abort signal between variants stops launching new ones', async () => {
@@ -754,27 +958,31 @@ describe('processTask — persistence & failure handling', () => {
       mediaStore,
       lockProvider: makeLocks().lockProvider,
     });
-    await processTask(
-      task({
-        previews: [
-          variant({
-            sizeKey: '10x10',
-            requestedWidth: 10,
-            requestedHeight: 10,
+    await assert.rejects(
+      () =>
+        processTask(
+          task({
+            previews: [
+              variant({
+                sizeKey: '10x10',
+                requestedWidth: 10,
+                requestedHeight: 10,
+              }),
+              variant({
+                sizeKey: '11x11',
+                requestedWidth: 11,
+                requestedHeight: 11,
+              }),
+              variant({
+                sizeKey: '12x12',
+                requestedWidth: 12,
+                requestedHeight: 12,
+              }),
+            ],
           }),
-          variant({
-            sizeKey: '11x11',
-            requestedWidth: 11,
-            requestedHeight: 11,
-          }),
-          variant({
-            sizeKey: '12x12',
-            requestedWidth: 12,
-            requestedHeight: 12,
-          }),
-        ],
-      }),
-      { signal: controller.signal },
+          { signal: controller.signal },
+        ),
+      /incomplete/,
     );
     assert.equal(uploads.length, 1); // aborted after the first, launched no more
   });
@@ -934,7 +1142,7 @@ describe('generate (eager)', () => {
     const existing = {
       sizeKey: '20x20',
       format: 'jpeg',
-      key: 'e',
+      storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { mediaStore, appendCalls } = makeMediaStore(null);
@@ -958,7 +1166,12 @@ describe('generate (eager)', () => {
     await assert.rejects(
       () =>
         r.generate({
-          media: { original: { key: 'uploads/o', contentType: 'image/jpeg' } },
+          media: {
+            original: {
+              storageRef: { key: 'uploads/o' },
+              contentType: 'image/jpeg',
+            },
+          },
           sizes: [{ width: 20, height: 20 }],
           formats: ['jpeg'],
         }),
@@ -966,23 +1179,66 @@ describe('generate (eager)', () => {
     );
   });
 
-  test('SVG original → log + { created: [], failed: 0 }, nothing uploaded or persisted', async () => {
-    const { logs } = installApp();
-    const { storage, uploads } = makeStorage(redPng);
+  test('SVG original → eager JPEG/WebP/AVIF previews', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(smallSvg);
     const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
-        original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
+        original: {
+          storageRef: { key: 'uploads/x.svg' },
+          contentType: 'image/svg+xml',
+        },
       }),
-      sizes: [{ width: 20, height: 20 }],
-      formats: ['jpeg'],
+      sizes: [{ width: 80, height: 80 }],
+      formats: ['jpeg', 'webp', 'avif'],
     });
-    assert.deepEqual(result.created, []);
+    assert.equal(result.created.length, 3);
     assert.equal(result.failed, 0);
-    assert.equal(uploads.length, 0);
-    assert.equal(appendCalls.length, 0);
-    assert.ok(logs.info.some((l) => String(l[0]).includes('SVG')));
+    assert.equal(uploads.length, 3);
+    assert.deepEqual(
+      new Set(uploads.map((upload) => upload.contentType)),
+      new Set(['image/jpeg', 'image/webp', 'image/avif']),
+    );
+    for (const upload of uploads) {
+      const metadata = await sharp(upload.body).metadata();
+      assert.equal(metadata.width, 80);
+      assert.equal(metadata.height, 80);
+      assert.notEqual(metadata.format, 'svg');
+    }
+    assert.equal(appendCalls.length, 1);
+  });
+
+  test('SVG fit keeps the original size when a cover sibling needs high density', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(smallSvg);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const result = await r.generate({
+      media: mediaDoc({
+        original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+      }),
+      sizes: [{ width: 200, height: 200 }, { fit: true }],
+      formats: ['webp'],
+    });
+    assert.equal(result.created.length, 2);
+    const byKey = new Map(
+      result.created.map((preview) => [preview.sizeKey, preview]),
+    );
+    const cover = uploads.find(
+      (upload) =>
+        upload.key ===
+        (byKey.get('200x200')?.storageRef as { key: string })?.key,
+    );
+    const fit = uploads.find(
+      (upload) =>
+        upload.key === (byKey.get('fit')?.storageRef as { key: string })?.key,
+    );
+    assert.ok(cover);
+    assert.ok(fit);
+    assert.equal((await sharp(cover.body).metadata()).width, 200);
+    assert.equal((await sharp(fit.body).metadata()).width, 8);
   });
 
   test('no original → ResizeNoOriginalError', async () => {
@@ -1002,6 +1258,48 @@ describe('generate (eager)', () => {
         assert.equal(err.mediaId, 'm1');
         return true;
       },
+    );
+  });
+
+  test('eager generation passes a falsy scalar original and persists a falsy preview ref', async () => {
+    installApp();
+    const refs: unknown[] = [];
+    const storage: ResizeStorage = {
+      download: async (ref) => {
+        refs.push(ref);
+        return redPng;
+      },
+      upload: async () => false,
+      publicUrl: () => '/preview',
+    };
+    const r = new Resizer({ storage });
+    const result = await r.generate({
+      media: { id: 'scalar', original: { storageRef: 0 } },
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+      persist: false,
+    });
+    assert.deepEqual(refs, [0]);
+    assert.equal(result.created[0]?.storageRef, false);
+  });
+
+  test('rejects a nullish preview ref instead of appending it', async () => {
+    installApp();
+    const storage: ResizeStorage = {
+      download: async () => redPng,
+      upload: async () => null,
+      publicUrl: () => '/preview',
+    };
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: { id: 'bad-ref', original: { storageRef: 0 } },
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+          persist: false,
+        }),
+      (error: unknown) => error instanceof ResizeGenerateError,
     );
   });
 
@@ -1157,9 +1455,11 @@ describe('runResizeWorker', () => {
     let started = false;
     new Resizer({
       storage: makeStorage(redPng).storage,
-      transport: fakeTransport(() => {
-        started = true;
-      }),
+      transport: {
+        ...fakeTransport(() => {
+          started = true;
+        }),
+      },
     });
     await runResizeWorker();
     assert.equal(started, false);
@@ -1168,11 +1468,14 @@ describe('runResizeWorker', () => {
     );
   });
 
-  test('no transport → logs an error and returns', async () => {
-    const { logs } = installApp({ worker: { enabled: true } });
+  test('no transport → logs an error and returns without preparing framework drivers', async () => {
+    const { logs, getModelCalls } = installApp({
+      worker: { enabled: true },
+    });
     new Resizer({ storage: makeStorage(redPng).storage });
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
+    assert.equal(getModelCalls(), 0);
   });
 
   test('enabled + transport → startWorker gets a handler that reaches processTask', async () => {
@@ -1187,6 +1490,7 @@ describe('runResizeWorker', () => {
         handle = h;
       }),
       mediaStore,
+      lockProvider: makeLocks().lockProvider,
     });
     await runResizeWorker();
     assert.equal(typeof handle, 'function');

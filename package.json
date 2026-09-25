@@ -1,6 +1,6 @@
 {
   "name": "@adaptivestone/framework-module-resize",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "description": "Adaptive stone node js framework module: image resize (sharp)",
   "main": "./dist/index.js",
   "type": "module",
@@ -41,7 +41,7 @@
   "scripts": {
     "prepublishOnly": "npm run build",
     "build": "node preBuild.ts && tsc && node postBuild.ts",
-    "types:check": "tsc --noEmit",
+    "types:check": "tsc --noEmit && tsc -p tsconfig.test-helpers.json",
     "test": "node --experimental-strip-types --test",
     "check": "biome check",
     "check:fix": "biome check --write",
@@ -54,7 +54,6 @@
   "author": "Andrei Lahunou",
   "license": "MIT",
   "dependencies": {
-    "deepmerge": "^4.3.1",
     "sharp": "^0.35.3"
   },
   "peerDependencies": {

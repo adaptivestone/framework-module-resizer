@@ -81,11 +81,16 @@ a private original.
    (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`) — no `app` parameter;
    a driver closes over its own client.
 
-4. Import `./resizer.ts` from the process that needs it (API; and the worker, if any)
-   **after** `Server.init()`.
+4. Dynamically load the construction site from each process that needs it (API; and the worker,
+   if any) **after** `Server.init()`: `await import('./resizer.ts')`. Do not use a static import;
+   ESM evaluates it before bootstrap code.
 
-5. Set the one required config field in the scaffolded `src/config/resize.ts`:
-   `mediaModelName: 'File'` (your host media model's name).
+5. The scaffolded `src/config/resize.ts` extends the canonical package defaults from
+   `@adaptivestone/framework-module-resize/config/resize.js`. Set
+   `mediaModelName: 'File'` (your host media model's name) and keep only host overrides there.
+   Put environment-only changes in `resize.<NODE_ENV>.ts` (for example,
+   `resize.production.ts`); the framework merges that file before
+   this module reads and validates the resolved config. Do not add a second runtime merge.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
    instead of hand-writing those fields (single source of truth for schema + types):
@@ -96,12 +101,52 @@ a private original.
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
 
-7. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
+   Keep `minimize: false` on the media schema (already the Framework `BaseModel`
+   default). Direct Mongoose users must pass `{ minimize: false }` to `new Schema`.
+   Otherwise empty objects in opaque `storageRef` values can disappear on save/update.
+
+7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model and
+   the framework's `Lock` model declare their indexes; the host's normal lifecycle or an explicit
+   migration must create them before `resolve`, `prewarm`, `enqueueRequired`, or the worker can
+   run. The module does not create, synchronize, drop, or repair indexes, and it has no
+   `prepareQueue()` API. The partial unique active-request index on `{ fileId, pipeline,
+   requestKey }` is required for the Mongo deduplication guarantee; verify it in the host's DB
+   rollout. Never add index creation to HTTP bootstrap or the first enqueue.
+
+8. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
-   The flag permits the command to run; it does not start a worker in the API.
+   The flag permits the command to run; it does not start a worker in the API. The worker consumes
+   indexes prepared by the host lifecycle; it does not create them.
    Eager mode needs no worker.
 
 ## Use
+
+Store an original (no model creation and no queue work; persist the returned value in the host):
+
+```ts
+const original = await getResizer().uploadOriginal({
+  body: buffer,
+  visibility: 'private',
+  // Optional audit grouping: namespace: `users/${user.id}` or `products/${product.id}`,
+});
+```
+
+The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
+bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) as a private original. SVG
+sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
+is rejected. The module does not sanitize SVG markup. The worker rasterizes accepted SVG
+into the same configured public preview formats as other images.
+
+Persist every original privately, then call the same `prewarm()` / `enqueueRequired()` path for
+raster and SVG. The worker creates the requested Sharp previews for both. SVG is an input
+format only; public upload of an SVG original is rejected. Configure a distinct private S3
+bucket, or for `LocalFsStorage` keep its private root outside the static server's public root.
+Persist `original.storageRef` and `previews[].storageRef` through the host media schema.
+The shipped drivers keep optional grouping metadata in their refs; the worker passes the
+original ref to the driver as `parentRef` when creating public previews. The namespace
+is a placement hint, not authorization. This nested ref shape is a breaking change:
+update host models, DTOs, custom drivers, and API/worker processes together. No old
+record reader or migration is included.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
@@ -126,6 +171,18 @@ Upload handler, pre-warm mode (non-blocking; the worker fills the cache before t
 const { enqueued } = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
 ```
 
+When every required variant needs a confirmed receipt, use the separate strict operation:
+
+```ts
+const result = await getResizer().enqueueRequired({ media: fileDoc, sizes: catalog });
+// ready | accepted | not-required | incomplete; inspect unconfirmed/tasks/issues
+```
+
+`prewarm` stays best-effort. A held lock is not accepted proof. Mongo confirms only an exact
+canonical active payload; conflicting payloads with one preview identity are explicit errors.
+SQS/custom transports without `findActive` report lock races as retryable `incomplete`. Delivery
+remains at-least-once, not exactly-once.
+
 Upload handler, eager mode (blocking; a transport-backed Resizer is also supported):
 
 ```ts
@@ -143,7 +200,8 @@ No original throws `ResizeNoOriginalError`; every requested variant failing thro
 Errors: EVERY throw from this module extends `ResizeError`, so one check separates a module
 rejection from a sharp/S3/mongo failure. Subclasses say what to do — `ResizeSetupError` (wiring
 is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this record;
-`ResizeNoOriginalError` extends it), `ResizeGenerateError` (produced nothing),
+`ResizeNoOriginalError` and `ResizeOriginalError` extend it), `ResizeGenerateError` (eager produced
+nothing or queued coverage is incomplete),
 `ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
 Every instance carries a stable `err.code`. Use `ResizeError.isResizeError(err)` rather than
 `instanceof` when the error may cross a package boundary — duplicate copies of the package
@@ -183,16 +241,20 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants).
-- Config arrays REPLACE defaults: `formats: ['webp','avif']` means exactly two formats.
-- Per-format `encode.quality` values are NOT comparable (defaults: jpeg 80 ≈ webp 82 ≈ avif 64).
-  Never copy one quality number across formats.
-- Never run sharp on the request path — preventing that is this module's reason to exist.
+- The scaffolded `resize.ts` is complete. The framework merges environment overrides and the
+  module reads that final config without a second merge. Arrays in environment overrides replace.
+- Format ids are open strings. `formats` controls generated outputs, `upload.formats` controls
+  accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options.
+- Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
+  `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
 - The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
   drift in CI with `npx resize-scaffold --check`.
-- SVG originals pass through untouched at every requested size (never rasterized, never
-  enqueued). Private originals require an authorized signed URL; anonymous reads do not
-  receive a fabricated public URL. Sanitizing SVG at upload is the HOST's job.
+- SVG originals stay private. The worker rasterizes SVG into the requested public preview
+  formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
+  shortcut returns uploaded SVG markup.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
+- A queued raster task completes only with full identity coverage. Partial successes are persisted,
+  then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.
 
 ## Troubleshooting
 
@@ -207,5 +269,5 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |
 
-Config knobs: see the "Config reference" table in `README.md`; the defaults object is
-`defaultResizeConfig` (main entry).
+Config knobs and their scaffolded defaults are listed in the "Config reference" table in
+`README.md`.

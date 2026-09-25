@@ -200,7 +200,7 @@ Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — new Resizer({ transport, storage, pipelines })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
   src/commands/ResizeWorker.ts  re-export of the module's worker command
-  src/config/resize.ts      editable config (spreads the module defaults)
+  src/config/resize.ts      host overrides over module defaults (framework merges environment overrides)
 
 Options:
   --check      verify the shims exist + reference the module; exit 1 on missing/drift (no writes)
@@ -282,14 +282,17 @@ export async function runScaffold(
       '\nDone. Next: set `mediaModelName` in src/config/resize.ts, construct the',
     );
     console.log(
-      'Resizer after Server.init() (or lazily), and call generate() at upload.',
+      "Resizer after Server.init() with `await import('./resizer.ts')` (or lazily), then call generate() at upload.",
     );
   } else {
     console.log(
       '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
     );
     console.log(
-      'src/config/resize.ts, and `import ./resizer.ts` from src/server.ts (runs in every process).',
+      "src/config/resize.ts, then run `await import('./resizer.ts')` only AFTER",
+    );
+    console.log(
+      '`await Server.init()` in every process (a static import runs too early).',
     );
   }
   return code;

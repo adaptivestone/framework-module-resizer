@@ -11,6 +11,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,7 @@ function installFakeApp() {
   const warn: unknown[][] = [];
   const errors: unknown[][] = [];
   setAppInstance({
-    getConfig: () => ({ mediaModelName: 'File' }),
+    getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
     logger: {
       info(...a: unknown[]) {
@@ -98,15 +99,45 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('resolve — partitioning', () => {
+  test('a falsy scalar preview ref remains ready and is passed through unchanged', async () => {
+    installFakeApp();
+    const refs: unknown[] = [];
+    const r = new Resizer({
+      storage: makeStorage({
+        publicUrl: (ref) => {
+          refs.push(ref);
+          return `/media/${String(ref)}`;
+        },
+      }),
+    });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'scalar',
+        original: { storageRef: 0 },
+        previews: [
+          {
+            storageRef: false,
+            contentType: 'image/jpeg',
+            sizeKey: '20x20',
+            format: 'jpeg',
+          },
+        ],
+      },
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(decision.ready[0]?.url, '/media/false');
+    assert.deepEqual(refs, [false]);
+  });
   test('partitions existing previews to ready and absent ones to missing', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', contentType: 'image/jpeg' },
+      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
       previews: [
         {
-          key: 'p1',
+          storageRef: { key: 'p1' },
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
@@ -155,7 +186,7 @@ describe('resolve — partitioning', () => {
       original: null,
       previews: [
         {
-          key: 'cached.jpg',
+          storageRef: { key: 'cached.jpg' },
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
@@ -200,10 +231,13 @@ describe('resolve — partitioning', () => {
       const { decision } = await r.resolve({
         media: {
           id: 'm1',
-          original: { key: 'legacy-origin.jpg', bucket: 'retired-bucket' },
+          original: {
+            storageRef: { key: 'legacy-origin.jpg' },
+            bucket: 'retired-bucket',
+          },
           previews: [
             {
-              key: 'public-preview.jpg',
+              storageRef: { key: 'public-preview.jpg' },
               contentType: 'image/jpeg',
               sizeKey: '300x300',
               format: 'jpeg',
@@ -248,10 +282,10 @@ describe('resolve — partitioning', () => {
     const r = new Resizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', contentType: 'image/jpeg' },
+      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
       previews: [
         {
-          key: 'p1',
+          storageRef: { key: 'p1' },
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
@@ -406,10 +440,10 @@ describe('resolve — enqueue wiring', () => {
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', contentType: 'image/jpeg' },
+      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
       previews: [
         {
-          key: 'p1',
+          storageRef: { key: 'p1' },
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
@@ -438,10 +472,10 @@ describe('resolve — enqueue wiring', () => {
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', contentType: 'image/jpeg' },
+      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
       previews: [
         {
-          key: 'p1',
+          storageRef: { key: 'p1' },
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
@@ -464,7 +498,7 @@ describe('resolve — enqueue wiring', () => {
     await r.resolve({
       media: {
         _id: { toString: () => 'abc123' },
-        original: { key: 'orig.jpg' },
+        original: { storageRef: { key: 'orig.jpg' } },
       },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -481,7 +515,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const { decision } = await r.resolve({
-      media: { id: 'm1', original: { key: 'orig.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -495,7 +529,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     await r.resolve({
-      media: { id: 'm1', original: { key: 'orig.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -577,7 +611,7 @@ describe('resolve — no transport (eager-only host)', () => {
     const { warn } = installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
-      media: { id: 'm1', original: { key: 'orig.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
       enqueueMissing: true,
@@ -588,18 +622,23 @@ describe('resolve — no transport (eager-only host)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 step 6 — SVG pass-through
+// SVG originals, including legacy public copies, require raster previews.
 // ---------------------------------------------------------------------------
 
-describe('resolve — SVG pass-through', () => {
-  test('serves the original at every size×format, missing empty, no transport call', async () => {
+describe('resolve — SVG raster previews', () => {
+  test('queues missing size×format variants instead of exposing a public original', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
     const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'logo.svg', contentType: 'image/svg+xml' },
+      original: {
+        storageRef: { key: 'logo.svg' },
+        contentType: 'image/svg+xml',
+        width: 20,
+        height: 20,
+      },
     };
     const { decision } = await r.resolve({
       media,
@@ -609,93 +648,78 @@ describe('resolve — SVG pass-through', () => {
       ],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(decision.ready.length, 4);
-    assert.equal(decision.missing.length, 0);
-    assert.equal(calls.length, 0);
-    for (const entry of decision.ready) {
-      assert.equal(entry.url, 'https://cdn/logo.svg');
-      assert.equal(entry.isOriginal, true);
-      assert.equal(entry.preview, undefined);
-    }
-    // requested format recorded, but never used to pick a raster preview
-    assert.deepEqual(decision.ready.map((e) => e.format).sort(), [
-      'jpeg',
-      'jpeg',
-      'webp',
-      'webp',
-    ]);
+    assert.equal(decision.ready.length, 0);
+    assert.equal(decision.missing.length, 4);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].previews.length, 4);
   });
 
-  test('a private SVG served to an owner uses signedUrl (same original-URL rule as the fast-path)', async () => {
+  test('never signs an SVG original or serves an SVG preview', async () => {
     installFakeApp();
-    const storage = makeStorage({
-      signedUrl: async (ref, ttl) => `https://signed/${ref.key}?ttl=${ttl}`,
+    let signedCalls = 0;
+    const r = new Resizer({
+      storage: makeStorage({
+        canServeOriginalPublicly: () => true,
+        signedUrl: async () => {
+          signedCalls++;
+          return 'https://signed/private.svg';
+        },
+      }),
     });
-    const r = new Resizer({ storage });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'private/logo.svg', contentType: 'image/svg+xml' },
+      original: {
+        storageRef: { key: 'private/logo.svg' },
+        contentType: 'image/svg+xml',
+        width: 20,
+        height: 20,
+      },
+      previews: [
+        {
+          storageRef: { key: 'published/logo.svg' },
+          sizeKey: '300x300',
+          format: 'jpeg',
+          contentType: 'image/svg+xml',
+        },
+      ],
     };
-    const owned = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      ctx: { isOwner: true },
-      enqueueMissing: false,
-    });
-    assert.equal(
-      owned.decision.ready[0].url,
-      'https://signed/private/logo.svg?ttl=300',
-    );
-    // No owner ctx → the pure public URL.
-    const anon = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      enqueueMissing: false,
-    });
-    assert.equal(anon.decision.ready[0].url, 'https://cdn/private/logo.svg');
+    for (const ctx of [{}, { isOwner: true }]) {
+      const { decision } = await r.resolve({
+        media,
+        sizes: [{ width: 300, height: 300 }],
+        formats: ['jpeg'],
+        ctx,
+        enqueueMissing: false,
+      });
+      assert.deepEqual(decision.ready, []);
+      assert.equal(decision.missing.length, 1);
+    }
+    assert.equal(signedCalls, 0);
   });
 
-  test('detects SVG via original.format === "svg" too', async () => {
+  test('stored raster preview is returned for an SVG original', async () => {
     installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { key: 'logo', format: 'svg' },
-    };
-    const { decision } = await r.resolve({
-      media,
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg'],
-      enqueueMissing: false,
-    });
-    assert.equal(decision.ready.length, 1);
-    assert.equal(decision.ready[0].isOriginal, true);
-    assert.equal(decision.ready[0].url, 'https://cdn/logo');
-    assert.equal(decision.missing.length, 0);
-  });
-
-  test('does not expose a private SVG anonymously, enqueue it, or invent raster work', async () => {
-    installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
-      storage: makeStorage({ canServeOriginalPublicly: () => false }),
-      transport,
-      lockProvider,
-    });
     const { decision } = await r.resolve({
       media: {
         id: 'm1',
-        original: { key: 'private/logo.svg', contentType: 'image/svg+xml' },
+        original: { storageRef: { key: 'logo' }, format: 'svg' },
+        previews: [
+          {
+            storageRef: { key: 'logo.webp' },
+            sizeKey: '300x300',
+            format: 'webp',
+            contentType: 'image/webp',
+          },
+        ],
       },
       sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg', 'webp'],
+      formats: ['webp'],
+      enqueueMissing: false,
     });
-    assert.deepEqual(decision.ready, []);
+    assert.equal(decision.ready[0].url, 'https://cdn/logo.webp');
+    assert.equal(decision.ready[0].contentType, 'image/webp');
     assert.deepEqual(decision.missing, []);
-    assert.equal(calls.length, 0);
   });
 });
 
@@ -707,7 +731,7 @@ describe('resolve — original-fits fast-path', () => {
   const fitsMedia = (): MediaLike => ({
     id: 'm1',
     original: {
-      key: 'orig.jpg',
+      storageRef: { key: 'orig.jpg' },
       contentType: 'image/jpeg',
       width: 200,
       height: 150,
@@ -739,7 +763,7 @@ describe('resolve — original-fits fast-path', () => {
     const r = new Resizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', width: 200, height: 400 },
+      original: { storageRef: { key: 'orig.jpg' }, width: 200, height: 400 },
     };
     const { decision } = await r.resolve({
       media,
@@ -756,7 +780,7 @@ describe('resolve — original-fits fast-path', () => {
     const r = new Resizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', width: 100, height: 100 },
+      original: { storageRef: { key: 'orig.jpg' }, width: 100, height: 100 },
     };
     const { decision } = await r.resolve({
       media,
@@ -774,7 +798,7 @@ describe('resolve — original-fits fast-path', () => {
     const r = new Resizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', width: 100, height: 100 },
+      original: { storageRef: { key: 'orig.jpg' }, width: 100, height: 100 },
     };
     const { decision } = await r.resolve({
       media,
@@ -792,7 +816,7 @@ describe('resolve — original-fits fast-path', () => {
     const r = new Resizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
-      original: { key: 'orig.jpg', contentType: 'image/jpeg' },
+      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
     };
     const { decision } = await r.resolve({
       media,
@@ -930,13 +954,13 @@ describe('resolve — never throws', () => {
       id: 'm1',
       previews: [
         {
-          key: 'p1',
+          storageRef: { key: 'p1' },
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
         },
         {
-          key: 'p2',
+          storageRef: { key: 'p2' },
           contentType: 'image/jpeg',
           sizeKey: '100x100',
           format: 'jpeg',
@@ -963,7 +987,12 @@ describe('resolve — never throws', () => {
     const { errors } = installFakeApp();
     const r = new Resizer({ storage: makeStorage() });
     const { decision, output } = await r.resolve({
-      media: { original: { key: 'orig.jpg', contentType: 'image/jpeg' } },
+      media: {
+        original: {
+          storageRef: { key: 'orig.jpg' },
+          contentType: 'image/jpeg',
+        },
+      },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });

@@ -1,84 +1,177 @@
-// Local filesystem storage (0.2 adoption) — default story for tests and first-week
-// local. Same ResizeStorage contract as S3; no optional peers. SUBPATH-ONLY ENTRY
-// (`…/storage/fs.js`), same as the other drivers.
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+// Local filesystem driver. Each persisted ref identifies both a relative path and its root.
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { ResizeSecurityError } from '../errors.ts';
 import type { StorageRef } from '../types.d.ts';
 import type { ResizeStorage } from './AbstractStorage.ts';
+import { validateLogicalKey, validateNamespace } from './placement.ts';
 
 export interface LocalFsStorageOptions {
-  rootDir: string; // files land under this directory
-  publicBaseUrl: string; // URL prefix for publicUrl(), e.g. '/media' or 'http://localhost:3000/media'
+  rootDir: string;
+  privateRootDir?: string;
+  publicBaseUrl: string;
 }
 
-/** Resolve `key` under `rootDir`; throw if it escapes the root (path traversal). */
-function resolveInsideRoot(rootDir: string, key: string): string {
-  if (!key || key.includes('\0')) {
-    throw new ResizeSecurityError('resize fs: invalid storage key', {
-      code: 'RESIZE_FS_KEY_INVALID',
-    });
-  }
+interface LocalFsStorageRef {
+  path: string;
+  visibility: 'public' | 'private';
+  namespace?: string;
+}
+
+function resolveInsideRoot(rootDir: string, path: string): string {
   const root = resolve(rootDir);
-  const abs = resolve(root, key);
+  const abs = resolve(root, path);
   const rel = relative(root, abs);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
-    throw new ResizeSecurityError(
-      `resize fs: key "${key}" escapes rootDir — refusing path traversal`,
-      { code: 'RESIZE_FS_PATH_TRAVERSAL' },
-    );
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new ResizeSecurityError('resize fs: path escapes rootDir', {
+      code: 'RESIZE_FS_PATH_TRAVERSAL',
+    });
   }
   return abs;
 }
 
-/** URL refs may carry a leading slash; treat it as a URL separator, not an absolute FS path. */
-function normalizePublicKey(key: string): string {
-  return key.replace(/^\/+/, '');
+/** Check the actual target after symlinks are resolved, not just its lexical path. */
+async function assertRealPathInsideRoot(
+  rootDir: string,
+  path: string,
+): Promise<void> {
+  const root = await realpath(rootDir);
+  const target = await realpath(path);
+  const rel = relative(root, target);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new ResizeSecurityError('resize fs: resolved path escapes rootDir', {
+      code: 'RESIZE_FS_PATH_TRAVERSAL',
+    });
+  }
 }
 
 export class LocalFsStorage implements ResizeStorage {
   readonly #rootDir: string;
+  readonly #privateRootDir: string;
   readonly #publicBaseUrl: string;
 
   constructor(opts: LocalFsStorageOptions) {
     this.#rootDir = opts.rootDir;
+    this.#privateRootDir = opts.privateRootDir ?? `${opts.rootDir}-private`;
     this.#publicBaseUrl = opts.publicBaseUrl;
   }
 
+  #ref(value: StorageRef): LocalFsStorageRef {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new ResizeSecurityError('resize fs: invalid storage ref', {
+        code: 'RESIZE_FS_REF_INVALID',
+      });
+    }
+    const ref = value as Record<string, unknown>;
+    if (
+      typeof ref.path !== 'string' ||
+      (ref.visibility !== 'public' && ref.visibility !== 'private')
+    ) {
+      throw new ResizeSecurityError('resize fs: invalid storage ref', {
+        code: 'RESIZE_FS_REF_INVALID',
+      });
+    }
+    validateLogicalKey(ref.path);
+    const namespace = validateNamespace(ref.namespace);
+    if (namespace && !ref.path.startsWith(`${namespace}/`)) {
+      throw new ResizeSecurityError(
+        'resize fs: namespace does not match path',
+        {
+          code: 'RESIZE_FS_REF_INVALID',
+        },
+      );
+    }
+    resolveInsideRoot(
+      ref.visibility === 'private' ? this.#privateRootDir : this.#rootDir,
+      ref.path,
+    );
+    return ref as unknown as LocalFsStorageRef;
+  }
+
   async download(ref: StorageRef): Promise<Buffer> {
-    return readFile(resolveInsideRoot(this.#rootDir, ref.key));
+    const parsed = this.#ref(ref);
+    const root =
+      parsed.visibility === 'private' ? this.#privateRootDir : this.#rootDir;
+    const abs = resolveInsideRoot(root, parsed.path);
+    await assertRealPathInsideRoot(root, abs);
+    return readFile(abs);
   }
 
   async upload({
     key,
     body,
+    visibility,
+    namespace,
+    parentRef,
   }: {
     key: string;
     body: Buffer | Uint8Array;
     contentType: string;
-    // Accepted to match ResizeStorage; local/dev shares one tree (not a private store).
     visibility: 'public' | 'private';
+    namespace?: string;
+    parentRef?: StorageRef;
   }): Promise<StorageRef> {
-    const abs = resolveInsideRoot(this.#rootDir, key);
-    await mkdir(dirname(abs), { recursive: true });
-    await writeFile(abs, body);
-    return { key };
+    if (parentRef !== undefined && namespace !== undefined) {
+      throw new ResizeSecurityError(
+        'resize fs: namespace and parentRef conflict',
+        { code: 'RESIZE_FS_HINT_CONFLICT' },
+      );
+    }
+    if (parentRef === null) {
+      throw new ResizeSecurityError('resize fs: invalid parentRef', {
+        code: 'RESIZE_FS_REF_INVALID',
+      });
+    }
+    const grouping = validateNamespace(
+      parentRef === undefined ? namespace : this.#ref(parentRef).namespace,
+    );
+    if (visibility !== 'public' && visibility !== 'private') {
+      throw new ResizeSecurityError('resize fs: invalid visibility', {
+        code: 'RESIZE_FS_VISIBILITY_INVALID',
+      });
+    }
+    const path = grouping
+      ? `${grouping}/${validateLogicalKey(key)}`
+      : validateLogicalKey(key);
+    const root =
+      visibility === 'private' ? this.#privateRootDir : this.#rootDir;
+    const abs = resolveInsideRoot(root, path);
+    await mkdir(root, { recursive: true });
+    let parent = resolve(root);
+    for (const segment of path.split('/').slice(0, -1)) {
+      parent = resolve(parent, segment);
+      try {
+        await mkdir(parent);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw error;
+        }
+      }
+      await assertRealPathInsideRoot(root, parent);
+    }
+    // Exclusive creation refuses an existing symlink leaf (and accidental collisions).
+    await writeFile(abs, body, { flag: 'wx' });
+    return {
+      path,
+      visibility,
+      ...(grouping === undefined ? {} : { namespace: grouping }),
+    };
   }
 
-  // PURE string building — no I/O (called on the read path). Option is publicBaseUrl
-  // (never `publicUrl`) so it cannot shadow this method name.
   publicUrl(ref: StorageRef): string {
-    // Keep the same path-traversal validation for this pure URL builder as for I/O. Local
-    // development intentionally uses one shared tree for originals and previews, so a validated
-    // key is considered publicly servable.
-    resolveInsideRoot(this.#rootDir, normalizePublicKey(ref.key));
-    const base = this.#publicBaseUrl.replace(/\/+$/, '');
-    const key = normalizePublicKey(ref.key);
-    return `${base}/${key}`;
+    const parsed = this.#ref(ref);
+    if (parsed.visibility !== 'public') {
+      throw new ResizeSecurityError(
+        'resize fs: refusing public URL for private original',
+        {
+          code: 'RESIZE_FS_PRIVATE_URL',
+        },
+      );
+    }
+    return `${this.#publicBaseUrl.replace(/\/+$/, '')}/${parsed.path}`;
   }
 
   canServeOriginalPublicly(ref: StorageRef): boolean {
-    resolveInsideRoot(this.#rootDir, normalizePublicKey(ref.key));
-    return true;
+    return this.#ref(ref).visibility === 'public';
   }
 }

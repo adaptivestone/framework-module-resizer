@@ -7,7 +7,7 @@
 // media model through getApp() + getResizeConfig() (02 · §4). The read path never calls load();
 // resolve() receives `media` from the caller.
 import { getApp } from '../app.ts';
-import { getResizeConfig } from '../config/resize.ts';
+import { getResizeConfig } from '../resizeConfig.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import type { MediaStore } from './AbstractMediaStore.ts';
 

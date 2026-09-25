@@ -65,7 +65,7 @@ It emits (into `process.cwd()`, or `--out <dir>`), **never overwriting** without
 | File | What it is |
 |---|---|
 | `src/resizer.ts` | the construction site — `new Resizer({ … })` (edit freely) |
-| `src/config/resize.ts` | editable config that spreads the module defaults |
+| `src/config/resize.ts` | small host extension of the module defaults; framework applies environment overrides |
 | `src/models/ResizeTask.ts` | thin shim (only without `--eager`) |
 | `src/commands/ResizeWorker.ts` | worker command re-export (only without `--eager`) |
 
@@ -87,6 +87,15 @@ Start here. No queue, no worker, no AWS. `npx resize-scaffold --eager` emits thi
 **1. Wire the Resizer** after `Server.init()` (or lazily on first request). One Resizer per
 process — a second `new Resizer()` throws.
 
+Load the scaffolded construction site dynamically from bootstrap after initialization:
+
+```ts
+await server.init();
+const { resizer } = await import('./resizer.ts');
+```
+
+A static import is evaluated before bootstrap code and is therefore too early.
+
 ```ts
 import { Resizer } from '@adaptivestone/framework-module-resize';
 import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
@@ -96,9 +105,16 @@ export const resizer = new Resizer({
 });
 ```
 
-**2. At upload**, after the original is on `media.original`:
+**2. At upload**, store the untouched original, persist the returned `Original` on your host
+media document, then generate the catalog:
 
 ```ts
+media.original = await resizer.uploadOriginal({
+  body: buffer,                         // Buffer or Uint8Array
+  visibility: 'private',
+});
+await media.save();                     // host-owned model lifecycle
+
 const { created, failed } = await resizer.generate({
   media,
   sizes: [{ width: 320, height: 320 }],
@@ -109,8 +125,14 @@ const { decision } = await resizer.resolve({
 });
 ```
 
-**3. Set your media model name** in `src/config/resize.ts` (the one required field) and spread
+**3. Review the scaffolded config** in `src/config/resize.ts`. It imports the canonical defaults
+from `…/config/resize.js`; set `mediaModelName` and only the host-specific overrides. Spread
 `resizeMediaSchemaFragment` into the model so `original` + `previews[]` exist. Listing queries:
+
+Framework environment overrides use `resize.<NODE_ENV>.ts`, for example
+`resize.production.ts`. The Framework's file loader filters out `*.test.ts`, so
+`resize.test.ts` cannot serve as a config override with the currently installed
+Framework release.
 
 ```ts
 import { resizeMediaPaths } from '@adaptivestone/framework-module-resize';
@@ -118,6 +140,42 @@ File.find().select(['mediaType', ...resizeMediaPaths]);
 ```
 
 S3 when you have buckets; a queue when listings are huge — both are later sections.
+
+### Original upload
+
+`uploadOriginal()` sniffs the actual bytes, creates a random `originals/<hex>.<ext>` suggested
+key, writes through the configured `storage.upload()`, and returns an `Original` with an opaque
+`storageRef` and
+`format`, `contentType`, byte `size`, and reliable display dimensions when known. It does not
+create a media document, enqueue variants, or know anything about users, owners, routes, or DTOs.
+Built-in filesystem/S3 drivers preserve the suggested extension; a custom content-addressed
+driver may return its own JSON-compatible locator. The host persists the entire returned
+`Original` in its media model. The old spread `original.key`/`bucket` and
+`previews[].key`/`bucket` fields have been replaced by nested `storageRef` fields.
+
+Grouping is optional and is only a placement hint. For example, pass
+`namespace: \`users/${user.id}\`` or `namespace: \`products/${product.id}\`` to
+`uploadOriginal()`, or omit it for ungrouped objects. The shipped drivers accept
+slash-separated ASCII segments (`A-Z`, `a-z`, `0-9`, `_`, `-`, `.`), rejecting empty,
+`.` and `..` segments and other characters. The host remains responsible for
+authorization. The original ref stores this grouping, so a later worker can pass it as
+`parentRef` to the driver when creating a public preview after a process restart.
+
+Input bytes are stored unchanged. Format and dimensions for raster images and SVG are read
+with `sharp().metadata()` under the configured pixel limits. No output image is rendered,
+rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml` as a private original. The worker
+later produces the requested raster previews through Sharp.
+SVG dimensions are those reported by Sharp, including dimensions derived from `viewBox`.
+SVG without dimensions that Sharp can determine is rejected.
+There is no separate XML validator, DTD prohibition, or sanitizer. Sharp metadata inspection does
+not remove scripts or external references from the private original. The module rejects public SVG
+uploads and serves only generated raster previews for accepted SVG input.
+Inputs Sharp cannot read use the common `RESIZE_ORIGINAL_INVALID` error instead of the former
+SVG-specific XML errors.
+
+Failures are typed: malformed/unsupported/over-limit input throws `ResizeOriginalError`; storage
+I/O throws `ResizeStorageError` with code `RESIZE_ORIGINAL_UPLOAD_FAILED` and the driver error as
+`cause`. The byte and format allowlists are `upload.maxBytes` and `upload.formats`.
 
 ---
 
@@ -161,16 +219,31 @@ export const resizer = new Resizer({
 });
 ```
 
-**Enable the worker command** in the host `src/config/resize.ts` (the module default is `false`):
+Queue indexes are a lifecycle concern, not a resizer runtime operation. The package declares the
+required `ResizeTask` indexes, and the framework declares the `Lock` indexes; the host's normal
+model lifecycle or an explicit database migration must create them before producers and workers
+run. The module does not expose `prepareQueue()`, call `createIndexes()`, synchronize/drop indexes,
+or create any external queue/storage resource. In particular, do not put index creation in HTTP
+bootstrap, the first enqueue, or the worker command.
+
+The active-request partial unique index on `{ fileId, pipeline, requestKey }` is what guarantees
+deduplication of identical active tasks. Without that index, enqueue remains at-least-once and
+concurrent identical requests are not guaranteed to collapse to one row. Prepare the database
+through the host's migration/lifecycle process and verify the exact model declarations there;
+never run a destructive global `syncIndexes()` automatically.
+
+**Enable the worker command** in the host `src/config/resize.ts` by changing the scaffolded
+`worker.enabled` value. For an environment-only override, add `resize.production.ts`:
 
 ```ts
-import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+import type {
+  DeepPartial,
+  ResizeConfig,
+} from '@adaptivestone/framework-module-resize';
 
 export default {
-  ...defaultResizeConfig,
-  mediaModelName: 'File',
-  worker: { ...defaultResizeConfig.worker, enabled: true },
-};
+  worker: { enabled: true },
+} satisfies DeepPartial<ResizeConfig>;
 ```
 
 **Run the worker** as a separate process:
@@ -179,7 +252,9 @@ export default {
 npm run cli ResizeWorker
 ```
 
-`worker.enabled` permits the command to run; it does not start a worker inside the API.
+`worker.enabled` permits the command to run; it does not start a worker inside the API. The
+command assumes the host lifecycle or an explicit migration has already prepared the configured
+queue/lock indexes before consumption.
 
 Your media model (`File`/`Media`) must carry `original` (incl. `width`/`height`) and `previews[]`
 (incl. `filters`/`fit`). That schema is host-owned; to avoid hand-written drift the module exports
@@ -193,8 +268,23 @@ class File extends BaseModel {
 }
 ```
 
-At **upload** capture `original.width/height` (from sharp metadata) onto the media doc; if you
-don't, the worker backfills them on first process.
+The media schema must use `minimize: false` to preserve opaque refs such as `{}` or
+`{ id: 'x', options: {} }`. Framework `BaseModel` already sets this default; retain it.
+When using Mongoose directly, configure it explicitly:
+
+```ts
+const schema = new mongoose.Schema(
+  { ...existingFields, ...resizeMediaSchemaFragment },
+  { minimize: false },
+);
+```
+
+Without this option, Mongoose can remove a ref or its empty nested objects during
+original saves and preview updates, changing the locator passed back to the driver.
+
+At **upload**, prefer `uploadOriginal()` and persist its returned metadata on the media doc. Legacy
+hosts may still populate `original` themselves; if dimensions are absent, the worker backfills
+display dimensions on first processing.
 
 **Read** from your DTO builders. No `app` argument — the module reads the ambient app instance.
 `resolve` returns the raw `decision` and the `output` of your `formatPublicUrls` hook (`undefined`
@@ -248,6 +338,27 @@ await resizer.prewarm({ media: fileDoc, sizes: getListingSizes(), pipeline: 'lis
 Choose pre-warm when you want **fast uploads and a warm cache** — the request returns immediately
 while the worker fills the catalog in the background.
 
+When the upload workflow must know whether every required identity has a confirmed queue receipt,
+use the separate strict API:
+
+```ts
+const result = await resizer.enqueueRequired({ media, sizes: catalog, pipeline: 'listing' });
+// result.status: 'ready' | 'accepted' | 'not-required' | 'incomplete'
+// ready / accepted / notRequired / unconfirmed partition the resolved catalog.
+// tasks contains non-null transport receipts; issues is a machine-readable retry guide.
+```
+
+`prewarm()` remains best-effort and never throws for compatibility. In contrast,
+`enqueueRequired()` never treats a held dispatch lock as proof that a task exists. Mongo can query
+active task payloads through `findActive()` and prove coverage after a lock race only when the
+complete canonical variant payload matches. Each active receipt is checked in full before any
+requested payload is matched: two different payloads that collapse to one preview identity are
+reported as a non-retryable conflict instead of being guessed. SQS confirms a
+successful send by its `MessageId`, but cannot query another producer's message; a lock loser is
+therefore `incomplete` and safely retryable. Custom transports may implement `findActive()` or
+accept the same explicit limitation. These are at-least-once systems—this API does not promise
+exactly-once delivery.
+
 **Eager** — call `generate` from your
 upload handler (`ctx` reaches pipeline steps here, unlike the queued worker):
 
@@ -263,8 +374,7 @@ const { created, failed } = await resizer.generate({
 
 `created` is **only what this call made**. A second `generate` with the same catalog returns
 `{ created: [], failed: 0 }` because everything already exists — treat an empty `created` as
-"nothing new was needed", never as failure. An SVG original is the same: pass-through, never
-rasterized, `{ created: [], failed: 0 }`.
+"nothing new was needed", never as failure. SVG input follows the same generation rule.
 
 **Hybrid:** `generate` the above-the-fold sizes at upload and let `resolve` lazily fill the heavy
 ones on demand — or `prewarm` the whole catalog at upload and let `resolve` cover anything added
@@ -284,7 +394,8 @@ question a catch block actually has — what to do about it:
 | `ResizeConfigError` | host config invalid or violates an invariant | crash at boot |
 | `ResizeMediaError` | this media record is unusable | skip it; don't retry |
 | ↳ `ResizeNoOriginalError` | `generate` called with no `original` | upload the source first |
-| `ResizeGenerateError` | the operation produced nothing | inspect `failed` / `requested` |
+| ↳ `ResizeOriginalError` | upload bytes are invalid, unsupported, or over limit | reject/fix the input |
+| `ResizeGenerateError` | eager produced nothing, or queued coverage is incomplete | inspect `failed` / `requested` / `missing` |
 | `ResizeStorageError` | transient storage I/O | a retry may help |
 | `ResizeSecurityError` | a refusal (path traversal, cross-bucket) | never retry; log loudly |
 
@@ -331,7 +442,8 @@ instance anywhere via `getResizer()` (throws a clear error if none was construct
 ### `MongoTransport`
 
 Option-less: `new MongoTransport()`. Backed by the scaffolded `ResizeTask` model; uses the
-`config.queue` lease/retry knobs. No optional deps.
+`config.queue` lease/retry knobs. It also implements the optional `findActive()` capability used
+by `enqueueRequired()` to prove coverage after dispatch-lock races. No optional deps.
 
 ### `SqsTransport({ … })`
 
@@ -351,15 +463,20 @@ Credentials are never options — they resolve via the standard AWS provider cha
 
 | Option | | |
 |---|---|---|
-| `rootDir` | **required** | files land under this directory |
+| `rootDir` | **required** | public previews land under this directory |
+| `privateRootDir` | optional | private originals; defaults to a sibling directory, `rootDir` + `-private` |
 | `publicBaseUrl` | **required** | URL prefix for `publicUrl()`, e.g. `/media` |
 
 Default story for tests and first-week local. Same `download` / `upload` / `publicUrl` contract.
 Option is `publicBaseUrl` (never `publicUrl`) so it cannot shadow the method.
 
-The host must (1) write originals under `rootDir` at `original.key`, (2) serve `rootDir` at
-`publicBaseUrl` (otherwise every URL 404s), and (3) treat this as a **local/dev** store:
-`visibility` is accepted and ignored — originals and previews share one tree.
+The host serves only `rootDir` at `publicBaseUrl`; it must not mount `privateRootDir` in the
+static server. The driver stores `{ path, visibility, namespace? }` inside `storageRef`.
+`path` is relative to the root selected by `visibility`; private objects never receive
+a public URL. Keep both roots writable only by the application and do not place symlinks
+to private or external directories in the public tree. Read/write operations check real
+paths, while `publicUrl()` stays synchronous and cannot inspect the filesystem. A process
+that can concurrently replace directories inside the roots can race those checks.
 
 ### `S3Storage({ … })`
 
@@ -375,7 +492,7 @@ new S3Storage({
 | Option | | |
 |---|---|---|
 | `bucketPublic` | **required** | previews land here (`public` visibility) |
-| `bucketPrivate` | optional | originals (`private`); defaults to `bucketPublic` |
+| `bucketPrivate` | required for private uploads | must differ from `bucketPublic`; originals land here |
 | `publicBaseUrl` | optional | CDN/base URL for public objects |
 | `publicUrl` | optional | **deprecated** alias of `publicBaseUrl` (one minor) |
 | `region`, `endpoint`, `forcePathStyle` | optional | S3-compatible targets (MinIO / localstack / R2) |
@@ -383,7 +500,7 @@ new S3Storage({
 
 `publicUrl()` is **pure and I/O-free** (called on the read path). No per-object ACL — public access
 is a bucket policy. Credentials via the AWS provider chain. `download`/`publicUrl`/`signedUrl`
-enforce a **bucket allowlist**: a stored `ref.bucket` must be one of the configured
+enforce a **bucket allowlist**: an S3 `storageRef.bucket` must be one of the configured
 `bucketPublic`/`bucketPrivate`, else they throw a named error — so a tampered media-doc `bucket`
 can never become a cross-bucket read or an attacker-controlled hostname in a URL.
 
@@ -393,19 +510,25 @@ Any seam takes a plain object (or class) that satisfies the interface — no `ap
 closes over its own client. For plain S3 use `S3Storage`; for anything else (GCS, filesystem, R2):
 
 ```ts
-new Resizer({ /* … */, storage: {
-  download: (ref) => s3.getObject(ref.bucket!, ref.key),
-  upload: async ({ key, body, contentType, visibility }) => {
-    const bucket = visibility === 'public' ? 'my-cdn' : 'my-originals';
-    await s3.putObject(bucket, key, body, contentType);
-    return { bucket, key };               // ← persisted onto the preview/original
-  },
-  publicUrl: (ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
-  signedUrl: (ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
-}});
+import { Resizer, type ResizeStorage } from '@adaptivestone/framework-module-resize';
+
+// `StorageRef` is opaque to the module. A custom driver validates its own JSON-compatible
+// locator when receiving download/publicUrl/signedUrl/parentRef calls.
+// `myStore` is the host's storage implementation.
+const storage: ResizeStorage = {
+  download: (ref) => myStore.download(ref),
+  upload: ({ key, body, contentType, visibility, namespace, parentRef }) =>
+    myStore.upload({ key, body, contentType, visibility, namespace, parentRef }),
+  publicUrl: (ref) => myStore.publicUrl(ref), // pure; no I/O
+};
+new Resizer({ storage });
 ```
 
 The same pattern swaps `mediaStore` (e.g. another DB/ORM) or `lockProvider` (e.g. Redis/redlock).
+A custom media store implements `load` and `appendPreviews`. A custom storage driver
+must persist a ref unchanged through the media store and inherit grouping from its own
+`parentRef` for derived previews. The shipped drivers reject simultaneous `namespace`
+and `parentRef` hints; custom drivers should follow the same contract.
 Contract types (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`, …) are exported
 from the main entry for custom-driver authors.
 
@@ -519,27 +642,42 @@ formatPictureUrls(decision, { id }); // unfiltered <picture> map; filtered varia
 
 ## Config reference
 
-`src/config/resize.ts` (scaffolded, editable) spreads the module defaults and is deep-merged over
-them by `getResizeConfig()` — override any knob at any depth. **Arrays REPLACE** (so
-`formats: ['webp','avif']` doesn't concat to five); nested objects merge field-by-field.
+The package exports canonical defaults from
+`@adaptivestone/framework-module-resize/config/resize.js`. The scaffolded
+`src/config/resize.ts` extends that object with the required `mediaModelName` and host overrides.
+The framework then merges `resize.<NODE_ENV>.ts` over the base file and caches the final value
+returned by `getConfig('resize')`. The module validates that final value when `new Resizer()` is
+constructed; it does not perform another runtime merge. Framework merging replaces arrays and
+merges nested objects field by field. `formats` selects generated outputs, while `upload.formats`
+is the independent allowlist for original input bytes.
+
+```ts
+// src/config/resize.ts
+import type { ResizeConfig } from '@adaptivestone/framework-module-resize';
+import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+
+export default {
+  ...defaultResizeConfig,
+  mediaModelName: 'File',
+} satisfies ResizeConfig;
+```
 
 | Key | Default | Notes |
 |---|---|---|
 | `mediaModelName` | — (**required**) | your host media model name (`'File'`/`'Media'`) |
 | `formats` | `['jpeg','webp','avif']` | generated formats |
-| `webpAvifOnly` | `false` | when `true`, `requiredFormats()` drops `jpeg` (read + worker must agree) |
+| `upload.maxBytes` | `26214400` (25 MiB) | maximum original byte length checked before storage |
+| `upload.formats` | `['jpeg','png','webp','avif','gif','svg']` | allowed formats, determined from bytes |
 | `maxSize` | `{ width: 2000, height: 1200 }` | the `fit` cap |
 | `animated` | `false` | `true` keeps GIF/WebP frames |
-| `encode.quality` | `{ jpeg: 80, webp: 82, avif: 64 }` | per-format — sharp codec defaults aren't perceptually comparable; never reuse one int |
-| `encode.effort` | `{ webp: 4, avif: 4 }` | encode-once + CDN-cached, so 5–6 is often worth it |
-| `encode.mozjpeg` | `true` | progressive + trellis quantization |
-| `encode.chromaSubsampling` | `'4:2:0'` | `'4:4:4'` keeps full chroma for text/logos/UI |
+| `encode.formats` | per-format Sharp options for jpeg/webp/avif | passed to `sharp.toFormat(format, options)` |
 | `encode.sharpen` | `{ cover: true, fit: false }` | mild unsharp after downscale (off for the large modal) |
-| `encode.flattenBackground` | `'#ffffff'` | alpha → jpeg flatten color |
+| `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | flatten alpha before the listed encoders |
 | `limits.inputPixels` | `268402689` | sharp decoder bomb guard |
 | `limits.sourcePixels` | `50_000_000` | rejected before decode, from metadata |
 | `limits.resultDimension` | `5000` | clamp on the cover branch |
 | `limits.animationFrames` | `64` | animation-bomb guard |
+| `limits.processingTimeoutSeconds` | `30` | Sharp native processing timeout |
 | `queue.lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | worker ≤ `leaseMs` |
 | `queue.leaseMs` | `60000` | heartbeat renews at `leaseMs/2`; set ≥ ~2× worst-case encode |
 | `queue.retryBackoffMs` | `{ base: 5000, max: 300000 }` | delayed re-lease on fail |
@@ -550,6 +688,12 @@ them by `getResizeConfig()` — override any knob at any depth. **Arrays REPLACE
 | `worker.concurrency` | `4` | variants resized in parallel per task |
 | `worker.sharpConcurrency` | `1` | `sharp.concurrency()`; keep `concurrency × sharpConcurrency ≈ nCPU` |
 | `worker.sharpCache` | `false` | a worker processes distinct images; the op-cache mostly wastes memory |
+
+Format ids are open strings rather than a package enum. To enable another format supported by the
+installed Sharp/libvips build, add it to `formats` or `upload.formats`. Output encoder options
+live under the same id in `encode.formats`; for example, TIFF can use
+`formats: ['tiff']` with `encode.formats.tiff: { compression: 'lzw' }`. Unsupported codecs fail
+through Sharp with the normal generation error path.
 
 Storage buckets/URLs and the SQS queue URL are **not** config — they are driver options passed to
 `new S3Storage({...})` / `new SqsTransport({...})`.
@@ -597,12 +741,30 @@ of the same request. If a concurrent operator creates one after the lookup, the 
 re-reads that active row instead of retrying the dead row.
 
 **Delivery is at-least-once** (both transports); the worker is **idempotent** — re-running a task
-for an already-generated identity skips via the existing-preview check, never duplicates.
+for an already-generated identity skips via the existing-preview check, never duplicates. A
+raster task completes only when every requested identity is covered. Successfully uploaded
+variants are persisted before an incomplete task is failed into the existing backoff/retry path;
+the next delivery generates only the missing identities, and permanent gaps reach dead-letter.
+`afterTaskComplete` fires only after full coverage. A deleted media row remains a successful no-op;
+a live row without `original.storageRef` is an observable terminal media error.
 
-**SVG originals are pass-through** — when `original.contentType === 'image/svg+xml'` the read path
-serves a public original at every requested size/format and never resizes or enqueues. A private
-original is served only through a successful authorized `signedUrl`; anonymous reads return no
-original URL. **SVG sanitization is host-owned** (sanitize at upload before storing).
+**SVG originals use the same task lifecycle.** Upload and persist the original privately, then call
+the same `prewarm()` or `enqueueRequired()` used for raster images. The worker reads the SVG through
+Sharp and creates a raster preview for every requested size and format.
+
+```ts
+const original = await resizer.uploadOriginal({ body: svgBytes, visibility: 'private' });
+media.original = original;
+await media.save();
+
+await resizer.prewarm({ media, sizes });
+```
+
+With `S3Storage`, configure distinct `bucketPrivate` and `bucketPublic` values and a bucket
+policy that keeps the private bucket inaccessible to the public. The original locator stays in
+`media.original`; generated previews are stored in the public bucket. Owner/admin context does not expose the
+uploaded SVG through the read path. `LocalFsStorage` writes private originals outside its public
+root; the host must expose only that public root through its static server.
 
 **Original visibility is explicit.** Storage drivers that can prove an original is public should
 implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary custom driver's
@@ -610,7 +772,13 @@ implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary 
 previews remain the preferred public read path.
 
 **Deleting media / storage cleanup is host-owned.** The module appends previews but does not delete
-them; removing a media doc's storage objects (originals + derivatives) is your lifecycle.
+them; removing a media doc's storage objects (originals and derivatives)
+is your lifecycle.
+
+**Breaking change:** the new nested `storageRef` shape has no legacy-record reader or
+automatic migration. Update host schemas, direct `key`/`bucket` reads, DTO helpers, custom
+drivers, and API/worker processes together. Start processing new records only when every
+process uses the new contract and the target dataset needs no old records.
 
 ---
 
@@ -626,7 +794,7 @@ The module owns the resize core; the host owns everything domain-specific (spec 
   pipeline `beforeSteps`/`variantSteps`).
 - **Permissions** — who may delete/replace media; the host may pass `ctx.isOwner`/`ctx.isAdmin` to
   opt a read into a signed-original URL.
-- **SVG sanitization** and **deleting media / storage cleanup**.
+- **Deleting media / storage cleanup** and removing legacy public SVG copies.
 
 ---
 

@@ -6,6 +6,8 @@ import type {
   Filters,
   MediaLike,
   MissingPreview,
+  Original,
+  Preview,
   PreviewFormat,
   SizeInput,
 } from './types.d.ts';
@@ -172,8 +174,23 @@ export function expandMissingPreviews(
 ): MissingPreview[] {
   const existing = new Set<string>();
   for (const p of media.previews ?? []) {
-    existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+    if (isUsablePreview(p)) {
+      existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+    }
   }
+  return expandPreviewRequests(sizes, formats).filter(
+    (preview) =>
+      !existing.has(
+        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      ),
+  );
+}
+
+/** Expand a size catalog without consulting stored previews. */
+export function expandPreviewRequests(
+  sizes: SizeInput[],
+  formats: PreviewFormat[],
+): MissingPreview[] {
   const requested: MissingPreview[] = [];
   const seen = new Set<string>();
   for (const size of sizes) {
@@ -185,7 +202,7 @@ export function expandMissingPreviews(
     }
     for (const format of formats) {
       const identity = getPreviewIdentity(sizeKey, format, size.filters);
-      if (existing.has(identity) || seen.has(identity)) {
+      if (seen.has(identity)) {
         continue;
       }
       seen.add(identity);
@@ -210,22 +227,29 @@ export function expandMissingPreviews(
 
 /**
  * True when every `sizes × formats` identity is already stored on `media.previews`
- * (or the original is SVG, which is pass-through and never needs a preview). Hosts
- * use this to skip a no-op `generate` / `prewarm`.
+ * Hosts use this to skip a no-op `generate` / `prewarm`.
  */
 export function isCatalogCovered(
   media: MediaLike,
   sizes: SizeInput[],
   formats: PreviewFormat[],
 ): boolean {
-  const original = media.original;
-  if (
-    original &&
-    (original.contentType === 'image/svg+xml' || original.format === 'svg')
-  ) {
-    return true;
-  }
   return expandMissingPreviews(media, sizes, formats).length === 0;
+}
+
+export function isSvgOriginal(original: Original | undefined): boolean {
+  return (
+    original?.format === 'svg' || original?.contentType === 'image/svg+xml'
+  );
+}
+
+export function isUsablePreview(preview: Preview): boolean {
+  return Boolean(
+    preview.storageRef != null &&
+      preview.contentType &&
+      preview.contentType !== 'image/svg+xml' &&
+      preview.format !== 'svg',
+  );
 }
 
 /**

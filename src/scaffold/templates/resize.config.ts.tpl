@@ -1,15 +1,10 @@
-// src/config/resize.ts — scaffolded EDITABLE config (08 · §12/§13). The framework loads this by
-// filename as the `resize` config; the module's getResizeConfig() then deep-merges it OVER the
-// module defaults (arrays REPLACE, nested objects merge field-by-field). This is the ONE file you
-// are meant to tune — override any knob (formats / encode / limits / queue / worker) at any depth.
+// src/config/resize.ts — host extension of the module defaults.
+// Put environment-only changes in resize.<NODE_ENV>.ts; @adaptivestone/framework
+// merges that file over this one before getConfig('resize') is called.
+import type { ResizeConfig } from '@adaptivestone/framework-module-resize';
 import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
 
 export default {
   ...defaultResizeConfig,
-  mediaModelName: 'File', // TODO (REQUIRED): your host media model name, e.g. 'File' or 'Media'
-  // Example overrides (delete if unused):
-  // formats: ['webp', 'avif'],            // arrays REPLACE the default (no concat)
-  // encode: { ...defaultResizeConfig.encode, quality: { ...defaultResizeConfig.encode.quality, avif: 55 } },
-  // Lazy/pre-warm: enable the worker command, then run `npm run cli ResizeWorker`.
-  // worker: { ...defaultResizeConfig.worker, enabled: true, concurrency: 4 },
-};
+  mediaModelName: 'File', // TODO(REQUIRED): the host media model, e.g. File or Media
+} satisfies ResizeConfig;

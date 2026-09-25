@@ -21,14 +21,12 @@
 // './worker.ts'`: the ResizeWorker CLASS actually lives in ./commands/ResizeWorker.ts (a package
 // subpath the scaffold re-exports); `runResizeWorker` is the module function in ./worker.ts.
 export { default as ResizeWorker } from './commands/ResizeWorker.ts';
-// --- config: the defaults + the host-merged resolver + the active-format list ---
-export {
-  default as defaultResizeConfig,
-  getResizeConfig,
-  requiredFormats,
-} from './config/resize.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
-export type { PrewarmOpts, ResolveOpts } from './engine.ts';
+export type {
+  EnqueueRequiredOpts,
+  PrewarmOpts,
+  ResolveOpts,
+} from './engine.ts';
 // --- error hierarchy: every module throw is a `ResizeError`; the subclass says what to DO ---
 // Hosts catch `ResizeError` to separate "this module rejected it" from a sharp/S3/mongo failure,
 // then branch on the subclass (or the stable `err.code`). `ResizeError.isResizeError(err)` is the
@@ -39,6 +37,7 @@ export {
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
+  ResizeOriginalError,
   ResizeSecurityError,
   ResizeSetupError,
   ResizeStorageError,
