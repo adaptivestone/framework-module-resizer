@@ -26,14 +26,12 @@ describe('resizeMediaSchemaFragment — shape', () => {
   test('original carries the documented Original leaf fields', () => {
     const o = resizeMediaSchemaFragment.original;
     for (const k of [
-      'key',
-      'bucket',
+      'storageRef',
       'format',
       'size',
       'contentType',
       'width',
       'height',
-      'publicCopy',
     ]) {
       assert.ok(k in o, `missing original.${k}`);
     }
@@ -42,8 +40,7 @@ describe('resizeMediaSchemaFragment — shape', () => {
   test('previews[0] carries the full Preview leaf fields', () => {
     const p = resizeMediaSchemaFragment.previews[0];
     for (const k of [
-      'key',
-      'bucket',
+      'storageRef',
       'sizeKey',
       'filters',
       'requestedWidth',
@@ -59,7 +56,7 @@ describe('resizeMediaSchemaFragment — shape', () => {
   });
 
   test('leaf types are the expected global constructors / string alias', () => {
-    assert.equal(resizeMediaSchemaFragment.original.key.type, String);
+    assert.equal(resizeMediaSchemaFragment.original.storageRef.type, 'Mixed');
     assert.equal(resizeMediaSchemaFragment.original.width.type, Number);
     assert.equal(resizeMediaSchemaFragment.previews[0].fit.type, Boolean);
     // Mixed via the string alias (no mongoose import in the fragment source).
@@ -80,9 +77,10 @@ describe('resizeMediaSchemaFragment — host usage', () => {
     // `previews` is a real subdocument-array path; nested `original` is addressed by leaf.
     assert.ok(schema.path('previews'));
     assert.ok(schema.path('original.width'));
-    assert.ok(schema.path('original.key'));
-    assert.ok(schema.path('original.publicCopy.key'));
-    assert.ok(schema.path('original.publicCopy.bucket'));
+    assert.ok(schema.path('original.storageRef'));
+    assert.ok(schema.path('previews.storageRef'));
+    assert.equal(schema.path('original.key'), undefined);
+    assert.equal(schema.path('original.bucket'), undefined);
   });
 });
 

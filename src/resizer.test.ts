@@ -417,7 +417,10 @@ describe('resolve/generate stubs', () => {
     } as never);
     const r = new Resizer(baseOpts());
     const result = await r.generate({
-      media: { id: 'm1', original: { key: 'o', contentType: 'image/jpeg' } },
+      media: {
+        id: 'm1',
+        original: { storageRef: { key: 'o' }, contentType: 'image/jpeg' },
+      },
       sizes: [],
     });
     assert.deepEqual(result.created, []);

@@ -179,7 +179,7 @@ describe('SqsTransport.enqueue', () => {
       lockProvider: { acquire: async () => true, release: async () => {} },
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'original.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -201,7 +201,7 @@ describe('SqsTransport.enqueue', () => {
       lockProvider: { acquire: async () => false, release: async () => {} },
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'original.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });

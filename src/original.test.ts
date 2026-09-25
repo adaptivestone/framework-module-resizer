@@ -131,8 +131,14 @@ describe('uploadOriginal — raster bytes and metadata', () => {
     assert.equal(original.size, orientedJpeg.byteLength);
     assert.equal(original.width, 20);
     assert.equal(original.height, 40);
-    assert.equal(original.bucket, 'originals');
-    assert.match(original.key, /^originals\/[a-f0-9]{32}\.jpg$/);
+    assert.equal(
+      (original.storageRef as { bucket?: string }).bucket,
+      'originals',
+    );
+    assert.match(
+      (original.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.jpg$/,
+    );
     assert.deepEqual(uploads[0].body, orientedJpeg);
     assert.equal(uploads[0].visibility, 'private');
   });
@@ -151,8 +157,14 @@ describe('uploadOriginal — raster bytes and metadata', () => {
     assert.equal(first.contentType, 'image/png');
     assert.equal(first.width, 32);
     assert.equal(first.height, 24);
-    assert.match(first.key, /^originals\/[a-f0-9]{32}\.png$/);
-    assert.notEqual(first.key, second.key);
+    assert.match(
+      (first.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.png$/,
+    );
+    assert.notEqual(
+      (first.storageRef as { key: string }).key,
+      (second.storageRef as { key: string }).key,
+    );
     assert.deepEqual(uploads[0].body, png);
   });
 
@@ -166,7 +178,10 @@ describe('uploadOriginal — raster bytes and metadata', () => {
 
     assert.equal(original.format, 'tiff');
     assert.equal(original.contentType, 'image/tiff');
-    assert.match(original.key, /^originals\/[a-f0-9]{32}\.tiff$/);
+    assert.match(
+      (original.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.tiff$/,
+    );
     assert.deepEqual(uploads[0].body, body);
   });
 
@@ -180,8 +195,16 @@ describe('uploadOriginal — raster bytes and metadata', () => {
       body: png,
       visibility: 'private',
     });
-    assert.equal(original.bucket, 'local-private');
-    assert.deepEqual(await readFile(join(`${dir}-private`, original.key)), png);
+    assert.deepEqual(original.storageRef, {
+      path: (original.storageRef as { path: string }).path,
+      visibility: 'private',
+    });
+    assert.deepEqual(
+      await readFile(
+        join(`${dir}-private`, (original.storageRef as { path: string }).path),
+      ),
+      png,
+    );
   });
 
   test('recognizes WebP and AVIF containers without rewriting their bytes', async () => {
@@ -228,7 +251,10 @@ describe('uploadOriginal — private SVG source', () => {
     assert.equal(original.width, 120);
     assert.equal(original.height, 80);
     assert.equal(original.size, body.byteLength);
-    assert.match(original.key, /^originals\/[a-f0-9]{32}\.svg$/);
+    assert.match(
+      (original.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.svg$/,
+    );
     assert.deepEqual(uploads[0].body, body);
     assert.equal(queueCalls, 0);
   });
@@ -429,8 +455,28 @@ describe('uploadOriginal — typed failures', () => {
     });
 
     assert.match(suggestedKey, /^originals\/[a-f0-9]{32}\.svg$/);
-    assert.equal(original.key, 'sha256/opaque-content-id');
-    assert.equal(original.bucket, 'objects');
+    assert.equal(
+      (original.storageRef as { key: string }).key,
+      'sha256/opaque-content-id',
+    );
+    assert.equal(
+      (original.storageRef as { bucket?: string }).bucket,
+      'objects',
+    );
     assert.equal(original.format, 'svg');
+  });
+
+  test('preserves a valid falsy scalar locator', async () => {
+    installApp();
+    const storage: ResizeStorage = {
+      download: async () => png,
+      upload: async () => 0,
+      publicUrl: () => '/zero',
+    };
+    const original = await new Resizer({ storage }).uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    assert.equal(original.storageRef, 0);
   });
 });

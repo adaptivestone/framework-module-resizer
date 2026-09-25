@@ -21,6 +21,13 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
 import type { StorageRef } from '../types.d.ts';
 import type { ResizeStorage } from './AbstractStorage.ts';
+import { validateLogicalKey, validateNamespace } from './placement.ts';
+
+interface S3StorageRef {
+  bucket: string;
+  key: string;
+  namespace?: string;
+}
 
 export interface S3StorageOptions {
   bucketPublic: string; // previews land here (upload visibility 'public')
@@ -68,13 +75,8 @@ export class S3Storage implements ResizeStorage {
     return this.#client;
   }
 
-  // Bucket allowlist (05 · §10.5): a stored `ref.bucket` MUST be one of the driver's configured
-  // buckets. A tampered media-doc `bucket` must never become a cross-bucket read or an
-  // attacker-controlled hostname in a public URL (the virtual-hosted form interpolates the bucket
-  // into the host). ref.bucket === undefined is fine — the caller uses the configured fallbacks.
-  #assertAllowedBucket(bucket: string | undefined): void {
+  #assertAllowedBucket(bucket: string): void {
     if (
-      bucket === undefined ||
       bucket === this.#opts.bucketPublic ||
       bucket === this.#opts.bucketPrivate
     ) {
@@ -86,6 +88,33 @@ export class S3Storage implements ResizeStorage {
     );
   }
 
+  #ref(value: StorageRef): S3StorageRef {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new ResizeSecurityError('resize s3: invalid storage ref', {
+        code: 'RESIZE_S3_REF_INVALID',
+      });
+    }
+    const ref = value as Record<string, unknown>;
+    if (
+      typeof ref.bucket !== 'string' ||
+      !ref.bucket ||
+      typeof ref.key !== 'string'
+    ) {
+      throw new ResizeSecurityError('resize s3: invalid storage ref', {
+        code: 'RESIZE_S3_REF_INVALID',
+      });
+    }
+    this.#assertAllowedBucket(ref.bucket);
+    validateLogicalKey(ref.key);
+    const namespace = validateNamespace(ref.namespace);
+    if (namespace && !ref.key.startsWith(`${namespace}/`)) {
+      throw new ResizeSecurityError('resize s3: namespace does not match key', {
+        code: 'RESIZE_S3_REF_INVALID',
+      });
+    }
+    return ref as unknown as S3StorageRef;
+  }
+
   // Upload a NEW object. Route by visibility (NO per-object ACL — public access is a
   // bucket policy). The driver owns the physical bucket; returns the ref to persist.
   async upload({
@@ -93,12 +122,48 @@ export class S3Storage implements ResizeStorage {
     body,
     contentType,
     visibility,
+    namespace,
+    parentRef,
   }: {
     key: string;
     body: Buffer | Uint8Array;
     contentType: string;
     visibility: 'public' | 'private';
+    namespace?: string;
+    parentRef?: StorageRef;
   }): Promise<StorageRef> {
+    if (parentRef !== undefined && namespace !== undefined) {
+      throw new ResizeSecurityError(
+        'resize s3: namespace and parentRef conflict',
+        {
+          code: 'RESIZE_S3_HINT_CONFLICT',
+        },
+      );
+    }
+    if (parentRef === null) {
+      throw new ResizeSecurityError('resize s3: invalid parentRef', {
+        code: 'RESIZE_S3_REF_INVALID',
+      });
+    }
+    const grouping = validateNamespace(
+      parentRef === undefined ? namespace : this.#ref(parentRef).namespace,
+    );
+    if (visibility !== 'public' && visibility !== 'private') {
+      throw new ResizeSecurityError('resize s3: invalid visibility', {
+        code: 'RESIZE_S3_VISIBILITY_INVALID',
+      });
+    }
+    const physicalKey = grouping
+      ? `${grouping}/${validateLogicalKey(key)}`
+      : validateLogicalKey(key);
+    if (Buffer.byteLength(physicalKey, 'utf8') > 1024) {
+      throw new ResizeSecurityError(
+        'resize s3: object key exceeds 1024 bytes',
+        {
+          code: 'RESIZE_S3_KEY_TOO_LONG',
+        },
+      );
+    }
     const bucket =
       visibility === 'public'
         ? this.#opts.bucketPublic
@@ -112,27 +177,27 @@ export class S3Storage implements ResizeStorage {
     await this.#getClient().send(
       new PutObjectCommand({
         Bucket: bucket,
-        Key: key,
+        Key: physicalKey,
         Body: body,
         ContentType: contentType,
       }),
     );
-    return { bucket, key };
+    return {
+      bucket,
+      key: physicalKey,
+      ...(grouping === undefined ? {} : { namespace: grouping }),
+    };
   }
 
-  // Download by stored locator (the worker's original). ref.bucket wins, then the
-  // private/public fallbacks.
   async download(ref: StorageRef): Promise<Buffer> {
-    this.#assertAllowedBucket(ref.bucket);
-    const bucket =
-      ref.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
+    const { bucket, key } = this.#ref(ref);
     const out = await this.#getClient().send(
-      new GetObjectCommand({ Bucket: bucket, Key: ref.key }),
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
     );
     const stream = out.Body;
     if (!stream) {
       throw new ResizeStorageError(
-        `resize s3: empty body for ${bucket}/${ref.key}`,
+        `resize s3: empty body for ${bucket}/${key}`,
         { code: 'RESIZE_S3_EMPTY_BODY' },
       );
     }
@@ -140,56 +205,47 @@ export class S3Storage implements ResizeStorage {
     return Buffer.from(bytes);
   }
 
-  // PURE, synchronous visibility check for originals. A missing ref.bucket follows the same
-  // effective-original-bucket rule as download/signedUrl: private first, then public. This means
-  // a legacy original without a persisted bucket stays private when bucketPrivate is configured.
   canServeOriginalPublicly(ref: StorageRef): boolean {
-    this.#assertAllowedBucket(ref.bucket);
-    const bucket =
-      ref.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
+    const { bucket } = this.#ref(ref);
     return bucket === this.#opts.bucketPublic;
   }
 
   // PURE string building — no SDK, no I/O (called on the read path). Three forms:
   // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
-  // virtual-hosted. bucket = ref.bucket ?? bucketPublic.
+  // virtual-hosted.
   publicUrl(ref: StorageRef): string {
-    this.#assertAllowedBucket(ref.bucket);
+    const { bucket, key } = this.#ref(ref);
     // A ref explicitly pointing at the configured private bucket must never be turned into a
     // public CDN URL. The engine normally prevents this call; keep the driver safe when a host
     // calls publicUrl directly too. If both buckets are the same, that bucket is intentionally
     // public and the check below does not reject it.
     if (
-      ref.bucket !== undefined &&
       this.#opts.bucketPrivate !== undefined &&
-      ref.bucket === this.#opts.bucketPrivate &&
-      ref.bucket !== this.#opts.bucketPublic
+      bucket === this.#opts.bucketPrivate &&
+      bucket !== this.#opts.bucketPublic
     ) {
       throw new ResizeSecurityError(
-        `resize s3: refusing public URL for private bucket "${ref.bucket}"`,
+        `resize s3: refusing public URL for private bucket "${bucket}"`,
         { code: 'RESIZE_S3_PRIVATE_ORIGINAL_PUBLIC_URL' },
       );
     }
-    const bucket = ref.bucket ?? this.#opts.bucketPublic;
     const publicBase = this.#opts.publicBaseUrl ?? this.#opts.publicUrl;
     if (publicBase) {
-      return `${publicBase.replace(/\/+$/, '')}/${ref.key}`;
+      return `${publicBase.replace(/\/+$/, '')}/${key}`;
     }
     if (this.#opts.endpoint !== undefined || this.#opts.forcePathStyle) {
       const base = (this.#opts.endpoint ?? '').replace(/\/+$/, '');
-      return `${base}/${bucket}/${ref.key}`;
+      return `${base}/${bucket}/${key}`;
     }
-    return `https://${bucket}.s3.${this.#opts.region ?? 'us-east-1'}.amazonaws.com/${ref.key}`;
+    return `https://${bucket}.s3.${this.#opts.region ?? 'us-east-1'}.amazonaws.com/${key}`;
   }
 
   // Time-limited signed URL for owner/admin reads of a private original.
   async signedUrl(ref: StorageRef, ttlSeconds: number): Promise<string> {
-    this.#assertAllowedBucket(ref.bucket);
-    const bucket =
-      ref.bucket ?? this.#opts.bucketPrivate ?? this.#opts.bucketPublic;
+    const { bucket, key } = this.#ref(ref);
     return getSignedUrl(
       this.#getClient(),
-      new GetObjectCommand({ Bucket: bucket, Key: ref.key }),
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
       { expiresIn: ttlSeconds },
     );
   }

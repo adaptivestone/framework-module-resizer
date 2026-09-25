@@ -183,7 +183,10 @@ function mediaDoc(
 ): MediaLike {
   return {
     id: over.id ?? 'm1',
-    original: { key: 'uploads/orig', ...(over.original ?? {}) } as Original,
+    original: {
+      storageRef: { key: 'uploads/orig' },
+      ...(over.original ?? {}),
+    } as Original,
     previews: over.previews ?? [],
   };
 }
@@ -272,7 +275,10 @@ describe('processTask — source handling', () => {
     const { storage, uploads } = makeStorage(smallSvg);
     const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({
-        original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
+        original: {
+          storageRef: { key: 'uploads/x.svg' },
+          contentType: 'image/svg+xml',
+        },
       }),
     );
     new Resizer({
@@ -409,7 +415,7 @@ describe('processTask — variants', () => {
     const existing = {
       sizeKey: '20x20',
       format: 'jpeg',
-      key: 'e',
+      storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { mediaStore, appendCalls } = makeMediaStore(
@@ -725,7 +731,13 @@ describe('processTask — persistence & failure handling', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(
-      mediaDoc({ original: { key: 'uploads/orig', width: 64, height: 48 } }),
+      mediaDoc({
+        original: {
+          storageRef: { key: 'uploads/orig' },
+          width: 64,
+          height: 48,
+        },
+      }),
     );
     new Resizer({
       storage,
@@ -885,7 +897,7 @@ describe('processTask — persistence & failure handling', () => {
     const media = mediaDoc();
     let loads = 0;
     const concurrent = {
-      key: 'concurrent.jpg',
+      storageRef: { key: 'concurrent.jpg' },
       contentType: 'image/jpeg',
       sizeKey: '20x20',
       format: 'jpeg' as const,
@@ -1130,7 +1142,7 @@ describe('generate (eager)', () => {
     const existing = {
       sizeKey: '20x20',
       format: 'jpeg',
-      key: 'e',
+      storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { mediaStore, appendCalls } = makeMediaStore(null);
@@ -1154,7 +1166,12 @@ describe('generate (eager)', () => {
     await assert.rejects(
       () =>
         r.generate({
-          media: { original: { key: 'uploads/o', contentType: 'image/jpeg' } },
+          media: {
+            original: {
+              storageRef: { key: 'uploads/o' },
+              contentType: 'image/jpeg',
+            },
+          },
           sizes: [{ width: 20, height: 20 }],
           formats: ['jpeg'],
         }),
@@ -1169,7 +1186,10 @@ describe('generate (eager)', () => {
     const r = new Resizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
-        original: { key: 'uploads/x.svg', contentType: 'image/svg+xml' },
+        original: {
+          storageRef: { key: 'uploads/x.svg' },
+          contentType: 'image/svg+xml',
+        },
       }),
       sizes: [{ width: 80, height: 80 }],
       formats: ['jpeg', 'webp', 'avif'],
@@ -1196,7 +1216,9 @@ describe('generate (eager)', () => {
     const { mediaStore } = makeMediaStore(null);
     const r = new Resizer({ storage, mediaStore });
     const result = await r.generate({
-      media: mediaDoc({ original: { key: 'uploads/x.svg', format: 'svg' } }),
+      media: mediaDoc({
+        original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+      }),
       sizes: [{ width: 200, height: 200 }, { fit: true }],
       formats: ['webp'],
     });
@@ -1205,9 +1227,14 @@ describe('generate (eager)', () => {
       result.created.map((preview) => [preview.sizeKey, preview]),
     );
     const cover = uploads.find(
-      (upload) => upload.key === byKey.get('200x200')?.key,
+      (upload) =>
+        upload.key ===
+        (byKey.get('200x200')?.storageRef as { key: string })?.key,
     );
-    const fit = uploads.find((upload) => upload.key === byKey.get('fit')?.key);
+    const fit = uploads.find(
+      (upload) =>
+        upload.key === (byKey.get('fit')?.storageRef as { key: string })?.key,
+    );
     assert.ok(cover);
     assert.ok(fit);
     assert.equal((await sharp(cover.body).metadata()).width, 200);
@@ -1231,6 +1258,48 @@ describe('generate (eager)', () => {
         assert.equal(err.mediaId, 'm1');
         return true;
       },
+    );
+  });
+
+  test('eager generation passes a falsy scalar original and persists a falsy preview ref', async () => {
+    installApp();
+    const refs: unknown[] = [];
+    const storage: ResizeStorage = {
+      download: async (ref) => {
+        refs.push(ref);
+        return redPng;
+      },
+      upload: async () => false,
+      publicUrl: () => '/preview',
+    };
+    const r = new Resizer({ storage });
+    const result = await r.generate({
+      media: { id: 'scalar', original: { storageRef: 0 } },
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+      persist: false,
+    });
+    assert.deepEqual(refs, [0]);
+    assert.equal(result.created[0]?.storageRef, false);
+  });
+
+  test('rejects a nullish preview ref instead of appending it', async () => {
+    installApp();
+    const storage: ResizeStorage = {
+      download: async () => redPng,
+      upload: async () => null,
+      publicUrl: () => '/preview',
+    };
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: { id: 'bad-ref', original: { storageRef: 0 } },
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+          persist: false,
+        }),
+      (error: unknown) => error instanceof ResizeGenerateError,
     );
   });
 

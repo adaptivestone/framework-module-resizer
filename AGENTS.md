@@ -88,7 +88,8 @@ a private original.
 5. The scaffolded `src/config/resize.ts` extends the canonical package defaults from
    `@adaptivestone/framework-module-resize/config/resize.js`. Set
    `mediaModelName: 'File'` (your host media model's name) and keep only host overrides there.
-   Put environment-only changes in `resize.<NODE_ENV>.ts`; the framework merges that file before
+   Put environment-only changes in `resize.<NODE_ENV>.ts` (for example,
+   `resize.production.ts`); the framework merges that file before
    this module reads and validates the resolved config. Do not add a second runtime merge.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
@@ -99,6 +100,10 @@ a private original.
    // in the model:
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
+
+   Keep `minimize: false` on the media schema (already the Framework `BaseModel`
+   default). Direct Mongoose users must pass `{ minimize: false }` to `new Schema`.
+   Otherwise empty objects in opaque `storageRef` values can disappear on save/update.
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model and
    the framework's `Lock` model declare their indexes; the host's normal lifecycle or an explicit
@@ -122,6 +127,7 @@ Store an original (no model creation and no queue work; persist the returned val
 const original = await getResizer().uploadOriginal({
   body: buffer,
   visibility: 'private',
+  // Optional audit grouping: namespace: `users/${user.id}` or `products/${product.id}`,
 });
 ```
 
@@ -135,7 +141,12 @@ Persist every original privately, then call the same `prewarm()` / `enqueueRequi
 raster and SVG. The worker creates the requested Sharp previews for both. SVG is an input
 format only; public upload of an SVG original is rejected. Configure a distinct private S3
 bucket, or for `LocalFsStorage` keep its private root outside the static server's public root.
-Legacy `original.publicCopy` data is ignored by the read and worker paths.
+Persist `original.storageRef` and `previews[].storageRef` through the host media schema.
+The shipped drivers keep optional grouping metadata in their refs; the worker passes the
+original ref to the driver as `parentRef` when creating public previews. The namespace
+is a placement hint, not authorization. This nested ref shape is a breaking change:
+update host models, DTOs, custom drivers, and API/worker processes together. No old
+record reader or migration is included.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately:
@@ -240,7 +251,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   drift in CI with `npx resize-scaffold --check`.
 - SVG originals stay private. The worker rasterizes SVG into the requested public preview
   formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
-  shortcut returns uploaded SVG markup, even for legacy `original.publicCopy` records.
+  shortcut returns uploaded SVG markup.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.

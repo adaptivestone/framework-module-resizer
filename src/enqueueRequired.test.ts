@@ -73,7 +73,7 @@ describe('enqueueRequired — explicit coverage', () => {
       lockProvider: locks().lockProvider,
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'original.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
@@ -94,10 +94,10 @@ describe('enqueueRequired — explicit coverage', () => {
     const readyResult = await ready.enqueueRequired({
       media: {
         id: 'm1',
-        original: { key: 'original.jpg' },
+        original: { storageRef: { key: 'original.jpg' } },
         previews: [
           {
-            key: 'ready.jpg',
+            storageRef: { key: 'ready.jpg' },
             sizeKey: '300x300',
             format: 'jpeg',
             contentType: 'image/jpeg',
@@ -119,7 +119,10 @@ describe('enqueueRequired — explicit coverage', () => {
     const svgResult = await svg.enqueueRequired({
       media: {
         id: 'm2',
-        original: { key: 'logo.svg', contentType: 'image/svg+xml' },
+        original: {
+          storageRef: { key: 'logo.svg' },
+          contentType: 'image/svg+xml',
+        },
       },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -132,7 +135,7 @@ describe('enqueueRequired — explicit coverage', () => {
     assert.equal(
       (
         await empty.enqueueRequired({
-          media: { id: 'm3', original: { key: 'x.jpg' } },
+          media: { id: 'm3', original: { storageRef: { key: 'x.jpg' } } },
           sizes: [],
         })
       ).reason,
@@ -146,7 +149,7 @@ describe('enqueueRequired — explicit coverage', () => {
       hooks: { beforeEnqueue: () => [] },
     });
     const filteredResult = await filtered.enqueueRequired({
-      media: { id: 'm4', original: { key: 'x.jpg' } },
+      media: { id: 'm4', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -159,7 +162,7 @@ describe('enqueueRequired — explicit coverage', () => {
     installApp();
     const noTransport = new Resizer({ storage });
     const missingTransport = await noTransport.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -188,7 +191,7 @@ describe('enqueueRequired — explicit coverage', () => {
     assert.equal(missingOriginal.issues[0].code, 'RESIZE_ENQUEUE_NO_ORIGINAL');
 
     const nullTask = await noOriginal.enqueueRequired({
-      media: { id: 'm3', original: { key: 'x.jpg' } },
+      media: { id: 'm3', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -210,7 +213,7 @@ describe('enqueueRequired — explicit coverage', () => {
       lockProvider: locks().lockProvider,
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -236,7 +239,7 @@ describe('enqueueRequired — lock races and retries', () => {
       lockProvider: locks(false).lockProvider,
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -261,7 +264,7 @@ describe('enqueueRequired — lock races and retries', () => {
       lockProvider: locks(false).lockProvider,
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -290,7 +293,7 @@ describe('enqueueRequired — lock races and retries', () => {
     });
 
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -326,7 +329,7 @@ describe('enqueueRequired — lock races and retries', () => {
     });
 
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -363,7 +366,7 @@ describe('enqueueRequired — lock races and retries', () => {
       });
 
       const result = await r.enqueueRequired({
-        media: { id: `m-${label}`, original: { key: 'x.jpg' } },
+        media: { id: `m-${label}`, original: { storageRef: { key: 'x.jpg' } } },
         sizes: [{ width: 300, height: 300 }],
         formats: ['jpeg'],
       });
@@ -397,7 +400,7 @@ describe('enqueueRequired — lock races and retries', () => {
     });
 
     const result = await r.enqueueRequired({
-      media: { id: 'm-same', original: { key: 'x.jpg' } },
+      media: { id: 'm-same', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -427,7 +430,7 @@ describe('enqueueRequired — lock races and retries', () => {
     });
 
     const result = await r.enqueueRequired({
-      media: { id: 'm-filters', original: { key: 'x.jpg' } },
+      media: { id: 'm-filters', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -457,7 +460,7 @@ describe('enqueueRequired — lock races and retries', () => {
     });
 
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['webp'],
     });
@@ -492,7 +495,7 @@ describe('enqueueRequired — lock races and retries', () => {
     });
 
     const result = await r.enqueueRequired({
-      media: { id: 'm-separate', original: { key: 'x.jpg' } },
+      media: { id: 'm-separate', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
@@ -523,7 +526,7 @@ describe('enqueueRequired — lock races and retries', () => {
     const { lockProvider, released } = locks(true);
     const r = new Resizer({ storage, transport, lockProvider });
     const opts: Parameters<Resizer['enqueueRequired']>[0] = {
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     };
@@ -548,7 +551,7 @@ describe('enqueueRequired — lock races and retries', () => {
       lockProvider: locks((key) => key.includes(':jpeg:')).lockProvider,
     });
     const result = await r.enqueueRequired({
-      media: { id: 'm1', original: { key: 'x.jpg' } },
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });

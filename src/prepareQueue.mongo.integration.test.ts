@@ -199,7 +199,7 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       lockProvider: fixture.lockProvider,
     });
     const result = await resizer.enqueueRequired({
-      media: { id: mediaId, original: { key: 'original.jpg' } },
+      media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 30 }],
       formats: ['webp'],
     });

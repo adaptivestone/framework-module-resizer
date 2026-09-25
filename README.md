@@ -129,6 +129,11 @@ const { decision } = await resizer.resolve({
 from `…/config/resize.js`; set `mediaModelName` and only the host-specific overrides. Spread
 `resizeMediaSchemaFragment` into the model so `original` + `previews[]` exist. Listing queries:
 
+Framework environment overrides use `resize.<NODE_ENV>.ts`, for example
+`resize.production.ts`. The Framework's file loader filters out `*.test.ts`, so
+`resize.test.ts` cannot serve as a config override with the currently installed
+Framework release.
+
 ```ts
 import { resizeMediaPaths } from '@adaptivestone/framework-module-resize';
 File.find().select(['mediaType', ...resizeMediaPaths]);
@@ -139,18 +144,29 @@ S3 when you have buckets; a queue when listings are huge — both are later sect
 ### Original upload
 
 `uploadOriginal()` sniffs the actual bytes, creates a random `originals/<hex>.<ext>` suggested
-key, writes through the configured `storage.upload()`, and returns a complete `Original` locator with
+key, writes through the configured `storage.upload()`, and returns an `Original` with an opaque
+`storageRef` and
 `format`, `contentType`, byte `size`, and reliable display dimensions when known. It does not
 create a media document, enqueue variants, or know anything about users, owners, routes, or DTOs.
 Built-in filesystem/S3 drivers preserve the suggested extension; a custom content-addressed
-driver may return its own opaque locator key.
+driver may return its own JSON-compatible locator. The host persists the entire returned
+`Original` in its media model. The old spread `original.key`/`bucket` and
+`previews[].key`/`bucket` fields have been replaced by nested `storageRef` fields.
+
+Grouping is optional and is only a placement hint. For example, pass
+`namespace: \`users/${user.id}\`` or `namespace: \`products/${product.id}\`` to
+`uploadOriginal()`, or omit it for ungrouped objects. The shipped drivers accept
+slash-separated ASCII segments (`A-Z`, `a-z`, `0-9`, `_`, `-`, `.`), rejecting empty,
+`.` and `..` segments and other characters. The host remains responsible for
+authorization. The original ref stores this grouping, so a later worker can pass it as
+`parentRef` to the driver when creating a public preview after a process restart.
 
 Input bytes are stored unchanged. Format and dimensions for raster images and SVG are read
 with `sharp().metadata()` under the configured pixel limits. No output image is rendered,
 rotated, or re-encoded. SVG stays `.svg` with `image/svg+xml` as a private original. The worker
 later produces the requested raster previews through Sharp.
 SVG dimensions are those reported by Sharp, including dimensions derived from `viewBox`.
-SVG without dimensions that Sharp can determine is rejected. Previously stored rows are unchanged.
+SVG without dimensions that Sharp can determine is rejected.
 There is no separate XML validator, DTD prohibition, or sanitizer. Sharp metadata inspection does
 not remove scripts or external references from the private original. The module rejects public SVG
 uploads and serves only generated raster previews for accepted SVG input.
@@ -251,6 +267,20 @@ class File extends BaseModel {
   static get modelSchema() { return { ...existingFields, ...resizeMediaSchemaFragment } as const; }
 }
 ```
+
+The media schema must use `minimize: false` to preserve opaque refs such as `{}` or
+`{ id: 'x', options: {} }`. Framework `BaseModel` already sets this default; retain it.
+When using Mongoose directly, configure it explicitly:
+
+```ts
+const schema = new mongoose.Schema(
+  { ...existingFields, ...resizeMediaSchemaFragment },
+  { minimize: false },
+);
+```
+
+Without this option, Mongoose can remove a ref or its empty nested objects during
+original saves and preview updates, changing the locator passed back to the driver.
 
 At **upload**, prefer `uploadOriginal()` and persist its returned metadata on the media doc. Legacy
 hosts may still populate `original` themselves; if dimensions are absent, the worker backfills
@@ -441,9 +471,12 @@ Default story for tests and first-week local. Same `download` / `upload` / `publ
 Option is `publicBaseUrl` (never `publicUrl`) so it cannot shadow the method.
 
 The host serves only `rootDir` at `publicBaseUrl`; it must not mount `privateRootDir` in the
-static server. The storage driver writes `visibility: 'private'` uploads there and records
-`bucket: 'local-private'` so the worker can download them. Existing legacy local refs without
-that marker still read from `rootDir`; move or deny any old public originals during rollout.
+static server. The driver stores `{ path, visibility, namespace? }` inside `storageRef`.
+`path` is relative to the root selected by `visibility`; private objects never receive
+a public URL. Keep both roots writable only by the application and do not place symlinks
+to private or external directories in the public tree. Read/write operations check real
+paths, while `publicUrl()` stays synchronous and cannot inspect the filesystem. A process
+that can concurrently replace directories inside the roots can race those checks.
 
 ### `S3Storage({ … })`
 
@@ -467,7 +500,7 @@ new S3Storage({
 
 `publicUrl()` is **pure and I/O-free** (called on the read path). No per-object ACL — public access
 is a bucket policy. Credentials via the AWS provider chain. `download`/`publicUrl`/`signedUrl`
-enforce a **bucket allowlist**: a stored `ref.bucket` must be one of the configured
+enforce a **bucket allowlist**: an S3 `storageRef.bucket` must be one of the configured
 `bucketPublic`/`bucketPrivate`, else they throw a named error — so a tampered media-doc `bucket`
 can never become a cross-bucket read or an attacker-controlled hostname in a URL.
 
@@ -477,21 +510,25 @@ Any seam takes a plain object (or class) that satisfies the interface — no `ap
 closes over its own client. For plain S3 use `S3Storage`; for anything else (GCS, filesystem, R2):
 
 ```ts
-new Resizer({ /* … */, storage: {
-  download: (ref) => s3.getObject(ref.bucket!, ref.key),
-  upload: async ({ key, body, contentType, visibility }) => {
-    const bucket = visibility === 'public' ? 'my-cdn' : 'my-originals';
-    await s3.putObject(bucket, key, body, contentType);
-    return { bucket, key };               // ← persisted onto the preview/original
-  },
-  publicUrl: (ref) => `https://cdn.example.com/${ref.key}`,   // pure; no I/O
-  signedUrl: (ref, ttl) => s3.getSignedUrl(ref.bucket!, ref.key, ttl),
-}});
+import { Resizer, type ResizeStorage } from '@adaptivestone/framework-module-resize';
+
+// `StorageRef` is opaque to the module. A custom driver validates its own JSON-compatible
+// locator when receiving download/publicUrl/signedUrl/parentRef calls.
+// `myStore` is the host's storage implementation.
+const storage: ResizeStorage = {
+  download: (ref) => myStore.download(ref),
+  upload: ({ key, body, contentType, visibility, namespace, parentRef }) =>
+    myStore.upload({ key, body, contentType, visibility, namespace, parentRef }),
+  publicUrl: (ref) => myStore.publicUrl(ref), // pure; no I/O
+};
+new Resizer({ storage });
 ```
 
 The same pattern swaps `mediaStore` (e.g. another DB/ORM) or `lockProvider` (e.g. Redis/redlock).
-A custom media store implements `load` and `appendPreviews`. Older drivers may still expose
-`setOriginalPublicCopy`, but the SVG worker no longer calls it.
+A custom media store implements `load` and `appendPreviews`. A custom storage driver
+must persist a ref unchanged through the media store and inherit grouping from its own
+`parentRef` for derived previews. The shipped drivers reject simultaneous `namespace`
+and `parentRef` hints; custom drivers should follow the same contract.
 Contract types (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`, …) are exported
 from the main entry for custom-driver authors.
 
@@ -709,7 +746,7 @@ raster task completes only when every requested identity is covered. Successfull
 variants are persisted before an incomplete task is failed into the existing backoff/retry path;
 the next delivery generates only the missing identities, and permanent gaps reach dead-letter.
 `afterTaskComplete` fires only after full coverage. A deleted media row remains a successful no-op;
-a live row without `original.key` is an observable terminal media error.
+a live row without `original.storageRef` is an observable terminal media error.
 
 **SVG originals use the same task lifecycle.** Upload and persist the original privately, then call
 the same `prewarm()` or `enqueueRequired()` used for raster images. The worker reads the SVG through
@@ -725,8 +762,7 @@ await resizer.prewarm({ media, sizes });
 
 With `S3Storage`, configure distinct `bucketPrivate` and `bucketPublic` values and a bucket
 policy that keeps the private bucket inaccessible to the public. The original locator stays in
-`media.original`; generated previews are stored in the public bucket. `resolve()` ignores any
-legacy `original.publicCopy` and waits for real previews. Owner/admin context does not expose the
+`media.original`; generated previews are stored in the public bucket. Owner/admin context does not expose the
 uploaded SVG through the read path. `LocalFsStorage` writes private originals outside its public
 root; the host must expose only that public root through its static server.
 
@@ -736,8 +772,13 @@ implement `canServeOriginalPublicly(ref)`. The engine never treats an arbitrary 
 previews remain the preferred public read path.
 
 **Deleting media / storage cleanup is host-owned.** The module appends previews but does not delete
-them; removing a media doc's storage objects (originals, derivatives, and any legacy SVG copies)
+them; removing a media doc's storage objects (originals and derivatives)
 is your lifecycle.
+
+**Breaking change:** the new nested `storageRef` shape has no legacy-record reader or
+automatic migration. Update host schemas, direct `key`/`bucket` reads, DTO helpers, custom
+drivers, and API/worker processes together. Start processing new records only when every
+process uses the new contract and the target dataset needs no old records.
 
 ---
 

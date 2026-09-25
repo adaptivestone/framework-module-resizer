@@ -110,7 +110,8 @@ export async function resolveImpl(
         try {
           originalIsPublic =
             original != null &&
-            storage.canServeOriginalPublicly?.(original) === true;
+            original.storageRef != null &&
+            storage.canServeOriginalPublicly?.(original.storageRef) === true;
         } catch (err) {
           getApp().logger.error(
             'resize resolve: canServeOriginalPublicly threw — treating original as private',
@@ -141,7 +142,7 @@ export async function resolveImpl(
           const entry: ReadyEntry = {
             sizeKey,
             format,
-            url: storage.publicUrl(existing),
+            url: storage.publicUrl(existing.storageRef),
             preview: existing,
             contentType: existing.contentType,
           };
@@ -221,9 +222,9 @@ export async function resolveImpl(
     // lazy mode (enqueue), no transport means eager-only (do not log-on-every-read).
     const enqueueMissing = opts.enqueueMissing ?? resizer.transport != null;
     if (enqueueMissing && decision.missing.length > 0) {
-      if (!media.original?.key) {
+      if (media.original?.storageRef == null) {
         getApp().logger.info(
-          `resize resolve: media ${mediaId} has no original key — nothing enqueued`,
+          `resize resolve: media ${mediaId} has no original storage ref — nothing enqueued`,
         );
       } else if (!resizer.transport) {
         getApp().logger.warn(
@@ -306,9 +307,9 @@ export async function prewarmImpl(
       return { enqueued: 0 };
     }
 
-    if (!media.original?.key) {
+    if (media.original?.storageRef == null) {
       getApp().logger.info(
-        `resize prewarm: media ${mediaId} has no original key — nothing enqueued`,
+        `resize prewarm: media ${mediaId} has no original storage ref — nothing enqueued`,
       );
       return { enqueued: 0 };
     }
@@ -419,7 +420,7 @@ export async function enqueueRequiredImpl(
       issues: [],
     };
   }
-  if (!media.original?.key) {
+  if (media.original?.storageRef == null) {
     return {
       status: 'incomplete',
       requested,
@@ -431,7 +432,7 @@ export async function enqueueRequiredImpl(
       issues: [
         {
           code: 'RESIZE_ENQUEUE_NO_ORIGINAL',
-          message: `media ${mediaId} has no original key`,
+          message: `media ${mediaId} has no original storage ref`,
           retryable: false,
           previews: required,
         },
@@ -466,7 +467,10 @@ async function originalUrl(
   const storage = resizer.storage;
   if ((ctx.isOwner || ctx.isAdmin) && storage.signedUrl) {
     try {
-      return await storage.signedUrl(original, SIGNED_ORIGINAL_TTL_SECONDS);
+      return await storage.signedUrl(
+        original.storageRef,
+        SIGNED_ORIGINAL_TTL_SECONDS,
+      );
     } catch (err) {
       getApp().logger.error(
         'resize resolve: signedUrl failed — private original stays unavailable',
@@ -477,7 +481,7 @@ async function originalUrl(
       }
     }
   }
-  return originalIsPublic ? storage.publicUrl(original) : undefined;
+  return originalIsPublic ? storage.publicUrl(original.storageRef) : undefined;
 }
 
 /** Log the never-throw catch; if getApp() itself threw (called pre-Server), use console. */

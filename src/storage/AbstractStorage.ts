@@ -16,6 +16,8 @@ export interface ResizeStorage {
     body: Buffer | Uint8Array;
     contentType: string;
     visibility: 'public' | 'private';
+    namespace?: string;
+    parentRef?: StorageRef;
   }): Promise<StorageRef>;
   // PURE, synchronous, NO I/O — the read path calls this to build public URLs (05 · §10.4).
   publicUrl(ref: StorageRef): string;

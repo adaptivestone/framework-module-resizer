@@ -466,7 +466,7 @@ describe('MongoTransport.enqueue', () => {
       lockProvider: { acquire: async () => false, release: async () => {} },
     });
     const result = await r.enqueueRequired({
-      media: { id: mediaId, original: { key: 'original.jpg' } },
+      media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });

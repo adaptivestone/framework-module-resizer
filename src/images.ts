@@ -245,7 +245,7 @@ export function isSvgOriginal(original: Original | undefined): boolean {
 
 export function isUsablePreview(preview: Preview): boolean {
   return Boolean(
-    preview.key &&
+    preview.storageRef != null &&
       preview.contentType &&
       preview.contentType !== 'image/svg+xml' &&
       preview.format !== 'svg',

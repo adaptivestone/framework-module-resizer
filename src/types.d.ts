@@ -57,18 +57,11 @@ export type OriginalFormat = string;
 // into the identity. e.g. { blur: 40 }. Empty / undefined → 'none' in the identity.
 export type Filters = Record<string, string | number | boolean>;
 
-// Opaque storage locator round-tripped between the module and the active storage
-// driver. `key` is always present; `bucket` is S3-specific — a filesystem/GCS/other
-// driver may omit it. The module never interprets these fields; it passes them back
-// to the driver's download/publicUrl/signedUrl (see 05 · §10.4).
-export interface StorageRef {
-  key: string;
-  bucket?: string;
-}
+// A JSON-compatible locator owned and validated by the active storage driver.
+export type StorageRef = unknown;
 
-export interface Original extends StorageRef {
-  // Legacy locator from earlier SVG pass-through releases; ignored by resize/read paths.
-  publicCopy?: StorageRef;
+export interface Original {
+  storageRef: StorageRef;
   format?: string;
   size?: number;
   contentType?: string;
@@ -79,9 +72,11 @@ export interface Original extends StorageRef {
 export interface UploadOriginalOpts {
   body: Buffer | Uint8Array;
   visibility: 'public' | 'private';
+  namespace?: string;
 }
 
-export interface Preview extends StorageRef {
+export interface Preview {
+  storageRef: StorageRef;
   sizeKey: string; // canonical size key — see 03 · Identity
   filters?: Filters; // part of identity — see 03 · Identity
   requestedWidth?: number;

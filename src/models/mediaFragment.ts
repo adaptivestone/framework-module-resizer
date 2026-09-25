@@ -10,8 +10,7 @@
 // (Mixed / subdoc arrays) the HOST layers the framework's TsTypeOverride<Original> /
 // TsTypeOverride<Preview[]> for exact field types — see the usage note below.
 //
-// Opt-in, scaffolded as a commented example: many hosts have a pre-existing media model
-// with a legacy preview shape + migration that a forced fragment would collide with.
+// Opt-in, scaffolded as a commented example: hosts may have a media model of their own.
 //
 // Usage (exactly as spec/08 §12):
 //   import { resizeMediaSchemaFragment } from '@adaptivestone/framework-module-resize';
@@ -20,18 +19,13 @@
 //       return { ...existingFields, ...resizeMediaSchemaFragment } as const;
 //     }
 //   }
+// The host schema must use minimize:false to preserve empty objects inside opaque
+// refs. Framework BaseModel already defaults to this. Direct Mongoose users must
+// pass { minimize: false } as the second argument to new mongoose.Schema(...).
 export const resizeMediaSchemaFragment = {
-  // The stored original (Original): `key` (+ optional S3-only `bucket`, StorageRef) plus
-  // metadata. publicCopy is retained only so existing documents can be read during
-  // migration; new SVG previews never write or serve it. width/height are captured
-  // at upload or backfilled.
+  // The driver's opaque, JSON-compatible locator plus module metadata.
   original: {
-    key: { type: String },
-    bucket: { type: String }, // omitted by non-S3 drivers; present for S3
-    publicCopy: {
-      key: { type: String },
-      bucket: { type: String },
-    },
+    storageRef: { type: 'Mixed' },
     format: { type: String },
     size: { type: Number },
     contentType: { type: String },
@@ -42,8 +36,7 @@ export const resizeMediaSchemaFragment = {
   // (sizeKey, format, filters) identity.
   previews: [
     {
-      key: { type: String },
-      bucket: { type: String }, // omitted by non-S3 drivers; present for S3
+      storageRef: { type: 'Mixed' },
       sizeKey: { type: String },
       // Filters bag (Mixed). 'Mixed' string alias keeps this import-free; the host
       // tightens the whole array with TsTypeOverride<Preview[]> for exact field types.

@@ -149,6 +149,7 @@ export async function uploadOriginalImpl(
       body,
       contentType: prepared.contentType,
       visibility: opts.visibility,
+      ...(opts.namespace === undefined ? {} : { namespace: opts.namespace }),
     });
   } catch (cause) {
     throw new ResizeStorageError(
@@ -156,19 +157,14 @@ export async function uploadOriginalImpl(
       { code: 'RESIZE_ORIGINAL_UPLOAD_FAILED', cause },
     );
   }
-  if (
-    typeof ref !== 'object' ||
-    ref === null ||
-    typeof ref.key !== 'string' ||
-    !ref.key
-  ) {
+  if (ref === null || ref === undefined) {
     throw new ResizeStorageError(
       'resize uploadOriginal: storage returned an invalid original locator',
       { code: 'RESIZE_ORIGINAL_STORAGE_REF_INVALID' },
     );
   }
   return {
-    ...ref,
+    storageRef: ref,
     format: prepared.format,
     contentType: prepared.contentType,
     size: body.byteLength,

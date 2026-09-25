@@ -14,6 +14,7 @@ import {
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
+  ResizeStorageError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { isAvifBuffer } from './helpers/imageFormat.ts';
@@ -43,15 +44,6 @@ import type {
 /** Normalize a driver download / beforeStep result to a Node Buffer for the next sharp(). */
 const asBuffer = (b: Buffer | Uint8Array): Buffer =>
   Buffer.isBuffer(b) ? b : Buffer.from(b);
-
-/** Random folder prefix for a preview key = the original key's folder, else 'uploads'. */
-function keyPrefix(originalKey: string | undefined): string {
-  if (!originalKey) {
-    return 'uploads';
-  }
-  const idx = originalKey.lastIndexOf('/');
-  return idx > 0 ? originalKey.slice(0, idx) : 'uploads';
-}
 
 // ---------------------------------------------------------------------------
 // The shared core (07 steps 2–8; 11 · §11.1 step 4). Both modes expand their inputs into a
@@ -103,14 +95,14 @@ export async function generatePreviews(
   }
 
   const original = media.original;
-  if (!original) {
+  if (original?.storageRef == null) {
     // Callers guard this, but never assume — a media without an original has nothing to
     // resize from.
     return { generated, failedCount };
   }
 
   // 2. Download the original ONCE.
-  let buf = asBuffer(await storage.download(original));
+  let buf = asBuffer(await storage.download(original.storageRef));
 
   // 3. Metadata + decode-bomb guards + orientation normalization (07 · §11 step 3). EVERY worker
   // sharp() call carries limitInputPixels (01 · §16), so an oversized-for-inputPixels source is
@@ -360,16 +352,26 @@ export async function generatePreviews(
         );
       }
       const contentType = `image/${outputFormat}`;
-      const key = `${keyPrefix(original.key)}/${randomHex()}.${outputFormat}`;
+      const key = `previews/${randomHex()}.${outputFormat}`;
       const ref = await storage.upload({
         key,
         body: data,
         contentType,
         visibility: 'public',
+        parentRef: original.storageRef,
       });
 
+      if (ref == null) {
+        throw new ResizeStorageError(
+          'resize: storage returned an invalid preview locator',
+          {
+            code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID',
+          },
+        );
+      }
+
       const preview: Preview = {
-        ...ref,
+        storageRef: ref,
         sizeKey: v.sizeKey,
         format: v.format,
         contentType,
@@ -469,7 +471,7 @@ export async function processTask(
     );
     return;
   }
-  if (!media.original?.key) {
+  if (media.original?.storageRef == null) {
     throw new ResizeNoOriginalError(task.mediaId);
   }
   const requestedByIdentity = new Map<string, MissingPreview>();
@@ -556,7 +558,7 @@ export async function generateImpl(
   const mediaId = requireMediaId(media);
 
   const original = media.original;
-  if (!original?.key) {
+  if (original?.storageRef == null) {
     throw new ResizeNoOriginalError(mediaId);
   }
 
