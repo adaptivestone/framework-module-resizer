@@ -6,12 +6,19 @@
 // can install a fake per run.
 import type { Metadata, Sharp } from 'sharp';
 import { getApp } from './app.ts';
-import { prewarmImpl, resolveImpl } from './engine.ts';
+import {
+  type EnqueueRequiredOpts,
+  enqueueRequiredImpl,
+  prewarmImpl,
+  resolveImpl,
+} from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
 import type { LockProvider } from './locks/AbstractLockProvider.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
 import { FrameworkMediaStore } from './mediaStore/framework.ts';
+import { uploadOriginalImpl } from './original.ts';
+import { getResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
 // Transport + storage contracts (05 · §10.1, §10.4) now live in their own files —
 // transports/AbstractTransport.ts + storage/AbstractStorage.ts — so the optional-peer drivers
@@ -24,12 +31,15 @@ import type {
   QueueTransport,
 } from './transports/AbstractTransport.ts';
 import type {
+  EnqueueRequiredResult,
   MediaLike,
   MissingPreview,
+  Original,
   Preview,
   PreviewFormat,
   ReadDecision,
   SizeInput,
+  UploadOriginalOpts,
 } from './types.d.ts';
 
 export type { LockProvider } from './locks/AbstractLockProvider.ts';
@@ -139,13 +149,13 @@ export interface GenerateOpts {
   media: MediaLike;
   sizes: SizeInput[];
   pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = requiredFormats(config)
+  formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // real ctx reaches pipeline steps (eager mode, 04 · §8)
   persist?: boolean; // default true → $push previews + backfill dims
 }
 
 // `created` is only the rows THIS call produced. Empty + `failed === 0` is success
-// (already stored, SVG pass-through, or an empty catalog). Total failure throws.
+// (already stored or an empty catalog). Total failure throws.
 export interface GenerateResult {
   created: Preview[];
   failed: number;
@@ -194,6 +204,10 @@ export class Resizer {
         { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
+    // Resolve and validate the framework-loaded config before claiming the singleton.
+    // This makes configuration failures boot-time failures and leaves retry possible after
+    // the host corrects its config.
+    getResizeConfig();
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
@@ -297,7 +311,7 @@ export class Resizer {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = requiredFormats(config)
+    formats?: PreviewFormat[]; // default = config.formats
     ctx?: Record<string, unknown>; // threaded to read-path hooks (04 · §8)
     enqueueMissing?: boolean; // default true when a transport is set, false otherwise
   }): Promise<{ decision: ReadDecision; output: unknown }> {
@@ -309,7 +323,7 @@ export class Resizer {
    * on image work, so the previews are (usually) already there by the first real read. Delegates
    * to the engine (src/engine.ts): the `resolveSizes` waterfall (real ctx reaches the taps) →
    * expand sizes × formats, skipping identities already in `media.previews` and SVG originals
-   * (pass-through → no-op) → `beforeEnqueue` waterfall → hand the survivors to the SAME
+   * that storage proves are already public → `beforeEnqueue` waterfall → hand survivors to the SAME
    * dispatch-lock `enqueue()` as the read path. NEVER throws (same guarantee as `resolve`); with
    * no transport it logs once and returns `{ enqueued: 0 }`. `enqueued` = variants handed to the
    * transport (dispatch-lock survivors).
@@ -318,10 +332,17 @@ export class Resizer {
     media: MediaLike;
     sizes: SizeInput[];
     pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = requiredFormats(config)
+    formats?: PreviewFormat[]; // default = config.formats
     ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
   }): Promise<{ enqueued: number }> {
     return prewarmImpl(this, opts);
+  }
+
+  /** Strict queueing API: never equates a held lock with a durable task receipt. */
+  async enqueueRequired(
+    opts: EnqueueRequiredOpts,
+  ): Promise<EnqueueRequiredResult> {
+    return enqueueRequiredImpl(this, opts);
   }
 
   /**
@@ -334,6 +355,11 @@ export class Resizer {
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
     return generateImpl(this, opts);
+  }
+
+  /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
+  async uploadOriginal(opts: UploadOriginalOpts): Promise<Original> {
+    return uploadOriginalImpl(this, opts);
   }
 }
 

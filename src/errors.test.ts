@@ -6,6 +6,7 @@ import {
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
+  ResizeOriginalError,
   ResizeSecurityError,
   ResizeSetupError,
   ResizeStorageError,
@@ -26,6 +27,11 @@ const SIMPLE_SUBCLASSES = [
     code: 'RESIZE_SECURITY',
   },
   { Ctor: ResizeMediaError, name: 'ResizeMediaError', code: 'RESIZE_MEDIA' },
+  {
+    Ctor: ResizeOriginalError,
+    name: 'ResizeOriginalError',
+    code: 'RESIZE_ORIGINAL_INVALID',
+  },
 ] as const;
 
 describe('ResizeError (base)', () => {

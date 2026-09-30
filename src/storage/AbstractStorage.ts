@@ -10,11 +10,14 @@ export interface ResizeStorage {
   // Download an existing object by its stored locator (the worker's original).
   download(ref: StorageRef): Promise<Buffer | Uint8Array>;
   // Upload a NEW object; the DRIVER picks physical placement + returns the locator to persist.
+  // A content-addressed driver may return an opaque key different from the suggested input key.
   upload(args: {
     key: string;
     body: Buffer | Uint8Array;
     contentType: string;
     visibility: 'public' | 'private';
+    namespace?: string;
+    parentRef?: StorageRef;
   }): Promise<StorageRef>;
   // PURE, synchronous, NO I/O — the read path calls this to build public URLs (05 · §10.4).
   publicUrl(ref: StorageRef): string;

@@ -1,0 +1,482 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, test } from 'node:test';
+import {
+  resetAppInstance,
+  setAppInstance,
+} from '@adaptivestone/framework/helpers/appInstance.js';
+import sharp from 'sharp';
+import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
+import type { QueueTransport, ResizeStorage } from './resizer.ts';
+import { Resizer, resetResizerForTests } from './resizer.ts';
+import { LocalFsStorage } from './storage/fs.ts';
+import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+
+const png = await sharp({
+  create: {
+    width: 32,
+    height: 24,
+    channels: 4,
+    background: { r: 12, g: 34, b: 56, alpha: 0.5 },
+  },
+})
+  .png()
+  .toBuffer();
+
+const orientedJpeg = await sharp({
+  create: {
+    width: 40,
+    height: 20,
+    channels: 3,
+    background: { r: 1, g: 2, b: 3 },
+  },
+})
+  .jpeg()
+  .withMetadata({ orientation: 6 })
+  .toBuffer();
+
+const webp = await sharp(png).webp().toBuffer();
+const avif = await sharp(png).avif().toBuffer();
+
+// Distinct frames prevent the encoder from collapsing the animation into one frame.
+const animation = sharp(
+  Buffer.concat([Buffer.alloc(300, 0), Buffer.alloc(300, 255)]),
+  { raw: { width: 10, height: 20, channels: 3, pageHeight: 10 } },
+);
+const animatedOriginals = {
+  gif: await animation
+    .clone()
+    .gif({ delay: [100, 100] })
+    .toBuffer(),
+  webp: await animation
+    .clone()
+    .webp({ delay: [100, 100] })
+    .toBuffer(),
+};
+
+function installApp(config: Record<string, unknown> = {}) {
+  setAppInstance({
+    getConfig: () => makeResizeConfig(config),
+    getModel: () => ({}),
+    logger: { info() {}, warn() {}, error() {} },
+  } as never);
+}
+
+function recordingStorage() {
+  const uploads: Array<{
+    key: string;
+    body: Buffer;
+    contentType: string;
+    visibility: 'public' | 'private';
+  }> = [];
+  const storage: ResizeStorage = {
+    download: async () => Buffer.alloc(0),
+    upload: async (args) => {
+      uploads.push({ ...args, body: Buffer.from(args.body) });
+      return { key: args.key, bucket: 'originals' };
+    },
+    publicUrl: (ref) => `/media/${ref.key}`,
+  };
+  return { storage, uploads };
+}
+
+afterEach(() => {
+  resetResizerForTests();
+  resetAppInstance();
+});
+
+describe('uploadOriginal — raster bytes and metadata', () => {
+  for (const [format, body] of Object.entries(animatedOriginals)) {
+    test(`${format} animation reports frame dimensions and preserves bytes`, async () => {
+      installApp();
+      const { storage, uploads } = recordingStorage();
+      const r = new Resizer({ storage });
+      const original = await r.uploadOriginal({ body, visibility: 'public' });
+      assert.equal(original.width, 10);
+      assert.equal(original.height, 10);
+      assert.deepEqual(uploads[0].body, body);
+    });
+
+    test(`${format} animation counts each frame once at the pixel limit`, async () => {
+      installApp({ limits: { sourcePixels: 200 } });
+      const { storage } = recordingStorage();
+      const r = new Resizer({ storage });
+      await r.uploadOriginal({ body, visibility: 'public' });
+    });
+
+    test(`${format} animation rejects total pixels above the limit before storage`, async () => {
+      installApp({ limits: { sourcePixels: 199 } });
+      const { storage, uploads } = recordingStorage();
+      const r = new Resizer({ storage });
+      await assert.rejects(r.uploadOriginal({ body, visibility: 'public' }), {
+        code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
+      });
+      assert.equal(uploads.length, 0);
+    });
+  }
+
+  test('stores JPEG bytes unchanged and reports display dimensions without rotating EXIF', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const original = await r.uploadOriginal({
+      body: orientedJpeg,
+      visibility: 'private',
+    });
+
+    assert.equal(original.format, 'jpeg');
+    assert.equal(original.contentType, 'image/jpeg');
+    assert.equal(original.size, orientedJpeg.byteLength);
+    assert.equal(original.width, 20);
+    assert.equal(original.height, 40);
+    assert.equal(
+      (original.storageRef as { bucket?: string }).bucket,
+      'originals',
+    );
+    assert.match(
+      (original.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.jpg$/,
+    );
+    assert.deepEqual(uploads[0].body, orientedJpeg);
+    assert.equal(uploads[0].visibility, 'private');
+  });
+
+  test('accepts Uint8Array PNG and produces a different safe key for each upload', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const first = await r.uploadOriginal({
+      body: new Uint8Array(png),
+      visibility: 'public',
+    });
+    const second = await r.uploadOriginal({ body: png, visibility: 'public' });
+
+    assert.equal(first.format, 'png');
+    assert.equal(first.contentType, 'image/png');
+    assert.equal(first.width, 32);
+    assert.equal(first.height, 24);
+    assert.match(
+      (first.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.png$/,
+    );
+    assert.notEqual(
+      (first.storageRef as { key: string }).key,
+      (second.storageRef as { key: string }).key,
+    );
+    assert.deepEqual(uploads[0].body, png);
+  });
+
+  test('accepts a TIFF enabled only through upload.formats', async () => {
+    installApp({ upload: { formats: ['tiff'] } });
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const body = await sharp(png).tiff().toBuffer();
+
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+
+    assert.equal(original.format, 'tiff');
+    assert.equal(original.contentType, 'image/tiff');
+    assert.match(
+      (original.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.tiff$/,
+    );
+    assert.deepEqual(uploads[0].body, body);
+  });
+
+  test('round-trips exact original bytes through LocalFsStorage', async () => {
+    installApp();
+    const dir = await mkdtemp(join(tmpdir(), 'resize-original-'));
+    const r = new Resizer({
+      storage: new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' }),
+    });
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    assert.deepEqual(original.storageRef, {
+      path: (original.storageRef as { path: string }).path,
+      visibility: 'private',
+    });
+    assert.deepEqual(
+      await readFile(
+        join(`${dir}-private`, (original.storageRef as { path: string }).path),
+      ),
+      png,
+    );
+  });
+
+  test('recognizes WebP and AVIF containers without rewriting their bytes', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const webpOriginal = await r.uploadOriginal({
+      body: webp,
+      visibility: 'public',
+    });
+    const avifOriginal = await r.uploadOriginal({
+      body: avif,
+      visibility: 'public',
+    });
+    assert.equal(webpOriginal.format, 'webp');
+    assert.equal(webpOriginal.contentType, 'image/webp');
+    assert.equal(avifOriginal.format, 'avif');
+    assert.equal(avifOriginal.contentType, 'image/avif');
+    assert.deepEqual(uploads[0].body, webp);
+    assert.deepEqual(uploads[1].body, avif);
+  });
+});
+
+describe('uploadOriginal — private SVG source', () => {
+  test('reads SVG metadata and stores the exact source bytes without queue work', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    let queueCalls = 0;
+    const transport: QueueTransport = {
+      enqueue: async () => {
+        queueCalls++;
+        return { taskId: 'unexpected' };
+      },
+      startWorker: async () => {},
+    };
+    const r = new Resizer({ storage, transport });
+    const body = Buffer.from(
+      '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="120px" height="80px" viewBox="0 0 240 100"><path d="M0 0h1v1z"/></svg>',
+    );
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+
+    assert.equal(original.format, 'svg');
+    assert.equal(original.contentType, 'image/svg+xml');
+    assert.equal(original.width, 120);
+    assert.equal(original.height, 80);
+    assert.equal(original.size, body.byteLength);
+    assert.match(
+      (original.storageRef as { key: string }).key,
+      /^originals\/[a-f0-9]{32}\.svg$/,
+    );
+    assert.deepEqual(uploads[0].body, body);
+    assert.equal(queueCalls, 0);
+  });
+
+  test('rejects a public SVG original before writing to storage', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const body = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"/>',
+    );
+    await assert.rejects(
+      () => r.uploadOriginal({ body, visibility: 'public' }),
+      /SVG originals must be stored privately/,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('uses Sharp dimensions for SVG with a viewBox', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const body = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 100"/>',
+    );
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+    assert.equal(original.format, 'svg');
+    assert.equal(original.width, 240);
+    assert.equal(original.height, 100);
+    assert.deepEqual(uploads[0].body, body);
+  });
+
+  test('rejects unreadable SVG and non-image XML before storage', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    for (const svg of [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><g></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg"/>',
+      '<?xml version="1.0"?><html/>',
+    ]) {
+      await assert.rejects(
+        r.uploadOriginal({ body: Buffer.from(svg), visibility: 'private' }),
+        { code: 'RESIZE_ORIGINAL_INVALID' },
+      );
+    }
+    assert.equal(uploads.length, 0);
+  });
+
+  test('applies the source pixel limit to SVG metadata before storage', async () => {
+    installApp({ limits: { sourcePixels: 99 } });
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      r.uploadOriginal({
+        body: Buffer.from(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
+        ),
+        visibility: 'private',
+      }),
+      { code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('honors the SVG upload format allowlist before storage', async () => {
+    installApp({ upload: { formats: ['png'] } });
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      r.uploadOriginal({
+        body: Buffer.from(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
+        ),
+        visibility: 'private',
+      }),
+      { code: 'RESIZE_ORIGINAL_FORMAT_DISABLED' },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('preserves a declared ISO-8859-1 SVG byte-for-byte', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    const body = Buffer.from(
+      '<?xml version="1.0" encoding="ISO-8859-1"?><svg xmlns="http://www.w3.org/2000/svg" width="9" height="7"><text>é</text></svg>',
+      'latin1',
+    );
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+    assert.equal(original.format, 'svg');
+    assert.equal(original.width, 9);
+    assert.equal(original.height, 7);
+    assert.deepEqual(uploads[0].body, body);
+  });
+});
+
+describe('uploadOriginal — typed failures', () => {
+  test('rejects empty, over-limit, and disabled formats before storage', async () => {
+    installApp({ upload: { maxBytes: 8, formats: ['jpeg'] } });
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      () => r.uploadOriginal({ body: Buffer.alloc(0), visibility: 'private' }),
+      (error: unknown) =>
+        error instanceof ResizeOriginalError &&
+        error.code === 'RESIZE_ORIGINAL_EMPTY',
+    );
+    await assert.rejects(
+      () => r.uploadOriginal({ body: png, visibility: 'private' }),
+      (error: unknown) =>
+        error instanceof ResizeOriginalError &&
+        error.code === 'RESIZE_ORIGINAL_TOO_LARGE',
+    );
+    resetAppInstance();
+    installApp({ upload: { maxBytes: 1024 * 1024, formats: ['jpeg'] } });
+    await assert.rejects(
+      () => r.uploadOriginal({ body: png, visibility: 'private' }),
+      (error: unknown) =>
+        error instanceof ResizeOriginalError &&
+        error.code === 'RESIZE_ORIGINAL_FORMAT_DISABLED',
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('wraps storage failure as ResizeStorageError with its cause', async () => {
+    installApp();
+    const cause = new Error('disk full');
+    const storage: ResizeStorage = {
+      download: async () => Buffer.alloc(0),
+      upload: async () => {
+        throw cause;
+      },
+      publicUrl: () => '',
+    };
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      () => r.uploadOriginal({ body: png, visibility: 'private' }),
+      (error: unknown) =>
+        error instanceof ResizeStorageError &&
+        error.code === 'RESIZE_ORIGINAL_UPLOAD_FAILED' &&
+        error.cause === cause,
+    );
+  });
+
+  test('rejects unsupported bytes with a stable input error', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      () =>
+        r.uploadOriginal({
+          body: Buffer.from('this is not an image'),
+          visibility: 'private',
+        }),
+      (error: unknown) =>
+        error instanceof ResizeOriginalError &&
+        error.code === 'RESIZE_ORIGINAL_INVALID',
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('rejects an invalid custom-storage locator with a typed error', async () => {
+    installApp();
+    const storage: ResizeStorage = {
+      download: async () => Buffer.alloc(0),
+      upload: async () => undefined as never,
+      publicUrl: () => '',
+    };
+    const r = new Resizer({ storage });
+    await assert.rejects(
+      () => r.uploadOriginal({ body: png, visibility: 'private' }),
+      (error: unknown) =>
+        error instanceof ResizeStorageError &&
+        error.code === 'RESIZE_ORIGINAL_STORAGE_REF_INVALID',
+    );
+  });
+
+  test('accepts an opaque locator returned by a content-addressed storage driver', async () => {
+    installApp();
+    let suggestedKey = '';
+    const storage: ResizeStorage = {
+      download: async () => Buffer.alloc(0),
+      upload: async ({ key }) => {
+        suggestedKey = key;
+        return { key: 'sha256/opaque-content-id', bucket: 'objects' };
+      },
+      publicUrl: () => '',
+    };
+    const r = new Resizer({ storage });
+    const body = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"/>',
+    );
+
+    const original = await r.uploadOriginal({
+      body,
+      visibility: 'private',
+    });
+
+    assert.match(suggestedKey, /^originals\/[a-f0-9]{32}\.svg$/);
+    assert.equal(
+      (original.storageRef as { key: string }).key,
+      'sha256/opaque-content-id',
+    );
+    assert.equal(
+      (original.storageRef as { bucket?: string }).bucket,
+      'objects',
+    );
+    assert.equal(original.format, 'svg');
+  });
+
+  test('preserves a valid falsy scalar locator', async () => {
+    installApp();
+    const storage: ResizeStorage = {
+      download: async () => png,
+      upload: async () => 0,
+      publicUrl: () => '/zero',
+    };
+    const original = await new Resizer({ storage }).uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    assert.equal(original.storageRef, 0);
+  });
+});

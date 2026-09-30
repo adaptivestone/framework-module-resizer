@@ -275,9 +275,11 @@ describe('isCatalogCovered', () => {
 
   test('false when no matching preview is stored', () => {
     assert.equal(
-      isCatalogCovered({ original: { key: 'o' }, previews: [] }, sizes, [
-        ...formats,
-      ]),
+      isCatalogCovered(
+        { original: { storageRef: { key: 'o' } }, previews: [] },
+        sizes,
+        [...formats],
+      ),
       false,
     );
   });
@@ -286,10 +288,10 @@ describe('isCatalogCovered', () => {
     assert.equal(
       isCatalogCovered(
         {
-          original: { key: 'o' },
+          original: { storageRef: { key: 'o' } },
           previews: [
             {
-              key: 'p',
+              storageRef: { key: 'p' },
               sizeKey: '20x20',
               format: 'jpeg',
               contentType: 'image/jpeg',
@@ -303,20 +305,42 @@ describe('isCatalogCovered', () => {
     );
   });
 
-  test('SVG original is covered without previews (pass-through)', () => {
+  test('SVG original is covered only after raster previews are persisted', () => {
     assert.equal(
       isCatalogCovered(
-        { original: { key: 'x.svg', contentType: 'image/svg+xml' } },
+        {
+          original: {
+            storageRef: { key: 'x.svg' },
+            contentType: 'image/svg+xml',
+          },
+        },
         sizes,
         [...formats],
       ),
-      true,
+      false,
+    );
+    assert.equal(
+      isCatalogCovered(
+        {
+          original: {
+            storageRef: { key: 'x.svg' },
+            contentType: 'image/svg+xml',
+          },
+        },
+        [{ width: 100, height: 100 }],
+        ['webp'],
+      ),
+      false,
     );
   });
 
   test('empty sizes is covered (nothing to generate)', () => {
     assert.equal(
-      isCatalogCovered({ original: { key: 'o' } }, [], ['jpeg']),
+      isCatalogCovered(
+        { original: { storageRef: { key: 'o' } } },
+        [],
+        ['jpeg'],
+      ),
       true,
     );
   });

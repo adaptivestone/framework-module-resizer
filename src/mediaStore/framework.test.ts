@@ -4,6 +4,8 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import { ResizeConfigError } from '../errors.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { Preview } from '../types.d.ts';
 import { FrameworkMediaStore } from './framework.ts';
 
@@ -21,7 +23,7 @@ function installApp(
   const mediaModelName = opts.mediaModelName ?? 'File';
   const errors: unknown[][] = [];
   setAppInstance({
-    getConfig: () => ({ mediaModelName }),
+    getConfig: () => makeResizeConfig({ mediaModelName }),
     getModel: () => model,
     logger: {
       info() {},
@@ -44,7 +46,7 @@ describe('FrameworkMediaStore.load', () => {
     const findByIdCalls: string[] = [];
     let modelAsked = '';
     setAppInstance({
-      getConfig: () => ({ mediaModelName: 'Media' }),
+      getConfig: () => makeResizeConfig({ mediaModelName: 'Media' }),
       getModel: (name: string) => {
         modelAsked = name;
         return {
@@ -63,11 +65,22 @@ describe('FrameworkMediaStore.load', () => {
     assert.equal(out, doc);
   });
 
-  test('unknown model (getModel → false) returns null and logs an error', async () => {
-    const { errors } = installApp(false, { mediaModelName: 'Nope' });
-    const out = await store.load('x');
-    assert.equal(out, null);
-    assert.equal(errors.length, 1);
+  test('unknown model (getModel → false) is a config error, not missing media', async () => {
+    installApp(false, { mediaModelName: 'Nope' });
+    // A null here would let the worker complete every task as a deleted-media no-op.
+    await assert.rejects(
+      () => store.load('x'),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN' &&
+        err.message.includes("'Nope'"),
+    );
+    await assert.rejects(
+      () => store.appendPreviews('x', []),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN',
+    );
   });
 });
 

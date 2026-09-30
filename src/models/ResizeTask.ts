@@ -59,7 +59,7 @@ export default class ResizeTaskModel extends BaseModel {
           } & TsTypeOverride<Filters>,
           requestedWidth: { type: Number },
           requestedHeight: { type: Number },
-          format: { type: String, enum: ['jpeg', 'webp', 'avif'] },
+          format: { type: String, required: true },
           fit: { type: Boolean },
         },
       ],

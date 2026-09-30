@@ -11,13 +11,13 @@
 // contract comes from ./AbstractTransport.ts (not resizer.ts); no optional deps, so importing
 // this driver is always safe (05 · §10.2).
 import { getApp } from '../app.ts';
-import { getResizeConfig } from '../config/resize.ts';
 import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
 import { ResizeError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
+import { getResizeConfig } from '../resizeConfig.ts';
 import { getResizer } from '../resizer.ts';
-import type { MissingPreview } from '../types.d.ts';
+import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
 import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';
 
 // The subset of the ResizeTask document the transport reads. The model itself is dynamic
@@ -379,6 +379,26 @@ export class MongoTransport implements QueueTransport {
       `resize mongo transport: enqueue remained contended after duplicate-key retries for media ${task.mediaId}`,
     );
     return { taskId: null };
+  }
+
+  async findActive(task: {
+    mediaId: string;
+    pipeline: string;
+    previews: MissingPreview[];
+  }): Promise<EnqueueReceipt[]> {
+    const model = taskModel();
+    if (!model) {
+      return [];
+    }
+    const docs = (await model.find({
+      fileId: task.mediaId,
+      pipeline: task.pipeline,
+      status: { $in: ['pending', 'processing'] },
+    })) as TaskDoc[];
+    return docs.map((doc) => ({
+      taskId: String(doc._id),
+      previews: canonicalizeVariants(doc.previews ?? []),
+    }));
   }
 
   async startWorker(

@@ -7,6 +7,7 @@
 //   ResizeConfigError   — host config is invalid; crash at boot
 //   ResizeMediaError    — this record is unusable; skip it, do not retry
 //   ResizeGenerateError — the operation produced nothing
+//   ResizeOriginalError — uploaded original bytes are invalid/unsupported/outside policy
 //   ResizeStorageError  — transient I/O; a retry may help
 //   ResizeSecurityError — a refusal (traversal, cross-bucket); never retry, log loudly
 //
@@ -114,6 +115,7 @@ export class ResizeGenerateError extends ResizeError {
   readonly mediaId: string;
   readonly failed: number;
   readonly requested: number;
+  readonly missing: string[];
 
   constructor(opts: {
     mediaId: string;
@@ -126,6 +128,7 @@ export class ResizeGenerateError extends ResizeError {
      */
     message?: string;
     code?: string;
+    missing?: string[];
   }) {
     super(
       opts.message ??
@@ -135,5 +138,16 @@ export class ResizeGenerateError extends ResizeError {
     this.mediaId = opts.mediaId;
     this.failed = opts.failed;
     this.requested = opts.requested;
+    this.missing = opts.missing ?? [];
+  }
+}
+
+/** Original-upload input is empty, malformed, unsupported, or over a configured limit. */
+export class ResizeOriginalError extends ResizeMediaError {
+  constructor(message: string, opts?: { code?: string; cause?: unknown }) {
+    super(message, {
+      code: opts?.code ?? 'RESIZE_ORIGINAL_INVALID',
+      cause: opts?.cause,
+    });
   }
 }

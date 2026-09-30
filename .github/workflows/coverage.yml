@@ -74,6 +74,9 @@ jobs:
       - name: npm clean install
         run: npm ci
 
+      - name: Build package for integration tests
+        run: node --run build
+
       # Same suite as `npm test` (= node --experimental-strip-types --test), invoked via
       # `node --run test -- <flags>` so the strip-types flag stays single-sourced in package.json.
       # Two reporter pairs: `spec` -> stdout keeps the human-readable table + results in the log;

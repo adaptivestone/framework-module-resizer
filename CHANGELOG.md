@@ -1,8 +1,74 @@
 # Unreleased
 
+Pending changes since 0.2.1. The release version will be chosen when these changes are ready.
+
+**Breaking changes**
+
+- Persisted locators are nested, driver-owned refs: `original.storageRef` and
+  `previews[].storageRef` replace the flat `key`/`bucket` fields, and `StorageRef` is now an
+  opaque JSON value. No reader or migration for old resize records is included; update host
+  models, DTOs, custom storage drivers and the API/worker processes together. Keep
+  `minimize: false` on the media schema so empty objects inside refs survive persistence.
+- `ResizeStorage.upload()` receives optional `namespace` (a placement hint from
+  `uploadOriginal({ namespace })`) and `parentRef` (the original's ref when the worker stores
+  previews).
+- Private originals need separate storage: `S3Storage` rejects a private upload unless
+  `bucketPrivate` differs from `bucketPublic`; `LocalFsStorage` keeps private files under
+  `privateRootDir` (default `<rootDir>-private`).
+- SVG is an input format only. `uploadOriginal()` stores SVG privately and rejects public SVG
+  uploads; the worker rasterizes accepted SVG into the configured preview formats through the
+  normal task lifecycle. `resolve()` never returns uploaded SVG markup.
+- The module no longer merges host config over its defaults and drops the `deepmerge`
+  dependency. The framework's `resize.ts` + `resize.<NODE_ENV>.ts` merge is the only merge: the
+  host `src/config/resize.ts` spreads the defaults from
+  `@adaptivestone/framework-module-resize/config/resize.js`, and the final value must be complete.
+  It is validated when `new Resizer()` is constructed.
+- Config keys moved. The old keys now fail validation with `RESIZE_CONFIG_REMOVED_KEY` instead of
+  being ignored:
+
+  | 0.2.x | Unreleased |
+  |---|---|
+  | `webpAvifOnly: true` | `formats: ['webp', 'avif']` |
+  | `encode.quality.<format>` | `encode.formats.<format>.quality` |
+  | `encode.effort.<format>` | `encode.formats.<format>.effort` |
+  | `encode.mozjpeg`, `encode.chromaSubsampling` | `encode.formats.jpeg.mozjpeg`, `encode.formats.jpeg.chromaSubsampling` |
+  | `encode.flattenBackground` | `encode.flatten.background` (formats in `encode.flatten.formats`) |
+
+- Format ids are open strings passed to `sharp.toFormat(id, encode.formats[id])`. Every `formats`
+  entry needs an `encode.formats` entry (`{}` keeps Sharp defaults), so an alias such as `'jpg'`
+  fails at boot instead of skipping the `'jpeg'` options and flatten step.
+- `mediaModelName` must name a registered model. The worker checks it at startup, and
+  `FrameworkMediaStore` throws `ResizeConfigError` (`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`) instead of
+  completing every task as a deleted-media no-op.
 - Worker setup uses an explicit `worker.enabled: true` in host config instead of an
   environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
   message; the module default remains `false`.
+
+**Features**
+
+- `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
+  and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
+  `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
+- Strict `enqueueRequired()` partitions ready, accepted, not-required and unconfirmed variants. A
+  held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
+  through the optional `QueueTransport.findActive()`, while SQS/custom transports without it
+  report lock races as retryable `incomplete`. Conflicting payloads with one preview identity are
+  explicit errors.
+- The Mongo transport deduplicates identical active requests with a canonical SHA-256
+  `requestKey` and a partial unique index on `{ fileId, pipeline, requestKey }`. The module does not
+  create indexes; prepare them through the host's migration or lifecycle before rollout.
+- Queued raster tasks retry only the identities still missing after partial generation.
+  Successful previews stay persisted, and permanent gaps use the normal backoff and dead-letter
+  path. Deleted media tasks remain successful no-ops.
+
+**Fixes**
+
+- `LocalFsStorage` normalizes root paths before deriving the private root and rejects a
+  `privateRootDir` equal to or inside the public root. A trailing slash no longer places private
+  originals in the public folder.
+- Coverage builds the package before integration tests. Source-only test runs skip the Framework
+  config integration test with a build instruction when the compiled config is absent.
+- Host adoption documentation uses a generic checklist without internal project names or paths.
 
 # 0.2.1
 
