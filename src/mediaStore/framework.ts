@@ -16,8 +16,7 @@ export class FrameworkMediaStore implements MediaStore {
   /**
    * The host media model named by config.mediaModelName. An unregistered name is a config
    * error, never "media missing": the worker completes tasks for deleted media as no-ops, so
-   * returning null here would silently drop every task. The worker calls this once at startup
-   * (models are loaded by then) to fail before leasing anything.
+   * returning null here would silently drop every task.
    */
   getMediaModel() {
     const { mediaModelName } = getResizeConfig();
@@ -29,6 +28,11 @@ export class FrameworkMediaStore implements MediaStore {
       );
     }
     return model;
+  }
+
+  /** Worker startup check: BaseCli has loaded the models by now (ResizeWorker.isShouldInitModels). */
+  verify(): void {
+    this.getMediaModel();
   }
 
   async load(mediaId: string): Promise<MediaLike | null> {

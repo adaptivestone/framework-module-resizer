@@ -4,7 +4,6 @@
 // completion/failure observers (05 · §10.2); the worker only supplies the WORK.
 import sharp from 'sharp';
 import { getApp } from './app.ts';
-import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import { getResizeConfig } from './resizeConfig.ts';
 import { getResizer } from './resizer.ts';
 import { processTask } from './resizeTask.ts';
@@ -26,11 +25,9 @@ export async function runResizeWorker(): Promise<void> {
     );
     return;
   }
-  // Fail before leasing anything: a wrong mediaModelName would otherwise surface only as
-  // per-task errors. BaseCli has loaded the models by now (ResizeWorker.isShouldInitModels).
-  if (resizer.mediaStore instanceof FrameworkMediaStore) {
-    resizer.mediaStore.getMediaModel();
-  }
+  // Fail before leasing anything: a misconfigured media store (e.g. a wrong mediaModelName)
+  // would otherwise surface only as per-task errors.
+  await resizer.mediaStore.verify?.();
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.once('SIGTERM', abort);

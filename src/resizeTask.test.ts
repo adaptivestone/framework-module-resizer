@@ -1565,6 +1565,52 @@ describe('runResizeWorker', () => {
     assert.equal(started, false);
   });
 
+  test('custom media store verify() runs before startWorker, and its failure stops the worker', async () => {
+    installApp({ worker: { enabled: true } });
+    const events: string[] = [];
+    const { mediaStore } = makeMediaStore(null);
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport: fakeTransport(() => {
+        events.push('startWorker');
+      }),
+      mediaStore: {
+        ...mediaStore,
+        async verify() {
+          events.push('verify');
+          throw new ResizeConfigError('custom store is misconfigured', {
+            code: 'CUSTOM_STORE_INVALID',
+          });
+        },
+      },
+      lockProvider: makeLocks().lockProvider,
+    });
+    await assert.rejects(
+      () => runResizeWorker(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError && err.code === 'CUSTOM_STORE_INVALID',
+    );
+    assert.deepEqual(events, ['verify']);
+
+    resetResizerForTests();
+    events.length = 0;
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport: fakeTransport(() => {
+        events.push('startWorker');
+      }),
+      mediaStore: {
+        ...mediaStore,
+        verify() {
+          events.push('verify');
+        },
+      },
+      lockProvider: makeLocks().lockProvider,
+    });
+    await runResizeWorker();
+    assert.deepEqual(events, ['verify', 'startWorker']);
+  });
+
   test('enabled + transport → startWorker gets a handler that reaches processTask', async () => {
     installApp({ worker: { enabled: true } });
     let handle:

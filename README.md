@@ -525,7 +525,9 @@ new Resizer({ storage });
 ```
 
 The same pattern swaps `mediaStore` (e.g. another DB/ORM) or `lockProvider` (e.g. Redis/redlock).
-A custom media store implements `load` and `appendPreviews`. A custom storage driver
+A custom media store implements `load` and `appendPreviews`, plus an optional `verify()` that
+the worker awaits once at startup — throw there to stop the worker before it leases any task.
+A custom storage driver
 must persist a ref unchanged through the media store and inherit grouping from its own
 `parentRef` for derived previews. The shipped drivers reject simultaneous `namespace`
 and `parentRef` hints; custom drivers should follow the same contract.
@@ -699,9 +701,10 @@ codecs fail through Sharp with the normal generation error path.
 
 Validation also rejects the removed 0.2.x keys (`webpAvifOnly`, `encode.quality`,
 `encode.effort`, `encode.mozjpeg`, `encode.chromaSubsampling`, `encode.flattenBackground`)
-with `RESIZE_CONFIG_REMOVED_KEY` rather than ignoring them. The worker checks at startup that
-`mediaModelName` names a registered model (`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`); the default
-`FrameworkMediaStore` raises the same error instead of treating every task as deleted media.
+with `RESIZE_CONFIG_REMOVED_KEY` rather than ignoring them. At startup the worker calls the media
+store's `verify()`; the default `FrameworkMediaStore` checks there that `mediaModelName` names a
+registered model (`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`), and raises the same error on `load` instead
+of treating every task as deleted media.
 
 Storage buckets/URLs and the SQS queue URL are **not** config — they are driver options passed to
 `new S3Storage({...})` / `new SqsTransport({...})`.

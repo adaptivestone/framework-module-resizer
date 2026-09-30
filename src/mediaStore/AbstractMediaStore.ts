@@ -7,6 +7,10 @@
 import type { MediaLike, Preview } from '../types.d.ts';
 
 export interface MediaStore {
+  // Optional startup check. The worker awaits it once before leasing any task; throw when the
+  // store cannot work (e.g. an unknown media model) so a misconfiguration never drops tasks.
+  verify?(): void | Promise<void>;
+
   // Load the media doc for the WORKER. null/undefined → the task is a logged no-op (07 step 1).
   load(mediaId: string): Promise<MediaLike | null>;
 
