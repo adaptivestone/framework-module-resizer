@@ -5,7 +5,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
-import { getResizeConfig } from '../resizeConfig.ts';
+import { getResizeConfig, validateResizeConfig } from '../resizeConfig.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { ResizeConfig } from '../types.d.ts';
 import defaultResizeConfig from './resize.ts';
@@ -60,6 +60,18 @@ describe('getResizeConfig', () => {
     getResizeConfig();
     getResizeConfig();
     assert.equal(uploadReads, afterFirstCall);
+  });
+
+  test('validateResizeConfig checks a config without a framework app', () => {
+    resetAppInstance();
+    const config = makeResizeConfig({ formats: ['webp'] });
+    assert.strictEqual(validateResizeConfig(config), config);
+    assert.throws(
+      () => validateResizeConfig({ ...config, formats: [] }),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_FORMATS_INVALID',
+    );
   });
 
   test('accepts arbitrary non-empty Sharp format ids from config', () => {

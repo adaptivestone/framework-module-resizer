@@ -22,6 +22,16 @@ export type DeepPartial<T> = T extends readonly (infer _U)[]
 // via setAppInstance() (see 02 · §4).
 // ---------------------------------------------------------------------------
 
+export interface ResizeLogger {
+  info(msg: string, ...rest: unknown[]): void;
+  warn(msg: string, ...rest: unknown[]): void;
+  error(msg: string, ...rest: unknown[]): void;
+}
+
+export interface ResizeEventBus {
+  emit(name: string, ...args: unknown[]): void;
+}
+
 export type TMinimalResizeApp = {
   // Framework config loading has already combined the base and environment files.
   getConfig(name: 'resize'): ResizeConfig;
@@ -31,14 +41,10 @@ export type TMinimalResizeApp = {
   //  - the host media model, by name from config.mediaModelName
   // biome-ignore lint/suspicious/noExplicitAny: returns a host-registered mongoose model; the module stays mongoose-type-free by design
   getModel(name: string): any;
-  logger: {
-    info(msg: string, ...rest: unknown[]): void;
-    warn(msg: string, ...rest: unknown[]): void;
-    error(msg: string, ...rest: unknown[]): void;
-  };
+  logger: ResizeLogger;
   // Framework EventEmitter (app.events). Observers are mirrored as `resize:<name>`.
   // Duck-typed here, NOT a framework import (see 04 · §9).
-  events?: { emit(name: string, ...args: unknown[]): void };
+  events?: ResizeEventBus;
   // Part of the framework app shape; NOT read by the resize module (the standalone
   // scaffold bin resolves write paths from cwd + `--out` — see 08 · §12).
   foldersConfig?: { [k: string]: string | undefined };
