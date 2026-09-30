@@ -203,9 +203,9 @@ published; the page still describes 0.2.
   when `new Resizer()` runs, and the host spreading the defaults.
 - `bucketPrivate` and `privateRootDir`, and `MediaStore.verify()`.
 - Fix the `{ enqueued: 0 }` causes: SVG is no longer one of them.
-- Done when: `grep -nE "original\.key|webpAvifOnly|encode\.quality|pass-through"
-  docs/12-resize.md` in the docs repo finds nothing, and every example matches the package's
-  `README.md`.
+- Done when: `grep -nE "original\.key|pass-through|deep-merged|uploads/original-photo"
+  docs/12-resize.md` in the docs repo finds nothing, `webpAvifOnly` and `encode.quality` appear
+  only in the removed-keys table, and every example matches the package's `README.md`.
 
 **P1 — The Resizer owns its context.** [Plan](../superpowers/plans/2026-09-30-p1-resizer-owns-context.md).
 - The Resizer holds its own `name`, `config`, `logger` and event bus, registered in a
