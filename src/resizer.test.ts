@@ -23,8 +23,8 @@ import type { MissingPreview, SizeInput } from './types.d.ts';
 // ---------------------------------------------------------------------------
 // Fakes. The Resizer stores passed driver references verbatim (identity checks);
 // omitted defaults are fresh framework-driver instances (instanceof checks). The
-// hook bus needs a recording ambient app (logger/events) read via getApp() at
-// CALL time — stolen from the old hooks.test.ts harness.
+// hook bus needs a recording ambient app (logger/events), which the Resizer reads
+// when it is constructed — stolen from the old hooks.test.ts harness.
 // ---------------------------------------------------------------------------
 
 const fakeTransport = (): QueueTransport => ({
@@ -46,8 +46,8 @@ const fakeLockProvider = (): LockProvider => ({
 });
 
 // A recording fake app: logger.error pushes to `errors`; events.emit (when present)
-// pushes to `emitted` (or throws when emitThrows). Reads happen at CALL time (getApp()),
-// so installing this before each run is enough.
+// pushes to `emitted` (or throws when emitThrows). The Resizer reads the app when it is
+// constructed, so install this before constructing the Resizer.
 function installFakeApp(
   opts: { withEvents?: boolean; emitThrows?: boolean } = {},
 ): { errors: unknown[][]; emitted: unknown[][] } {
@@ -512,7 +512,7 @@ describe('resolve/generate stubs', () => {
   });
 
   test('generate is wired (no longer a stub): empty sizes → empty created', async () => {
-    // A config WITH mediaModelName so getResizeConfig() inside generateImpl does not throw.
+    // A config WITH mediaModelName so the Resizer's config validation does not throw.
     resetAppInstance();
     setAppInstance({
       getConfig: () => makeResizeConfig(),

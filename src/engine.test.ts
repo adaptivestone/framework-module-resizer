@@ -16,8 +16,8 @@ import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
 // Harness — a recording ambient app (getConfig('resize') → { mediaModelName },
-// recording logger) + recording driver fakes. Engine reads logger/config via
-// getApp() at CALL time, so installing the fake before each run is enough.
+// recording logger) + recording driver fakes. A Resizer takes its logger/config from the
+// app when it is constructed, so install the fake before constructing the Resizer.
 // ---------------------------------------------------------------------------
 
 function installFakeApp() {
@@ -999,5 +999,48 @@ describe('resolve — never throws', () => {
     assert.deepEqual(decision, { ready: [], missing: [] });
     assert.equal(output, undefined);
     assert.ok(errors.length >= 1);
+  });
+});
+
+describe('several Resizers in one process', () => {
+  test('each resolve uses its own formats and logger', async () => {
+    const errorsA: unknown[][] = [];
+    const errorsB: unknown[][] = [];
+    const logger = (errors: unknown[][]) => ({
+      info() {},
+      warn() {},
+      error: (...args: unknown[]) => {
+        errors.push(args);
+      },
+    });
+    const a = new Resizer({
+      storage: makeStorage(),
+      config: makeResizeConfig({ formats: ['webp'] }),
+      logger: logger(errorsA),
+    });
+    const b = new Resizer({
+      name: 'listings',
+      storage: makeStorage(),
+      config: makeResizeConfig({ formats: ['jpeg'] }),
+      logger: logger(errorsB),
+    });
+    const media = { id: 'm1', previews: [] };
+    const sizes = [{ width: 10, height: 10 }];
+
+    const fromA = await a.resolve({ media, sizes });
+    const fromB = await b.resolve({ media, sizes });
+    assert.deepEqual(
+      fromA.decision.missing.map((m) => m.format),
+      ['webp'],
+    );
+    assert.deepEqual(
+      fromB.decision.missing.map((m) => m.format),
+      ['jpeg'],
+    );
+
+    // A media without an id is a never-throw failure, logged by the Resizer that hit it.
+    await b.resolve({ media: {} as never, sizes });
+    assert.equal(errorsA.length, 0);
+    assert.equal(errorsB.length, 1);
   });
 });

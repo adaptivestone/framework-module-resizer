@@ -80,13 +80,12 @@ export type {
   VariantStep,
   WaterfallName,
 } from './resizer.ts';
-// --- core: the Resizer + its process-wide accessors (constructor-wired; one per process) ---
+// --- core: the Resizer + its registry accessors (constructor-wired; one per name) ---
 // `resetResizerForTests` is a TEST-ONLY escape hatch. 02 · §6 documents it as "not re-exported
 // from index.ts docs", but HOST test suites construct Resizers in their own tests (mirroring the
 // framework publicly exporting `resetAppInstance`), so it IS re-exported here — documented
 // deviation from that literal note.
 export { getResizer, Resizer, resetResizerForTests } from './resizer.ts';
-export { processTask } from './resizeTask.ts';
 // --- data shapes (types.d.ts) ---
 export type * from './types.d.ts';
-export { runResizeWorker } from './worker.ts';
+export { processTask, runResizeWorker } from './worker.ts';

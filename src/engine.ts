@@ -5,7 +5,6 @@
 // the caller's read. All URLs come from the PURE, I/O-free storage.publicUrl; the only I/O
 // is the owner/admin-gated signedUrl (itself caught + fallen back). Imports the Resizer
 // TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
-import { getApp } from './app.ts';
 import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import {
@@ -18,7 +17,6 @@ import {
   isUsablePreview,
   requireMediaId,
 } from './images.ts';
-import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   EnqueueRequiredResult,
@@ -86,7 +84,7 @@ export async function resolveImpl(
       ctx,
     )) as SizeInput[];
 
-    const formats = opts.formats ?? getResizeConfig().formats;
+    const formats = opts.formats ?? resizer.config.formats;
 
     // 5. previewMap keyed by identity — only complete entries (both key + contentType).
     const previewMap = new Map<string, Preview>();
@@ -113,7 +111,7 @@ export async function resolveImpl(
             original.storageRef != null &&
             storage.canServeOriginalPublicly?.(original.storageRef) === true;
         } catch (err) {
-          getApp().logger.error(
+          resizer.logger.error(
             'resize resolve: canServeOriginalPublicly threw — treating original as private',
             err,
           );
@@ -223,11 +221,11 @@ export async function resolveImpl(
     const enqueueMissing = opts.enqueueMissing ?? resizer.transport != null;
     if (enqueueMissing && decision.missing.length > 0) {
       if (media.original?.storageRef == null) {
-        getApp().logger.info(
+        resizer.logger.info(
           `resize resolve: media ${mediaId} has no original storage ref — nothing enqueued`,
         );
       } else if (!resizer.transport) {
-        getApp().logger.warn(
+        resizer.logger.warn(
           'resize resolve: missing previews but no transport is registered — they stay placeholders (eager-only host? construct the Resizer with a transport for lazy mode)',
         );
       } else {
@@ -235,7 +233,7 @@ export async function resolveImpl(
           await enqueue(resizer, mediaId, pipeline, decision.missing);
         } catch (err) {
           // enqueue is internally guarded and should never reach here; belt-and-suspenders.
-          getApp().logger.error(
+          resizer.logger.error(
             'resize resolve: enqueue threw unexpectedly (read continues)',
             err,
           );
@@ -256,7 +254,11 @@ export async function resolveImpl(
     return { decision, output };
   } catch (err) {
     // Never-throw guarantee (layer 3): the read must not break on an internal error.
-    logResolveError(err);
+    logNeverThrow(
+      resizer,
+      'resize resolve: unexpected internal error — returning the safe empty decision',
+      err,
+    );
     const safe: ReadDecision = { ready, missing: [] };
     return { decision: safe, output: undefined };
   }
@@ -293,7 +295,7 @@ export async function prewarmImpl(
 
     // 2. Expand sizes × formats → deduped MissingPreview[], skipping unbuildable sizes + existing
     //    identities. The fast-path is deliberately NOT consulted here (see the doc comment).
-    const formats = opts.formats ?? getResizeConfig().formats;
+    const formats = opts.formats ?? resizer.config.formats;
     const expanded = expandMissingPreviews(media, sizes, formats);
 
     // 3. beforeEnqueue — REASSIGN the (post-hook) set so the enqueue sees exactly what a host tap
@@ -308,7 +310,7 @@ export async function prewarmImpl(
     }
 
     if (media.original?.storageRef == null) {
-      getApp().logger.info(
+      resizer.logger.info(
         `resize prewarm: media ${mediaId} has no original storage ref — nothing enqueued`,
       );
       return { enqueued: 0 };
@@ -316,7 +318,7 @@ export async function prewarmImpl(
 
     // 4. No transport → this host is eager-only; warn once and enqueue nothing.
     if (!resizer.transport) {
-      getApp().logger.warn(
+      resizer.logger.warn(
         'resize prewarm: previews to warm but no transport is registered — nothing enqueued (eager-only host? construct the Resizer with a transport for pre-warm/lazy mode)',
       );
       return { enqueued: 0 };
@@ -328,7 +330,11 @@ export async function prewarmImpl(
     return { enqueued };
   } catch (err) {
     // 5. Never-throw guard (same guarantee as resolve): an upload must not fail on a prewarm hiccup.
-    logPrewarmError(err);
+    logNeverThrow(
+      resizer,
+      'resize prewarm: unexpected internal error — nothing enqueued',
+      err,
+    );
     return { enqueued: 0 };
   }
 }
@@ -347,7 +353,7 @@ export async function enqueueRequiredImpl(
     opts.sizes,
     ctx,
   )) as SizeInput[];
-  const formats = opts.formats ?? getResizeConfig().formats;
+  const formats = opts.formats ?? resizer.config.formats;
   const requestedBeforePolicy = expandPreviewRequests(sizes, formats);
   const empty = (): EnqueueRequiredResult => ({
     status: 'not-required',
@@ -472,7 +478,7 @@ async function originalUrl(
         SIGNED_ORIGINAL_TTL_SECONDS,
       );
     } catch (err) {
-      getApp().logger.error(
+      resizer.logger.error(
         'resize resolve: signedUrl failed — private original stays unavailable',
         err,
       );
@@ -484,33 +490,11 @@ async function originalUrl(
   return originalIsPublic ? storage.publicUrl(original.storageRef) : undefined;
 }
 
-/** Log the never-throw catch; if getApp() itself threw (called pre-Server), use console. */
-function logResolveError(err: unknown): void {
+/** Log a never-throw catch; a throwing host logger falls back to the console. */
+function logNeverThrow(resizer: Resizer, message: string, err: unknown): void {
   try {
-    getApp().logger.error(
-      'resize resolve: unexpected internal error — returning the safe empty decision',
-      err,
-    );
+    resizer.logger.error(message, err);
   } catch {
-    // getApp() threw (resolve called before the Server exists) — last-resort console.
-    console.error(
-      'resize resolve: unexpected internal error (no app for logger)',
-      err,
-    );
-  }
-}
-
-/** As logResolveError, for prewarm's never-throw catch (11 · §11.1b step 5). */
-function logPrewarmError(err: unknown): void {
-  try {
-    getApp().logger.error(
-      'resize prewarm: unexpected internal error — nothing enqueued',
-      err,
-    );
-  } catch {
-    console.error(
-      'resize prewarm: unexpected internal error (no app for logger)',
-      err,
-    );
+    console.error(message, err);
   }
 }

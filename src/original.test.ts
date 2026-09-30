@@ -369,10 +369,13 @@ describe('uploadOriginal — typed failures', () => {
         error instanceof ResizeOriginalError &&
         error.code === 'RESIZE_ORIGINAL_TOO_LARGE',
     );
+    // A Resizer reads its config once, at construction: a new config needs a new Resizer.
     resetAppInstance();
+    resetResizerForTests();
     installApp({ upload: { maxBytes: 1024 * 1024, formats: ['jpeg'] } });
+    const larger = new Resizer({ storage });
     await assert.rejects(
-      () => r.uploadOriginal({ body: png, visibility: 'private' }),
+      () => larger.uploadOriginal({ body: png, visibility: 'private' }),
       (error: unknown) =>
         error instanceof ResizeOriginalError &&
         error.code === 'RESIZE_ORIGINAL_FORMAT_DISABLED',

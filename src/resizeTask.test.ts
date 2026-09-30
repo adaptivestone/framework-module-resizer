@@ -29,7 +29,6 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
-import { processTask } from './resizeTask.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
@@ -37,7 +36,7 @@ import type {
   Original,
   Preview,
 } from './types.d.ts';
-import { runResizeWorker } from './worker.ts';
+import { processTask, runResizeWorker } from './worker.ts';
 
 // ---------------------------------------------------------------------------
 // Fixtures — built ONCE with sharp. redPng (opaque), alphaPng (fully transparent),
