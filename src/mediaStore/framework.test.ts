@@ -81,6 +81,17 @@ describe('FrameworkMediaStore.load', () => {
         err instanceof ResizeConfigError &&
         err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN',
     );
+    assert.throws(
+      () => store.verify(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN',
+    );
+  });
+
+  test('verify() passes when the configured media model is registered', () => {
+    installApp({}, { mediaModelName: 'Media' });
+    assert.doesNotThrow(() => store.verify());
   });
 });
 

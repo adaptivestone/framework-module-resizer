@@ -43,6 +43,25 @@ describe('getResizeConfig', () => {
     assert.deepEqual(getResizeConfig().formats, ['webp']);
   });
 
+  test('validates one cached framework config object once', () => {
+    let uploadReads = 0;
+    const config = new Proxy(makeResizeConfig(), {
+      get(target, key, receiver) {
+        if (key === 'upload') {
+          uploadReads += 1;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    install(config);
+    getResizeConfig();
+    const afterFirstCall = uploadReads;
+    assert.ok(afterFirstCall > 0);
+    getResizeConfig();
+    getResizeConfig();
+    assert.equal(uploadReads, afterFirstCall);
+  });
+
   test('accepts arbitrary non-empty Sharp format ids from config', () => {
     const config = makeResizeConfig({
       formats: ['tiff'],

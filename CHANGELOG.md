@@ -60,6 +60,9 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - Queued raster tasks retry only the identities still missing after partial generation.
   Successful previews stay persisted, and permanent gaps use the normal backoff and dead-letter
   path. Deleted media tasks remain successful no-ops.
+- `MediaStore` gains an optional `verify()` startup check. The worker awaits it once before
+  leasing tasks, so custom media stores can fail fast too; `FrameworkMediaStore.verify()` checks
+  that `mediaModelName` names a registered model.
 
 **Fixes**
 
@@ -69,6 +72,8 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - Coverage builds the package before integration tests. Source-only test runs skip the Framework
   config integration test with a build instruction when the compiled config is absent.
 - Host adoption documentation uses a generic checklist without internal project names or paths.
+- The resolved config object is validated once instead of on every `getResizeConfig()` call, so
+  the read path no longer re-runs full validation per `resolve()`.
 
 # 0.2.1
 
