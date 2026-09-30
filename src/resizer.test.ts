@@ -4,6 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import {
@@ -123,7 +124,7 @@ describe('Resizer constructor — driver wiring', () => {
     // construction with a NAMED error, not a downstream TypeError (02 · §6 review fix).
     assert.throws(() => new Resizer({} as never), /storage/);
     // The bad construction must NOT have claimed the active slot.
-    assert.throws(() => getResizer(), /no Resizer constructed/);
+    assert.throws(() => getResizer(), /no Resizer named 'default'/);
   });
 
   test('rejects invalid config during construction without claiming the singleton', () => {
@@ -134,7 +135,7 @@ describe('Resizer constructor — driver wiring', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
     assert.throws(() => new Resizer(baseOpts()), /upload must be an object/);
-    assert.throws(() => getResizer(), /no Resizer constructed/);
+    assert.throws(() => getResizer(), /no Resizer named 'default'/);
     resetAppInstance();
     setAppInstance({
       getConfig: () => makeResizeConfig(),
@@ -172,33 +173,114 @@ describe('Resizer constructor — driver wiring', () => {
 });
 
 // ---------------------------------------------------------------------------
-// One-per-process active-instance slot (mirrors setAppInstance)
+// Named registry: several Resizers per process, one per name
 // ---------------------------------------------------------------------------
 
-describe('Resizer one-per-process slot', () => {
-  test('a second construction throws a clear error', () => {
+describe('Resizer registry', () => {
+  test('a second Resizer with the same name throws a clear error', () => {
     new Resizer(baseOpts());
     assert.throws(
       () => new Resizer(baseOpts()),
-      /only one Resizer per process/,
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_DUPLICATE_RESIZER' &&
+        err.message.includes("'default'"),
     );
   });
 
-  test('resetResizerForTests() allows a fresh construction', () => {
+  test('Resizers with different names coexist and are found by name', () => {
+    const media = new Resizer(baseOpts());
+    const listings = new Resizer({ ...baseOpts(), name: 'listings' });
+    assert.equal(getResizer(), media);
+    assert.equal(getResizer('default'), media);
+    assert.equal(getResizer('listings'), listings);
+    assert.equal(media.name, 'default');
+    assert.equal(listings.name, 'listings');
+  });
+
+  test('each Resizer keeps its own config', () => {
+    const a = new Resizer({
+      ...baseOpts(),
+      config: makeResizeConfig({ formats: ['webp'] }),
+    });
+    const b = new Resizer({
+      ...baseOpts(),
+      name: 'b',
+      config: makeResizeConfig({ formats: ['jpeg'] }),
+    });
+    assert.deepEqual(a.config.formats, ['webp']);
+    assert.deepEqual(b.config.formats, ['jpeg']);
+  });
+
+  test('getResizer() names the missing Resizer', () => {
+    new Resizer({ ...baseOpts(), name: 'listings' });
+    assert.throws(
+      () => getResizer(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_NO_RESIZER' &&
+        err.message.includes("'default'"),
+    );
+  });
+
+  test('an invalid config throws at construction and does not claim the name', () => {
+    assert.throws(
+      () =>
+        new Resizer({
+          ...baseOpts(),
+          config: { mediaModelName: 'File' } as never,
+        }),
+      (err: unknown) => err instanceof ResizeConfigError,
+    );
+    assert.doesNotThrow(() => new Resizer(baseOpts()));
+  });
+
+  test('only the default Resizer may have a transport until tasks record their Resizer', () => {
+    assert.throws(
+      () =>
+        new Resizer({
+          ...baseOpts(),
+          name: 'listings',
+          transport: fakeTransport(),
+        }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_NAMED_TRANSPORT_UNSUPPORTED',
+    );
+    assert.doesNotThrow(
+      () => new Resizer({ ...baseOpts(), transport: fakeTransport() }),
+    );
+  });
+
+  test('an empty name is rejected', () => {
+    assert.throws(
+      () => new Resizer({ ...baseOpts(), name: '' }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_NAME_INVALID',
+    );
+  });
+
+  test('explicit config, logger and drivers need no framework app', () => {
+    resetAppInstance();
+    const r = new Resizer({
+      storage: fakeStorage(),
+      mediaStore: fakeMediaStore(),
+      lockProvider: fakeLockProvider(),
+      config: makeResizeConfig(),
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    assert.equal(r.name, 'default');
+    assert.equal(getResizer(), r);
+  });
+
+  test('resetResizerForTests() forgets every Resizer', () => {
     const first = new Resizer(baseOpts());
+    new Resizer({ ...baseOpts(), name: 'listings' });
     resetResizerForTests();
     const second = new Resizer(baseOpts());
     assert.notEqual(first, second);
     assert.equal(getResizer(), second);
-  });
-
-  test('getResizer() throws a clear error before any construction', () => {
-    assert.throws(() => getResizer(), /no Resizer constructed/);
-  });
-
-  test('getResizer() returns the active instance after construction', () => {
-    const r = new Resizer(baseOpts());
-    assert.equal(getResizer(), r);
+    assert.throws(() => getResizer('listings'), /no Resizer named 'listings'/);
   });
 });
 

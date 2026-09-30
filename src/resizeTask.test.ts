@@ -17,6 +17,7 @@ import {
   ResizeConfigError,
   ResizeGenerateError,
   ResizeNoOriginalError,
+  ResizeSetupError,
 } from './errors.ts';
 import type { LockProvider } from './locks.ts';
 import type { MediaStore } from './mediaStore.ts';
@@ -1535,6 +1536,16 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
     assert.equal(getModelCalls(), 0);
+  });
+
+  test('a worker with no default Resizer fails before leasing', async () => {
+    installApp({ worker: { enabled: true } });
+    new Resizer({ name: 'listings', storage: makeStorage(redPng).storage });
+    await assert.rejects(
+      () => runResizeWorker(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_NO_RESIZER',
+    );
   });
 
   test('default media store + unregistered mediaModelName → throws before startWorker', async () => {
