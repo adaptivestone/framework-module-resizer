@@ -55,6 +55,7 @@ export async function runResizeWorker(): Promise<void> {
       (task, taskOpts) => processTaskWith(resizer, task, taskOpts),
       {
         signal: controller.signal,
+        queue: 'default',
       },
     );
     app.logger.info('resize worker stopped');

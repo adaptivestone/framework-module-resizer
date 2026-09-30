@@ -202,6 +202,8 @@ function mediaDoc(
 
 const task = (over: Partial<LeasedTask> = {}): LeasedTask => ({
   taskId: 't1',
+  resizer: 'default',
+  queue: 'default',
   mediaId: 'm1',
   pipeline: 'default',
   previews: [],

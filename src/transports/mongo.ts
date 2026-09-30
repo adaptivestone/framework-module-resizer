@@ -18,7 +18,11 @@ import { sleep } from '../helpers/sleep.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
 import { getResizer } from '../resizer.ts';
 import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
-import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';
+import type {
+  EnqueueTask,
+  LeasedTask,
+  QueueTransport,
+} from './AbstractTransport.ts';
 
 // The subset of the ResizeTask document the transport reads. The model itself is dynamic
 // (getModel returns `any` by design — the module stays mongoose-type-free), so the
@@ -26,6 +30,8 @@ import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';
 interface TaskDoc {
   _id: { toString(): string };
   fileId: { toString(): string };
+  resizer?: string;
+  queue?: string;
   pipeline: string;
   requestKey?: string;
   previews: MissingPreview[];
@@ -72,6 +78,8 @@ function fence(taskId: string, leaseToken: string) {
 function toLeasedTask(doc: TaskDoc): LeasedTask {
   return {
     taskId: doc._id.toString(),
+    resizer: doc.resizer ?? 'default',
+    queue: doc.queue ?? 'default',
     mediaId: doc.fileId.toString(),
     pipeline: doc.pipeline,
     previews: doc.previews ?? [],
@@ -309,17 +317,19 @@ export class MongoTransport implements QueueTransport {
   // enqueue + startWorker (the QueueTransport surface).
   // -------------------------------------------------------------------------
 
-  async enqueue(task: {
-    mediaId: string;
-    pipeline: string;
-    previews: MissingPreview[];
-  }): Promise<{ taskId: string | null }> {
+  async enqueue(task: EnqueueTask): Promise<{ taskId: string | null }> {
     const model = taskModel();
     if (!model) {
       return { taskId: null };
     }
     const previews = canonicalizeVariants(task.previews);
-    const requestKey = buildRequestKey(task.mediaId, task.pipeline, previews);
+    const requestKey = buildRequestKey({
+      mediaId: task.mediaId,
+      resizer: task.resizer,
+      queue: task.queue,
+      pipeline: task.pipeline,
+      previews,
+    });
     const filter = activeRequestFilter(task.mediaId, task.pipeline, requestKey);
     const upsert = () =>
       model.findOneAndUpdate(

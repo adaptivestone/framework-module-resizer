@@ -9,7 +9,9 @@ import { getApp } from './app.ts';
 import {
   type EnqueueRequiredOpts,
   enqueueRequiredImpl,
+  type PrewarmOpts,
   prewarmImpl,
+  type ResolveOpts,
   resolveImpl,
 } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
@@ -27,8 +29,12 @@ import { generateImpl } from './resizeTask.ts';
 // them from resizer.ts unchanged.
 import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import type {
+  EnqueueTask,
   LeasedTask,
   QueueTransport,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
 } from './transports/AbstractTransport.ts';
 import type {
   EnqueueRequiredResult,
@@ -47,7 +53,15 @@ import type {
 
 export type { LockProvider } from './locks/AbstractLockProvider.ts';
 export type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
-export type { LeasedTask, QueueTransport, ResizeStorage };
+export type {
+  EnqueueTask,
+  LeasedTask,
+  QueueTransport,
+  ResizeStorage,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
+};
 
 // ---------------------------------------------------------------------------
 // Named pipeline types (04 · §8) — the per-media-type pixel work. sharp is a hard dep;
@@ -343,14 +357,9 @@ export class Resizer {
    * engine (src/engine.ts), which partitions ready vs missing, enqueues the missing set,
    * and never throws into the caller's read.
    */
-  async resolve(opts: {
-    media: MediaLike;
-    sizes: SizeInput[];
-    pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = config.formats
-    ctx?: Record<string, unknown>; // threaded to read-path hooks (04 · §8)
-    enqueueMissing?: boolean; // default true when a transport is set, false otherwise
-  }): Promise<{ decision: ReadDecision; output: unknown }> {
+  async resolve(
+    opts: ResolveOpts,
+  ): Promise<{ decision: ReadDecision; output: unknown }> {
     return resolveImpl(this, opts);
   }
 
@@ -364,13 +373,7 @@ export class Resizer {
    * no transport it logs once and returns `{ enqueued: 0 }`. `enqueued` = variants handed to the
    * transport (dispatch-lock survivors).
    */
-  async prewarm(opts: {
-    media: MediaLike;
-    sizes: SizeInput[];
-    pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = config.formats
-    ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
-  }): Promise<{ enqueued: number }> {
+  async prewarm(opts: PrewarmOpts): Promise<{ enqueued: number }> {
     return prewarmImpl(this, opts);
   }
 

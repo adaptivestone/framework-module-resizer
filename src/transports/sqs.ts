@@ -100,18 +100,24 @@ export class SqsTransport implements QueueTransport {
         // observer always receives a task-shaped payload.
         let task: LeasedTask = {
           taskId: message.MessageId ?? '',
+          resizer: 'default',
+          queue: 'default',
           mediaId: '',
           pipeline: '',
           previews: [],
         };
         try {
           const body = JSON.parse(message.Body ?? '{}') as {
+            resizer?: string;
+            queue?: string;
             mediaId: string;
             pipeline: string;
             previews: LeasedTask['previews'];
           };
           task = {
             taskId: message.MessageId ?? '',
+            resizer: body.resizer ?? 'default',
+            queue: body.queue ?? 'default',
             mediaId: body.mediaId,
             pipeline: body.pipeline,
             previews: body.previews ?? [],

@@ -37,6 +37,7 @@ export interface ResolveOpts {
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // threaded to read-path hooks; ctx.isOwner/isAdmin gate signedUrl
   enqueueMissing?: boolean; // default true when a transport is set, false otherwise
+  queue?: string; // queue for missing variants; default resizer.queue
 }
 
 export interface PrewarmOpts {
@@ -45,6 +46,7 @@ export interface PrewarmOpts {
   pipeline?: string; // selects a registered pipeline; default 'default'
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
+  queue?: string; // queue for missing variants; default resizer.queue
 }
 
 export type EnqueueRequiredOpts = PrewarmOpts;
@@ -230,7 +232,13 @@ export async function resolveImpl(
         );
       } else {
         try {
-          await enqueue(resizer, mediaId, pipeline, decision.missing);
+          await enqueue(
+            resizer,
+            mediaId,
+            pipeline,
+            decision.missing,
+            opts.queue ?? resizer.queue,
+          );
         } catch (err) {
           // enqueue is internally guarded and should never reach here; belt-and-suspenders.
           resizer.logger.error(
@@ -326,7 +334,13 @@ export async function prewarmImpl(
 
     // 4. Hand the survivors to the SAME dispatch-lock enqueue as the read path; its return value
     //    is the count actually queued (post lock-loser filtering, 0 on any failure).
-    const enqueued = await enqueue(resizer, mediaId, pipeline, missing);
+    const enqueued = await enqueue(
+      resizer,
+      mediaId,
+      pipeline,
+      missing,
+      opts.queue ?? resizer.queue,
+    );
     return { enqueued };
   } catch (err) {
     // 5. Never-throw guard (same guarantee as resolve): an upload must not fail on a prewarm hiccup.
@@ -446,7 +460,13 @@ export async function enqueueRequiredImpl(
     };
   }
 
-  const attempt = await enqueueConfirmed(resizer, mediaId, pipeline, required);
+  const attempt = await enqueueConfirmed(
+    resizer,
+    mediaId,
+    pipeline,
+    required,
+    opts.queue ?? resizer.queue,
+  );
   return {
     status: attempt.unconfirmed.length > 0 ? 'incomplete' : 'accepted',
     requested,

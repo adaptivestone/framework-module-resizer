@@ -64,6 +64,7 @@ export { default as ResizeTaskModel } from './models/ResizeTask.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,
+  EnqueueTask,
   GenerateOpts,
   GenerateResult,
   HookFn,
@@ -77,6 +78,9 @@ export type {
   QueueTransport,
   ResizerOptions,
   ResizeStorage,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
   VariantStep,
   WaterfallName,
 } from './resizer.ts';

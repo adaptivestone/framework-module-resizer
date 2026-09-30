@@ -55,6 +55,8 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
 }
 
 type EnqueueTask = {
+  resizer: string;
+  queue: string;
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
@@ -462,6 +464,41 @@ describe('resolve — enqueue wiring', () => {
     assert.deepEqual(
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
       ['300x300:webp'],
+    );
+  });
+
+  test('sends the Resizer name and its queue, or the per-call queue', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const r = new Resizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+      name: 'listings',
+      queue: 'interactive',
+    });
+    const media: MediaLike = {
+      id: 'm1',
+      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
+    };
+    await r.resolve({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    await r.resolve({
+      media,
+      sizes: [{ width: 100, height: 100 }],
+      formats: ['jpeg'],
+      queue: 'bulk',
+    });
+    assert.deepEqual(
+      calls.map((c) => [c.resizer, c.queue]),
+      [
+        ['listings', 'interactive'],
+        ['listings', 'bulk'],
+      ],
     );
   });
 

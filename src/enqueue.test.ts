@@ -42,6 +42,8 @@ const storage: ResizeStorage = {
 };
 
 type EnqueueTask = {
+  resizer: string;
+  queue: string;
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
@@ -119,12 +121,21 @@ describe('enqueue', () => {
       filters: { nested: { a: 1, z: 2 } },
       requestedWidth: 300,
     });
+    const request = {
+      mediaId: 'm1',
+      resizer: 'default',
+      queue: 'default',
+      pipeline: 'default',
+    };
     assert.equal(
-      buildRequestKey('m1', 'default', [first, second]),
-      buildRequestKey('m1', 'default', [
-        second,
-        { ...first, filters: { nested: { a: 1, z: 2 } } as never },
-      ]),
+      buildRequestKey({ ...request, previews: [first, second] }),
+      buildRequestKey({
+        ...request,
+        previews: [
+          second,
+          { ...first, filters: { nested: { a: 1, z: 2 } } as never },
+        ],
+      }),
     );
   });
 
@@ -133,7 +144,13 @@ describe('enqueue', () => {
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [variant(), variant()]);
+    const enqueued = await enqueue(
+      r,
+      'm1',
+      'default',
+      [variant(), variant()],
+      'default',
+    );
     assert.equal(acquired.length, 1);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].previews.length, 1);
@@ -146,10 +163,16 @@ describe('enqueue', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
 
-    const enqueued = await enqueue(r, 'm1', 'default', [
-      variant({ filters: { crop: { x: 0, y: 0 } } as never }),
-      variant({ filters: { crop: { x: 10, y: 0 } } as never }),
-    ]);
+    const enqueued = await enqueue(
+      r,
+      'm1',
+      'default',
+      [
+        variant({ filters: { crop: { x: 0, y: 0 } } as never }),
+        variant({ filters: { crop: { x: 10, y: 0 } } as never }),
+      ],
+      'default',
+    );
 
     assert.equal(acquired.length, 2);
     assert.equal(calls.length, 1);
@@ -163,10 +186,16 @@ describe('enqueue', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
 
-    const enqueued = await enqueue(r, 'm1', 'default', [
-      variant({ filters: { crop: { x: 1 } } as never }),
-      variant({ filters: { crop: { x: '1' } } as never }),
-    ]);
+    const enqueued = await enqueue(
+      r,
+      'm1',
+      'default',
+      [
+        variant({ filters: { crop: { x: 1 } } as never }),
+        variant({ filters: { crop: { x: '1' } } as never }),
+      ],
+      'default',
+    );
 
     assert.equal(acquired.length, 2);
     assert.equal(calls.length, 1);
@@ -179,7 +208,13 @@ describe('enqueue', () => {
     const { transport } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    await enqueue(r, 'm1', 'default', [variant(), variant({ format: 'webp' })]);
+    await enqueue(
+      r,
+      'm1',
+      'default',
+      [variant(), variant({ format: 'webp' })],
+      'default',
+    );
     assert.deepEqual(
       acquired.map((a) => a.key),
       [
@@ -197,10 +232,13 @@ describe('enqueue', () => {
       (key) => key.endsWith(':jpeg:none'), // only the jpeg lock is won
     );
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [
-      variant(),
-      variant({ format: 'webp' }),
-    ]);
+    const enqueued = await enqueue(
+      r,
+      'm1',
+      'default',
+      [variant(), variant({ format: 'webp' })],
+      'default',
+    );
     assert.equal(calls.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => p.format),
@@ -224,10 +262,13 @@ describe('enqueue', () => {
       release: async () => {},
     };
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [
-      variant(),
-      variant({ format: 'webp' }),
-    ]);
+    const enqueued = await enqueue(
+      r,
+      'm1',
+      'default',
+      [variant(), variant({ format: 'webp' })],
+      'default',
+    );
     assert.equal(calls.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => p.format),
@@ -242,7 +283,7 @@ describe('enqueue', () => {
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(false);
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.equal(calls.length, 0);
     assert.equal(enqueued, 0); // no survivor → nothing handed over
   });
@@ -252,7 +293,7 @@ describe('enqueue', () => {
     const { transport } = makeTransport();
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.equal(released.length, 0);
     assert.equal(enqueued, 1); // success → the one survivor is counted
   });
@@ -264,7 +305,7 @@ describe('enqueue', () => {
     });
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
     assert.ok(errors.length >= 1);
     assert.equal(enqueued, 0); // a throw released the locks → nothing durably queued
@@ -275,7 +316,7 @@ describe('enqueue', () => {
     const { transport } = makeTransport(() => ({ taskId: null }));
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
-    const enqueued = await enqueue(r, 'm1', 'default', [variant()]);
+    const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
     assert.ok(errors.length >= 1);
     assert.equal(enqueued, 0); // null taskId → soft failure → not counted
@@ -287,10 +328,55 @@ describe('enqueue', () => {
     const { lockProvider } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
     const v = variant({ requestedWidth: 300, requestedHeight: 300 });
-    await enqueue(r, 'm1', 'photo', [v]);
+    await enqueue(r, 'm1', 'photo', [v], 'default');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].mediaId, 'm1');
     assert.equal(calls[0].pipeline, 'photo');
     assert.deepEqual(calls[0].previews, [v]);
+  });
+
+  test('enqueue sends the resizer name and the given queue', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const resizer = new Resizer({
+      storage,
+      transport,
+      lockProvider,
+      name: 'listings',
+    });
+    await enqueue(
+      resizer,
+      'm1',
+      'default',
+      [{ sizeKey: '300x300', format: 'webp' }],
+      'bulk',
+    );
+    assert.deepEqual(
+      { resizer: calls[0].resizer, queue: calls[0].queue },
+      { resizer: 'listings', queue: 'bulk' },
+    );
+  });
+});
+
+describe('buildRequestKey', () => {
+  const previews: MissingPreview[] = [{ sizeKey: '300x300', format: 'webp' }];
+  const base = {
+    mediaId: 'm1',
+    resizer: 'default',
+    queue: 'default',
+    pipeline: 'default',
+    previews,
+  };
+
+  test('is stable and versioned', () => {
+    assert.match(buildRequestKey(base), /^v2:[0-9a-f]{64}$/);
+    assert.equal(buildRequestKey(base), buildRequestKey({ ...base }));
+  });
+
+  test('differs by resizer and by queue', () => {
+    const key = buildRequestKey(base);
+    assert.notEqual(buildRequestKey({ ...base, resizer: 'listings' }), key);
+    assert.notEqual(buildRequestKey({ ...base, queue: 'bulk' }), key);
   });
 });
