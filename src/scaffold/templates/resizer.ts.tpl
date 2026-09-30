@@ -3,8 +3,9 @@
 // Load this file dynamically from bootstrap ONLY AFTER `await server.init()` in EVERY process:
 //     const { resizer } = await import('./resizer.ts');
 // A static import runs before bootstrap code and is therefore too early.
-// On construction the Resizer registers itself as the one-per-process active instance, so the
-// ResizeWorker command and your DTO builders reach it via getResizer() — or `import { resizer }`.
+// On construction the Resizer registers itself under its name ('default' unless you pass
+// `name`), so the ResizeWorker command and your DTO builders reach it via getResizer() — or
+// `import { resizer }`. Construct each name once.
 //
 // Everything below is wired EXCEPT `storage` (REQUIRED): fill the storage TODO and you're done.
 import { Resizer } from '@adaptivestone/framework-module-resize';
