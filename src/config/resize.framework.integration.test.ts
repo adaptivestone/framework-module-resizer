@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -24,7 +25,11 @@ afterEach(async () => {
   }
 });
 
-test('the Framework loads the scaffold bridge and merges the environment override', async () => {
+test('the Framework loads the scaffold bridge and merges the environment override', {
+  skip: existsSync(new URL('../../dist/config/resize.js', import.meta.url))
+    ? false
+    : 'Requires dist/config/resize.js; run npm run build to enable this integration test',
+}, async () => {
   previousEnv = process.env.NODE_ENV;
   root = await mkdtemp(join(tmpdir(), 'resize-framework-config-'));
   const linkedPackage = join(
@@ -35,7 +40,7 @@ test('the Framework loads the scaffold bridge and merges the environment overrid
   await symlink(
     resolve(fileURLToPath(new URL('../../', import.meta.url))),
     linkedPackage,
-    'dir',
+    process.platform === 'win32' ? 'junction' : 'dir',
   );
   assert.equal(await runScaffold(['--eager', '--agents', 'skip'], root), 0);
   await writeFile(

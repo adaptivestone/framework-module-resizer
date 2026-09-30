@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { describe, test } from 'node:test';
+import { ResizeSecurityError } from '../errors.ts';
 import { LocalFsStorage } from './fs.ts';
 
 const fresh = () => mkdtemp(join(tmpdir(), 'resize-fs-'));
@@ -14,6 +15,74 @@ const uploadArgs = (key: string, visibility: 'public' | 'private') => ({
 });
 
 describe('LocalFsStorage', () => {
+  test('a trailing slash keeps private originals outside the public root', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const publicRoot = join(dir, 'media');
+    for (const suffix of new Set(['/', sep])) {
+      const key = `originals/a-${suffix === '/' ? 'slash' : 'separator'}.svg`;
+      const s = new LocalFsStorage({
+        rootDir: `${publicRoot}${suffix}`,
+        publicBaseUrl: '/media',
+      });
+      const ref = await s.upload({
+        ...uploadArgs(key, 'private'),
+        body: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'),
+        contentType: 'image/svg+xml',
+      });
+      assert.deepEqual(
+        await readFile(join(`${publicRoot}-private`, key)),
+        await s.download(ref),
+      );
+      await assert.rejects(() => readFile(join(publicRoot, '-private', key)), {
+        code: 'ENOENT',
+      });
+      assert.equal(s.canServeOriginalPublicly(ref), false);
+      assert.throws(() => s.publicUrl(ref), /private original/);
+    }
+  });
+
+  test('rejects a private root equal to or inside the normalized public root', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const publicRoot = join(dir, 'media');
+    for (const privateRootDir of [
+      publicRoot,
+      `${publicRoot}${sep}`,
+      join(publicRoot, 'private'),
+      join(publicRoot, 'nested', 'private'),
+      join(dir, 'other', '..', 'media', 'private'),
+    ]) {
+      assert.throws(
+        () =>
+          new LocalFsStorage({
+            rootDir: `${publicRoot}${sep}`,
+            privateRootDir,
+            publicBaseUrl: '/media',
+          }),
+        (err) =>
+          err instanceof ResizeSecurityError &&
+          err.code === 'RESIZE_FS_PRIVATE_ROOT_PUBLIC',
+      );
+    }
+  });
+
+  test('allows an explicit sibling private root sharing the public name prefix', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const privateRootDir = join(dir, 'media-private');
+    const s = new LocalFsStorage({
+      rootDir: join(dir, 'media'),
+      privateRootDir,
+      publicBaseUrl: '/media',
+    });
+    const ref = await s.upload(uploadArgs('originals/a.jpg', 'private'));
+    assert.deepEqual(
+      await readFile(join(privateRootDir, 'originals/a.jpg')),
+      await s.download(ref),
+    );
+  });
+
   test('private and public refs round-trip under separate roots', async () => {
     const dir = await fresh();
     const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
@@ -118,7 +187,11 @@ describe('LocalFsStorage', () => {
     const dir = await fresh();
     const outside = await fresh();
     await writeFile(join(outside, 'secret.jpg'), Buffer.from('secret'));
-    await symlink(outside, join(dir, 'escape'), 'dir');
+    await symlink(
+      outside,
+      join(dir, 'escape'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
     const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
     await assert.rejects(
       () => s.upload(uploadArgs('escape/new/deep.jpg', 'public')),

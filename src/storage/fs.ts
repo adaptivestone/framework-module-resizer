@@ -51,8 +51,22 @@ export class LocalFsStorage implements ResizeStorage {
   readonly #publicBaseUrl: string;
 
   constructor(opts: LocalFsStorageOptions) {
-    this.#rootDir = opts.rootDir;
-    this.#privateRootDir = opts.privateRootDir ?? `${opts.rootDir}-private`;
+    this.#rootDir = resolve(opts.rootDir);
+    this.#privateRootDir = resolve(
+      opts.privateRootDir ?? `${this.#rootDir}-private`,
+    );
+    const privateRelativePath = relative(this.#rootDir, this.#privateRootDir);
+    if (
+      !privateRelativePath ||
+      (privateRelativePath !== '..' &&
+        !privateRelativePath.startsWith(`..${sep}`) &&
+        !isAbsolute(privateRelativePath))
+    ) {
+      throw new ResizeSecurityError(
+        'resize fs: privateRootDir must be outside the public rootDir',
+        { code: 'RESIZE_FS_PRIVATE_ROOT_PUBLIC' },
+      );
+    }
     this.#publicBaseUrl = opts.publicBaseUrl;
   }
 

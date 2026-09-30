@@ -5,22 +5,18 @@ This package changes the persisted resize fields from flat `key`/`bucket` fields
 old resize records. Updating this package alone does not make an existing host ready
 for rollout: the API and worker must use the same package version and media schema.
 
-Known `insailing-backend` work (outside this package patch):
+Host adoption checklist (implementation belongs in the host repository):
 
-- `src/helpers/uploadImageOriginal.ts` reads `original.key`/`original.bucket` and
-  constructs a flat `original`; adapt the upload result and host metadata mapping.
-  Supply a stable optional namespace here if this host wants auditable S3 prefixes.
-- `src/helpers/toMediaLike.ts` constructs flat refs from `original` and legacy
-  `originalMetadata`; define how that host handles its legacy data under the
-  no-old-resize-record assumption, and pass nested refs to the module.
-- `src/models/File.ts` checks and writes `original.key` in
-  `prepareResizeOriginal`; update its schema expectations, presence checks and
-  conditional update. It already spreads `resizeMediaSchemaFragment`.
-- `src/helpers/mediaPublicUrls.ts` gates reads on `original.key`; update that
-  persisted-original check. `src/helpers/generateAvatarPreviews.ts` checks the
-  same field after preparation.
-- The related upload, avatar and local-media tests assert flat keys or
-  `bucket: 'local-private'`; update them when adapting the host.
+- Upload handlers must persist the returned original with its nested `storageRef`.
+  Supply a stable optional namespace if the host wants auditable storage prefixes.
+- Media mapping helpers must pass nested refs to the module. Any handling of legacy
+  host data is the host's responsibility; the module supplies no old-record reader
+  or migration.
+- Media models must use `resizeMediaSchemaFragment` and update presence checks and
+  conditional writes that previously relied on flat `original.key` fields.
+- Public URL builders and preview-generation helpers must check
+  `original.storageRef` when deciding whether an original has been persisted.
+- Upload, preview and storage tests must assert the nested ref shape.
 
 Before deployment, verify the target data policy, update all host consumers, run
 host tests and coordinate API/worker release. The module patch does not establish
