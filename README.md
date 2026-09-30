@@ -692,8 +692,16 @@ export default {
 Format ids are open strings rather than a package enum. To enable another format supported by the
 installed Sharp/libvips build, add it to `formats` or `upload.formats`. Output encoder options
 live under the same id in `encode.formats`; for example, TIFF can use
-`formats: ['tiff']` with `encode.formats.tiff: { compression: 'lzw' }`. Unsupported codecs fail
-through Sharp with the normal generation error path.
+`formats: ['tiff']` with `encode.formats.tiff: { compression: 'lzw' }`. Every `formats` entry
+needs an `encode.formats` entry (`{}` keeps Sharp defaults), so a Sharp alias such as `'jpg'`
+fails at boot instead of encoding JPEG without the `'jpeg'` options and flatten step. Unsupported
+codecs fail through Sharp with the normal generation error path.
+
+Validation also rejects the removed 0.2.x keys (`webpAvifOnly`, `encode.quality`,
+`encode.effort`, `encode.mozjpeg`, `encode.chromaSubsampling`, `encode.flattenBackground`)
+with `RESIZE_CONFIG_REMOVED_KEY` rather than ignoring them. The worker checks at startup that
+`mediaModelName` names a registered model (`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`); the default
+`FrameworkMediaStore` raises the same error instead of treating every task as deleted media.
 
 Storage buckets/URLs and the SQS queue URL are **not** config — they are driver options passed to
 `new S3Storage({...})` / `new SqsTransport({...})`.

@@ -8,7 +8,11 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
-import { ResizeGenerateError, ResizeNoOriginalError } from './errors.ts';
+import {
+  ResizeConfigError,
+  ResizeGenerateError,
+  ResizeNoOriginalError,
+} from './errors.ts';
 import type { LockProvider } from './locks.ts';
 import type { MediaStore } from './mediaStore.ts';
 import {
@@ -1476,6 +1480,34 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
     assert.equal(getModelCalls(), 0);
+  });
+
+  test('default media store + unregistered mediaModelName → throws before startWorker', async () => {
+    resetAppInstance();
+    setAppInstance({
+      getConfig: () =>
+        makeResizeConfig({
+          mediaModelName: 'Media',
+          worker: { enabled: true },
+        }),
+      getModel: () => false,
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    let started = false;
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport: fakeTransport(() => {
+        started = true;
+      }),
+      lockProvider: makeLocks().lockProvider,
+    });
+    await assert.rejects(
+      () => runResizeWorker(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN',
+    );
+    assert.equal(started, false);
   });
 
   test('enabled + transport → startWorker gets a handler that reaches processTask', async () => {

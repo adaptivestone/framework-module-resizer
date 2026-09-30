@@ -97,6 +97,50 @@ describe('getResizeConfig', () => {
     }
   });
 
+  test('rejects 0.2.x keys that would otherwise be ignored silently', () => {
+    const base = makeResizeConfig();
+    const cases: Array<[unknown, string]> = [
+      [{ ...base, webpAvifOnly: true }, '`webpAvifOnly`'],
+      [
+        { ...base, encode: { ...base.encode, quality: { avif: 50 } } },
+        '`encode.quality`',
+      ],
+      [
+        { ...base, encode: { ...base.encode, flattenBackground: '#000' } },
+        '`encode.flattenBackground`',
+      ],
+    ];
+    for (const [config, path] of cases) {
+      install(config);
+      assert.throws(
+        () => getResizeConfig(),
+        (error: unknown) =>
+          error instanceof ResizeConfigError &&
+          error.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+          error.message.includes(path),
+      );
+    }
+  });
+
+  test('requires an encode.formats entry for every generated format', () => {
+    // 'jpg' is a Sharp alias: it would encode JPEG without the 'jpeg' options or flatten.
+    install(makeResizeConfig({ formats: ['jpg', 'webp'] }));
+    assert.throws(
+      () => getResizeConfig(),
+      (error: unknown) =>
+        error instanceof ResizeConfigError &&
+        error.code === 'RESIZE_CONFIG_FORMATS_INVALID' &&
+        error.message.includes('[jpg]'),
+    );
+
+    const config = makeResizeConfig({
+      formats: ['png'],
+      encode: { formats: { png: {} } },
+    });
+    install(config);
+    assert.deepEqual(getResizeConfig().formats, ['png']);
+  });
+
   test('throws clearly when the framework app is not initialized', () => {
     resetAppInstance();
     assert.throws(() => getResizeConfig(), /not initialized/);

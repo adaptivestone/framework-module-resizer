@@ -7,24 +7,32 @@
 // media model through getApp() + getResizeConfig() (02 · §4). The read path never calls load();
 // resolve() receives `media` from the caller.
 import { getApp } from '../app.ts';
+import { ResizeConfigError } from '../errors.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import type { MediaStore } from './AbstractMediaStore.ts';
 
 export class FrameworkMediaStore implements MediaStore {
-  async load(mediaId: string): Promise<MediaLike | null> {
-    const app = getApp();
+  /**
+   * The host media model named by config.mediaModelName. An unregistered name is a config
+   * error, never "media missing": the worker completes tasks for deleted media as no-ops, so
+   * returning null here would silently drop every task. The worker calls this once at startup
+   * (models are loaded by then) to fail before leasing anything.
+   */
+  getMediaModel() {
     const { mediaModelName } = getResizeConfig();
-    const model = app.getModel(mediaModelName);
-    // getModel returns false/undefined for a name no host model was registered under.
-    // Tolerate it: log + no-op (null) rather than throwing on `.findById` of a non-model.
+    const model = getApp().getModel(mediaModelName);
     if (!model) {
-      app.logger.error(
-        `resize mediaStore: no model registered as '${mediaModelName}' — cannot load media ${mediaId}`,
+      throw new ResizeConfigError(
+        `resize config: mediaModelName '${mediaModelName}' is not a registered model — set it in the host src/config/resize.ts`,
+        { code: 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN' },
       );
-      return null;
     }
-    return model.findById(mediaId);
+    return model;
+  }
+
+  async load(mediaId: string): Promise<MediaLike | null> {
+    return this.getMediaModel().findById(mediaId);
   }
 
   async appendPreviews(
@@ -32,7 +40,7 @@ export class FrameworkMediaStore implements MediaStore {
     previews: Preview[],
     backfillDims?: { width: number; height: number },
   ): Promise<void> {
-    const { mediaModelName } = getResizeConfig();
+    const model = this.getMediaModel();
     // ONE atomic write: $push the previews, and (only when the worker backfilled the
     // original's display dims) $set them via dotted paths in the same update.
     const update: {
@@ -47,6 +55,6 @@ export class FrameworkMediaStore implements MediaStore {
         'original.height': backfillDims.height,
       };
     }
-    await getApp().getModel(mediaModelName).findByIdAndUpdate(mediaId, update);
+    await model.findByIdAndUpdate(mediaId, update);
   }
 }

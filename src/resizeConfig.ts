@@ -12,6 +12,17 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 
+// Keys read by 0.2.x and ignored since. Framework merging keeps unknown keys, so an upgraded
+// host would otherwise lose these settings silently (e.g. webpAvifOnly: jpeg output returns).
+const REMOVED_KEYS: Record<string, string> = {
+  webpAvifOnly: 'formats',
+  'encode.quality': 'encode.formats.<format>.quality',
+  'encode.effort': 'encode.formats.<format>.effort',
+  'encode.mozjpeg': 'encode.formats.jpeg.mozjpeg',
+  'encode.chromaSubsampling': 'encode.formats.jpeg.chromaSubsampling',
+  'encode.flattenBackground': 'encode.flatten.background',
+};
+
 /** Validate the complete framework-resolved config before it is consumed. */
 function validateRequiredResizeConfigFields(
   config: unknown,
@@ -20,6 +31,16 @@ function validateRequiredResizeConfigFields(
     return invalid('resize config must be an object', 'RESIZE_CONFIG_INVALID');
   }
   const root = config;
+  for (const [path, replacement] of Object.entries(REMOVED_KEYS)) {
+    const [head, tail] = path.split('.');
+    const owner = tail === undefined ? root : root[head];
+    if (isRecord(owner) && Object.hasOwn(owner, tail ?? head)) {
+      invalid(
+        `resize config: \`${path}\` is no longer supported — use \`${replacement}\``,
+        'RESIZE_CONFIG_REMOVED_KEY',
+      );
+    }
+  }
   if (
     typeof root.mediaModelName !== 'string' ||
     root.mediaModelName.trim().length === 0
@@ -93,6 +114,19 @@ function validateRequiredResizeConfigFields(
     invalid(
       'resize config: every encode.formats value must be an options object',
       'RESIZE_CONFIG_INVALID',
+    );
+  }
+  // Every generated format needs its own encoder entry ({} keeps Sharp defaults). Sharp accepts
+  // aliases such as 'jpg', which would encode JPEG while skipping the 'jpeg' options and the
+  // flatten list, so transparent pixels would turn black.
+  const encoders = encode.formats;
+  const unconfigured = (root.formats as string[]).filter(
+    (format) => !Object.hasOwn(encoders, format),
+  );
+  if (unconfigured.length > 0) {
+    invalid(
+      `resize config: formats [${unconfigured.join(', ')}] have no encode.formats entry — add one ({} keeps Sharp defaults) and use Sharp format ids such as 'jpeg', not aliases such as 'jpg'`,
+      'RESIZE_CONFIG_FORMATS_INVALID',
     );
   }
   const flatten = encode.flatten;
