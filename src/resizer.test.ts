@@ -145,6 +145,28 @@ describe('Resizer constructor — driver wiring', () => {
     assert.doesNotThrow(() => new Resizer(baseOpts()));
   });
 
+  test('the default media store loads from the Resizer’s own media model', async () => {
+    const asked: string[] = [];
+    resetAppInstance();
+    setAppInstance({
+      getConfig: () => makeResizeConfig(), // mediaModelName 'File'
+      getModel: (name: string) => {
+        asked.push(name);
+        return { findById: async () => null };
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    const photos = new Resizer({
+      ...baseOpts(),
+      name: 'photos',
+      config: makeResizeConfig({ mediaModelName: 'Photo' }),
+    });
+    const files = new Resizer(baseOpts());
+    await photos.mediaStore.load('m1');
+    await files.mediaStore.load('m2');
+    assert.deepEqual(asked, ['Photo', 'File']);
+  });
+
   test('seeds pipelines from options', () => {
     const photo: Pipeline = { beforeSteps: [] };
     const r = new Resizer({ ...baseOpts(), pipelines: { photo } });

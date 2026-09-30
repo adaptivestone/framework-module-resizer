@@ -143,7 +143,7 @@ export interface ResizerOptions {
   events?: ResizeEventBus; // default: the framework app's event bus, when one exists
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
-  mediaStore?: MediaStore; // default: new FrameworkMediaStore() (05 · §10.6)
+  mediaStore?: MediaStore; // default: a FrameworkMediaStore for config.mediaModelName (05 · §10.6)
   lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
@@ -246,7 +246,9 @@ export class Resizer {
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
-    this.mediaStore = opts.mediaStore ?? new FrameworkMediaStore();
+    this.mediaStore =
+      opts.mediaStore ??
+      new FrameworkMediaStore({ modelName: this.config.mediaModelName });
     this.lockProvider = opts.lockProvider ?? new FrameworkLockProvider();
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and

@@ -4,22 +4,34 @@
 // remote media service — so the module core stays DB-free. Subpath entry
 // `…/mediaStore/framework.js`: a host wrapping this default imports it from there (uniform rule
 // 02 · §6); no optional deps, so importing is always safe. No `app` parameter: reads the host
-// media model through getApp() + getResizeConfig() (02 · §4). The read path never calls load();
-// resolve() receives `media` from the caller.
+// media model through getApp() (02 · §4). The model name comes from the `modelName` option, so
+// each Resizer loads from its own model; without it, from the app's `resize` config. The read
+// path never calls load(); resolve() receives `media` from the caller.
 import { getApp } from '../app.ts';
 import { ResizeConfigError } from '../errors.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import type { MediaStore } from './AbstractMediaStore.ts';
 
+export interface FrameworkMediaStoreOptions {
+  // The host media model. Default: `mediaModelName` from the app's `resize` config.
+  modelName?: string;
+}
+
 export class FrameworkMediaStore implements MediaStore {
+  readonly #modelName: string | undefined;
+
+  constructor(opts: FrameworkMediaStoreOptions = {}) {
+    this.#modelName = opts.modelName;
+  }
+
   /**
-   * The host media model named by config.mediaModelName. An unregistered name is a config
-   * error, never "media missing": the worker completes tasks for deleted media as no-ops, so
-   * returning null here would silently drop every task.
+   * The host media model named by `modelName` (or config.mediaModelName). An unregistered name
+   * is a config error, never "media missing": the worker completes tasks for deleted media as
+   * no-ops, so returning null here would silently drop every task.
    */
   getMediaModel() {
-    const { mediaModelName } = getResizeConfig();
+    const mediaModelName = this.#modelName ?? getResizeConfig().mediaModelName;
     const model = getApp().getModel(mediaModelName);
     if (!model) {
       throw new ResizeConfigError(
