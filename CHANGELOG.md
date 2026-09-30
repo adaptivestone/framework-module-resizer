@@ -1,6 +1,6 @@
-# 0.4.0
+# Unreleased
 
-0.3.0 was never published; this entry covers every change since 0.2.1.
+Pending changes since 0.2.1. The release version will be chosen when these changes are ready.
 
 **Breaking changes**
 
@@ -26,7 +26,7 @@
 - Config keys moved. The old keys now fail validation with `RESIZE_CONFIG_REMOVED_KEY` instead of
   being ignored:
 
-  | 0.2.x | 0.4.0 |
+  | 0.2.x | Unreleased |
   |---|---|
   | `webpAvifOnly: true` | `formats: ['webp', 'avif']` |
   | `encode.quality.<format>` | `encode.formats.<format>.quality` |
@@ -40,8 +40,9 @@
 - `mediaModelName` must name a registered model. The worker checks it at startup, and
   `FrameworkMediaStore` throws `ResizeConfigError` (`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`) instead of
   completing every task as a deleted-media no-op.
-- The worker command needs an explicit `worker.enabled: true` in host config instead of an
-  environment-variable convention; the module default remains `false`.
+- Worker setup uses an explicit `worker.enabled: true` in host config instead of an
+  environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
+  message; the module default remains `false`.
 
 **Features**
 
@@ -59,6 +60,15 @@
 - Queued raster tasks retry only the identities still missing after partial generation.
   Successful previews stay persisted, and permanent gaps use the normal backoff and dead-letter
   path. Deleted media tasks remain successful no-ops.
+
+**Fixes**
+
+- `LocalFsStorage` normalizes root paths before deriving the private root and rejects a
+  `privateRootDir` equal to or inside the public root. A trailing slash no longer places private
+  originals in the public folder.
+- Coverage builds the package before integration tests. Source-only test runs skip the Framework
+  config integration test with a build instruction when the compiled config is absent.
+- Host adoption documentation uses a generic checklist without internal project names or paths.
 
 # 0.2.1
 
