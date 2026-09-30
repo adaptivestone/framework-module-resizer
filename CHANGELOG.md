@@ -69,6 +69,8 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - Coverage builds the package before integration tests. Source-only test runs skip the Framework
   config integration test with a build instruction when the compiled config is absent.
 - Host adoption documentation uses a generic checklist without internal project names or paths.
+- The resolved config object is validated once instead of on every `getResizeConfig()` call, so
+  the read path no longer re-runs full validation per `resolve()`.
 
 # 0.2.1
 

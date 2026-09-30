@@ -233,9 +233,17 @@ function validateRequiredResizeConfigFields(
   }
 }
 
+// The framework returns the same cached object on every getConfig call, so the read path
+// validates each resolved config object once instead of on every resolve().
+const validatedConfigs = new WeakSet<object>();
+
 /** Read the final config already resolved and cached by the framework. */
 export function getResizeConfig(): ResizeConfig {
   const config: unknown = getApp().getConfig('resize');
+  if (isRecord(config) && validatedConfigs.has(config)) {
+    return config as unknown as ResizeConfig;
+  }
   validateRequiredResizeConfigFields(config);
-  return config as ResizeConfig;
+  validatedConfigs.add(config);
+  return config;
 }
