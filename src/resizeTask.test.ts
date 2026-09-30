@@ -2,6 +2,11 @@
 // generated with sharp itself; fakes for storage / mediaStore / lockProvider / transport.
 // Fresh Resizer + fake ambient app per test (node:test = per-file process isolation).
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 import {
   resetAppInstance,
@@ -1243,6 +1248,56 @@ describe('generate (eager)', () => {
     assert.ok(fit);
     assert.equal((await sharp(cover.body).metadata()).width, 200);
     assert.equal((await sharp(fit.body).metadata()).width, 8);
+  });
+
+  test('SVG rasterization never loads external file, URL or CSS references', async (t) => {
+    installApp();
+    const dir = await mkdtemp(join(tmpdir(), 'resize-svg-refs-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const redPath = join(dir, 'red.png');
+    await writeFile(redPath, redPng);
+    let requests = 0;
+    const server = createServer((_req, res) => {
+      requests += 1;
+      res.writeHead(200, { 'content-type': 'image/png' });
+      res.end(redPng);
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    t.after(() => server.close());
+    const { port } = server.address() as AddressInfo;
+    const remote = `http://127.0.0.1:${port}/red.png`;
+    // A green canvas covered by red external images: any loaded reference turns pixels red.
+    const svg = Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="8" height="8">
+        <style>@import url("http://127.0.0.1:${port}/x.css");</style>
+        <rect width="8" height="8" fill="#00ff00"/>
+        <image href="file://${redPath}" width="8" height="8"/>
+        <image href="red.png" width="8" height="8"/>
+        <image href="${remote}" width="8" height="8"/>
+        <image xlink:href="${remote}" width="8" height="8"/>
+        <use href="file://${redPath}#x"/>
+      </svg>`,
+    );
+    const { storage, uploads } = makeStorage(svg);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const result = await r.generate({
+      media: mediaDoc({
+        original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+      }),
+      sizes: [{ width: 32, height: 32 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.created.length, 1);
+    assert.equal(requests, 0);
+    const { data, info } = await sharp(uploads[0].body)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const center = (16 * info.width + 16) * info.channels;
+    assert.ok(data[center] < 60, `red channel ${data[center]}`);
+    assert.ok(data[center + 1] > 200, `green channel ${data[center + 1]}`);
   });
 
   test('no original → ResizeNoOriginalError', async () => {

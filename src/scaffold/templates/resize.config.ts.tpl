@@ -7,4 +7,6 @@ import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/r
 export default {
   ...defaultResizeConfig,
   mediaModelName: 'File', // TODO(REQUIRED): the host media model, e.g. File or Media
+  // Lazy / pre-warm modes: allow the worker command, then run `npm run cli ResizeWorker`.
+  // worker: { ...defaultResizeConfig.worker, enabled: true },
 } satisfies ResizeConfig;
