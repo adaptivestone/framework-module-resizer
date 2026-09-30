@@ -143,6 +143,7 @@ export interface ResizerOptions {
   events?: ResizeEventBus; // default: the framework app's event bus, when one exists
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
+  queue?: string; // default queue for this Resizer's tasks; default 'default'
   mediaStore?: MediaStore; // default: a FrameworkMediaStore for config.mediaModelName (05 · §10.6)
   lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
@@ -192,6 +193,7 @@ function frameworkEvents(): ResizeEventBus | undefined {
  */
 export class Resizer {
   readonly name: string;
+  readonly queue: string;
   readonly config: ResizeConfig;
   readonly logger: ResizeLogger;
   readonly #events: ResizeEventBus | undefined;
@@ -227,13 +229,11 @@ export class Resizer {
         { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
-    // Queued tasks do not record their Resizer yet, so the worker runs every task with the
-    // default Resizer. A named Resizer's tasks would use the wrong storage and config.
-    if (name !== 'default' && opts.transport) {
-      throw new ResizeSetupError(
-        `resize: Resizer '${name}' cannot have a transport yet — its queued tasks would be processed by the default Resizer. Use generate() for '${name}', or queue through the default Resizer.`,
-        { code: 'RESIZE_NAMED_TRANSPORT_UNSUPPORTED' },
-      );
+    const queue = opts.queue ?? 'default';
+    if (typeof queue !== 'string' || queue.trim().length === 0) {
+      throw new ResizeSetupError('resize: `queue` must be a non-empty string', {
+        code: 'RESIZE_QUEUE_INVALID',
+      });
     }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
@@ -243,6 +243,7 @@ export class Resizer {
     this.logger = opts.logger ?? getApp().logger;
     this.#events = opts.events ?? frameworkEvents();
     this.name = name;
+    this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
@@ -408,6 +409,11 @@ export function getResizer(name = 'default'): Resizer {
     );
   }
   return resizer;
+}
+
+/** Every registered Resizer, in construction order (the worker serves all of them). */
+export function listResizers(): Resizer[] {
+  return [...resizers.values()];
 }
 
 /** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */

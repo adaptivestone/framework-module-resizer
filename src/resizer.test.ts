@@ -10,6 +10,7 @@ import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import {
   getResizer,
   type LockProvider,
+  listResizers,
   type MediaStore,
   type Pipeline,
   type QueueTransport,
@@ -257,21 +258,37 @@ describe('Resizer registry', () => {
     assert.doesNotThrow(() => new Resizer(baseOpts()));
   });
 
-  test('only the default Resizer may have a transport until tasks record their Resizer', () => {
+  test('a named Resizer may have a transport', () => {
+    const transport = fakeTransport();
+    const listings = new Resizer({
+      ...baseOpts(),
+      name: 'listings',
+      transport,
+    });
+    assert.equal(listings.transport, transport);
+  });
+
+  test('queue defaults to "default" and can be set per Resizer', () => {
+    const media = new Resizer(baseOpts());
+    const bulk = new Resizer({ ...baseOpts(), name: 'bulk', queue: 'bulk' });
+    assert.equal(media.queue, 'default');
+    assert.equal(bulk.queue, 'bulk');
+  });
+
+  test('an empty queue name is rejected', () => {
     assert.throws(
-      () =>
-        new Resizer({
-          ...baseOpts(),
-          name: 'listings',
-          transport: fakeTransport(),
-        }),
+      () => new Resizer({ ...baseOpts(), queue: '' }),
       (err: unknown) =>
-        err instanceof ResizeSetupError &&
-        err.code === 'RESIZE_NAMED_TRANSPORT_UNSUPPORTED',
+        err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_INVALID',
     );
-    assert.doesNotThrow(
-      () => new Resizer({ ...baseOpts(), transport: fakeTransport() }),
-    );
+  });
+
+  test('listResizers() returns every registered Resizer in construction order', () => {
+    const a = new Resizer(baseOpts());
+    const b = new Resizer({ ...baseOpts(), name: 'b' });
+    assert.deepEqual(listResizers(), [a, b]);
+    resetResizerForTests();
+    assert.deepEqual(listResizers(), []);
   });
 
   test('an empty name is rejected', () => {
