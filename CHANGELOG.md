@@ -1,48 +1,64 @@
-# 0.3.0
+# 0.4.0
+
+0.3.0 was never published; this entry covers every change since 0.2.1.
 
 **Breaking changes**
 
-- Private SVG originals now use the same `resolve()` / `prewarm()` / `enqueueRequired()` and
-  worker lifecycle as raster images. The worker copies the original bytes to public storage and
-  atomically persists the locator in `original.publicCopy`; it does not rasterize or rewrite SVG.
-- Custom `MediaStore` implementations must add
-  `setOriginalPublicCopy(mediaId, expectedOriginalKey, publicCopy): Promise<boolean>`. The
-  conditional write prevents a completed worker from attaching a copy to a replaced original.
+- Persisted locators are nested, driver-owned refs: `original.storageRef` and
+  `previews[].storageRef` replace the flat `key`/`bucket` fields, and `StorageRef` is now an
+  opaque JSON value. No reader or migration for old resize records is included; update host
+  models, DTOs, custom storage drivers and the API/worker processes together. Keep
+  `minimize: false` on the media schema so empty objects inside refs survive persistence.
+- `ResizeStorage.upload()` receives optional `namespace` (a placement hint from
+  `uploadOriginal({ namespace })`) and `parentRef` (the original's ref when the worker stores
+  previews).
+- Private originals need separate storage: `S3Storage` rejects a private upload unless
+  `bucketPrivate` differs from `bucketPublic`; `LocalFsStorage` keeps private files under
+  `privateRootDir` (default `<rootDir>-private`).
+- SVG is an input format only. `uploadOriginal()` stores SVG privately and rejects public SVG
+  uploads; the worker rasterizes accepted SVG into the configured preview formats through the
+  normal task lifecycle. `resolve()` never returns uploaded SVG markup.
+- The module no longer merges host config over its defaults and drops the `deepmerge`
+  dependency. The framework's `resize.ts` + `resize.<NODE_ENV>.ts` merge is the only merge: the
+  host `src/config/resize.ts` spreads the defaults from
+  `@adaptivestone/framework-module-resize/config/resize.js`, and the final value must be complete.
+  It is validated when `new Resizer()` is constructed.
+- Config keys moved. The old keys now fail validation with `RESIZE_CONFIG_REMOVED_KEY` instead of
+  being ignored:
+
+  | 0.2.x | 0.4.0 |
+  |---|---|
+  | `webpAvifOnly: true` | `formats: ['webp', 'avif']` |
+  | `encode.quality.<format>` | `encode.formats.<format>.quality` |
+  | `encode.effort.<format>` | `encode.formats.<format>.effort` |
+  | `encode.mozjpeg`, `encode.chromaSubsampling` | `encode.formats.jpeg.mozjpeg`, `encode.formats.jpeg.chromaSubsampling` |
+  | `encode.flattenBackground` | `encode.flatten.background` (formats in `encode.flatten.formats`) |
+
+- Format ids are open strings passed to `sharp.toFormat(id, encode.formats[id])`. Every `formats`
+  entry needs an `encode.formats` entry (`{}` keeps Sharp defaults), so an alias such as `'jpg'`
+  fails at boot instead of skipping the `'jpeg'` options and flatten step.
+- `mediaModelName` must name a registered model. The worker checks it at startup, and
+  `FrameworkMediaStore` throws `ResizeConfigError` (`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`) instead of
+  completing every task as a deleted-media no-op.
+- The worker command needs an explicit `worker.enabled: true` in host config instead of an
+  environment-variable convention; the module default remains `false`.
 
 **Features**
 
-- Restored the framework-style `./config/resize.js` subpath with canonical module defaults.
-  Scaffolded hosts extend that config and declare only `mediaModelName` plus their overrides;
-  framework environment merging remains the single runtime merge layer.
-- `ResizeStorage` has an optional `copyToPublic()` optimization. `S3Storage` implements it with a
-  server-side `CopyObject`; other drivers use the core download/upload fallback.
-- `resolve()` now queues publication when an anonymous read reaches a private SVG without a valid
-  public copy. After publication, every requested size and format resolves to the same SVG URL and
-  reports its real `image/svg+xml` content type.
-- `generate()` performs the same publication eagerly. `prewarm()` and `enqueueRequired()` skip it
-  only when storage proves that the SVG original or its persisted copy is already public.
-
-**Upload policy**
-
-- `uploadOriginal()` still stores the exact input bytes. The module inspects SVG metadata but does
-  not sanitize markup, remove scripts, or follow a host-specific trust policy. Hosts decide which
-  SVG inputs they accept; this release adds no sanitizer.
-
-**Also included since 0.2.1**
-
-- Added `resizer.uploadOriginal({ body, visibility })`: byte-sniffed, unchanged original storage
-  with typed metadata/errors and explicit SVG-as-SVG handling. New `upload.maxBytes` and
-  `upload.formats` controls bound accepted inputs.
-- Added strict `enqueueRequired()`, which partitions ready, accepted, not-required, and
-  unconfirmed variants. A held lock is no longer treated as a task receipt; Mongo can prove
-  exact canonical active-payload coverage, while SQS/custom transports report non-queryable
-  races as incomplete. Conflicting payloads with one preview identity are explicit.
-- Queued raster tasks now retry any missing identities after partial generation. Successful
-  previews remain persisted, retries skip them, and permanent gaps use existing backoff and
-  dead-letter handling. Deleted media tasks remain successful no-ops.
-- Worker setup uses an explicit `worker.enabled: true` in host config instead of an
-  environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
-  message; the module default remains `false`.
+- `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
+  and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
+  `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
+- Strict `enqueueRequired()` partitions ready, accepted, not-required and unconfirmed variants. A
+  held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
+  through the optional `QueueTransport.findActive()`, while SQS/custom transports without it
+  report lock races as retryable `incomplete`. Conflicting payloads with one preview identity are
+  explicit errors.
+- The Mongo transport deduplicates identical active requests with a canonical SHA-256
+  `requestKey` and a partial unique index on `{ fileId, pipeline, requestKey }`. The module does not
+  create indexes; prepare them through the host's migration or lifecycle before rollout.
+- Queued raster tasks retry only the identities still missing after partial generation.
+  Successful previews stay persisted, and permanent gaps use the normal backoff and dead-letter
+  path. Deleted media tasks remain successful no-ops.
 
 # 0.2.1
 
