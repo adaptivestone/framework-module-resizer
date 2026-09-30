@@ -236,7 +236,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 
 - `sizes` is an ALLOWLIST. Never pass client-supplied dimensions through — resolve them against
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
-- ONE `Resizer` per process; a second `new Resizer()` throws. Everywhere else use `getResizer()`.
+- Construct each Resizer ONCE, at one construction site. Most hosts need one (`getResizer()`); for
+  more, give each a `name` and its own `config` (`getResizer('listings')`). The same name twice
+  throws. Only the default Resizer may have a `transport` for now.
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
@@ -265,7 +267,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |
 | `formats [...] have no encode.formats entry` | add `encode.formats.<id>` (`{}` for Sharp defaults); use `'jpeg'`, not the alias `'jpg'` |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import | optional peer not installed — see step 1 |
-| a second `new Resizer()` throws | by design: one per process — import the single construction site; elsewhere `getResizer()` |
+| `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
 | boot throws `queue.lockTtlMs.worker … must be ≤ queue.leaseMs` | raise `queue.leaseMs` or lower `queue.lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
