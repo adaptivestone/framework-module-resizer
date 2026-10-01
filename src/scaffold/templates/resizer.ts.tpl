@@ -26,7 +26,7 @@ export const resizer = createFrameworkResizer({
   // or `new S3Storage({ bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: '…', client })`
   // (use distinct buckets when originals must stay private; uncomment an import above)
   // or your own ResizeStorage (05 · §10.4). Until then tsc fails with
-  // "Cannot find name 'PROVIDE_YOUR_STORAGE_DRIVER'" — a loud, named reminder (see README).
+  // "Cannot find name 'PROVIDE_YOUR_STORAGE_DRIVER'" — a loud, named reminder.
   storage: PROVIDE_YOUR_STORAGE_DRIVER,
   pipelines: {
     default: {}, // add named pipelines, e.g. listing: { beforeSteps: [...] }, premium: { variantSteps: [...] }
