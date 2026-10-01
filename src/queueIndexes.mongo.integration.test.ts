@@ -7,13 +7,16 @@ import {
 import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import {
+  createFrameworkMongoTransport,
+  createFrameworkResizer,
+} from './framework/resizer.ts';
 import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import ResizeTaskModel from './models/ResizeTask.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import { resetResizerForTests } from './resizer.ts';
 import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { MongoTransport } from './transports/mongo.ts';
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -81,7 +84,7 @@ async function createFixture(name: string) {
     connection,
     taskModel,
     lockModel,
-    transport: new MongoTransport(),
+    transport: createFrameworkMongoTransport(),
     lockProvider: new FrameworkLockProvider(),
   };
 }
@@ -210,7 +213,7 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       true,
     );
 
-    const resizer = new Resizer({
+    const resizer = createFrameworkResizer({
       storage,
       transport: fixture.transport,
       lockProvider: fixture.lockProvider,

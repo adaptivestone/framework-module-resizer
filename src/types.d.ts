@@ -14,12 +14,7 @@ export type DeepPartial<T> = T extends readonly (infer _U)[]
     : T;
 
 // ---------------------------------------------------------------------------
-// Minimal app interface — the SLICE of the framework app the module consumes.
-// The app is never a parameter: the module reads the framework's ambient
-// appInstance through src/app.ts getApp() (set once per process at Server
-// construction; the framework enforces one server per process). This type
-// documents that slice and is the shape a test fake must satisfy when installed
-// via setAppInstance() (see 02 · §4).
+// Logging and events a Resizer is given (the framework adapter passes the app's own).
 // ---------------------------------------------------------------------------
 
 export interface ResizeLogger {
@@ -31,24 +26,6 @@ export interface ResizeLogger {
 export interface ResizeEventBus {
   emit(name: string, ...args: unknown[]): void;
 }
-
-export type TMinimalResizeApp = {
-  // Framework config loading has already combined the base and environment files.
-  getConfig(name: 'resize'): ResizeConfig;
-  // Returns a Mongoose model registered by the host. At minimum:
-  //  - 'Lock'       (framework built-in: acquireLock/releaseLock/waitForUnlock)
-  //  - 'ResizeTask' (scaffolded into the host app; only for the Mongo transport)
-  //  - the host media model, by name from config.mediaModelName
-  // biome-ignore lint/suspicious/noExplicitAny: returns a host-registered mongoose model; the module stays mongoose-type-free by design
-  getModel(name: string): any;
-  logger: ResizeLogger;
-  // Framework EventEmitter (app.events). Observers are mirrored as `resize:<name>`.
-  // Duck-typed here, NOT a framework import (see 04 · §9).
-  events?: ResizeEventBus;
-  // Part of the framework app shape; NOT read by the resize module (the standalone
-  // scaffold bin resolves write paths from cwd + `--out` — see 08 · §12).
-  foldersConfig?: { [k: string]: string | undefined };
-};
 
 // ---------------------------------------------------------------------------
 // Data shapes
@@ -204,7 +181,6 @@ export interface PictureUrls {
 // ---------------------------------------------------------------------------
 
 export interface ResizeConfig {
-  mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   formats: PreviewFormat[]; // generated output formats, e.g. ['jpeg','webp','avif']
   upload: {
     maxBytes: number;
@@ -247,4 +223,10 @@ export interface ResizeConfig {
     sharpConcurrency: number; // default 1 — sharp.concurrency(); concurrency × this ≈ nCPU
     sharpCache: boolean; // default false — sharp.cache()
   };
+}
+
+// The config a framework host writes in `src/config/resize.ts` (or another config file per
+// Resizer): the core config plus the host media model the framework media store loads.
+export interface FrameworkResizeConfig extends ResizeConfig {
+  mediaModelName: string; // host media model, e.g. 'File' or 'Media'
 }

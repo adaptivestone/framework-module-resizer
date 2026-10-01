@@ -2,10 +2,10 @@
 // injected in ONE visible options literal at construction and fixed for the process
 // lifetime — no register-call sequence, no hidden global registries. The class also
 // carries the named-pipeline set (04 · §8) and the cross-cutting hook bus (04 · §9).
-// Each Resizer owns its config, logger and event bus. Framework defaults are read only for
-// options the host omits, so a framework-free host never touches the framework app.
+// Each Resizer owns its config, logger and event bus, all passed in explicitly: the core never
+// reads a framework app. Framework hosts get them filled by createFrameworkResizer
+// (src/framework/resizer.ts).
 import type { Metadata, Sharp } from 'sharp';
-import { getApp } from './app.ts';
 import {
   type EnqueueRequiredOpts,
   enqueueRequiredImpl,
@@ -16,9 +16,7 @@ import {
 } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
 import type { LockProvider } from './locks/AbstractLockProvider.ts';
-import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
-import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import { uploadOriginalImpl } from './original.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
@@ -152,14 +150,14 @@ export type HookFn = (...args: any[]) => unknown;
 
 export interface ResizerOptions {
   name?: string; // registry key; default 'default'
-  config?: ResizeConfig; // default: the framework app's `resize` config
-  logger?: ResizeLogger; // default: the framework app's logger
-  events?: ResizeEventBus; // default: the framework app's event bus, when one exists
+  config: ResizeConfig; // REQUIRED: the complete, validated resize config
+  logger?: ResizeLogger; // default: console
+  events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
+  mediaStore: MediaStore; // REQUIRED: loads media, saves preview metadata (05 · §10.6)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
   queue?: string; // default queue for this Resizer's tasks; default 'default'
-  mediaStore?: MediaStore; // default: a FrameworkMediaStore for config.mediaModelName (05 · §10.6)
-  lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
+  lockProvider?: LockProvider; // REQUIRED with a transport: dispatch and worker locks (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
   hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
@@ -191,14 +189,21 @@ const EMPTY_PIPELINE: Pipeline = Object.freeze({});
 // core code always receives its Resizer as an argument.
 const resizers = new Map<string, Resizer>();
 
-/** The framework event bus when a framework app exists; framework-free hosts have none. */
-function frameworkEvents(): ResizeEventBus | undefined {
-  try {
-    return getApp().events;
-  } catch {
-    return undefined;
-  }
-}
+// Eager-only Resizers (no transport) never take locks. This placeholder keeps the field typed
+// and turns an unexpected use into a named setup error instead of a TypeError.
+const NO_LOCK_PROVIDER: LockProvider = Object.freeze({
+  acquire: async (): Promise<boolean> => {
+    throw new ResizeSetupError(
+      'resize: this Resizer has no lockProvider — pass one together with a transport',
+      { code: 'RESIZE_LOCK_PROVIDER_REQUIRED' },
+    );
+  },
+  release: async (): Promise<void> => {},
+});
+
+// How framework hosts get the parts below filled in from their app.
+const FRAMEWORK_HINT =
+  "framework hosts: use createFrameworkResizer() from '@adaptivestone/framework-module-resize/framework.js'";
 
 /**
  * A named resize engine: config, drivers, pipelines and hooks. Most hosts construct one
@@ -249,22 +254,37 @@ export class Resizer {
         code: 'RESIZE_QUEUE_INVALID',
       });
     }
+    // The core takes every part explicitly; it never reads a framework app.
+    if (opts.config === undefined) {
+      throw new ResizeSetupError(
+        `resize: \`config\` is required — pass a complete ResizeConfig (e.g. spread defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js'); ${FRAMEWORK_HINT}`,
+        { code: 'RESIZE_CONFIG_REQUIRED' },
+      );
+    }
+    if (!opts.mediaStore) {
+      throw new ResizeSetupError(
+        `resize: \`mediaStore\` is required — it loads media and saves preview metadata; ${FRAMEWORK_HINT}`,
+        { code: 'RESIZE_MEDIA_STORE_REQUIRED' },
+      );
+    }
+    if (opts.transport && !opts.lockProvider) {
+      throw new ResizeSetupError(
+        `resize: a Resizer with a \`transport\` needs a \`lockProvider\` (dispatch and worker locks); ${FRAMEWORK_HINT}`,
+        { code: 'RESIZE_LOCK_PROVIDER_REQUIRED' },
+      );
+    }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
-    this.config = validateResizeConfig(
-      opts.config ?? getApp().getConfig('resize'),
-    );
-    this.logger = opts.logger ?? getApp().logger;
-    this.#events = opts.events ?? frameworkEvents();
+    this.config = validateResizeConfig(opts.config);
+    this.logger = opts.logger ?? console;
+    this.#events = opts.events;
     this.name = name;
     this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
-    this.mediaStore =
-      opts.mediaStore ??
-      new FrameworkMediaStore({ modelName: this.config.mediaModelName });
-    this.lockProvider = opts.lockProvider ?? new FrameworkLockProvider();
+    this.mediaStore = opts.mediaStore;
+    this.lockProvider = opts.lockProvider ?? NO_LOCK_PROVIDER;
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().

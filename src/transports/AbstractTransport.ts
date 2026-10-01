@@ -40,6 +40,10 @@ export interface StartWorkerOpts {
 }
 
 export interface QueueTransport {
+  // Lease length in ms, when the transport leases tasks (Mongo). The worker checks each
+  // Resizer's worker-lock TTL against it: a lock must expire within the lease.
+  readonly leaseMs?: number;
+
   enqueue(task: EnqueueTask): Promise<{ taskId: string | null }>;
 
   // Optional strict-enqueue capability: active tasks (any queue) of this resizer + media +

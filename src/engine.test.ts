@@ -4,6 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import {
   type LockProvider,
   type QueueTransport,
@@ -104,7 +105,7 @@ describe('resolve — partitioning', () => {
   test('a falsy scalar preview ref remains ready and is passed through unchanged', async () => {
     installFakeApp();
     const refs: unknown[] = [];
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage({
         publicUrl: (ref) => {
           refs.push(ref);
@@ -133,7 +134,7 @@ describe('resolve — partitioning', () => {
   });
   test('partitions existing previews to ready and absent ones to missing', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
@@ -173,7 +174,7 @@ describe('resolve — partitioning', () => {
     const { errors } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -225,7 +226,7 @@ describe('resolve — partitioning', () => {
       const { errors } = installFakeApp();
       const { transport, calls } = makeTransport();
       const { lockProvider } = makeLocks(true);
-      const r = new Resizer({
+      const r = createFrameworkResizer({
         storage: makeStorage({ canServeOriginalPublicly: check }),
         transport,
         lockProvider,
@@ -281,7 +282,7 @@ describe('resolve — partitioning', () => {
 
   test('a filtered variant is distinct from the unfiltered same size', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
@@ -317,7 +318,7 @@ describe('resolve — partitioning', () => {
 
   test('a getSizeKey-throwing size is skipped; others are processed', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
       sizes: [{}, { width: 300, height: 300 }],
@@ -337,7 +338,7 @@ describe('resolve — partitioning', () => {
 describe('resolve — waterfall hooks', () => {
   test('resolveSizes tap expands the size list fed to the loop', async () => {
     installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       hooks: {
         resolveSizes: () => [
@@ -361,7 +362,7 @@ describe('resolve — waterfall hooks', () => {
 
   test('formatPublicUrls tap output is returned as `output`', async () => {
     installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       hooks: { formatPublicUrls: () => ({ shaped: true }) },
     });
@@ -377,7 +378,7 @@ describe('resolve — waterfall hooks', () => {
 
   test('with no formatPublicUrls tap, output === undefined', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision, output } = await r.resolve({
       media: { id: 'm1' },
       sizes: [],
@@ -390,7 +391,7 @@ describe('resolve — waterfall hooks', () => {
 
   test('a throwing formatPublicUrls tap yields output === undefined (does not leak the decision)', async () => {
     const { errors } = installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       hooks: {
         formatPublicUrls: () => {
@@ -411,7 +412,7 @@ describe('resolve — waterfall hooks', () => {
 
   test('a throwing beforeEnqueue tap is skipped (missing kept intact)', async () => {
     const { errors } = installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       hooks: {
         beforeEnqueue: () => {
@@ -439,7 +440,11 @@ describe('resolve — enqueue wiring', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
@@ -472,7 +477,7 @@ describe('resolve — enqueue wiring', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -507,7 +512,11 @@ describe('resolve — enqueue wiring', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
@@ -532,7 +541,11 @@ describe('resolve — enqueue wiring', () => {
     installFakeApp();
     const { transport } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     await r.resolve({
       media: {
         _id: { toString: () => 'abc123' },
@@ -554,7 +567,11 @@ describe('resolve — enqueue wiring', () => {
       throw new Error('transport down');
     });
     const { lockProvider, released } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -570,7 +587,11 @@ describe('resolve — enqueue wiring', () => {
     installFakeApp();
     const { transport } = makeTransport(() => ({ taskId: null }));
     const { lockProvider, released } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -585,7 +606,11 @@ describe('resolve — enqueue wiring', () => {
     const { info } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: {} as MediaLike['original'] },
       sizes: [{ width: 300, height: 300 }],
@@ -601,7 +626,11 @@ describe('resolve — enqueue wiring', () => {
     const { info } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
       sizes: [{ width: 300, height: 300 }],
@@ -619,7 +648,11 @@ describe('prewarm — missing original key', () => {
     const { info } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const result = await r.prewarm({
       media: { id: 'm1', original: {} as MediaLike['original'] },
       sizes: [{ width: 300, height: 300 }],
@@ -639,7 +672,7 @@ describe('prewarm — missing original key', () => {
 describe('resolve — no transport (eager-only host)', () => {
   test('defaults enqueueMissing to false: missing intact, no warn', async () => {
     const { warn } = installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
       sizes: [
@@ -654,7 +687,7 @@ describe('resolve — no transport (eager-only host)', () => {
 
   test('explicit enqueueMissing:true with no transport still warns once', async () => {
     const { warn } = installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -675,7 +708,11 @@ describe('resolve — SVG raster previews', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const media: MediaLike = {
       id: 'm1',
       original: {
@@ -702,7 +739,7 @@ describe('resolve — SVG raster previews', () => {
   test('never signs an SVG original or serves an SVG preview', async () => {
     installFakeApp();
     let signedCalls = 0;
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage({
         canServeOriginalPublicly: () => true,
         signedUrl: async () => {
@@ -744,7 +781,7 @@ describe('resolve — SVG raster previews', () => {
 
   test('stored raster preview is returned for an SVG original', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
       media: {
         id: 'm1',
@@ -785,7 +822,7 @@ describe('resolve — original-fits fast-path', () => {
 
   test('serves the original (isOriginal, no preview) when it fits both dims', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
       media: fitsMedia(),
       sizes: [{ width: 300, height: 300 }],
@@ -805,7 +842,7 @@ describe('resolve — original-fits fast-path', () => {
 
   test('does NOT fire when only one dim fits — becomes missing', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, width: 200, height: 400 },
@@ -822,7 +859,7 @@ describe('resolve — original-fits fast-path', () => {
 
   test('does NOT fire when filters are present — becomes missing', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, width: 100, height: 100 },
@@ -840,7 +877,7 @@ describe('resolve — original-fits fast-path', () => {
 
   test('does NOT fire for a width-only size — becomes missing', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, width: 100, height: 100 },
@@ -858,7 +895,7 @@ describe('resolve — original-fits fast-path', () => {
 
   test('does NOT fire when original dims are unknown — becomes missing', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
@@ -882,7 +919,7 @@ describe('resolve — original-fits fast-path', () => {
         return `https://signed/${ref.key}?ttl=${ttl}`;
       },
     });
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const { decision } = await r.resolve({
       media: fitsMedia(),
       sizes: [{ width: 300, height: 300 }],
@@ -904,7 +941,7 @@ describe('resolve — original-fits fast-path', () => {
         throw new Error('presign down');
       },
     });
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const { decision } = await r.resolve({
       media: fitsMedia(),
       sizes: [{ width: 300, height: 300 }],
@@ -919,7 +956,7 @@ describe('resolve — original-fits fast-path', () => {
 
   test('a private raster original stays missing for an anonymous reader', async () => {
     installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage({ canServeOriginalPublicly: () => false }),
     });
     const { decision } = await r.resolve({
@@ -936,7 +973,7 @@ describe('resolve — original-fits fast-path', () => {
   test('a private original does not fall back to publicUrl when signing fails', async () => {
     installFakeApp();
     let publicUrlCalls = 0;
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage({
         canServeOriginalPublicly: () => false,
         signedUrl: async () => {
@@ -967,7 +1004,7 @@ describe('resolve — original-fits fast-path', () => {
       upload: async () => ({ key: 'k' }),
       publicUrl: (ref: StorageRef) => `https://cdn/${ref.key}`,
     };
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const { decision } = await r.resolve({
       media: fitsMedia(),
       sizes: [{ width: 300, height: 300 }],
@@ -994,7 +1031,7 @@ describe('resolve — never throws', () => {
         return `https://cdn/${ref.key}`;
       },
     });
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const media: MediaLike = {
       id: 'm1',
       previews: [
@@ -1030,7 +1067,7 @@ describe('resolve — never throws', () => {
 
   test('media with no id/_id → logged safe empty decision (never-throw wrapper absorbs requireMediaId)', async () => {
     const { errors } = installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision, output } = await r.resolve({
       media: {
         original: {
@@ -1058,14 +1095,21 @@ describe('several Resizers in one process', () => {
         errors.push(args);
       },
     });
+    // Core Resizers with explicit parts: no framework app is installed in this test.
+    const mediaStore = {
+      load: async () => null,
+      appendPreviews: async () => {},
+    };
     const a = new Resizer({
       storage: makeStorage(),
+      mediaStore,
       config: makeResizeConfig({ formats: ['webp'] }),
       logger: logger(errorsA),
     });
     const b = new Resizer({
       name: 'listings',
       storage: makeStorage(),
+      mediaStore,
       config: makeResizeConfig({ formats: ['jpeg'] }),
       logger: logger(errorsB),
     });
@@ -1101,7 +1145,7 @@ describe('pipelines are part of preview identity', () => {
 
   test('a default preview is not served for another pipeline', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media = { id: 'm1', previews: [stored] };
     const clean = await r.resolve({ media, sizes, formats: ['webp'] });
     const watermarked = await r.resolve({
@@ -1117,7 +1161,7 @@ describe('pipelines are part of preview identity', () => {
 
   test('a preview stored for a pipeline is served only to that pipeline', async () => {
     installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const media = {
       id: 'm1',
       previews: [{ ...stored, pipeline: 'watermark' }],
@@ -1135,7 +1179,10 @@ describe('pipelines are part of preview identity', () => {
 
   test("another Resizer's preview is not served", async () => {
     installFakeApp();
-    const r = new Resizer({ name: 'listings', storage: makeStorage() });
+    const r = createFrameworkResizer({
+      name: 'listings',
+      storage: makeStorage(),
+    });
     const media = { id: 'm1', previews: [stored] };
     const result = await r.resolve({ media, sizes, formats: ['webp'] });
     assert.equal(result.decision.ready.length, 0);

@@ -5,9 +5,9 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeSetupError } from '../errors.ts';
+import { createFrameworkResizer } from '../framework/resizer.ts';
 import {
   type LeasedTask,
-  Resizer,
   resetResizerForTests,
   type TaskEventHandler,
 } from '../resizer.ts';
@@ -77,18 +77,19 @@ const variant = (over: Partial<MissingPreview> = {}): MissingPreview => ({
 
 function installFakeApp() {
   const errors: unknown[][] = [];
+  const logger = {
+    info() {},
+    warn() {},
+    error(...a: unknown[]) {
+      errors.push(a);
+    },
+  };
   setAppInstance({
     getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
-    logger: {
-      info() {},
-      warn() {},
-      error(...a: unknown[]) {
-        errors.push(a);
-      },
-    },
+    logger,
   } as never);
-  return { errors };
+  return { errors, logger };
 }
 
 // Task events are reported through the startWorker `onEvent` callback (the worker routes them
@@ -223,7 +224,7 @@ describe('SqsTransport.enqueue', () => {
     installFakeApp();
     const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
     const transport = new SqsTransport({ queueUrl: 'q', client });
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: {
         download: async () => Buffer.alloc(0),
         upload: async ({ key }) => ({ key }),
@@ -245,7 +246,7 @@ describe('SqsTransport.enqueue', () => {
     installFakeApp();
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
     const transport = new SqsTransport({ queueUrl: 'q', client });
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: {
         download: async () => Buffer.alloc(0),
         upload: async ({ key }) => ({ key }),
@@ -333,7 +334,7 @@ describe('SqsTransport.startWorker', () => {
   test('a recurring consumer error is logged EVERY time (on, not once)', async () => {
     // Recurring consumer errors (e.g. heartbeat ChangeMessageVisibility failures) must all be
     // logged: `once` would capture only the FIRST and drop every later one (05 · §10.3 fix a).
-    const { errors } = installFakeApp();
+    const { errors, logger } = installFakeApp();
     let polls = 0;
     const client = {
       async send(command: FakeCommand) {
@@ -344,7 +345,7 @@ describe('SqsTransport.startWorker', () => {
         return {};
       },
     };
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ queueUrl: 'q', client, logger });
     const ctrl = new AbortController();
     const p = t.startWorker(async () => {}, {
       signal: ctrl.signal,
@@ -568,14 +569,14 @@ describe('SqsTransport.startWorker', () => {
   });
 
   test('a throwing onEvent after success is logged and the message is still acked', async () => {
-    const { errors } = installFakeApp();
+    const { errors, logger } = installFakeApp();
     const message: FakeMessage = {
       MessageId: 'mid',
       ReceiptHandle: 'rh-ok',
       Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
     };
     const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ queueUrl: 'q', client, logger });
     const ctrl = new AbortController();
     const p = t.startWorker(async () => {}, {
       signal: ctrl.signal,
@@ -594,14 +595,14 @@ describe('SqsTransport.startWorker', () => {
   });
 
   test('a throwing onEvent after a handler failure is logged and the message is still not acked', async () => {
-    const { errors } = installFakeApp();
+    const { errors, logger } = installFakeApp();
     const message: FakeMessage = {
       MessageId: 'mid',
       ReceiptHandle: 'rh',
       Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
     };
     const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ queueUrl: 'q', client, logger });
     let handlerCalls = 0;
     const ctrl = new AbortController();
     const p = t.startWorker(

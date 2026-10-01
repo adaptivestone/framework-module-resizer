@@ -1,12 +1,12 @@
-// The transport-agnostic worker entry (07 · Worker §11). `runResizeWorker()` serves every
+// The transport-agnostic worker (07 · Worker §11), framework-free. `runWorker()` serves every
 // registered Resizer for ONE named queue: they must share one transport, each media store is
-// verified first, sharp's process globals are tuned once, and SIGTERM/SIGINT stop it gracefully.
+// verified first, and each Resizer's worker-lock TTL is checked against the transport's lease.
 // The TRANSPORT owns lease → complete | fail and reports task events; the worker runs each task
-// with the Resizer named in it and routes the events to that Resizer's observers.
+// with the Resizer named in it and routes the events to that Resizer's observers. Framework
+// hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
+// `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
-import { getApp } from './app.ts';
-import { ResizeSetupError } from './errors.ts';
-import { getResizeConfig } from './resizeConfig.ts';
+import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { getResizer, listResizers, type ObserverName } from './resizer.ts';
 import { processTaskWith } from './resizeTask.ts';
 import type {
@@ -15,6 +15,7 @@ import type {
   TaskEvent,
   TaskEventHandler,
 } from './transports/AbstractTransport.ts';
+import type { ResizeLogger } from './types.d.ts';
 
 const OBSERVER: Record<TaskEvent, ObserverName> = {
   completed: 'afterTaskComplete',
@@ -34,18 +35,18 @@ export async function processTask(
   return processTaskWith(getResizer(task.resizer), task, taskOpts);
 }
 
-export async function runResizeWorker(
-  opts: { queue?: string } = {},
-): Promise<void> {
+export interface RunWorkerOptions {
+  queue?: string; // queue to consume; default 'default'
+  signal: AbortSignal; // stops the worker: finish in-flight tasks, then return
+  logger?: ResizeLogger; // the worker's own messages; default console
+  // Process-wide Sharp tuning, applied once (keep Resizers' worker.concurrency × concurrency ≈
+  // CPU cores). Omitted: Sharp's settings are left as they are.
+  sharp?: { concurrency: number; cache: boolean };
+}
+
+export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   const queue = opts.queue ?? 'default';
-  const app = getApp();
-  const config = getResizeConfig();
-  if (config.worker.enabled === false) {
-    app.logger.info(
-      'resize worker disabled — set config.worker.enabled=true in the host src/config/resize.ts to run it',
-    );
-    return;
-  }
+  const logger = opts.logger ?? console;
   const resizers = listResizers();
   if (resizers.length === 0) {
     throw new ResizeSetupError(
@@ -60,7 +61,7 @@ export async function runResizeWorker(
     }
   }
   if (transports.size === 0) {
-    app.logger.error(
+    logger.error(
       'resize worker: no Resizer was constructed with a transport (eager-only wiring)',
     );
     return;
@@ -72,6 +73,19 @@ export async function runResizeWorker(
     );
   }
   const [transport] = transports;
+  // A worker lock must expire within the lease, or a crashed worker's lock outlives the lease
+  // and blocks the worker that re-claims the task.
+  if (typeof transport.leaseMs === 'number') {
+    for (const resizer of resizers) {
+      const lockTtlMs = resizer.config.queue.lockTtlMs.worker;
+      if (lockTtlMs > transport.leaseMs) {
+        throw new ResizeConfigError(
+          `resize worker: Resizer '${resizer.name}' has queue.lockTtlMs.worker (${lockTtlMs}) above the transport's leaseMs (${transport.leaseMs}) — a worker lock must expire within the lease`,
+          { code: 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE' },
+        );
+      }
+    }
+  }
   // Fail before leasing anything: a misconfigured media store (e.g. a wrong mediaModelName)
   // would otherwise surface only as per-task errors.
   for (const resizer of resizers) {
@@ -82,7 +96,7 @@ export async function runResizeWorker(
   const onEvent: TaskEventHandler = async (event, task, error) => {
     const owner = listResizers().find((r) => r.name === task.resizer);
     if (!owner) {
-      app.logger.error(
+      logger.error(
         `resize worker: ${event} for task ${task.taskId} of unknown Resizer '${task.resizer}'`,
       );
       return;
@@ -94,28 +108,18 @@ export async function runResizeWorker(
     }
   };
 
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  process.once('SIGTERM', abort);
-  process.once('SIGINT', abort);
-
-  try {
-    // Tune sharp ONCE for a concurrent worker: keep worker.concurrency × sharp.concurrency ≈ nCPU
-    // (avoid libvips thread oversubscription), and disable the op-cache (distinct images per task).
-    sharp.concurrency(config.worker.sharpConcurrency);
-    sharp.cache(config.worker.sharpCache);
-
-    // The transport drives consumption its own way (poll OR push), owns completion/redelivery,
-    // and passes each task a per-task lease-loss signal. processTask SUCCEEDS by returning and
-    // FAILS by rejecting (never a synchronous throw). opts.signal is worker-wide graceful
-    // shutdown (finish in-flight, then stop).
-    await transport.startWorker(
-      (task, taskOpts) => processTask(task, taskOpts),
-      { signal: controller.signal, queue, onEvent },
-    );
-    app.logger.info('resize worker stopped');
-  } finally {
-    process.removeListener('SIGTERM', abort);
-    process.removeListener('SIGINT', abort);
+  if (opts.sharp) {
+    sharp.concurrency(opts.sharp.concurrency);
+    sharp.cache(opts.sharp.cache);
   }
+
+  // The transport drives consumption its own way (poll OR push), owns completion/redelivery,
+  // and passes each task a per-task lease-loss signal. processTask SUCCEEDS by returning and
+  // FAILS by rejecting (never a synchronous throw).
+  await transport.startWorker((task, taskOpts) => processTask(task, taskOpts), {
+    signal: opts.signal,
+    queue,
+    onEvent,
+  });
+  logger.info('resize worker stopped');
 }

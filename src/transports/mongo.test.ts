@@ -14,16 +14,19 @@ import {
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeGenerateError, ResizeNoOriginalError } from '../errors.ts';
+import {
+  createFrameworkMongoTransport,
+  createFrameworkResizer,
+} from '../framework/resizer.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
 import {
   type LeasedTask,
-  Resizer,
   resetResizerForTests,
   type TaskEventHandler,
 } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MissingPreview } from '../types.d.ts';
-import { MongoTransport } from './mongo.ts';
+import type { MongoTransport } from './mongo.ts';
 
 // Against mongodb-memory-server (real atomic semantics for lease/complete/fail/renew/sweep).
 // The model is compiled from the REAL ResizeTaskModel schema + initHooks, exactly as the
@@ -72,11 +75,10 @@ const fakeStorage = {
   publicUrl: () => '',
 };
 
-// One instance drives the whole file — the class is option-less and stateless (every
-// method reaches the model/config ambiently), so per-test construction would add
-// nothing. The lifecycle methods are PUBLIC on the class (not part of the
+// Rebuilt by every installFakeApp() from that app's config (timing) and model, exactly as a
+// framework host wires it. The lifecycle methods are PUBLIC on the class (not part of the
 // QueueTransport interface) precisely so these unit tests can drive them.
-const transport = new MongoTransport();
+let transport: MongoTransport;
 
 function installFakeApp(
   getModelImpl?: (name: string) => unknown,
@@ -106,6 +108,7 @@ function installFakeApp(
       },
     },
   } as never);
+  transport = createFrameworkMongoTransport();
   return { errors };
 }
 
@@ -546,7 +549,7 @@ describe('MongoTransport.enqueue', () => {
         },
       ],
     });
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: fakeStorage,
       transport,
       lockProvider: { acquire: async () => false, release: async () => {} },

@@ -38,7 +38,6 @@ const PKG = '@adaptivestone/framework-module-resize';
 // (a) main entry: exactly the expected runtime exports, and no driver class leaks into it.
 const mod = await import(PKG);
 const expected = [
-  'ResizeWorker',
   'calculateResizedDimensions',
   'formatPictureUrls',
   'getFilterSig',
@@ -58,12 +57,12 @@ const expected = [
   'ResizeGenerateError',
   'ResizeNoOriginalError',
   'ResizeOriginalError',
-  'ResizeTaskModel',
   'getResizer',
+  'listResizers',
   'Resizer',
   'resetResizerForTests',
   'processTask',
-  'runResizeWorker',
+  'runWorker',
 ];
 for (const name of expected) {
   assert.ok(name in mod, 'main entry missing export: ' + name);
@@ -82,8 +81,12 @@ for (const driver of [
   'LocalFsStorage',
   'FrameworkMediaStore',
   'FrameworkLockProvider',
+  'ResizeTaskModel',
+  'ResizeWorker',
+  'runResizeWorker',
+  'createFrameworkResizer',
 ]) {
-  assert.ok(!(driver in mod), 'driver must stay subpath-only, not on main entry: ' + driver);
+  assert.ok(!(driver in mod), 'driver/adapter must stay subpath-only, not on main entry: ' + driver);
 }
 assert.equal(
   'prepareQueue' in mod.Resizer.prototype,
@@ -122,6 +125,9 @@ const safe = [
   ['/locks/framework.js', 'FrameworkLockProvider'],
   ['/models/ResizeTask.js', 'default'],
   ['/commands/ResizeWorker.js', 'default'],
+  ['/framework.js', 'createFrameworkResizer'],
+  ['/framework.js', 'createFrameworkMongoTransport'],
+  ['/framework.js', 'runResizeWorker'],
 ];
 for (const [sub, exp] of safe) {
   const m = await import(PKG + sub);
@@ -141,6 +147,30 @@ assert.equal(
   'FrameworkLockProvider.prototype.prepare must not exist at runtime',
 );
 console.log('  ok  MongoTransport + FrameworkLockProvider have no runtime preparation methods');
+`;
+
+// Runs in a consumer installed WITHOUT peer dependencies (no @adaptivestone/framework, no
+// mongoose): the main entry and the pure config subpath must load, and a core Resizer must work.
+const CHECK_FRAMEWORK_FREE = `import assert from 'node:assert/strict';
+
+const PKG = '@adaptivestone/framework-module-resize';
+const mod = await import(PKG);
+const { default: defaultResizeConfig } = await import(PKG + '/config/resize.js');
+const resizer = new mod.Resizer({
+  config: defaultResizeConfig,
+  logger: { info() {}, warn() {}, error() {} },
+  storage: { download: async () => Buffer.alloc(0), upload: async () => ({}), publicUrl: () => '' },
+  mediaStore: { load: async () => null, appendPreviews: async () => {} },
+});
+assert.equal(resizer.name, 'default');
+let frameworkErr = null;
+try {
+  await import(PKG + '/framework.js');
+} catch (e) {
+  frameworkErr = e;
+}
+assert.ok(frameworkErr, '…/framework.js needs @adaptivestone/framework and should fail without it');
+console.log('  ok  main entry loads and a core Resizer works without @adaptivestone/framework');
 `;
 
 const CHECK_AWS = `import assert from 'node:assert/strict';
@@ -359,6 +389,21 @@ try {
   );
   writeFileSync(join(consumer, 'checkAws.mjs'), CHECK_AWS);
   run('node', ['checkAws.mjs'], consumer);
+
+  // (f) a second consumer WITHOUT peer dependencies: the main entry must not need the framework.
+  const bare = join(scratch, 'framework-free');
+  mkdirSync(bare);
+  console.log(
+    '→ Installing the tarball without peers, checking the framework-free core',
+  );
+  run('npm', ['init', '-y'], bare);
+  run(
+    'npm',
+    ['install', '--no-audit', '--no-fund', '--omit=peer', tarballPath],
+    bare,
+  );
+  writeFileSync(join(bare, 'checkFrameworkFree.mjs'), CHECK_FRAMEWORK_FREE);
+  run('node', ['checkFrameworkFree.mjs'], bare);
 
   console.log('\n✓ Packaging smoke test passed');
 } finally {

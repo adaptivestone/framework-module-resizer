@@ -5,10 +5,10 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import {
   type LockProvider,
   type QueueTransport,
-  Resizer,
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
@@ -82,7 +82,7 @@ function makeResizer(opts: {
   transport?: QueueTransport;
   lockProvider?: LockProvider;
 }) {
-  return new Resizer({ storage, ...opts });
+  return createFrameworkResizer({ storage, ...opts });
 }
 
 const variant = (over: Partial<MissingPreview> = {}): MissingPreview => ({
@@ -343,7 +343,7 @@ describe('enqueue', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const resizer = new Resizer({
+    const resizer = createFrameworkResizer({
       storage,
       transport,
       lockProvider,

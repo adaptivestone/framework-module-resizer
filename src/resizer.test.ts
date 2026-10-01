@@ -5,6 +5,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError, ResizeSetupError } from './errors.ts';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import {
@@ -97,10 +98,17 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('fills mediaStore/lockProvider defaults when omitted', () => {
-    const r = new Resizer(baseOpts());
-    assert.ok(r.mediaStore instanceof FrameworkMediaStore);
-    assert.ok(r.lockProvider instanceof FrameworkLockProvider);
+  test('createFrameworkResizer fills mediaStore, and lockProvider when there is a transport', () => {
+    const eager = createFrameworkResizer(baseOpts());
+    assert.ok(eager.mediaStore instanceof FrameworkMediaStore);
+    assert.ok(!(eager.lockProvider instanceof FrameworkLockProvider));
+    resetResizerForTests();
+    const queued = createFrameworkResizer({
+      ...baseOpts(),
+      transport: fakeTransport(),
+    });
+    assert.ok(queued.mediaStore instanceof FrameworkMediaStore);
+    assert.ok(queued.lockProvider instanceof FrameworkLockProvider);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
@@ -108,7 +116,12 @@ describe('Resizer constructor — driver wiring', () => {
     const transport = fakeTransport();
     const mediaStore = fakeMediaStore();
     const lockProvider = fakeLockProvider();
-    const r = new Resizer({ storage, transport, mediaStore, lockProvider });
+    const r = createFrameworkResizer({
+      storage,
+      transport,
+      mediaStore,
+      lockProvider,
+    });
     assert.equal(r.storage, storage);
     assert.equal(r.transport, transport);
     assert.equal(r.mediaStore, mediaStore);
@@ -116,14 +129,14 @@ describe('Resizer constructor — driver wiring', () => {
   });
 
   test('transport is undefined when omitted (eager-only host)', () => {
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     assert.equal(r.transport, undefined);
   });
 
   test('throws a named error when storage is missing (JS host / half-filled scaffold)', () => {
     // A JS host or half-filled scaffold could omit the required `storage` — fail loudly at
     // construction with a NAMED error, not a downstream TypeError (02 · §6 review fix).
-    assert.throws(() => new Resizer({} as never), /storage/);
+    assert.throws(() => createFrameworkResizer({} as never), /storage/);
     // The bad construction must NOT have claimed the active slot.
     assert.throws(() => getResizer(), /no Resizer named 'default'/);
   });
@@ -135,7 +148,10 @@ describe('Resizer constructor — driver wiring', () => {
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.throws(() => new Resizer(baseOpts()), /upload must be an object/);
+    assert.throws(
+      () => createFrameworkResizer(baseOpts()),
+      /upload must be an object/,
+    );
     assert.throws(() => getResizer(), /no Resizer named 'default'/);
     resetAppInstance();
     setAppInstance({
@@ -143,7 +159,7 @@ describe('Resizer constructor — driver wiring', () => {
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.doesNotThrow(() => new Resizer(baseOpts()));
+    assert.doesNotThrow(() => createFrameworkResizer(baseOpts()));
   });
 
   test('the default media store loads from the Resizer’s own media model', async () => {
@@ -157,12 +173,12 @@ describe('Resizer constructor — driver wiring', () => {
       },
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    const photos = new Resizer({
+    const photos = createFrameworkResizer({
       ...baseOpts(),
       name: 'photos',
       config: makeResizeConfig({ mediaModelName: 'Photo' }),
     });
-    const files = new Resizer(baseOpts());
+    const files = createFrameworkResizer(baseOpts());
     await photos.mediaStore.load('m1');
     await files.mediaStore.load('m2');
     assert.deepEqual(asked, ['Photo', 'File']);
@@ -170,13 +186,13 @@ describe('Resizer constructor — driver wiring', () => {
 
   test('seeds pipelines from options', () => {
     const photo: Pipeline = { beforeSteps: [] };
-    const r = new Resizer({ ...baseOpts(), pipelines: { photo } });
+    const r = createFrameworkResizer({ ...baseOpts(), pipelines: { photo } });
     assert.equal(r.getPipeline('photo'), photo);
   });
 
   test('seeds hooks from options — single fn form threads through runWaterfall', async () => {
     installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       ...baseOpts(),
       hooks: { resolveSizes: (v: number) => v + 1 },
     });
@@ -185,7 +201,7 @@ describe('Resizer constructor — driver wiring', () => {
 
   test('seeds hooks from options — array form runs every tap in order', async () => {
     installFakeApp();
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       ...baseOpts(),
       hooks: {
         resolveSizes: [(v: number) => v + 1, async (v: number) => v * 2],
@@ -201,9 +217,9 @@ describe('Resizer constructor — driver wiring', () => {
 
 describe('Resizer registry', () => {
   test('a second Resizer with the same name throws a clear error', () => {
-    new Resizer(baseOpts());
+    createFrameworkResizer(baseOpts());
     assert.throws(
-      () => new Resizer(baseOpts()),
+      () => createFrameworkResizer(baseOpts()),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_DUPLICATE_RESIZER' &&
@@ -212,8 +228,11 @@ describe('Resizer registry', () => {
   });
 
   test('Resizers with different names coexist and are found by name', () => {
-    const media = new Resizer(baseOpts());
-    const listings = new Resizer({ ...baseOpts(), name: 'listings' });
+    const media = createFrameworkResizer(baseOpts());
+    const listings = createFrameworkResizer({
+      ...baseOpts(),
+      name: 'listings',
+    });
     assert.equal(getResizer(), media);
     assert.equal(getResizer('default'), media);
     assert.equal(getResizer('listings'), listings);
@@ -222,11 +241,11 @@ describe('Resizer registry', () => {
   });
 
   test('each Resizer keeps its own config', () => {
-    const a = new Resizer({
+    const a = createFrameworkResizer({
       ...baseOpts(),
       config: makeResizeConfig({ formats: ['webp'] }),
     });
-    const b = new Resizer({
+    const b = createFrameworkResizer({
       ...baseOpts(),
       name: 'b',
       config: makeResizeConfig({ formats: ['jpeg'] }),
@@ -236,7 +255,7 @@ describe('Resizer registry', () => {
   });
 
   test('getResizer() names the missing Resizer', () => {
-    new Resizer({ ...baseOpts(), name: 'listings' });
+    createFrameworkResizer({ ...baseOpts(), name: 'listings' });
     assert.throws(
       () => getResizer(),
       (err: unknown) =>
@@ -249,18 +268,18 @@ describe('Resizer registry', () => {
   test('an invalid config throws at construction and does not claim the name', () => {
     assert.throws(
       () =>
-        new Resizer({
+        createFrameworkResizer({
           ...baseOpts(),
           config: { mediaModelName: 'File' } as never,
         }),
       (err: unknown) => err instanceof ResizeConfigError,
     );
-    assert.doesNotThrow(() => new Resizer(baseOpts()));
+    assert.doesNotThrow(() => createFrameworkResizer(baseOpts()));
   });
 
   test('a named Resizer may have a transport', () => {
     const transport = fakeTransport();
-    const listings = new Resizer({
+    const listings = createFrameworkResizer({
       ...baseOpts(),
       name: 'listings',
       transport,
@@ -269,23 +288,27 @@ describe('Resizer registry', () => {
   });
 
   test('queue defaults to "default" and can be set per Resizer', () => {
-    const media = new Resizer(baseOpts());
-    const bulk = new Resizer({ ...baseOpts(), name: 'bulk', queue: 'bulk' });
+    const media = createFrameworkResizer(baseOpts());
+    const bulk = createFrameworkResizer({
+      ...baseOpts(),
+      name: 'bulk',
+      queue: 'bulk',
+    });
     assert.equal(media.queue, 'default');
     assert.equal(bulk.queue, 'bulk');
   });
 
   test('an empty queue name is rejected', () => {
     assert.throws(
-      () => new Resizer({ ...baseOpts(), queue: '' }),
+      () => createFrameworkResizer({ ...baseOpts(), queue: '' }),
       (err: unknown) =>
         err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_INVALID',
     );
   });
 
   test('listResizers() returns every registered Resizer in construction order', () => {
-    const a = new Resizer(baseOpts());
-    const b = new Resizer({ ...baseOpts(), name: 'b' });
+    const a = createFrameworkResizer(baseOpts());
+    const b = createFrameworkResizer({ ...baseOpts(), name: 'b' });
     assert.deepEqual(listResizers(), [a, b]);
     resetResizerForTests();
     assert.deepEqual(listResizers(), []);
@@ -293,7 +316,7 @@ describe('Resizer registry', () => {
 
   test('an empty name is rejected', () => {
     assert.throws(
-      () => new Resizer({ ...baseOpts(), name: '' }),
+      () => createFrameworkResizer({ ...baseOpts(), name: '' }),
       (err: unknown) =>
         err instanceof ResizeSetupError && err.code === 'RESIZE_NAME_INVALID',
     );
@@ -312,11 +335,37 @@ describe('Resizer registry', () => {
     assert.equal(getResizer(), r);
   });
 
+  test('a core Resizer requires config and mediaStore, and lockProvider with a transport', () => {
+    resetAppInstance();
+    const core = {
+      storage: fakeStorage(),
+      mediaStore: fakeMediaStore(),
+      config: makeResizeConfig(),
+    };
+    const rejects = (opts: unknown, code: string) =>
+      assert.throws(
+        () => new Resizer(opts as never),
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === code &&
+          err.message.includes('createFrameworkResizer'),
+      );
+    rejects({ ...core, config: undefined }, 'RESIZE_CONFIG_REQUIRED');
+    rejects({ ...core, mediaStore: undefined }, 'RESIZE_MEDIA_STORE_REQUIRED');
+    rejects(
+      { ...core, transport: fakeTransport() },
+      'RESIZE_LOCK_PROVIDER_REQUIRED',
+    );
+    // None of the rejected constructions claimed the name.
+    const r = new Resizer(core);
+    assert.equal(r.logger, console);
+  });
+
   test('resetResizerForTests() forgets every Resizer', () => {
-    const first = new Resizer(baseOpts());
-    new Resizer({ ...baseOpts(), name: 'listings' });
+    const first = createFrameworkResizer(baseOpts());
+    createFrameworkResizer({ ...baseOpts(), name: 'listings' });
     resetResizerForTests();
-    const second = new Resizer(baseOpts());
+    const second = createFrameworkResizer(baseOpts());
     assert.notEqual(first, second);
     assert.equal(getResizer(), second);
     assert.throws(() => getResizer('listings'), /no Resizer named 'listings'/);
@@ -329,14 +378,14 @@ describe('Resizer registry', () => {
 
 describe('named pipelines', () => {
   test('a registered pipeline is retrievable', () => {
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const p: Pipeline = { beforeSteps: [] };
     r.registerPipeline('photo', p);
     assert.equal(r.getPipeline('photo'), p);
   });
 
   test('re-registering a name replaces it (last-wins)', () => {
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const p1: Pipeline = { beforeSteps: [] };
     const p2: Pipeline = { variantSteps: [] };
     r.registerPipeline('photo', p1);
@@ -345,7 +394,7 @@ describe('named pipelines', () => {
   });
 
   test('unknown name → structurally empty pipeline {}, and frozen', () => {
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const empty = r.getPipeline('nope');
     assert.deepEqual(empty, {});
     assert.equal(Object.isFrozen(empty), true);
@@ -359,7 +408,7 @@ describe('named pipelines', () => {
 describe('runWaterfall', () => {
   test('threads the value through taps in registration order', async () => {
     installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     r.hook('resolveSizes', (v: number) => v + 1);
     r.hook('resolveSizes', async (v: number) => v * 2);
     const out = await r.runWaterfall('resolveSizes', 1, {});
@@ -368,7 +417,7 @@ describe('runWaterfall', () => {
 
   test('threads ctx to each tap', async () => {
     installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const ctx = { entity: 'event' };
     let seen: unknown;
     r.hook('beforeEnqueue', (v: unknown, c: unknown) => {
@@ -381,7 +430,7 @@ describe('runWaterfall', () => {
 
   test('a throwing tap is logged and skipped (prior value kept); later taps still run', async () => {
     const { errors } = installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     r.hook('resolveSizes', (v: number) => v + 1);
     r.hook('resolveSizes', () => {
       throw new Error('boom');
@@ -395,7 +444,7 @@ describe('runWaterfall', () => {
 
   test('with no taps returns the input unchanged', async () => {
     installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const value = { a: 1 };
     assert.equal(await r.runWaterfall('formatPublicUrls', value, {}), value);
   });
@@ -408,7 +457,7 @@ describe('runWaterfall', () => {
 describe('runObservers', () => {
   test('awaits every tap in registration order', async () => {
     installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const order: number[] = [];
     r.hook('afterTaskComplete', async () => {
       await Promise.resolve();
@@ -423,7 +472,7 @@ describe('runObservers', () => {
 
   test('a throwing tap is logged and does not stop later taps', async () => {
     const { errors } = installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const seen: string[] = [];
     r.hook('onTaskFailed', () => {
       throw new Error('boom');
@@ -439,7 +488,7 @@ describe('runObservers', () => {
 
   test('mirrors onto app.events as resize:<name> BEFORE the taps run', async () => {
     const { emitted } = installFakeApp({ withEvents: true });
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     let emittedLenWhenTapRan = -1;
     r.hook('onPreviewGenerated', () => {
       emittedLenWhenTapRan = emitted.length;
@@ -455,7 +504,7 @@ describe('runObservers', () => {
 
   test('a missing app.events is fine — taps still run', async () => {
     installFakeApp(); // no events
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const seen: string[] = [];
     r.hook('afterTaskComplete', () => {
       seen.push('ran');
@@ -466,7 +515,7 @@ describe('runObservers', () => {
 
   test('a THROWING app.events.emit is caught (logged) and taps still run', async () => {
     const { errors } = installFakeApp({ withEvents: true, emitThrows: true });
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const seen: string[] = [];
     r.hook('onTaskDeadLettered', () => {
       seen.push('ran');
@@ -488,7 +537,7 @@ describe('typed hooks', () => {
   test('a correctly-typed constructor hook + late .hook() both run through the bus', async () => {
     installFakeApp();
     const injected: SizeInput = { width: 10, height: 10 };
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       ...baseOpts(),
       hooks: {
         resolveSizes: (sizes: SizeInput[]) => [...sizes, injected],
@@ -518,7 +567,7 @@ describe('typed hooks', () => {
 describe('resolve/generate stubs', () => {
   test('resolve delegates to the engine (no longer a stub)', async () => {
     installFakeApp();
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const { decision, output } = await r.resolve({
       media: {},
       sizes: [],
@@ -536,7 +585,7 @@ describe('resolve/generate stubs', () => {
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    const r = new Resizer(baseOpts());
+    const r = createFrameworkResizer(baseOpts());
     const result = await r.generate({
       media: {
         id: 'm1',

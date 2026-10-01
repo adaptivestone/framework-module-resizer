@@ -1,7 +1,7 @@
 // src/config/resize.ts — host extension of the module defaults.
 // Put environment-only changes in resize.<NODE_ENV>.ts; @adaptivestone/framework
 // merges that file over this one before getConfig('resize') is called.
-import type { ResizeConfig } from '@adaptivestone/framework-module-resize';
+import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
 import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
 
 export default {
@@ -9,4 +9,4 @@ export default {
   mediaModelName: 'File', // TODO(REQUIRED): the host media model, e.g. File or Media
   // Lazy / pre-warm modes: allow the worker command, then run `npm run cli ResizeWorker`.
   // worker: { ...defaultResizeConfig.worker, enabled: true },
-} satisfies ResizeConfig;
+} satisfies FrameworkResizeConfig;

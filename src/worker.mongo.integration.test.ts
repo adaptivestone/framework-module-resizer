@@ -10,19 +10,19 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
+import {
+  createFrameworkMongoTransport,
+  createFrameworkResizer,
+} from './framework/resizer.ts';
+import { runResizeWorker } from './framework/worker.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
 import ResizeTaskModel from './models/ResizeTask.ts';
-import {
-  type QueueTransport,
-  Resizer,
-  resetResizerForTests,
-} from './resizer.ts';
+import { type QueueTransport, resetResizerForTests } from './resizer.ts';
 import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { MongoTransport } from './transports/mongo.ts';
+import type { MongoTransport } from './transports/mongo.ts';
 import type { MediaLike, Preview } from './types.d.ts';
-import { runResizeWorker } from './worker.ts';
 
 const png = await sharp({
   create: {
@@ -153,19 +153,19 @@ const sizes = [{ width: 16, height: 16 }];
 test('one worker serves two Resizers that share a transport', async () => {
   installApp();
   await taskModel.deleteMany({});
-  const { transport, stop } = stoppable(new MongoTransport());
+  const { transport, stop } = stoppable(createFrameworkMongoTransport());
   const lockProvider = new FrameworkLockProvider();
   const mediaA = newMedia();
   const mediaB = newMedia();
   const a = memoryStorage();
   const b = memoryStorage();
-  const media = new Resizer({
+  const media = createFrameworkResizer({
     storage: a.storage,
     transport,
     lockProvider,
     mediaStore: memoryMediaStore(mediaA),
   });
-  const listings = new Resizer({
+  const listings = createFrameworkResizer({
     name: 'listings',
     storage: b.storage,
     transport,
@@ -197,11 +197,11 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   await taskModel.deleteMany({});
   const media = newMedia();
   const memory = memoryStorage();
-  const real = new MongoTransport();
+  const real = createFrameworkMongoTransport();
   const lockProvider = new FrameworkLockProvider();
 
   const first = stoppable(real);
-  const resizer = new Resizer({
+  const resizer = createFrameworkResizer({
     storage: memory.storage,
     transport: first.transport,
     lockProvider,
@@ -225,7 +225,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   // A bulk worker (same Resizer, a fresh stoppable wrapper) processes it.
   resetResizerForTests();
   const second = stoppable(real);
-  new Resizer({
+  createFrameworkResizer({
     storage: memory.storage,
     transport: second.transport,
     lockProvider,

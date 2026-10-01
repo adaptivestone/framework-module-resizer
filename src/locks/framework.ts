@@ -5,7 +5,7 @@
 // Identity). Subpath entry `…/locks/framework.js`: a host wrapping this default imports it from
 // there (uniform rule 02 · §6); no optional deps, so importing is always safe. No `app`
 // parameter: reads the framework `Lock` model through getApp() (02 · §4).
-import { getApp } from '../app.ts';
+import { getApp } from '../framework/app.ts';
 import type { LockProvider } from './AbstractLockProvider.ts';
 
 export class FrameworkLockProvider implements LockProvider {

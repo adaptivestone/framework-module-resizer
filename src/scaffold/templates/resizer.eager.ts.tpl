@@ -3,12 +3,14 @@
 // Load this file dynamically from API bootstrap AFTER `await server.init()`:
 //     const { resizer } = await import('./resizer.ts');
 // A static import runs before bootstrap code and is therefore too early.
-import { Resizer } from '@adaptivestone/framework-module-resize';
+// createFrameworkResizer fills config (src/config/resize.ts), the app logger and the media store
+// from the framework app.
+import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
 import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
 // S3 / S3-compatible storage (install the optional AWS peers first — 05 · §10.5):
 // import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js';
 
-export const resizer = new Resizer({
+export const resizer = createFrameworkResizer({
   // Local filesystem — swap for `new S3Storage({ bucketPublic, bucketPrivate,
   // publicBaseUrl, client })` with distinct buckets for private originals.
   // No queue/worker in eager mode.

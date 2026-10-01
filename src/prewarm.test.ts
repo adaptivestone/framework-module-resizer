@@ -4,10 +4,10 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import {
   type LockProvider,
   type QueueTransport,
-  Resizer,
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
@@ -101,7 +101,11 @@ describe('prewarm — happy path', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
@@ -126,7 +130,11 @@ describe('prewarm — happy path', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
@@ -153,7 +161,7 @@ describe('prewarm — queue', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -185,7 +193,11 @@ describe('prewarm — queue', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -201,7 +213,11 @@ describe('prewarm — skip existing & dedup', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const media: MediaLike = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
@@ -230,7 +246,11 @@ describe('prewarm — skip existing & dedup', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
@@ -247,7 +267,11 @@ describe('prewarm — skip existing & dedup', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{}, { width: 300, height: 300 }],
@@ -263,7 +287,11 @@ describe('prewarm — SVG original uses the normal queue', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: {
         id: 'm1',
@@ -284,7 +312,11 @@ describe('prewarm — SVG original uses the normal queue', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: {
         id: 'm1',
@@ -303,7 +335,7 @@ describe('prewarm — waterfall hooks', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -330,7 +362,7 @@ describe('prewarm — waterfall hooks', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -359,7 +391,7 @@ describe('prewarm — waterfall hooks', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -378,7 +410,7 @@ describe('prewarm — waterfall hooks', () => {
 describe('prewarm — no transport (eager-only host)', () => {
   test('warns once and returns { enqueued: 0 } without throwing', async () => {
     const { warn } = installFakeApp();
-    const r = new Resizer({ storage: makeStorage() });
+    const r = createFrameworkResizer({ storage: makeStorage() });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
@@ -398,7 +430,11 @@ describe('prewarm — dispatch-lock survivors only', () => {
     const { transport, calls } = makeTransport();
     // Only the jpeg dispatch lock is won; the webp one is already in flight elsewhere.
     const { lockProvider } = makeLocks((key) => key.endsWith(':jpeg:none'));
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -415,7 +451,11 @@ describe('prewarm — dispatch-lock survivors only', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(false);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -433,7 +473,11 @@ describe('prewarm — never throws', () => {
       throw new Error('transport down');
     });
     const { lockProvider, released } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -454,7 +498,11 @@ describe('prewarm — never throws', () => {
       },
       release: async () => {},
     };
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -468,7 +516,7 @@ describe('prewarm — never throws', () => {
     const { errors } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: makeStorage(),
       transport,
       lockProvider,
@@ -492,7 +540,11 @@ describe('prewarm — never throws', () => {
     const { errors } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const { enqueued } = await r.prewarm({
       media: { original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -509,7 +561,11 @@ describe('prewarm — fast-path is NOT consulted', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const media: MediaLike = {
       id: 'm1',
       // original (200×150) fits inside the 300×300 box — resolve() would serve the original,
@@ -539,7 +595,11 @@ describe('prewarm — pipelines are part of identity', () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
-    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+    });
     const media = {
       id: 'm1',
       original: { storageRef: { key: 'orig.jpg' } },

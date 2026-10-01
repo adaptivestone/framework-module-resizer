@@ -1,4 +1,5 @@
-import { getApp } from './app.ts';
+// Pure validation of a complete resize config. It reads no framework state; the framework
+// adapter (src/framework/config.ts) loads the config from the app and checks mediaModelName.
 import { ResizeConfigError } from './errors.ts';
 import type { ResizeConfig } from './types.d.ts';
 
@@ -41,16 +42,6 @@ function validateRequiredResizeConfigFields(
       );
     }
   }
-  if (
-    typeof root.mediaModelName !== 'string' ||
-    root.mediaModelName.trim().length === 0
-  ) {
-    invalid(
-      'resize config: `mediaModelName` is required — set it in the host src/config/resize.ts',
-      'RESIZE_CONFIG_MEDIA_MODEL_MISSING',
-    );
-  }
-
   const upload = root.upload;
   if (!isRecord(upload)) {
     return invalid(
@@ -245,9 +236,4 @@ export function validateResizeConfig(config: unknown): ResizeConfig {
   validateRequiredResizeConfigFields(config);
   validatedConfigs.add(config);
   return config;
-}
-
-/** The framework app's validated `resize` config — for the framework drivers only. */
-export function getResizeConfig(): ResizeConfig {
-  return validateResizeConfig(getApp().getConfig('resize'));
 }

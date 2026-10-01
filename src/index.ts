@@ -1,11 +1,11 @@
 // @adaptivestone/framework-module-resize — the main entry (public API surface, 02 · §6).
 //
-// MAIN ENTRY = CORE ONLY. Every DRIVER lives behind its own package subpath with plain
-// static imports inside; the main entry never resolves any driver's (optional-peer)
-// dependencies — so `import '@adaptivestone/framework-module-resize'` never loads the AWS
-// SDKs, and a missing optional peer fails LOUDLY at the host's own driver import line at
-// bootstrap, not at the first I/O call. The six driver subpaths (house style: CLASSES
-// implementing the Abstract* contracts, constructed `new X(opts?)`):
+// MAIN ENTRY = CORE ONLY. It imports no framework code (a guard test walks its import graph) and
+// no driver: every driver lives behind its own package subpath with plain static imports, so a
+// missing optional peer fails LOUDLY at the host's own driver import line. Framework hosts wire
+// everything through the framework adapter:
+//   import { createFrameworkResizer, createFrameworkMongoTransport } from '@adaptivestone/framework-module-resize/framework.js';
+// Driver subpaths (house style: CLASSES implementing the Abstract* contracts):
 //   import { MongoTransport }        from '@adaptivestone/framework-module-resize/transports/mongo.js';
 //   import { SqsTransport }          from '@adaptivestone/framework-module-resize/transports/sqs.js';
 //   import { S3Storage }             from '@adaptivestone/framework-module-resize/storage/s3.js';
@@ -13,14 +13,8 @@
 //   import { FrameworkMediaStore }   from '@adaptivestone/framework-module-resize/mediaStore/framework.js';
 //   import { FrameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
 // The contract INTERFACES for custom-driver authors re-export below (the VALUES live at the
-// subpaths). The core constructs the two framework DEFAULTS internally, so omitting
-// mediaStore/lockProvider still needs zero host imports.
+// subpaths).
 
-// --- worker: the CLI command (default export) + the programmatic entries ---
-// Reconciled vs 02 · §6's literal `export { default as ResizeWorker, runResizeWorker } from
-// './worker.ts'`: the ResizeWorker CLASS actually lives in ./commands/ResizeWorker.ts (a package
-// subpath the scaffold re-exports); `runResizeWorker` is the module function in ./worker.ts.
-export { default as ResizeWorker } from './commands/ResizeWorker.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type {
   EnqueueRequiredOpts,
@@ -58,9 +52,6 @@ export {
   resizeMediaPaths,
   resizeMediaSchemaFragment,
 } from './models/mediaFragment.ts';
-export type { TResizeTask } from './models/ResizeTask.ts';
-// --- Mongo-transport model class (the host's scaffolded model `extends` it) + its doc type ---
-export { default as ResizeTaskModel } from './models/ResizeTask.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,
@@ -89,7 +80,14 @@ export type {
 // from index.ts docs", but HOST test suites construct Resizers in their own tests (mirroring the
 // framework publicly exporting `resetAppInstance`), so it IS re-exported here — documented
 // deviation from that literal note.
-export { getResizer, Resizer, resetResizerForTests } from './resizer.ts';
+export {
+  getResizer,
+  listResizers,
+  Resizer,
+  resetResizerForTests,
+} from './resizer.ts';
 // --- data shapes (types.d.ts) ---
 export type * from './types.d.ts';
-export { processTask, runResizeWorker } from './worker.ts';
+// --- the framework-free worker (framework hosts run `runResizeWorker` from …/framework.js) ---
+export type { RunWorkerOptions } from './worker.ts';
+export { processTask, runWorker } from './worker.ts';

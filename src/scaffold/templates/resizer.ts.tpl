@@ -8,14 +8,19 @@
 // `import { resizer }`. Construct each name once.
 //
 // Everything below is wired EXCEPT `storage` (REQUIRED): fill the storage TODO and you're done.
-import { Resizer } from '@adaptivestone/framework-module-resize';
-import { MongoTransport } from '@adaptivestone/framework-module-resize/transports/mongo.js';
+// createFrameworkResizer fills config (src/config/resize.ts), the app logger, the media store and
+// the lock provider from the framework app; createFrameworkMongoTransport uses the scaffolded
+// ResizeTask model and the queue timing from the same config.
+import {
+  createFrameworkMongoTransport,
+  createFrameworkResizer,
+} from '@adaptivestone/framework-module-resize/framework.js';
 // Local filesystem (tests / first-week local) or S3 (install the optional AWS peers first):
 // import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
 // import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js';
 
-export const resizer = new Resizer({
-  transport: new MongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)
+export const resizer = createFrameworkResizer({
+  transport: createFrameworkMongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)
   // TODO(REQUIRED): provide a storage driver — e.g. `new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' })`
   // or `new S3Storage({ bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: '…', client })`
   // (use distinct buckets when originals must stay private; uncomment an import above)

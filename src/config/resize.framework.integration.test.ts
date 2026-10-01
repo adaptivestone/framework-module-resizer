@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import defaultFolders from '@adaptivestone/framework/folderConfig.js';
 import { resetAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
 import Server from '@adaptivestone/framework/server.js';
-import { getResizeConfig } from '../resizeConfig.ts';
+import { getResizeConfig } from '../framework/config.ts';
 import { runScaffold } from '../scaffold/command.ts';
 
 let root: string | undefined;

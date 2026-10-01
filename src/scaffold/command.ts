@@ -24,7 +24,8 @@ const COMMAND = 'src/commands/ResizeWorker.ts';
 const CONFIG = 'src/config/resize.ts';
 
 // Load-bearing substrings `--check` verifies (also documents what each shim MUST reference).
-const RESIZER_MARKER = 'new Resizer(';
+// A construction site builds its Resizer through the framework adapter or the core class.
+const RESIZER_MARKERS = ['createFrameworkResizer(', 'new Resizer('];
 const MODEL_MARKER = 'extends ResizeTaskModel';
 const COMMAND_MARKER =
   '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
@@ -129,7 +130,10 @@ interface CheckItem {
 /** Check mode (CI-gatable): verify the shims exist + reference the module. NEVER writes. */
 async function checkFiles(root: string, eager: boolean): Promise<number> {
   const items: CheckItem[] = [
-    { target: RESIZER, validate: (c) => c.includes(RESIZER_MARKER) },
+    {
+      target: RESIZER,
+      validate: (c) => RESIZER_MARKERS.some((marker) => c.includes(marker)),
+    },
   ];
   if (!eager) {
     items.push(
@@ -197,7 +201,7 @@ const USAGE = `resize-scaffold — vendor the resize module's integration files 
 Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
 
 Emits (into process.cwd(), or --out <dir>):
-  src/resizer.ts            construction site — new Resizer({ transport, storage, pipelines })
+  src/resizer.ts            construction site — createFrameworkResizer({ transport, storage, pipelines })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
   src/commands/ResizeWorker.ts  re-export of the module's worker command
   src/config/resize.ts      host overrides over module defaults (framework merges environment overrides)

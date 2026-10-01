@@ -22,8 +22,6 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeSecurityError',
   'ResizeSetupError',
   'ResizeStorageError',
-  'ResizeTaskModel',
-  'ResizeWorker',
   'calculateResizedDimensions',
   'formatPictureUrls',
   'getFilterSig',
@@ -32,12 +30,13 @@ const EXPECTED_VALUE_EXPORTS = [
   'getResizer',
   'getSizeKey',
   'isCatalogCovered',
+  'listResizers',
   'parseSizeKey',
   'processTask',
   'resetResizerForTests',
   'resizeMediaPaths',
   'resizeMediaSchemaFragment',
-  'runResizeWorker',
+  'runWorker',
 ];
 
 // Drivers are SUBPATH-ONLY (the uniform rule 02 · §6) — they must NEVER appear on the main entry.
@@ -48,6 +47,12 @@ const DRIVER_NAMES = [
   'LocalFsStorage',
   'FrameworkMediaStore',
   'FrameworkLockProvider',
+  // The framework adapter lives at …/framework.js, never on the framework-free main entry.
+  'ResizeTaskModel',
+  'ResizeWorker',
+  'runResizeWorker',
+  'createFrameworkResizer',
+  'createFrameworkMongoTransport',
 ];
 
 const asRecord = api as unknown as Record<string, unknown>;
@@ -61,7 +66,7 @@ describe('public API surface (src/index.ts)', () => {
   });
 
   test('the classes are constructors (function with a prototype)', () => {
-    for (const name of ['Resizer', 'ResizeWorker', 'ResizeTaskModel']) {
+    for (const name of ['Resizer']) {
       const v = asRecord[name];
       assert.equal(typeof v, 'function', `${name} should be a class/function`);
       assert.ok(
@@ -75,7 +80,8 @@ describe('public API surface (src/index.ts)', () => {
     for (const name of [
       'getResizer',
       'resetResizerForTests',
-      'runResizeWorker',
+      'listResizers',
+      'runWorker',
       'processTask',
       'getSizeKey',
       'parseSizeKey',
