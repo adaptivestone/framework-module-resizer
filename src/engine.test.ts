@@ -449,6 +449,7 @@ describe('resolve — enqueue wiring', () => {
           contentType: 'image/jpeg',
           sizeKey: '300x300',
           format: 'jpeg',
+          pipeline: 'photo', // previews are scoped by pipeline
         },
       ],
     };
@@ -541,7 +542,10 @@ describe('resolve — enqueue wiring', () => {
       formats: ['jpeg'],
     });
     assert.equal(acquired.length, 1);
-    assert.equal(acquired[0].key, 'resize_dispatch:abc123:300x300:jpeg:none');
+    assert.equal(
+      acquired[0].key,
+      'resize_dispatch:abc123:default:default:300x300:jpeg:none',
+    );
   });
 
   test('resolve does not throw when transport.enqueue throws; survivor locks released', async () => {
@@ -557,7 +561,9 @@ describe('resolve — enqueue wiring', () => {
       formats: ['jpeg'],
     });
     assert.equal(decision.missing.length, 1);
-    assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
+    assert.deepEqual(released, [
+      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    ]);
   });
 
   test('resolve does not throw when transport returns taskId null; locks released', async () => {
@@ -570,7 +576,9 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
+    assert.deepEqual(released, [
+      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    ]);
   });
 
   test('an original without a key leaves variants missing without enqueueing or locking', async () => {
@@ -1079,5 +1087,58 @@ describe('several Resizers in one process', () => {
     await b.resolve({ media: {} as never, sizes });
     assert.equal(errorsA.length, 0);
     assert.equal(errorsB.length, 1);
+  });
+});
+
+describe('pipelines are part of preview identity', () => {
+  const stored = {
+    storageRef: { k: 'clean' },
+    sizeKey: '300x300',
+    format: 'webp',
+    contentType: 'image/webp',
+  };
+  const sizes = [{ width: 300, height: 300 }];
+
+  test('a default preview is not served for another pipeline', async () => {
+    installFakeApp();
+    const r = new Resizer({ storage: makeStorage() });
+    const media = { id: 'm1', previews: [stored] };
+    const clean = await r.resolve({ media, sizes, formats: ['webp'] });
+    const watermarked = await r.resolve({
+      media,
+      sizes,
+      formats: ['webp'],
+      pipeline: 'watermark',
+    });
+    assert.equal(clean.decision.ready.length, 1);
+    assert.equal(watermarked.decision.ready.length, 0);
+    assert.equal(watermarked.decision.missing.length, 1);
+  });
+
+  test('a preview stored for a pipeline is served only to that pipeline', async () => {
+    installFakeApp();
+    const r = new Resizer({ storage: makeStorage() });
+    const media = {
+      id: 'm1',
+      previews: [{ ...stored, pipeline: 'watermark' }],
+    };
+    const watermarked = await r.resolve({
+      media,
+      sizes,
+      formats: ['webp'],
+      pipeline: 'watermark',
+    });
+    const clean = await r.resolve({ media, sizes, formats: ['webp'] });
+    assert.equal(watermarked.decision.ready.length, 1);
+    assert.equal(clean.decision.ready.length, 0);
+  });
+
+  test("another Resizer's preview is not served", async () => {
+    installFakeApp();
+    const r = new Resizer({ name: 'listings', storage: makeStorage() });
+    const media = { id: 'm1', previews: [stored] };
+    const result = await r.resolve({ media, sizes, formats: ['webp'] });
+    assert.equal(result.decision.ready.length, 0);
+    assert.equal(result.decision.missing.length, 1);
   });
 });

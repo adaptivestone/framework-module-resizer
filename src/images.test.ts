@@ -2,12 +2,15 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
   calculateResizedDimensions,
+  DEFAULT_SCOPE,
+  expandMissingPreviews,
   getFilterSig,
   getImageContentType,
   getPreviewIdentity,
   getSizeKey,
   isCatalogCovered,
   parseSizeKey,
+  previewScope,
 } from './images.ts';
 
 describe('getSizeKey', () => {
@@ -163,14 +166,103 @@ describe('getFilterSig', () => {
 });
 
 describe('getPreviewIdentity', () => {
-  test('composes sizeKey:format:none when no filters', () => {
-    assert.equal(getPreviewIdentity('fit', 'webp'), 'fit:webp:none');
+  test('composes resizer:pipeline:sizeKey:format:none when no filters', () => {
+    assert.equal(
+      getPreviewIdentity(DEFAULT_SCOPE, 'fit', 'webp'),
+      'default:default:fit:webp:none',
+    );
   });
 
   test('composes with the filter signature', () => {
     assert.equal(
-      getPreviewIdentity('300x300', 'avif', { blur: 40 }),
-      '300x300:avif:blur:40',
+      getPreviewIdentity(DEFAULT_SCOPE, '300x300', 'avif', { blur: 40 }),
+      'default:default:300x300:avif:blur:40',
+    );
+  });
+
+  test('includes the resizer and pipeline', () => {
+    assert.equal(
+      getPreviewIdentity(
+        { resizer: 'listings', pipeline: 'watermark' },
+        '300x300',
+        'webp',
+      ),
+      'listings:watermark:300x300:webp:none',
+    );
+  });
+
+  test('names containing ":" cannot collide', () => {
+    const a = getPreviewIdentity(
+      { resizer: 'a:b', pipeline: 'c' },
+      '300x300',
+      'webp',
+    );
+    const b = getPreviewIdentity(
+      { resizer: 'a', pipeline: 'b:c' },
+      '300x300',
+      'webp',
+    );
+    assert.notEqual(a, b);
+  });
+});
+
+describe('previewScope', () => {
+  test('a stored preview without resizer/pipeline belongs to the default scope', () => {
+    assert.deepEqual(previewScope({}), DEFAULT_SCOPE);
+    assert.deepEqual(previewScope({ pipeline: 'watermark' }), {
+      resizer: 'default',
+      pipeline: 'watermark',
+    });
+    assert.deepEqual(
+      previewScope({ resizer: 'listings', pipeline: 'watermark' }),
+      { resizer: 'listings', pipeline: 'watermark' },
+    );
+  });
+});
+
+describe('expandMissingPreviews with a scope', () => {
+  const media = {
+    id: 'm1',
+    previews: [
+      {
+        storageRef: { k: 1 },
+        sizeKey: '300x300',
+        format: 'webp',
+        contentType: 'image/webp',
+      },
+    ],
+  };
+  const sizes = [{ width: 300, height: 300 }];
+
+  test('ignores previews of another pipeline or Resizer', () => {
+    assert.equal(
+      expandMissingPreviews(media, sizes, ['webp'], DEFAULT_SCOPE).length,
+      0,
+    );
+    assert.equal(
+      expandMissingPreviews(media, sizes, ['webp'], {
+        resizer: 'default',
+        pipeline: 'watermark',
+      }).length,
+      1,
+    );
+    assert.equal(
+      expandMissingPreviews(media, sizes, ['webp'], {
+        resizer: 'listings',
+        pipeline: 'default',
+      }).length,
+      1,
+    );
+  });
+
+  test('isCatalogCovered uses the default scope unless given one', () => {
+    assert.equal(isCatalogCovered(media, sizes, ['webp']), true);
+    assert.equal(
+      isCatalogCovered(media, sizes, ['webp'], {
+        resizer: 'default',
+        pipeline: 'watermark',
+      }),
+      false,
     );
   });
 });

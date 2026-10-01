@@ -81,8 +81,17 @@ export interface UploadOriginalOpts {
   namespace?: string;
 }
 
+// Which Resizer and pipeline rendered a preview. Part of the preview identity, so different
+// renderings of the same media at the same size never share a stored preview.
+export interface PreviewScope {
+  resizer: string; // Resizer name
+  pipeline: string; // pipeline name
+}
+
 export interface Preview {
   storageRef: StorageRef;
+  resizer?: string; // Resizer that generated it; absent → 'default'
+  pipeline?: string; // pipeline that generated it; absent → 'default'
   sizeKey: string; // canonical size key — see 03 · Identity
   filters?: Filters; // part of identity — see 03 · Identity
   requestedWidth?: number;

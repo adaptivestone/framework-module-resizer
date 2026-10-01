@@ -19,9 +19,11 @@ filters whether a preview is ready or missing.
 The Mongo transport deduplicates identical active enqueue requests using a canonical SHA-256
 `requestKey` and a partial unique index. Its key includes the Resizer name, the queue, the
 pipeline and the surviving variant catalog, so the same request on another queue is a separate
-task. Dispatch locks, worker locks, and stored previews share media + size + format + filters
-across pipelines; use distinct filters for different renderings of the same media, including
-on reads. Legacy rows without a key remain valid. Storage drivers that can prove original
+task. Preview identity is `resizer:pipeline:sizeKey:format:filterSig`: dispatch locks, worker
+locks and stored previews are separate per Resizer and per pipeline, so different renderings of
+the same media keep separate previews (rename a pipeline, e.g. `watermark-v2`, to regenerate its
+images). Preview rows without `resizer`/`pipeline` belong to `default`. Legacy task rows without
+a key remain valid. Storage drivers that can prove original
 visibility implement `canServeOriginalPublicly`; the engine never fabricates a public URL for
 a private original.
 

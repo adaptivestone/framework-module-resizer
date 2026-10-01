@@ -102,7 +102,14 @@ describe('public API surface (src/index.ts)', () => {
   test('a pure helper actually works through the re-export', () => {
     assert.equal(api.getSizeKey({ width: 320, height: 200 }), '320x200');
     assert.equal(api.getSizeKey({ fit: true }), 'fit');
-    assert.equal(api.getPreviewIdentity('fit', 'webp'), 'fit:webp:none');
+    assert.equal(
+      api.getPreviewIdentity(
+        { resizer: 'default', pipeline: 'default' },
+        'fit',
+        'webp',
+      ),
+      'default:default:fit:webp:none',
+    );
   });
 
   test('NO driver value exports leak onto the main entry (subpath-only rule)', () => {

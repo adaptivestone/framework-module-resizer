@@ -439,7 +439,9 @@ describe('processTask — variants', () => {
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
-    assert.deepEqual(released, ['resize_dispatch:m1:20x20:jpeg:none']);
+    assert.deepEqual(released, [
+      'resize_dispatch:m1:default:default:20x20:jpeg:none',
+    ]);
   });
 
   test('worker lock not acquired → variant skipped, still missing, not persisted', async () => {
@@ -452,7 +454,9 @@ describe('processTask — variants', () => {
       () => processTask(task({ previews: [variant()] })),
       /incomplete/,
     );
-    assert.deepEqual(acquired, ['resize_worker:m1:20x20:jpeg:none']);
+    assert.deepEqual(acquired, [
+      'resize_worker:m1:default:default:20x20:jpeg:none',
+    ]);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
   });
@@ -467,7 +471,7 @@ describe('processTask — variants', () => {
       // variant (leave it missing), never reject the pool or skip persist/finally. The jpeg variant
       // is unaffected: generated, persisted, and its locks released (1.2a).
       acquire: async (key: string) => {
-        if (key === 'resize_worker:m1:20x20:webp:none') {
+        if (key === 'resize_worker:m1:default:default:20x20:webp:none') {
           throw new Error('lock backend down');
         }
         return true;
@@ -491,8 +495,12 @@ describe('processTask — variants', () => {
       appendCalls[0].previews.map((p) => p.format),
       ['jpeg'],
     );
-    assert.ok(released.includes('resize_worker:m1:20x20:jpeg:none'));
-    assert.ok(released.includes('resize_dispatch:m1:20x20:jpeg:none'));
+    assert.ok(
+      released.includes('resize_worker:m1:default:default:20x20:jpeg:none'),
+    );
+    assert.ok(
+      released.includes('resize_dispatch:m1:default:default:20x20:jpeg:none'),
+    );
   });
 
   test('variantSteps receive { variant } (with filters) and run in registration order', async () => {
@@ -811,8 +819,8 @@ describe('processTask — persistence & failure handling', () => {
     assert.equal(appendCalls.length, 0);
     // both the worker lock and the dispatch lock for the processed variant are released
     assert.deepEqual([...released].sort(), [
-      'resize_dispatch:m1:20x20:jpeg:none',
-      'resize_worker:m1:20x20:jpeg:none',
+      'resize_dispatch:m1:default:default:20x20:jpeg:none',
+      'resize_worker:m1:default:default:20x20:jpeg:none',
     ]);
   });
 
@@ -846,7 +854,7 @@ describe('processTask — persistence & failure handling', () => {
       (error: unknown) =>
         error instanceof ResizeGenerateError &&
         error.code === 'RESIZE_WORKER_INCOMPLETE' &&
-        error.missing.includes('20x20:jpeg:poison:true'),
+        error.missing.includes('default:default:20x20:jpeg:poison:true'),
     );
     assert.equal(uploads.length, 1);
     assert.equal(appendCalls.length, 1);
@@ -1881,5 +1889,93 @@ describe('one worker serves every Resizer', () => {
     assert.equal(captured.opts?.queue, 'bulk');
     await new ResizeWorker({}, {}, {}).run();
     assert.equal(captured.opts?.queue, 'default');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Generation and worker coverage are scoped per Resizer and pipeline
+// ---------------------------------------------------------------------------
+
+describe('scoped generation', () => {
+  const cleanPreview: Preview = {
+    storageRef: { bucket: 'previews', key: 'clean.jpeg' },
+    sizeKey: '20x20',
+    format: 'jpeg',
+    contentType: 'image/jpeg',
+  };
+
+  test('generate records the Resizer and pipeline on every created preview', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(created[0].resizer, 'default');
+    assert.equal(created[0].pipeline, 'default');
+
+    resetResizerForTests();
+    const listings = new Resizer({ name: 'listings', storage, mediaStore });
+    const watermarked = await listings.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+      pipeline: 'watermark',
+    });
+    assert.equal(watermarked.created[0].resizer, 'listings');
+    assert.equal(watermarked.created[0].pipeline, 'watermark');
+  });
+
+  test('a default preview does not stop generation for another pipeline', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new Resizer({ storage, mediaStore });
+    const media = mediaDoc({ previews: [cleanPreview] });
+    const same = await r.generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(same.created.length, 0);
+    const other = await r.generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+      pipeline: 'watermark',
+    });
+    assert.equal(other.created.length, 1);
+    assert.equal(uploads.length, 1);
+  });
+
+  test('worker lock keys carry the pipeline', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const media = mediaDoc();
+    const { mediaStore } = makeMediaStore(media);
+    const { lockProvider, acquired } = makeLocks(true);
+    new Resizer({ storage, mediaStore, lockProvider });
+    await processTask(task({ pipeline: 'watermark', previews: [variant()] }));
+    assert.ok(acquired.some((key) => key.includes(':watermark:')));
+  });
+
+  test('a default preview does not count as coverage for a watermark task', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    // The reloaded media has only the default rendering of the requested variant.
+    const media = mediaDoc({ previews: [cleanPreview] });
+    const { mediaStore } = makeMediaStore(media);
+    // The worker lock for the watermark variant is held elsewhere, so nothing is generated.
+    const { lockProvider } = makeLocks(false);
+    new Resizer({ storage, mediaStore, lockProvider });
+    await assert.rejects(
+      () => processTask(task({ pipeline: 'watermark', previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeGenerateError &&
+        err.code === 'RESIZE_WORKER_INCOMPLETE',
+    );
   });
 });

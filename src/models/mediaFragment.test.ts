@@ -41,6 +41,8 @@ describe('resizeMediaSchemaFragment — shape', () => {
     const p = resizeMediaSchemaFragment.previews[0];
     for (const k of [
       'storageRef',
+      'resizer',
+      'pipeline',
       'sizeKey',
       'filters',
       'requestedWidth',
@@ -59,6 +61,8 @@ describe('resizeMediaSchemaFragment — shape', () => {
     assert.equal(resizeMediaSchemaFragment.original.storageRef.type, 'Mixed');
     assert.equal(resizeMediaSchemaFragment.original.width.type, Number);
     assert.equal(resizeMediaSchemaFragment.previews[0].fit.type, Boolean);
+    assert.equal(resizeMediaSchemaFragment.previews[0].resizer.type, String);
+    assert.equal(resizeMediaSchemaFragment.previews[0].pipeline.type, String);
     // Mixed via the string alias (no mongoose import in the fragment source).
     assert.equal(resizeMediaSchemaFragment.previews[0].filters.type, 'Mixed');
   });

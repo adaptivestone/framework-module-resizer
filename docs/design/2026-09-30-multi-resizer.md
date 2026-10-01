@@ -236,7 +236,7 @@ published; the page still describes 0.2.
   - A task for an unknown Resizer dead-letters with a clear error.
 - **Status: done.**
 
-**P3 — Identity includes resizer and pipeline.**
+**P3 — Identity includes resizer and pipeline.** [Plan](../superpowers/plans/2026-09-30-p3-identity-includes-resizer-and-pipeline.md).
 - Preview identity becomes `resizer:pipeline:sizeKey:format:filterSig`.
 - Preview rows store `resizer` and `pipeline`.
 - Every key builder moves to the new helper: the read map, `expandMissingPreviews`, the
@@ -245,6 +245,8 @@ published; the page still describes 0.2.
 - Done when:
   - Two pipelines on one media produce two previews, and each read gets its own.
   - A stored row without the new fields reads as `'default'`.
+- **Status: done.** The `requestKey` needed no change: it already hashes the resizer and the
+  pipeline (P2).
 
 **P4 — The framework becomes an adapter.**
 - A framework subpath takes the app gateway, config loading, the event mirror,

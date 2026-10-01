@@ -9,6 +9,7 @@ import type {
   Original,
   Preview,
   PreviewFormat,
+  PreviewScope,
   SizeInput,
 } from './types.d.ts';
 
@@ -149,13 +150,35 @@ export function requireMediaId(media: MediaLike): string {
   return id;
 }
 
-/** The one lookup/lock key used everywhere: `${sizeKey}:${format}:${filterSig}`. */
+/** Scope of rows stored before previews recorded their resizer and pipeline. */
+export const DEFAULT_SCOPE: PreviewScope = Object.freeze({
+  resizer: 'default',
+  pipeline: 'default',
+});
+
+/** The scope a stored preview belongs to. */
+export function previewScope(preview: {
+  resizer?: string;
+  pipeline?: string;
+}): PreviewScope {
+  return {
+    resizer: preview.resizer ?? 'default',
+    pipeline: preview.pipeline ?? 'default',
+  };
+}
+
+/**
+ * The one lookup and lock identity, used everywhere: which Resizer and pipeline rendered which
+ * size, format and filters (`resizer:pipeline:sizeKey:format:filterSig`). Names are
+ * URI-encoded, so a ':' inside a name cannot shift the fields.
+ */
 export function getPreviewIdentity(
+  scope: PreviewScope,
   sizeKey: string,
   format: PreviewFormat,
   filters?: Filters,
 ): string {
-  return `${sizeKey}:${format}:${getFilterSig(filters)}`;
+  return `${encodeURIComponent(scope.resizer)}:${encodeURIComponent(scope.pipeline)}:${sizeKey}:${format}:${getFilterSig(filters)}`;
 }
 
 /**
@@ -171,25 +194,34 @@ export function expandMissingPreviews(
   media: MediaLike,
   sizes: SizeInput[],
   formats: PreviewFormat[],
+  scope: PreviewScope,
 ): MissingPreview[] {
   const existing = new Set<string>();
   for (const p of media.previews ?? []) {
     if (isUsablePreview(p)) {
-      existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+      existing.add(
+        getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
+      );
     }
   }
-  return expandPreviewRequests(sizes, formats).filter(
+  return expandPreviewRequests(sizes, formats, scope).filter(
     (preview) =>
       !existing.has(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       ),
   );
 }
 
-/** Expand a size catalog without consulting stored previews. */
+/** Expand a size catalog for one scope without consulting stored previews. */
 export function expandPreviewRequests(
   sizes: SizeInput[],
   formats: PreviewFormat[],
+  scope: PreviewScope,
 ): MissingPreview[] {
   const requested: MissingPreview[] = [];
   const seen = new Set<string>();
@@ -201,7 +233,7 @@ export function expandPreviewRequests(
       continue; // a size with nothing usable is skipped
     }
     for (const format of formats) {
-      const identity = getPreviewIdentity(sizeKey, format, size.filters);
+      const identity = getPreviewIdentity(scope, sizeKey, format, size.filters);
       if (seen.has(identity)) {
         continue;
       }
@@ -226,15 +258,17 @@ export function expandPreviewRequests(
 }
 
 /**
- * True when every `sizes × formats` identity is already stored on `media.previews`
- * Hosts use this to skip a no-op `generate` / `prewarm`.
+ * True when every `sizes × formats` identity of `scope` (default: the default Resizer and
+ * pipeline) is already stored on `media.previews`. Hosts use this to skip a no-op
+ * `generate` / `prewarm`.
  */
 export function isCatalogCovered(
   media: MediaLike,
   sizes: SizeInput[],
   formats: PreviewFormat[],
+  scope: PreviewScope = DEFAULT_SCOPE,
 ): boolean {
-  return expandMissingPreviews(media, sizes, formats).length === 0;
+  return expandMissingPreviews(media, sizes, formats, scope).length === 0;
 }
 
 export function isSvgOriginal(original: Original | undefined): boolean {

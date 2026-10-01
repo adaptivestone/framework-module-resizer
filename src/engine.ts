@@ -15,6 +15,7 @@ import {
   getSizeKey,
   isSvgOriginal,
   isUsablePreview,
+  previewScope,
   requireMediaId,
 } from './images.ts';
 import type { Resizer } from './resizer.ts';
@@ -88,11 +89,17 @@ export async function resolveImpl(
 
     const formats = opts.formats ?? resizer.config.formats;
 
-    // 5. previewMap keyed by identity — only complete entries (both key + contentType).
+    // 5. previewMap keyed by identity — only complete entries (both key + contentType). Stored
+    // previews keep the scope they were rendered in, so another pipeline or Resizer never
+    // matches them.
+    const scope = { resizer: resizer.name, pipeline };
     const previewMap = new Map<string, Preview>();
     for (const p of media.previews ?? []) {
       if (isUsablePreview(p)) {
-        previewMap.set(getPreviewIdentity(p.sizeKey, p.format, p.filters), p);
+        previewMap.set(
+          getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
+          p,
+        );
       }
     }
 
@@ -135,7 +142,12 @@ export async function resolveImpl(
         continue; // skip a size whose key cannot be built
       }
       for (const format of formats) {
-        const identity = getPreviewIdentity(sizeKey, format, size.filters);
+        const identity = getPreviewIdentity(
+          scope,
+          sizeKey,
+          format,
+          size.filters,
+        );
         const existing = previewMap.get(identity);
         if (existing) {
           // exists → serve the generated preview.
@@ -304,7 +316,10 @@ export async function prewarmImpl(
     // 2. Expand sizes × formats → deduped MissingPreview[], skipping unbuildable sizes + existing
     //    identities. The fast-path is deliberately NOT consulted here (see the doc comment).
     const formats = opts.formats ?? resizer.config.formats;
-    const expanded = expandMissingPreviews(media, sizes, formats);
+    const expanded = expandMissingPreviews(media, sizes, formats, {
+      resizer: resizer.name,
+      pipeline,
+    });
 
     // 3. beforeEnqueue — REASSIGN the (post-hook) set so the enqueue sees exactly what a host tap
     //    left (same assign-back semantics as resolve step 8).
@@ -368,7 +383,8 @@ export async function enqueueRequiredImpl(
     ctx,
   )) as SizeInput[];
   const formats = opts.formats ?? resizer.config.formats;
-  const requestedBeforePolicy = expandPreviewRequests(sizes, formats);
+  const scope = { resizer: resizer.name, pipeline };
+  const requestedBeforePolicy = expandPreviewRequests(sizes, formats, scope);
   const empty = (): EnqueueRequiredResult => ({
     status: 'not-required',
     reason: 'empty-request',
@@ -388,19 +404,34 @@ export async function enqueueRequiredImpl(
   for (const preview of media.previews ?? []) {
     if (isUsablePreview(preview)) {
       readyIdentities.add(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          previewScope(preview),
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       );
     }
   }
   const ready = requestedBeforePolicy.filter((preview) =>
     readyIdentities.has(
-      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      getPreviewIdentity(
+        scope,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
+      ),
     ),
   );
   const missingBeforePolicy = requestedBeforePolicy.filter(
     (preview) =>
       !readyIdentities.has(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       ),
   );
   const required = canonicalizeVariants(
@@ -412,18 +443,33 @@ export async function enqueueRequiredImpl(
   ).filter(
     (preview) =>
       !readyIdentities.has(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       ),
   );
   const requiredIdentities = new Set(
     required.map((preview) =>
-      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      getPreviewIdentity(
+        scope,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
+      ),
     ),
   );
   const notRequired = missingBeforePolicy.filter(
     (preview) =>
       !requiredIdentities.has(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       ),
   );
   const requested = [...ready, ...required, ...notRequired];
