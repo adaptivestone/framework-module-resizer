@@ -9,7 +9,9 @@ import { getApp } from './app.ts';
 import {
   type EnqueueRequiredOpts,
   enqueueRequiredImpl,
+  type PrewarmOpts,
   prewarmImpl,
+  type ResolveOpts,
   resolveImpl,
 } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
@@ -27,8 +29,12 @@ import { generateImpl } from './resizeTask.ts';
 // them from resizer.ts unchanged.
 import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import type {
+  EnqueueTask,
   LeasedTask,
   QueueTransport,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
 } from './transports/AbstractTransport.ts';
 import type {
   EnqueueRequiredResult,
@@ -47,7 +53,15 @@ import type {
 
 export type { LockProvider } from './locks/AbstractLockProvider.ts';
 export type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
-export type { LeasedTask, QueueTransport, ResizeStorage };
+export type {
+  EnqueueTask,
+  LeasedTask,
+  QueueTransport,
+  ResizeStorage,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
+};
 
 // ---------------------------------------------------------------------------
 // Named pipeline types (04 · §8) — the per-media-type pixel work. sharp is a hard dep;
@@ -143,6 +157,7 @@ export interface ResizerOptions {
   events?: ResizeEventBus; // default: the framework app's event bus, when one exists
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
+  queue?: string; // default queue for this Resizer's tasks; default 'default'
   mediaStore?: MediaStore; // default: a FrameworkMediaStore for config.mediaModelName (05 · §10.6)
   lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
@@ -192,6 +207,7 @@ function frameworkEvents(): ResizeEventBus | undefined {
  */
 export class Resizer {
   readonly name: string;
+  readonly queue: string;
   readonly config: ResizeConfig;
   readonly logger: ResizeLogger;
   readonly #events: ResizeEventBus | undefined;
@@ -227,13 +243,11 @@ export class Resizer {
         { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
-    // Queued tasks do not record their Resizer yet, so the worker runs every task with the
-    // default Resizer. A named Resizer's tasks would use the wrong storage and config.
-    if (name !== 'default' && opts.transport) {
-      throw new ResizeSetupError(
-        `resize: Resizer '${name}' cannot have a transport yet — its queued tasks would be processed by the default Resizer. Use generate() for '${name}', or queue through the default Resizer.`,
-        { code: 'RESIZE_NAMED_TRANSPORT_UNSUPPORTED' },
-      );
+    const queue = opts.queue ?? 'default';
+    if (typeof queue !== 'string' || queue.trim().length === 0) {
+      throw new ResizeSetupError('resize: `queue` must be a non-empty string', {
+        code: 'RESIZE_QUEUE_INVALID',
+      });
     }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
@@ -243,6 +257,7 @@ export class Resizer {
     this.logger = opts.logger ?? getApp().logger;
     this.#events = opts.events ?? frameworkEvents();
     this.name = name;
+    this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
@@ -342,14 +357,9 @@ export class Resizer {
    * engine (src/engine.ts), which partitions ready vs missing, enqueues the missing set,
    * and never throws into the caller's read.
    */
-  async resolve(opts: {
-    media: MediaLike;
-    sizes: SizeInput[];
-    pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = config.formats
-    ctx?: Record<string, unknown>; // threaded to read-path hooks (04 · §8)
-    enqueueMissing?: boolean; // default true when a transport is set, false otherwise
-  }): Promise<{ decision: ReadDecision; output: unknown }> {
+  async resolve(
+    opts: ResolveOpts,
+  ): Promise<{ decision: ReadDecision; output: unknown }> {
     return resolveImpl(this, opts);
   }
 
@@ -363,13 +373,7 @@ export class Resizer {
    * no transport it logs once and returns `{ enqueued: 0 }`. `enqueued` = variants handed to the
    * transport (dispatch-lock survivors).
    */
-  async prewarm(opts: {
-    media: MediaLike;
-    sizes: SizeInput[];
-    pipeline?: string; // selects a registered pipeline; default 'default'
-    formats?: PreviewFormat[]; // default = config.formats
-    ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
-  }): Promise<{ enqueued: number }> {
+  async prewarm(opts: PrewarmOpts): Promise<{ enqueued: number }> {
     return prewarmImpl(this, opts);
   }
 
@@ -408,6 +412,11 @@ export function getResizer(name = 'default'): Resizer {
     );
   }
   return resizer;
+}
+
+/** Every registered Resizer, in construction order (the worker serves all of them). */
+export function listResizers(): Resizer[] {
+  return [...resizers.values()];
 }
 
 /** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */

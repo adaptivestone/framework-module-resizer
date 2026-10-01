@@ -84,6 +84,51 @@ describe('enqueueRequired — explicit coverage', () => {
     assert.deepEqual(result.tasks, [{ taskId: 'task-1', previews: calls[0] }]);
   });
 
+  test('sends the Resizer name and queue to enqueue and findActive; a per-call queue wins', async () => {
+    installApp();
+    const enqueued: { resizer: string; queue: string }[] = [];
+    const looked: { resizer: string; queue: string }[] = [];
+    const transport: QueueTransport = {
+      enqueue: async ({ resizer, queue }) => {
+        enqueued.push({ resizer, queue });
+        return { taskId: 'task-1' };
+      },
+      findActive: async ({ resizer, queue }) => {
+        looked.push({ resizer, queue });
+        return [];
+      },
+      startWorker: async () => {},
+    };
+    const r = new Resizer({
+      storage,
+      transport,
+      name: 'listings',
+      queue: 'interactive',
+      // The jpeg lock is won (enqueue); the webp lock is lost (findActive).
+      lockProvider: locks((key) => key.endsWith(':jpeg:none')).lockProvider,
+    });
+    const media = {
+      id: 'm1',
+      original: { storageRef: { key: 'original.jpg' } },
+    };
+    await r.enqueueRequired({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+    await r.enqueueRequired({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+      queue: 'bulk',
+    });
+    assert.deepEqual(enqueued, [
+      { resizer: 'listings', queue: 'interactive' },
+      { resizer: 'listings', queue: 'bulk' },
+    ]);
+    assert.deepEqual(looked, enqueued);
+  });
+
   test('distinguishes already ready, SVG, empty, and policy-filtered requests', async () => {
     installApp();
     const transport: QueueTransport = {

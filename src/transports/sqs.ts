@@ -13,17 +13,23 @@
 // import line at bootstrap (no dynamic import(), no lazy loaders).
 //
 // Dead-letter is NATIVE (the queue's redrive policy → DLQ): the transport just throws on
-// failure and lets SQS redeliver up to maxReceiveCount, so `onTaskDeadLettered` does NOT
-// fire here (documented — 05 · §10.3). It DOES fire `afterTaskComplete` / `onTaskFailed`.
+// failure and lets SQS redeliver up to maxReceiveCount, so no `deadLettered` event is reported
+// here (documented — 05 · §10.3). It DOES report `completed` / `failed` through `onEvent`.
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { Consumer } from 'sqs-consumer';
 import { getApp } from '../app.ts';
-import { getResizer } from '../resizer.ts';
-import type { MissingPreview } from '../types.d.ts';
-import type { LeasedTask, QueueTransport } from './AbstractTransport.ts';
+import { ResizeSetupError } from '../errors.ts';
+import type {
+  EnqueueTask,
+  LeasedTask,
+  QueueTransport,
+  StartWorkerOpts,
+  TaskEvent,
+} from './AbstractTransport.ts';
 
 export interface SqsTransportOptions {
-  queueUrl: string;
+  queueUrl: string; // serves the 'default' queue
+  queues?: Record<string, string>; // extra named queues → queue URLs
   region?: string;
   endpoint?: string;
   visibilityTimeout?: number; // seconds; passed to sqs-consumer when provided
@@ -59,18 +65,31 @@ export class SqsTransport implements QueueTransport {
     return this.#client;
   }
 
-  async enqueue(task: {
-    mediaId: string;
-    pipeline: string;
-    previews: MissingPreview[];
-  }): Promise<{ taskId: string | null }> {
+  // The URL for a named queue. An unknown name is a wiring error, reported before any send or
+  // poll so a typo never silently drops or ignores tasks.
+  #queueUrl(queue: string): string {
+    const url =
+      queue === 'default' ? this.#opts.queueUrl : this.#opts.queues?.[queue];
+    if (!url) {
+      throw new ResizeSetupError(
+        `resize sqs: no queue URL for queue '${queue}' — add it to the SqsTransport \`queues\` option`,
+        { code: 'RESIZE_SQS_QUEUE_UNKNOWN' },
+      );
+    }
+    return url;
+  }
+
+  async enqueue(task: EnqueueTask): Promise<{ taskId: string | null }> {
     // No local try/catch soft-fail: a throw is guarded by enqueue.ts; a successful send
     // without a MessageId returns a null taskId (which enqueue.ts also treats as a soft
     // failure). Body is the durable, ctx-free task payload (04 · §8).
+    const queueUrl = this.#queueUrl(task.queue);
     const out = await this.#getClient().send(
       new SendMessageCommand({
-        QueueUrl: this.#opts.queueUrl,
+        QueueUrl: queueUrl,
         MessageBody: JSON.stringify({
+          resizer: task.resizer,
+          queue: task.queue,
           mediaId: task.mediaId,
           pipeline: task.pipeline,
           previews: task.previews,
@@ -85,43 +104,66 @@ export class SqsTransport implements QueueTransport {
       task: LeasedTask,
       taskOpts?: { signal: AbortSignal },
     ) => Promise<void>,
-    workerOpts: { signal: AbortSignal },
+    workerOpts: StartWorkerOpts,
   ): Promise<void> {
+    const queueUrl = this.#queueUrl(workerOpts.queue);
+    // A throwing event handler (a host observer bug) is logged and never changes the
+    // ack/redelivery outcome of the message.
+    const report = async (
+      event: TaskEvent,
+      task: LeasedTask,
+      error?: unknown,
+    ): Promise<void> => {
+      if (!workerOpts.onEvent) {
+        return;
+      }
+      try {
+        await workerOpts.onEvent(event, task, error);
+      } catch (err) {
+        getApp().logger.error(`resize sqs: ${event} event handler failed`, err);
+      }
+    };
     const consumer = Consumer.create({
-      queueUrl: this.#opts.queueUrl,
+      queueUrl,
       sqs: this.#getClient(),
       // Returning the message ACKs it (sqs-consumer deletes it). Throwing leaves it for
       // SQS to redeliver after the visibility timeout (→ DLQ via redrive policy).
       // Arrow function: sqs-consumer invokes it detached, so `this` stays instance-bound.
       handleMessage: async (message) => {
         // The body JSON.parse is INSIDE the guarded region (05 · §10.3 fix b): a malformed body
-        // fires onTaskFailed before rethrowing, consistent with a handler throw → SQS redelivers.
+        // reports `failed` before rethrowing, consistent with a handler throw → SQS redelivers.
         // `task` starts as a minimal LeasedTask (fields unknown until the body parses) so the
-        // observer always receives a task-shaped payload.
+        // event always carries a task-shaped payload.
         let task: LeasedTask = {
           taskId: message.MessageId ?? '',
+          resizer: 'default',
+          queue: workerOpts.queue,
           mediaId: '',
           pipeline: '',
           previews: [],
         };
         try {
           const body = JSON.parse(message.Body ?? '{}') as {
+            resizer?: string;
+            queue?: string;
             mediaId: string;
             pipeline: string;
             previews: LeasedTask['previews'];
           };
           task = {
             taskId: message.MessageId ?? '',
+            resizer: body.resizer ?? 'default',
+            queue: body.queue ?? workerOpts.queue,
             mediaId: body.mediaId,
             pipeline: body.pipeline,
             previews: body.previews ?? [],
           };
           await handleTask(task);
         } catch (err) {
-          await getResizer().runObservers('onTaskFailed', task, err, {});
-          throw err; // let SQS redeliver → DLQ (no onTaskDeadLettered here — 05 · §10.3)
+          await report('failed', task, err);
+          throw err; // let SQS redeliver → DLQ (no deadLettered event here — 05 · §10.3)
         }
-        await getResizer().runObservers('afterTaskComplete', task, {});
+        await report('completed', task);
         return message;
       },
       // visibilityTimeout / heartbeatInterval only when the host provided them (else the

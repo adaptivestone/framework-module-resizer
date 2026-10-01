@@ -100,6 +100,8 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
   try {
     const mediaId = new mongoose.Types.ObjectId().toString();
     await fixture.transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' }],
@@ -138,6 +140,19 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
       hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
     );
     assert.ok(dedupe, 'fixture should create the active-request dedupe index');
+    assert.ok(
+      taskIndexes.some(({ key }) =>
+        hasExactKey(key, { queue: 1, status: 1, createdAt: 1 }),
+      ),
+      'fixture should create the queue-scoped lease index',
+    );
+    assert.equal(
+      taskIndexes.some(({ key }) =>
+        hasExactKey(key, { status: 1, createdAt: 1 }),
+      ),
+      false,
+      'the queue-less lease index is gone',
+    );
     assert.equal(dedupe.unique, true);
     assert.deepEqual(dedupe.partialFilterExpression, {
       status: { $in: ['pending', 'processing'] },
@@ -146,6 +161,8 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
 
     const mediaId = new mongoose.Types.ObjectId().toString();
     const request = {
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' as const }],

@@ -218,11 +218,12 @@ published; the page still describes 0.2.
   the default Resizer. P2 lifts this.
 - Done when: two Resizers with different configs work in one process, and a guard test keeps
   the core free of globals.
+- **Status: done** (PR #32).
 
-**P2 — Tasks carry their resizer and queue.**
+**P2 — Tasks carry their resizer and queue.** [Plan](../superpowers/plans/2026-09-30-p2-tasks-carry-resizer-and-queue.md).
 - The task envelope and `LeasedTask` gain `resizer` and `queue`.
-- `ResizeTask` gains both fields, the lease query filters by queue, and the unique
-  active-request index and the `requestKey` include the resizer.
+- `ResizeTask` gains both fields, and the lease query filters by queue. The `requestKey` covers
+  the resizer and the queue, so the unique active-request index keeps its keys.
 - SQS gets a queue-name → URL map.
 - Named Resizers may have a transport (the P1 restriction is lifted).
 - `startWorker` takes a queue name and an event callback, and the transports stop calling
@@ -233,6 +234,7 @@ published; the page still describes 0.2.
   - Two Resizers share one queue and one worker processes both.
   - A `bulk` worker ignores `default` tasks and the reverse.
   - A task for an unknown Resizer dead-letters with a clear error.
+- **Status: done.**
 
 **P3 — Identity includes resizer and pipeline.**
 - Preview identity becomes `resizer:pipeline:sizeKey:format:filterSig`.

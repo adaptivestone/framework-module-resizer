@@ -47,11 +47,27 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   name (default `'default'`), a duplicate name throws `RESIZE_DUPLICATE_RESIZER`, and
   `getResizer(name?)` looks one up. Each Resizer reads its own `config`, `logger` and `events`
   (framework app defaults when omitted) at construction, instead of reading the app on every call.
-  Until queued tasks record their Resizer, only the default Resizer may have a `transport`
-  (`RESIZE_NAMED_TRANSPORT_UNSUPPORTED`).
+- The `QueueTransport` contract changed. `enqueue()` receives an `EnqueueTask`
+  (`{ resizer, queue, mediaId, pipeline, previews }`), `LeasedTask` carries `resizer` and `queue`,
+  and `startWorker(handle, { signal, queue, onEvent })` consumes one named queue and reports
+  `completed` / `failed` / `deadLettered` events instead of calling Resizer observers. The worker
+  routes those events to the owning Resizer's hooks. Custom transports must follow.
+- The Mongo `requestKey` is now `v2` and covers the Resizer name and the queue. `ResizeTask` gains
+  `resizer` and `queue` fields, and its lease index becomes `{ queue, status, createdAt }`; create
+  the new index through your migration. Rows without the new fields read as `'default'`.
+- `processTask(task)` runs the task with the Resizer named in it; an unknown name rejects with
+  `RESIZE_NO_RESIZER` (the task retries, then dead-letters).
 
 **Features**
 
+- Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()`,
+  `prewarm()` and `enqueueRequired()` accept a per-call `queue`. `ResizeWorker --queue=<name>`
+  consumes only that queue; without the flag it consumes `'default'`. `SqsTransport` maps queue
+  names to URLs with the new `queues` option (`RESIZE_SQS_QUEUE_UNKNOWN` for an unknown name).
+- One worker process serves every Resizer constructed in it, routing each task to the Resizer
+  named in it. Its Resizers must share one transport instance (`RESIZE_WORKER_TRANSPORTS_DIFFER`
+  otherwise), and every media store's `verify()` runs before leasing. Named Resizers may have a
+  transport. `listResizers()` lists the registered Resizers.
 - `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
   and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
   `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.

@@ -51,6 +51,8 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
 }
 
 type EnqueueTask = {
+  resizer: string;
+  queue: string;
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
@@ -143,6 +145,54 @@ describe('prewarm — happy path', () => {
       },
       { sizeKey: 'fit', format: 'jpeg', fit: true },
     ]);
+  });
+});
+
+describe('prewarm — queue', () => {
+  test('without queue sends resizer.queue; with queue sends that queue', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const r = new Resizer({
+      storage: makeStorage(),
+      transport,
+      lockProvider,
+      name: 'listings',
+      queue: 'interactive',
+    });
+    const media = { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } };
+    await r.prewarm({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    await r.prewarm({
+      media,
+      sizes: [{ width: 100, height: 100 }],
+      formats: ['jpeg'],
+      queue: 'bulk',
+    });
+    assert.deepEqual(
+      calls.map((c) => [c.resizer, c.queue]),
+      [
+        ['listings', 'interactive'],
+        ['listings', 'bulk'],
+      ],
+    );
+  });
+
+  test('a Resizer without a queue option sends "default"', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(calls[0].resizer, 'default');
+    assert.equal(calls[0].queue, 'default');
   });
 });
 

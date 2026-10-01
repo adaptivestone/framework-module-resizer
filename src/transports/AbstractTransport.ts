@@ -6,37 +6,54 @@
 // existing import site keeps working unchanged.
 import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
 
-export interface LeasedTask {
-  taskId: string;
+/** What a Resizer hands to a transport. `resizer` and `queue` route the task later. */
+export interface EnqueueTask {
+  resizer: string;
+  queue: string;
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
 }
 
+/** A task a worker is processing. Rows/messages written without resizer/queue read as 'default'. */
+export interface LeasedTask {
+  taskId: string;
+  resizer: string;
+  queue: string;
+  mediaId: string;
+  pipeline: string;
+  previews: MissingPreview[];
+}
+
+export type TaskEvent = 'completed' | 'failed' | 'deadLettered';
+
+export type TaskEventHandler = (
+  event: TaskEvent,
+  task: LeasedTask,
+  error?: unknown,
+) => void | Promise<void>;
+
+export interface StartWorkerOpts {
+  signal: AbortSignal; // worker-wide graceful shutdown
+  queue: string; // consume only this queue
+  onEvent?: TaskEventHandler; // completion/failure/dead-letter reports; errors it throws are logged
+}
+
 export interface QueueTransport {
-  enqueue(task: {
-    mediaId: string;
-    pipeline: string;
-    previews: MissingPreview[];
-  }): Promise<{ taskId: string | null }>;
+  enqueue(task: EnqueueTask): Promise<{ taskId: string | null }>;
 
-  // Optional strict-enqueue capability. Return active tasks whose persisted payload can
-  // prove coverage of requested variants. Transports without queryable state (such as SQS)
-  // omit it; callers then report lock losers as unconfirmed instead of guessing.
-  findActive?(task: {
-    mediaId: string;
-    pipeline: string;
-    previews: MissingPreview[];
-  }): Promise<EnqueueReceipt[]>;
+  // Optional strict-enqueue capability: active tasks (any queue) of this resizer + media +
+  // pipeline whose payload can prove coverage. Transports without queryable state omit it.
+  findActive?(task: EnqueueTask): Promise<EnqueueReceipt[]>;
 
-  // The transport drives consumption its own way (poll OR push): it calls handleTask per
-  // task and owns completion/redelivery. taskOpts.signal aborts THIS task if its lease is
-  // lost (best-effort); opts.signal is worker-wide shutdown (05 · §10.1).
+  // The transport drives consumption its own way (poll or push) for ONE queue. It calls
+  // handleTask per task and owns completion/redelivery; taskOpts.signal aborts this task if its
+  // lease is lost; opts.signal is worker-wide shutdown.
   startWorker(
     handleTask: (
       task: LeasedTask,
       taskOpts?: { signal: AbortSignal },
     ) => Promise<void>,
-    opts: { signal: AbortSignal },
+    opts: StartWorkerOpts,
   ): Promise<void>;
 }

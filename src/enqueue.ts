@@ -63,24 +63,30 @@ export function canonicalizeVariants(
 
 /**
  * Build a bounded request identity for the durable Mongo dedupe index. The complete
- * file + pipeline identity is included before hashing; the hash keeps the indexed
- * value small even when filters or the variant catalog are large.
+ * file + resizer + queue + pipeline identity is included before hashing; the hash keeps the
+ * indexed value small even when filters or the variant catalog are large. The queue is part
+ * of the key, so the same request on another queue is a separate task: an interactive
+ * request never waits behind a bulk backfill that happens to hold the same payload.
  */
-export function buildRequestKey(
-  mediaId: string,
-  pipeline: string,
-  variants: readonly MissingPreview[],
-): string {
-  const canonical = canonicalizeVariants(variants);
+export function buildRequestKey(task: {
+  mediaId: string;
+  resizer: string;
+  queue: string;
+  pipeline: string;
+  previews: readonly MissingPreview[];
+}): string {
+  const canonical = canonicalizeVariants(task.previews);
   // FNV-style string hashing would be shorter but collision-prone for a durable
   // correctness key. Web Crypto is not guaranteed in every supported Node runtime,
   // so use the built-in SHA-256 implementation.
   const json = JSON.stringify({
-    fileId: mediaId,
-    pipeline,
+    fileId: task.mediaId,
+    resizer: task.resizer,
+    queue: task.queue,
+    pipeline: task.pipeline,
     variants: canonical,
   });
-  return `v1:${createHash('sha256').update(json).digest('hex')}`;
+  return `v2:${createHash('sha256').update(json).digest('hex')}`;
 }
 
 /**
@@ -99,6 +105,7 @@ export async function enqueue(
   mediaId: string,
   pipeline: string,
   missing: MissingPreview[],
+  queue: string,
 ): Promise<number> {
   // Defensive: resolve guarantees a transport before calling us (§17 step 9), but never
   // assume — bail before grabbing any lock we could not use.
@@ -156,6 +163,8 @@ export async function enqueue(
   // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
   try {
     const { taskId } = await transport.enqueue({
+      resizer: resizer.name,
+      queue,
       mediaId,
       pipeline,
       previews: survivors,
@@ -237,6 +246,7 @@ export async function enqueueConfirmed(
   mediaId: string,
   pipeline: string,
   missing: MissingPreview[],
+  queue: string,
 ): Promise<ConfirmedEnqueueResult> {
   const transport = resizer.transport;
   const canonical = canonicalizeVariants(missing);
@@ -300,6 +310,8 @@ export async function enqueueConfirmed(
   if (winners.length > 0) {
     try {
       const { taskId } = await transport.enqueue({
+        resizer: resizer.name,
+        queue,
         mediaId,
         pipeline,
         previews: winners,
@@ -343,6 +355,8 @@ export async function enqueueConfirmed(
   if (unresolved.size > 0 && transport.findActive) {
     try {
       const confirmations = await transport.findActive({
+        resizer: resizer.name,
+        queue,
         mediaId,
         pipeline,
         previews: [...unresolved.values()],

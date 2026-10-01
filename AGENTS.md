@@ -17,8 +17,9 @@ no queue/worker — start here), lazy (on read, worker fills `previews[]`), pre-
 filters whether a preview is ready or missing.
 
 The Mongo transport deduplicates identical active enqueue requests using a canonical SHA-256
-`requestKey` and a partial unique index. Its key includes the pipeline and surviving variant
-catalog. Dispatch locks, worker locks, and stored previews share media + size + format + filters
+`requestKey` and a partial unique index. Its key includes the Resizer name, the queue, the
+pipeline and the surviving variant catalog, so the same request on another queue is a separate
+task. Dispatch locks, worker locks, and stored previews share media + size + format + filters
 across pipelines; use distinct filters for different renderings of the same media, including
 on reads. Legacy rows without a key remain valid. Storage drivers that can prove original
 visibility implement `canServeOriginalPublicly`; the engine never fabricates a public URL for
@@ -73,8 +74,9 @@ a private original.
    `publicBaseUrl` — alias of the old `publicUrl` for one minor; `client` first when the host
    already has an `S3Client`), `MongoTransport` from
    `@adaptivestone/framework-module-resize/transports/mongo.js`, `SqsTransport` from
-   `@adaptivestone/framework-module-resize/transports/sqs.js` (options: `queueUrl` required;
-   `region`, `endpoint`, `visibilityTimeout`, `heartbeatInterval`, `client`),
+   `@adaptivestone/framework-module-resize/transports/sqs.js` (options: `queueUrl` required, for
+   the `'default'` queue; `queues` maps other queue names to URLs; `region`, `endpoint`,
+   `visibilityTimeout`, `heartbeatInterval`, `client`),
    `FrameworkMediaStore` from `@adaptivestone/framework-module-resize/mediaStore/framework.js`,
    `FrameworkLockProvider` from `@adaptivestone/framework-module-resize/locks/framework.js`.
    A custom driver is any object or class satisfying the exported contract types
@@ -114,7 +116,8 @@ a private original.
    rollout. Never add index creation to HTTP bootstrap or the first enqueue.
 
 8. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
-   (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`.
+   (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`
+   (queue `'default'`; `npm run cli ResizeWorker -- --queue=bulk` consumes only `'bulk'`).
    The flag permits the command to run; it does not start a worker in the API. The worker consumes
    indexes prepared by the host lifecycle; it does not create them.
    Eager mode needs no worker.
@@ -238,7 +241,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
 - Construct each Resizer ONCE, at one construction site. Most hosts need one (`getResizer()`); for
   more, give each a `name` and its own `config` (`getResizer('listings')`). The same name twice
-  throws. Only the default Resizer may have a `transport` for now.
+  throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
+  for one queue (`--queue`, default `'default'`), and they must share one transport instance.
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
@@ -268,6 +272,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `formats [...] have no encode.formats entry` | add `encode.formats.<id>` (`{}` for Sharp defaults); use `'jpeg'`, not the alias `'jpg'` |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import | optional peer not installed — see step 1 |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
+| `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in both the API and the worker process |
+| `RESIZE_WORKER_TRANSPORTS_DIFFER` at worker start | the Resizers in one worker use different transport instances — share one instance, or run one worker process per transport |
+| tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
 | boot throws `queue.lockTtlMs.worker … must be ≤ queue.leaseMs` | raise `queue.leaseMs` or lower `queue.lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |

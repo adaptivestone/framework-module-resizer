@@ -170,6 +170,21 @@ describe('runScaffold — --eject', () => {
       /\{ fileId: 1, pipeline: 1, requestKey: 1 \}/,
       'the ejected schema carries the active-request dedupe index',
     );
+    assert.match(
+      model,
+      /resizer:\s*\{\s*type:\s*String,\s*default:\s*'default'\s*\}/,
+      'the ejected schema records the Resizer of each task',
+    );
+    assert.match(
+      model,
+      /queue:\s*\{\s*type:\s*String,\s*default:\s*'default'\s*\}/,
+      'the ejected schema records the queue of each task',
+    );
+    assert.match(
+      model,
+      /\{ queue: 1, status: 1, createdAt: 1 \}/,
+      'the ejected schema carries the queue-scoped lease index',
+    );
     // Still the full set of files.
     assert.equal(await exists(COMMAND), true);
     assert.equal(await exists(CONFIG), true);

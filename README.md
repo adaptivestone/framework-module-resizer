@@ -88,8 +88,8 @@ Start here. No queue, no worker, no AWS. `npx resize-scaffold --eager` emits thi
 
 Most hosts construct one Resizer. A host that needs different storage, media models or formats
 constructs more, each with its own `name`, and looks them up with `getResizer(name)`;
-constructing the same name twice throws. For now only the default Resizer can have a
-`transport` (queued work); named Resizers use `generate()` and `resolve()`.
+constructing the same name twice throws. Queued work records which Resizer created it, so one
+worker serves all of them (see [named queues](#named-queues)).
 
 Load the scaffolded construction site dynamically from bootstrap after initialization:
 
@@ -190,8 +190,9 @@ pushed at upload with `prewarm()`).
 
 The Mongo transport deduplicates identical active tasks: variants are canonicalized and a
 SHA-256 `requestKey` is stored under a partial unique index for `pending`/`processing` rows.
-The key includes the pipeline and the complete variant payload handed to the transport;
-reordering that payload returns the existing task. Before this stage, shared dispatch locks
+The key includes the Resizer name, the queue, the pipeline and the complete variant payload
+handed to the transport; reordering that payload returns the existing task, while the same
+request on another queue is a separate task. Before this stage, shared dispatch locks
 can remove overlapping variants from a request. Rows created before `requestKey` was introduced
 remain valid.
 
@@ -259,6 +260,30 @@ npm run cli ResizeWorker
 `worker.enabled` permits the command to run; it does not start a worker inside the API. The
 command assumes the host lifecycle or an explicit migration has already prepared the configured
 queue/lock indexes before consumption.
+
+### Named queues
+
+Every task records the Resizer that created it and the queue it waits in. A queue is just a
+name; when none is given it is `'default'`.
+
+- A Resizer sets its default queue: `new Resizer({ …, queue: 'bulk' })`.
+- A call can override it: `resizer.prewarm({ media, sizes, queue: 'bulk' })`. `resolve()` and
+  `enqueueRequired()` accept `queue` too.
+- `npm run cli ResizeWorker` consumes **only** `'default'`.
+  `npm run cli ResizeWorker -- --queue=bulk` consumes **only** `'bulk'`.
+- Any number of workers on any number of servers can consume one queue; each task is held by one
+  worker at a time.
+- One worker process serves **every** Resizer constructed in it, routing each task to the Resizer
+  named in it. Those Resizers must share one transport instance; run one worker process per
+  transport. Construct every Resizer in both the API and the worker process: a task for a
+  Resizer the worker does not know fails with `RESIZE_NO_RESIZER` and dead-letters.
+- The same request on two queues is two tasks, so an interactive request never waits behind a
+  bulk backfill on another queue.
+- SQS maps queue names to queue URLs: `queueUrl` serves `'default'`, and
+  `queues: { bulk: 'https://sqs…/bulk' }` adds the others.
+
+A typical split keeps upload and read traffic on `'default'` and sends backfills to `'bulk'`,
+with a separate `--queue=bulk` worker so backfills never delay fresh uploads.
 
 Your media model (`File`/`Media`) must carry `original` (incl. `width`/`height`) and `previews[]`
 (incl. `filters`/`fit`). That schema is host-owned; to avoid hand-written drift the module exports
@@ -454,7 +479,8 @@ by `enqueueRequired()` to prove coverage after dispatch-lock races. No optional 
 
 | Option | | |
 |---|---|---|
-| `queueUrl` | **required** | the SQS queue URL |
+| `queueUrl` | **required** | the SQS queue URL for the `'default'` queue |
+| `queues` | optional | more [named queues](#named-queues): `{ bulk: 'https://sqs…/bulk' }`; an unknown name throws `RESIZE_SQS_QUEUE_UNKNOWN` |
 | `region`, `endpoint` | optional | AWS region / custom endpoint |
 | `visibilityTimeout` | optional | seconds; passed to `sqs-consumer` |
 | `heartbeatInterval` | optional | seconds; extends visibility during long resizes (SQS analog of the Mongo lease heartbeat) |
@@ -536,8 +562,23 @@ A custom storage driver
 must persist a ref unchanged through the media store and inherit grouping from its own
 `parentRef` for derived previews. The shipped drivers reject simultaneous `namespace`
 and `parentRef` hints; custom drivers should follow the same contract.
-Contract types (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`, …) are exported
-from the main entry for custom-driver authors.
+
+A custom queue transport implements:
+
+- `enqueue(task: EnqueueTask)`, where the task is `{ resizer, queue, mediaId, pipeline, previews }`.
+  Store `resizer` and `queue` with the task.
+- `startWorker(handle, { signal, queue, onEvent })`, consuming **only** `queue`. Hand `handle`
+  a `LeasedTask` that carries `resizer` and `queue`; a task stored without them reads as
+  `'default'`.
+- Report `onEvent('completed' | 'failed' | 'deadLettered', task, error?)` instead of calling
+  observers. The worker routes each event to the owning Resizer's hooks. Log, do not rethrow,
+  errors that `onEvent` itself throws.
+- Optionally, `findActive(task)`, so `enqueueRequired()` can confirm work queued by another
+  request.
+
+Contract types (`QueueTransport`, `EnqueueTask`, `LeasedTask`, `StartWorkerOpts`, `TaskEvent`,
+`ResizeStorage`, `MediaStore`, `LockProvider`, …) are exported from the main entry for
+custom-driver authors.
 
 ---
 

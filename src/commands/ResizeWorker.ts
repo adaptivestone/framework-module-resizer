@@ -34,8 +34,20 @@ export default class ResizeWorker {
     this.args = args;
   }
 
+  // BaseCli parses these with node:util parseArgs and passes the values as `args`.
+  static get commandArguments() {
+    return {
+      queue: {
+        type: 'string',
+        description:
+          "Queue to consume (default 'default'). Tasks on other queues are left for their own workers.",
+      },
+    } as const;
+  }
+
   async run(): Promise<boolean> {
-    await runResizeWorker();
+    const queue = (this.args as { queue?: string } | undefined)?.queue;
+    await runResizeWorker(queue === undefined ? {} : { queue });
     return true;
   }
 }

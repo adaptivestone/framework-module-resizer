@@ -15,7 +15,12 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeGenerateError, ResizeNoOriginalError } from '../errors.ts';
 import ResizeTaskModel from '../models/ResizeTask.ts';
-import { Resizer, resetResizerForTests } from '../resizer.ts';
+import {
+  type LeasedTask,
+  Resizer,
+  resetResizerForTests,
+  type TaskEventHandler,
+} from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MissingPreview } from '../types.d.ts';
 import { MongoTransport } from './mongo.ts';
@@ -104,28 +109,28 @@ function installFakeApp(
   return { errors };
 }
 
+// Task events are reported through the startWorker/complete/fail/sweep `onEvent` callback
+// (the worker routes them to the owning Resizer's observers); this recorder stands in for it.
 interface Rec {
   completed: unknown[][];
   failed: unknown[][];
   dead: unknown[][];
+  onEvent: TaskEventHandler;
 }
-function makeResizer(): Rec {
-  const rec: Rec = { completed: [], failed: [], dead: [] };
-  new Resizer({
-    storage: fakeStorage,
-    transport,
-    hooks: {
-      afterTaskComplete: (...a: unknown[]) => {
-        rec.completed.push(a);
-      },
-      onTaskFailed: (...a: unknown[]) => {
-        rec.failed.push(a);
-      },
-      onTaskDeadLettered: (...a: unknown[]) => {
-        rec.dead.push(a);
-      },
-    },
-  });
+function makeEvents(): Rec {
+  const rec = { completed: [], failed: [], dead: [] } as unknown as Rec;
+  rec.onEvent = (event, task, error) => {
+    const row = error === undefined ? [task] : [task, error];
+    if (event === 'completed') {
+      rec.completed.push(row);
+    }
+    if (event === 'failed') {
+      rec.failed.push(row);
+    }
+    if (event === 'deadLettered') {
+      rec.dead.push(row);
+    }
+  };
   return rec;
 }
 
@@ -179,6 +184,8 @@ describe('MongoTransport.enqueue', () => {
     const mediaId = new mongoose.Types.ObjectId().toString();
     const previews = [{ sizeKey: '300x300', format: 'jpeg' as const }];
     const { taskId } = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews,
@@ -211,6 +218,8 @@ describe('MongoTransport.enqueue', () => {
     test(`rejects an invalid queued variant (${name}) without persisting a task`, async () => {
       const { errors } = installFakeApp();
       const result = await transport.enqueue({
+        resizer: 'default',
+        queue: 'default',
         mediaId: new mongoose.Types.ObjectId().toString(),
         pipeline: 'default',
         // Exercise runtime validation for JavaScript callers and host hooks.
@@ -237,6 +246,8 @@ describe('MongoTransport.enqueue', () => {
     };
     const second = { sizeKey: 'fit', format: 'webp' as const, fit: true };
     const a = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews: [
@@ -246,6 +257,8 @@ describe('MongoTransport.enqueue', () => {
       ],
     });
     const b = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews: [
@@ -269,6 +282,8 @@ describe('MongoTransport.enqueue', () => {
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const task = {
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '640w', format: 'avif' as const }],
@@ -314,6 +329,8 @@ describe('MongoTransport.enqueue', () => {
     installFakeApp((name) => (name === 'ResizeTask' ? model : null));
 
     const result = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId: new mongoose.Types.ObjectId().toString(),
       pipeline: 'default',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
@@ -327,16 +344,22 @@ describe('MongoTransport.enqueue', () => {
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const a = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
     });
     const b = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '600x600', format: 'jpeg' }],
     });
     const c = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
@@ -351,6 +374,8 @@ describe('MongoTransport.enqueue', () => {
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const original = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
@@ -358,6 +383,8 @@ describe('MongoTransport.enqueue', () => {
     const leased = await transport.lease();
     assert.ok(leased);
     const repeated = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
@@ -371,10 +398,12 @@ describe('MongoTransport.enqueue', () => {
   });
 
   test('retry reuses active row, while completed and dead rows permit a new request', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const payload = {
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '300x300', format: 'jpeg' as const }],
@@ -387,6 +416,7 @@ describe('MongoTransport.enqueue', () => {
       String(leased.leaseToken),
       new Error('retry'),
       1,
+      rec.onEvent,
     );
     const retry = await transport.enqueue(payload);
     assert.equal(retry.taskId, first.taskId);
@@ -408,6 +438,8 @@ describe('MongoTransport.enqueue', () => {
     installFakeApp();
     const legacy = await insert();
     const created = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId: String(legacy.fileId),
       pipeline: 'default',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
@@ -420,6 +452,8 @@ describe('MongoTransport.enqueue', () => {
   test('returns { taskId: null } and logs when getModel is falsy (no TypeError)', async () => {
     const { errors } = installFakeApp(() => false);
     const res = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId: new mongoose.Types.ObjectId().toString(),
       pipeline: 'p',
       previews: [],
@@ -433,11 +467,15 @@ describe('MongoTransport.enqueue', () => {
     const mediaId = new mongoose.Types.ObjectId().toString();
     const previews = [{ sizeKey: '300x300', format: 'jpeg' as const }];
     const enqueued = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews,
     });
     const active = await transport.findActive({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews,
@@ -445,10 +483,58 @@ describe('MongoTransport.enqueue', () => {
     assert.deepEqual(active, [{ taskId: enqueued.taskId, previews }]);
   });
 
+  test('findActive only returns tasks of the asking Resizer, on any queue', async () => {
+    installFakeApp();
+    const mediaId = new mongoose.Types.ObjectId().toString();
+    const previews = [{ sizeKey: '300x300', format: 'jpeg' as const }];
+    const request = { mediaId, pipeline: 'photo', previews };
+    await transport.enqueue({
+      ...request,
+      resizer: 'listings',
+      queue: 'default',
+    });
+    const bulk = await transport.enqueue({
+      ...request,
+      resizer: 'default',
+      queue: 'bulk',
+    });
+    const active = await transport.findActive({
+      ...request,
+      resizer: 'default',
+      queue: 'default',
+    });
+    assert.deepEqual(active, [{ taskId: bulk.taskId, previews }]);
+  });
+
+  test('findActive treats a row without a resizer as the default Resizer', async () => {
+    installFakeApp();
+    const legacy = await insert({ pipeline: 'photo' });
+    await M.collection.updateOne(
+      { _id: legacy._id },
+      { $unset: { queue: '', resizer: '' } },
+    );
+    const request = {
+      mediaId: String(legacy.fileId),
+      queue: 'default',
+      pipeline: 'photo',
+      previews: [{ sizeKey: '300x300', format: 'jpeg' as const }],
+    };
+    const own = await transport.findActive({ ...request, resizer: 'default' });
+    assert.equal(own.length, 1);
+    assert.equal(own[0].taskId, String(legacy._id));
+    const other = await transport.findActive({
+      ...request,
+      resizer: 'listings',
+    });
+    assert.deepEqual(other, []);
+  });
+
   test('enqueueRequired confirms an existing Mongo task after losing its dispatch lock', async () => {
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const existing = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [
@@ -519,12 +605,164 @@ describe('MongoTransport.lease', () => {
 });
 
 // ---------------------------------------------------------------------------
+// named queues: lease isolation, enqueue identity, events carry the owner
+// ---------------------------------------------------------------------------
+
+describe('MongoTransport queues', () => {
+  test('lease takes only the requested queue; rows without a queue read as default', async () => {
+    installFakeApp();
+    await insert({ queue: 'bulk' }, past());
+    const legacy = await insert({}, past());
+    await M.collection.updateOne(
+      { _id: legacy._id },
+      { $unset: { queue: '', resizer: '' } },
+    );
+
+    const fromDefault = await transport.lease('default');
+    assert.equal(String(fromDefault?._id), String(legacy._id));
+    const fromBulk = await transport.lease('bulk');
+    assert.equal(fromBulk?.queue, 'bulk');
+    assert.equal(await transport.lease('default'), null);
+  });
+
+  test('lease() with no argument consumes the default queue', async () => {
+    installFakeApp();
+    await insert({ queue: 'bulk' }, past());
+    assert.equal(await transport.lease(), null);
+  });
+
+  test('enqueue stores resizer and queue, and one request on two queues is two tasks', async () => {
+    installFakeApp();
+    const task = {
+      resizer: 'listings',
+      mediaId: String(new mongoose.Types.ObjectId()),
+      pipeline: 'default',
+      previews: [{ sizeKey: '300x300', format: 'webp' as const }],
+    };
+    const a = await transport.enqueue({ ...task, queue: 'default' });
+    const b = await transport.enqueue({ ...task, queue: 'bulk' });
+    const again = await transport.enqueue({ ...task, queue: 'default' });
+    assert.notEqual(a.taskId, b.taskId);
+    assert.equal(again.taskId, a.taskId);
+    const row = await M.findById(b.taskId).lean();
+    assert.equal(row?.resizer, 'listings');
+    assert.equal(row?.queue, 'bulk');
+  });
+
+  test('a leased task reports its resizer and queue', async () => {
+    installFakeApp();
+    await insert({ resizer: 'listings', queue: 'bulk' }, past());
+    const rec = makeEvents();
+    const doc = await transport.lease('bulk');
+    assert.ok(doc);
+    await transport.complete(
+      String(doc._id),
+      String(doc.leaseToken),
+      rec.onEvent,
+    );
+    const [[task]] = rec.completed as [[LeasedTask]];
+    assert.equal(task.resizer, 'listings');
+    assert.equal(task.queue, 'bulk');
+  });
+
+  test('a legacy row reports resizer and queue "default"', async () => {
+    installFakeApp();
+    const legacy = await insert({}, past());
+    await M.collection.updateOne(
+      { _id: legacy._id },
+      { $unset: { queue: '', resizer: '' } },
+    );
+    const rec = makeEvents();
+    const doc = await transport.lease('default');
+    assert.ok(doc);
+    await transport.complete(
+      String(doc._id),
+      String(doc.leaseToken),
+      rec.onEvent,
+    );
+    const [[task]] = rec.completed as [[LeasedTask]];
+    assert.equal(task.resizer, 'default');
+    assert.equal(task.queue, 'default');
+  });
+
+  test('a throwing onEvent does not undo completion', async () => {
+    const { errors } = installFakeApp();
+    await insert({}, past());
+    const doc = await transport.lease('default');
+    assert.ok(doc);
+    const held = await transport.complete(
+      String(doc._id),
+      String(doc.leaseToken),
+      () => {
+        throw new Error('observer bug');
+      },
+    );
+    assert.equal(held, true);
+    const row = await M.findById(doc._id).lean();
+    assert.equal(row?.status, 'completed');
+    assert.ok(
+      errors.some((e) => String(e[0]).includes('completed event handler')),
+    );
+  });
+
+  test('a throwing onEvent does not stop the worker loop', async () => {
+    installFakeApp();
+    const first = await insert({}, new Date(1000));
+    const second = await insert({}, new Date(2000));
+    const seen: string[] = [];
+    const ctrl = new AbortController();
+    const p = transport.startWorker(
+      async (task) => {
+        seen.push(task.taskId);
+      },
+      {
+        signal: ctrl.signal,
+        queue: 'default',
+        onEvent: async () => {
+          throw new Error('observer bug');
+        },
+      },
+    );
+    await waitFor(async () => {
+      const d = await M.findById(second._id).lean();
+      return d?.status === 'completed';
+    });
+    ctrl.abort();
+    await p;
+    assert.deepEqual(seen, [String(first._id), String(second._id)]);
+  });
+
+  test('startWorker consumes only its queue', async () => {
+    installFakeApp();
+    const bulk = await insert({ queue: 'bulk' }, new Date(1000));
+    const own = await insert({}, new Date(2000));
+    const seen: string[] = [];
+    const ctrl = new AbortController();
+    const p = transport.startWorker(
+      async (task) => {
+        seen.push(task.taskId);
+      },
+      { signal: ctrl.signal, queue: 'default' },
+    );
+    await waitFor(async () => {
+      const d = await M.findById(own._id).lean();
+      return d?.status === 'completed';
+    });
+    await sleep(40); // a couple more idle polls: the bulk task stays untouched
+    ctrl.abort();
+    await p;
+    assert.deepEqual(seen, [String(own._id)]);
+    assert.equal((await M.findById(bulk._id).lean())?.status, 'pending');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // complete / fail / renew fencing (05 · §10.2)
 // ---------------------------------------------------------------------------
 
 describe('MongoTransport.complete (fencing)', () => {
   test('a valid token completes the task and fires afterTaskComplete with a LeasedTask', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     const inserted = await insert();
     const leased = await transport.lease();
@@ -532,6 +770,7 @@ describe('MongoTransport.complete (fencing)', () => {
     const ok = await transport.complete(
       String(leased._id),
       String(leased.leaseToken),
+      rec.onEvent,
     );
     assert.equal(ok, true);
     const doc = await M.findById(leased._id).lean();
@@ -547,7 +786,7 @@ describe('MongoTransport.complete (fencing)', () => {
   });
 
   test('a lapsed-but-unreclaimed lease CAN still complete (token is the fence, not expiry)', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert();
     const leased = await transport.lease();
@@ -561,6 +800,7 @@ describe('MongoTransport.complete (fencing)', () => {
     const ok = await transport.complete(
       String(leased._id),
       String(leased.leaseToken),
+      rec.onEvent,
     );
     assert.equal(ok, true);
     const doc = await M.findById(leased._id).lean();
@@ -569,7 +809,6 @@ describe('MongoTransport.complete (fencing)', () => {
   });
 
   test('a re-claimed lease (new token) still 0-matches the old token', async () => {
-    makeResizer();
     installFakeApp();
     await insert();
     const first = await transport.lease();
@@ -592,12 +831,16 @@ describe('MongoTransport.complete (fencing)', () => {
   });
 
   test('a STALE token 0-matches: no state change and afterTaskComplete NOT fired', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert();
     const leased = await transport.lease();
     assert.ok(leased);
-    const ok = await transport.complete(String(leased._id), 'stale-token');
+    const ok = await transport.complete(
+      String(leased._id),
+      'stale-token',
+      rec.onEvent,
+    );
     assert.equal(ok, false);
     const doc = await M.findById(leased._id).lean();
     assert.equal(doc?.status, 'processing'); // untouched
@@ -607,7 +850,7 @@ describe('MongoTransport.complete (fencing)', () => {
 
 describe('MongoTransport.fail (backoff → dead-letter)', () => {
   test('below maxAttempts → back to pending with a FUTURE leaseExpiresAt + onTaskFailed', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert();
     const leased = await transport.lease(); // attempts → 1
@@ -618,6 +861,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
       String(leased.leaseToken),
       new Error('boom'),
       1,
+      rec.onEvent,
     );
     const doc = await M.findById(leased._id).lean();
     assert.ok(doc, 'failed task doc should exist');
@@ -630,7 +874,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
   });
 
   test('RESIZE_NO_ORIGINAL is dead-lettered on the first failure', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert();
     const leased = await transport.lease();
@@ -641,6 +885,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
       String(leased.leaseToken),
       new ResizeNoOriginalError(String(leased.fileId)),
       leased.attempts as number,
+      rec.onEvent,
     );
     const doc = await M.findById(leased._id).lean();
     assert.equal(doc?.status, 'dead');
@@ -651,7 +896,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
   });
 
   test('RESIZE_NO_ORIGINAL with a stale token is a fenced no-op', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert();
     const leased = await transport.lease();
@@ -661,6 +906,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
       'stale-token',
       new ResizeNoOriginalError(String(leased.fileId)),
       leased.attempts as number,
+      rec.onEvent,
     );
     const doc = await M.findById(leased._id).lean();
     assert.equal(doc?.status, 'processing');
@@ -670,7 +916,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
   });
 
   test('at maxAttempts → dead with stored error + onTaskDeadLettered', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert({ attempts: 2 });
     const leased = await transport.lease(); // attempts → 3 (= maxAttempts)
@@ -681,6 +927,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
       String(leased.leaseToken),
       new Error('permanent'),
       leased.attempts as number,
+      rec.onEvent,
     );
     const doc = await M.findById(leased._id).lean();
     assert.equal(doc?.status, 'dead');
@@ -691,7 +938,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
   });
 
   test('a permanently incomplete variant reaches dead-letter with its identity', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert({ attempts: 2 });
     const leased = await transport.lease();
@@ -709,6 +956,7 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
       String(leased.leaseToken),
       error,
       leased.attempts as number,
+      rec.onEvent,
     );
     const doc = await M.findById(leased._id).lean();
     assert.equal(doc?.status, 'dead');
@@ -717,7 +965,6 @@ describe('MongoTransport.fail (backoff → dead-letter)', () => {
   });
 
   test('a pending task in its backoff window is NOT re-leasable until the backoff elapses', async () => {
-    makeResizer();
     installFakeApp();
     await insert();
     const leased = await transport.lease();
@@ -766,10 +1013,10 @@ describe('MongoTransport.renew (fencing)', () => {
 
 describe('MongoTransport.sweepDeadLetters', () => {
   test('flips a crash-looped task to dead exactly once and fires onTaskDeadLettered', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     await insert({ status: 'processing', leaseExpiresAt: past(), attempts: 3 });
-    await transport.sweepDeadLetters();
+    await transport.sweepDeadLetters(rec.onEvent);
     const dead = await M.find({ status: 'dead' }).lean();
     assert.equal(dead.length, 1);
     assert.match(String(dead[0].error), /crash loop/);
@@ -779,12 +1026,11 @@ describe('MongoTransport.sweepDeadLetters', () => {
     assert.ok(deadTask.mediaId);
     assert.equal('fileId' in deadTask, false);
     // A second sweep finds nothing new → no double-fire.
-    await transport.sweepDeadLetters();
+    await transport.sweepDeadLetters(rec.onEvent);
     assert.equal(rec.dead.length, 1);
   });
 
   test('does not touch a still-live processing lease', async () => {
-    makeResizer();
     installFakeApp();
     await insert({
       status: 'processing',
@@ -802,10 +1048,12 @@ describe('MongoTransport.sweepDeadLetters', () => {
 
 describe('MongoTransport.startWorker', () => {
   test('enqueue → worker leases → handleTask runs → completed + afterTaskComplete', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const { taskId } = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'photo',
       previews: [{ sizeKey: '300x300', format: 'jpeg' }],
@@ -816,7 +1064,7 @@ describe('MongoTransport.startWorker', () => {
       async (task) => {
         seen.push({ mediaId: task.mediaId, taskId: task.taskId });
       },
-      { signal: ctrl.signal },
+      { signal: ctrl.signal, queue: 'default', onEvent: rec.onEvent },
     );
     await waitFor(async () => {
       const d = await M.findById(taskId).lean();
@@ -831,10 +1079,12 @@ describe('MongoTransport.startWorker', () => {
   });
 
   test('graceful stop: an in-flight task finishes before the loop exits', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const { taskId } = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '1x1', format: 'jpeg' }],
@@ -850,7 +1100,7 @@ describe('MongoTransport.startWorker', () => {
         started = true;
         await gate;
       },
-      { signal: ctrl.signal },
+      { signal: ctrl.signal, queue: 'default', onEvent: rec.onEvent },
     );
     await waitFor(() => started); // task is in-flight
     ctrl.abort(); // request shutdown mid-task
@@ -862,10 +1112,12 @@ describe('MongoTransport.startWorker', () => {
   });
 
   test('a hung handleTask is timed out → failed (loop continues), never completed (taskTimeoutMs)', async () => {
-    const rec = makeResizer();
+    const rec = makeEvents();
     installFakeApp(undefined, { taskTimeoutMs: 40 }); // fires before the leaseMs/2 heartbeat
     const mediaId = new mongoose.Types.ObjectId().toString();
     const { taskId } = await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '1x1', format: 'jpeg' }],
@@ -879,7 +1131,7 @@ describe('MongoTransport.startWorker', () => {
       async () => {
         await gate; // hang well past taskTimeoutMs
       },
-      { signal: ctrl.signal },
+      { signal: ctrl.signal, queue: 'default', onEvent: rec.onEvent },
     );
     // The timeout fires → fail() runs → onTaskFailed, the task returns to pending (attempts<max).
     await waitFor(() => rec.failed.length >= 1);
@@ -895,27 +1147,35 @@ describe('MongoTransport.startWorker', () => {
   test('a rejecting lease is logged, then the loop survives and processes the next task (F11)', async () => {
     // A transient DB error in the poll (sweep/lease) must NOT kill the daemon: log + sleep +
     // retry. Wrap the transport so lease() rejects EXACTLY once, then delegates normally (05 · §10.2).
-    const rec = makeResizer();
+    const rec = makeEvents();
     const { errors } = installFakeApp();
     const realLease = transport.lease.bind(transport);
     let leaseCalls = 0;
-    const spied = transport as unknown as { lease: () => Promise<unknown> };
-    spied.lease = async () => {
+    const spied = transport as unknown as {
+      lease: (queue?: string) => Promise<unknown>;
+    };
+    spied.lease = async (queue?: string) => {
       leaseCalls += 1;
       if (leaseCalls === 1) {
         throw new Error('transient mongo blip');
       }
-      return realLease();
+      return realLease(queue);
     };
     try {
       const mediaId = new mongoose.Types.ObjectId().toString();
       const { taskId } = await transport.enqueue({
+        resizer: 'default',
+        queue: 'default',
         mediaId,
         pipeline: 'default',
         previews: [{ sizeKey: '1x1', format: 'jpeg' }],
       });
       const ctrl = new AbortController();
-      const p = transport.startWorker(async () => {}, { signal: ctrl.signal });
+      const p = transport.startWorker(async () => {}, {
+        signal: ctrl.signal,
+        queue: 'default',
+        onEvent: rec.onEvent,
+      });
       // The loop logged the blip and kept going, eventually leasing + completing the task.
       await waitFor(async () => {
         const d = await M.findById(taskId).lean();
@@ -932,10 +1192,11 @@ describe('MongoTransport.startWorker', () => {
   });
 
   test('worker-wide shutdown aborts the in-flight task signal (05 · §10.2 shutdown wiring)', async () => {
-    makeResizer();
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     await transport.enqueue({
+      resizer: 'default',
+      queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '1x1', format: 'jpeg' }],
@@ -951,7 +1212,7 @@ describe('MongoTransport.startWorker', () => {
         capturedSignal = taskOpts?.signal;
         await gate;
       },
-      { signal: ctrl.signal },
+      { signal: ctrl.signal, queue: 'default' },
     );
     await waitFor(() => capturedSignal !== undefined);
     assert.equal(capturedSignal?.aborted, false);
@@ -962,11 +1223,11 @@ describe('MongoTransport.startWorker', () => {
   });
 
   test('idle worker stops promptly when the signal aborts', async () => {
-    makeResizer();
     installFakeApp();
     const ctrl = new AbortController();
     const p = transport.startWorker(async () => {}, {
       signal: ctrl.signal,
+      queue: 'default',
     });
     await sleep(30); // let it spin the idle poll a few times (idlePollMs=20)
     ctrl.abort();
