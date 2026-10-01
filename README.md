@@ -84,8 +84,12 @@ shipped [`AGENTS.md`](./AGENTS.md); default `agents` = the host `AGENTS.md`), `-
 
 Start here. No queue, no worker, no AWS. `npx resize-scaffold --eager` emits this wiring.
 
-**1. Wire the Resizer** after `Server.init()` (or lazily on first request). One Resizer per
-process — a second `new Resizer()` throws.
+**1. Wire the Resizer** after `Server.init()` (or lazily on first request).
+
+Most hosts construct one Resizer. A host that needs different storage, media models or formats
+constructs more, each with its own `name`, and looks them up with `getResizer(name)`;
+constructing the same name twice throws. For now only the default Resizer can have a
+`transport` (queued work); named Resizers use `generate()` and `resolve()`.
 
 Load the scaffolded construction site dynamically from bootstrap after initialization:
 
@@ -436,8 +440,9 @@ Every driver lives behind its own package subpath (the core entry never loads dr
 | Lock provider | `lockProvider?` | `FrameworkLockProvider` (default) | `…/locks/framework.js` |
 
 `storage` is the one **required** option (both modes need it). `transport` is optional (omit for
-eager-only). `mediaStore`/`lockProvider` default to the framework drivers. Reach the process-wide
-instance anywhere via `getResizer()` (throws a clear error if none was constructed).
+eager-only). `mediaStore`/`lockProvider` default to the framework drivers. Reach a constructed
+Resizer anywhere via `getResizer(name?)` (default `'default'`; throws a clear error if no Resizer
+has that name).
 
 ### `MongoTransport`
 

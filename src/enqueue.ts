@@ -5,9 +5,7 @@
 // Takes the Resizer type-only (the resizer.ts → engine.ts → enqueue.ts value chain never
 // closes back on this module at runtime — 05 · design delta).
 import { createHash } from 'node:crypto';
-import { getApp } from './app.ts';
 import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
-import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   EnqueueIssue,
@@ -126,7 +124,7 @@ export async function enqueue(
 
   // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
   // in flight from a concurrent read). TTL in ms — the framework driver converts to s.
-  const dispatchTtlMs = getResizeConfig().queue.lockTtlMs.dispatch;
+  const dispatchTtlMs = resizer.config.queue.lockTtlMs.dispatch;
   const survivors: MissingPreview[] = [];
   const survivorLockKeys: string[] = [];
   for (const [identity, m] of byIdentity) {
@@ -137,7 +135,7 @@ export async function enqueue(
     try {
       acquired = await resizer.lockProvider.acquire(lockKey, dispatchTtlMs);
     } catch (err) {
-      getApp().logger.error(
+      resizer.logger.error(
         `resize enqueue: dispatch-lock acquire failed for ${lockKey} on media ${mediaId} — skipping this variant`,
         err,
       );
@@ -163,7 +161,7 @@ export async function enqueue(
       previews: survivors,
     });
     if (taskId === null) {
-      getApp().logger.error(
+      resizer.logger.error(
         `resize enqueue: transport returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       );
       await releaseAll(resizer, survivorLockKeys);
@@ -172,7 +170,7 @@ export async function enqueue(
     // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
     return survivors.length;
   } catch (err) {
-    getApp().logger.error(
+    resizer.logger.error(
       `resize enqueue: transport.enqueue threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       err,
     );
@@ -276,7 +274,7 @@ export async function enqueueConfirmed(
   }
   const lockContended: MissingPreview[] = [];
   const lockFailed: MissingPreview[] = [];
-  const dispatchTtlMs = getResizeConfig().queue.lockTtlMs.dispatch;
+  const dispatchTtlMs = resizer.config.queue.lockTtlMs.dispatch;
 
   for (const [identity, preview] of byIdentity) {
     const lockKey = `resize_dispatch:${mediaId}:${identity}`;
@@ -288,7 +286,7 @@ export async function enqueueConfirmed(
         lockContended.push(preview);
       }
     } catch (error) {
-      getApp().logger.error(
+      resizer.logger.error(
         `resize enqueueRequired: dispatch-lock acquire failed for ${lockKey}`,
         error,
       );
@@ -328,7 +326,7 @@ export async function enqueueConfirmed(
         }
       }
     } catch (error) {
-      getApp().logger.error(
+      resizer.logger.error(
         `resize enqueueRequired: transport.enqueue threw for media ${mediaId}`,
         error,
       );
@@ -387,7 +385,7 @@ export async function enqueueConfirmed(
         }
       }
     } catch (error) {
-      getApp().logger.error(
+      resizer.logger.error(
         `resize enqueueRequired: active-task confirmation failed for media ${mediaId}`,
         error,
       );
@@ -460,7 +458,7 @@ async function releaseAll(resizer: Resizer, lockKeys: string[]): Promise<void> {
     try {
       await resizer.lockProvider.release(key);
     } catch (err) {
-      getApp().logger.error(
+      resizer.logger.error(
         `resize enqueue: failed to release dispatch lock ${key}`,
         err,
       );

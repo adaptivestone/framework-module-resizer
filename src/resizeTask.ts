@@ -1,14 +1,13 @@
 // The async resize CORE (07 · Worker §11, 11 · Modes §11.1). ONE sharp pipeline shared by
 // both generation modes:
-//   - processTask()  = the core + lease/lock/transport bookkeeping (queued/lazy worker)
-//   - generateImpl()  = the core WITHOUT locks/transport (eager `resizer.generate`)
+//   - processTaskWith() = the core + lease/lock/transport bookkeeping (queued/lazy worker)
+//   - generateImpl()    = the core WITHOUT locks/transport (eager `resizer.generate`)
 // Steps 2–8 (download once → metadata guards + orientation normalize → beforeSteps once →
 // decode once + bounded per-variant resize/encode/upload → one appendPreviews) live in
-// generatePreviews(). getResizer()/Resizer are imported for the value/type; the resizer↔
-// resizeTask cycle is runtime-safe (only hoisted functions are referenced, never called at
-// module load). sharp is a hard dep; this is the only place besides worker.ts that decodes.
+// generatePreviews(). Every function receives its Resizer as an argument, and resizer.ts is
+// imported for types only, so the resizer↔resizeTask cycle is runtime-free. sharp is a hard
+// dep; this is the only place besides worker.ts that decodes.
 import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
-import { getApp } from './app.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
@@ -26,13 +25,11 @@ import {
   isUsablePreview,
   requireMediaId,
 } from './images.ts';
-import { getResizeConfig } from './resizeConfig.ts';
-import {
-  type GenerateOpts,
-  type GenerateResult,
-  getResizer,
-  type LeasedTask,
-  type Resizer,
+import type {
+  GenerateOpts,
+  GenerateResult,
+  LeasedTask,
+  Resizer,
 } from './resizer.ts';
 import type {
   MediaLike,
@@ -82,8 +79,7 @@ export async function generatePreviews(
     persist,
     signal,
   } = args;
-  const app = getApp();
-  const config = getResizeConfig();
+  const { config, logger } = resizer;
   const storage = resizer.storage;
 
   const generated: Preview[] = [];
@@ -267,7 +263,7 @@ export async function generatePreviews(
           config.queue.lockTtlMs.worker,
         );
       } catch (err) {
-        app.logger.error(
+        logger.error(
           `resize worker: worker-lock acquire failed for ${identity} on media ${mediaId} — leaving variant missing`,
           err,
         );
@@ -393,7 +389,7 @@ export async function generatePreviews(
       generated.push(preview);
     } catch (err) {
       // One bad variant must not fail the whole task; poison guard (step 10) is the caller's.
-      app.logger.error(
+      logger.error(
         `resize worker: variant ${identity} failed for media ${mediaId}`,
         err,
       );
@@ -442,7 +438,7 @@ async function releaseLock(resizer: Resizer, key: string): Promise<void> {
   try {
     await resizer.lockProvider.release(key);
   } catch (err) {
-    getApp().logger.error(`resize worker: failed to release lock ${key}`, err);
+    resizer.logger.error(`resize worker: failed to release lock ${key}`, err);
   }
 }
 
@@ -451,12 +447,12 @@ async function releaseLock(resizer: Resizer, key: string): Promise<void> {
 // it SUCCEEDS by returning and FAILS by throwing (which engages the transport's retry → DLQ).
 // ---------------------------------------------------------------------------
 
-export async function processTask(
+export async function processTaskWith(
+  resizer: Resizer,
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
 ): Promise<void> {
-  const app = getApp();
-  const resizer = getResizer();
+  const { logger } = resizer;
   // ctx does NOT cross the queue (04 · §8) — the worker's pipeline steps depend on media/metadata.
   const ctx: Record<string, unknown> = {};
 
@@ -466,7 +462,7 @@ export async function processTask(
   // usable locator and retrying it cannot make the source appear.
   const media = await resizer.mediaStore.load(task.mediaId);
   if (!media) {
-    app.logger.info(
+    logger.info(
       `resize worker: media ${task.mediaId} missing (no doc) — no-op complete`,
     );
     return;
@@ -502,7 +498,7 @@ export async function processTask(
   // are included too: appendPreviews returned successfully before generatePreviews returned.
   const refreshed = await resizer.mediaStore.load(task.mediaId);
   if (!refreshed) {
-    app.logger.info(
+    logger.info(
       `resize worker: media ${task.mediaId} was deleted while processing — no-op complete`,
     );
     return;
@@ -549,7 +545,7 @@ export async function generateImpl(
   resizer: Resizer,
   opts: GenerateOpts,
 ): Promise<GenerateResult> {
-  const config = getResizeConfig();
+  const { config } = resizer;
   const ctx = opts.ctx ?? {};
   const { media } = opts;
   const pipeline = opts.pipeline ?? 'default';

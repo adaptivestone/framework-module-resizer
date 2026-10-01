@@ -2,7 +2,6 @@ import sharp, { type Metadata } from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
-import { getResizeConfig } from './resizeConfig.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   Original,
@@ -121,7 +120,7 @@ export async function uploadOriginalImpl(
       code: 'RESIZE_ORIGINAL_EMPTY',
     });
   }
-  const config = getResizeConfig();
+  const { config } = resizer;
   if (body.byteLength > config.upload.maxBytes) {
     throw new ResizeOriginalError(
       `resize uploadOriginal: body exceeds upload.maxBytes (${config.upload.maxBytes})`,

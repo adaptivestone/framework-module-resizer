@@ -43,6 +43,12 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - Worker setup uses an explicit `worker.enabled: true` in host config instead of an
   environment-variable convention. Updated the scaffold example, guidance, and disabled-worker
   message; the module default remains `false`.
+- Several named Resizers can live in one process. `new Resizer({ name })` registers under its
+  name (default `'default'`), a duplicate name throws `RESIZE_DUPLICATE_RESIZER`, and
+  `getResizer(name?)` looks one up. Each Resizer reads its own `config`, `logger` and `events`
+  (framework app defaults when omitted) at construction, instead of reading the app on every call.
+  Until queued tasks record their Resizer, only the default Resizer may have a `transport`
+  (`RESIZE_NAMED_TRANSPORT_UNSUPPORTED`).
 
 **Features**
 
@@ -63,6 +69,8 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - `MediaStore` gains an optional `verify()` startup check. The worker awaits it once before
   leasing tasks, so custom media stores can fail fast too; `FrameworkMediaStore.verify()` checks
   that `mediaModelName` names a registered model.
+- `FrameworkMediaStore({ modelName })`; the default media store uses the Resizer's own
+  `mediaModelName`.
 
 **Fixes**
 

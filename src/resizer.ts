@@ -2,8 +2,8 @@
 // injected in ONE visible options literal at construction and fixed for the process
 // lifetime — no register-call sequence, no hidden global registries. The class also
 // carries the named-pipeline set (04 · §8) and the cross-cutting hook bus (04 · §9).
-// logger/events are read through getApp() at CALL time (never at module top) so tests
-// can install a fake per run.
+// Each Resizer owns its config, logger and event bus. Framework defaults are read only for
+// options the host omits, so a framework-free host never touches the framework app.
 import type { Metadata, Sharp } from 'sharp';
 import { getApp } from './app.ts';
 import {
@@ -18,7 +18,7 @@ import { FrameworkLockProvider } from './locks/framework.ts';
 import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
 import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import { uploadOriginalImpl } from './original.ts';
-import { getResizeConfig } from './resizeConfig.ts';
+import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
 // Transport + storage contracts (05 · §10.1, §10.4) now live in their own files —
 // transports/AbstractTransport.ts + storage/AbstractStorage.ts — so the optional-peer drivers
@@ -38,6 +38,9 @@ import type {
   Preview,
   PreviewFormat,
   ReadDecision,
+  ResizeConfig,
+  ResizeEventBus,
+  ResizeLogger,
   SizeInput,
   UploadOriginalOpts,
 } from './types.d.ts';
@@ -134,9 +137,13 @@ export type HookFn = (...args: any[]) => unknown;
 // ---------------------------------------------------------------------------
 
 export interface ResizerOptions {
+  name?: string; // registry key; default 'default'
+  config?: ResizeConfig; // default: the framework app's `resize` config
+  logger?: ResizeLogger; // default: the framework app's logger
+  events?: ResizeEventBus; // default: the framework app's event bus, when one exists
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
-  mediaStore?: MediaStore; // default: new FrameworkMediaStore() (05 · §10.6)
+  mediaStore?: MediaStore; // default: a FrameworkMediaStore for config.mediaModelName (05 · §10.6)
   lockProvider?: LockProvider; // default: new FrameworkLockProvider() (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
@@ -165,17 +172,29 @@ export interface GenerateResult {
 // constant avoids per-call allocation + accidental mutation of a "default" (04 · §8).
 const EMPTY_PIPELINE: Pipeline = Object.freeze({});
 
-// The process-wide active instance, set by the constructor (mirrors the framework's
-// one-server-per-process appInstance slot). Module-scope `let`, never exported directly.
-let activeResizer: Resizer | undefined;
+// Constructed Resizers by name. Entry points (the worker, host code) look them up here;
+// core code always receives its Resizer as an argument.
+const resizers = new Map<string, Resizer>();
+
+/** The framework event bus when a framework app exists; framework-free hosts have none. */
+function frameworkEvents(): ResizeEventBus | undefined {
+  try {
+    return getApp().events;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
- * One Resizer per process. The host constructs it in bootstrap code that runs in BOTH
- * the API and worker processes; the worker command and late taps reach the instance via
- * getResizer(). Drivers are fixed at construction — swapping one means constructing the
- * Resizer differently (tests build fresh instances after resetResizerForTests()).
+ * A named resize engine: config, drivers, pipelines and hooks. Most hosts construct one
+ * (named 'default'); a host that needs different storage, media models or formats constructs
+ * more, each under its own name. Drivers are fixed at construction.
  */
 export class Resizer {
+  readonly name: string;
+  readonly config: ResizeConfig;
+  readonly logger: ResizeLogger;
+  readonly #events: ResizeEventBus | undefined;
   readonly storage: ResizeStorage;
   readonly transport: QueueTransport | undefined;
   readonly mediaStore: MediaStore;
@@ -196,32 +215,50 @@ export class Resizer {
         { code: 'RESIZE_STORAGE_REQUIRED' },
       );
     }
-    // One-per-process ENFORCED, mirroring the framework's setAppInstance: a second
-    // construction is a bootstrap bug (two competing driver sets), so throw loudly.
-    if (activeResizer) {
+    const name = opts.name ?? 'default';
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      throw new ResizeSetupError('resize: `name` must be a non-empty string', {
+        code: 'RESIZE_NAME_INVALID',
+      });
+    }
+    if (resizers.has(name)) {
       throw new ResizeSetupError(
-        'resize: only one Resizer per process — use resetResizerForTests() in tests',
+        `resize: a Resizer named '${name}' already exists in this process — construct each name once and use getResizer('${name}') elsewhere`,
         { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
-    // Resolve and validate the framework-loaded config before claiming the singleton.
-    // This makes configuration failures boot-time failures and leaves retry possible after
-    // the host corrects its config.
-    getResizeConfig();
+    // Queued tasks do not record their Resizer yet, so the worker runs every task with the
+    // default Resizer. A named Resizer's tasks would use the wrong storage and config.
+    if (name !== 'default' && opts.transport) {
+      throw new ResizeSetupError(
+        `resize: Resizer '${name}' cannot have a transport yet — its queued tasks would be processed by the default Resizer. Use generate() for '${name}', or queue through the default Resizer.`,
+        { code: 'RESIZE_NAMED_TRANSPORT_UNSUPPORTED' },
+      );
+    }
+    // Validate before registering, so a bad config never claims the name and a corrected
+    // retry succeeds.
+    this.config = validateResizeConfig(
+      opts.config ?? getApp().getConfig('resize'),
+    );
+    this.logger = opts.logger ?? getApp().logger;
+    this.#events = opts.events ?? frameworkEvents();
+    this.name = name;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
     this.transport = opts.transport;
-    this.mediaStore = opts.mediaStore ?? new FrameworkMediaStore();
+    this.mediaStore =
+      opts.mediaStore ??
+      new FrameworkMediaStore({ modelName: this.config.mediaModelName });
     this.lockProvider = opts.lockProvider ?? new FrameworkLockProvider();
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().
     this.#hooks = new Map();
-    for (const [name, fns] of Object.entries(opts.hooks ?? {})) {
+    for (const [hookName, fns] of Object.entries(opts.hooks ?? {})) {
       const arr = (Array.isArray(fns) ? [...fns] : [fns]) as HookFn[];
-      this.#hooks.set(name as HookName, arr);
+      this.#hooks.set(hookName as HookName, arr);
     }
-    activeResizer = this;
+    resizers.set(name, this);
   }
 
   /**
@@ -264,14 +301,13 @@ export class Resizer {
     if (mode === 'optional' && taps.length === 0) {
       return undefined;
     }
-    const app = getApp();
     let succeeded = false;
     for (const fn of taps) {
       try {
         value = await fn(value, ctx);
         succeeded = true;
       } catch (e) {
-        app.logger.error(`resize waterfall ${name} tap failed (skipped)`, e);
+        this.logger.error(`resize waterfall ${name} tap failed (skipped)`, e);
       }
     }
     if (mode === 'optional' && !succeeded) {
@@ -287,17 +323,16 @@ export class Resizer {
    * values are ignored. (04 · §9)
    */
   async runObservers(name: ObserverName, ...args: unknown[]): Promise<void> {
-    const app = getApp();
     try {
-      app.events?.emit(`resize:${name}`, ...args);
+      this.#events?.emit(`resize:${name}`, ...args);
     } catch (e) {
-      app.logger.error(`resize event ${name} listener failed`, e);
+      this.logger.error(`resize event ${name} listener failed`, e);
     }
     for (const fn of this.#hooks.get(name) ?? []) {
       try {
         await fn(...args);
       } catch (e) {
-        app.logger.error(`resize hook ${name} failed`, e);
+        this.logger.error(`resize hook ${name} failed`, e);
       }
     }
   }
@@ -363,21 +398,19 @@ export class Resizer {
   }
 }
 
-/** The active instance (worker command, module internals, late taps from other modules). */
-export function getResizer(): Resizer {
-  if (!activeResizer) {
+/** The Resizer registered under `name` (worker entry, host code, late taps). */
+export function getResizer(name = 'default'): Resizer {
+  const resizer = resizers.get(name);
+  if (!resizer) {
     throw new ResizeSetupError(
-      'resize: no Resizer constructed yet — `new Resizer({ storage, … })` in bootstrap code that runs in both the API and worker processes (02 · §6)',
+      `resize: no Resizer named '${name}' — construct it in bootstrap code that runs in every process that uses it`,
       { code: 'RESIZE_NO_RESIZER' },
     );
   }
-  return activeResizer;
+  return resizer;
 }
 
-/**
- * TEST-ONLY: clear the active-instance slot so a test can construct a fresh Resizer.
- * NOT part of the public docs surface (not re-exported from index.ts docs — 02 · §6).
- */
+/** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */
 export function resetResizerForTests(): void {
-  activeResizer = undefined;
+  resizers.clear();
 }

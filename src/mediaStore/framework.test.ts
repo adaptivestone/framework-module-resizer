@@ -89,6 +89,21 @@ describe('FrameworkMediaStore.load', () => {
     );
   });
 
+  test('an explicit modelName wins over the app config', async () => {
+    const asked: string[] = [];
+    resetAppInstance();
+    setAppInstance({
+      getConfig: () => makeResizeConfig({ mediaModelName: 'File' }),
+      getModel: (name: string) => {
+        asked.push(name);
+        return { findById: async () => null };
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    await new FrameworkMediaStore({ modelName: 'Photo' }).load('m1');
+    assert.deepEqual(asked, ['Photo']);
+  });
+
   test('verify() passes when the configured media model is registered', () => {
     installApp({}, { mediaModelName: 'Media' });
     assert.doesNotThrow(() => store.verify());
