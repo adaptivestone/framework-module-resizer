@@ -27,8 +27,12 @@ const CONFIG = 'src/config/resize.ts';
 // A construction site builds its Resizer through the framework adapter or the core class.
 const RESIZER_MARKERS = ['createFrameworkResizer(', 'new Resizer('];
 const MODEL_MARKER = 'extends ResizeTaskModel';
-const COMMAND_MARKER =
-  '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
+// The worker command extends the module's command AND loads the construction site, so the
+// worker process has the Resizers its tasks name (a bare re-export starts with none).
+const COMMAND_MARKERS = [
+  '@adaptivestone/framework-module-resize/commands/ResizeWorker.js',
+  '../resizer',
+];
 
 // --agents pointer: make the shipped AGENTS.md discoverable from the host's own agent file.
 // Append-only + marker-idempotent — the scaffold NEVER rewrites host-authored content.
@@ -125,6 +129,7 @@ interface CheckItem {
   target: string;
   // Content validator; omit → existence-only (config is meant to diverge, so it is not diffed).
   validate?: (content: string) => boolean;
+  hint?: string; // printed after a drift line
 }
 
 /** Check mode (CI-gatable): verify the shims exist + reference the module. NEVER writes. */
@@ -138,7 +143,11 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
   if (!eager) {
     items.push(
       { target: MODEL, validate: (c) => c.includes(MODEL_MARKER) },
-      { target: COMMAND, validate: (c) => c.includes(COMMAND_MARKER) },
+      {
+        target: COMMAND,
+        validate: (c) => COMMAND_MARKERS.every((marker) => c.includes(marker)),
+        hint: 'must extend the module command and load ../resizer.ts in run() — delete it and re-run resize-scaffold',
+      },
     );
   }
   items.push({ target: CONFIG }); // existence only
@@ -154,7 +163,9 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
     if (item.validate) {
       const content = await readFile(dest, 'utf8');
       if (!item.validate(content)) {
-        console.log(`${pad('drift')}${item.target}`);
+        console.log(
+          `${pad('drift')}${item.target}${item.hint ? ` — ${item.hint}` : ''}`,
+        );
         failed = true;
         continue;
       }
@@ -203,11 +214,12 @@ Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
 Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — createFrameworkResizer({ transport, storage, pipelines })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
-  src/commands/ResizeWorker.ts  re-export of the module's worker command
+  src/commands/ResizeWorker.ts  the module's worker command; loads src/resizer.ts before it starts
   src/config/resize.ts      host overrides over module defaults (framework merges environment overrides)
 
 Options:
-  --check      verify the shims exist + reference the module; exit 1 on missing/drift (no writes)
+  --check      verify the shims exist + reference the module (and the worker command loads
+               src/resizer.ts); exit 1 on missing/drift (no writes)
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
   --eager      eager-mode hosts: emit only src/resizer.ts (LocalFsStorage, no transport) + src/config/resize.ts
   --force      overwrite existing files (default: never overwrite)
@@ -296,7 +308,10 @@ export async function runScaffold(
       "src/config/resize.ts, then run `await import('./resizer.ts')` only AFTER",
     );
     console.log(
-      '`await Server.init()` in every process (a static import runs too early).',
+      '`await Server.init()` in the API process (a static import runs too early).',
+    );
+    console.log(
+      'The scaffolded ResizeWorker command loads it in the worker process.',
     );
   }
   return code;

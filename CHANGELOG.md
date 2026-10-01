@@ -122,6 +122,12 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 
 **Fixes**
 
+- `npm run cli ResizeWorker` no longer starts with no Resizer. The scaffolded
+  `src/commands/ResizeWorker.ts` was a bare re-export, so nothing built the host's Resizers in the
+  CLI process. It is now a subclass that loads `src/resizer.ts` before the worker starts.
+  `resize-scaffold --check` reports the old re-export as drift, and the framework worker
+  rejects an empty registry with `RESIZE_NO_RESIZER` and that fix in the message. Hosts:
+  delete `src/commands/ResizeWorker.ts` and re-run `npx resize-scaffold`.
 - `LocalFsStorage` normalizes root paths before deriving the private root and rejects a
   `privateRootDir` equal to or inside the public root. A trailing slash no longer places private
   originals in the public folder.

@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   resetAppInstance,
   setAppInstance,
@@ -79,9 +79,16 @@ describe('runScaffold — default run', () => {
       /Queue indexes are declared[\s\S]+normal migration\/lifecycle process[\s\S]+does not create or[\s\S]+synchronize indexes/,
     );
     assert.match(await read(MODEL), /extends ResizeTaskModel/);
+    const command = await read(COMMAND);
     assert.match(
-      await read(COMMAND),
+      command,
       /@adaptivestone\/framework-module-resize\/commands\/ResizeWorker\.js/,
+    );
+    assert.match(command, /extends ModuleResizeWorker/);
+    assert.match(
+      command,
+      /await import\('\.\.\/resizer\.ts'\)[\s\S]+super\.run\(\)/,
+      'the worker command must build the Resizers before the worker starts',
     );
     const configSource = await read(CONFIG);
     assert.match(
@@ -261,6 +268,35 @@ describe('runScaffold — --check', () => {
     assert.match(out, /drift/);
   });
 
+  test('bare command re-export (no construction site) → exit 1 + drift with the fix', async () => {
+    await run([]);
+    await writeFile(
+      join(root, COMMAND),
+      "export { default } from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';\n",
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 1);
+    assert.match(out, /drift\s+src\/commands\/ResizeWorker\.ts — must extend/);
+    assert.match(out, /re-run resize-scaffold/);
+  });
+
+  test('a host command that builds its Resizers from ../resizer.ts passes', async () => {
+    await run([]);
+    await writeFile(
+      join(root, COMMAND),
+      [
+        "import ModuleResizeWorker from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';",
+        "import { ensureResizers } from '../resizer.ts';",
+        'export default class ResizeWorker extends ModuleResizeWorker {',
+        '  async run() { ensureResizers(); return super.run(); }',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const { code } = await run(['--check']);
+    assert.equal(code, 0);
+  });
+
   test('never creates files (empty root → exit 1, nothing written)', async () => {
     const { code, out } = await run(['--check']);
     assert.equal(code, 1);
@@ -398,5 +434,46 @@ describe('packaging smoke', () => {
       ),
     );
     assert.equal(pkg.bin['resize-scaffold'], './dist/scaffold/command.js');
+  });
+});
+
+describe('scaffolded ResizeWorker command', () => {
+  test('loads src/resizer.ts before the module worker starts', async () => {
+    await run([]);
+    // The temp root cannot resolve the package name; point the shim at this checkout's command.
+    const moduleCommand = pathToFileURL(
+      fileURLToPath(new URL('../commands/ResizeWorker.ts', import.meta.url)),
+    ).href;
+    const shim = (await read(COMMAND)).replace(
+      '@adaptivestone/framework-module-resize/commands/ResizeWorker.js',
+      moduleCommand,
+    );
+    await writeFile(join(root, COMMAND), shim);
+    await writeFile(join(root, 'package.json'), '{ "type": "module" }\n');
+    // Stand-in construction site: records that it ran.
+    await writeFile(
+      join(root, RESIZER),
+      'Object.assign(globalThis, { resizeSiteLoaded: true });\nexport {};\n',
+    );
+    const flags = globalThis as { resizeSiteLoaded?: boolean };
+    let loadedWhenWorkerStarted: boolean | undefined;
+    setAppInstance({
+      // runResizeWorker reads the config first; worker.enabled is false, so it returns there.
+      getConfig: () => {
+        loadedWhenWorkerStarted = flags.resizeSiteLoaded;
+        return { ...defaultResizeConfig, mediaModelName: 'File' };
+      },
+      getModel: () => undefined,
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    try {
+      const { default: Command } = await import(
+        pathToFileURL(join(root, COMMAND)).href
+      );
+      assert.equal(await new Command({}, {}, {}).run(), true);
+      assert.equal(loadedWhenWorkerStarted, true);
+    } finally {
+      delete flags.resizeSiteLoaded;
+    }
   });
 });

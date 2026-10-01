@@ -67,10 +67,13 @@ It emits (into `process.cwd()`, or `--out <dir>`), **never overwriting** without
 | `src/resizer.ts` | the construction site — `createFrameworkResizer({ … })` (edit freely) |
 | `src/config/resize.ts` | small host extension of the module defaults; framework applies environment overrides |
 | `src/models/ResizeTask.ts` | thin shim (only without `--eager`) |
-| `src/commands/ResizeWorker.ts` | worker command re-export (only without `--eager`) |
+| `src/commands/ResizeWorker.ts` | the module's worker command; loads `src/resizer.ts` before the worker starts (only without `--eager`) |
 
 The shims are **not vendored copies** — the schema/behavior stays in the npm package (auto-updates,
-no drift). `--eager` wires `LocalFsStorage`; omit the flag for a Mongo transport + a storage TODO.
+no drift). The worker command subclasses the module's command only to build your Resizers in the
+CLI process: the framework CLI loads config and models just before the command runs, so the
+command is the first place that can. `--eager` wires `LocalFsStorage`; omit the flag for a Mongo
+transport + a storage TODO.
 
 Other flags: `--check` (CI-gatable drift check; exits 1 on missing/drift, no writes), `--eject`
 (write the full editable model instead of the shim, for custom fields/indexes), `--agents
@@ -96,6 +99,21 @@ Load the scaffolded construction site dynamically from bootstrap after initializ
 ```ts
 await server.init();
 const { resizer } = await import('./resizer.ts');
+await server.startServer(); // init() runs once, so no request arrives before the Resizer exists
+```
+
+The worker process (`npm run cli ResizeWorker`) loads it from the scaffolded
+`src/commands/ResizeWorker.ts`:
+
+```ts
+import ModuleResizeWorker from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
+
+export default class ResizeWorker extends ModuleResizeWorker {
+  async run(): Promise<boolean> {
+    await import('../resizer.ts'); // config and models are loaded by now
+    return super.run();
+  }
+}
 ```
 
 A static import is evaluated before bootstrap code and is therefore too early.
@@ -202,7 +220,7 @@ can remove overlapping variants from a request. Rows created before `requestKey`
 remain valid.
 
 ```ts
-// src/resizer.ts — construct after Server.init(); import from API and worker processes
+// src/resizer.ts — construct after Server.init(); the API bootstrap and the ResizeWorker command load it
 import {
   createFrameworkMongoTransport,
   createFrameworkResizer,
@@ -282,8 +300,9 @@ name; when none is given it is `'default'`.
   worker at a time.
 - One worker process serves **every** Resizer constructed in it, routing each task to the Resizer
   named in it. Those Resizers must share one transport instance; run one worker process per
-  transport. Construct every Resizer in both the API and the worker process: a task for a
-  Resizer the worker does not know fails with `RESIZE_NO_RESIZER` and dead-letters.
+  transport. Construct every Resizer in both the API and the worker process (the scaffolded
+  `ResizeWorker` command loads `src/resizer.ts`): a task for a Resizer the worker does not know
+  fails with `RESIZE_NO_RESIZER` and dead-letters.
 - The same request on two queues is two tasks, so an interactive request never waits behind a
   bulk backfill on another queue.
 - SQS maps queue names to queue URLs: `queueUrl` serves `'default'`, and
