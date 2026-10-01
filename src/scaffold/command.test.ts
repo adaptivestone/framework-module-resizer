@@ -16,7 +16,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import defaultResizeConfig from '../config/resize.ts';
-import { getResizeConfig } from '../resizeConfig.ts';
+import { getResizeConfig } from '../framework/config.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -66,7 +66,9 @@ describe('runScaffold — default run', () => {
     assert.equal(code, 0);
 
     const resizer = await read(RESIZER);
-    assert.match(resizer, /new Resizer\(/);
+    assert.match(resizer, /createFrameworkResizer\(/);
+    assert.match(resizer, /createFrameworkMongoTransport\(\)/);
+    assert.match(resizer, /framework\.js/);
     assert.match(
       resizer,
       /await import\('\.\/resizer\.ts'\)/,
@@ -87,7 +89,7 @@ describe('runScaffold — default run', () => {
       /@adaptivestone\/framework-module-resize\/config\/resize\.js/,
     );
     assert.match(configSource, /\.\.\.defaultResizeConfig/);
-    assert.match(configSource, /satisfies ResizeConfig/);
+    assert.match(configSource, /satisfies FrameworkResizeConfig/);
 
     assert.match(configSource, /mediaModelName: 'File'/);
     const scaffoldedConfig = {

@@ -2,8 +2,8 @@ import type { ResizeConfig } from '../types.d.ts';
 
 // Canonical module defaults. A framework host extends this file from its own
 // src/config/resize.ts, while the framework remains responsible for applying
-// resize.<NODE_ENV>.ts overrides. mediaModelName is intentionally host-owned.
-const defaultResizeConfig: Omit<ResizeConfig, 'mediaModelName'> = {
+// resize.<NODE_ENV>.ts overrides. A framework host adds mediaModelName (FrameworkResizeConfig).
+const defaultResizeConfig: ResizeConfig = {
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
     maxBytes: 25 * 1024 * 1024,

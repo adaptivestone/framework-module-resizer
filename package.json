@@ -14,6 +14,7 @@
     "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
     "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
     "./config/resize.js": "./dist/config/resize.js",
+    "./framework.js": "./dist/framework/index.js",
     "./transports/mongo.js": "./dist/transports/mongo.js",
     "./transports/sqs.js": "./dist/transports/sqs.js",
     "./storage/s3.js": "./dist/storage/s3.js",

@@ -1,5 +1,6 @@
-// Mongo transport (05 · §10.2) — DEFAULT, option-less class (`new MongoTransport()`). Backed by
-// the host-scaffolded `ResizeTask` model, reached through getApp().getModel('ResizeTask'). Owns
+// Mongo transport (05 · §10.2). Backed by a `ResizeTask` mongoose model passed in as `model`
+// (or resolved lazily through `getModel`); the framework adapter's
+// createFrameworkMongoTransport() wires the framework's model, logger and config timing. Owns
 // the lease/complete/fail/renew/dead-letter-sweep lifecycle and drives the worker's poll loop.
 // Delivery is at-least-once; correctness rests on the atomic findOneAndUpdate claim + the
 // fencing `leaseToken` (a 0-matched guarded update = this worker lost the lease → drop it).
@@ -8,15 +9,17 @@
 // PUBLIC methods (unit tests drive them; not part of the QueueTransport interface).
 //
 // Subpath entry `…/transports/mongo.js` (uniform rule 02 · §6): the QueueTransport/LeasedTask
-// contract comes from ./AbstractTransport.ts (not resizer.ts); no optional deps, so importing
-// this driver is always safe (05 · §10.2).
-import { getApp } from '../app.ts';
+// contract comes from ./AbstractTransport.ts (not resizer.ts); it imports no framework code.
+import defaultResizeConfig from '../config/resize.ts';
 import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
-import { ResizeError } from '../errors.ts';
+import { ResizeError, ResizeSetupError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
-import { getResizeConfig } from '../resizeConfig.ts';
-import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
+import type {
+  EnqueueReceipt,
+  MissingPreview,
+  ResizeLogger,
+} from '../types.d.ts';
 import type {
   EnqueueTask,
   LeasedTask,
@@ -25,6 +28,24 @@ import type {
   TaskEvent,
   TaskEventHandler,
 } from './AbstractTransport.ts';
+
+// The mongoose model the transport calls (findOneAndUpdate / findOne / find). Typed loosely so
+// the module stays free of mongoose types.
+// biome-ignore lint/suspicious/noExplicitAny: a host-registered mongoose model
+type TaskModel = any;
+
+export interface MongoTransportOptions {
+  // The ResizeTask model. Pass `model`, or `getModel` when the model is registered later
+  // (resolved on every use). Exactly one of the two.
+  model?: TaskModel;
+  getModel?: () => TaskModel;
+  logger?: ResizeLogger; // default: console
+  leaseMs?: number; // default 60000 — heartbeat renews at leaseMs / 2
+  retryBackoffMs?: { base: number; max: number }; // default { base: 5000, max: 300000 }
+  maxAttempts?: number; // default 5 — deliveries before dead-letter
+  idlePollMs?: number; // default 1000 — sleep after an empty lease
+  taskTimeoutMs?: number; // default 600000 — a task running longer is failed
+}
 
 // The subset of the ResizeTask document the transport reads. The model itself is dynamic
 // (getModel returns `any` by design — the module stays mongoose-type-free), so the
@@ -45,19 +66,6 @@ interface TaskDoc {
   completedAt?: Date | null;
   deadAt?: Date | null;
   error?: string | null;
-}
-
-// Resolve the model, tolerating a falsy getModel (mis-scaffolded host) with a logged
-// soft-fail rather than a TypeError.
-function taskModel(): ReturnType<ReturnType<typeof getApp>['getModel']> | null {
-  const model = getApp().getModel('ResizeTask');
-  if (!model) {
-    getApp().logger.error(
-      'resize mongo transport: getModel("ResizeTask") returned falsy — scaffold the ResizeTask model (08 · §12)',
-    );
-    return null;
-  }
-  return model;
 }
 
 // The fencing filter shared by complete/fail/renew: a 0-match means the lease was lost.
@@ -94,28 +102,6 @@ function named(value: string) {
   return value === 'default' ? { $in: ['default', null] } : value;
 }
 
-// Task events go to the worker's callback, which routes them to the owning Resizer. A
-// throwing callback (a host observer bug) is logged: the task's state is already written, and
-// the worker loop must keep running.
-async function report(
-  onEvent: TaskEventHandler | undefined,
-  event: TaskEvent,
-  task: LeasedTask,
-  error?: unknown,
-): Promise<void> {
-  if (!onEvent) {
-    return;
-  }
-  try {
-    await onEvent(event, task, error);
-  } catch (err) {
-    getApp().logger.error(
-      `resize mongo transport: ${event} event handler failed`,
-      err,
-    );
-  }
-}
-
 function activeRequestFilter(
   mediaId: string,
   pipeline: string,
@@ -141,11 +127,73 @@ function isDuplicateKeyError(error: unknown): boolean {
   );
 }
 
-/** The default transport — an option-less class (`new MongoTransport()`) (05 · §10.2). */
+/** The Mongo-backed queue transport (05 · §10.2). */
 export class MongoTransport implements QueueTransport {
-  /** `min(max, base * 2 ** (n - 1))` from config.queue.retryBackoffMs (05 · §10.2). */
+  readonly leaseMs: number;
+  readonly #model: TaskModel;
+  readonly #getModel: (() => TaskModel) | undefined;
+  readonly #logger: ResizeLogger;
+  readonly #retryBackoffMs: { base: number; max: number };
+  readonly #maxAttempts: number;
+  readonly #idlePollMs: number;
+  readonly #taskTimeoutMs: number;
+
+  constructor(opts: MongoTransportOptions) {
+    if (!opts || (opts.model === undefined) === (opts.getModel === undefined)) {
+      throw new ResizeSetupError(
+        "resize mongo transport: pass exactly one of `model` (the ResizeTask model) or `getModel`; framework hosts: use createFrameworkMongoTransport() from '@adaptivestone/framework-module-resize/framework.js'",
+        { code: 'RESIZE_MONGO_MODEL_REQUIRED' },
+      );
+    }
+    const defaults = defaultResizeConfig.queue;
+    this.#model = opts.model;
+    this.#getModel = opts.getModel;
+    this.#logger = opts.logger ?? console;
+    this.leaseMs = opts.leaseMs ?? defaults.leaseMs;
+    this.#retryBackoffMs = opts.retryBackoffMs ?? defaults.retryBackoffMs;
+    this.#maxAttempts = opts.maxAttempts ?? defaults.maxAttempts;
+    this.#idlePollMs = opts.idlePollMs ?? defaults.idlePollMs;
+    this.#taskTimeoutMs = opts.taskTimeoutMs ?? defaults.taskTimeoutMs;
+  }
+
+  // Resolve the model, tolerating a falsy getter result (a mis-registered host model) with a
+  // logged soft-fail rather than a TypeError.
+  #taskModel(): TaskModel | null {
+    const model = this.#getModel ? this.#getModel() : this.#model;
+    if (!model) {
+      this.#logger.error(
+        'resize mongo transport: the ResizeTask model is missing — register (scaffold) the ResizeTask model (08 · §12)',
+      );
+      return null;
+    }
+    return model;
+  }
+
+  // Task events go to the worker's callback, which routes them to the owning Resizer. A
+  // throwing callback (a host observer bug) is logged: the task's state is already written, and
+  // the worker loop must keep running.
+  async #report(
+    onEvent: TaskEventHandler | undefined,
+    event: TaskEvent,
+    task: LeasedTask,
+    error?: unknown,
+  ): Promise<void> {
+    if (!onEvent) {
+      return;
+    }
+    try {
+      await onEvent(event, task, error);
+    } catch (err) {
+      this.#logger.error(
+        `resize mongo transport: ${event} event handler failed`,
+        err,
+      );
+    }
+  }
+
+  /** `min(max, base * 2 ** (n - 1))` from the retryBackoffMs option (05 · §10.2). */
   backoff(attempts: number): number {
-    const { base, max } = getResizeConfig().queue.retryBackoffMs;
+    const { base, max } = this.#retryBackoffMs;
     return Math.min(max, base * 2 ** (attempts - 1));
   }
 
@@ -160,11 +208,12 @@ export class MongoTransport implements QueueTransport {
    * considered, so a worker never takes another queue's work. (05 · §10.2)
    */
   async lease(queue = 'default'): Promise<TaskDoc | null> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return null;
     }
-    const { leaseMs, maxAttempts } = getResizeConfig().queue;
+    const leaseMs = this.leaseMs;
+    const maxAttempts = this.#maxAttempts;
     const now = new Date();
     const doc = await model.findOneAndUpdate(
       {
@@ -205,7 +254,7 @@ export class MongoTransport implements QueueTransport {
     leaseToken: string,
     onEvent?: TaskEventHandler,
   ): Promise<boolean> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return false;
     }
@@ -218,7 +267,7 @@ export class MongoTransport implements QueueTransport {
     if (!doc) {
       return false;
     }
-    await report(onEvent, 'completed', toLeasedTask(doc));
+    await this.#report(onEvent, 'completed', toLeasedTask(doc));
     return true;
   }
 
@@ -236,11 +285,11 @@ export class MongoTransport implements QueueTransport {
     attempts: number,
     onEvent?: TaskEventHandler,
   ): Promise<void> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return;
     }
-    const { maxAttempts } = getResizeConfig().queue;
+    const maxAttempts = this.#maxAttempts;
     const now = new Date();
     // A persisted media row without an original is a deterministic terminal failure. Keep the
     // normal retry policy for every other error (including errors that merely happen to expose a
@@ -265,7 +314,7 @@ export class MongoTransport implements QueueTransport {
         { returnDocument: 'after' },
       )) as TaskDoc | null;
       if (doc) {
-        await report(onEvent, 'failed', toLeasedTask(doc), error);
+        await this.#report(onEvent, 'failed', toLeasedTask(doc), error);
       }
       return;
     }
@@ -281,7 +330,7 @@ export class MongoTransport implements QueueTransport {
       { returnDocument: 'after' },
     )) as TaskDoc | null;
     if (doc) {
-      await report(onEvent, 'deadLettered', toLeasedTask(doc), error);
+      await this.#report(onEvent, 'deadLettered', toLeasedTask(doc), error);
     }
   }
 
@@ -290,11 +339,11 @@ export class MongoTransport implements QueueTransport {
    * Returns whether the lease was still held. (05 · §10.2)
    */
   async renew(taskId: string, leaseToken: string): Promise<boolean> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return false;
     }
-    const { leaseMs } = getResizeConfig().queue;
+    const leaseMs = this.leaseMs;
     const now = new Date();
     const doc = await model.findOneAndUpdate(
       fence(taskId, leaseToken),
@@ -310,11 +359,11 @@ export class MongoTransport implements QueueTransport {
    * worker reports it (updateMany returns only a count → can't enumerate). (05 · §10.2)
    */
   async sweepDeadLetters(onEvent?: TaskEventHandler): Promise<void> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return;
     }
-    const { maxAttempts } = getResizeConfig().queue;
+    const maxAttempts = this.#maxAttempts;
     const now = new Date();
     const err = 'max attempts exceeded (crash loop)';
     const filter = {
@@ -331,7 +380,12 @@ export class MongoTransport implements QueueTransport {
       if (!dead) {
         break; // none left this poll
       }
-      await report(onEvent, 'deadLettered', toLeasedTask(dead), new Error(err));
+      await this.#report(
+        onEvent,
+        'deadLettered',
+        toLeasedTask(dead),
+        new Error(err),
+      );
     }
   }
 
@@ -340,7 +394,7 @@ export class MongoTransport implements QueueTransport {
   // -------------------------------------------------------------------------
 
   async enqueue(task: EnqueueTask): Promise<{ taskId: string | null }> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return { taskId: null };
     }
@@ -388,7 +442,7 @@ export class MongoTransport implements QueueTransport {
         return { taskId: doc ? String(doc._id) : null };
       } catch (err) {
         if (!isDuplicateKeyError(err)) {
-          getApp().logger.error(
+          this.#logger.error(
             `resize mongo transport: enqueue failed for media ${task.mediaId}`,
             err,
           );
@@ -400,7 +454,7 @@ export class MongoTransport implements QueueTransport {
             return { taskId: String(existing._id) };
           }
         } catch (raceError) {
-          getApp().logger.error(
+          this.#logger.error(
             `resize mongo transport: enqueue duplicate-key reread failed for media ${task.mediaId}`,
             raceError,
           );
@@ -409,7 +463,7 @@ export class MongoTransport implements QueueTransport {
       }
     }
 
-    getApp().logger.error(
+    this.#logger.error(
       `resize mongo transport: enqueue remained contended after duplicate-key retries for media ${task.mediaId}`,
     );
     return { taskId: null };
@@ -417,7 +471,7 @@ export class MongoTransport implements QueueTransport {
 
   // Any queue: a task already waiting on another queue still covers the request.
   async findActive(task: EnqueueTask): Promise<EnqueueReceipt[]> {
-    const model = taskModel();
+    const model = this.#taskModel();
     if (!model) {
       return [];
     }
@@ -440,7 +494,9 @@ export class MongoTransport implements QueueTransport {
     ) => Promise<void>,
     opts: StartWorkerOpts,
   ): Promise<void> {
-    const { leaseMs, idlePollMs, taskTimeoutMs } = getResizeConfig().queue;
+    const leaseMs = this.leaseMs;
+    const idlePollMs = this.#idlePollMs;
+    const taskTimeoutMs = this.#taskTimeoutMs;
     const heartbeatMs = Math.max(1, Math.floor(leaseMs / 2));
 
     while (!opts.signal.aborted) {
@@ -453,7 +509,7 @@ export class MongoTransport implements QueueTransport {
         await this.sweepDeadLetters(opts.onEvent);
         doc = await this.lease(opts.queue);
       } catch (err) {
-        getApp().logger.error(
+        this.#logger.error(
           'resize mongo transport: poll iteration failed (sweep/lease) — retrying after idlePollMs',
           err,
         );
@@ -488,7 +544,7 @@ export class MongoTransport implements QueueTransport {
             }
           })
           .catch((e) => {
-            getApp().logger.error(
+            this.#logger.error(
               'resize mongo transport: heartbeat renew failed',
               e,
             );

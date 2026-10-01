@@ -17,8 +17,8 @@
 // here (documented — 05 · §10.3). It DOES report `completed` / `failed` through `onEvent`.
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { Consumer } from 'sqs-consumer';
-import { getApp } from '../app.ts';
 import { ResizeSetupError } from '../errors.ts';
+import type { ResizeLogger } from '../types.d.ts';
 import type {
   EnqueueTask,
   LeasedTask,
@@ -30,6 +30,7 @@ import type {
 export interface SqsTransportOptions {
   queueUrl: string; // serves the 'default' queue
   queues?: Record<string, string>; // extra named queues → queue URLs
+  logger?: ResizeLogger; // default: console
   region?: string;
   endpoint?: string;
   visibilityTimeout?: number; // seconds; passed to sqs-consumer when provided
@@ -120,7 +121,10 @@ export class SqsTransport implements QueueTransport {
       try {
         await workerOpts.onEvent(event, task, error);
       } catch (err) {
-        getApp().logger.error(`resize sqs: ${event} event handler failed`, err);
+        (this.#opts.logger ?? console).error(
+          `resize sqs: ${event} event handler failed`,
+          err,
+        );
       }
     };
     const consumer = Consumer.create({
@@ -184,7 +188,7 @@ export class SqsTransport implements QueueTransport {
       // failures) must ALL be logged — a `once` listener drops every error after the first,
       // leaving later ones unhandled (05 · §10.3 fix a).
       consumer.on('error', (err) => {
-        getApp().logger.error('resize sqs consumer error', err);
+        (this.#opts.logger ?? console).error('resize sqs consumer error', err);
       });
       const stop = () => consumer.stop();
       if (workerOpts.signal.aborted) {

@@ -248,7 +248,7 @@ published; the page still describes 0.2.
 - **Status: done.** The `requestKey` needed no change: it already hashes the resizer and the
   pipeline (P2).
 
-**P4 — The framework becomes an adapter.**
+**P4 — The framework becomes an adapter.** [Plan](../superpowers/plans/2026-09-30-p4-framework-adapter.md).
 - A framework subpath takes the app gateway, config loading, the event mirror,
   `ResizeTaskModel` and `ResizeWorker`.
 - `FrameworkMediaStore` takes `{ modelName }`.
@@ -257,12 +257,19 @@ published; the page still describes 0.2.
 - Config splits as in D8, and the scaffold templates are updated.
 - Done when: a static check proves the main entry's import graph has no framework module, and a
   framework-free example runs in the test suite.
+- **Status: done.** D8 was applied partially, by design: config keys kept their names and places
+  (no new removed-key errors). `MongoTransport` takes its own timing options, which the adapter
+  maps from `config.queue`. `config.worker` is read by the framework `runResizeWorker`.
+  `mediaModelName` moved to `FrameworkResizeConfig`. The packaging smoke test also installs the
+  package without peers and runs a core Resizer.
 
 **P5 — Later, each optional and separate.**
 - `worker.parallelTasks`.
 - Merge `prewarm` into `enqueueRequired`.
 - Strip archived-spec section references from comments.
 - Check the AVIF/WebP quality defaults on real photos.
+- Export a framework-free `ResizeTask` schema definition (fields + indexes). Today a host
+  without the framework copies them from `src/models/ResizeTask.ts`.
 
 ## 7. Non-goals
 
@@ -273,7 +280,7 @@ published; the page still describes 0.2.
 
 ## 8. Open questions (decided in the phase plan that needs them)
 
-- **P2:** the SQS option shape for several queues. A `queues: { default: url, bulk: url }` map,
-  or one transport instance per queue.
-- **P4:** the framework config layout for several Resizers. One config file per Resizer (for
-  example `resize.ts` and `resizeListings.ts`), or one file with a `resizers` map.
+- **P2 (decided):** a `queues: { bulk: url }` map on one `SqsTransport`; `queueUrl` serves
+  `'default'`.
+- **P4 (decided):** one config file per Resizer (`resize.ts`, `resizeListings.ts`, …), selected
+  with `createFrameworkResizer({ configName })`.

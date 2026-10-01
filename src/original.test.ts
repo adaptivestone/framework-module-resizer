@@ -9,8 +9,9 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import type { QueueTransport, ResizeStorage } from './resizer.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import { resetResizerForTests } from './resizer.ts';
 import { LocalFsStorage } from './storage/fs.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 
@@ -92,7 +93,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
     test(`${format} animation reports frame dimensions and preserves bytes`, async () => {
       installApp();
       const { storage, uploads } = recordingStorage();
-      const r = new Resizer({ storage });
+      const r = createFrameworkResizer({ storage });
       const original = await r.uploadOriginal({ body, visibility: 'public' });
       assert.equal(original.width, 10);
       assert.equal(original.height, 10);
@@ -102,14 +103,14 @@ describe('uploadOriginal — raster bytes and metadata', () => {
     test(`${format} animation counts each frame once at the pixel limit`, async () => {
       installApp({ limits: { sourcePixels: 200 } });
       const { storage } = recordingStorage();
-      const r = new Resizer({ storage });
+      const r = createFrameworkResizer({ storage });
       await r.uploadOriginal({ body, visibility: 'public' });
     });
 
     test(`${format} animation rejects total pixels above the limit before storage`, async () => {
       installApp({ limits: { sourcePixels: 199 } });
       const { storage, uploads } = recordingStorage();
-      const r = new Resizer({ storage });
+      const r = createFrameworkResizer({ storage });
       await assert.rejects(r.uploadOriginal({ body, visibility: 'public' }), {
         code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
       });
@@ -120,7 +121,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
   test('stores JPEG bytes unchanged and reports display dimensions without rotating EXIF', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const original = await r.uploadOriginal({
       body: orientedJpeg,
       visibility: 'private',
@@ -146,7 +147,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
   test('accepts Uint8Array PNG and produces a different safe key for each upload', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const first = await r.uploadOriginal({
       body: new Uint8Array(png),
       visibility: 'public',
@@ -171,7 +172,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
   test('accepts a TIFF enabled only through upload.formats', async () => {
     installApp({ upload: { formats: ['tiff'] } });
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const body = await sharp(png).tiff().toBuffer();
 
     const original = await r.uploadOriginal({ body, visibility: 'private' });
@@ -188,7 +189,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
   test('round-trips exact original bytes through LocalFsStorage', async () => {
     installApp();
     const dir = await mkdtemp(join(tmpdir(), 'resize-original-'));
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage: new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' }),
     });
     const original = await r.uploadOriginal({
@@ -210,7 +211,7 @@ describe('uploadOriginal — raster bytes and metadata', () => {
   test('recognizes WebP and AVIF containers without rewriting their bytes', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const webpOriginal = await r.uploadOriginal({
       body: webp,
       visibility: 'public',
@@ -240,7 +241,7 @@ describe('uploadOriginal — private SVG source', () => {
       },
       startWorker: async () => {},
     };
-    const r = new Resizer({ storage, transport });
+    const r = createFrameworkResizer({ storage, transport });
     const body = Buffer.from(
       '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="120px" height="80px" viewBox="0 0 240 100"><path d="M0 0h1v1z"/></svg>',
     );
@@ -262,7 +263,7 @@ describe('uploadOriginal — private SVG source', () => {
   test('rejects a public SVG original before writing to storage', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const body = Buffer.from(
       '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"/>',
     );
@@ -276,7 +277,7 @@ describe('uploadOriginal — private SVG source', () => {
   test('uses Sharp dimensions for SVG with a viewBox', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const body = Buffer.from(
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 100"/>',
     );
@@ -290,7 +291,7 @@ describe('uploadOriginal — private SVG source', () => {
   test('rejects unreadable SVG and non-image XML before storage', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     for (const svg of [
       '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><g></svg>',
       '<svg xmlns="http://www.w3.org/2000/svg"/>',
@@ -307,7 +308,7 @@ describe('uploadOriginal — private SVG source', () => {
   test('applies the source pixel limit to SVG metadata before storage', async () => {
     installApp({ limits: { sourcePixels: 99 } });
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       r.uploadOriginal({
         body: Buffer.from(
@@ -323,7 +324,7 @@ describe('uploadOriginal — private SVG source', () => {
   test('honors the SVG upload format allowlist before storage', async () => {
     installApp({ upload: { formats: ['png'] } });
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       r.uploadOriginal({
         body: Buffer.from(
@@ -339,7 +340,7 @@ describe('uploadOriginal — private SVG source', () => {
   test('preserves a declared ISO-8859-1 SVG byte-for-byte', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const body = Buffer.from(
       '<?xml version="1.0" encoding="ISO-8859-1"?><svg xmlns="http://www.w3.org/2000/svg" width="9" height="7"><text>é</text></svg>',
       'latin1',
@@ -356,7 +357,7 @@ describe('uploadOriginal — typed failures', () => {
   test('rejects empty, over-limit, and disabled formats before storage', async () => {
     installApp({ upload: { maxBytes: 8, formats: ['jpeg'] } });
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       () => r.uploadOriginal({ body: Buffer.alloc(0), visibility: 'private' }),
       (error: unknown) =>
@@ -373,7 +374,7 @@ describe('uploadOriginal — typed failures', () => {
     resetAppInstance();
     resetResizerForTests();
     installApp({ upload: { maxBytes: 1024 * 1024, formats: ['jpeg'] } });
-    const larger = new Resizer({ storage });
+    const larger = createFrameworkResizer({ storage });
     await assert.rejects(
       () => larger.uploadOriginal({ body: png, visibility: 'private' }),
       (error: unknown) =>
@@ -393,7 +394,7 @@ describe('uploadOriginal — typed failures', () => {
       },
       publicUrl: () => '',
     };
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       () => r.uploadOriginal({ body: png, visibility: 'private' }),
       (error: unknown) =>
@@ -406,7 +407,7 @@ describe('uploadOriginal — typed failures', () => {
   test('rejects unsupported bytes with a stable input error', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       () =>
         r.uploadOriginal({
@@ -427,7 +428,7 @@ describe('uploadOriginal — typed failures', () => {
       upload: async () => undefined as never,
       publicUrl: () => '',
     };
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       () => r.uploadOriginal({ body: png, visibility: 'private' }),
       (error: unknown) =>
@@ -447,7 +448,7 @@ describe('uploadOriginal — typed failures', () => {
       },
       publicUrl: () => '',
     };
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const body = Buffer.from(
       '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"/>',
     );
@@ -476,7 +477,7 @@ describe('uploadOriginal — typed failures', () => {
       upload: async () => 0,
       publicUrl: () => '/zero',
     };
-    const original = await new Resizer({ storage }).uploadOriginal({
+    const original = await createFrameworkResizer({ storage }).uploadOriginal({
       body: png,
       visibility: 'private',
     });

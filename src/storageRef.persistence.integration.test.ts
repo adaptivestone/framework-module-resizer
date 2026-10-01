@@ -11,8 +11,9 @@ import { defaultOptions } from '@adaptivestone/framework/modules/BaseModel.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import { resizeMediaSchemaFragment } from './models/mediaFragment.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import { resetResizerForTests } from './resizer.ts';
 import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import { LocalFsStorage } from './storage/fs.ts';
 import { S3Storage } from './storage/s3.ts';
@@ -92,7 +93,7 @@ test('refs survive media save/load and fresh-driver preview generation', async (
   for (const [name, createStorage] of Object.entries(factory)) {
     for (const namespace of [undefined, 'products/p1']) {
       resetResizerForTests();
-      const uploader = new Resizer({ storage: createStorage() });
+      const uploader = createFrameworkResizer({ storage: createStorage() });
       const original = await uploader.uploadOriginal({
         body: bytes,
         visibility: 'private',
@@ -105,7 +106,7 @@ test('refs survive media save/load and fresh-driver preview generation', async (
       assert.deepEqual(loaded.original?.storageRef, original.storageRef);
 
       resetResizerForTests();
-      const worker = new Resizer({ storage: createStorage() });
+      const worker = createFrameworkResizer({ storage: createStorage() });
       const result = await worker.generate({
         media: loaded,
         sizes: [{ width: 8, height: 8 }],

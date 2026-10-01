@@ -5,7 +5,8 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
-import { getResizeConfig, validateResizeConfig } from '../resizeConfig.ts';
+import { getResizeConfig } from '../framework/config.ts';
+import { validateResizeConfig } from '../resizeConfig.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { ResizeConfig } from '../types.d.ts';
 import defaultResizeConfig from './resize.ts';
@@ -187,5 +188,54 @@ describe('getResizeConfig', () => {
       quality: 71,
       effort: 6,
     });
+  });
+});
+
+describe('config split: core validation vs framework loading', () => {
+  test('the core accepts a complete config without mediaModelName', () => {
+    resetAppInstance();
+    const { mediaModelName: _omit, ...core } = makeResizeConfig();
+    assert.doesNotThrow(() => validateResizeConfig(core));
+  });
+
+  test('core validation does not read the framework app', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const source = await readFile(
+      new URL('../resizeConfig.ts', import.meta.url),
+      'utf8',
+    );
+    assert.doesNotMatch(source, /from '[^']*framework[^']*'/);
+  });
+
+  test('getResizeConfig(configName) reads that config file', () => {
+    resetAppInstance();
+    setAppInstance({
+      getConfig: (name: string) =>
+        name === 'resizeListings'
+          ? makeResizeConfig({ formats: ['webp'], mediaModelName: 'Photo' })
+          : makeResizeConfig(),
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.deepEqual(getResizeConfig('resizeListings').formats, ['webp']);
+    assert.equal(getResizeConfig('resizeListings').mediaModelName, 'Photo');
+    assert.equal(getResizeConfig().mediaModelName, 'File');
+  });
+
+  test('a missing mediaModelName names the config file it is missing from', () => {
+    resetAppInstance();
+    const { mediaModelName: _omit, ...core } = makeResizeConfig();
+    setAppInstance({
+      getConfig: () => core,
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.throws(
+      () => getResizeConfig('resizeListings'),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_MEDIA_MODEL_MISSING' &&
+        err.message.includes('resizeListings'),
+    );
   });
 });

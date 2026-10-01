@@ -7,9 +7,10 @@
 // media model through getApp() (02 · §4). The model name comes from the `modelName` option, so
 // each Resizer loads from its own model; without it, from the app's `resize` config. The read
 // path never calls load(); resolve() receives `media` from the caller.
-import { getApp } from '../app.ts';
+
 import { ResizeConfigError } from '../errors.ts';
-import { getResizeConfig } from '../resizeConfig.ts';
+import { getApp } from '../framework/app.ts';
+import { getResizeConfig } from '../framework/config.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import type { MediaStore } from './AbstractMediaStore.ts';
 

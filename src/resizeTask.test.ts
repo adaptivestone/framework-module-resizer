@@ -20,13 +20,14 @@ import {
   ResizeNoOriginalError,
   ResizeSetupError,
 } from './errors.ts';
+import { createFrameworkResizer } from './framework/resizer.ts';
+import { runResizeWorker } from './framework/worker.ts';
 import type { LockProvider } from './locks.ts';
 import type { MediaStore } from './mediaStore.ts';
 import {
   type LeasedTask,
   type Pipeline,
   type QueueTransport,
-  Resizer,
   type ResizeStorage,
   resetResizerForTests,
   type StartWorkerOpts,
@@ -38,7 +39,7 @@ import type {
   Original,
   Preview,
 } from './types.d.ts';
-import { processTask, runResizeWorker } from './worker.ts';
+import { processTask, runWorker } from './worker.ts';
 
 // ---------------------------------------------------------------------------
 // Fixtures — built ONCE with sharp. redPng (opaque), alphaPng (fully transparent),
@@ -240,7 +241,7 @@ describe('processTask — source handling', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null);
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -266,7 +267,7 @@ describe('processTask — source handling', () => {
       original: {},
       previews: [],
     } as MediaLike);
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -294,7 +295,7 @@ describe('processTask — source handling', () => {
         },
       }),
     );
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -324,7 +325,7 @@ describe('processTask — source handling', () => {
       Buffer.from('this is definitely not an image'),
     );
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -336,7 +337,7 @@ describe('processTask — source handling', () => {
     installApp({ limits: { sourcePixels: 10 } }); // redPng is 64×48 = 3072 px
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -355,7 +356,7 @@ describe('processTask — source handling', () => {
     installApp({ limits: { inputPixels: 100 } }); // orientedJpeg 64×48 = 3072 px > 100
     const { storage, uploads } = makeStorage(orientedJpeg);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -384,7 +385,7 @@ describe('processTask — source handling', () => {
       ],
     };
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -404,7 +405,7 @@ describe('processTask — source handling', () => {
       beforeSteps: [async (buf) => sharp(buf).toBuffer()],
     };
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -435,7 +436,7 @@ describe('processTask — variants', () => {
       mediaDoc({ previews: [existing] }),
     );
     const { lockProvider, released } = makeLocks(true);
-    new Resizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({ storage, mediaStore, lockProvider });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -449,7 +450,7 @@ describe('processTask — variants', () => {
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const { lockProvider, acquired } = makeLocks(false); // acquire always fails
-    new Resizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({ storage, mediaStore, lockProvider });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
       /incomplete/,
@@ -480,7 +481,7 @@ describe('processTask — variants', () => {
         released.push(key);
       },
     };
-    new Resizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({ storage, mediaStore, lockProvider });
     await assert.rejects(
       () =>
         processTask(
@@ -522,7 +523,7 @@ describe('processTask — variants', () => {
       ],
     };
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -543,7 +544,7 @@ describe('processTask — variants', () => {
       ],
     };
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -565,7 +566,7 @@ describe('processTask — variants', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -613,7 +614,7 @@ describe('processTask — variants', () => {
     });
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -633,7 +634,7 @@ describe('processTask — variants', () => {
     });
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -654,7 +655,7 @@ describe('processTask — variants', () => {
     installApp();
     const { storage, uploads } = makeStorage(alphaPng);
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -681,7 +682,7 @@ describe('processTask — variants', () => {
     installApp({ limits: { resultDimension: 100 } });
     const { storage } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -706,7 +707,7 @@ describe('processTask — variants', () => {
     installApp();
     const { storage } = makeStorage(redPng); // 64×48
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -728,7 +729,7 @@ describe('processTask — persistence & failure handling', () => {
     installApp();
     const { storage } = makeStorage(orientedJpeg); // display 48×64
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc()); // no original dims
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -760,7 +761,7 @@ describe('processTask — persistence & failure handling', () => {
         },
       }),
     );
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -775,7 +776,7 @@ describe('processTask — persistence & failure handling', () => {
     const { storage } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(mediaDoc());
     const fired: Preview[] = [];
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -805,7 +806,7 @@ describe('processTask — persistence & failure handling', () => {
     };
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const { lockProvider, released } = makeLocks(true);
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider,
@@ -838,7 +839,7 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -883,7 +884,7 @@ describe('processTask — persistence & failure handling', () => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
     };
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -933,7 +934,7 @@ describe('processTask — persistence & failure handling', () => {
       },
       appendPreviews: async () => {},
     };
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks(false).lockProvider,
@@ -952,7 +953,7 @@ describe('processTask — persistence & failure handling', () => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
     };
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -974,7 +975,7 @@ describe('processTask — persistence & failure handling', () => {
     const controller = new AbortController();
     const { storage, uploads } = makeStorage(redPng, () => controller.abort());
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -1025,7 +1026,7 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -1072,7 +1073,7 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { mediaStore } = makeMediaStore(mediaDoc());
-    new Resizer({
+    createFrameworkResizer({
       storage,
       mediaStore,
       lockProvider: makeLocks().lockProvider,
@@ -1112,7 +1113,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null); // load unused in eager mode
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -1128,7 +1129,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const media = mediaDoc();
     const { created } = await r.generate({
       media,
@@ -1143,7 +1144,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const media = mediaDoc();
     const { created } = await r.generate({
       media,
@@ -1167,7 +1168,7 @@ describe('generate (eager)', () => {
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { mediaStore, appendCalls } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({ previews: [existing] }),
       sizes: [{ width: 20, height: 20 }],
@@ -1183,7 +1184,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1204,7 +1205,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
     const { mediaStore, appendCalls } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: {
@@ -1235,7 +1236,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -1294,7 +1295,7 @@ describe('generate (eager)', () => {
     );
     const { storage, uploads } = makeStorage(svg);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -1316,7 +1317,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1343,7 +1344,7 @@ describe('generate (eager)', () => {
       upload: async () => false,
       publicUrl: () => '/preview',
     };
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     const result = await r.generate({
       media: { id: 'scalar', original: { storageRef: 0 } },
       sizes: [{ width: 20, height: 20 }],
@@ -1361,7 +1362,7 @@ describe('generate (eager)', () => {
       upload: async () => null,
       publicUrl: () => '/preview',
     };
-    const r = new Resizer({ storage });
+    const r = createFrameworkResizer({ storage });
     await assert.rejects(
       () =>
         r.generate({
@@ -1386,7 +1387,7 @@ describe('generate (eager)', () => {
       upload: async () => ({ key: 'unused' }),
       publicUrl: () => '',
     };
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1417,7 +1418,7 @@ describe('generate (eager)', () => {
       },
       publicUrl: () => '',
     };
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1438,7 +1439,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(null);
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage,
       mediaStore,
       pipelines: {
@@ -1485,7 +1486,7 @@ describe('generate (eager)', () => {
         },
       ],
     };
-    const r = new Resizer({
+    const r = createFrameworkResizer({
       storage,
       mediaStore,
       pipelines: { photo: pipeline },
@@ -1524,7 +1525,7 @@ describe('runResizeWorker', () => {
   test('worker.enabled=false → clean no-op (startWorker NOT called); log says how to enable', async () => {
     const { logs } = installApp(); // default worker.enabled is false
     let started = false;
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport: {
         ...fakeTransport(() => {
@@ -1543,7 +1544,7 @@ describe('runResizeWorker', () => {
     const { logs, getModelCalls } = installApp({
       worker: { enabled: true },
     });
-    new Resizer({ storage: makeStorage(redPng).storage });
+    createFrameworkResizer({ storage: makeStorage(redPng).storage });
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
     assert.equal(getModelCalls(), 0);
@@ -1570,7 +1571,7 @@ describe('runResizeWorker', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
     let started = false;
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport: fakeTransport(() => {
         started = true;
@@ -1590,7 +1591,7 @@ describe('runResizeWorker', () => {
     installApp({ worker: { enabled: true } });
     const events: string[] = [];
     const { mediaStore } = makeMediaStore(null);
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport: fakeTransport(() => {
         events.push('startWorker');
@@ -1615,7 +1616,7 @@ describe('runResizeWorker', () => {
 
     resetResizerForTests();
     events.length = 0;
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport: fakeTransport(() => {
         events.push('startWorker');
@@ -1638,7 +1639,7 @@ describe('runResizeWorker', () => {
       | ((task: LeasedTask, opts?: { signal: AbortSignal }) => Promise<void>)
       | undefined;
     const { mediaStore } = makeMediaStore(null); // processTask loads null → no-op
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport: fakeTransport((h) => {
         handle = h;
@@ -1695,13 +1696,13 @@ describe('one worker serves every Resizer', () => {
     installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
     const loadedBy: string[] = [];
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       mediaStore: labelledStore('default', loadedBy),
       lockProvider: makeLocks().lockProvider,
     });
-    new Resizer({
+    createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
       transport,
@@ -1719,7 +1720,7 @@ describe('one worker serves every Resizer', () => {
   test('runResizeWorker({ queue }) consumes that queue only', async () => {
     installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       lockProvider: makeLocks().lockProvider,
@@ -1733,13 +1734,13 @@ describe('one worker serves every Resizer', () => {
     installApp({ worker: { enabled: true } });
     const a = capturingTransport();
     const b = capturingTransport();
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport: a.transport,
       lockProvider: makeLocks().lockProvider,
       mediaStore: makeMediaStore(null).mediaStore,
     });
-    new Resizer({
+    createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
       transport: b.transport,
@@ -1759,7 +1760,7 @@ describe('one worker serves every Resizer', () => {
     installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
     const seen: unknown[][] = [];
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       lockProvider: makeLocks().lockProvider,
@@ -1770,7 +1771,7 @@ describe('one worker serves every Resizer', () => {
         },
       },
     });
-    new Resizer({
+    createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
       transport,
@@ -1811,7 +1812,7 @@ describe('one worker serves every Resizer', () => {
   test('an event for an unknown Resizer is logged, not thrown', async () => {
     const { logs } = installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       lockProvider: makeLocks().lockProvider,
@@ -1825,7 +1826,7 @@ describe('one worker serves every Resizer', () => {
   test('a task for an unregistered Resizer fails with RESIZE_NO_RESIZER', async () => {
     installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       lockProvider: makeLocks().lockProvider,
@@ -1847,13 +1848,13 @@ describe('one worker serves every Resizer', () => {
   test('every Resizer verifies its media store before the worker starts', async () => {
     installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       lockProvider: makeLocks().lockProvider,
       mediaStore: makeMediaStore(null).mediaStore,
     });
-    new Resizer({
+    createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
       lockProvider: makeLocks().lockProvider,
@@ -1878,7 +1879,7 @@ describe('one worker serves every Resizer', () => {
   test('the ResizeWorker command passes --queue through', async () => {
     installApp({ worker: { enabled: true } });
     const { transport, captured } = capturingTransport();
-    new Resizer({
+    createFrameworkResizer({
       storage: makeStorage(redPng).storage,
       transport,
       lockProvider: makeLocks().lockProvider,
@@ -1908,7 +1909,7 @@ describe('scoped generation', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -1918,7 +1919,11 @@ describe('scoped generation', () => {
     assert.equal(created[0].pipeline, 'default');
 
     resetResizerForTests();
-    const listings = new Resizer({ name: 'listings', storage, mediaStore });
+    const listings = createFrameworkResizer({
+      name: 'listings',
+      storage,
+      mediaStore,
+    });
     const watermarked = await listings.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -1933,7 +1938,7 @@ describe('scoped generation', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore } = makeMediaStore(null);
-    const r = new Resizer({ storage, mediaStore });
+    const r = createFrameworkResizer({ storage, mediaStore });
     const media = mediaDoc({ previews: [cleanPreview] });
     const same = await r.generate({
       media,
@@ -1957,7 +1962,7 @@ describe('scoped generation', () => {
     const media = mediaDoc();
     const { mediaStore } = makeMediaStore(media);
     const { lockProvider, acquired } = makeLocks(true);
-    new Resizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({ storage, mediaStore, lockProvider });
     await processTask(task({ pipeline: 'watermark', previews: [variant()] }));
     assert.ok(acquired.some((key) => key.includes(':watermark:')));
   });
@@ -1970,12 +1975,70 @@ describe('scoped generation', () => {
     const { mediaStore } = makeMediaStore(media);
     // The worker lock for the watermark variant is held elsewhere, so nothing is generated.
     const { lockProvider } = makeLocks(false);
-    new Resizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({ storage, mediaStore, lockProvider });
     await assert.rejects(
       () => processTask(task({ pipeline: 'watermark', previews: [variant()] })),
       (err: unknown) =>
         err instanceof ResizeGenerateError &&
         err.code === 'RESIZE_WORKER_INCOMPLETE',
     );
+  });
+});
+
+describe('runWorker (core)', () => {
+  test('refuses a transport lease shorter than a Resizer worker-lock TTL', async () => {
+    installApp();
+    let started = false;
+    const transport: QueueTransport = {
+      leaseMs: 1000,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async () => {
+        started = true;
+      },
+    };
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    }); // default config: queue.lockTtlMs.worker = 60000
+    await assert.rejects(
+      () => runWorker({ signal: new AbortController().signal }),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+    );
+    assert.equal(started, false);
+  });
+
+  test('runs with an explicit signal and logger, without the framework worker switch', async () => {
+    installApp(); // worker.enabled is false: only the framework entry checks it
+    let seenQueue: string | undefined;
+    const transport: QueueTransport = {
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async (_handle, opts) => {
+        seenQueue = opts.queue;
+      },
+    };
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    const logged: unknown[][] = [];
+    await runWorker({
+      signal: new AbortController().signal,
+      queue: 'bulk',
+      logger: {
+        info: (...a: unknown[]) => {
+          logged.push(a);
+        },
+        warn() {},
+        error() {},
+      },
+    });
+    assert.equal(seenQueue, 'bulk');
+    assert.ok(logged.some((l) => String(l[0]).includes('stopped')));
   });
 });

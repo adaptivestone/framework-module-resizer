@@ -14,7 +14,8 @@ API ground truth: the installed `dist/index.d.ts` (main entry) and `dist/types.d
 original. Three modes share one core and one stored shape: eager (`generate()` inline,
 no queue/worker — start here), lazy (on read, worker fills `previews[]`), pre-warm
 (`prewarm()` queues the catalog at upload). The read path decides per size + format +
-filters whether a preview is ready or missing.
+filters whether a preview is ready or missing. The main entry imports no framework code; the
+framework integration is the `@adaptivestone/framework-module-resize/framework.js` adapter.
 
 The Mongo transport deduplicates identical active enqueue requests using a canonical SHA-256
 `requestKey` and a partial unique index. Its key includes the Resizer name, the queue, the
@@ -52,15 +53,16 @@ a private original.
    Appends a pointer to this guide into the host's `AGENTS.md`
    (`--agents claude|print|skip` to redirect or suppress it).
 
-3. Wire the drivers in `src/resizer.ts` — ONE constructor literal. `storage` is REQUIRED;
-   `transport` is optional (omit it for eager-only hosts); `mediaStore`/`lockProvider` default
-   to framework-backed drivers:
+3. Wire the drivers in `src/resizer.ts` — ONE construction call. `createFrameworkResizer`
+   (framework adapter) fills `config` (from `src/config/resize.ts`), the app logger, the media
+   store and, with a `transport`, the lock provider. `storage` is REQUIRED; `transport` is
+   optional (omit it for eager-only hosts):
 
    ```ts
-   import { Resizer } from '@adaptivestone/framework-module-resize';
+   import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
    import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
 
-   export const resizer = new Resizer({
+   export const resizer = createFrameworkResizer({
      storage: new LocalFsStorage({
        rootDir: './var/media',
        publicBaseUrl: '/media',
@@ -74,11 +76,14 @@ a private original.
    Other shipped drivers: `S3Storage` from
    `@adaptivestone/framework-module-resize/storage/s3.js` (options: `bucketPublic` required;
    `publicBaseUrl` — alias of the old `publicUrl` for one minor; `client` first when the host
-   already has an `S3Client`), `MongoTransport` from
-   `@adaptivestone/framework-module-resize/transports/mongo.js`, `SqsTransport` from
+   already has an `S3Client`), `createFrameworkMongoTransport()` from
+   `@adaptivestone/framework-module-resize/framework.js` (wraps `MongoTransport` from
+   `@adaptivestone/framework-module-resize/transports/mongo.js` with the scaffolded model, the app
+   logger and the config's `queue` timing), `SqsTransport` from
    `@adaptivestone/framework-module-resize/transports/sqs.js` (options: `queueUrl` required, for
    the `'default'` queue; `queues` maps other queue names to URLs; `region`, `endpoint`,
-   `visibilityTimeout`, `heartbeatInterval`, `client`),
+   `visibilityTimeout`, `heartbeatInterval`, `client`, `logger` — pass `appLogger` from the
+   framework adapter),
    `FrameworkMediaStore` from `@adaptivestone/framework-module-resize/mediaStore/framework.js`,
    `FrameworkLockProvider` from `@adaptivestone/framework-module-resize/locks/framework.js`.
    A custom driver is any object or class satisfying the exported contract types
@@ -90,8 +95,10 @@ a private original.
    ESM evaluates it before bootstrap code.
 
 5. The scaffolded `src/config/resize.ts` extends the canonical package defaults from
-   `@adaptivestone/framework-module-resize/config/resize.js`. Set
-   `mediaModelName: 'File'` (your host media model's name) and keep only host overrides there.
+   `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
+   FrameworkResizeConfig`. Set `mediaModelName: 'File'` (your host media model's name) and keep
+   only host overrides there. A second Resizer can read its own file:
+   `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
    Put environment-only changes in `resize.<NODE_ENV>.ts` (for example,
    `resize.production.ts`); the framework merges that file before
    this module reads and validates the resolved config. Do not add a second runtime merge.
@@ -241,9 +248,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 
 - `sizes` is an ALLOWLIST. Never pass client-supplied dimensions through — resolve them against
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
-- Construct each Resizer ONCE, at one construction site. Most hosts need one (`getResizer()`); for
-  more, give each a `name` and its own `config` (`getResizer('listings')`). The same name twice
-  throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
+- Construct each Resizer ONCE, at one construction site, with `createFrameworkResizer`. Most
+  hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
+  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
   for one queue (`--queue`, default `'default'`), and they must share one transport instance.
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
@@ -268,7 +275,10 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 
 | Symptom | Cause → fix |
 |---|---|
-| `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` |
+| `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
+| `RESIZE_CONFIG_REQUIRED` / `RESIZE_MEDIA_STORE_REQUIRED` at construction | `new Resizer()` takes every part explicitly — framework hosts use `createFrameworkResizer` from `…/framework.js` |
+| `RESIZE_LOCK_PROVIDER_REQUIRED` | a Resizer with a `transport` needs a `lockProvider` — `createFrameworkResizer` adds the framework one |
+| `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoTransport()` needs `{ model }` or `{ getModel }` — framework hosts use `createFrameworkMongoTransport()` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |
 | `formats [...] have no encode.formats entry` | add `encode.formats.<id>` (`{}` for Sharp defaults); use `'jpeg'`, not the alias `'jpg'` |
@@ -278,7 +288,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `RESIZE_WORKER_TRANSPORTS_DIFFER` at worker start | the Resizers in one worker use different transport instances — share one instance, or run one worker process per transport |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
-| boot throws `queue.lockTtlMs.worker … must be ≤ queue.leaseMs` | raise `queue.leaseMs` or lower `queue.lockTtlMs.worker` |
+| `queue.lockTtlMs.worker … must be ≤ queue.leaseMs` at boot, or `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` at worker start | raise the lease (`queue.leaseMs`, or the transport's `leaseMs`) or lower `queue.lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |
