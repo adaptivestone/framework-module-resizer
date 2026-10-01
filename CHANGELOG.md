@@ -64,8 +64,33 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   first. Dispatch and worker lock keys change accordingly. `expandMissingPreviews` and
   `expandPreviewRequests` take a scope; `isCatalogCovered` takes an optional one. The
   "use distinct filters per pipeline" workaround is no longer needed.
+- The framework is an adapter. The main entry imports no framework code; framework wiring moves
+  to the new `@adaptivestone/framework-module-resize/framework.js` subpath.
+  - `new Resizer()` requires `config` and `mediaStore` (and `lockProvider` with a `transport`;
+    `RESIZE_CONFIG_REQUIRED` / `RESIZE_MEDIA_STORE_REQUIRED` / `RESIZE_LOCK_PROVIDER_REQUIRED`),
+    defaults `logger` to `console`, and never reads the framework app. Framework hosts construct
+    through `createFrameworkResizer({ … })`, which fills config, logger, events, the framework
+    media store and, with a transport, the framework lock provider. Re-scaffold or update
+    `src/resizer.ts`.
+  - `MongoTransport` takes `{ model }` or `{ getModel }` plus `logger`, `leaseMs`,
+    `retryBackoffMs`, `maxAttempts`, `idlePollMs`, `taskTimeoutMs` instead of reading the global
+    config (`RESIZE_MONGO_MODEL_REQUIRED` without a model). Framework hosts use
+    `createFrameworkMongoTransport()`. `SqsTransport` takes a `logger` (framework hosts:
+    `appLogger` from `…/framework.js`).
+  - `ResizeConfig` no longer contains `mediaModelName`; `FrameworkResizeConfig` does. The scaffold
+    config `satisfies FrameworkResizeConfig`.
+  - The main entry no longer exports `ResizeWorker`, `ResizeTaskModel`, `runResizeWorker` or the
+    `TResizeTask` type; import them from `…/framework.js` (the `…/commands/ResizeWorker.js` and
+    `…/models/ResizeTask.js` subpaths still work).
 
 **Features**
+
+- Framework-free use: `new Resizer({ config, storage, mediaStore, … })`, `new MongoTransport({
+  model })` and the core `runWorker({ queue, signal, logger, sharp })` run without
+  `@adaptivestone/framework`. `runWorker` also refuses to start when a Resizer's
+  `queue.lockTtlMs.worker` exceeds the transport's `leaseMs` (`RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`).
+- Each framework Resizer can read its own config file:
+  `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
 
 - Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()`,
   `prewarm()` and `enqueueRequired()` accept a per-call `queue`. `ResizeWorker --queue=<name>`

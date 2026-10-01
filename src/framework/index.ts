@@ -12,7 +12,7 @@ export {
 export type { TResizeTask } from '../models/ResizeTask.ts';
 export { default as ResizeTaskModel } from '../models/ResizeTask.ts';
 export type { FrameworkResizeConfig } from '../types.d.ts';
-export { getApp, type TMinimalResizeApp } from './app.ts';
+export { appLogger, getApp, type TMinimalResizeApp } from './app.ts';
 export { getResizeConfig } from './config.ts';
 export {
   createFrameworkMongoTransport,
