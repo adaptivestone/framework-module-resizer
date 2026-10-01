@@ -46,6 +46,14 @@ describe('ResizeTaskModel.modelSchema — spec/08 §12 fields', () => {
     assert.equal(p.default, 'default');
   });
 
+  test('resizer and queue are Strings defaulting to "default"', () => {
+    const { resizer, queue } = ResizeTaskModel.modelSchema;
+    assert.equal(resizer.type, String);
+    assert.equal(resizer.default, 'default');
+    assert.equal(queue.type, String);
+    assert.equal(queue.default, 'default');
+  });
+
   test('requestKey is an optional String for active-request dedupe', () => {
     const requestKey = ResizeTaskModel.modelSchema.requestKey;
     assert.equal(requestKey.type, String);
@@ -129,10 +137,15 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     });
   });
 
-  test('{ status:1, createdAt:1 } with no options (lease hot path)', () => {
-    const idx = byFields(buildIndexes(), { status: 1, createdAt: 1 });
+  test('{ queue:1, status:1, createdAt:1 } with no options (lease hot path)', () => {
+    const idx = byFields(buildIndexes(), { queue: 1, status: 1, createdAt: 1 });
     assert.ok(idx);
     assert.deepEqual(idx[1], {});
+    // The queue-less lease index is gone: every lease filters by queue.
+    assert.equal(
+      byFields(buildIndexes(), { status: 1, createdAt: 1 }),
+      undefined,
+    );
   });
 
   test('{ leaseExpiresAt:1 } partial to status:processing, NOT sparse', () => {

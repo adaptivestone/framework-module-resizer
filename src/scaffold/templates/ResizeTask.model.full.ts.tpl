@@ -29,6 +29,10 @@ export default class ResizeTask extends BaseModel {
       },
       // Which registered pipeline the worker runs for this task.
       pipeline: { type: String, default: 'default' },
+      // The Resizer that queued the task (the worker runs it with that Resizer) and the named
+      // queue it waits in. Rows written before tasks recorded them read as 'default'.
+      resizer: { type: String, default: 'default' },
+      queue: { type: String, default: 'default' },
       // SHA-256 identity of the complete enqueue request. Keep this optional so
       // rows created by older module versions remain readable during upgrades.
       requestKey: { type: String },
@@ -80,8 +84,8 @@ export default class ResizeTask extends BaseModel {
         partialFilterExpression: { status: 'dead' },
       },
     );
-    // Lease hot path (+ dead-letter sweep).
-    schema.index({ status: 1, createdAt: 1 });
+    // Lease hot path: a worker consumes one queue, oldest task first.
+    schema.index({ queue: 1, status: 1, createdAt: 1 });
     // Sweep/reclaim stuck leases. NOT sparse: the partial filter on status:'processing' scopes it.
     schema.index(
       { leaseExpiresAt: 1 },

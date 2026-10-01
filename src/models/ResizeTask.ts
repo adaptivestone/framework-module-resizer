@@ -42,8 +42,12 @@ export default class ResizeTaskModel extends BaseModel {
       },
       // Which registered pipeline the worker runs for this task.
       pipeline: { type: String, default: 'default' },
-      // SHA-256 identity of the complete enqueue request (file + pipeline + canonical
-      // variants). Optional so legacy rows written before durable dedupe remain valid.
+      // The Resizer that queued the task (the worker runs it with that Resizer) and the named
+      // queue it waits in. Rows written before tasks recorded them read as 'default'.
+      resizer: { type: String, default: 'default' },
+      queue: { type: String, default: 'default' },
+      // SHA-256 identity of the complete enqueue request (file + resizer + queue + pipeline +
+      // canonical variants). Optional so legacy rows written before durable dedupe remain valid.
       requestKey: { type: String },
       // The REQUESTED variants to generate (the MissingPreview shape — NOT the full stored
       // Preview; the worker computes key/dims/contentType and $pushes those to the media doc).
@@ -100,8 +104,8 @@ export default class ResizeTaskModel extends BaseModel {
         partialFilterExpression: { status: 'dead' },
       },
     );
-    // Lease hot path (+ dead-letter sweep).
-    schema.index({ status: 1, createdAt: 1 });
+    // Lease hot path: a worker consumes one queue, oldest task first.
+    schema.index({ queue: 1, status: 1, createdAt: 1 });
     // Sweep/reclaim stuck leases. NOT sparse: a sparse index would not exclude a null
     // leaseExpiresAt — the partial filter on status:'processing' is what scopes it.
     schema.index(

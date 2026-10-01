@@ -16,12 +16,14 @@ import { ResizeError } from '../errors.ts';
 import { randomHex } from '../helpers/random.ts';
 import { sleep } from '../helpers/sleep.ts';
 import { getResizeConfig } from '../resizeConfig.ts';
-import { getResizer } from '../resizer.ts';
 import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
 import type {
   EnqueueTask,
   LeasedTask,
   QueueTransport,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
 } from './AbstractTransport.ts';
 
 // The subset of the ResizeTask document the transport reads. The model itself is dynamic
@@ -86,6 +88,34 @@ function toLeasedTask(doc: TaskDoc): LeasedTask {
   };
 }
 
+// Rows written before tasks carried a resizer/queue have neither field; they belong to
+// 'default'. `$in` with null matches a missing field.
+function named(value: string) {
+  return value === 'default' ? { $in: ['default', null] } : value;
+}
+
+// Task events go to the worker's callback, which routes them to the owning Resizer. A
+// throwing callback (a host observer bug) is logged: the task's state is already written, and
+// the worker loop must keep running.
+async function report(
+  onEvent: TaskEventHandler | undefined,
+  event: TaskEvent,
+  task: LeasedTask,
+  error?: unknown,
+): Promise<void> {
+  if (!onEvent) {
+    return;
+  }
+  try {
+    await onEvent(event, task, error);
+  } catch (err) {
+    getApp().logger.error(
+      `resize mongo transport: ${event} event handler failed`,
+      err,
+    );
+  }
+}
+
 function activeRequestFilter(
   mediaId: string,
   pipeline: string,
@@ -126,9 +156,10 @@ export class MongoTransport implements QueueTransport {
   /**
    * Atomic claim of the oldest eligible task (also reclaims a crashed worker's expired lease,
    * but NEVER an exhausted one — `attempts < maxAttempts`). Mints a fresh fencing leaseToken.
-   * Returns the leased doc or null when nothing is eligible. (05 · §10.2)
+   * Returns the leased doc or null when nothing is eligible. Only tasks of `queue` are
+   * considered, so a worker never takes another queue's work. (05 · §10.2)
    */
-  async lease(): Promise<TaskDoc | null> {
+  async lease(queue = 'default'): Promise<TaskDoc | null> {
     const model = taskModel();
     if (!model) {
       return null;
@@ -137,6 +168,7 @@ export class MongoTransport implements QueueTransport {
     const now = new Date();
     const doc = await model.findOneAndUpdate(
       {
+        queue: named(queue),
         attempts: { $lt: maxAttempts },
         $or: [
           {
@@ -165,10 +197,14 @@ export class MongoTransport implements QueueTransport {
   }
 
   /**
-   * Guarded completion. On a matched update, fire `afterTaskComplete`; a 0-match (lease lost)
-   * drops the result WITHOUT firing. Returns whether the lease was still held. (05 · §10.2)
+   * Guarded completion. On a matched update, report `completed`; a 0-match (lease lost)
+   * drops the result WITHOUT reporting. Returns whether the lease was still held. (05 · §10.2)
    */
-  async complete(taskId: string, leaseToken: string): Promise<boolean> {
+  async complete(
+    taskId: string,
+    leaseToken: string,
+    onEvent?: TaskEventHandler,
+  ): Promise<boolean> {
     const model = taskModel();
     if (!model) {
       return false;
@@ -182,15 +218,15 @@ export class MongoTransport implements QueueTransport {
     if (!doc) {
       return false;
     }
-    await getResizer().runObservers('afterTaskComplete', toLeasedTask(doc), {});
+    await report(onEvent, 'completed', toLeasedTask(doc));
     return true;
   }
 
   /**
    * Guarded failure with backoff → dead-letter. `attempts` is the lease-incremented count
    * from the leased doc. If `attempts < maxAttempts` → back to `pending` with a future
-   * leaseExpiresAt (so the pending branch only re-claims after the backoff elapses) + fire
-   * `onTaskFailed`; else → `dead` + fire `onTaskDeadLettered`. A 0-match (lease lost) is a
+   * leaseExpiresAt (so the pending branch only re-claims after the backoff elapses) + report
+   * `failed`; else → `dead` + report `deadLettered`. A 0-match (lease lost) is a
    * no-op. (05 · §10.2)
    */
   async fail(
@@ -198,6 +234,7 @@ export class MongoTransport implements QueueTransport {
     leaseToken: string,
     error: unknown,
     attempts: number,
+    onEvent?: TaskEventHandler,
   ): Promise<void> {
     const model = taskModel();
     if (!model) {
@@ -228,12 +265,7 @@ export class MongoTransport implements QueueTransport {
         { returnDocument: 'after' },
       )) as TaskDoc | null;
       if (doc) {
-        await getResizer().runObservers(
-          'onTaskFailed',
-          toLeasedTask(doc),
-          error,
-          {},
-        );
+        await report(onEvent, 'failed', toLeasedTask(doc), error);
       }
       return;
     }
@@ -249,12 +281,7 @@ export class MongoTransport implements QueueTransport {
       { returnDocument: 'after' },
     )) as TaskDoc | null;
     if (doc) {
-      await getResizer().runObservers(
-        'onTaskDeadLettered',
-        toLeasedTask(doc),
-        error,
-        {},
-      );
+      await report(onEvent, 'deadLettered', toLeasedTask(doc), error);
     }
   }
 
@@ -280,9 +307,9 @@ export class MongoTransport implements QueueTransport {
   /**
    * Per-row claim-to-dead sweep of crash-looped tasks (a worker that died never called
    * `fail`, so the task is stuck `processing`). findOneAndUpdate per row so EXACTLY ONE
-   * worker fires the observer (updateMany returns only a count → can't enumerate). (05 · §10.2)
+   * worker reports it (updateMany returns only a count → can't enumerate). (05 · §10.2)
    */
-  async sweepDeadLetters(): Promise<void> {
+  async sweepDeadLetters(onEvent?: TaskEventHandler): Promise<void> {
     const model = taskModel();
     if (!model) {
       return;
@@ -304,12 +331,7 @@ export class MongoTransport implements QueueTransport {
       if (!dead) {
         break; // none left this poll
       }
-      await getResizer().runObservers(
-        'onTaskDeadLettered',
-        toLeasedTask(dead),
-        new Error(err),
-        {},
-      );
+      await report(onEvent, 'deadLettered', toLeasedTask(dead), new Error(err));
     }
   }
 
@@ -337,6 +359,8 @@ export class MongoTransport implements QueueTransport {
         {
           $setOnInsert: {
             fileId: task.mediaId,
+            resizer: task.resizer,
+            queue: task.queue,
             pipeline: task.pipeline,
             requestKey,
             previews,
@@ -391,17 +415,15 @@ export class MongoTransport implements QueueTransport {
     return { taskId: null };
   }
 
-  async findActive(task: {
-    mediaId: string;
-    pipeline: string;
-    previews: MissingPreview[];
-  }): Promise<EnqueueReceipt[]> {
+  // Any queue: a task already waiting on another queue still covers the request.
+  async findActive(task: EnqueueTask): Promise<EnqueueReceipt[]> {
     const model = taskModel();
     if (!model) {
       return [];
     }
     const docs = (await model.find({
       fileId: task.mediaId,
+      resizer: named(task.resizer),
       pipeline: task.pipeline,
       status: { $in: ['pending', 'processing'] },
     })) as TaskDoc[];
@@ -416,7 +438,7 @@ export class MongoTransport implements QueueTransport {
       task: LeasedTask,
       taskOpts?: { signal: AbortSignal },
     ) => Promise<void>,
-    opts: { signal: AbortSignal },
+    opts: StartWorkerOpts,
   ): Promise<void> {
     const { leaseMs, idlePollMs, taskTimeoutMs } = getResizeConfig().queue;
     const heartbeatMs = Math.max(1, Math.floor(leaseMs / 2));
@@ -428,8 +450,8 @@ export class MongoTransport implements QueueTransport {
       let doc: TaskDoc | null;
       try {
         // Cheap, indexed dead-letter sweep, then claim.
-        await this.sweepDeadLetters();
-        doc = await this.lease();
+        await this.sweepDeadLetters(opts.onEvent);
+        doc = await this.lease(opts.queue);
       } catch (err) {
         getApp().logger.error(
           'resize mongo transport: poll iteration failed (sweep/lease) — retrying after idlePollMs',
@@ -507,7 +529,7 @@ export class MongoTransport implements QueueTransport {
         opts.signal.removeEventListener('abort', onShutdown);
       }
 
-      // Completion + observer firing are the transport's job.
+      // Completion and event reporting are the transport's job.
       if (timedOut) {
         // Abort the (still-running, detached) handler and fail the task; the detached work is
         // harmless — a later complete/fail is token-fenced and any $push writes valid previews.
@@ -522,12 +544,19 @@ export class MongoTransport implements QueueTransport {
             { code: 'RESIZE_TASK_TIMEOUT' },
           ),
           attempts,
+          opts.onEvent,
         );
       } else if (ok) {
         // Graceful: this in-flight task finished before we re-check opts.signal at the loop top.
-        await this.complete(task.taskId, leaseToken);
+        await this.complete(task.taskId, leaseToken, opts.onEvent);
       } else {
-        await this.fail(task.taskId, leaseToken, handlerError, attempts);
+        await this.fail(
+          task.taskId,
+          leaseToken,
+          handlerError,
+          attempts,
+          opts.onEvent,
+        );
       }
     }
   }
