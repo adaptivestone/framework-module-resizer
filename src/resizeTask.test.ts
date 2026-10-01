@@ -13,6 +13,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import ResizeWorker from './commands/ResizeWorker.ts';
 import {
   ResizeConfigError,
   ResizeGenerateError,
@@ -28,6 +29,7 @@ import {
   Resizer,
   type ResizeStorage,
   resetResizerForTests,
+  type StartWorkerOpts,
 } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type {
@@ -1539,9 +1541,8 @@ describe('runResizeWorker', () => {
     assert.equal(getModelCalls(), 0);
   });
 
-  test('a worker with no default Resizer fails before leasing', async () => {
+  test('a worker with no Resizers fails before leasing', async () => {
     installApp({ worker: { enabled: true } });
-    new Resizer({ name: 'listings', storage: makeStorage(redPng).storage });
     await assert.rejects(
       () => runResizeWorker(),
       (err: unknown) =>
@@ -1641,5 +1642,244 @@ describe('runResizeWorker', () => {
     assert.equal(typeof handle, 'function');
     // driving the handler reaches processTask without throwing (media load → null no-op)
     await handle?.(task({ previews: [variant()] }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One worker process serves every registered Resizer, for one named queue
+// ---------------------------------------------------------------------------
+
+describe('one worker serves every Resizer', () => {
+  type Handle = (
+    task: LeasedTask,
+    opts?: { signal: AbortSignal },
+  ) => Promise<void>;
+
+  function capturingTransport(): {
+    transport: QueueTransport;
+    captured: { handle?: Handle; opts?: StartWorkerOpts; calls: number };
+  } {
+    const captured: { handle?: Handle; opts?: StartWorkerOpts; calls: number } =
+      { calls: 0 };
+    const transport: QueueTransport = {
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async (handle, opts) => {
+        captured.handle = handle;
+        captured.opts = opts;
+        captured.calls += 1;
+      },
+    };
+    return { transport, captured };
+  }
+
+  // A media store that records which Resizer loaded the media (null = deleted-media no-op).
+  function labelledStore(label: string, loadedBy: string[]): MediaStore {
+    return {
+      load: async () => {
+        loadedBy.push(label);
+        return null;
+      },
+      appendPreviews: async () => {},
+    };
+  }
+
+  test('one transport serves both Resizers, and each task runs with its own Resizer', async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    const loadedBy: string[] = [];
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      mediaStore: labelledStore('default', loadedBy),
+      lockProvider: makeLocks().lockProvider,
+    });
+    new Resizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport,
+      mediaStore: labelledStore('listings', loadedBy),
+      lockProvider: makeLocks().lockProvider,
+    });
+    await runResizeWorker();
+    assert.equal(captured.calls, 1);
+    assert.equal(captured.opts?.queue, 'default');
+    await captured.handle?.(task({ resizer: 'listings' }));
+    await captured.handle?.(task());
+    assert.deepEqual(loadedBy, ['listings', 'default']);
+  });
+
+  test('runResizeWorker({ queue }) consumes that queue only', async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await runResizeWorker({ queue: 'bulk' });
+    assert.equal(captured.opts?.queue, 'bulk');
+  });
+
+  test('Resizers with different transports stop the worker before it starts', async () => {
+    installApp({ worker: { enabled: true } });
+    const a = capturingTransport();
+    const b = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport: a.transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    new Resizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport: b.transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await assert.rejects(
+      () => runResizeWorker(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_WORKER_TRANSPORTS_DIFFER',
+    );
+    assert.equal(a.captured.calls + b.captured.calls, 0);
+  });
+
+  test("task events reach only the owning Resizer's observers", async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    const seen: unknown[][] = [];
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+      hooks: {
+        afterTaskComplete: () => {
+          seen.push(['default', 'completed']);
+        },
+      },
+    });
+    new Resizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+      hooks: {
+        afterTaskComplete: () => {
+          seen.push(['listings', 'completed']);
+        },
+        onTaskFailed: (_task, error) => {
+          seen.push(['listings', 'failed', error]);
+        },
+        onTaskDeadLettered: (_task, error) => {
+          seen.push(['listings', 'dead', error]);
+        },
+      },
+    });
+    await runResizeWorker();
+    const boom = new Error('boom');
+    await captured.opts?.onEvent?.('completed', task({ resizer: 'listings' }));
+    await captured.opts?.onEvent?.(
+      'failed',
+      task({ resizer: 'listings' }),
+      boom,
+    );
+    await captured.opts?.onEvent?.(
+      'deadLettered',
+      task({ resizer: 'listings' }),
+      boom,
+    );
+    assert.deepEqual(seen, [
+      ['listings', 'completed'],
+      ['listings', 'failed', boom],
+      ['listings', 'dead', boom],
+    ]);
+  });
+
+  test('an event for an unknown Resizer is logged, not thrown', async () => {
+    const { logs } = installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await runResizeWorker();
+    await captured.opts?.onEvent?.('completed', task({ resizer: 'ghost' }));
+    assert.ok(logs.error.some((l) => String(l[0]).includes("'ghost'")));
+  });
+
+  test('a task for an unregistered Resizer fails with RESIZE_NO_RESIZER', async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await runResizeWorker();
+    await assert.rejects(
+      () => captured.handle?.(task({ resizer: 'ghost' })) ?? Promise.resolve(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_NO_RESIZER',
+    );
+    await assert.rejects(
+      () => processTask(task({ resizer: 'ghost' })),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_NO_RESIZER',
+    );
+  });
+
+  test('every Resizer verifies its media store before the worker starts', async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    new Resizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: {
+        ...makeMediaStore(null).mediaStore,
+        verify() {
+          throw new ResizeConfigError('listings store is misconfigured', {
+            code: 'LISTINGS_STORE_INVALID',
+          });
+        },
+      },
+    });
+    await assert.rejects(
+      () => runResizeWorker(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'LISTINGS_STORE_INVALID',
+    );
+    assert.equal(captured.calls, 0);
+  });
+
+  test('the ResizeWorker command passes --queue through', async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      transport,
+      lockProvider: makeLocks().lockProvider,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    assert.equal(ResizeWorker.commandArguments.queue.type, 'string');
+    assert.equal(await new ResizeWorker({}, {}, { queue: 'bulk' }).run(), true);
+    assert.equal(captured.opts?.queue, 'bulk');
+    await new ResizeWorker({}, {}, {}).run();
+    assert.equal(captured.opts?.queue, 'default');
   });
 });
