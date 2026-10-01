@@ -57,6 +57,13 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   the new index through your migration. Rows without the new fields read as `'default'`.
 - `processTask(task)` runs the task with the Resizer named in it; an unknown name rejects with
   `RESIZE_NO_RESIZER` (the task retries, then dead-letters).
+- Preview identity includes the Resizer and pipeline: `getPreviewIdentity(scope, sizeKey, format,
+  filters)` returns `resizer:pipeline:sizeKey:format:filterSig`. Generated preview rows store
+  `resizer` and `pipeline` (rows without them belong to `default`), so different pipelines and
+  Resizers keep separate previews of the same media instead of sharing whichever was generated
+  first. Dispatch and worker lock keys change accordingly. `expandMissingPreviews` and
+  `expandPreviewRequests` take a scope; `isCatalogCovered` takes an optional one. The
+  "use distinct filters per pipeline" workaround is no longer needed.
 
 **Features**
 

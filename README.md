@@ -647,8 +647,12 @@ never a raw driver document — so a host tap is portable across transports.
 ## Sizes & identity
 
 A size becomes a canonical **size key** via `getSizeKey`, and the full lookup/lock **identity** is
-`sizeKey:format:filterSig`. Filters are part of identity (empty → `none`), so a blurred variant is a
-distinct object.
+`resizer:pipeline:sizeKey:format:filterSig`. Filters are part of identity (empty → `none`), so a
+blurred variant is a distinct object. The Resizer and pipeline are part of it too: each generated
+preview row records `resizer` and `pipeline` (a row without them belongs to `default`), so a
+`watermark` pipeline and the `default` pipeline keep separate previews of the same media, and so
+do two Resizers. A name does not notice when a pipeline's code changes; rename the pipeline (for
+example `watermark-v2`) to regenerate its images.
 
 | Size input | Size key | Meaning |
 |---|---|---|
@@ -682,6 +686,7 @@ import {
 } from '@adaptivestone/framework-module-resize';
 
 isCatalogCovered(media, sizes, formats); // optional skip; generate is already a no-op when covered
+isCatalogCovered(media, sizes, formats, { resizer: 'default', pipeline: 'watermark' }); // another pipeline
 File.find().select(['mediaType', ...resizeMediaPaths]);
 formatPictureUrls(decision, { id }); // unfiltered <picture> map; filtered variants stay on decision
 ```
