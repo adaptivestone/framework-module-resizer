@@ -49,7 +49,8 @@ a private original.
    ```
 
    `--eager` emits `src/resizer.ts` (LocalFsStorage already wired) + `src/config/resize.ts`.
-   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts`.
+   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts` (a
+   subclass of the module's command that loads `src/resizer.ts` before the worker starts).
    Appends a pointer to this guide into the host's `AGENTS.md`
    (`--agents claude|print|skip` to redirect or suppress it).
 
@@ -90,9 +91,11 @@ a private original.
    (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`) — no `app` parameter;
    a driver closes over its own client.
 
-4. Dynamically load the construction site from each process that needs it (API; and the worker,
-   if any) **after** `Server.init()`: `await import('./resizer.ts')`. Do not use a static import;
-   ESM evaluates it before bootstrap code.
+4. In the API process, dynamically load the construction site **after** `Server.init()`:
+   `await import('./resizer.ts')`. Do not use a static import; ESM evaluates it before bootstrap
+   code. The worker process loads it from the scaffolded `src/commands/ResizeWorker.ts`, whose
+   `run()` does `await import('../resizer.ts')` before `super.run()`; keep that line if you edit
+   the command.
 
 5. The scaffolded `src/config/resize.ts` extends the canonical package defaults from
    `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
@@ -262,8 +265,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
-- The scaffolded model/command shims re-export the package: do not vendor or fork them. Gate
-  drift in CI with `npx resize-scaffold --check`.
+- The scaffolded model/command shims extend the package: do not vendor or fork them. The command
+  must keep loading `../resizer.ts` in `run()`. Gate drift in CI with `npx resize-scaffold --check`.
 - SVG originals stay private. The worker rasterizes SVG into the requested public preview
   formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
   shortcut returns uploaded SVG markup.
@@ -284,7 +287,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `formats [...] have no encode.formats entry` | add `encode.formats.<id>` (`{}` for Sharp defaults); use `'jpeg'`, not the alias `'jpg'` |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import | optional peer not installed — see step 1 |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
-| `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in both the API and the worker process |
+| `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` is the old bare re-export — delete it and re-run `npx resize-scaffold` (it then loads `src/resizer.ts`) |
+| `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
 | `RESIZE_WORKER_TRANSPORTS_DIFFER` at worker start | the Resizers in one worker use different transport instances — share one instance, or run one worker process per transport |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |

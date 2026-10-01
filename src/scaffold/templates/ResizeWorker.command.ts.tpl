@@ -1,5 +1,14 @@
-// src/commands/ResizeWorker.ts — scaffolded thin re-export (08 · §12). The MODULE owns the
-// command (AbstractCommand shape, isShouldInitModels=true); this file only names it so the
-// framework's filename-keyed CLI loader registers `npm run cli ResizeWorker`. Auto-updates
-// with the package — no drift.
-export { default } from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
+// src/commands/ResizeWorker.ts — scaffolded (08 · §12). The MODULE owns the worker command
+// (AbstractCommand shape, isShouldInitModels=true, --queue); this subclass only builds the host's
+// Resizers in the CLI process before the worker starts. The framework's filename-keyed CLI loader
+// registers it as `npm run cli ResizeWorker`.
+import ModuleResizeWorker from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
+
+export default class ResizeWorker extends ModuleResizeWorker {
+  async run(): Promise<boolean> {
+    // The worker routes each task to the Resizer named in it, so every Resizer must exist in this
+    // process. The CLI has loaded config and models by now, so the construction site can run.
+    await import('../resizer.ts');
+    return super.run();
+  }
+}
