@@ -440,7 +440,9 @@ describe('prewarm — never throws', () => {
       formats: ['jpeg'],
     });
     assert.equal(enqueued, 0);
-    assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
+    assert.deepEqual(released, [
+      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    ]);
   });
 
   test('an internal error (lockProvider.acquire throws) is caught → { enqueued: 0 }, logged', async () => {
@@ -529,5 +531,43 @@ describe('prewarm — fast-path is NOT consulted', () => {
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
       ['300x300:jpeg'],
     );
+  });
+});
+
+describe('prewarm — pipelines are part of identity', () => {
+  test('a default preview does not satisfy a watermark prewarm', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const { lockProvider } = makeLocks(true);
+    const r = new Resizer({ storage: makeStorage(), transport, lockProvider });
+    const media = {
+      id: 'm1',
+      original: { storageRef: { key: 'orig.jpg' } },
+      previews: [
+        {
+          storageRef: { key: 'p.webp' },
+          sizeKey: '300x300',
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+      ],
+    };
+    const sizes = [{ width: 300, height: 300 }];
+    assert.equal(
+      (await r.prewarm({ media, sizes, formats: ['webp'] })).enqueued,
+      0,
+    );
+    assert.equal(
+      (
+        await r.prewarm({
+          media,
+          sizes,
+          formats: ['webp'],
+          pipeline: 'watermark',
+        })
+      ).enqueued,
+      1,
+    );
+    assert.equal(calls[0].pipeline, 'watermark');
   });
 });

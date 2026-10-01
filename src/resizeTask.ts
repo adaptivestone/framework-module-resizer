@@ -23,6 +23,7 @@ import {
   expandMissingPreviews,
   getPreviewIdentity,
   isUsablePreview,
+  previewScope,
   requireMediaId,
 } from './images.ts';
 import type {
@@ -35,6 +36,7 @@ import type {
   MediaLike,
   MissingPreview,
   Preview,
+  PreviewScope,
   SizeInput,
 } from './types.d.ts';
 
@@ -169,11 +171,15 @@ export async function generatePreviews(
     );
   }
 
-  // 6. Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6).
+  // 6. Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6). Stored
+  // previews keep their own scope, so another pipeline's rendering never counts as done here.
+  const scope: PreviewScope = { resizer: resizer.name, pipeline: pipelineName };
   const existing = new Set<string>();
   for (const p of media.previews ?? []) {
     if (isUsablePreview(p)) {
-      existing.add(getPreviewIdentity(p.sizeKey, p.format, p.filters));
+      existing.add(
+        getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
+      );
     }
   }
 
@@ -237,7 +243,7 @@ export async function generatePreviews(
   const heldLocks = new Set<string>();
 
   const processVariant = async (v: MissingPreview): Promise<void> => {
-    const identity = getPreviewIdentity(v.sizeKey, v.format, v.filters);
+    const identity = getPreviewIdentity(scope, v.sizeKey, v.format, v.filters);
     const dispatchKey = `resize_dispatch:${mediaId}:${identity}`;
     const workerKey = `resize_worker:${mediaId}:${identity}`;
 
@@ -368,6 +374,8 @@ export async function generatePreviews(
 
       const preview: Preview = {
         storageRef: ref,
+        resizer: resizer.name,
+        pipeline: pipelineName,
         sizeKey: v.sizeKey,
         format: v.format,
         contentType,
@@ -470,9 +478,14 @@ export async function processTaskWith(
   if (media.original?.storageRef == null) {
     throw new ResizeNoOriginalError(task.mediaId);
   }
+  const scope: PreviewScope = {
+    resizer: resizer.name,
+    pipeline: task.pipeline,
+  };
   const requestedByIdentity = new Map<string, MissingPreview>();
   for (const preview of canonicalizeVariants(task.previews)) {
     const identity = getPreviewIdentity(
+      scope,
       preview.sizeKey,
       preview.format,
       preview.filters,
@@ -511,19 +524,34 @@ export async function processTaskWith(
   ]) {
     if (isUsablePreview(preview)) {
       covered.add(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          previewScope(preview),
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       );
     }
   }
   const missing = requested.filter(
     (preview) =>
       !covered.has(
-        getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       ),
   );
   if (missing.length > 0) {
     const missingIdentities = missing.map((preview) =>
-      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      getPreviewIdentity(
+        scope,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
+      ),
     );
     throw new ResizeGenerateError({
       mediaId: task.mediaId,
@@ -567,7 +595,10 @@ export async function generateImpl(
   const formats = opts.formats ?? config.formats;
 
   // Expand sizes × formats; skip unbuildable sizes + existing identities (idempotent).
-  const requested = expandMissingPreviews(media, sizes, formats);
+  const requested = expandMissingPreviews(media, sizes, formats, {
+    resizer: resizer.name,
+    pipeline,
+  });
 
   const persist = opts.persist !== false;
   const { generated, failedCount } = await generatePreviews(resizer, {

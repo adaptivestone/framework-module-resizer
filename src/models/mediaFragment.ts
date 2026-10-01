@@ -37,6 +37,9 @@ export const resizeMediaSchemaFragment = {
   previews: [
     {
       storageRef: { type: 'Mixed' },
+      // Resizer and pipeline that generated this preview; absent means 'default'.
+      resizer: { type: String },
+      pipeline: { type: String },
       sizeKey: { type: String },
       // Filters bag (Mixed). 'Mixed' string alias keeps this import-free; the host
       // tightens the whole array with TsTypeOverride<Preview[]> for exact field types.

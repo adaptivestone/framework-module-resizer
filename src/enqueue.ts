@@ -11,6 +11,7 @@ import type {
   EnqueueIssue,
   EnqueueReceipt,
   MissingPreview,
+  PreviewScope,
 } from './types.d.ts';
 
 function normalizeVariant(variant: MissingPreview): MissingPreview {
@@ -120,10 +121,12 @@ export async function enqueue(
   // complete request key.
   const canonical = canonicalizeVariants(missing);
 
-  // 2. Dedup by identity — the one lookup/lock key, built one way (03 · Identity).
+  // 2. Dedup by identity — the one lookup/lock key, built one way (03 · Identity). The scope
+  // keeps another pipeline's (or Resizer's) dispatch lock from suppressing this request.
+  const scope: PreviewScope = { resizer: resizer.name, pipeline };
   const byIdentity = new Map<string, MissingPreview>();
   for (const m of canonical) {
-    const identity = getPreviewIdentity(m.sizeKey, m.format, m.filters);
+    const identity = getPreviewIdentity(scope, m.sizeKey, m.format, m.filters);
     if (!byIdentity.has(identity)) {
       byIdentity.set(identity, m);
     }
@@ -208,10 +211,14 @@ interface VariantGroups {
  * Canonicalize a complete payload before grouping it by preview identity. Exact duplicate
  * payloads are harmless; different payloads sharing an identity are not safe to confirm.
  */
-function groupVariants(variants: readonly MissingPreview[]): VariantGroups {
+function groupVariants(
+  variants: readonly MissingPreview[],
+  scope: PreviewScope,
+): VariantGroups {
   const grouped = new Map<string, MissingPreview[]>();
   for (const preview of canonicalizeVariants(variants)) {
     const identity = getPreviewIdentity(
+      scope,
       preview.sizeKey,
       preview.format,
       preview.filters,
@@ -266,7 +273,10 @@ export async function enqueueConfirmed(
     };
   }
 
-  const requestedGroups = groupVariants(canonical);
+  // Receipts from findActive belong to the same Resizer and pipeline (the transport filters by
+  // both), so one scope covers every identity built here.
+  const scope: PreviewScope = { resizer: resizer.name, pipeline };
+  const requestedGroups = groupVariants(canonical, scope);
   const byIdentity = requestedGroups.unique;
   const conflicts = [...requestedGroups.conflicts.values()].flat();
   const winners: MissingPreview[] = [];
@@ -329,6 +339,7 @@ export async function enqueueConfirmed(
         tasks.push(receipt);
         for (const preview of winners) {
           const identity = getPreviewIdentity(
+            scope,
             preview.sizeKey,
             preview.format,
             preview.filters,
@@ -377,7 +388,7 @@ export async function enqueueConfirmed(
         // Inspect the complete receipt before matching any requested payload. Filtering to
         // the requested payload first would hide a second payload that makes the identity
         // ambiguous in the active task.
-        const receiptGroups = groupVariants(receipt.previews);
+        const receiptGroups = groupVariants(receipt.previews, scope);
         for (const identity of receiptGroups.conflicts.keys()) {
           const requested = unresolved.get(identity);
           if (requested && !activeReceiptConflicts.has(identity)) {
@@ -427,17 +438,32 @@ export async function enqueueConfirmed(
   }
   const unresolvedIdentities = new Set(
     unconfirmed.map((preview) =>
-      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      getPreviewIdentity(
+        scope,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
+      ),
     ),
   );
   const remainingContended = lockContended.filter((preview) =>
     unresolvedIdentities.has(
-      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      getPreviewIdentity(
+        scope,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
+      ),
     ),
   );
   const remainingFailed = lockFailed.filter((preview) =>
     unresolvedIdentities.has(
-      getPreviewIdentity(preview.sizeKey, preview.format, preview.filters),
+      getPreviewIdentity(
+        scope,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
+      ),
     ),
   );
   if (remainingContended.length > 0) {

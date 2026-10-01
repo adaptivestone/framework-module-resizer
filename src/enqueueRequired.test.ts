@@ -611,3 +611,41 @@ describe('enqueueRequired — lock races and retries', () => {
     );
   });
 });
+
+describe('enqueueRequired — pipelines are part of identity', () => {
+  test('a default preview does not make a watermark request ready', async () => {
+    installApp();
+    const transport: QueueTransport = {
+      enqueue: async () => ({ taskId: 'task-1' }),
+      startWorker: async () => {},
+    };
+    const r = new Resizer({
+      storage,
+      transport,
+      lockProvider: locks().lockProvider,
+    });
+    const media = {
+      id: 'm1',
+      original: { storageRef: { key: 'original.jpg' } },
+      previews: [
+        {
+          storageRef: { key: 'p.jpg' },
+          sizeKey: '300x300',
+          format: 'jpeg',
+          contentType: 'image/jpeg',
+        },
+      ],
+    };
+    const sizes = [{ width: 300, height: 300 }];
+    const clean = await r.enqueueRequired({ media, sizes, formats: ['jpeg'] });
+    assert.equal(clean.status, 'ready');
+    const watermarked = await r.enqueueRequired({
+      media,
+      sizes,
+      formats: ['jpeg'],
+      pipeline: 'watermark',
+    });
+    assert.equal(watermarked.status, 'accepted');
+    assert.equal(watermarked.accepted.length, 1);
+  });
+});

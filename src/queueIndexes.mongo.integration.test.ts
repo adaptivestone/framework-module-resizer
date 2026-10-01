@@ -7,7 +7,7 @@ import {
 import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import { getPreviewIdentity } from './images.ts';
+import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
 import { FrameworkLockProvider } from './locks/framework.ts';
 import ResizeTaskModel from './models/ResizeTask.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
@@ -201,7 +201,7 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       previews: conflictingPreviews,
     });
 
-    const identity = getPreviewIdentity('30w', 'webp');
+    const identity = getPreviewIdentity(DEFAULT_SCOPE, '30w', 'webp');
     assert.equal(
       await fixture.lockProvider.acquire(
         `resize_dispatch:${mediaId}:${identity}`,

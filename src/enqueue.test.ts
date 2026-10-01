@@ -218,8 +218,8 @@ describe('enqueue', () => {
     assert.deepEqual(
       acquired.map((a) => a.key),
       [
-        'resize_dispatch:m1:300x300:jpeg:none',
-        'resize_dispatch:m1:300x300:webp:none',
+        'resize_dispatch:m1:default:default:300x300:jpeg:none',
+        'resize_dispatch:m1:default:default:300x300:webp:none',
       ],
     );
     assert.equal(acquired[0].ttl, 60000);
@@ -306,7 +306,9 @@ describe('enqueue', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
-    assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
+    assert.deepEqual(released, [
+      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    ]);
     assert.ok(errors.length >= 1);
     assert.equal(enqueued, 0); // a throw released the locks → nothing durably queued
   });
@@ -317,7 +319,9 @@ describe('enqueue', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = makeResizer({ transport, lockProvider });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
-    assert.deepEqual(released, ['resize_dispatch:m1:300x300:jpeg:none']);
+    assert.deepEqual(released, [
+      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    ]);
     assert.ok(errors.length >= 1);
     assert.equal(enqueued, 0); // null taskId → soft failure → not counted
   });
@@ -378,5 +382,27 @@ describe('buildRequestKey', () => {
     const key = buildRequestKey(base);
     assert.notEqual(buildRequestKey({ ...base, resizer: 'listings' }), key);
     assert.notEqual(buildRequestKey({ ...base, queue: 'bulk' }), key);
+  });
+});
+
+describe('dispatch locks are scoped per resizer and pipeline', () => {
+  test('two pipelines of the same variant both reach the transport', async () => {
+    installFakeApp();
+    const { transport, calls } = makeTransport();
+    const held = new Set<string>();
+    // Grants each lock key once: a second request for the SAME key is a loser.
+    const { lockProvider, acquired } = makeLocks((key) => {
+      if (held.has(key)) {
+        return false;
+      }
+      held.add(key);
+      return true;
+    });
+    const r = makeResizer({ transport, lockProvider });
+    await enqueue(r, 'm1', 'default', [variant()], 'default');
+    await enqueue(r, 'm1', 'watermark', [variant()], 'default');
+    assert.equal(calls.length, 2);
+    assert.notEqual(acquired[0].key, acquired[1].key);
+    assert.ok(acquired[1].key.includes(':watermark:'));
   });
 });
