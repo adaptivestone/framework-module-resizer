@@ -1,5 +1,5 @@
-// Storage contract (05 · §10.4) — NO `app` parameter anywhere; shipped drivers reach the
-// framework through getApp(), custom ones close over their own. This is an INTERFACE, not an
+// Storage contract (05 · §10.4) — NO `app` parameter anywhere; every driver closes over its own
+// client (the shipped drivers import no framework code). This is an INTERFACE, not an
 // abstract class: drivers are plain object literals by design (05 · §10.5). It lives in its own
 // file so the optional-peer S3 driver can import it WITHOUT depending on resizer.ts (the driver
 // is a subpath-only entry — 05 · §10.5); it is re-exported from resizer.ts so every existing

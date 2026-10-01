@@ -93,8 +93,8 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
 
 - Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()`,
-  `prewarm()` and `enqueueRequired()` accept a per-call `queue`. `ResizeWorker --queue=<name>`
-  consumes only that queue; without the flag it consumes `'default'`. `SqsTransport` maps queue
+  `prewarm()` and `enqueueRequired()` accept a per-call `queue`.
+  `npm run cli ResizeWorker -- --queue=<name>` consumes only that queue; without the flag it consumes `'default'`. `SqsTransport` maps queue
   names to URLs with the new `queues` option (`RESIZE_SQS_QUEUE_UNKNOWN` for an unknown name).
 - One worker process serves every Resizer constructed in it, routing each task to the Resizer
   named in it. Its Resizers must share one transport instance (`RESIZE_WORKER_TRANSPORTS_DIFFER`

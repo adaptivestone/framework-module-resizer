@@ -24,9 +24,8 @@ import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
 // Fakes. The Resizer stores passed driver references verbatim (identity checks);
-// omitted defaults are fresh framework-driver instances (instanceof checks). The
-// hook bus needs a recording ambient app (logger/events), which the Resizer reads
-// when it is constructed — stolen from the old hooks.test.ts harness.
+// createFrameworkResizer fills omitted parts with framework-driver instances (instanceof
+// checks) and takes the logger/events from the recording fake app installed here.
 // ---------------------------------------------------------------------------
 
 const fakeTransport = (): QueueTransport => ({

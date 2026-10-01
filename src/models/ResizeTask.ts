@@ -3,8 +3,9 @@
 // shim — the MODULE owns the schema + indexes; the shim only names the file so the
 // framework's filename-keyed loader registers `getModel('ResizeTask')` (08 · §12).
 //
-// This is ONE of exactly TWO files allowed to import `@adaptivestone/framework` (the
-// other is src/app.ts) — 01 · §2.3/§16. `mongoose` is imported NOWHERE in src/: schema
+// This is one of the two files that import `@adaptivestone/framework` (the other is
+// src/framework/app.ts). It is exported only from the `…/framework.js` and
+// `…/models/ResizeTask.js` subpaths, never from the main entry (src/importGraph.test.ts). `mongoose` is imported NOWHERE in src/: schema
 // field types use mongoose's STRING aliases ('ObjectId','Mixed') or global constructors
 // (String/Number/Boolean/Date), and the `initHooks` schema param is typed via
 // `Parameters<typeof BaseModel.initHooks>[0]` — reusing the framework's own already-
