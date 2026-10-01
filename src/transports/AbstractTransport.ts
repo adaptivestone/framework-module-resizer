@@ -1,5 +1,5 @@
-// Queue transport contract (05 · §10.1) — NO `app` parameter anywhere; shipped drivers reach
-// the framework through getApp(), custom ones close over their own. This is an INTERFACE, not
+// Queue transport contract (05 · §10.1) — NO `app` parameter anywhere; drivers receive what they
+// need as constructor options (the framework adapter's createFrameworkMongoTransport fills them). This is an INTERFACE, not
 // an abstract class: drivers are plain object literals by design (05 · §10.3). It lives in its
 // own file so the optional-peer SQS driver can import it WITHOUT depending on resizer.ts (the
 // driver is a subpath-only entry — 05 · §10.3); it is re-exported from resizer.ts so every

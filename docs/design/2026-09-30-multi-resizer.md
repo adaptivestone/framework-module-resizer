@@ -1,8 +1,8 @@
 # Multi-resizer architecture — review and plan
 
-Status: agreed direction, 2026-09-30. Implementation runs in phases; each phase gets its own
-plan in `docs/superpowers/plans/`. Phase 1:
-[`2026-09-30-p1-resizer-owns-context.md`](../superpowers/plans/2026-09-30-p1-resizer-owns-context.md).
+Status: **P1–P4 implemented and merged** (PRs #32–#35, 2026-10-01); P5 items are open and
+optional. Each phase has its plan in `docs/superpowers/plans/` (linked from §6). The redesigned
+version is not published yet.
 
 The module's image logic is sound; its wiring is not. Core code reaches process-wide globals —
 the framework app, "the" Resizer, "the" config — instead of receiving what it needs. As a
@@ -142,24 +142,29 @@ rationale:
 | Replace hooks with constructor callbacks | Rejected | Hooks are already per instance and can be seeded at construction. Only the framework event mirror moves (D7). |
 | Merge `prewarm` and `enqueueRequired` | Deferred to phase 5 | Not needed for multiple Resizers. |
 
-## 5. Target wiring (sketch — final names are set in each phase plan)
+## 5. Wiring (as implemented)
 
 Framework host:
 
 ```ts
 // src/resizer.ts, loaded after `await server.init()`
-const transport = new MongoTransport();
-export const media = new Resizer({ storage, transport });            // name 'default'
-export const listings = new Resizer({
+import {
+  createFrameworkMongoTransport,
+  createFrameworkResizer,
+} from '@adaptivestone/framework-module-resize/framework.js';
+
+const transport = createFrameworkMongoTransport();
+export const media = createFrameworkResizer({ storage, transport }); // name 'default', config 'resize'
+export const listings = createFrameworkResizer({
   name: 'listings',
-  config: listingsConfig,                                            // own formats and limits
+  configName: 'resizeListings',                                      // own formats and limits
   storage: listingsStorage,
   transport,                                                         // same queue, same worker
   pipelines: { watermark },
 });
 ```
 
-Framework-free host (after phase 4):
+Framework-free host:
 
 ```ts
 const resizer = new Resizer({
@@ -167,8 +172,10 @@ const resizer = new Resizer({
   logger: console,
   storage: new LocalFsStorage({ rootDir: './media', publicBaseUrl: '/media' }),
   mediaStore,     // load + appendPreviews over the host's database
-  lockProvider,   // only for queued mode
+  transport: new MongoTransport({ model: ResizeTask }), // queued modes only
+  lockProvider,   // required with a transport
 });
+await runWorker({ signal });  // in the worker process
 ```
 
 Queued task:
@@ -180,8 +187,8 @@ Queued task:
 Worker:
 
 ```sh
-npm run cli ResizeWorker               # queue 'default'
-npm run cli ResizeWorker --queue=bulk  # queue 'bulk' only
+npm run cli ResizeWorker                  # queue 'default'
+npm run cli ResizeWorker -- --queue=bulk  # queue 'bulk' only
 ```
 
 ## 6. Phases
