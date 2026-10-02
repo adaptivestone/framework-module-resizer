@@ -1,7 +1,7 @@
 // Builds Resizers and the Mongo transport from the framework app. The core takes every part
 // explicitly; these helpers fill the parts a framework host would otherwise repeat: the config
-// file, the app logger and event bus, the framework media store and lock provider, and the
-// ResizeTask model.
+// file, the app logger and event bus, the framework media store, and for the transport the
+// ResizeTask model and the framework Lock model.
 
 import type { MediaStore } from '../contracts/mediaStore.ts';
 import {
@@ -15,7 +15,7 @@ import type {
   ResizeLogger,
 } from '../types.d.ts';
 import { appLogger, getApp } from './app.ts';
-import { getResizeConfig } from './config.ts';
+import { getResizeConfig, resolveFrameworkConfig } from './config.ts';
 import { FrameworkLockStore } from './lockStore.ts';
 import { FrameworkMediaStore } from './mediaStore.ts';
 
@@ -29,47 +29,43 @@ export interface FrameworkResizerOptions
 }
 
 /**
- * A Resizer wired from the framework app. Explicit options win; a `transport` without a
- * `lockProvider` gets the framework `Lock` model's FrameworkLockStore.
+ * A Resizer wired from the framework app: the config file's image settings, the app logger and
+ * events, and FrameworkMediaStore for the file's `mediaModelName`. Explicit options win.
  */
 export function createFrameworkResizer(opts: FrameworkResizerOptions): Resizer {
   const { configName, config: explicitConfig, ...rest } = opts;
-  const config = explicitConfig ?? getResizeConfig(configName);
+  const config = explicitConfig
+    ? resolveFrameworkConfig(explicitConfig, configName)
+    : getResizeConfig(configName);
   const events = opts.events ?? getApp().events;
   return new Resizer({
     ...rest,
-    config,
+    config: config.image,
     logger: opts.logger ?? getApp().logger,
     ...(events === undefined ? {} : { events }),
     mediaStore:
       opts.mediaStore ??
       new FrameworkMediaStore({ modelName: config.mediaModelName }),
-    ...(opts.transport && !opts.lockProvider
-      ? { lockProvider: new FrameworkLockStore() }
-      : {}),
   });
 }
 
 /**
  * A MongoTransport on the framework's `ResizeTask` model (resolved on each use, so it works
- * before models load), logging through the app, with lease and retry timing from the config
- * file's `queue` section. Explicit options win.
+ * before models load) and the framework's `Lock` model, logging through the app, with timing
+ * from the config file's `queue` section. Explicit options win.
  */
 export function createFrameworkMongoTransport(
   opts: Partial<Omit<MongoTransportOptions, 'model' | 'getModel'>> & {
     configName?: string;
   } = {},
 ): MongoTransport {
-  const { configName, ...overrides } = opts;
+  const { configName, locks, ...overrides } = opts;
   const { queue } = getResizeConfig(configName);
   return new MongoTransport({
     getModel: () => getApp().getModel('ResizeTask'),
     logger: appLogger,
-    leaseMs: queue.leaseMs,
-    retryBackoffMs: queue.retryBackoffMs,
-    maxAttempts: queue.maxAttempts,
-    idlePollMs: queue.idlePollMs,
-    taskTimeoutMs: queue.taskTimeoutMs,
+    ...queue,
     ...overrides,
+    locks: locks ?? new FrameworkLockStore(),
   });
 }

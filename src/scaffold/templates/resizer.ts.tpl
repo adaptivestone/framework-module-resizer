@@ -9,9 +9,9 @@
 // `import { resizer }`. Construct each name once.
 //
 // Everything below is wired EXCEPT `storage` (REQUIRED): fill the storage TODO and you're done.
-// createFrameworkResizer fills config (src/config/resize.ts), the app logger, the media store and
-// the lock provider from the framework app; createFrameworkMongoTransport uses the scaffolded
-// ResizeTask model and the queue timing from the same config.
+// createFrameworkResizer fills config (src/config/resize.ts), the app logger and the media store
+// from the framework app; createFrameworkMongoTransport uses the scaffolded ResizeTask model, the
+// framework Lock model and the `queue` timing from the same config.
 import {
   createFrameworkMongoTransport,
   createFrameworkResizer,

@@ -7,9 +7,15 @@ import {
 import { ResizeConfigError } from '../errors.ts';
 import { getResizeConfig } from '../framework/config.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
-import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
-import type { ResizeConfig } from '../types.d.ts';
-import defaultResizeConfig from './resize.ts';
+import {
+  makeImageConfig,
+  makeResizeConfig,
+} from '../testHelpers/resizeConfig.ts';
+import defaultResizeConfig, {
+  defaultFrameworkResizeConfig,
+  defaultQueueOptions,
+  defaultWorkerOptions,
+} from './resize.ts';
 
 function install(config: unknown) {
   resetAppInstance();
@@ -34,14 +40,22 @@ describe('getResizeConfig', () => {
       'gif',
       'svg',
     ]);
-    assert.equal(defaultResizeConfig.worker.enabled, false);
+    // The core config holds image settings only; the framework defaults add queue and worker.
+    assert.equal('queue' in defaultResizeConfig, false);
+    assert.equal('worker' in defaultResizeConfig, false);
+    assert.equal(defaultResizeConfig.concurrency, 4);
+    assert.equal(defaultFrameworkResizeConfig.worker.enabled, false);
+    assert.equal(defaultFrameworkResizeConfig.queue, defaultQueueOptions);
   });
 
   test('returns the final framework config without merging another defaults object', () => {
     const config = makeResizeConfig({ formats: ['webp'] });
     install(config);
-    assert.strictEqual(getResizeConfig(), config);
-    assert.deepEqual(getResizeConfig().formats, ['webp']);
+    const resolved = getResizeConfig();
+    assert.strictEqual(getResizeConfig(), resolved);
+    assert.strictEqual(resolved.image.formats, config.formats);
+    assert.strictEqual(resolved.queue, config.queue);
+    assert.deepEqual(resolved.image.formats, ['webp']);
   });
 
   test('validates one cached framework config object once', () => {
@@ -65,7 +79,7 @@ describe('getResizeConfig', () => {
 
   test('validateResizeConfig checks a config without a framework app', () => {
     resetAppInstance();
-    const config = makeResizeConfig({ formats: ['webp'] });
+    const config = makeImageConfig({ formats: ['webp'] });
     assert.strictEqual(validateResizeConfig(config), config);
     assert.throws(
       () => validateResizeConfig({ ...config, formats: [] }),
@@ -82,8 +96,8 @@ describe('getResizeConfig', () => {
       encode: { formats: { tiff: { compression: 'lzw' } } },
     });
     install(config);
-    assert.deepEqual(getResizeConfig().formats, ['tiff']);
-    assert.deepEqual(getResizeConfig().upload.formats, ['tiff', 'heif']);
+    assert.deepEqual(getResizeConfig().image.formats, ['tiff']);
+    assert.deepEqual(getResizeConfig().image.upload.formats, ['tiff', 'heif']);
   });
 
   test('rejects a partial host config because the framework config must be complete', () => {
@@ -170,7 +184,7 @@ describe('getResizeConfig', () => {
       encode: { formats: { png: {} } },
     });
     install(config);
-    assert.deepEqual(getResizeConfig().formats, ['png']);
+    assert.deepEqual(getResizeConfig().image.formats, ['png']);
   });
 
   test('throws clearly when the framework app is not initialized', () => {
@@ -179,12 +193,12 @@ describe('getResizeConfig', () => {
   });
 
   test('preserves the framework-provided object and nested encoder options', () => {
-    const config: ResizeConfig = makeResizeConfig({
+    const config = makeResizeConfig({
       encode: { formats: { webp: { quality: 71, effort: 6 } } },
     });
     install(config);
-    assert.strictEqual(getResizeConfig(), config);
-    assert.deepEqual(getResizeConfig().encode.formats.webp, {
+    assert.strictEqual(getResizeConfig().image.encode, config.encode);
+    assert.deepEqual(getResizeConfig().image.encode.formats.webp, {
       quality: 71,
       effort: 6,
     });
@@ -192,10 +206,38 @@ describe('getResizeConfig', () => {
 });
 
 describe('config split: core validation vs framework loading', () => {
-  test('the core accepts a complete config without mediaModelName', () => {
+  test('the core accepts a complete image config', () => {
     resetAppInstance();
-    const { mediaModelName: _omit, ...core } = makeResizeConfig();
-    assert.doesNotThrow(() => validateResizeConfig(core));
+    assert.doesNotThrow(() => validateResizeConfig(makeImageConfig()));
+  });
+
+  test('the core rejects queue and worker settings: they belong to the transport and worker', () => {
+    for (const key of ['queue', 'worker']) {
+      assert.throws(
+        () => validateResizeConfig({ ...makeImageConfig(), [key]: {} }),
+        (err: unknown) =>
+          err instanceof ResizeConfigError &&
+          err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+          err.message.includes(`\`${key}\``),
+      );
+    }
+  });
+
+  test('a framework config file may omit queue and worker; the defaults apply', () => {
+    const { queue: _q, worker: _w, ...file } = makeResizeConfig();
+    install(file);
+    assert.strictEqual(getResizeConfig().queue, defaultQueueOptions);
+    assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
+  });
+
+  test('an invalid worker section is a config error', () => {
+    install(makeResizeConfig({ worker: { sharpConcurrency: 0 } }));
+    assert.throws(
+      () => getResizeConfig(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_INVALID',
+    );
   });
 
   test('core validation does not read the framework app', async () => {
@@ -217,7 +259,7 @@ describe('config split: core validation vs framework loading', () => {
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.deepEqual(getResizeConfig('resizeListings').formats, ['webp']);
+    assert.deepEqual(getResizeConfig('resizeListings').image.formats, ['webp']);
     assert.equal(getResizeConfig('resizeListings').mediaModelName, 'Photo');
     assert.equal(getResizeConfig().mediaModelName, 'File');
   });

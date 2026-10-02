@@ -12,7 +12,11 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import {
+  makeImageConfig,
+  makeResizeConfig,
+} from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -176,8 +180,7 @@ describe('resolve — partitioning', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       hooks: {
         formatPublicUrls: (decision) =>
           decision.ready.map((entry) => entry.url),
@@ -228,8 +231,7 @@ describe('resolve — partitioning', () => {
       const { lockProvider } = makeLocks(true);
       const r = createFrameworkResizer({
         storage: makeStorage({ canServeOriginalPublicly: check }),
-        transport,
-        lockProvider,
+        transport: withLocks(transport, lockProvider),
       });
       const { decision } = await r.resolve({
         media: {
@@ -442,8 +444,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -479,8 +480,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       name: 'listings',
       queue: 'interactive',
     });
@@ -514,8 +514,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -543,8 +542,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     await r.resolve({
       media: {
@@ -569,8 +567,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -589,8 +586,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -608,8 +604,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -628,8 +623,7 @@ describe('resolve — enqueue wiring', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
@@ -650,8 +644,7 @@ describe('prewarm — missing original key', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -710,8 +703,7 @@ describe('resolve — SVG raster previews', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -1103,14 +1095,14 @@ describe('several Resizers in one process', () => {
     const a = new Resizer({
       storage: makeStorage(),
       mediaStore,
-      config: makeResizeConfig({ formats: ['webp'] }),
+      config: makeImageConfig({ formats: ['webp'] }),
       logger: logger(errorsA),
     });
     const b = new Resizer({
       name: 'listings',
       storage: makeStorage(),
       mediaStore,
-      config: makeResizeConfig({ formats: ['jpeg'] }),
+      config: makeImageConfig({ formats: ['jpeg'] }),
       logger: logger(errorsB),
     });
     const media = { id: 'm1', previews: [] };

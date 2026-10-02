@@ -10,7 +10,8 @@
 //
 // Exported from `…/drivers/mongo.js`. It extends the QueueTransport contract
 // (src/contracts/transport.ts) and imports no framework code and no mongoose.
-import defaultResizeConfig from '../../config/resize.ts';
+import { defaultQueueOptions } from '../../config/resize.ts';
+import type { LockStore } from '../../contracts/lockStore.ts';
 import {
   type EnqueueTask,
   type LeasedTask,
@@ -23,6 +24,7 @@ import { buildRequestKey, canonicalizeVariants } from '../../enqueue.ts';
 import { ResizeError, ResizeSetupError } from '../../errors.ts';
 import { randomHex } from '../../helpers/random.ts';
 import { sleep } from '../../helpers/sleep.ts';
+import { validateQueueTiming } from '../../resizeConfig.ts';
 import type {
   EnqueueReceipt,
   MissingPreview,
@@ -39,6 +41,10 @@ export interface MongoTransportOptions {
   // (resolved on every use). Exactly one of the two.
   model?: TaskModel;
   getModel?: () => TaskModel;
+  // REQUIRED: the locks this queue's work is coordinated with (dispatch + worker locks), e.g.
+  // new MongoLockStore({ model: ResizeLock }); framework hosts get FrameworkLockStore.
+  locks: LockStore;
+  lockTtlMs?: { dispatch: number; worker: number }; // default 60000 each; worker must be ≤ leaseMs
   logger?: ResizeLogger; // default: console
   leaseMs?: number; // default 60000 — heartbeat renews at leaseMs / 2
   retryBackoffMs?: { base: number; max: number }; // default { base: 5000, max: 300000 }
@@ -129,6 +135,8 @@ function isDuplicateKeyError(error: unknown): boolean {
 
 /** The Mongo-backed queue transport (05 · §10.2). */
 export class MongoTransport extends QueueTransport {
+  readonly locks: LockStore;
+  readonly lockTtlMs: { dispatch: number; worker: number };
   readonly leaseMs: number;
   readonly #model: TaskModel;
   readonly #getModel: (() => TaskModel) | undefined;
@@ -146,15 +154,31 @@ export class MongoTransport extends QueueTransport {
         { code: 'RESIZE_MONGO_MODEL_REQUIRED' },
       );
     }
-    const defaults = defaultResizeConfig.queue;
+    if (!opts.locks) {
+      throw new ResizeSetupError(
+        'resize mongo transport: `locks` is required (e.g. new MongoLockStore({ model: ResizeLock }))',
+        { code: 'RESIZE_LOCKS_REQUIRED' },
+      );
+    }
+    const timing = {
+      lockTtlMs: opts.lockTtlMs ?? defaultQueueOptions.lockTtlMs,
+      leaseMs: opts.leaseMs ?? defaultQueueOptions.leaseMs,
+      retryBackoffMs: opts.retryBackoffMs ?? defaultQueueOptions.retryBackoffMs,
+      maxAttempts: opts.maxAttempts ?? defaultQueueOptions.maxAttempts,
+      idlePollMs: opts.idlePollMs ?? defaultQueueOptions.idlePollMs,
+      taskTimeoutMs: opts.taskTimeoutMs ?? defaultQueueOptions.taskTimeoutMs,
+    };
+    validateQueueTiming(timing);
     this.#model = opts.model;
     this.#getModel = opts.getModel;
     this.#logger = opts.logger ?? console;
-    this.leaseMs = opts.leaseMs ?? defaults.leaseMs;
-    this.#retryBackoffMs = opts.retryBackoffMs ?? defaults.retryBackoffMs;
-    this.#maxAttempts = opts.maxAttempts ?? defaults.maxAttempts;
-    this.#idlePollMs = opts.idlePollMs ?? defaults.idlePollMs;
-    this.#taskTimeoutMs = opts.taskTimeoutMs ?? defaults.taskTimeoutMs;
+    this.locks = opts.locks;
+    this.lockTtlMs = timing.lockTtlMs;
+    this.leaseMs = timing.leaseMs;
+    this.#retryBackoffMs = timing.retryBackoffMs;
+    this.#maxAttempts = timing.maxAttempts;
+    this.#idlePollMs = timing.idlePollMs;
+    this.#taskTimeoutMs = timing.taskTimeoutMs;
   }
 
   // Resolve the model, tolerating a falsy getter result (a mis-registered host model) with a

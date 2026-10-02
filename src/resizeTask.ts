@@ -8,11 +8,14 @@
 // imported for types only, so the resizer↔resizeTask cycle is runtime-free. sharp is a hard
 // dep; this is the only place besides worker.ts that decodes.
 import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
+import type { LockStore } from './contracts/lockStore.ts';
+import { lockTtlMsOf } from './contracts/transport.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
+  ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
@@ -46,8 +49,8 @@ const asBuffer = (b: Buffer | Uint8Array): Buffer =>
 
 // ---------------------------------------------------------------------------
 // The shared core (07 steps 2–8; 11 · §11.1 step 4). Both modes expand their inputs into a
-// `requested` MissingPreview[] and call this. `useLocks` toggles the queued-mode two-tier
-// locks (dispatch release on skip-existing + best-effort worker lock); `persist` toggles the
+// `requested` MissingPreview[] and call this. `locks` (queued mode only: the transport's lock store)
+// enables the two-tier locks (dispatch release on skip-existing + best-effort worker lock); `persist` toggles the
 // single appendPreviews + onPreviewGenerated firing (eager `persist:false` returns raw).
 // ---------------------------------------------------------------------------
 
@@ -57,7 +60,8 @@ export interface GenerateCoreArgs {
   requested: MissingPreview[];
   pipeline: string;
   ctx: Record<string, unknown>;
-  useLocks: boolean;
+  // Queued mode: the transport's lock store and worker-lock TTL. Eager mode passes none.
+  locks?: { store: LockStore; workerTtlMs: number };
   persist: boolean;
   signal?: AbortSignal;
 }
@@ -77,7 +81,7 @@ export async function generatePreviews(
     requested,
     pipeline: pipelineName,
     ctx,
-    useLocks,
+    locks,
     persist,
     signal,
   } = args;
@@ -250,8 +254,8 @@ export async function generatePreviews(
     // Skip anything already generated; in queued mode drop its dispatch lock so a later read
     // can re-enqueue a sibling promptly.
     if (existing.has(identity)) {
-      if (useLocks) {
-        await releaseLock(resizer, dispatchKey);
+      if (locks) {
+        await releaseLock(resizer, locks.store, dispatchKey);
       }
       return;
     }
@@ -261,13 +265,10 @@ export async function generatePreviews(
     // An acquire REJECTION behaves EXACTLY like "not acquired": log + skip; it must never reject
     // the bounded pool (that would skip persist + the held-lock release) — a lock-infra hiccup is
     // not a poison variant, so it does NOT count toward the poison-guard's failedCount (1.2a).
-    if (useLocks) {
+    if (locks) {
       let acquired: boolean;
       try {
-        acquired = await resizer.lockProvider.acquire(
-          workerKey,
-          config.queue.lockTtlMs.worker,
-        );
+        acquired = await locks.store.acquire(workerKey, locks.workerTtlMs);
       } catch (err) {
         logger.error(
           `resize worker: worker-lock acquire failed for ${identity} on media ${mediaId} — leaving variant missing`,
@@ -402,21 +403,16 @@ export async function generatePreviews(
         err,
       );
       failedCount += 1;
-      if (useLocks) {
+      if (locks) {
         heldLocks.delete(workerKey);
-        await releaseLock(resizer, workerKey);
+        await releaseLock(resizer, locks.store, workerKey);
       }
     }
   };
 
   // Bounded per-variant pool (NOT unbounded Promise.all); between variants stop launching new
   // ones if the lease was lost (best-effort — correctness holds via the fencing token).
-  await runBounded(
-    requested,
-    config.worker.concurrency,
-    signal,
-    processVariant,
-  );
+  await runBounded(requested, config.concurrency, signal, processVariant);
 
   try {
     // 8. ONE atomic persist for everything generated (+ display-dim backfill when the original
@@ -433,8 +429,10 @@ export async function generatePreviews(
     }
   } finally {
     // 9. Release every held dispatch + worker lock (success AND error paths).
-    for (const key of heldLocks) {
-      await releaseLock(resizer, key);
+    if (locks) {
+      for (const key of heldLocks) {
+        await releaseLock(resizer, locks.store, key);
+      }
     }
   }
 
@@ -442,9 +440,13 @@ export async function generatePreviews(
 }
 
 /** Best-effort lock release; a failing release is logged, never thrown. */
-async function releaseLock(resizer: Resizer, key: string): Promise<void> {
+async function releaseLock(
+  resizer: Resizer,
+  store: LockStore,
+  key: string,
+): Promise<void> {
   try {
-    await resizer.lockProvider.release(key);
+    await store.release(key);
   } catch (err) {
     resizer.logger.error(`resize worker: failed to release lock ${key}`, err);
   }
@@ -460,7 +462,14 @@ export async function processTaskWith(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
 ): Promise<void> {
-  const { logger } = resizer;
+  const { logger, transport } = resizer;
+  // Queued tasks are coordinated with the transport's locks; a Resizer without one can't run them.
+  if (!transport) {
+    throw new ResizeSetupError(
+      `resize worker: Resizer '${resizer.name}' has no transport — a queued task needs its locks`,
+      { code: 'RESIZE_TRANSPORT_REQUIRED' },
+    );
+  }
   // ctx does NOT cross the queue (04 · §8) — the worker's pipeline steps depend on media/metadata.
   const ctx: Record<string, unknown> = {};
 
@@ -501,7 +510,10 @@ export async function processTaskWith(
     requested,
     pipeline: task.pipeline,
     ctx,
-    useLocks: true,
+    locks: {
+      store: transport.locks,
+      workerTtlMs: lockTtlMsOf(transport).worker,
+    },
     persist: true,
     signal: taskOpts?.signal,
   });
@@ -607,7 +619,6 @@ export async function generateImpl(
     requested,
     pipeline,
     ctx,
-    useLocks: false,
     persist,
   });
 

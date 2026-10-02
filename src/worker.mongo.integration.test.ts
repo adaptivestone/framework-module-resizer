@@ -22,6 +22,7 @@ import {
 import { runResizeWorker } from './framework/worker.ts';
 import { type QueueTransport, resetResizerForTests } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type { MediaLike, Preview } from './types.d.ts';
 
 const png = await sharp({
@@ -161,15 +162,13 @@ test('one worker serves two Resizers that share a transport', async () => {
   const b = memoryStorage();
   const media = createFrameworkResizer({
     storage: a.storage,
-    transport,
-    lockProvider,
+    transport: withLocks(transport, lockProvider),
     mediaStore: memoryMediaStore(mediaA),
   });
   const listings = createFrameworkResizer({
     name: 'listings',
     storage: b.storage,
-    transport,
-    lockProvider,
+    transport: withLocks(transport, lockProvider),
     mediaStore: memoryMediaStore(mediaB),
   });
 
@@ -203,8 +202,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   const first = stoppable(real);
   const resizer = createFrameworkResizer({
     storage: memory.storage,
-    transport: first.transport,
-    lockProvider,
+    transport: withLocks(first.transport, lockProvider),
     mediaStore: memoryMediaStore(media),
   });
   assert.equal(
@@ -227,8 +225,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   const second = stoppable(real);
   createFrameworkResizer({
     storage: memory.storage,
-    transport: second.transport,
-    lockProvider,
+    transport: withLocks(second.transport, lockProvider),
     mediaStore: memoryMediaStore(media),
   });
   const bulkWorker = runResizeWorker({ queue: 'bulk' });

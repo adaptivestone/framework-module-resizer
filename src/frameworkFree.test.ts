@@ -119,24 +119,18 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
   await Promise.all([File.init(), ResizeTask.init(), ResizeLock.init()]);
 
   const resizer = new Resizer({
-    config: {
-      ...defaultResizeConfig,
-      formats: ['webp'],
-      queue: {
-        ...defaultResizeConfig.queue,
-        lockTtlMs: { dispatch: 60_000, worker: 5000 },
-      },
-    },
+    config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
     storage: memoryStorage(),
     mediaStore: new MongoMediaStore({ model: File }),
     transport: new MongoTransport({
       model: ResizeTask,
+      locks: new MongoLockStore({ model: ResizeLock }),
+      lockTtlMs: { dispatch: 60_000, worker: 5000 },
       logger: silent,
       idlePollMs: 20,
       leaseMs: 5000,
     }),
-    lockProvider: new MongoLockStore({ model: ResizeLock }),
   });
   const original = await resizer.uploadOriginal({
     body: png,

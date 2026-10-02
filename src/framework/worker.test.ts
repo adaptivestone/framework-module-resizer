@@ -4,7 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import defaultResizeConfig from '../config/resize.ts';
+import defaultResizeConfig, { defaultWorkerOptions } from '../config/resize.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { runResizeWorker } from './worker.ts';
 
@@ -13,7 +13,7 @@ const installApp = (enabled: boolean) => {
     getConfig: () => ({
       ...defaultResizeConfig,
       mediaModelName: 'File',
-      worker: { ...defaultResizeConfig.worker, enabled },
+      worker: { ...defaultWorkerOptions, enabled },
     }),
     getModel: () => undefined,
     logger: { info() {}, warn() {}, error() {} },

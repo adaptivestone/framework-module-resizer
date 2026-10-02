@@ -13,6 +13,7 @@ import {
   resetResizerForTests,
 } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type { MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -82,7 +83,18 @@ function makeResizer(opts: {
   transport?: QueueTransport;
   lockProvider?: LockStore;
 }) {
-  return createFrameworkResizer({ storage, ...opts });
+  const { transport, lockProvider } = opts;
+  return createFrameworkResizer({
+    storage,
+    ...(transport
+      ? {
+          transport: withLocks(
+            transport,
+            lockProvider ?? makeLocks(true).lockProvider,
+          ),
+        }
+      : {}),
+  });
 }
 
 const variant = (over: Partial<MissingPreview> = {}): MissingPreview => ({
@@ -345,8 +357,7 @@ describe('enqueue', () => {
     const { lockProvider } = makeLocks(true);
     const resizer = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       name: 'listings',
     });
     await enqueue(

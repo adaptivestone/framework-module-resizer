@@ -13,6 +13,7 @@ import {
   resetResizerForTests,
 } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type { MissingPreview } from './types.d.ts';
 
 const storage: ResizeStorage = {
@@ -70,8 +71,7 @@ describe('enqueueRequired — explicit coverage', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
@@ -102,11 +102,13 @@ describe('enqueueRequired — explicit coverage', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
+      // The jpeg lock is won (enqueue); the webp lock is lost (findActive).
+      transport: withLocks(
+        transport,
+        locks((key) => key.endsWith(':jpeg:none')).lockProvider,
+      ),
       name: 'listings',
       queue: 'interactive',
-      // The jpeg lock is won (enqueue); the webp lock is lost (findActive).
-      lockProvider: locks((key) => key.endsWith(':jpeg:none')).lockProvider,
     });
     const media = {
       id: 'm1',
@@ -136,7 +138,10 @@ describe('enqueueRequired — explicit coverage', () => {
       enqueue: async () => ({ taskId: 'unexpected' }),
       startWorker: async () => {},
     };
-    const ready = createFrameworkResizer({ storage, transport });
+    const ready = createFrameworkResizer({
+      storage,
+      transport: withLocks(transport, locks().lockProvider),
+    });
     const readyResult = await ready.enqueueRequired({
       media: {
         id: 'm1',
@@ -159,8 +164,7 @@ describe('enqueueRequired — explicit coverage', () => {
     resetResizerForTests();
     const svg = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
     });
     const svgResult = await svg.enqueueRequired({
       media: {
@@ -225,8 +229,7 @@ describe('enqueueRequired — explicit coverage', () => {
     };
     const noOriginal = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
     });
     const missingOriginal = await noOriginal.enqueueRequired({
       media: { id: 'm2' },
@@ -255,8 +258,7 @@ describe('enqueueRequired — explicit coverage', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -281,8 +283,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks(false).lockProvider,
+      transport: withLocks(transport, locks(false).lockProvider),
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -306,8 +307,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks(false).lockProvider,
+      transport: withLocks(transport, locks(false).lockProvider),
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -334,8 +334,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks(false).lockProvider,
+      transport: withLocks(transport, locks(false).lockProvider),
     });
 
     const result = await r.enqueueRequired({
@@ -362,8 +361,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
       hooks: {
         beforeEnqueue: (missing) => {
           const first = missing[0];
@@ -403,8 +401,7 @@ describe('enqueueRequired — lock races and retries', () => {
       };
       const r = createFrameworkResizer({
         storage,
-        transport,
-        lockProvider: locks().lockProvider,
+        transport: withLocks(transport, locks().lockProvider),
         hooks: {
           beforeEnqueue: (missing) =>
             missing[0] ? [...missing, { ...missing[0], ...override }] : missing,
@@ -437,8 +434,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
       hooks: {
         beforeEnqueue: (missing) =>
           missing[0] ? [...missing, missing[0]] : missing,
@@ -465,8 +461,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
       hooks: {
         beforeEnqueue: (missing) =>
           missing[0]
@@ -501,8 +496,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks(false).lockProvider,
+      transport: withLocks(transport, locks(false).lockProvider),
     });
 
     const result = await r.enqueueRequired({
@@ -536,8 +530,7 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks(false).lockProvider,
+      transport: withLocks(transport, locks(false).lockProvider),
     });
 
     const result = await r.enqueueRequired({
@@ -570,7 +563,10 @@ describe('enqueueRequired — lock races and retries', () => {
       startWorker: async () => {},
     };
     const { lockProvider, released } = locks(true);
-    const r = createFrameworkResizer({ storage, transport, lockProvider });
+    const r = createFrameworkResizer({
+      storage,
+      transport: withLocks(transport, lockProvider),
+    });
     const opts: Parameters<Resizer['enqueueRequired']>[0] = {
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -593,8 +589,10 @@ describe('enqueueRequired — lock races and retries', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks((key) => key.includes(':jpeg:')).lockProvider,
+      transport: withLocks(
+        transport,
+        locks((key) => key.includes(':jpeg:')).lockProvider,
+      ),
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -622,8 +620,7 @@ describe('enqueueRequired — pipelines are part of identity', () => {
     };
     const r = createFrameworkResizer({
       storage,
-      transport,
-      lockProvider: locks().lockProvider,
+      transport: withLocks(transport, locks().lockProvider),
     });
     const media = {
       id: 'm1',

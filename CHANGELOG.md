@@ -66,17 +66,30 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   "use distinct filters per pipeline" workaround is no longer needed.
 - The framework is an adapter. The main entry imports no framework code; framework wiring moves
   to the new `@adaptivestone/framework-module-resize/framework.js` subpath.
-  - `new Resizer()` requires `config` and `mediaStore` (and `lockProvider` with a `transport`;
-    `RESIZE_CONFIG_REQUIRED` / `RESIZE_MEDIA_STORE_REQUIRED` / `RESIZE_LOCK_PROVIDER_REQUIRED`),
-    defaults `logger` to `console`, and never reads the framework app. Framework hosts construct
-    through `createFrameworkResizer({ … })`, which fills config, logger, events, the framework
-    media store and, with a transport, the framework lock provider. Re-scaffold or update
-    `src/resizer.ts`.
-  - `MongoTransport` takes `{ model }` or `{ getModel }` plus `logger`, `leaseMs`,
-    `retryBackoffMs`, `maxAttempts`, `idlePollMs`, `taskTimeoutMs` instead of reading the global
-    config (`RESIZE_MONGO_MODEL_REQUIRED` without a model). Framework hosts use
-    `createFrameworkMongoTransport()`. `SqsTransport` takes a `logger` (framework hosts:
-    `appLogger` from `…/framework.js`).
+  - `new Resizer()` requires `mediaStore` (`RESIZE_MEDIA_STORE_REQUIRED`), takes an optional
+    `config` (default: the package defaults), defaults `logger` to `console`, and never reads the
+    framework app. Framework hosts construct through `createFrameworkResizer({ … })`, which fills
+    config, logger, events and the framework media store. Re-scaffold or update `src/resizer.ts`.
+  - `MongoTransport` takes `{ model }` or `{ getModel }` plus `locks`, `logger`, `lockTtlMs`,
+    `leaseMs`, `retryBackoffMs`, `maxAttempts`, `idlePollMs`, `taskTimeoutMs` instead of reading
+    the global config (`RESIZE_MONGO_MODEL_REQUIRED` without a model). Framework hosts use
+    `createFrameworkMongoTransport()`. `SqsTransport` takes `locks` and a `logger` (framework
+    hosts: `appLogger` from `…/framework.js`).
+- Locks belong to the transport. The `lockProvider` Resizer option is removed: `MongoTransport` and
+  `SqsTransport` take a required `locks` (a `LockStore`; `RESIZE_LOCKS_REQUIRED`) and optional
+  `lockTtlMs`. `createFrameworkMongoTransport()` passes `FrameworkLockStore` (the framework `Lock`
+  model); plain Node apps pass `MongoLockStore`. The `QueueTransport` contract gains `locks` and
+  `lockTtlMs` and drops `leaseMs`.
+- The core config holds image settings only. `ResizeConfig` loses `queue` and `worker` (a core
+  config containing them fails with `RESIZE_CONFIG_REMOVED_KEY`), and `worker.concurrency` becomes
+  the top-level `concurrency`. Queue timing and lock TTLs are transport options; `MongoTransport`
+  validates them when it is created, including worker lock ≤ lease
+  (`RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`, previously checked at worker start). Sharp process tuning is
+  `runWorker({ sharp })`.
+- Framework config files keep `mediaModelName`, `queue` and `worker` and spread
+  `defaultFrameworkResizeConfig` (from `…/config/resize.js`, which also exports
+  `defaultQueueOptions` and `defaultWorkerOptions`). `queue` and `worker` may be omitted (the
+  defaults apply). `getResizeConfig()` returns `{ image, mediaModelName, queue, worker }`.
   - `ResizeConfig` no longer contains `mediaModelName`; `FrameworkResizeConfig` does. The scaffold
     config `satisfies FrameworkResizeConfig`.
   - The main entry no longer exports `ResizeWorker`, `ResizeTaskModel`, `runResizeWorker` or the
@@ -105,10 +118,9 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   and `ResizeLock` with the package's schemas and indexes. A plain Node app with MongoDB writes no
   driver code. `FrameworkMediaStore` is now `MongoMediaStore` with the model taken from the app,
   and the framework `ResizeTaskModel` uses the same schema definitions.
-- Framework-free use: `new Resizer({ config, storage, mediaStore, … })`, `new MongoTransport({
-  model })` and the core `runWorker({ queue, signal, logger, sharp })` run without
-  `@adaptivestone/framework`. `runWorker` also refuses to start when a Resizer's
-  `queue.lockTtlMs.worker` exceeds the transport's `leaseMs` (`RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`).
+- Framework-free use: `new Resizer({ storage, mediaStore, … })`, `new MongoTransport({ model,
+  locks })` and the core `runWorker({ queue, signal, logger, sharp })` run without
+  `@adaptivestone/framework`.
 - Each framework Resizer can read its own config file:
   `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
 - Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()`,
