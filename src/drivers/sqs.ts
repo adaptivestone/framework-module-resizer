@@ -17,6 +17,7 @@
 // here (documented — 05 · §10.3). It DOES report `completed` / `failed` through `onEvent`.
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { Consumer } from 'sqs-consumer';
+import type { LockStore } from '../contracts/lockStore.ts';
 import {
   type EnqueueTask,
   type LeasedTask,
@@ -30,6 +31,10 @@ import type { ResizeLogger } from '../types.d.ts';
 export interface SqsTransportOptions {
   queueUrl: string; // serves the 'default' queue
   queues?: Record<string, string>; // extra named queues → queue URLs
+  // REQUIRED: the locks queued work is coordinated with (dispatch + worker locks). SQS has no
+  // lock primitive, so pass a store: MongoLockStore, FrameworkLockStore, or your own LockStore.
+  locks: LockStore;
+  lockTtlMs?: { dispatch: number; worker: number }; // default 60000 each
   logger?: ResizeLogger; // default: console
   region?: string;
   endpoint?: string;
@@ -43,6 +48,8 @@ export interface SqsTransportOptions {
 }
 
 export class SqsTransport extends QueueTransport {
+  readonly locks: LockStore;
+  readonly lockTtlMs: { dispatch: number; worker: number } | undefined;
   readonly #opts: SqsTransportOptions;
   // Memoized per instance. A host-provided `opts.client` short-circuits construction.
   // Synchronous now that the SDK is a static import — built lazily on first use.
@@ -50,8 +57,16 @@ export class SqsTransport extends QueueTransport {
 
   constructor(opts: SqsTransportOptions) {
     super();
+    if (!opts?.locks) {
+      throw new ResizeSetupError(
+        'resize sqs transport: `locks` is required (e.g. new MongoLockStore({ model: ResizeLock }) or FrameworkLockStore)',
+        { code: 'RESIZE_LOCKS_REQUIRED' },
+      );
+    }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
+    this.locks = opts.locks;
+    this.lockTtlMs = opts.lockTtlMs;
   }
 
   #getClient(): SQSClient {

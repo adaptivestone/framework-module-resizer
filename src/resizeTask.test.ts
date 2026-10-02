@@ -33,6 +33,7 @@ import {
   type StartWorkerOpts,
 } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type {
   MediaLike,
   MissingPreview,
@@ -244,7 +245,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
@@ -270,7 +271,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -298,7 +299,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(
       task({
@@ -328,7 +329,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await assert.rejects(() => processTask(task({ previews: [variant()] })));
   });
@@ -340,7 +341,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -359,7 +360,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -388,7 +389,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await processTask(task({ previews: [variant()] }));
@@ -408,7 +409,7 @@ describe('processTask — source handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await processTask(task({ previews: [fitVariant] }));
@@ -436,7 +437,11 @@ describe('processTask — variants', () => {
       mediaDoc({ previews: [existing] }),
     );
     const { lockProvider, released } = makeLocks(true);
-    createFrameworkResizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({
+      storage,
+      mediaStore,
+      transport: withLocks(undefined, lockProvider),
+    });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -450,7 +455,11 @@ describe('processTask — variants', () => {
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const { lockProvider, acquired } = makeLocks(false); // acquire always fails
-    createFrameworkResizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({
+      storage,
+      mediaStore,
+      transport: withLocks(undefined, lockProvider),
+    });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
       /incomplete/,
@@ -481,7 +490,11 @@ describe('processTask — variants', () => {
         released.push(key);
       },
     };
-    createFrameworkResizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({
+      storage,
+      mediaStore,
+      transport: withLocks(undefined, lockProvider),
+    });
     await assert.rejects(
       () =>
         processTask(
@@ -526,7 +539,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await processTask(task({ previews: [variant({ filters: { blur: 3 } })] }));
@@ -547,7 +560,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await processTask(
@@ -569,7 +582,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(
       task({
@@ -617,7 +630,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
 
     await processTask(task({ previews: [variant({ format: 'tiff' })] }));
@@ -637,7 +650,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
 
     await processTask(task({ previews: [variant({ format: 'heif' })] }));
@@ -658,7 +671,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(
       task({
@@ -685,7 +698,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(
       task({
@@ -710,7 +723,7 @@ describe('processTask — variants', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(task({ previews: [fitVariant] }));
     const p = appendCalls[0].previews[0];
@@ -732,7 +745,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(
       task({
@@ -764,7 +777,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(appendCalls.length, 1);
@@ -779,7 +792,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       hooks: {
         onPreviewGenerated: (preview: unknown) => {
           fired.push(preview as Preview);
@@ -809,7 +822,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider,
+      transport: withLocks(undefined, lockProvider),
       pipelines: { default: pipeline },
     });
     await assert.rejects(
@@ -842,7 +855,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await assert.rejects(
@@ -887,7 +900,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     const queued = task({
@@ -937,7 +950,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks(false).lockProvider,
+      transport: withLocks(undefined, makeLocks(false).lockProvider),
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
@@ -956,7 +969,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await processTask(
       task({
@@ -971,14 +984,14 @@ describe('processTask — persistence & failure handling', () => {
   });
 
   test('abort signal between variants stops launching new ones', async () => {
-    installApp({ worker: { concurrency: 1 } });
+    installApp({ concurrency: 1 });
     const controller = new AbortController();
     const { storage, uploads } = makeStorage(redPng, () => controller.abort());
     const { mediaStore } = makeMediaStore(mediaDoc());
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
     });
     await assert.rejects(
       () =>
@@ -1009,8 +1022,8 @@ describe('processTask — persistence & failure handling', () => {
     assert.equal(uploads.length, 1); // aborted after the first, launched no more
   });
 
-  test('worker.concurrency=1 → variants run serially (no overlap)', async () => {
-    installApp({ worker: { concurrency: 1 } });
+  test('concurrency=1 → variants run serially (no overlap)', async () => {
+    installApp({ concurrency: 1 });
     const { storage } = makeStorage(redPng);
     let active = 0;
     let maxActive = 0;
@@ -1029,7 +1042,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await processTask(
@@ -1056,8 +1069,8 @@ describe('processTask — persistence & failure handling', () => {
     assert.equal(maxActive, 1);
   });
 
-  test('worker.concurrency=2 → up to two variants run at once', async () => {
-    installApp({ worker: { concurrency: 2 } });
+  test('concurrency=2 → up to two variants run at once', async () => {
+    installApp({ concurrency: 2 });
     const { storage } = makeStorage(redPng);
     let active = 0;
     let maxActive = 0;
@@ -1076,7 +1089,7 @@ describe('processTask — persistence & failure handling', () => {
     createFrameworkResizer({
       storage,
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(undefined, makeLocks().lockProvider),
       pipelines: { default: pipeline },
     });
     await processTask(
@@ -1516,6 +1529,7 @@ describe('runResizeWorker', () => {
       ) => Promise<void>,
     ) => void,
   ): QueueTransport => ({
+    locks: makeLocks().lockProvider,
     enqueue: async () => ({ taskId: null }),
     startWorker: async (handle) => {
       onStart?.(handle);
@@ -1576,7 +1590,6 @@ describe('runResizeWorker', () => {
       transport: fakeTransport(() => {
         started = true;
       }),
-      lockProvider: makeLocks().lockProvider,
     });
     await assert.rejects(
       () => runResizeWorker(),
@@ -1605,7 +1618,6 @@ describe('runResizeWorker', () => {
           });
         },
       },
-      lockProvider: makeLocks().lockProvider,
     });
     await assert.rejects(
       () => runResizeWorker(),
@@ -1627,7 +1639,6 @@ describe('runResizeWorker', () => {
           events.push('verify');
         },
       },
-      lockProvider: makeLocks().lockProvider,
     });
     await runResizeWorker();
     assert.deepEqual(events, ['verify', 'startWorker']);
@@ -1645,7 +1656,6 @@ describe('runResizeWorker', () => {
         handle = h;
       }),
       mediaStore,
-      lockProvider: makeLocks().lockProvider,
     });
     await runResizeWorker();
     assert.equal(typeof handle, 'function');
@@ -1698,16 +1708,14 @@ describe('one worker serves every Resizer', () => {
     const loadedBy: string[] = [];
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: labelledStore('default', loadedBy),
-      lockProvider: makeLocks().lockProvider,
     });
     createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
-      transport,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: labelledStore('listings', loadedBy),
-      lockProvider: makeLocks().lockProvider,
     });
     await runResizeWorker();
     assert.equal(captured.calls, 1);
@@ -1722,8 +1730,7 @@ describe('one worker serves every Resizer', () => {
     const { transport, captured } = capturingTransport();
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     await runResizeWorker({ queue: 'bulk' });
@@ -1736,15 +1743,13 @@ describe('one worker serves every Resizer', () => {
     const b = capturingTransport();
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport: a.transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(a.transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
-      transport: b.transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(b.transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     await assert.rejects(
@@ -1762,8 +1767,7 @@ describe('one worker serves every Resizer', () => {
     const seen: unknown[][] = [];
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
       hooks: {
         afterTaskComplete: () => {
@@ -1774,8 +1778,7 @@ describe('one worker serves every Resizer', () => {
     createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
       hooks: {
         afterTaskComplete: () => {
@@ -1814,8 +1817,7 @@ describe('one worker serves every Resizer', () => {
     const { transport, captured } = capturingTransport();
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     await runResizeWorker();
@@ -1828,8 +1830,7 @@ describe('one worker serves every Resizer', () => {
     const { transport, captured } = capturingTransport();
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     await runResizeWorker();
@@ -1850,14 +1851,12 @@ describe('one worker serves every Resizer', () => {
     const { transport, captured } = capturingTransport();
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     createFrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
-      lockProvider: makeLocks().lockProvider,
       mediaStore: {
         ...makeMediaStore(null).mediaStore,
         verify() {
@@ -1881,8 +1880,7 @@ describe('one worker serves every Resizer', () => {
     const { transport, captured } = capturingTransport();
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     assert.equal(ResizeWorker.commandArguments.queue.type, 'string');
@@ -1962,7 +1960,11 @@ describe('scoped generation', () => {
     const media = mediaDoc();
     const { mediaStore } = makeMediaStore(media);
     const { lockProvider, acquired } = makeLocks(true);
-    createFrameworkResizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({
+      storage,
+      mediaStore,
+      transport: withLocks(undefined, lockProvider),
+    });
     await processTask(task({ pipeline: 'watermark', previews: [variant()] }));
     assert.ok(acquired.some((key) => key.includes(':watermark:')));
   });
@@ -1975,7 +1977,11 @@ describe('scoped generation', () => {
     const { mediaStore } = makeMediaStore(media);
     // The worker lock for the watermark variant is held elsewhere, so nothing is generated.
     const { lockProvider } = makeLocks(false);
-    createFrameworkResizer({ storage, mediaStore, lockProvider });
+    createFrameworkResizer({
+      storage,
+      mediaStore,
+      transport: withLocks(undefined, lockProvider),
+    });
     await assert.rejects(
       () => processTask(task({ pipeline: 'watermark', previews: [variant()] })),
       (err: unknown) =>
@@ -1986,31 +1992,6 @@ describe('scoped generation', () => {
 });
 
 describe('runWorker (core)', () => {
-  test('refuses a transport lease shorter than a Resizer worker-lock TTL', async () => {
-    installApp();
-    let started = false;
-    const transport: QueueTransport = {
-      leaseMs: 1000,
-      enqueue: async () => ({ taskId: null }),
-      startWorker: async () => {
-        started = true;
-      },
-    };
-    createFrameworkResizer({
-      storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
-      mediaStore: makeMediaStore(null).mediaStore,
-    }); // default config: queue.lockTtlMs.worker = 60000
-    await assert.rejects(
-      () => runWorker({ signal: new AbortController().signal }),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
-    );
-    assert.equal(started, false);
-  });
-
   test('runs with an explicit signal and logger, without the framework worker switch', async () => {
     installApp(); // worker.enabled is false: only the framework entry checks it
     let seenQueue: string | undefined;
@@ -2022,8 +2003,7 @@ describe('runWorker (core)', () => {
     };
     createFrameworkResizer({
       storage: makeStorage(redPng).storage,
-      transport,
-      lockProvider: makeLocks().lockProvider,
+      transport: withLocks(transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
     const logged: unknown[][] = [];

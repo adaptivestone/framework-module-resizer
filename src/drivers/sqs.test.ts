@@ -12,6 +12,7 @@ import {
   type TaskEventHandler,
 } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import { memoryLocks } from '../testHelpers/withLocks.ts';
 import type { MissingPreview } from '../types.d.ts';
 import { SqsTransport } from './sqs.ts';
 
@@ -144,6 +145,7 @@ describe('SqsTransport.enqueue', () => {
   test('sends the default queue to opts.queueUrl with the task JSON body and returns MessageId', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'mid-1' });
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'https://q/url',
       region: 'us-east-1',
       queues: { bulk: BULK_URL },
@@ -170,6 +172,7 @@ describe('SqsTransport.enqueue', () => {
   test('a named queue is sent to its URL from `queues`, and the body names resizer and queue', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'mid-2' });
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'https://q/url',
       queues: { bulk: BULK_URL },
       client,
@@ -189,7 +192,7 @@ describe('SqsTransport.enqueue', () => {
 
   test('an unknown queue rejects with RESIZE_SQS_QUEUE_UNKNOWN and sends nothing', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     await assert.rejects(
       () =>
         t.enqueue({
@@ -209,7 +212,7 @@ describe('SqsTransport.enqueue', () => {
 
   test('returns a null taskId when the send response has no MessageId', async () => {
     const { client } = makeFakeSqsClient({ messageId: undefined });
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     const res = await t.enqueue({
       resizer: 'default',
       queue: 'default',
@@ -223,7 +226,11 @@ describe('SqsTransport.enqueue', () => {
   test('enqueueRequired accepts a successful SQS MessageId receipt', async () => {
     installFakeApp();
     const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
-    const transport = new SqsTransport({ queueUrl: 'q', client });
+    const transport = new SqsTransport({
+      queueUrl: 'q',
+      client,
+      locks: { acquire: async () => true, release: async () => {} },
+    });
     const r = createFrameworkResizer({
       storage: {
         download: async () => Buffer.alloc(0),
@@ -231,7 +238,6 @@ describe('SqsTransport.enqueue', () => {
         publicUrl: () => '',
       },
       transport,
-      lockProvider: { acquire: async () => true, release: async () => {} },
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
@@ -245,7 +251,11 @@ describe('SqsTransport.enqueue', () => {
   test('enqueueRequired leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
     installFakeApp();
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
-    const transport = new SqsTransport({ queueUrl: 'q', client });
+    const transport = new SqsTransport({
+      queueUrl: 'q',
+      client,
+      locks: { acquire: async () => false, release: async () => {} },
+    });
     const r = createFrameworkResizer({
       storage: {
         download: async () => Buffer.alloc(0),
@@ -253,7 +263,6 @@ describe('SqsTransport.enqueue', () => {
         publicUrl: () => '',
       },
       transport,
-      lockProvider: { acquire: async () => false, release: async () => {} },
     });
     const result = await r.enqueueRequired({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
@@ -284,7 +293,7 @@ describe('SqsTransport.startWorker', () => {
     };
     const { client, deletes } = makeFakeSqsClient({ message });
     const seen: unknown[] = [];
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     const rec = makeEvents();
     const ctrl = new AbortController();
     const p = t.startWorker(
@@ -313,7 +322,7 @@ describe('SqsTransport.startWorker', () => {
     };
     const { client, deletes } = makeFakeSqsClient({ message });
     const boom = new Error('handler boom');
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     const rec = makeEvents();
     const ctrl = new AbortController();
     const p = t.startWorker(
@@ -345,7 +354,12 @@ describe('SqsTransport.startWorker', () => {
         return {};
       },
     };
-    const t = new SqsTransport({ queueUrl: 'q', client, logger });
+    const t = new SqsTransport({
+      locks: memoryLocks(),
+      queueUrl: 'q',
+      client,
+      logger,
+    });
     const ctrl = new AbortController();
     const p = t.startWorker(async () => {}, {
       signal: ctrl.signal,
@@ -370,7 +384,7 @@ describe('SqsTransport.startWorker', () => {
     };
     const { client, deletes } = makeFakeSqsClient({ message });
     let handlerCalls = 0;
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     const rec = makeEvents();
     const ctrl = new AbortController();
     const p = t.startWorker(
@@ -391,7 +405,7 @@ describe('SqsTransport.startWorker', () => {
   test('aborting opts.signal stops the consumer and resolves startWorker', async () => {
     installFakeApp();
     const { client, receiveParams } = makeFakeSqsClient({});
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     const ctrl = new AbortController();
     const p = t.startWorker(async () => {}, {
       signal: ctrl.signal,
@@ -407,6 +421,7 @@ describe('SqsTransport.startWorker', () => {
     installFakeApp();
     const { client, receiveParams } = makeFakeSqsClient({});
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'q',
       visibilityTimeout: 30,
       client,
@@ -423,7 +438,11 @@ describe('SqsTransport.startWorker', () => {
 
     resetResizerForTests();
     const { client: client2, receiveParams: rp2 } = makeFakeSqsClient({});
-    const t2 = new SqsTransport({ queueUrl: 'q', client: client2 });
+    const t2 = new SqsTransport({
+      locks: memoryLocks(),
+      queueUrl: 'q',
+      client: client2,
+    });
     const ctrl2 = new AbortController();
     const p2 = t2.startWorker(async () => {}, {
       signal: ctrl2.signal,
@@ -446,6 +465,7 @@ describe('SqsTransport.startWorker', () => {
     // sqs-consumer validation requires heartbeatInterval < visibilityTimeout; a 10ms heartbeat
     // renews visibility repeatedly while the (gated) handler is in flight.
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'q',
       visibilityTimeout: 1,
       heartbeatInterval: 0.01,
@@ -475,6 +495,7 @@ describe('SqsTransport.startWorker', () => {
     installFakeApp();
     const { client, receiveParams } = makeFakeSqsClient({});
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'q',
       queues: { bulk: BULK_URL },
       client,
@@ -493,7 +514,7 @@ describe('SqsTransport.startWorker', () => {
   test('an unknown queue rejects with RESIZE_SQS_QUEUE_UNKNOWN before polling', async () => {
     installFakeApp();
     const { client, receiveParams } = makeFakeSqsClient({});
-    const t = new SqsTransport({ queueUrl: 'q', client });
+    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
     await assert.rejects(
       () =>
         t.startWorker(async () => {}, {
@@ -523,6 +544,7 @@ describe('SqsTransport.startWorker', () => {
     const { client, deletes } = makeFakeSqsClient({ message });
     const seen: LeasedTask[] = [];
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'q',
       queues: { bulk: BULK_URL },
       client,
@@ -550,6 +572,7 @@ describe('SqsTransport.startWorker', () => {
     };
     const { client, deletes } = makeFakeSqsClient({ message });
     const t = new SqsTransport({
+      locks: memoryLocks(),
       queueUrl: 'q',
       queues: { bulk: BULK_URL },
       client,
@@ -576,7 +599,12 @@ describe('SqsTransport.startWorker', () => {
       Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
     };
     const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({ queueUrl: 'q', client, logger });
+    const t = new SqsTransport({
+      locks: memoryLocks(),
+      queueUrl: 'q',
+      client,
+      logger,
+    });
     const ctrl = new AbortController();
     const p = t.startWorker(async () => {}, {
       signal: ctrl.signal,
@@ -602,7 +630,12 @@ describe('SqsTransport.startWorker', () => {
       Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
     };
     const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({ queueUrl: 'q', client, logger });
+    const t = new SqsTransport({
+      locks: memoryLocks(),
+      queueUrl: 'q',
+      client,
+      logger,
+    });
     let handlerCalls = 0;
     const ctrl = new AbortController();
     const p = t.startWorker(

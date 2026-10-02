@@ -119,11 +119,13 @@ import {
 const { ResizeTask, ResizeLock } = createResizeModels(mongoose.connection);
 
 export const resizer = new Resizer({
-  config: { ...defaultResizeConfig, formats: ['webp', 'avif'] },
+  config: { ...defaultResizeConfig, formats: ['webp', 'avif'] }, // optional; image settings only
   storage: new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' }),
   mediaStore: new MongoMediaStore({ model: File }), // File spreads resizeMediaSchemaFragment
-  transport: new MongoTransport({ model: ResizeTask }), // queued workflows only
-  lockProvider: new MongoLockStore({ model: ResizeLock }), // required with a transport
+  transport: new MongoTransport({ // queued workflows only
+    model: ResizeTask,
+    locks: new MongoLockStore({ model: ResizeLock }),
+  }),
 });
 
 // Worker process; abort the signal on SIGTERM to stop it
@@ -147,11 +149,13 @@ the module never creates them at runtime.
 
 ## Drivers
 
-A `Resizer` takes one driver per seam: `storage` (required), `mediaStore` (required),
-`transport` (queued workflows), and `lockProvider` (required with a transport). Drivers receive
+A `Resizer` takes one driver per seam: `storage` (required), `mediaStore` (required) and
+`transport` (queued workflows). The transport owns its `locks` (a `LockStore`), because locks
+exist only for queued work. Drivers receive
 no `app` argument; each one uses its own clients. `createFrameworkResizer` adds
-`FrameworkMediaStore` and `FrameworkLockStore` for you. Those are thin wrappers: the Mongo media
-store with the model taken from the app, and the framework's own `Lock` model.
+`FrameworkMediaStore`, and `createFrameworkMongoTransport()` adds `FrameworkLockStore`. Those are
+thin wrappers: the Mongo media store with the model taken from the app, and the framework's own
+`Lock` model.
 
 **`LocalFsStorage`**
 
@@ -183,6 +187,8 @@ scaffolded model, the app logger and the config's `queue` timing):
 | Option | Default | |
 |---|---|---|
 | `model` / `getModel` | one required | The `ResizeTask` model, or a getter called on each use |
+| `locks` | required | A `LockStore`: `MongoLockStore`, or `FrameworkLockStore` in framework apps |
+| `lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | `worker` must be ≤ `leaseMs` |
 | `leaseMs` | `60000` | Heartbeat renews the lease at `leaseMs / 2` |
 | `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Delay before a failed task is retried |
 | `maxAttempts` | `5` | Attempts before the task is `dead` |
@@ -195,6 +201,8 @@ scaffolded model, the app logger and the config's `queue` timing):
 | Option | | |
 |---|---|---|
 | `queueUrl` | required | The `'default'` queue |
+| `locks` | required | A `LockStore` (SQS has no lock primitive) |
+| `lockTtlMs` | optional | Default `{ dispatch: 60000, worker: 60000 }` |
 | `queues` | optional | Other named queues: `{ bulk: 'https://sqs…/bulk' }` |
 | `region`, `endpoint`, `client` | optional | An existing `SQSClient`, or one built on first use |
 | `visibilityTimeout`, `heartbeatInterval` | optional | Seconds; the heartbeat extends visibility during long tasks |
@@ -226,14 +234,11 @@ comes from `createResizeModels(connection)`.
 
 ## Config reference
 
-`src/config/resize.ts` spreads the defaults from `…/config/resize.js`. The framework merges
-`resize.<NODE_ENV>.ts` over it: objects merge field by field, and arrays are replaced. The module
-validates the result when a Resizer is created and does not merge again. A second Resizer can read
-its own file with `createFrameworkResizer({ configName: 'resizeListings', … })`.
+The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
+`…/config/resize.js`; spread it to change keys. It is validated when the Resizer is created.
 
 | Key | Default | Notes |
 |---|---|---|
-| `mediaModelName` | required (framework only) | The host media model, e.g. `'File'` |
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes |
@@ -247,27 +252,41 @@ its own file with `createFrameworkResizer({ configName: 'resizeListings', … })
 | `limits.resultDimension` | `5000` | Largest output side for cropped sizes |
 | `limits.animationFrames` | `64` | Frame limit for animated input |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
-| `queue.lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | `worker` must be ≤ `queue.leaseMs` |
-| `queue.leaseMs` | `60000` | Set to at least ~2× the slowest encode |
-| `queue.retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
-| `queue.maxAttempts` | `5` | Every lease counts, including reclaimed ones |
-| `queue.idlePollMs` | `1000` | Sleep after an empty poll |
-| `queue.taskTimeoutMs` | `600000` | A longer task is failed |
-| `worker.enabled` | `false` | Allows the worker command to run |
-| `worker.concurrency` | `4` | Variants in parallel per task or `generate()` call |
-| `worker.sharpConcurrency` | `1` | `sharp.concurrency()`; keep `concurrency × sharpConcurrency ≈ CPU cores` |
-| `worker.sharpCache` | `false` | Sharp's cache mostly wastes memory on distinct images |
+| `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
-Who reads what:
-- **Each Resizer:** `queue.lockTtlMs` and `worker.concurrency`.
-- **`createFrameworkMongoTransport()`:** the other `queue.*` keys. A core `MongoTransport` takes
-  them as constructor options instead.
-- **The framework worker command:** `worker.enabled` and the Sharp keys, from the `resize`
-  config.
-- **Not config:** buckets, URLs and queue URLs are driver options.
+Queue timing and lock TTLs are **transport options** (`MongoTransport`; `SqsTransport` takes
+`lockTtlMs`), validated in the transport's constructor. Their defaults are `defaultQueueOptions`
+in `…/config/resize.js`:
 
-The 0.2.x keys `webpAvifOnly`, `encode.quality`, `encode.effort`, `encode.mozjpeg`,
-`encode.chromaSubsampling` and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`.
+| Option | Default | Notes |
+|---|---|---|
+| `lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | `worker` must be ≤ `leaseMs` |
+| `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
+| `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
+| `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
+| `idlePollMs` | `1000` | Sleep after an empty poll |
+| `taskTimeoutMs` | `600000` | A longer task is failed |
+
+Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
+`concurrency × sharp.concurrency ≈ CPU cores`.
+
+**Framework config file.** `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
+`…/config/resize.js` and adds `mediaModelName`. The framework merges `resize.<NODE_ENV>.ts` over
+it (objects merge field by field, arrays are replaced); the module does not merge again. Only the
+adapter reads the extra keys:
+- `mediaModelName` (required): the host media model, used by `FrameworkMediaStore`.
+- `queue`: the transport options above, used by `createFrameworkMongoTransport()`.
+- `worker`: `{ enabled: false, sharpConcurrency: 1, sharpCache: false }`, used by the
+  `ResizeWorker` command. `enabled` allows the command to run.
+
+`queue` and `worker` may be omitted (the defaults apply), but a section that is present must be
+complete. A second Resizer can read its own file with
+`createFrameworkResizer({ configName: 'resizeListings', … })`.
+
+Buckets, URLs and queue URLs are not config; they are driver options. The 0.2.x keys
+`webpAvifOnly`, `encode.quality`, `encode.effort`, `encode.mozjpeg`, `encode.chromaSubsampling`
+and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do `queue` and
+`worker` in a core config.
 
 ## Operations
 

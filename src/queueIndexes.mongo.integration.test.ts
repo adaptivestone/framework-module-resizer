@@ -17,6 +17,7 @@ import {
 import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -215,8 +216,7 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
 
     const resizer = createFrameworkResizer({
       storage,
-      transport: fixture.transport,
-      lockProvider: fixture.lockProvider,
+      transport: withLocks(fixture.transport, fixture.lockProvider),
     });
     const result = await resizer.enqueueRequired({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },

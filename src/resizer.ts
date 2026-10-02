@@ -6,7 +6,7 @@
 // reads a framework app. Framework hosts get them filled by createFrameworkResizer
 // (src/framework/resizer.ts).
 import type { Metadata, Sharp } from 'sharp';
-import type { LockStore } from './contracts/lockStore.ts';
+import defaultResizeConfig from './config/resize.ts';
 import type { MediaStore } from './contracts/mediaStore.ts';
 // The driver contracts live in src/contracts/ so drivers import them without this module. They
 // are re-exported here (types only) for the core files that import them from resizer.ts.
@@ -147,14 +147,13 @@ export type HookFn = (...args: any[]) => unknown;
 
 export interface ResizerOptions {
   name?: string; // registry key; default 'default'
-  config: ResizeConfig; // REQUIRED: the complete, validated resize config
+  config?: ResizeConfig; // the complete image config; default: the package defaults
   logger?: ResizeLogger; // default: console
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
   mediaStore: MediaStore; // REQUIRED: loads media, saves preview metadata (05 · §10.6)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
   queue?: string; // default queue for this Resizer's tasks; default 'default'
-  lockProvider?: LockStore; // REQUIRED with a transport: dispatch and worker locks (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
   hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
@@ -186,18 +185,6 @@ const EMPTY_PIPELINE: Pipeline = Object.freeze({});
 // core code always receives its Resizer as an argument.
 const resizers = new Map<string, Resizer>();
 
-// Eager-only Resizers (no transport) never take locks. This placeholder keeps the field typed
-// and turns an unexpected use into a named setup error instead of a TypeError.
-const NO_LOCK_PROVIDER: LockStore = Object.freeze({
-  acquire: async (): Promise<boolean> => {
-    throw new ResizeSetupError(
-      'resize: this Resizer has no lockProvider — pass one together with a transport',
-      { code: 'RESIZE_LOCK_PROVIDER_REQUIRED' },
-    );
-  },
-  release: async (): Promise<void> => {},
-});
-
 // How framework hosts get the parts below filled in from their app.
 const FRAMEWORK_HINT =
   "framework hosts: use createFrameworkResizer() from '@adaptivestone/framework-module-resize/framework.js'";
@@ -216,7 +203,6 @@ export class Resizer {
   readonly storage: ResizeStorage;
   readonly transport: QueueTransport | undefined;
   readonly mediaStore: MediaStore;
-  readonly lockProvider: LockStore;
   // Named pipelines: last-wins per name (04 · §8).
   readonly #pipelines: Map<string, Pipeline>;
   // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
@@ -252,27 +238,22 @@ export class Resizer {
       });
     }
     // The core takes every part explicitly; it never reads a framework app.
-    if (opts.config === undefined) {
-      throw new ResizeSetupError(
-        `resize: \`config\` is required — pass a complete ResizeConfig (e.g. spread defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js'); ${FRAMEWORK_HINT}`,
-        { code: 'RESIZE_CONFIG_REQUIRED' },
-      );
-    }
     if (!opts.mediaStore) {
       throw new ResizeSetupError(
         `resize: \`mediaStore\` is required — it loads media and saves preview metadata; ${FRAMEWORK_HINT}`,
         { code: 'RESIZE_MEDIA_STORE_REQUIRED' },
       );
     }
-    if (opts.transport && !opts.lockProvider) {
+    // Locks belong to the transport; catch a transport without them here, not at the first read.
+    if (opts.transport && !opts.transport.locks) {
       throw new ResizeSetupError(
-        `resize: a Resizer with a \`transport\` needs a \`lockProvider\` (dispatch and worker locks); ${FRAMEWORK_HINT}`,
-        { code: 'RESIZE_LOCK_PROVIDER_REQUIRED' },
+        'resize: the `transport` has no `locks` — queued work is coordinated with them (e.g. new MongoTransport({ model, locks: new MongoLockStore({ model: ResizeLock }) }))',
+        { code: 'RESIZE_LOCKS_REQUIRED' },
       );
     }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
-    this.config = validateResizeConfig(opts.config);
+    this.config = validateResizeConfig(opts.config ?? defaultResizeConfig);
     this.logger = opts.logger ?? console;
     this.#events = opts.events;
     this.name = name;
@@ -281,7 +262,6 @@ export class Resizer {
     this.storage = opts.storage;
     this.transport = opts.transport;
     this.mediaStore = opts.mediaStore;
-    this.lockProvider = opts.lockProvider ?? NO_LOCK_PROVIDER;
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().
@@ -406,7 +386,7 @@ export class Resizer {
    * Delegates to the SHARED resize core (src/resizeTask.ts): resolveSizes waterfall with the
    * caller's REAL ctx → expand sizes × formats, skipping identities already in media.previews
    * (idempotent) → download once → beforeSteps once → per-variant resize/encode/upload
-   * (bounded by config.worker.concurrency, NO locks). `persist !== false` → one
+   * (bounded by config.concurrency, NO locks). `persist !== false` → one
    * mediaStore.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {

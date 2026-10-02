@@ -54,9 +54,9 @@ test('the Framework loads the scaffold bridge and merges the environment overrid
   } as never);
   await server.init({ isSkipModelInit: true, isSkipModelLoading: true });
   const resolved = getResizeConfig();
-  assert.deepEqual(resolved.formats, ['webp']);
+  assert.deepEqual(resolved.image.formats, ['webp']);
   assert.equal(resolved.worker.enabled, true);
-  assert.deepEqual(resolved.upload.formats, [
+  assert.deepEqual(resolved.image.upload.formats, [
     'jpeg',
     'png',
     'webp',

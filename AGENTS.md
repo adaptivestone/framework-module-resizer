@@ -57,9 +57,10 @@ a private original.
    (`--agents claude|print|skip` to redirect or suppress it).
 
 3. Wire the drivers in `src/resizer.ts` — ONE construction call. `createFrameworkResizer`
-   (framework adapter) fills `config` (from `src/config/resize.ts`), the app logger, the media
-   store and, with a `transport`, the lock provider. `storage` is REQUIRED; `transport` is
-   optional (omit it for eager-only hosts):
+   (framework adapter) fills `config` (the image settings from `src/config/resize.ts`), the app
+   logger and the media store. `storage` is REQUIRED; `transport` is optional (omit it for
+   eager-only hosts). The transport owns its locks: `createFrameworkMongoTransport()` uses the
+   framework `Lock` model:
 
    ```ts
    import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
@@ -102,10 +103,12 @@ a private original.
    `run()` does `await import('../resizer.ts')` before `super.run()`; keep that line if you edit
    the command.
 
-5. The scaffolded `src/config/resize.ts` extends the canonical package defaults from
+5. The scaffolded `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
    `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
    FrameworkResizeConfig`. Set `mediaModelName: 'File'` (your host media model's name) and keep
-   only host overrides there. A second Resizer can read its own file:
+   only host overrides there. The image settings go to the Resizer; the adapter reads
+   `mediaModelName`, `queue` (Mongo transport timing and lock TTLs) and `worker` (the worker
+   command). Variant parallelism is the top-level `concurrency`. A second Resizer can read its own file:
    `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
    Put environment-only changes in `resize.<NODE_ENV>.ts` (for example,
    `resize.production.ts`); the framework merges that file before
@@ -284,8 +287,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | Symptom | Cause → fix |
 |---|---|
 | `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
-| `RESIZE_CONFIG_REQUIRED` / `RESIZE_MEDIA_STORE_REQUIRED` at construction | `new Resizer()` takes every part explicitly — framework hosts use `createFrameworkResizer` from `…/framework.js` |
-| `RESIZE_LOCK_PROVIDER_REQUIRED` | a Resizer with a `transport` needs a `lockProvider` (a `LockStore`) — `createFrameworkResizer` adds `FrameworkLockStore`; plain Node: `MongoLockStore` |
+| `RESIZE_MEDIA_STORE_REQUIRED` at construction | `new Resizer()` takes its media store explicitly — framework hosts use `createFrameworkResizer` from `…/framework.js` |
+| `RESIZE_LOCKS_REQUIRED` | the transport needs `locks` (a `LockStore`) — `createFrameworkMongoTransport()` adds `FrameworkLockStore`; plain Node: `new MongoTransport({ model, locks: new MongoLockStore({ model }) })` |
+| `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the transport options, `worker.concurrency` to `concurrency` |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoTransport()` needs `{ model }` or `{ getModel }` — framework hosts use `createFrameworkMongoTransport()` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |
@@ -297,7 +301,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `RESIZE_WORKER_TRANSPORTS_DIFFER` at worker start | the Resizers in one worker use different transport instances — share one instance, or run one worker process per transport |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
-| `queue.lockTtlMs.worker … must be ≤ queue.leaseMs` at boot, or `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` at worker start | raise the lease (`queue.leaseMs`, or the transport's `leaseMs`) or lower `queue.lockTtlMs.worker` |
+| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` when the transport is created | raise the lease (`queue.leaseMs` in the config file, or the transport's `leaseMs`) or lower `lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |

@@ -12,6 +12,7 @@ import {
   resetResizerForTests,
 } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -103,8 +104,7 @@ describe('prewarm — happy path', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -132,8 +132,7 @@ describe('prewarm — happy path', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -163,8 +162,7 @@ describe('prewarm — queue', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       name: 'listings',
       queue: 'interactive',
     });
@@ -195,8 +193,7 @@ describe('prewarm — queue', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -215,8 +212,7 @@ describe('prewarm — skip existing & dedup', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -248,8 +244,7 @@ describe('prewarm — skip existing & dedup', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -269,8 +264,7 @@ describe('prewarm — skip existing & dedup', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -289,8 +283,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: {
@@ -314,8 +307,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: {
@@ -337,8 +329,7 @@ describe('prewarm — waterfall hooks', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       hooks: {
         resolveSizes: () => [
           { width: 100, height: 100 },
@@ -364,8 +355,7 @@ describe('prewarm — waterfall hooks', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       hooks: {
         // drop everything but the jpeg 300x300 variant
         beforeEnqueue: (missing: MissingPreview[]) =>
@@ -393,8 +383,7 @@ describe('prewarm — waterfall hooks', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       hooks: { beforeEnqueue: () => [] },
     });
     const { enqueued } = await r.prewarm({
@@ -432,8 +421,7 @@ describe('prewarm — dispatch-lock survivors only', () => {
     const { lockProvider } = makeLocks((key) => key.endsWith(':jpeg:none'));
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -453,8 +441,7 @@ describe('prewarm — dispatch-lock survivors only', () => {
     const { lockProvider } = makeLocks(false);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -475,8 +462,7 @@ describe('prewarm — never throws', () => {
     const { lockProvider, released } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -500,8 +486,7 @@ describe('prewarm — never throws', () => {
     };
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -518,8 +503,7 @@ describe('prewarm — never throws', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
       hooks: {
         resolveSizes: () => {
           throw new Error('boom');
@@ -542,8 +526,7 @@ describe('prewarm — never throws', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const { enqueued } = await r.prewarm({
       media: { original: { storageRef: { key: 'orig.jpg' } } },
@@ -563,8 +546,7 @@ describe('prewarm — fast-path is NOT consulted', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -597,8 +579,7 @@ describe('prewarm — pipelines are part of identity', () => {
     const { lockProvider } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport,
-      lockProvider,
+      transport: withLocks(transport, lockProvider),
     });
     const media = {
       id: 'm1',

@@ -15,7 +15,9 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import defaultResizeConfig from '../config/resize.ts';
+import defaultResizeConfig, {
+  defaultFrameworkResizeConfig,
+} from '../config/resize.ts';
 import { getResizeConfig } from '../framework/config.ts';
 import { runScaffold } from './command.ts';
 
@@ -95,12 +97,12 @@ describe('runScaffold — default run', () => {
       configSource,
       /@adaptivestone\/framework-module-resize\/config\/resize\.js/,
     );
-    assert.match(configSource, /\.\.\.defaultResizeConfig/);
+    assert.match(configSource, /\.\.\.defaultFrameworkResizeConfig/);
     assert.match(configSource, /satisfies FrameworkResizeConfig/);
 
     assert.match(configSource, /mediaModelName: 'File'/);
     const scaffoldedConfig = {
-      ...defaultResizeConfig,
+      ...defaultFrameworkResizeConfig,
       mediaModelName: 'File',
     };
     assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
@@ -112,7 +114,10 @@ describe('runScaffold — default run', () => {
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.strictEqual(getResizeConfig(), scaffoldedConfig);
+    const resolved = getResizeConfig();
+    assert.equal(resolved.mediaModelName, 'File');
+    assert.strictEqual(resolved.queue, scaffoldedConfig.queue);
+    assert.strictEqual(resolved.image.encode, scaffoldedConfig.encode);
   });
 
   test('auto-creates missing directories', async () => {

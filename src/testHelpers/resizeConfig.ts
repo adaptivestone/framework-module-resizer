@@ -1,5 +1,11 @@
-import defaultResizeConfig from '../config/resize.ts';
-import type { DeepPartial, ResizeConfig } from '../types.d.ts';
+import defaultResizeConfig, {
+  defaultFrameworkResizeConfig,
+} from '../config/resize.ts';
+import type {
+  DeepPartial,
+  FrameworkResizeConfig,
+  ResizeConfig,
+} from '../types.d.ts';
 
 function merge(base: unknown, override: unknown): unknown {
   if (Array.isArray(override)) {
@@ -22,14 +28,22 @@ function merge(base: unknown, override: unknown): unknown {
   return override === undefined ? base : override;
 }
 
+/** Test-only: a framework config file (framework defaults + mediaModelName 'File') with overrides. */
 export function makeResizeConfig(
-  override: DeepPartial<ResizeConfig> = {},
-): ResizeConfig {
-  // Test-only overrides. Each test gets independent nested defaults; production
-  // config merging remains the framework's responsibility.
+  override: DeepPartial<FrameworkResizeConfig> = {},
+): FrameworkResizeConfig & ResizeConfig {
+  // Each test gets independent nested defaults; production config merging remains the
+  // framework's responsibility.
   const base = structuredClone({
-    ...defaultResizeConfig,
+    ...defaultFrameworkResizeConfig,
     mediaModelName: 'File',
   });
-  return merge(base, override) as ResizeConfig;
+  return merge(base, override) as FrameworkResizeConfig & ResizeConfig;
+}
+
+/** Test-only: a core image config (what `new Resizer({ config })` takes) with overrides. */
+export function makeImageConfig(
+  override: DeepPartial<ResizeConfig> = {},
+): ResizeConfig {
+  return merge(structuredClone(defaultResizeConfig), override) as ResizeConfig;
 }

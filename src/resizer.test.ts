@@ -19,7 +19,11 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import {
+  makeImageConfig,
+  makeResizeConfig,
+} from './testHelpers/resizeConfig.ts';
+import { withLocks } from './testHelpers/withLocks.ts';
 import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -29,6 +33,7 @@ import type { MissingPreview, SizeInput } from './types.d.ts';
 // ---------------------------------------------------------------------------
 
 const fakeTransport = (): QueueTransport => ({
+  locks: fakeLockProvider(),
   enqueue: async () => ({ taskId: null }),
   startWorker: async () => {},
 });
@@ -97,17 +102,15 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('createFrameworkResizer fills mediaStore, and lockProvider when there is a transport', () => {
+  test('createFrameworkResizer fills mediaStore; locks stay on the transport', () => {
     const eager = createFrameworkResizer(baseOpts());
     assert.ok(eager.mediaStore instanceof FrameworkMediaStore);
-    assert.ok(!(eager.lockProvider instanceof FrameworkLockStore));
     resetResizerForTests();
-    const queued = createFrameworkResizer({
-      ...baseOpts(),
-      transport: fakeTransport(),
-    });
+    const transport = fakeTransport();
+    const queued = createFrameworkResizer({ ...baseOpts(), transport });
     assert.ok(queued.mediaStore instanceof FrameworkMediaStore);
-    assert.ok(queued.lockProvider instanceof FrameworkLockStore);
+    assert.equal(queued.transport?.locks, transport.locks);
+    assert.ok(!(transport.locks instanceof FrameworkLockStore));
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
@@ -117,14 +120,13 @@ describe('Resizer constructor — driver wiring', () => {
     const lockProvider = fakeLockProvider();
     const r = createFrameworkResizer({
       storage,
-      transport,
+      transport: withLocks(transport, lockProvider),
       mediaStore,
-      lockProvider,
     });
     assert.equal(r.storage, storage);
     assert.equal(r.transport, transport);
     assert.equal(r.mediaStore, mediaStore);
-    assert.equal(r.lockProvider, lockProvider);
+    assert.equal(r.transport?.locks, lockProvider);
   });
 
   test('transport is undefined when omitted (eager-only host)', () => {
@@ -326,38 +328,37 @@ describe('Resizer registry', () => {
     const r = new Resizer({
       storage: fakeStorage(),
       mediaStore: fakeMediaStore(),
-      lockProvider: fakeLockProvider(),
-      config: makeResizeConfig(),
+      transport: withLocks(undefined, fakeLockProvider()),
+      config: makeImageConfig(),
       logger: { info() {}, warn() {}, error() {} },
     });
     assert.equal(r.name, 'default');
     assert.equal(getResizer(), r);
   });
 
-  test('a core Resizer requires config and mediaStore, and lockProvider with a transport', () => {
+  test('a core Resizer requires mediaStore and a transport with locks; config defaults', () => {
     resetAppInstance();
-    const core = {
-      storage: fakeStorage(),
-      mediaStore: fakeMediaStore(),
-      config: makeResizeConfig(),
-    };
+    const core = { storage: fakeStorage(), mediaStore: fakeMediaStore() };
     const rejects = (opts: unknown, code: string) =>
       assert.throws(
         () => new Resizer(opts as never),
-        (err: unknown) =>
-          err instanceof ResizeSetupError &&
-          err.code === code &&
-          err.message.includes('createFrameworkResizer'),
+        (err: unknown) => err instanceof ResizeSetupError && err.code === code,
       );
-    rejects({ ...core, config: undefined }, 'RESIZE_CONFIG_REQUIRED');
     rejects({ ...core, mediaStore: undefined }, 'RESIZE_MEDIA_STORE_REQUIRED');
     rejects(
-      { ...core, transport: fakeTransport() },
-      'RESIZE_LOCK_PROVIDER_REQUIRED',
+      {
+        ...core,
+        transport: {
+          enqueue: async () => ({ taskId: null }),
+          startWorker: async () => {},
+        },
+      },
+      'RESIZE_LOCKS_REQUIRED',
     );
-    // None of the rejected constructions claimed the name.
+    // None of the rejected constructions claimed the name; config defaults to the package's.
     const r = new Resizer(core);
     assert.equal(r.logger, console);
+    assert.deepEqual(r.config.formats, ['jpeg', 'webp', 'avif']);
   });
 
   test('resetResizerForTests() forgets every Resizer', () => {

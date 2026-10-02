@@ -1,7 +1,7 @@
 // Pure validation of a complete resize config. It reads no framework state; the framework
 // adapter (src/framework/config.ts) loads the config from the app and checks mediaModelName.
 import { ResizeConfigError } from './errors.ts';
-import type { ResizeConfig } from './types.d.ts';
+import type { QueueTimingOptions, ResizeConfig } from './types.d.ts';
 
 const invalid = (message: string, code: string): never => {
   throw new ResizeConfigError(message, { code });
@@ -22,6 +22,12 @@ const REMOVED_KEYS: Record<string, string> = {
   'encode.mozjpeg': 'encode.formats.jpeg.mozjpeg',
   'encode.chromaSubsampling': 'encode.formats.jpeg.chromaSubsampling',
   'encode.flattenBackground': 'encode.flatten.background',
+  // Moved out of the image config: queue timing is a transport option, and `worker.concurrency`
+  // is the top-level `concurrency`.
+  queue:
+    'the queue transport options (e.g. new MongoTransport({ leaseMs, lockTtlMs })); framework hosts keep `queue` in the config file',
+  worker:
+    '`concurrency`, and runWorker({ sharp }) for Sharp tuning; framework hosts keep `worker` in the config file',
 };
 
 /** Validate the complete framework-resolved config before it is consumed. */
@@ -156,49 +162,48 @@ function validateRequiredResizeConfigFields(
     );
   }
 
-  const worker = root.worker;
-  if (
-    !isRecord(worker) ||
-    typeof worker.enabled !== 'boolean' ||
-    !isPositiveSafeInteger(worker.concurrency) ||
-    !isPositiveSafeInteger(worker.sharpConcurrency) ||
-    typeof worker.sharpCache !== 'boolean'
-  ) {
+  if (!isPositiveSafeInteger(root.concurrency)) {
     invalid(
-      'resize config: worker settings are invalid',
+      'resize config: concurrency must be a positive safe integer',
       'RESIZE_CONFIG_INVALID',
     );
   }
+}
 
-  const queue = root.queue;
+/**
+ * Validate queue timing and lock TTLs (MongoTransport options, and the framework config file's
+ * `queue` section). A worker lock must expire within the lease.
+ */
+export function validateQueueTiming(
+  queue: unknown,
+): asserts queue is QueueTimingOptions {
   if (!isRecord(queue)) {
     return invalid(
-      'resize config: queue must be an object',
+      'resize queue options must be an object',
       'RESIZE_CONFIG_QUEUE_INVALID',
     );
   }
   const leaseMs = queue.leaseMs;
   if (!isPositiveSafeInteger(leaseMs)) {
     invalid(
-      'resize config: queue.leaseMs must be a positive safe integer',
+      'resize queue options: leaseMs must be a positive safe integer',
       'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
   }
   const lockTtlMs = queue.lockTtlMs;
   if (!isRecord(lockTtlMs)) {
     return invalid(
-      'resize config: queue.lockTtlMs must be an object',
+      'resize queue options: lockTtlMs must be an object',
       'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
     );
   }
-  const dispatchTtlMs = lockTtlMs.dispatch;
   const workerTtlMs = lockTtlMs.worker;
   if (
-    !isPositiveSafeInteger(dispatchTtlMs) ||
+    !isPositiveSafeInteger(lockTtlMs.dispatch) ||
     !isPositiveSafeInteger(workerTtlMs)
   ) {
     invalid(
-      'resize config: queue.lockTtlMs.dispatch and queue.lockTtlMs.worker must be positive safe integers',
+      'resize queue options: lockTtlMs.dispatch and lockTtlMs.worker must be positive safe integers',
       'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
     );
   }
@@ -212,13 +217,13 @@ function validateRequiredResizeConfigFields(
     !isPositiveSafeInteger(queue.taskTimeoutMs)
   ) {
     invalid(
-      'resize config: queue retry/runtime settings are invalid',
+      'resize queue options: retryBackoffMs, maxAttempts, idlePollMs and taskTimeoutMs must be positive safe integers',
       'RESIZE_CONFIG_QUEUE_INVALID',
     );
   }
   if ((workerTtlMs as number) > (leaseMs as number)) {
     invalid(
-      `resize config: queue.lockTtlMs.worker (${workerTtlMs}) must be ≤ queue.leaseMs (${leaseMs}) — a worker lock must expire within the lease window (07 · doneness invariant)`,
+      `resize queue options: lockTtlMs.worker (${workerTtlMs}) must be ≤ leaseMs (${leaseMs}) — a worker lock must expire within the lease`,
       'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
     );
   }

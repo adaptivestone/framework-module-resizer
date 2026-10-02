@@ -6,7 +6,7 @@ import { getApp } from './app.ts';
 
 export class FrameworkLockStore extends LockStore {
   // The framework Lock TTL is SECONDS — the ms→s conversion lives HERE and nowhere else
-  // (call sites pass ms, e.g. config.queue.lockTtlMs.dispatch). Round UP so a sub-second
+  // (call sites pass ms, e.g. the transport's lockTtlMs.dispatch). Round UP so a sub-second
   // ttl never truncates to a 0-second (immediately-expired) lock.
   async acquire(key: string, ttlMs: number): Promise<boolean> {
     const acquired = await getApp()

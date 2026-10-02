@@ -1,7 +1,9 @@
 // Queue transport contract: stores tasks and drives a worker's consumption of one named queue. A
 // driver receives everything it needs as constructor options (no `app`). Extend this class (or pass
 // any object of the same shape — the core never checks `instanceof`).
+import { defaultQueueOptions } from '../config/resize.ts';
 import type { EnqueueReceipt, MissingPreview } from '../types.d.ts';
+import type { LockStore } from './lockStore.ts';
 
 /** What a Resizer hands to a transport. `resizer` and `queue` route the task later. */
 export interface EnqueueTask {
@@ -38,10 +40,14 @@ export interface StartWorkerOpts {
 
 export abstract class QueueTransport {
   /**
-   * Lease length in ms, for transports that lease tasks (Mongo). The worker checks each Resizer's
-   * worker-lock TTL against it: a lock must expire within the lease.
+   * The locks queued work is coordinated with: dispatch locks when requests enqueue, and worker
+   * locks while a variant is generated. Locks exist only for queued work, so the transport owns
+   * them.
    */
-  declare readonly leaseMs?: number;
+  abstract readonly locks: LockStore;
+
+  /** Lock TTLs in ms. Default `{ dispatch: 60000, worker: 60000 }`. */
+  declare readonly lockTtlMs?: { dispatch: number; worker: number };
 
   /** Store a task. `taskId` is the receipt; `null` when the backend gives none. */
   abstract enqueue(task: EnqueueTask): Promise<{ taskId: string | null }>;
@@ -63,4 +69,12 @@ export abstract class QueueTransport {
     ) => Promise<void>,
     opts: StartWorkerOpts,
   ): Promise<void>;
+}
+
+/** A transport's lock TTLs, or the defaults when it sets none. */
+export function lockTtlMsOf(transport: Pick<QueueTransport, 'lockTtlMs'>): {
+  dispatch: number;
+  worker: number;
+} {
+  return transport.lockTtlMs ?? defaultQueueOptions.lockTtlMs;
 }

@@ -1,8 +1,14 @@
-import type { ResizeConfig } from '../types.d.ts';
+import type {
+  FrameworkResizeConfig,
+  FrameworkWorkerConfig,
+  QueueTimingOptions,
+  ResizeConfig,
+} from '../types.d.ts';
 
-// Canonical module defaults. A framework host extends this file from its own
-// src/config/resize.ts, while the framework remains responsible for applying
-// resize.<NODE_ENV>.ts overrides. A framework host adds mediaModelName (FrameworkResizeConfig).
+// Canonical defaults, pure data. The default export is the core image config (what
+// `new Resizer({ config })` takes). Framework hosts spread `defaultFrameworkResizeConfig`, which adds
+// the `queue` and `worker` sections the framework adapter reads; the framework applies
+// resize.<NODE_ENV>.ts overrides.
 const defaultResizeConfig: ResizeConfig = {
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
@@ -27,20 +33,34 @@ const defaultResizeConfig: ResizeConfig = {
     animationFrames: 64,
     processingTimeoutSeconds: 30,
   },
-  queue: {
-    lockTtlMs: { dispatch: 60_000, worker: 60_000 },
-    leaseMs: 60_000,
-    retryBackoffMs: { base: 5_000, max: 300_000 },
-    maxAttempts: 5,
-    idlePollMs: 1_000,
-    taskTimeoutMs: 600_000,
-  },
-  worker: {
-    enabled: false,
-    concurrency: 4,
-    sharpConcurrency: 1,
-    sharpCache: false,
-  },
+  concurrency: 4,
+};
+
+/** Mongo transport timing and lock TTL defaults (also MongoTransport's own defaults). */
+export const defaultQueueOptions: QueueTimingOptions = {
+  lockTtlMs: { dispatch: 60_000, worker: 60_000 },
+  leaseMs: 60_000,
+  retryBackoffMs: { base: 5_000, max: 300_000 },
+  maxAttempts: 5,
+  idlePollMs: 1_000,
+  taskTimeoutMs: 600_000,
+};
+
+/** Framework worker command defaults. */
+export const defaultWorkerOptions: FrameworkWorkerConfig = {
+  enabled: false,
+  sharpConcurrency: 1,
+  sharpCache: false,
+};
+
+/** What a framework host's config file spreads; it adds `mediaModelName`. */
+export const defaultFrameworkResizeConfig: Omit<
+  FrameworkResizeConfig,
+  'mediaModelName'
+> = {
+  ...defaultResizeConfig,
+  queue: defaultQueueOptions,
+  worker: defaultWorkerOptions,
 };
 
 export default defaultResizeConfig;

@@ -206,27 +206,34 @@ export interface ResizeConfig {
     processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
   };
 
-  // Queue/lease tuning (used by the Mongo transport; harmless for SQS, which has native redrive).
-  queue: {
-    lockTtlMs: { dispatch: number; worker: number }; // worker MUST be ≤ leaseMs
-    leaseMs: number; // default 60000 — heartbeat renews at leaseMs/2
-    retryBackoffMs: { base: number; max: number }; // default { base:5000, max:300000 }
-    maxAttempts: number; // default 5 — DELIVERY count before dead-letter (increments on every lease incl. reclaims, like SQS maxReceiveCount)
-    idlePollMs: number; // default 1000
-    taskTimeoutMs: number; // default 600000 — handleTask raced against this; on timeout: heartbeat stopped, task signal aborted, fail() fired (05 · §10.2)
-  };
-
-  // Worker runtime tuning.
-  worker: {
-    enabled: boolean; // default false; set true to enable the worker command
-    concurrency: number; // default 4 — variants resized in parallel per task
-    sharpConcurrency: number; // default 1 — sharp.concurrency(); concurrency × this ≈ nCPU
-    sharpCache: boolean; // default false — sharp.cache()
-  };
+  // Variants processed in parallel per queued task or generate() call. Default 4; keep
+  // concurrency × the worker's Sharp concurrency ≈ CPU cores.
+  concurrency: number;
 }
 
-// The config a framework host writes in `src/config/resize.ts` (or another config file per
-// Resizer): the core config plus the host media model the framework media store loads.
+// Queue timing and lock TTLs: options of the queue transport (MongoTransport takes all of them;
+// the framework config file's `queue` section feeds createFrameworkMongoTransport()).
+export interface QueueTimingOptions {
+  lockTtlMs: { dispatch: number; worker: number }; // worker must be ≤ leaseMs
+  leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
+  retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
+  maxAttempts: number; // default 5 — deliveries before dead-letter (every lease counts, incl. reclaims)
+  idlePollMs: number; // default 1000 — sleep after an empty poll
+  taskTimeoutMs: number; // default 600000 — a task running longer is failed
+}
+
+// The framework worker command's settings (the config file's `worker` section).
+export interface FrameworkWorkerConfig {
+  enabled: boolean; // default false — permits `npm run cli ResizeWorker` to run
+  sharpConcurrency: number; // default 1 — sharp.concurrency()
+  sharpCache: boolean; // default false — sharp.cache()
+}
+
+// The config file a framework host writes (`src/config/resize.ts`, or another file per Resizer).
+// The image settings go to the Resizer; the framework adapter reads the rest: the media model,
+// the Mongo transport's timing (`queue`) and the worker command's settings (`worker`).
 export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
+  queue?: QueueTimingOptions; // default: defaultQueueOptions (a present section must be complete)
+  worker?: FrameworkWorkerConfig; // default: defaultWorkerOptions
 }

@@ -14,6 +14,7 @@ import { createFrameworkResizer } from './framework/resizer.ts';
 import type { QueueTransport, ResizeStorage } from './resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import { memoryLocks, withLocks } from './testHelpers/withLocks.ts';
 
 const png = await sharp({
   create: {
@@ -241,7 +242,10 @@ describe('uploadOriginal — private SVG source', () => {
       },
       startWorker: async () => {},
     };
-    const r = createFrameworkResizer({ storage, transport });
+    const r = createFrameworkResizer({
+      storage,
+      transport: withLocks(transport, memoryLocks()),
+    });
     const body = Buffer.from(
       '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="120px" height="80px" viewBox="0 0 240 100"><path d="M0 0h1v1z"/></svg>',
     );

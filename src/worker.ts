@@ -12,7 +12,7 @@ import type {
   TaskEvent,
   TaskEventHandler,
 } from './contracts/transport.ts';
-import { ResizeConfigError, ResizeSetupError } from './errors.ts';
+import { ResizeSetupError } from './errors.ts';
 import { getResizer, listResizers, type ObserverName } from './resizer.ts';
 import { processTaskWith } from './resizeTask.ts';
 import type { ResizeLogger } from './types.d.ts';
@@ -39,7 +39,7 @@ export interface RunWorkerOptions {
   queue?: string; // queue to consume; default 'default'
   signal: AbortSignal; // stops the worker: finish in-flight tasks, then return
   logger?: ResizeLogger; // the worker's own messages; default console
-  // Process-wide Sharp tuning, applied once (keep Resizers' worker.concurrency × concurrency ≈
+  // Process-wide Sharp tuning, applied once (keep Resizers' config.concurrency × concurrency ≈
   // CPU cores). Omitted: Sharp's settings are left as they are.
   sharp?: { concurrency: number; cache: boolean };
 }
@@ -73,19 +73,6 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     );
   }
   const [transport] = transports;
-  // A worker lock must expire within the lease, or a crashed worker's lock outlives the lease
-  // and blocks the worker that re-claims the task.
-  if (typeof transport.leaseMs === 'number') {
-    for (const resizer of resizers) {
-      const lockTtlMs = resizer.config.queue.lockTtlMs.worker;
-      if (lockTtlMs > transport.leaseMs) {
-        throw new ResizeConfigError(
-          `resize worker: Resizer '${resizer.name}' has queue.lockTtlMs.worker (${lockTtlMs}) above the transport's leaseMs (${transport.leaseMs}) — a worker lock must expire within the lease`,
-          { code: 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE' },
-        );
-      }
-    }
-  }
   // Fail before leasing anything: a misconfigured media store (e.g. a wrong mediaModelName)
   // would otherwise surface only as per-task errors.
   for (const resizer of resizers) {
