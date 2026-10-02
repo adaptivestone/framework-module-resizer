@@ -13,20 +13,20 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import { ResizeGenerateError, ResizeNoOriginalError } from '../errors.ts';
+import { ResizeGenerateError, ResizeNoOriginalError } from '../../errors.ts';
+import ResizeTaskModel from '../../framework/ResizeTaskModel.ts';
 import {
   createFrameworkMongoTransport,
   createFrameworkResizer,
-} from '../framework/resizer.ts';
-import ResizeTaskModel from '../models/ResizeTask.ts';
+} from '../../framework/resizer.ts';
 import {
   type LeasedTask,
   resetResizerForTests,
   type TaskEventHandler,
-} from '../resizer.ts';
-import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
-import type { MissingPreview } from '../types.d.ts';
-import type { MongoTransport } from './mongo.ts';
+} from '../../resizer.ts';
+import { makeResizeConfig } from '../../testHelpers/resizeConfig.ts';
+import type { MissingPreview } from '../../types.d.ts';
+import type { MongoTransport } from './transport.ts';
 
 // Against mongodb-memory-server (real atomic semantics for lease/complete/fail/renew/sweep).
 // The model is compiled from the REAL ResizeTaskModel schema + initHooks, exactly as the

@@ -38,7 +38,7 @@ test('the Framework loads the scaffold bridge and merges the environment overrid
   );
   await mkdir(dirname(linkedPackage), { recursive: true });
   await symlink(
-    resolve(fileURLToPath(new URL('../../', import.meta.url))),
+    resolve(fileURLToPath(new URL('../..', import.meta.url))),
     linkedPackage,
     process.platform === 'win32' ? 'junction' : 'dir',
   );

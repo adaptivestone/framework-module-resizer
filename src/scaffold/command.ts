@@ -30,7 +30,8 @@ const MODEL_MARKER = 'extends ResizeTaskModel';
 // The worker command extends the module's command AND loads the construction site, so the
 // worker process has the Resizers its tasks name (a bare re-export starts with none).
 const COMMAND_MARKERS = [
-  '@adaptivestone/framework-module-resize/commands/ResizeWorker.js',
+  '@adaptivestone/framework-module-resize/framework.js',
+  'ResizeWorker',
   '../resizer',
 ];
 

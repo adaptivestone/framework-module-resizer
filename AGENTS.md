@@ -14,8 +14,10 @@ API ground truth: the installed `dist/index.d.ts` (main entry) and `dist/types.d
 original. Three modes share one core and one stored shape: eager (`generate()` inline,
 no queue/worker — start here), lazy (on read, worker fills `previews[]`), pre-warm
 (`prewarm()` queues the catalog at upload). The read path decides per size + format +
-filters whether a preview is ready or missing. The main entry imports no framework code; the
-framework integration is the `@adaptivestone/framework-module-resize/framework.js` adapter.
+filters whether a preview is ready or missing. The main entry imports no framework code and no
+mongoose. Shipped drivers live under `drivers/*` and need no framework; the framework
+integration is the `@adaptivestone/framework-module-resize/framework.js` adapter, which only wraps
+those drivers with framework models and config.
 
 The Mongo transport deduplicates identical active enqueue requests using a canonical SHA-256
 `requestKey` and a partial unique index. Its key includes the Resizer name, the queue, the
@@ -30,9 +32,9 @@ a private original.
 
 ## Integrate (in order)
 
-1. Install. The framework and mongoose are REQUIRED peers; the AWS SDKs are OPTIONAL peers —
-   install them only for the driver subpaths that use them (a missing one fails loudly at your
-   own import line at bootstrap):
+1. Install. Every peer is OPTIONAL: a framework app already has `@adaptivestone/framework` and
+   `mongoose`; the AWS SDKs are needed only for the driver subpaths that use them (a missing one
+   fails loudly at your own import line at bootstrap):
 
    ```bash
    npm i @adaptivestone/framework-module-resize
@@ -61,7 +63,7 @@ a private original.
 
    ```ts
    import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
-   import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
+   import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
 
    export const resizer = createFrameworkResizer({
      storage: new LocalFsStorage({
@@ -75,20 +77,23 @@ a private original.
    `server.ts` before `startServer()`.
 
    Other shipped drivers: `S3Storage` from
-   `@adaptivestone/framework-module-resize/storage/s3.js` (options: `bucketPublic` required;
+   `@adaptivestone/framework-module-resize/drivers/s3.js` (options: `bucketPublic` required;
    `publicBaseUrl` — alias of the old `publicUrl` for one minor; `client` first when the host
    already has an `S3Client`), `createFrameworkMongoTransport()` from
    `@adaptivestone/framework-module-resize/framework.js` (wraps `MongoTransport` from
-   `@adaptivestone/framework-module-resize/transports/mongo.js` with the scaffolded model, the app
+   `@adaptivestone/framework-module-resize/drivers/mongo.js` with the scaffolded model, the app
    logger and the config's `queue` timing), `SqsTransport` from
-   `@adaptivestone/framework-module-resize/transports/sqs.js` (options: `queueUrl` required, for
+   `@adaptivestone/framework-module-resize/drivers/sqs.js` (options: `queueUrl` required, for
    the `'default'` queue; `queues` maps other queue names to URLs; `region`, `endpoint`,
    `visibilityTimeout`, `heartbeatInterval`, `client`, `logger` — pass `appLogger` from the
    framework adapter),
-   `FrameworkMediaStore` from `@adaptivestone/framework-module-resize/mediaStore/framework.js`,
-   `FrameworkLockProvider` from `@adaptivestone/framework-module-resize/locks/framework.js`.
-   A custom driver is any object or class satisfying the exported contract types
-   (`QueueTransport`, `ResizeStorage`, `MediaStore`, `LockProvider`) — no `app` parameter;
+   `FrameworkMediaStore` and `FrameworkLockStore` (the framework `Lock` model) from
+   `@adaptivestone/framework-module-resize/framework.js`.
+   Without the framework, `@adaptivestone/framework-module-resize/drivers/mongo.js` ships
+   `MongoMediaStore({ model })`, `MongoLockStore({ model })`, `MongoTransport({ model })` and
+   `createResizeModels(connection)` (registers `ResizeTask` and `ResizeLock` with their indexes).
+   A custom driver extends the exported abstract class (`ResizeStorage`, `MediaStore`,
+   `QueueTransport`, `LockStore`) or is any object of the same shape — no `app` parameter;
    a driver closes over its own client.
 
 4. In the API process, dynamically load the construction site **after** `Server.init()`:
@@ -280,7 +285,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 |---|---|
 | `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
 | `RESIZE_CONFIG_REQUIRED` / `RESIZE_MEDIA_STORE_REQUIRED` at construction | `new Resizer()` takes every part explicitly — framework hosts use `createFrameworkResizer` from `…/framework.js` |
-| `RESIZE_LOCK_PROVIDER_REQUIRED` | a Resizer with a `transport` needs a `lockProvider` — `createFrameworkResizer` adds the framework one |
+| `RESIZE_LOCK_PROVIDER_REQUIRED` | a Resizer with a `transport` needs a `lockProvider` (a `LockStore`) — `createFrameworkResizer` adds `FrameworkLockStore`; plain Node: `MongoLockStore` |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoTransport()` needs `{ model }` or `{ getModel }` — framework hosts use `createFrameworkMongoTransport()` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |

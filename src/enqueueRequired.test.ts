@@ -6,7 +6,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import {
-  type LockProvider,
+  type LockStore,
   type QueueTransport,
   type Resizer,
   type ResizeStorage,
@@ -33,7 +33,7 @@ function locks(
   acquire: boolean | ((key: string) => boolean | Promise<boolean>) = true,
 ) {
   const released: string[] = [];
-  const lockProvider: LockProvider = {
+  const lockProvider: LockStore = {
     acquire: async (key) =>
       typeof acquire === 'function' ? acquire(key) : acquire,
     release: async (key) => {

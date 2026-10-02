@@ -79,18 +79,45 @@ test('the main entry reaches no framework code', () => {
     [],
     'main entry must not import @adaptivestone/framework',
   );
-  const adapterFiles = [...files.entries()].filter(
-    ([file]) =>
-      file.startsWith('framework/') ||
-      file === 'models/ResizeTask.ts' ||
-      file.startsWith('commands/'),
+  const adapterFiles = [...files.entries()].filter(([file]) =>
+    file.startsWith('framework/'),
   );
   assert.deepEqual(
     adapterFiles.map(([, chain]) => chain.join(' → ')),
     [],
-    'main entry must not reach the framework adapter, ResizeTask model or CLI command',
+    'main entry must not reach the framework adapter',
   );
 });
+
+for (const entry of [
+  'drivers/fs.ts',
+  'drivers/s3.ts',
+  'drivers/sqs.ts',
+  'drivers/mongo/index.ts',
+]) {
+  test(`${entry} reaches no framework code and no mongoose at runtime`, () => {
+    const { files, bare } = walk(entry);
+    const banned = [...bare.entries()].filter(
+      ([spec]) =>
+        spec === 'mongoose' ||
+        spec === '@adaptivestone/framework' ||
+        spec.startsWith('@adaptivestone/framework/'),
+    );
+    assert.deepEqual(
+      banned.map(([, chain]) => chain.join(' → ')),
+      [],
+      'drivers must run without the framework and import mongoose only as types',
+    );
+    const adapter = [...files.keys()].filter((file) =>
+      file.startsWith('framework/'),
+    );
+    assert.deepEqual(
+      adapter,
+      [],
+      'drivers must not reach the framework adapter',
+    );
+  });
+}
 
 test('the framework adapter is reachable from its own entry', () => {
   const { bare } = walk('framework/index.ts');

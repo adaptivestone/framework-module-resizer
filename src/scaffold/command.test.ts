@@ -82,7 +82,7 @@ describe('runScaffold — default run', () => {
     const command = await read(COMMAND);
     assert.match(
       command,
-      /@adaptivestone\/framework-module-resize\/commands\/ResizeWorker\.js/,
+      /\{ ResizeWorker as ModuleResizeWorker \} from '@adaptivestone\/framework-module-resize\/framework\.js'/,
     );
     assert.match(command, /extends ModuleResizeWorker/);
     assert.match(
@@ -226,7 +226,7 @@ describe('runScaffold — --eager', () => {
     assert.doesNotMatch(resizer, /MongoTransport/);
     assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
     assert.match(resizer, /LocalFsStorage/);
-    assert.match(resizer, /storage\/fs\.js/);
+    assert.match(resizer, /drivers\/fs\.js/);
     assert.match(resizer, /publicBaseUrl/);
     assert.match(resizer, /no transport or worker/);
   });
@@ -272,7 +272,7 @@ describe('runScaffold — --check', () => {
     await run([]);
     await writeFile(
       join(root, COMMAND),
-      "export { default } from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';\n",
+      "export { ResizeWorker as default } from '@adaptivestone/framework-module-resize/framework.js';\n",
     );
     const { code, out } = await run(['--check']);
     assert.equal(code, 1);
@@ -285,7 +285,7 @@ describe('runScaffold — --check', () => {
     await writeFile(
       join(root, COMMAND),
       [
-        "import ModuleResizeWorker from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';",
+        "import { ResizeWorker as ModuleResizeWorker } from '@adaptivestone/framework-module-resize/framework.js';",
         "import { ensureResizers } from '../resizer.ts';",
         'export default class ResizeWorker extends ModuleResizeWorker {',
         '  async run() { ensureResizers(); return super.run(); }',
@@ -442,10 +442,10 @@ describe('scaffolded ResizeWorker command', () => {
     await run([]);
     // The temp root cannot resolve the package name; point the shim at this checkout's command.
     const moduleCommand = pathToFileURL(
-      fileURLToPath(new URL('../commands/ResizeWorker.ts', import.meta.url)),
+      fileURLToPath(new URL('../framework/index.ts', import.meta.url)),
     ).href;
     const shim = (await read(COMMAND)).replace(
-      '@adaptivestone/framework-module-resize/commands/ResizeWorker.js',
+      '@adaptivestone/framework-module-resize/framework.js',
       moduleCommand,
     );
     await writeFile(join(root, COMMAND), shim);

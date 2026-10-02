@@ -17,8 +17,8 @@ import {
   createFrameworkResizer,
 } from '@adaptivestone/framework-module-resize/framework.js';
 // Local filesystem (tests / first-week local) or S3 (install the optional AWS peers first):
-// import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
-// import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js';
+// import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
+// import { S3Storage } from '@adaptivestone/framework-module-resize/drivers/s3.js';
 
 export const resizer = createFrameworkResizer({
   transport: createFrameworkMongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)

@@ -6,7 +6,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import {
-  type LockProvider,
+  type LockStore,
   type QueueTransport,
   type ResizeStorage,
   resetResizerForTests,
@@ -75,7 +75,7 @@ function makeTransport(
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const lockProvider: LockProvider = {
+  const lockProvider: LockStore = {
     acquire: async (key, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
@@ -492,7 +492,7 @@ describe('prewarm — never throws', () => {
   test('an internal error (lockProvider.acquire throws) is caught → { enqueued: 0 }, logged', async () => {
     const { errors } = installFakeApp();
     const { transport } = makeTransport();
-    const lockProvider: LockProvider = {
+    const lockProvider: LockStore = {
       acquire: async () => {
         throw new Error('lock backend down');
       },

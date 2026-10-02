@@ -4,14 +4,14 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import type { ResizeStorage } from '../contracts/storage.ts';
+import type { QueueTransport } from '../contracts/transport.ts';
+import { MongoTransport } from '../drivers/mongo/transport.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { FrameworkLockProvider } from '../locks/framework.ts';
-import { FrameworkMediaStore } from '../mediaStore/framework.ts';
 import { resetResizerForTests } from '../resizer.ts';
-import type { ResizeStorage } from '../storage/AbstractStorage.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
-import type { QueueTransport } from '../transports/AbstractTransport.ts';
-import { MongoTransport } from '../transports/mongo.ts';
+import { FrameworkLockStore } from './lockStore.ts';
+import { FrameworkMediaStore } from './mediaStore.ts';
 import {
   createFrameworkMongoTransport,
   createFrameworkResizer,
@@ -61,10 +61,10 @@ test('fills config, logger, events and the media store from the app', async () =
 test('adds the framework lock provider only with a transport', () => {
   installApp();
   const eager = createFrameworkResizer({ storage });
-  assert.ok(!(eager.lockProvider instanceof FrameworkLockProvider));
+  assert.ok(!(eager.lockProvider instanceof FrameworkLockStore));
   resetResizerForTests();
   const queued = createFrameworkResizer({ storage, transport });
-  assert.ok(queued.lockProvider instanceof FrameworkLockProvider);
+  assert.ok(queued.lockProvider instanceof FrameworkLockStore);
 });
 
 test('configName selects the config file, including its media model', async () => {

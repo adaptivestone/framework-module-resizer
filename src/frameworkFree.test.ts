@@ -1,6 +1,6 @@
-// A host without @adaptivestone/framework: explicit config, logger and drivers, no framework app
-// installed anywhere. Covers eager generation + reads and the queued Mongo flow with the core
-// worker runner.
+// A host without @adaptivestone/framework: explicit config and drivers, no framework app. Eager
+// generation uses hand-written in-memory drivers (any object of the contract's shape works); the
+// queued flow uses only the shipped Mongo drivers, so a plain Node app writes no driver code.
 import assert from 'node:assert/strict';
 import { after, afterEach, before, test } from 'node:test';
 import { resetAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
@@ -8,11 +8,16 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
 import defaultResizeConfig from './config/resize.ts';
+import type { MediaStore } from './contracts/mediaStore.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
+import {
+  createResizeModels,
+  MongoLockStore,
+  MongoMediaStore,
+  MongoTransport,
+} from './drivers/mongo/index.ts';
 import { Resizer, resetResizerForTests } from './index.ts';
-import type { LockProvider } from './locks/AbstractLockProvider.ts';
-import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
-import type { ResizeStorage } from './storage/AbstractStorage.ts';
-import { MongoTransport } from './transports/mongo.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 import type { MediaLike, Preview } from './types.d.ts';
 import { runWorker } from './worker.ts';
 
@@ -53,22 +58,6 @@ function memoryMediaStore(docs: Map<string, MediaLike>): MediaStore {
       if (doc) {
         doc.previews = [...(doc.previews ?? []), ...previews];
       }
-    },
-  };
-}
-
-function memoryLocks(): LockProvider {
-  const held = new Set<string>();
-  return {
-    acquire: async (key) => {
-      if (held.has(key)) {
-        return false;
-      }
-      held.add(key);
-      return true;
-    },
-    release: async (key) => {
-      held.delete(key);
     },
   };
 }
@@ -120,39 +109,15 @@ after(async () => {
   await server.stop();
 });
 
-test('queued: a Mongo task processed by the core worker, no framework app', async () => {
+test('queued: the shipped Mongo drivers and the core worker, no framework app', async () => {
   resetAppInstance();
-  // A host-defined ResizeTask model: the fields and lease index the Mongo transport uses.
-  const schema = new mongoose.Schema(
-    {
-      fileId: { type: String, required: true },
-      resizer: { type: String, default: 'default' },
-      queue: { type: String, default: 'default' },
-      pipeline: { type: String, default: 'default' },
-      requestKey: { type: String },
-      previews: [{ type: mongoose.Schema.Types.Mixed }],
-      status: { type: String, default: 'pending' },
-      attempts: { type: Number, default: 0 },
-      leasedBy: { type: String },
-      leaseToken: { type: String },
-      leaseExpiresAt: { type: Date },
-      completedAt: { type: Date },
-      deadAt: { type: Date },
-      error: { type: String },
-    },
-    { timestamps: true, minimize: false },
+  const File = connection.model(
+    'File',
+    new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
   );
-  schema.index({ queue: 1, status: 1, createdAt: 1 });
-  const ResizeTask = connection.model('ResizeTask', schema);
-  await ResizeTask.init();
+  const { ResizeTask, ResizeLock } = createResizeModels(connection);
+  await Promise.all([File.init(), ResizeTask.init(), ResizeLock.init()]);
 
-  const docs = new Map<string, MediaLike>();
-  const transport = new MongoTransport({
-    model: ResizeTask,
-    logger: silent,
-    idlePollMs: 20,
-    leaseMs: 5000,
-  });
   const resizer = new Resizer({
     config: {
       ...defaultResizeConfig,
@@ -164,32 +129,38 @@ test('queued: a Mongo task processed by the core worker, no framework app', asyn
     },
     logger: silent,
     storage: memoryStorage(),
-    mediaStore: memoryMediaStore(docs),
-    transport,
-    lockProvider: memoryLocks(),
-  });
-  const media: MediaLike = {
-    id: 'm2',
-    original: await resizer.uploadOriginal({
-      body: png,
-      visibility: 'private',
+    mediaStore: new MongoMediaStore({ model: File }),
+    transport: new MongoTransport({
+      model: ResizeTask,
+      logger: silent,
+      idlePollMs: 20,
+      leaseMs: 5000,
     }),
-    previews: [],
-  };
-  docs.set('m2', media);
+    lockProvider: new MongoLockStore({ model: ResizeLock }),
+  });
+  const original = await resizer.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  const file = await File.create({ original, previews: [] });
   const sizes = [{ width: 16, height: 16 }];
-  assert.equal((await resizer.prewarm({ media, sizes })).enqueued, 1);
+  assert.equal((await resizer.prewarm({ media: file, sizes })).enqueued, 1);
 
   const stop = new AbortController();
   const worker = runWorker({ signal: stop.signal, logger: silent });
   const until = Date.now() + 20_000;
-  while ((media.previews?.length ?? 0) === 0) {
+  let stored = await File.findById(file.id);
+  while ((stored?.previews?.length ?? 0) === 0) {
     assert.ok(Date.now() < until, 'the worker did not generate the preview');
     await new Promise((r) => setTimeout(r, 20));
+    stored = await File.findById(file.id);
   }
   stop.abort();
   await worker;
-  const { decision } = await resizer.resolve({ media, sizes });
+  const { decision } = await resizer.resolve({
+    media: stored as unknown as MediaLike,
+    sizes,
+  });
   assert.equal(decision.ready.length, 1);
   const task = await ResizeTask.findOne({}).lean();
   assert.equal(task?.status, 'completed');

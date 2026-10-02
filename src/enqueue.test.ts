@@ -7,7 +7,7 @@ import {
 import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import {
-  type LockProvider,
+  type LockStore,
   type QueueTransport,
   type ResizeStorage,
   resetResizerForTests,
@@ -66,7 +66,7 @@ function makeTransport(
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const lockProvider: LockProvider = {
+  const lockProvider: LockStore = {
     acquire: async (key, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
@@ -80,7 +80,7 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
 
 function makeResizer(opts: {
   transport?: QueueTransport;
-  lockProvider?: LockProvider;
+  lockProvider?: LockStore;
 }) {
   return createFrameworkResizer({ storage, ...opts });
 }
@@ -250,7 +250,7 @@ describe('enqueue', () => {
   test('a rejecting dispatch-lock acquire skips that variant; earlier survivors still enqueue', async () => {
     const { errors } = installFakeApp();
     const { transport, calls } = makeTransport();
-    const lockProvider: LockProvider = {
+    const lockProvider: LockStore = {
       // jpeg acquires fine; the webp acquire REJECTS — that variant is not a survivor (log +
       // continue), and the earlier jpeg survivor still reaches the transport (1.2b).
       acquire: async (key) => {

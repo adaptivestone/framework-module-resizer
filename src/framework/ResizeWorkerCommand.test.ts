@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import ResizeWorker from './ResizeWorker.ts';
+import ResizeWorker from './ResizeWorkerCommand.ts';
 
 describe('ResizeWorker CLI contract', () => {
   test('provides the Mongo connection name expected by BaseCli', () => {

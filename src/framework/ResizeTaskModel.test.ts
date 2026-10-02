@@ -4,7 +4,7 @@ import { describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { BaseModel } from '@adaptivestone/framework/modules/BaseModel.js';
 import mongoose from 'mongoose';
-import ResizeTaskModel from './ResizeTask.ts';
+import ResizeTaskModel from './ResizeTaskModel.ts';
 
 // Tests MAY import mongoose (a devDep): the no-mongoose rule (01 · §16) is for the
 // module's RUNTIME code only. Building a real mongoose.Schema is how we exercise the
@@ -184,7 +184,7 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
 describe('ResizeTaskModel — §16 no-mongoose invariant', () => {
   test('the module source never imports mongoose', () => {
     const src = readFileSync(
-      fileURLToPath(new URL('./ResizeTask.ts', import.meta.url)),
+      fileURLToPath(new URL('./ResizeTaskModel.ts', import.meta.url)),
       'utf8',
     );
     assert.doesNotMatch(src, /from ['"]mongoose['"]/);

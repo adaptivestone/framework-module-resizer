@@ -2,7 +2,7 @@
 // This file is copied verbatim into dist by postBuild.ts (tsc does not emit it),
 // so it MUST stay dependency-free: no imports of source (.ts) modules and no
 // runtime imports. Source-coupled types (Pipeline, BeforeStep, VariantStep,
-// QueueTransport, ResizeStorage, MediaStore, LockProvider, HookName, HookFn)
+// QueueTransport, ResizeStorage, MediaStore, LockStore, HookName, HookFn)
 // live next to their code.
 
 // Recursive partial for environment-specific config overrides. Arrays stay whole because

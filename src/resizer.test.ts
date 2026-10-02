@@ -5,12 +5,12 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError, ResizeSetupError } from './errors.ts';
+import { FrameworkLockStore } from './framework/lockStore.ts';
+import { FrameworkMediaStore } from './framework/mediaStore.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
-import { FrameworkLockProvider } from './locks/framework.ts';
-import { FrameworkMediaStore } from './mediaStore/framework.ts';
 import {
   getResizer,
-  type LockProvider,
+  type LockStore,
   listResizers,
   type MediaStore,
   type Pipeline,
@@ -41,7 +41,7 @@ const fakeMediaStore = (): MediaStore => ({
   load: async () => null,
   appendPreviews: async () => {},
 });
-const fakeLockProvider = (): LockProvider => ({
+const fakeLockProvider = (): LockStore => ({
   acquire: async () => true,
   release: async () => {},
 });
@@ -100,14 +100,14 @@ describe('Resizer constructor — driver wiring', () => {
   test('createFrameworkResizer fills mediaStore, and lockProvider when there is a transport', () => {
     const eager = createFrameworkResizer(baseOpts());
     assert.ok(eager.mediaStore instanceof FrameworkMediaStore);
-    assert.ok(!(eager.lockProvider instanceof FrameworkLockProvider));
+    assert.ok(!(eager.lockProvider instanceof FrameworkLockStore));
     resetResizerForTests();
     const queued = createFrameworkResizer({
       ...baseOpts(),
       transport: fakeTransport(),
     });
     assert.ok(queued.mediaStore instanceof FrameworkMediaStore);
-    assert.ok(queued.lockProvider instanceof FrameworkLockProvider);
+    assert.ok(queued.lockProvider instanceof FrameworkLockStore);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {

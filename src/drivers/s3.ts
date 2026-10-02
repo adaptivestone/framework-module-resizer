@@ -9,7 +9,7 @@
 // SUBPATH-ONLY ENTRY, STATIC SDK IMPORTS (05 · §10.5): `@aws-sdk/client-s3` and
 // `@aws-sdk/s3-request-presigner` are imported plainly at the top of this module. This is safe
 // precisely because this driver is NOT re-exported from the main package entry (02 · §6) —
-// hosts import `@adaptivestone/framework-module-resize/storage/s3.js` directly, so the optional
+// hosts import `@adaptivestone/framework-module-resize/drivers/s3.js` directly, so the optional
 // peers are resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the
 // host's own import line at bootstrap (no dynamic import(), no lazy loaders).
 import {
@@ -18,9 +18,9 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { ResizeStorage } from '../contracts/storage.ts';
 import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
 import type { StorageRef } from '../types.d.ts';
-import type { ResizeStorage } from './AbstractStorage.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
 interface S3StorageRef {
@@ -45,7 +45,7 @@ export interface S3StorageOptions {
   client?: S3Client;
 }
 
-export class S3Storage implements ResizeStorage {
+export class S3Storage extends ResizeStorage {
   readonly #opts: S3StorageOptions;
   // Memoized per instance (a host may construct more than one driver). A host-provided
   // `opts.client` short-circuits construction. Synchronous now that the SDK is a static
@@ -53,6 +53,7 @@ export class S3Storage implements ResizeStorage {
   #client: S3Client | undefined;
 
   constructor(opts: S3StorageOptions) {
+    super();
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
   }

@@ -1,20 +1,25 @@
-// @adaptivestone/framework-module-resize — the main entry (public API surface, 02 · §6).
-//
-// MAIN ENTRY = CORE ONLY. It imports no framework code (a guard test walks its import graph) and
-// no driver: every driver lives behind its own package subpath with plain static imports, so a
-// missing optional peer fails LOUDLY at the host's own driver import line. Framework hosts wire
-// everything through the framework adapter:
-//   import { createFrameworkResizer, createFrameworkMongoTransport } from '@adaptivestone/framework-module-resize/framework.js';
-// Driver subpaths (house style: CLASSES implementing the Abstract* contracts):
-//   import { MongoTransport }        from '@adaptivestone/framework-module-resize/transports/mongo.js';
-//   import { SqsTransport }          from '@adaptivestone/framework-module-resize/transports/sqs.js';
-//   import { S3Storage }             from '@adaptivestone/framework-module-resize/storage/s3.js';
-//   import { LocalFsStorage }        from '@adaptivestone/framework-module-resize/storage/fs.js';
-//   import { FrameworkMediaStore }   from '@adaptivestone/framework-module-resize/mediaStore/framework.js';
-//   import { FrameworkLockProvider } from '@adaptivestone/framework-module-resize/locks/framework.js';
-// The contract INTERFACES for custom-driver authors re-export below (the VALUES live at the
-// subpaths).
+// @adaptivestone/framework-module-resize — the main entry: the core, the driver contracts and the
+// helpers. It imports no framework code, no mongoose and no driver (a guard test walks its import
+// graph). Shipped drivers live behind their own subpaths, so a missing optional peer fails at the
+// host's own import line:
+//   …/drivers/fs.js     LocalFsStorage
+//   …/drivers/s3.js     S3Storage                      (optional peers: AWS S3 SDK)
+//   …/drivers/mongo.js  MongoTransport, MongoMediaStore, MongoLockStore, createResizeModels
+//   …/drivers/sqs.js    SqsTransport                   (optional peers: AWS SQS SDK, sqs-consumer)
+//   …/framework.js      the framework adapter: createFrameworkResizer, createFrameworkMongoTransport, …
 
+// --- driver contracts: abstract classes a custom driver extends (or any object of the same shape) ---
+export { LockStore } from './contracts/lockStore.ts';
+export { MediaStore } from './contracts/mediaStore.ts';
+export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
+export {
+  type EnqueueTask,
+  type LeasedTask,
+  QueueTransport,
+  type StartWorkerOpts,
+  type TaskEvent,
+  type TaskEventHandler,
+} from './contracts/transport.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type {
   EnqueueRequiredOpts,
@@ -51,27 +56,18 @@ export {
 export {
   resizeMediaPaths,
   resizeMediaSchemaFragment,
-} from './models/mediaFragment.ts';
+} from './mediaFragment.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,
-  EnqueueTask,
   GenerateOpts,
   GenerateResult,
   HookFn,
   HookName,
   HookSignatures,
-  LeasedTask,
-  LockProvider,
-  MediaStore,
   ObserverName,
   Pipeline,
-  QueueTransport,
   ResizerOptions,
-  ResizeStorage,
-  StartWorkerOpts,
-  TaskEvent,
-  TaskEventHandler,
   VariantStep,
   WaterfallName,
 } from './resizer.ts';
