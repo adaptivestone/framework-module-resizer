@@ -80,18 +80,37 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   - `ResizeConfig` no longer contains `mediaModelName`; `FrameworkResizeConfig` does. The scaffold
     config `satisfies FrameworkResizeConfig`.
   - The main entry no longer exports `ResizeWorker`, `ResizeTaskModel`, `runResizeWorker` or the
-    `TResizeTask` type; import them from `…/framework.js` (the `…/commands/ResizeWorker.js` and
-    `…/models/ResizeTask.js` subpaths still work).
+    `TResizeTask` type; import them from `…/framework.js`.
+- Subpaths are grouped by backend, and framework pieces live only in the adapter:
+
+  | Before | Now |
+  |---|---|
+  | `…/storage/fs.js`, `…/storage/s3.js` | `…/drivers/fs.js`, `…/drivers/s3.js` |
+  | `…/transports/mongo.js`, `…/transports/sqs.js` | `…/drivers/mongo.js`, `…/drivers/sqs.js` |
+  | `…/mediaStore/framework.js`, `…/locks/framework.js` | `…/framework.js` |
+  | `…/models/ResizeTask.js`, `…/commands/ResizeWorker.js` (default exports) | `…/framework.js` (`ResizeTaskModel`, `ResizeWorker`) |
+
+  `FrameworkLockProvider` is now `FrameworkLockStore`, and the `LockProvider` type is now
+  `LockStore`. Re-run `resize-scaffold` after deleting the old model and command shims.
+- The driver contracts `ResizeStorage`, `MediaStore`, `QueueTransport` and `LockStore` are
+  exported abstract classes (runtime values) instead of interfaces. A custom driver `extends` one,
+  or stays any object of the same shape.
 
 **Features**
 
+- The framework is optional. `@adaptivestone/framework` and `mongoose` are optional peers, so
+  npm no longer installs them into a plain Node app; the core needs only `sharp`.
+- Framework-free Mongo drivers in `…/drivers/mongo.js`: `MongoMediaStore({ model })`,
+  `MongoLockStore({ model })` and `createResizeModels(connection)`, which registers `ResizeTask`
+  and `ResizeLock` with the package's schemas and indexes. A plain Node app with MongoDB writes no
+  driver code. `FrameworkMediaStore` is now `MongoMediaStore` with the model taken from the app,
+  and the framework `ResizeTaskModel` uses the same schema definitions.
 - Framework-free use: `new Resizer({ config, storage, mediaStore, … })`, `new MongoTransport({
   model })` and the core `runWorker({ queue, signal, logger, sharp })` run without
   `@adaptivestone/framework`. `runWorker` also refuses to start when a Resizer's
   `queue.lockTtlMs.worker` exceeds the transport's `leaseMs` (`RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`).
 - Each framework Resizer can read its own config file:
   `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
-
 - Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()`,
   `prewarm()` and `enqueueRequired()` accept a per-call `queue`.
   `npm run cli ResizeWorker -- --queue=<name>` consumes only that queue; without the flag it consumes `'default'`. `SqsTransport` maps queue

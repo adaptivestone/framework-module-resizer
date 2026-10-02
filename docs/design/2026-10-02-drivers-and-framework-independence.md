@@ -1,7 +1,8 @@
 # Drivers and framework independence
 
-Status: **proposal**, 2026-10-02. Follows [the multi-resizer redesign](./2026-09-30-multi-resizer.md)
-(P1–P4, merged). Pre-release: breaking changes are fine; hosts migrate their own data.
+Status: **accepted** 2026-10-02 and implemented in phases Q1–Q4. Follows
+[the multi-resizer redesign](./2026-09-30-multi-resizer.md) (P1–P4, merged). Pre-release:
+breaking changes are fine; hosts migrate their own data.
 
 ## Goal
 
@@ -185,10 +186,9 @@ same phase.
 | **Q3** One enqueue method | D7 | `enqueueRequired` is gone; `prewarm` returns the detailed result and never throws |
 | **Q4** Worker and framework bootstrap | D8, D9 | `runWorker` serves several transports; a framework host imports `src/resizer.ts` statically, and the scaffolded worker command is an import plus a re-export |
 
-## Open questions
+## Resolved questions
 
-1. **Locks in framework apps.** Should they use the framework's existing `Lock` model
-   (proposed: no new collection), or the module's own `ResizeLock` (the same code in both
-   worlds)?
-2. **D9.** Should lazy framework reads be in or out?
-3. **Subpath names.** Is `…/drivers/{fs,s3,mongo,sqs}.js` acceptable?
+1. **Locks in framework apps:** the framework's existing `Lock` model, through `FrameworkLockStore`.
+   The module only defines the `LockStore` contract. Plain Node apps use `MongoLockStore`.
+2. **D9:** in. Framework reads are lazy.
+3. **Subpaths:** `…/drivers/{fs,s3,mongo,sqs}.js`.

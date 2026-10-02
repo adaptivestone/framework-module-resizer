@@ -8,26 +8,26 @@
 // `lease`/`complete`/`fail`/`renew`/`sweepDeadLetters`/`backoff` are transport-internal but
 // PUBLIC methods (unit tests drive them; not part of the QueueTransport interface).
 //
-// Subpath entry `…/transports/mongo.js` (uniform rule 02 · §6): the QueueTransport/LeasedTask
-// contract comes from ./AbstractTransport.ts (not resizer.ts); it imports no framework code.
-import defaultResizeConfig from '../config/resize.ts';
-import { buildRequestKey, canonicalizeVariants } from '../enqueue.ts';
-import { ResizeError, ResizeSetupError } from '../errors.ts';
-import { randomHex } from '../helpers/random.ts';
-import { sleep } from '../helpers/sleep.ts';
+// Exported from `…/drivers/mongo.js`. It extends the QueueTransport contract
+// (src/contracts/transport.ts) and imports no framework code and no mongoose.
+import defaultResizeConfig from '../../config/resize.ts';
+import {
+  type EnqueueTask,
+  type LeasedTask,
+  QueueTransport,
+  type StartWorkerOpts,
+  type TaskEvent,
+  type TaskEventHandler,
+} from '../../contracts/transport.ts';
+import { buildRequestKey, canonicalizeVariants } from '../../enqueue.ts';
+import { ResizeError, ResizeSetupError } from '../../errors.ts';
+import { randomHex } from '../../helpers/random.ts';
+import { sleep } from '../../helpers/sleep.ts';
 import type {
   EnqueueReceipt,
   MissingPreview,
   ResizeLogger,
-} from '../types.d.ts';
-import type {
-  EnqueueTask,
-  LeasedTask,
-  QueueTransport,
-  StartWorkerOpts,
-  TaskEvent,
-  TaskEventHandler,
-} from './AbstractTransport.ts';
+} from '../../types.d.ts';
 
 // The mongoose model the transport calls (findOneAndUpdate / findOne / find). Typed loosely so
 // the module stays free of mongoose types.
@@ -128,7 +128,7 @@ function isDuplicateKeyError(error: unknown): boolean {
 }
 
 /** The Mongo-backed queue transport (05 · §10.2). */
-export class MongoTransport implements QueueTransport {
+export class MongoTransport extends QueueTransport {
   readonly leaseMs: number;
   readonly #model: TaskModel;
   readonly #getModel: (() => TaskModel) | undefined;
@@ -139,6 +139,7 @@ export class MongoTransport implements QueueTransport {
   readonly #taskTimeoutMs: number;
 
   constructor(opts: MongoTransportOptions) {
+    super();
     if (!opts || (opts.model === undefined) === (opts.getModel === undefined)) {
       throw new ResizeSetupError(
         "resize mongo transport: pass exactly one of `model` (the ResizeTask model) or `getModel`; framework hosts: use createFrameworkMongoTransport() from '@adaptivestone/framework-module-resize/framework.js'",

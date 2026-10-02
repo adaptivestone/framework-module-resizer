@@ -6,9 +6,9 @@
 // createFrameworkResizer fills config (src/config/resize.ts), the app logger and the media store
 // from the framework app.
 import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
-import { LocalFsStorage } from '@adaptivestone/framework-module-resize/storage/fs.js';
+import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
 // S3 / S3-compatible storage (install the optional AWS peers first — 05 · §10.5):
-// import { S3Storage } from '@adaptivestone/framework-module-resize/storage/s3.js';
+// import { S3Storage } from '@adaptivestone/framework-module-resize/drivers/s3.js';
 
 export const resizer = createFrameworkResizer({
   // Local filesystem — swap for `new S3Storage({ bucketPublic, bucketPrivate,

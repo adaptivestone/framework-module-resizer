@@ -8,7 +8,7 @@
 // SUBPATH-ONLY ENTRY, STATIC SDK IMPORTS (05 · §10.3): `@aws-sdk/client-sqs` and `sqs-consumer`
 // are imported plainly at the top of this module. This is safe precisely because this driver is
 // NOT re-exported from the main package entry (02 · §6) — hosts import
-// `@adaptivestone/framework-module-resize/transports/sqs.js` directly, so the optional peers are
+// `@adaptivestone/framework-module-resize/drivers/sqs.js` directly, so the optional peers are
 // resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the host's own
 // import line at bootstrap (no dynamic import(), no lazy loaders).
 //
@@ -17,15 +17,15 @@
 // here (documented — 05 · §10.3). It DOES report `completed` / `failed` through `onEvent`.
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { Consumer } from 'sqs-consumer';
+import {
+  type EnqueueTask,
+  type LeasedTask,
+  QueueTransport,
+  type StartWorkerOpts,
+  type TaskEvent,
+} from '../contracts/transport.ts';
 import { ResizeSetupError } from '../errors.ts';
 import type { ResizeLogger } from '../types.d.ts';
-import type {
-  EnqueueTask,
-  LeasedTask,
-  QueueTransport,
-  StartWorkerOpts,
-  TaskEvent,
-} from './AbstractTransport.ts';
 
 export interface SqsTransportOptions {
   queueUrl: string; // serves the 'default' queue
@@ -42,13 +42,14 @@ export interface SqsTransportOptions {
   client?: SQSClient;
 }
 
-export class SqsTransport implements QueueTransport {
+export class SqsTransport extends QueueTransport {
   readonly #opts: SqsTransportOptions;
   // Memoized per instance. A host-provided `opts.client` short-circuits construction.
   // Synchronous now that the SDK is a static import — built lazily on first use.
   #client: SQSClient | undefined;
 
   constructor(opts: SqsTransportOptions) {
+    super();
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
   }

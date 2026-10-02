@@ -10,18 +10,18 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
+import type { MediaStore } from './contracts/mediaStore.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
+import type { MongoTransport } from './drivers/mongo/transport.ts';
+import { FrameworkLockStore } from './framework/lockStore.ts';
+import ResizeTaskModel from './framework/ResizeTaskModel.ts';
 import {
   createFrameworkMongoTransport,
   createFrameworkResizer,
 } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
-import { FrameworkLockProvider } from './locks/framework.ts';
-import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
-import ResizeTaskModel from './models/ResizeTask.ts';
 import { type QueueTransport, resetResizerForTests } from './resizer.ts';
-import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import type { MongoTransport } from './transports/mongo.ts';
 import type { MediaLike, Preview } from './types.d.ts';
 
 const png = await sharp({
@@ -154,7 +154,7 @@ test('one worker serves two Resizers that share a transport', async () => {
   installApp();
   await taskModel.deleteMany({});
   const { transport, stop } = stoppable(createFrameworkMongoTransport());
-  const lockProvider = new FrameworkLockProvider();
+  const lockProvider = new FrameworkLockStore();
   const mediaA = newMedia();
   const mediaB = newMedia();
   const a = memoryStorage();
@@ -198,7 +198,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   const media = newMedia();
   const memory = memoryStorage();
   const real = createFrameworkMongoTransport();
-  const lockProvider = new FrameworkLockProvider();
+  const lockProvider = new FrameworkLockStore();
 
   const first = stoppable(real);
   const resizer = createFrameworkResizer({

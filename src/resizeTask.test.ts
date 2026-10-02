@@ -13,16 +13,16 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
-import ResizeWorker from './commands/ResizeWorker.ts';
+import type { LockStore } from './contracts/lockStore.ts';
 import {
   ResizeConfigError,
   ResizeGenerateError,
   ResizeNoOriginalError,
   ResizeSetupError,
 } from './errors.ts';
+import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
-import type { LockProvider } from './locks.ts';
 import type { MediaStore } from './mediaStore.ts';
 import {
   type LeasedTask,
@@ -168,13 +168,13 @@ function makeMediaStore(media: MediaLike | null): {
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
-  lockProvider: LockProvider;
+  lockProvider: LockStore;
   acquired: string[];
   released: string[];
 } {
   const acquired: string[] = [];
   const released: string[] = [];
-  const lockProvider: LockProvider = {
+  const lockProvider: LockStore = {
     acquire: async (key) => {
       acquired.push(key);
       return typeof acquire === 'function' ? acquire(key) : acquire;
@@ -467,7 +467,7 @@ describe('processTask — variants', () => {
     const { storage, uploads } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const released: string[] = [];
-    const lockProvider: LockProvider = {
+    const lockProvider: LockStore = {
       // The webp worker-lock acquire REJECTS — treated exactly like a not-acquired lock: skip the
       // variant (leave it missing), never reject the pool or skip persist/finally. The jpeg variant
       // is unaffected: generated, persisted, and its locks released (1.2a).

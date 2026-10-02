@@ -2,7 +2,7 @@
 // (AbstractCommand shape, isShouldInitModels=true, --queue); this subclass only builds the host's
 // Resizers in the CLI process before the worker starts. The framework's filename-keyed CLI loader
 // registers it as `npm run cli ResizeWorker`.
-import ModuleResizeWorker from '@adaptivestone/framework-module-resize/commands/ResizeWorker.js';
+import { ResizeWorker as ModuleResizeWorker } from '@adaptivestone/framework-module-resize/framework.js';
 
 export default class ResizeWorker extends ModuleResizeWorker {
   async run(): Promise<boolean> {

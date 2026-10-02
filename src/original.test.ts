@@ -8,11 +8,11 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import { LocalFsStorage } from './drivers/fs.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import type { QueueTransport, ResizeStorage } from './resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
-import { LocalFsStorage } from './storage/fs.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 
 const png = await sharp({

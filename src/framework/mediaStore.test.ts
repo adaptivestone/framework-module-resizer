@@ -7,7 +7,7 @@ import {
 import { ResizeConfigError } from '../errors.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { Preview } from '../types.d.ts';
-import { FrameworkMediaStore } from './framework.ts';
+import { FrameworkMediaStore } from './mediaStore.ts';
 
 // One stateless instance drives the whole file (option-less constructor; every
 // method reaches the model/config ambiently through getApp()).

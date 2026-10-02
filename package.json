@@ -11,16 +11,12 @@
   "exports": {
     ".": "./dist/index.js",
     "./package.json": "./package.json",
-    "./models/ResizeTask.js": "./dist/models/ResizeTask.js",
-    "./commands/ResizeWorker.js": "./dist/commands/ResizeWorker.js",
     "./config/resize.js": "./dist/config/resize.js",
     "./framework.js": "./dist/framework/index.js",
-    "./transports/mongo.js": "./dist/transports/mongo.js",
-    "./transports/sqs.js": "./dist/transports/sqs.js",
-    "./storage/s3.js": "./dist/storage/s3.js",
-    "./storage/fs.js": "./dist/storage/fs.js",
-    "./mediaStore/framework.js": "./dist/mediaStore/framework.js",
-    "./locks/framework.js": "./dist/locks/framework.js"
+    "./drivers/fs.js": "./dist/drivers/fs.js",
+    "./drivers/s3.js": "./dist/drivers/s3.js",
+    "./drivers/mongo.js": "./dist/drivers/mongo/index.js",
+    "./drivers/sqs.js": "./dist/drivers/sqs.js"
   },
   "bin": {
     "resize-scaffold": "./dist/scaffold/command.js"
@@ -66,6 +62,9 @@
     "sqs-consumer": "*"
   },
   "peerDependenciesMeta": {
+    "@adaptivestone/framework": {
+      "optional": true
+    },
     "@aws-sdk/client-s3": {
       "optional": true
     },
@@ -73,6 +72,9 @@
       "optional": true
     },
     "@aws-sdk/s3-request-presigner": {
+      "optional": true
+    },
+    "mongoose": {
       "optional": true
     },
     "sqs-consumer": {

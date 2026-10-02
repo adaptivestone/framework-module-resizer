@@ -11,12 +11,12 @@ import { defaultOptions } from '@adaptivestone/framework/modules/BaseModel.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
+import type { ResizeStorage } from './contracts/storage.ts';
+import { LocalFsStorage } from './drivers/fs.ts';
+import { S3Storage } from './drivers/s3.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
-import { resizeMediaSchemaFragment } from './models/mediaFragment.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 import { resetResizerForTests } from './resizer.ts';
-import type { ResizeStorage } from './storage/AbstractStorage.ts';
-import { LocalFsStorage } from './storage/fs.ts';
-import { S3Storage } from './storage/s3.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MediaLike } from './types.d.ts';
 

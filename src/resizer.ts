@@ -6,6 +6,19 @@
 // reads a framework app. Framework hosts get them filled by createFrameworkResizer
 // (src/framework/resizer.ts).
 import type { Metadata, Sharp } from 'sharp';
+import type { LockStore } from './contracts/lockStore.ts';
+import type { MediaStore } from './contracts/mediaStore.ts';
+// The driver contracts live in src/contracts/ so drivers import them without this module. They
+// are re-exported here (types only) for the core files that import them from resizer.ts.
+import type { ResizeStorage } from './contracts/storage.ts';
+import type {
+  EnqueueTask,
+  LeasedTask,
+  QueueTransport,
+  StartWorkerOpts,
+  TaskEvent,
+  TaskEventHandler,
+} from './contracts/transport.ts';
 import {
   type EnqueueRequiredOpts,
   enqueueRequiredImpl,
@@ -15,25 +28,9 @@ import {
   resolveImpl,
 } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
-import type { LockProvider } from './locks/AbstractLockProvider.ts';
-import type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
 import { uploadOriginalImpl } from './original.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
-// Transport + storage contracts (05 · §10.1, §10.4) now live in their own files —
-// transports/AbstractTransport.ts + storage/AbstractStorage.ts — so the optional-peer drivers
-// import them WITHOUT depending on this module. Imported here for the local annotations below
-// and re-exported so every existing import site (engine.ts, mongo.ts, tests, …) keeps importing
-// them from resizer.ts unchanged.
-import type { ResizeStorage } from './storage/AbstractStorage.ts';
-import type {
-  EnqueueTask,
-  LeasedTask,
-  QueueTransport,
-  StartWorkerOpts,
-  TaskEvent,
-  TaskEventHandler,
-} from './transports/AbstractTransport.ts';
 import type {
   EnqueueRequiredResult,
   MediaLike,
@@ -49,8 +46,8 @@ import type {
   UploadOriginalOpts,
 } from './types.d.ts';
 
-export type { LockProvider } from './locks/AbstractLockProvider.ts';
-export type { MediaStore } from './mediaStore/AbstractMediaStore.ts';
+export type { LockStore } from './contracts/lockStore.ts';
+export type { MediaStore } from './contracts/mediaStore.ts';
 export type {
   EnqueueTask,
   LeasedTask,
@@ -157,7 +154,7 @@ export interface ResizerOptions {
   mediaStore: MediaStore; // REQUIRED: loads media, saves preview metadata (05 · §10.6)
   transport?: QueueTransport; // lazy mode only (05 · §10.1)
   queue?: string; // default queue for this Resizer's tasks; default 'default'
-  lockProvider?: LockProvider; // REQUIRED with a transport: dispatch and worker locks (05 · §10.6)
+  lockProvider?: LockStore; // REQUIRED with a transport: dispatch and worker locks (05 · §10.6)
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
   hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
@@ -191,7 +188,7 @@ const resizers = new Map<string, Resizer>();
 
 // Eager-only Resizers (no transport) never take locks. This placeholder keeps the field typed
 // and turns an unexpected use into a named setup error instead of a TypeError.
-const NO_LOCK_PROVIDER: LockProvider = Object.freeze({
+const NO_LOCK_PROVIDER: LockStore = Object.freeze({
   acquire: async (): Promise<boolean> => {
     throw new ResizeSetupError(
       'resize: this Resizer has no lockProvider — pass one together with a transport',
@@ -219,7 +216,7 @@ export class Resizer {
   readonly storage: ResizeStorage;
   readonly transport: QueueTransport | undefined;
   readonly mediaStore: MediaStore;
-  readonly lockProvider: LockProvider;
+  readonly lockProvider: LockStore;
   // Named pipelines: last-wins per name (04 · §8).
   readonly #pipelines: Map<string, Pipeline>;
   // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).

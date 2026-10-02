@@ -31,6 +31,10 @@ const EXPECTED_VALUE_EXPORTS = [
   'getSizeKey',
   'isCatalogCovered',
   'listResizers',
+  'LockStore',
+  'MediaStore',
+  'QueueTransport',
+  'ResizeStorage',
   'parseSizeKey',
   'processTask',
   'resetResizerForTests',
@@ -46,7 +50,10 @@ const DRIVER_NAMES = [
   'S3Storage',
   'LocalFsStorage',
   'FrameworkMediaStore',
-  'FrameworkLockProvider',
+  'FrameworkLockStore',
+  'MongoMediaStore',
+  'MongoLockStore',
+  'createResizeModels',
   // The framework adapter lives at …/framework.js, never on the framework-free main entry.
   'ResizeTaskModel',
   'ResizeWorker',
@@ -66,7 +73,13 @@ describe('public API surface (src/index.ts)', () => {
   });
 
   test('the classes are constructors (function with a prototype)', () => {
-    for (const name of ['Resizer']) {
+    for (const name of [
+      'Resizer',
+      'ResizeStorage',
+      'MediaStore',
+      'QueueTransport',
+      'LockStore',
+    ]) {
       const v = asRecord[name];
       assert.equal(typeof v, 'function', `${name} should be a class/function`);
       assert.ok(
@@ -156,25 +169,22 @@ function reachableGraph(entry: string): Set<string> {
   return seen;
 }
 
-describe('import-time isolation (no optional AWS SDK in the main-entry graph)', () => {
+describe('import-time isolation (no optional peer in the main-entry graph)', () => {
   const graph = reachableGraph(resolve(SRC_DIR, 'index.ts'));
 
-  test('the graph excludes the AWS-SDK driver modules (transports/sqs, storage/s3)', () => {
-    const rels = [...graph].map((f) => relative(SRC_DIR, f));
-    assert.ok(
-      !rels.includes('transports/sqs.ts'),
-      'transports/sqs.ts must not be reachable from the main entry',
-    );
-    assert.ok(
-      !rels.includes('storage/s3.ts'),
-      'storage/s3.ts must not be reachable from the main entry',
-    );
+  test('the graph reaches no driver module', () => {
+    const drivers = [...graph]
+      .map((f) => relative(SRC_DIR, f))
+      .filter((rel) => rel.startsWith('drivers/'));
+    assert.deepEqual(drivers, [], 'drivers are subpath-only');
   });
 
   test('no file in the graph imports @aws-sdk/* or sqs-consumer', () => {
     for (const file of graph) {
       const src = readFileSync(file, 'utf8');
-      const m = /from\s*['"](@aws-sdk\/[^'"]+|sqs-consumer)['"]/.exec(src);
+      const m = /from\s*['"](@aws-sdk\/[^'"]+|sqs-consumer|mongoose)['"]/.exec(
+        src,
+      );
       assert.equal(
         m,
         null,

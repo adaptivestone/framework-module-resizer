@@ -1,10 +1,10 @@
-// The `ResizeWorker` CLI command (07 · Worker §11), part of the framework adapter (exported from
-// `…/framework.js` and `…/commands/ResizeWorker.js`). AbstractCommand-SHAPED but DUCK-TYPED, so
+// The `ResizeWorker` CLI command, part of the framework adapter (exported from `…/framework.js` as
+// `ResizeWorker`). AbstractCommand-SHAPED but DUCK-TYPED, so
 // it imports no framework class. The framework's BaseCli constructs
 // every command as `new Command(app, commands, args)` and reads the statics below before/after;
 // matching that shape (constructor args + `static description` + `static isShouldInitModels`) is
-// all it needs. Hosts register it via the scaffold re-export and launch `npm run cli ResizeWorker`.
-import { runResizeWorker } from '../framework/worker.ts';
+// all it needs. Hosts register it through the scaffolded src/commands/ResizeWorker.ts and launch `npm run cli ResizeWorker`.
+import { runResizeWorker } from './worker.ts';
 
 export default class ResizeWorker {
   static description =

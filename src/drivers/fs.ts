@@ -1,9 +1,9 @@
 // Local filesystem driver. Each persisted ref identifies both a relative path and its root.
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { ResizeStorage } from '../contracts/storage.ts';
 import { ResizeSecurityError } from '../errors.ts';
 import type { StorageRef } from '../types.d.ts';
-import type { ResizeStorage } from './AbstractStorage.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
 export interface LocalFsStorageOptions {
@@ -45,12 +45,13 @@ async function assertRealPathInsideRoot(
   }
 }
 
-export class LocalFsStorage implements ResizeStorage {
+export class LocalFsStorage extends ResizeStorage {
   readonly #rootDir: string;
   readonly #privateRootDir: string;
   readonly #publicBaseUrl: string;
 
   constructor(opts: LocalFsStorageOptions) {
+    super();
     this.#rootDir = resolve(opts.rootDir);
     this.#privateRootDir = resolve(
       opts.privateRootDir ?? `${this.#rootDir}-private`,

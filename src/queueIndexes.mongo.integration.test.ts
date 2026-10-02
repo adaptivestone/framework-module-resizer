@@ -7,15 +7,15 @@ import {
 import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import type { ResizeStorage } from './contracts/storage.ts';
+import { FrameworkLockStore } from './framework/lockStore.ts';
+import ResizeTaskModel from './framework/ResizeTaskModel.ts';
 import {
   createFrameworkMongoTransport,
   createFrameworkResizer,
 } from './framework/resizer.ts';
 import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
-import { FrameworkLockProvider } from './locks/framework.ts';
-import ResizeTaskModel from './models/ResizeTask.ts';
 import { resetResizerForTests } from './resizer.ts';
-import type { ResizeStorage } from './storage/AbstractStorage.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 
 const storage: ResizeStorage = {
@@ -85,7 +85,7 @@ async function createFixture(name: string) {
     taskModel,
     lockModel,
     transport: createFrameworkMongoTransport(),
-    lockProvider: new FrameworkLockProvider(),
+    lockProvider: new FrameworkLockStore(),
   };
 }
 

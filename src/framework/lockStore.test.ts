@@ -4,11 +4,11 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { FrameworkLockProvider } from './framework.ts';
+import { FrameworkLockStore } from './lockStore.ts';
 
 // One stateless instance drives the whole file (option-less constructor; the
 // driver reaches the framework `Lock` model ambiently through getApp()).
-const provider = new FrameworkLockProvider();
+const provider = new FrameworkLockStore();
 
 // A recording fake `Lock` model installed via getModel('Lock'). The ms→seconds
 // conversion is the framework's Lock TTL contract (02 · §4) and must live here.
@@ -27,7 +27,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-describe('FrameworkLockProvider.acquire', () => {
+describe('FrameworkLockStore.acquire', () => {
   test('passes SECONDS to Lock.acquireLock (60000ms → 60) and returns the boolean', async () => {
     const calls: Array<[string, number]> = [];
     installLock({
@@ -61,7 +61,7 @@ describe('FrameworkLockProvider.acquire', () => {
   });
 });
 
-describe('FrameworkLockProvider.release', () => {
+describe('FrameworkLockStore.release', () => {
   test('calls Lock.releaseLock with the key', async () => {
     const released: string[] = [];
     installLock({

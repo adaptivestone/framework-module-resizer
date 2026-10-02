@@ -2,14 +2,13 @@
 // explicitly; these helpers fill the parts a framework host would otherwise repeat: the config
 // file, the app logger and event bus, the framework media store and lock provider, and the
 // ResizeTask model.
-import { FrameworkLockProvider } from '../locks/framework.ts';
-import type { MediaStore } from '../mediaStore/AbstractMediaStore.ts';
-import { FrameworkMediaStore } from '../mediaStore/framework.ts';
-import { Resizer, type ResizerOptions } from '../resizer.ts';
+
+import type { MediaStore } from '../contracts/mediaStore.ts';
 import {
   MongoTransport,
   type MongoTransportOptions,
-} from '../transports/mongo.ts';
+} from '../drivers/mongo/transport.ts';
+import { Resizer, type ResizerOptions } from '../resizer.ts';
 import type {
   FrameworkResizeConfig,
   ResizeEventBus,
@@ -17,6 +16,8 @@ import type {
 } from '../types.d.ts';
 import { appLogger, getApp } from './app.ts';
 import { getResizeConfig } from './config.ts';
+import { FrameworkLockStore } from './lockStore.ts';
+import { FrameworkMediaStore } from './mediaStore.ts';
 
 export interface FrameworkResizerOptions
   extends Omit<ResizerOptions, 'config' | 'mediaStore' | 'logger' | 'events'> {
@@ -29,7 +30,7 @@ export interface FrameworkResizerOptions
 
 /**
  * A Resizer wired from the framework app. Explicit options win; a `transport` without a
- * `lockProvider` gets the framework `Lock` model's FrameworkLockProvider.
+ * `lockProvider` gets the framework `Lock` model's FrameworkLockStore.
  */
 export function createFrameworkResizer(opts: FrameworkResizerOptions): Resizer {
   const { configName, config: explicitConfig, ...rest } = opts;
@@ -44,7 +45,7 @@ export function createFrameworkResizer(opts: FrameworkResizerOptions): Resizer {
       opts.mediaStore ??
       new FrameworkMediaStore({ modelName: config.mediaModelName }),
     ...(opts.transport && !opts.lockProvider
-      ? { lockProvider: new FrameworkLockProvider() }
+      ? { lockProvider: new FrameworkLockStore() }
       : {}),
   });
 }
