@@ -31,8 +31,15 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 export async function processTask(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
+  transport?: QueueTransport, // the delivering transport; default: the Resizer's own
 ): Promise<void> {
-  return processTaskWith(getResizer(task.resizer), task, taskOpts);
+  const resizer = getResizer(task.resizer);
+  return processTaskWith(
+    resizer,
+    task,
+    taskOpts,
+    transport ?? resizer.transport,
+  );
 }
 
 export interface RunWorkerOptions {
@@ -66,10 +73,26 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     );
     return;
   }
-  // Fail before leasing anything: a misconfigured media store (e.g. a wrong mediaModelName)
-  // would otherwise surface only as per-task errors.
+  // A transport that can't consume this queue (e.g. SQS without that queue URL) is skipped, so
+  // one Resizer's missing queue never stops the others.
+  for (const transport of [...transports]) {
+    if (transport.servesQueue && !transport.servesQueue(queue)) {
+      transports.delete(transport);
+      logger.info(
+        `resize worker: a transport does not serve queue '${queue}' — skipping it`,
+      );
+    }
+  }
+  if (transports.size === 0) {
+    throw new ResizeSetupError(
+      `resize worker: no transport serves queue '${queue}'`,
+      { code: 'RESIZE_QUEUE_NOT_SERVED' },
+    );
+  }
+  // Fail before leasing anything: a bad config, transport timing or media store (e.g. a wrong
+  // mediaModelName) would otherwise surface only as per-task errors.
   for (const resizer of resizers) {
-    await resizer.mediaStore.verify?.();
+    await resizer.verify();
   }
 
   // Events are routed by the task's Resizer name, looked up when the event arrives.
@@ -108,7 +131,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       [...transports].map(async (transport) => {
         try {
           await transport.startWorker(
-            (task, taskOpts) => processTask(task, taskOpts),
+            (task, taskOpts) => processTask(task, taskOpts, transport),
             { signal: stop.signal, queue, onEvent },
           );
         } catch (err) {

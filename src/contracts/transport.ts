@@ -46,6 +46,13 @@ export abstract class QueueTransport {
    */
   abstract readonly locks: LockStore;
 
+  /**
+   * Optional: whether this transport can consume `queue` (e.g. SQS knows only its configured
+   * queue URLs). Without it every queue is served. The worker skips a transport that can't serve
+   * its queue, so one Resizer's missing queue never stops the others.
+   */
+  servesQueue?(queue: string): boolean;
+
   /** Optional: lock TTLs in ms. Without it the defaults apply: `{ dispatch: 60000, worker: 60000 }`. */
   getLockTtlMs?(): { dispatch: number; worker: number };
 

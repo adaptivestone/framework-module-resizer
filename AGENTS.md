@@ -51,8 +51,8 @@ a private original.
    ```
 
    `--eager` emits `src/resizer.ts` (LocalFsStorage already wired) + `src/config/resize.ts`.
-   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts` (a
-   subclass of the module's command that loads `src/resizer.ts` before the worker starts).
+   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts`
+   (`import '../resizer.ts'` plus a re-export of the module's command).
    Appends a pointer to this guide into the host's `AGENTS.md`
    (`--agents claude|print|skip` to redirect or suppress it).
 
@@ -85,9 +85,9 @@ a private original.
    `@adaptivestone/framework-module-resize/drivers/mongo.js` with the scaffolded model, the app
    logger and the config's `queue` timing), `SqsTransport` from
    `@adaptivestone/framework-module-resize/drivers/sqs.js` (options: `queueUrl` required, for
-   the `'default'` queue; `queues` maps other queue names to URLs; `region`, `endpoint`,
-   `visibilityTimeout`, `heartbeatInterval`, `client`, `logger` — pass `appLogger` from the
-   framework adapter),
+   the `'default'` queue; `locks` required — pass `new FrameworkLockStore()` in framework apps;
+   `queues` maps other queue names to URLs; `region`, `endpoint`, `visibilityTimeout`,
+   `heartbeatInterval`, `client`, `logger` — pass `appLogger` from the framework adapter),
    `FrameworkMediaStore` and `FrameworkLockStore` (the framework `Lock` model) from
    `@adaptivestone/framework-module-resize/framework.js`.
    Without the framework, `@adaptivestone/framework-module-resize/drivers/mongo.js` ships
@@ -270,8 +270,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
-- The scaffolded model/command shims extend the package: do not vendor or fork them. The command
-  must keep loading `../resizer.ts` in `run()`. Gate drift in CI with `npx resize-scaffold --check`.
+- The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
+  must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`.
 - SVG originals stay private. The worker rasterizes SVG into the requested public preview
   formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
   shortcut returns uploaded SVG markup.
@@ -295,9 +295,10 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
 | `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
+| `RESIZE_QUEUE_NOT_SERVED` at worker start | no transport can consume that queue (e.g. `SqsTransport` without it in `queues`) — add the queue URL, or start the worker for another queue |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
-| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` when the transport is created | raise the lease (`queue.leaseMs` in the config file, or the transport's `leaseMs`) or lower `lockTtlMs.worker` |
+| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` (when a plain `MongoTransport` is created; for `createFrameworkMongoTransport()` at first use, `verify()` or worker start) | raise the lease (`queue.leaseMs` in the config file, or the transport's `leaseMs`) or lower `lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |

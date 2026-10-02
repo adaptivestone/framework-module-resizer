@@ -68,6 +68,11 @@ export class SqsTransport extends QueueTransport {
     this.locks = opts.locks;
   }
 
+  /** Only `'default'` (queueUrl) and the names in `queues` can be consumed. */
+  servesQueue(queue: string): boolean {
+    return queue === 'default' || Object.hasOwn(this.#opts.queues ?? {}, queue);
+  }
+
   getLockTtlMs(): { dispatch: number; worker: number } {
     return this.#opts.lockTtlMs ?? defaultQueueOptions.lockTtlMs;
   }

@@ -180,3 +180,13 @@ test('createFrameworkMongoTransport reads nothing until first use', () => {
   });
   assert.equal(t.leaseMs, 4321);
 });
+
+test('undefined values from getTiming never override the defaults', () => {
+  const locks = { acquire: async () => true, release: async () => {} };
+  const t = new MongoTransport({
+    model: {},
+    locks,
+    getTiming: () => ({ leaseMs: undefined, maxAttempts: 7 }),
+  });
+  assert.equal(t.leaseMs, 60_000);
+});

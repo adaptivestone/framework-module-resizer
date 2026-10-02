@@ -9,7 +9,7 @@
 // dep; this is the only place besides worker.ts that decodes.
 import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
 import type { LockStore } from './contracts/lockStore.ts';
-import { lockTtlMsOf } from './contracts/transport.ts';
+import { lockTtlMsOf, type QueueTransport } from './contracts/transport.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
@@ -461,8 +461,11 @@ export async function processTaskWith(
   resizer: Resizer,
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
+  // The transport that delivered the task: its locks and TTLs match the lease it holds. Default:
+  // the Resizer's own transport.
+  transport: QueueTransport | undefined = resizer.transport,
 ): Promise<void> {
-  const { logger, transport } = resizer;
+  const { logger } = resizer;
   // Queued tasks are coordinated with the transport's locks; a Resizer without one can't run them.
   if (!transport) {
     throw new ResizeSetupError(

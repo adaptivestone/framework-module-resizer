@@ -48,9 +48,12 @@ npx resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
 ```ts
 // src/config/resize.ts
 import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
-import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
 
-export default { ...defaultResizeConfig, mediaModelName: 'File' } satisfies FrameworkResizeConfig;
+export default {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'File',
+} satisfies FrameworkResizeConfig;
 ```
 
 ```ts
@@ -131,7 +134,7 @@ await runWorker({ signal, queue: 'default', sharp: { concurrency: 1, cache: fals
 ```
 
 Create the indexes through your migration process (for example `ResizeTask.createIndexes()`);
-the module never creates them at runtime.
+the module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
 
 ## Package exports
 
@@ -223,17 +226,19 @@ comes from `createResizeModels(connection)`.
 - `MediaStore`: `load`, `appendPreviews`, and an optional `verify()` that the worker awaits once
   at startup. Throw there to stop the worker before it leases anything.
 - `LockStore`: `acquire(key, ttlMs)` (resolves `true` when taken) and `release(key)`.
-- `QueueTransport`: `enqueue(task)` with `{ resizer, queue, mediaId, pipeline, previews }`; store
-  `resizer` and `queue`.
+- `QueueTransport`: `locks` (a `LockStore`, required) and `enqueue(task)` with
+  `{ resizer, queue, mediaId, pipeline, previews }`; store `resizer` and `queue`.
   - `startWorker(handle, { signal, queue, onEvent })` consumes only that queue and reports
     `onEvent('completed' | 'failed' | 'deadLettered', task, error?)`.
   - Optionally, `findActive(task)` lets `prewarm()` confirm work that another request
-    queued.
+    queued; `getLockTtlMs()` returns lock TTLs (default 60 s each); `servesQueue(queue)` tells
+    the worker which queues it can consume (default: all).
 
 ## Config reference
 
 The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
-`…/config/resize.js`; spread it to change keys. It is validated when the Resizer is created.
+`…/config/resize.js`; spread it to change keys. A config object is validated when the Resizer is
+created; a config function (the framework adapter passes one) on first use or `verify()`.
 
 | Key | Default | Notes |
 |---|---|---|

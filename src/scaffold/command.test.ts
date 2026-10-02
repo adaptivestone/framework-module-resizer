@@ -257,6 +257,20 @@ describe('runScaffold — --check', () => {
     assert.match(out, /drift/);
   });
 
+  test('an old model shim importing the removed subpath → exit 1 + drift', async () => {
+    await run([]);
+    await writeFile(
+      join(root, MODEL),
+      "import ResizeTaskModel from '@adaptivestone/framework-module-resize/models/ResizeTask.js';\nexport default class ResizeTask extends ResizeTaskModel {}\n",
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 1);
+    assert.match(
+      out,
+      /drift\s+src\/models\/ResizeTask\.ts — must extend ResizeTaskModel/,
+    );
+  });
+
   test('drifted command re-export path → exit 1 + drift', async () => {
     await run([]);
     await writeFile(

@@ -26,8 +26,13 @@ const CONFIG = 'src/config/resize.ts';
 // Load-bearing substrings `--check` verifies (also documents what each shim MUST reference).
 // A construction site builds its Resizer through the framework adapter or the core class.
 const RESIZER_MARKERS = ['createFrameworkResizer(', 'new Resizer('];
-const MODEL_MARKER = 'extends ResizeTaskModel';
-// The worker command extends the module's command AND loads the construction site, so the
+// The model shim extends ResizeTaskModel from the framework adapter (the old …/models/ResizeTask.js
+// subpath no longer exists).
+const MODEL_MARKERS = [
+  'extends ResizeTaskModel',
+  '@adaptivestone/framework-module-resize/framework.js',
+];
+// The worker command imports the construction site AND re-exports the module's command, so the
 // worker process has the Resizers its tasks name (a bare re-export starts with none).
 const COMMAND_MARKERS = [
   '@adaptivestone/framework-module-resize/framework.js',
@@ -143,7 +148,11 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
   ];
   if (!eager) {
     items.push(
-      { target: MODEL, validate: (c) => c.includes(MODEL_MARKER) },
+      {
+        target: MODEL,
+        validate: (c) => MODEL_MARKERS.every((marker) => c.includes(marker)),
+        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework.js — delete it and re-run resize-scaffold',
+      },
       {
         target: COMMAND,
         validate: (c) => COMMAND_MARKERS.every((marker) => c.includes(marker)),

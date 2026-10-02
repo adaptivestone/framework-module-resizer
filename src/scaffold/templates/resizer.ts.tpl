@@ -21,7 +21,7 @@ import {
 // import { S3Storage } from '@adaptivestone/framework-module-resize/drivers/s3.js';
 
 export const resizer = createFrameworkResizer({
-  transport: createFrameworkMongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)
+  transport: createFrameworkMongoTransport(), // or new SqsTransport({ queueUrl, region, locks: new FrameworkLockStore() }); omit for eager-only
   // TODO(REQUIRED): provide a storage driver — e.g. `new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' })`
   // or `new S3Storage({ bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: '…', client })`
   // (use distinct buckets when originals must stay private; uncomment an import above)

@@ -146,6 +146,19 @@ const TIMING_KEYS = [
   'taskTimeoutMs',
 ] as const;
 
+/** The timing options that are set: an `undefined` value never overrides a default. */
+function definedTiming(
+  source: Partial<QueueTimingOptions>,
+): Partial<QueueTimingOptions> {
+  const timing: Partial<QueueTimingOptions> = {};
+  for (const key of TIMING_KEYS) {
+    if (source[key] !== undefined) {
+      Object.assign(timing, { [key]: source[key] });
+    }
+  }
+  return timing;
+}
+
 /** The Mongo-backed queue transport (05 · §10.2). */
 export class MongoTransport extends QueueTransport {
   readonly locks: LockStore;
@@ -174,13 +187,7 @@ export class MongoTransport extends QueueTransport {
     this.#getModel = opts.getModel;
     this.#logger = opts.logger ?? console;
     this.locks = opts.locks;
-    const explicit: Partial<QueueTimingOptions> = {};
-    for (const key of TIMING_KEYS) {
-      if (opts[key] !== undefined) {
-        Object.assign(explicit, { [key]: opts[key] });
-      }
-    }
-    this.#explicitTiming = explicit;
+    this.#explicitTiming = definedTiming(opts);
     this.#getTiming = opts.getTiming;
     if (!this.#getTiming) {
       this.#resolveTiming(); // validate now: fail at construction, not at the first task
@@ -192,7 +199,7 @@ export class MongoTransport extends QueueTransport {
     if (!this.#timing) {
       const timing = {
         ...defaultQueueOptions,
-        ...this.#getTiming?.(),
+        ...definedTiming(this.#getTiming?.() ?? {}),
         ...this.#explicitTiming,
       };
       validateQueueTiming(timing);
