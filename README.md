@@ -48,9 +48,12 @@ npx resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
 ```ts
 // src/config/resize.ts
 import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
-import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
+import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
 
-export default { ...defaultResizeConfig, mediaModelName: 'File' } satisfies FrameworkResizeConfig;
+export default {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'File',
+} satisfies FrameworkResizeConfig;
 ```
 
 ```ts
@@ -63,12 +66,9 @@ export const resizer = createFrameworkResizer({
 });
 ```
 
-```ts
-// src/server.ts: create the Resizer after init(); a static import would run too early
-await server.init();
-await import('./resizer.ts');
-await server.startServer();
-```
+Import `src/resizer.ts` wherever you need it; a normal static import is fine, because nothing is
+read from the framework until first use. To fail at boot on a bad config, call
+`await resizer.verify()` after `await server.init()`.
 
 Add `...resizeMediaSchemaFragment` (from the main entry) to your media model's schema, then:
 
@@ -95,7 +95,8 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 3. Create the indexes through your migration process.
 4. Run `npm run cli ResizeWorker` as a separate process.
 
-The scaffolded command loads `src/resizer.ts` before the worker starts. Keep that import, and run
+The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
+worker has the same Resizers as the API. Keep that import, and run
 `npx resize-scaffold --check` in CI to catch drift.
 
 ## Without the framework
@@ -133,7 +134,7 @@ await runWorker({ signal, queue: 'default', sharp: { concurrency: 1, cache: fals
 ```
 
 Create the indexes through your migration process (for example `ResizeTask.createIndexes()`);
-the module never creates them at runtime.
+the module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
 
 ## Package exports
 
@@ -145,7 +146,7 @@ the module never creates them at runtime.
 | `…/drivers/s3.js` | `S3Storage` |
 | `…/drivers/mongo.js` | `MongoTransport`, `MongoMediaStore`, `MongoLockStore`, `createResizeModels`, the schemas |
 | `…/drivers/sqs.js` | `SqsTransport` |
-| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `createFrameworkMongoTransport`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `getResizeConfig`, `FrameworkResizeConfig` |
+| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `createFrameworkMongoTransport`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` |
 
 ## Drivers
 
@@ -225,17 +226,19 @@ comes from `createResizeModels(connection)`.
 - `MediaStore`: `load`, `appendPreviews`, and an optional `verify()` that the worker awaits once
   at startup. Throw there to stop the worker before it leases anything.
 - `LockStore`: `acquire(key, ttlMs)` (resolves `true` when taken) and `release(key)`.
-- `QueueTransport`: `enqueue(task)` with `{ resizer, queue, mediaId, pipeline, previews }`; store
-  `resizer` and `queue`.
+- `QueueTransport`: `locks` (a `LockStore`, required) and `enqueue(task)` with
+  `{ resizer, queue, mediaId, pipeline, previews }`; store `resizer` and `queue`.
   - `startWorker(handle, { signal, queue, onEvent })` consumes only that queue and reports
     `onEvent('completed' | 'failed' | 'deadLettered', task, error?)`.
   - Optionally, `findActive(task)` lets `prewarm()` confirm work that another request
-    queued.
+    queued; `getLockTtlMs()` returns lock TTLs (default 60 s each); `servesQueue(queue)` tells
+    the worker which queues it can consume (default: all).
 
 ## Config reference
 
 The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
-`…/config/resize.js`; spread it to change keys. It is validated when the Resizer is created.
+`…/config/resize.js`; spread it to change keys. A config object is validated when the Resizer is
+created; a config function (the framework adapter passes one) on first use or `verify()`.
 
 | Key | Default | Notes |
 |---|---|---|

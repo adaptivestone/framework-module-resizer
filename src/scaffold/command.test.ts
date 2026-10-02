@@ -73,8 +73,8 @@ describe('runScaffold — default run', () => {
     assert.match(resizer, /framework\.js/);
     assert.match(
       resizer,
-      /await import\('\.\/resizer\.ts'\)/,
-      'bootstrap guidance must use a dynamic import after Server.init()',
+      /a normal static import is fine[\s\S]+resizer\.verify\(\)/,
+      'the framework is read lazily, so the guidance is a static import (+ verify() at boot)',
     );
     assert.match(
       resizer,
@@ -84,13 +84,12 @@ describe('runScaffold — default run', () => {
     const command = await read(COMMAND);
     assert.match(
       command,
-      /\{ ResizeWorker as ModuleResizeWorker \} from '@adaptivestone\/framework-module-resize\/framework\.js'/,
+      /^import '\.\.\/resizer\.ts';$/m,
+      'the worker command must build the Resizers in the CLI process',
     );
-    assert.match(command, /extends ModuleResizeWorker/);
     assert.match(
       command,
-      /await import\('\.\.\/resizer\.ts'\)[\s\S]+super\.run\(\)/,
-      'the worker command must build the Resizers before the worker starts',
+      /export \{ ResizeWorker as default \} from '@adaptivestone\/framework-module-resize\/framework\.js';/,
     );
     const configSource = await read(CONFIG);
     assert.match(
@@ -223,11 +222,7 @@ describe('runScaffold — --eager', () => {
     assert.equal(await exists(COMMAND), false);
 
     const resizer = await read(RESIZER);
-    assert.match(
-      resizer,
-      /await import\('\.\/resizer\.ts'\)/,
-      'eager bootstrap guidance must use a dynamic import after Server.init()',
-    );
+    assert.match(resizer, /a normal static import is fine/);
     assert.doesNotMatch(resizer, /MongoTransport/);
     assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
     assert.match(resizer, /LocalFsStorage/);
@@ -262,6 +257,20 @@ describe('runScaffold — --check', () => {
     assert.match(out, /drift/);
   });
 
+  test('an old model shim importing the removed subpath → exit 1 + drift', async () => {
+    await run([]);
+    await writeFile(
+      join(root, MODEL),
+      "import ResizeTaskModel from '@adaptivestone/framework-module-resize/models/ResizeTask.js';\nexport default class ResizeTask extends ResizeTaskModel {}\n",
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 1);
+    assert.match(
+      out,
+      /drift\s+src\/models\/ResizeTask\.ts — must extend ResizeTaskModel/,
+    );
+  });
+
   test('drifted command re-export path → exit 1 + drift', async () => {
     await run([]);
     await writeFile(
@@ -281,7 +290,7 @@ describe('runScaffold — --check', () => {
     );
     const { code, out } = await run(['--check']);
     assert.equal(code, 1);
-    assert.match(out, /drift\s+src\/commands\/ResizeWorker\.ts — must extend/);
+    assert.match(out, /drift\s+src\/commands\/ResizeWorker\.ts — must import/);
     assert.match(out, /re-run resize-scaffold/);
   });
 

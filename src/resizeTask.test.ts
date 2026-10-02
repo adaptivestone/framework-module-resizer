@@ -14,6 +14,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/lockStore.ts';
+import type { MediaStore } from './contracts/mediaStore.ts';
 import {
   ResizeConfigError,
   ResizeGenerateError,
@@ -23,11 +24,11 @@ import {
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
-import type { MediaStore } from './mediaStore.ts';
 import {
   type LeasedTask,
   type Pipeline,
   type QueueTransport,
+  Resizer,
   type ResizeStorage,
   resetResizerForTests,
   type StartWorkerOpts,
@@ -1737,7 +1738,7 @@ describe('one worker serves every Resizer', () => {
     assert.equal(captured.opts?.queue, 'bulk');
   });
 
-  test('Resizers with different transports stop the worker before it starts', async () => {
+  test('Resizers with different transports each get a worker loop on the queue', async () => {
     installApp({ worker: { enabled: true } });
     const a = capturingTransport();
     const b = capturingTransport();
@@ -1752,13 +1753,133 @@ describe('one worker serves every Resizer', () => {
       transport: withLocks(b.transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
+    await runResizeWorker({ queue: 'bulk' });
+    assert.equal(a.captured.calls, 1);
+    assert.equal(b.captured.calls, 1);
+    assert.equal(a.captured.opts?.queue, 'bulk');
+    assert.equal(b.captured.opts?.queue, 'bulk');
+  });
+
+  test('one failing transport loop stops the others and the worker rejects with its error', async () => {
+    installApp({ worker: { enabled: true } });
+    let otherStopped = false;
+    const failing: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async () => {
+        throw new Error('queue unreachable');
+      },
+    };
+    const waiting: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: (_handle, opts) =>
+        new Promise<void>((done) => {
+          opts.signal.addEventListener('abort', () => {
+            otherStopped = true;
+            done();
+          });
+        }),
+    };
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport: failing,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    createFrameworkResizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport: waiting,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await assert.rejects(() => runResizeWorker(), /queue unreachable/);
+    assert.equal(otherStopped, true);
+  });
+
+  test('a transport that does not serve the queue is skipped; the others run', async () => {
+    installApp({ worker: { enabled: true } });
+    const served = capturingTransport();
+    let unservedStarted = false;
+    const unserved: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      servesQueue: (queue) => queue === 'default',
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async () => {
+        unservedStarted = true;
+      },
+    };
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport: withLocks(served.transport, makeLocks().lockProvider),
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    createFrameworkResizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport: unserved,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await runResizeWorker({ queue: 'bulk' });
+    assert.equal(served.captured.calls, 1);
+    assert.equal(unservedStarted, false);
+  });
+
+  test('a queue no transport serves is a setup error', async () => {
+    installApp({ worker: { enabled: true } });
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport: {
+        locks: makeLocks().lockProvider,
+        servesQueue: () => false,
+        enqueue: async () => ({ taskId: null }),
+        startWorker: async () => {},
+      },
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
     await assert.rejects(
-      () => runResizeWorker(),
+      () => runResizeWorker({ queue: 'bulk' }),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
-        err.code === 'RESIZE_WORKER_TRANSPORTS_DIFFER',
+        err.code === 'RESIZE_QUEUE_NOT_SERVED',
     );
-    assert.equal(a.captured.calls + b.captured.calls, 0);
+  });
+
+  test('a task uses the locks of the transport that delivered it', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(mediaDoc());
+    const own = makeLocks();
+    createFrameworkResizer({
+      storage,
+      mediaStore,
+      transport: withLocks(undefined, own.lockProvider),
+    });
+    const delivering = makeLocks();
+    await processTask(
+      task({ previews: [variant()] }),
+      undefined,
+      withLocks(undefined, delivering.lockProvider),
+    );
+    assert.deepEqual(own.acquired, []);
+    assert.deepEqual(delivering.acquired, [
+      'resize_worker:m1:default:default:20x20:jpeg:none',
+    ]);
+  });
+
+  test('the worker verifies each Resizer (a bad lazy config fails before leasing)', async () => {
+    installApp({ worker: { enabled: true } });
+    const { transport, captured } = capturingTransport();
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      mediaStore: makeMediaStore(null).mediaStore,
+      transport: withLocks(transport, makeLocks().lockProvider),
+      config: () => ({ formats: [] }) as never,
+    });
+    await assert.rejects(
+      () => runResizeWorker(),
+      (err: unknown) => err instanceof ResizeConfigError,
+    );
+    assert.equal(captured.calls, 0);
   });
 
   test("task events reach only the owning Resizer's observers", async () => {

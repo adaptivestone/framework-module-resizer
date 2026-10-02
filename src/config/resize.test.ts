@@ -59,22 +59,25 @@ describe('getResizeConfig', () => {
   });
 
   test('validates one cached framework config object once', () => {
-    let uploadReads = 0;
-    const config = new Proxy(makeResizeConfig(), {
+    // Only validation reads upload.maxBytes; the per-call freshness check compares top-level
+    // values by identity and never looks inside them.
+    let maxBytesReads = 0;
+    const config = makeResizeConfig();
+    config.upload = new Proxy(config.upload, {
       get(target, key, receiver) {
-        if (key === 'upload') {
-          uploadReads += 1;
+        if (key === 'maxBytes') {
+          maxBytesReads += 1;
         }
         return Reflect.get(target, key, receiver);
       },
     });
     install(config);
     getResizeConfig();
-    const afterFirstCall = uploadReads;
+    const afterFirstCall = maxBytesReads;
     assert.ok(afterFirstCall > 0);
     getResizeConfig();
     getResizeConfig();
-    assert.equal(uploadReads, afterFirstCall);
+    assert.equal(maxBytesReads, afterFirstCall);
   });
 
   test('validateResizeConfig checks a config without a framework app', () => {
@@ -228,6 +231,20 @@ describe('config split: core validation vs framework loading', () => {
     install(file);
     assert.strictEqual(getResizeConfig().queue, defaultQueueOptions);
     assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
+  });
+
+  test('sees app.updateConfig()-style changes to the same config object', () => {
+    const config = makeResizeConfig();
+    install(config);
+    assert.equal(getResizeConfig().mediaModelName, 'File');
+    assert.equal(getResizeConfig().worker.enabled, false);
+    // The framework's updateConfig() assigns into the cached object.
+    Object.assign(config, {
+      mediaModelName: 'Media',
+      worker: { ...config.worker, enabled: true },
+    });
+    assert.equal(getResizeConfig().mediaModelName, 'Media');
+    assert.equal(getResizeConfig().worker.enabled, true);
   });
 
   test('an invalid worker section is a config error', () => {

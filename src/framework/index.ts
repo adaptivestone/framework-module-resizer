@@ -5,7 +5,12 @@
 //   export const resizer = createFrameworkResizer({ transport: createFrameworkMongoTransport(), storage });
 
 export type { FrameworkResizeConfig } from '../types.d.ts';
-export { appLogger, getApp, type TMinimalResizeApp } from './app.ts';
+export {
+  appEvents,
+  appLogger,
+  getApp,
+  type TMinimalResizeApp,
+} from './app.ts';
 export { getResizeConfig } from './config.ts';
 export { FrameworkLockStore } from './lockStore.ts';
 export {

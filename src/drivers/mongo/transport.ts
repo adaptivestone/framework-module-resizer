@@ -28,6 +28,7 @@ import { validateQueueTiming } from '../../resizeConfig.ts';
 import type {
   EnqueueReceipt,
   MissingPreview,
+  QueueTimingOptions,
   ResizeLogger,
 } from '../../types.d.ts';
 
@@ -50,6 +51,9 @@ export interface MongoTransportOptions {
   retryBackoffMs?: { base: number; max: number }; // default { base: 5000, max: 300000 }
   maxAttempts?: number; // default 5 — deliveries before dead-letter
   idlePollMs?: number; // default 1000 — sleep after an empty lease
+  // Timing read on first use instead of now (the framework adapter reads it from a config file
+  // that may not be loaded yet). The plain timing options above override what it returns.
+  getTiming?: () => Partial<QueueTimingOptions>;
   taskTimeoutMs?: number; // default 600000 — a task running longer is failed
 }
 
@@ -133,18 +137,37 @@ function isDuplicateKeyError(error: unknown): boolean {
   );
 }
 
+const TIMING_KEYS = [
+  'lockTtlMs',
+  'leaseMs',
+  'retryBackoffMs',
+  'maxAttempts',
+  'idlePollMs',
+  'taskTimeoutMs',
+] as const;
+
+/** The timing options that are set: an `undefined` value never overrides a default. */
+function definedTiming(
+  source: Partial<QueueTimingOptions>,
+): Partial<QueueTimingOptions> {
+  const timing: Partial<QueueTimingOptions> = {};
+  for (const key of TIMING_KEYS) {
+    if (source[key] !== undefined) {
+      Object.assign(timing, { [key]: source[key] });
+    }
+  }
+  return timing;
+}
+
 /** The Mongo-backed queue transport (05 · §10.2). */
 export class MongoTransport extends QueueTransport {
   readonly locks: LockStore;
-  readonly lockTtlMs: { dispatch: number; worker: number };
-  readonly leaseMs: number;
   readonly #model: TaskModel;
   readonly #getModel: (() => TaskModel) | undefined;
   readonly #logger: ResizeLogger;
-  readonly #retryBackoffMs: { base: number; max: number };
-  readonly #maxAttempts: number;
-  readonly #idlePollMs: number;
-  readonly #taskTimeoutMs: number;
+  readonly #explicitTiming: Partial<QueueTimingOptions>;
+  readonly #getTiming: (() => Partial<QueueTimingOptions>) | undefined;
+  #timing: QueueTimingOptions | undefined;
 
   constructor(opts: MongoTransportOptions) {
     super();
@@ -160,25 +183,39 @@ export class MongoTransport extends QueueTransport {
         { code: 'RESIZE_LOCKS_REQUIRED' },
       );
     }
-    const timing = {
-      lockTtlMs: opts.lockTtlMs ?? defaultQueueOptions.lockTtlMs,
-      leaseMs: opts.leaseMs ?? defaultQueueOptions.leaseMs,
-      retryBackoffMs: opts.retryBackoffMs ?? defaultQueueOptions.retryBackoffMs,
-      maxAttempts: opts.maxAttempts ?? defaultQueueOptions.maxAttempts,
-      idlePollMs: opts.idlePollMs ?? defaultQueueOptions.idlePollMs,
-      taskTimeoutMs: opts.taskTimeoutMs ?? defaultQueueOptions.taskTimeoutMs,
-    };
-    validateQueueTiming(timing);
     this.#model = opts.model;
     this.#getModel = opts.getModel;
     this.#logger = opts.logger ?? console;
     this.locks = opts.locks;
-    this.lockTtlMs = timing.lockTtlMs;
-    this.leaseMs = timing.leaseMs;
-    this.#retryBackoffMs = timing.retryBackoffMs;
-    this.#maxAttempts = timing.maxAttempts;
-    this.#idlePollMs = timing.idlePollMs;
-    this.#taskTimeoutMs = timing.taskTimeoutMs;
+    this.#explicitTiming = definedTiming(opts);
+    this.#getTiming = opts.getTiming;
+    if (!this.#getTiming) {
+      this.#resolveTiming(); // validate now: fail at construction, not at the first task
+    }
+  }
+
+  // Defaults, then the lazily read timing, then the explicit options; validated once.
+  #resolveTiming(): QueueTimingOptions {
+    if (!this.#timing) {
+      const timing = {
+        ...defaultQueueOptions,
+        ...definedTiming(this.#getTiming?.() ?? {}),
+        ...this.#explicitTiming,
+      };
+      validateQueueTiming(timing);
+      this.#timing = timing;
+    }
+    return this.#timing;
+  }
+
+  /** Lease length in ms; the heartbeat renews it at leaseMs / 2. */
+  get leaseMs(): number {
+    return this.#resolveTiming().leaseMs;
+  }
+
+  /** Dispatch and worker lock TTLs in ms (the worker lock is within the lease). */
+  getLockTtlMs(): { dispatch: number; worker: number } {
+    return this.#resolveTiming().lockTtlMs;
   }
 
   // Resolve the model, tolerating a falsy getter result (a mis-registered host model) with a
@@ -218,7 +255,7 @@ export class MongoTransport extends QueueTransport {
 
   /** `min(max, base * 2 ** (n - 1))` from the retryBackoffMs option (05 · §10.2). */
   backoff(attempts: number): number {
-    const { base, max } = this.#retryBackoffMs;
+    const { base, max } = this.#resolveTiming().retryBackoffMs;
     return Math.min(max, base * 2 ** (attempts - 1));
   }
 
@@ -238,7 +275,7 @@ export class MongoTransport extends QueueTransport {
       return null;
     }
     const leaseMs = this.leaseMs;
-    const maxAttempts = this.#maxAttempts;
+    const maxAttempts = this.#resolveTiming().maxAttempts;
     const now = new Date();
     const doc = await model.findOneAndUpdate(
       {
@@ -314,7 +351,7 @@ export class MongoTransport extends QueueTransport {
     if (!model) {
       return;
     }
-    const maxAttempts = this.#maxAttempts;
+    const maxAttempts = this.#resolveTiming().maxAttempts;
     const now = new Date();
     // A persisted media row without an original is a deterministic terminal failure. Keep the
     // normal retry policy for every other error (including errors that merely happen to expose a
@@ -388,7 +425,7 @@ export class MongoTransport extends QueueTransport {
     if (!model) {
       return;
     }
-    const maxAttempts = this.#maxAttempts;
+    const maxAttempts = this.#resolveTiming().maxAttempts;
     const now = new Date();
     const err = 'max attempts exceeded (crash loop)';
     const filter = {
@@ -520,8 +557,8 @@ export class MongoTransport extends QueueTransport {
     opts: StartWorkerOpts,
   ): Promise<void> {
     const leaseMs = this.leaseMs;
-    const idlePollMs = this.#idlePollMs;
-    const taskTimeoutMs = this.#taskTimeoutMs;
+    const idlePollMs = this.#resolveTiming().idlePollMs;
+    const taskTimeoutMs = this.#resolveTiming().taskTimeoutMs;
     const heartbeatMs = Math.max(1, Math.floor(leaseMs / 2));
 
     while (!opts.signal.aborted) {

@@ -33,7 +33,12 @@ export function createResizeModels(
     if (existing) {
       return existing;
     }
-    const schema = new Schema(fields, resizeSchemaOptions);
+    // autoIndex off: the module never builds indexes at runtime; the host's migration does
+    // (e.g. ResizeTask.createIndexes()).
+    const schema = new Schema(fields, {
+      ...resizeSchemaOptions,
+      autoIndex: false,
+    });
     for (const [keys, options] of indexes) {
       schema.index(keys, options);
     }

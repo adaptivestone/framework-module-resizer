@@ -142,25 +142,41 @@ describe('Resizer constructor — driver wiring', () => {
     assert.throws(() => getResizer(), /no Resizer named 'default'/);
   });
 
-  test('rejects invalid config during construction without claiming the singleton', () => {
+  test('an explicit invalid config is rejected at construction without claiming the name', () => {
     resetAppInstance();
+    assert.throws(
+      () =>
+        new Resizer({
+          storage: fakeStorage(),
+          mediaStore: fakeMediaStore(),
+          config: { ...makeImageConfig(), upload: null } as never,
+        }),
+      /upload must be an object/,
+    );
+    assert.throws(() => getResizer(), /no Resizer named 'default'/);
+  });
+
+  test('a framework Resizer reads its config file lazily; verify() reports a bad one', async () => {
+    // Constructed before any framework app exists: nothing is read yet.
+    resetAppInstance();
+    const r = createFrameworkResizer(baseOpts());
     setAppInstance({
       getConfig: () => ({ mediaModelName: 'File', upload: null }),
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.throws(
-      () => createFrameworkResizer(baseOpts()),
-      /upload must be an object/,
-    );
-    assert.throws(() => getResizer(), /no Resizer named 'default'/);
+    await assert.rejects(() => r.verify(), /upload must be an object/);
+  });
+
+  test('a framework Resizer built before the app works once the app exists', () => {
     resetAppInstance();
+    const r = createFrameworkResizer(baseOpts());
     setAppInstance({
-      getConfig: () => makeResizeConfig(),
+      getConfig: () => makeResizeConfig({ formats: ['webp'] }),
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    assert.doesNotThrow(() => createFrameworkResizer(baseOpts()));
+    assert.deepEqual(r.config.formats, ['webp']);
   });
 
   test('the default media store loads from the Resizer’s own media model', async () => {

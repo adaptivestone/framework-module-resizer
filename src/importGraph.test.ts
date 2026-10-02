@@ -71,13 +71,14 @@ function walk(entry: string): {
 test('the main entry reaches no framework code', () => {
   const { files, bare } = walk('index.ts');
   const isFramework = (spec: string) =>
+    spec === 'mongoose' ||
     spec === '@adaptivestone/framework' ||
     spec.startsWith('@adaptivestone/framework/');
   const framework = [...bare.entries()].filter(([spec]) => isFramework(spec));
   assert.deepEqual(
     framework.map(([, chain]) => chain.join(' → ')),
     [],
-    'main entry must not import @adaptivestone/framework',
+    'main entry must not import @adaptivestone/framework or mongoose',
   );
   const adapterFiles = [...files.entries()].filter(([file]) =>
     file.startsWith('framework/'),

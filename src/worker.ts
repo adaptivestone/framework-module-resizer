@@ -1,8 +1,8 @@
 // The transport-agnostic worker (07 · Worker §11), framework-free. `runWorker()` serves every
-// registered Resizer for ONE named queue: they must share one transport, each media store is
-// verified first, and each Resizer's worker-lock TTL is checked against the transport's lease.
-// The TRANSPORT owns lease → complete | fail and reports task events; the worker runs each task
-// with the Resizer named in it and routes the events to that Resizer's observers. Framework
+// registered Resizer for ONE named queue: it consumes that queue on each distinct transport the
+// Resizers use (one loop per transport), after verifying every media store. Each TRANSPORT owns
+// lease → complete | fail and reports task events; the worker runs each task with the Resizer
+// named in it and routes the events to that Resizer's observers. Framework
 // hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
@@ -31,8 +31,15 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 export async function processTask(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
+  transport?: QueueTransport, // the delivering transport; default: the Resizer's own
 ): Promise<void> {
-  return processTaskWith(getResizer(task.resizer), task, taskOpts);
+  const resizer = getResizer(task.resizer);
+  return processTaskWith(
+    resizer,
+    task,
+    taskOpts,
+    transport ?? resizer.transport,
+  );
 }
 
 export interface RunWorkerOptions {
@@ -66,17 +73,26 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     );
     return;
   }
-  if (transports.size > 1) {
+  // A transport that can't consume this queue (e.g. SQS without that queue URL) is skipped, so
+  // one Resizer's missing queue never stops the others.
+  for (const transport of [...transports]) {
+    if (transport.servesQueue && !transport.servesQueue(queue)) {
+      transports.delete(transport);
+      logger.info(
+        `resize worker: a transport does not serve queue '${queue}' — skipping it`,
+      );
+    }
+  }
+  if (transports.size === 0) {
     throw new ResizeSetupError(
-      'resize worker: every Resizer served by one worker must share one transport instance — run one worker process per transport',
-      { code: 'RESIZE_WORKER_TRANSPORTS_DIFFER' },
+      `resize worker: no transport serves queue '${queue}'`,
+      { code: 'RESIZE_QUEUE_NOT_SERVED' },
     );
   }
-  const [transport] = transports;
-  // Fail before leasing anything: a misconfigured media store (e.g. a wrong mediaModelName)
-  // would otherwise surface only as per-task errors.
+  // Fail before leasing anything: a bad config, transport timing or media store (e.g. a wrong
+  // mediaModelName) would otherwise surface only as per-task errors.
   for (const resizer of resizers) {
-    await resizer.mediaStore.verify?.();
+    await resizer.verify();
   }
 
   // Events are routed by the task's Resizer name, looked up when the event arrives.
@@ -100,13 +116,36 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     sharp.cache(opts.sharp.cache);
   }
 
-  // The transport drives consumption its own way (poll OR push), owns completion/redelivery,
+  // Each transport drives consumption its own way (poll OR push), owns completion/redelivery,
   // and passes each task a per-task lease-loss signal. processTask SUCCEEDS by returning and
-  // FAILS by rejecting (never a synchronous throw).
-  await transport.startWorker((task, taskOpts) => processTask(task, taskOpts), {
-    signal: opts.signal,
-    queue,
-    onEvent,
-  });
+  // FAILS by rejecting (never a synchronous throw). One loop per transport; if one loop fails,
+  // the others stop too, and the worker rejects with that error once all have returned.
+  const stop = new AbortController();
+  const onAbort = () => stop.abort();
+  if (opts.signal.aborted) {
+    stop.abort();
+  }
+  opts.signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    const results = await Promise.allSettled(
+      [...transports].map(async (transport) => {
+        try {
+          await transport.startWorker(
+            (task, taskOpts) => processTask(task, taskOpts, transport),
+            { signal: stop.signal, queue, onEvent },
+          );
+        } catch (err) {
+          stop.abort();
+          throw err;
+        }
+      }),
+    );
+    const failed = results.find((r) => r.status === 'rejected');
+    if (failed) {
+      throw (failed as PromiseRejectedResult).reason;
+    }
+  } finally {
+    opts.signal.removeEventListener('abort', onAbort);
+  }
   logger.info('resize worker stopped');
 }

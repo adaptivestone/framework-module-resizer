@@ -24,9 +24,25 @@ export interface ResolvedFrameworkConfig {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-// The framework returns the same cached object on every getConfig call, so each file is split
-// and validated once (and the image part stays one object, which the Resizer validates once).
-const resolved = new WeakMap<object, ResolvedFrameworkConfig>();
+// The framework returns the same cached object on every getConfig call, so each file is split and
+// validated once. But `app.updateConfig()` assigns new values into that same object, so a cached
+// result is reused only while every top-level value is still the same one.
+const resolved = new WeakMap<
+  object,
+  { result: ResolvedFrameworkConfig; values: Map<string, unknown> }
+>();
+
+const sameValues = (raw: object, values: Map<string, unknown>): boolean => {
+  const keys = Object.keys(raw);
+  return (
+    keys.length === values.size &&
+    keys.every(
+      (key) =>
+        values.has(key) &&
+        values.get(key) === (raw as Record<string, unknown>)[key],
+    )
+  );
+};
 
 /** Split and validate a framework config object (a config file's value). */
 export function resolveFrameworkConfig(
@@ -35,8 +51,8 @@ export function resolveFrameworkConfig(
 ): ResolvedFrameworkConfig {
   if (isRecord(raw)) {
     const cached = resolved.get(raw);
-    if (cached) {
-      return cached;
+    if (cached && sameValues(raw, cached.values)) {
+      return cached.result;
     }
   }
   if (!isRecord(raw)) {
@@ -77,7 +93,7 @@ export function resolveFrameworkConfig(
     queue: queueOptions,
     worker: workerOptions as unknown as FrameworkWorkerConfig,
   };
-  resolved.set(raw, result);
+  resolved.set(raw, { result, values: new Map(Object.entries(raw)) });
   return result;
 }
 

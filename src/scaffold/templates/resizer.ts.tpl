@@ -1,9 +1,9 @@
 // src/resizer.ts — the resize module's CONSTRUCTION SITE (scaffolded; edit freely).
 //
-// Load this file dynamically in the API process ONLY AFTER `await server.init()`:
-//     const { resizer } = await import('./resizer.ts');
-// A static import runs before bootstrap code and is therefore too early. The worker process
-// loads it from the scaffolded src/commands/ResizeWorker.ts.
+// Import it wherever you need the Resizer — a normal static import is fine: nothing is read from
+// the framework until first use. The worker process imports it from the scaffolded
+// src/commands/ResizeWorker.ts. To check the config at boot, call `await resizer.verify()` after
+// `await server.init()`.
 // On construction the Resizer registers itself under its name ('default' unless you pass
 // `name`), so the ResizeWorker command and your DTO builders reach it via getResizer() — or
 // `import { resizer }`. Construct each name once.
@@ -21,7 +21,7 @@ import {
 // import { S3Storage } from '@adaptivestone/framework-module-resize/drivers/s3.js';
 
 export const resizer = createFrameworkResizer({
-  transport: createFrameworkMongoTransport(), // or new SqsTransport({ queueUrl, region }); omit for eager-only (11 · Modes)
+  transport: createFrameworkMongoTransport(), // or new SqsTransport({ queueUrl, region, locks: new FrameworkLockStore() }); omit for eager-only
   // TODO(REQUIRED): provide a storage driver — e.g. `new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' })`
   // or `new S3Storage({ bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: '…', client })`
   // (use distinct buckets when originals must stay private; uncomment an import above)

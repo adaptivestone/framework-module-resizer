@@ -51,8 +51,8 @@ a private original.
    ```
 
    `--eager` emits `src/resizer.ts` (LocalFsStorage already wired) + `src/config/resize.ts`.
-   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts` (a
-   subclass of the module's command that loads `src/resizer.ts` before the worker starts).
+   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts`
+   (`import '../resizer.ts'` plus a re-export of the module's command).
    Appends a pointer to this guide into the host's `AGENTS.md`
    (`--agents claude|print|skip` to redirect or suppress it).
 
@@ -74,8 +74,8 @@ a private original.
    });
    ```
 
-   Construct **after** `Server.init()` (or lazily on first request). Do not construct in
-   `server.ts` before `startServer()`.
+   Nothing is read from the framework until first use, so this file can be imported statically
+   anywhere, even before `Server.init()`.
 
    Other shipped drivers: `S3Storage` from
    `@adaptivestone/framework-module-resize/drivers/s3.js` (options: `bucketPublic` required;
@@ -85,9 +85,9 @@ a private original.
    `@adaptivestone/framework-module-resize/drivers/mongo.js` with the scaffolded model, the app
    logger and the config's `queue` timing), `SqsTransport` from
    `@adaptivestone/framework-module-resize/drivers/sqs.js` (options: `queueUrl` required, for
-   the `'default'` queue; `queues` maps other queue names to URLs; `region`, `endpoint`,
-   `visibilityTimeout`, `heartbeatInterval`, `client`, `logger` — pass `appLogger` from the
-   framework adapter),
+   the `'default'` queue; `locks` required — pass `new FrameworkLockStore()` in framework apps;
+   `queues` maps other queue names to URLs; `region`, `endpoint`, `visibilityTimeout`,
+   `heartbeatInterval`, `client`, `logger` — pass `appLogger` from the framework adapter),
    `FrameworkMediaStore` and `FrameworkLockStore` (the framework `Lock` model) from
    `@adaptivestone/framework-module-resize/framework.js`.
    Without the framework, `@adaptivestone/framework-module-resize/drivers/mongo.js` ships
@@ -97,11 +97,11 @@ a private original.
    `QueueTransport`, `LockStore`) or is any object of the same shape — no `app` parameter;
    a driver closes over its own client.
 
-4. In the API process, dynamically load the construction site **after** `Server.init()`:
-   `await import('./resizer.ts')`. Do not use a static import; ESM evaluates it before bootstrap
-   code. The worker process loads it from the scaffolded `src/commands/ResizeWorker.ts`, whose
-   `run()` does `await import('../resizer.ts')` before `super.run()`; keep that line if you edit
-   the command.
+4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
+   on a bad config, call `await getResizer().verify()` after `Server.init()`; otherwise a config
+   error appears at the first call. The worker process imports it from the scaffolded
+   `src/commands/ResizeWorker.ts` (`import '../resizer.ts'` plus a re-export of the module's
+   command); keep that import if you edit the command.
 
 5. The scaffolded `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
    `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
@@ -259,7 +259,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 - Construct each Resizer ONCE, at one construction site, with `createFrameworkResizer`. Most
   hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
   config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
-  for one queue (`--queue`, default `'default'`), and they must share one transport instance.
+  for one queue (`--queue`, default `'default'`), with one consume loop per distinct transport.
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
@@ -270,8 +270,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
-- The scaffolded model/command shims extend the package: do not vendor or fork them. The command
-  must keep loading `../resizer.ts` in `run()`. Gate drift in CI with `npx resize-scaffold --check`.
+- The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
+  must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`.
 - SVG originals stay private. The worker rasterizes SVG into the requested public preview
   formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
   shortcut returns uploaded SVG markup.
@@ -293,12 +293,12 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `formats [...] have no encode.formats entry` | add `encode.formats.<id>` (`{}` for Sharp defaults); use `'jpeg'`, not the alias `'jpg'` |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import | optional peer not installed — see step 1 |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
-| `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` is the old bare re-export — delete it and re-run `npx resize-scaffold` (it then loads `src/resizer.ts`) |
+| `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
 | `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
-| `RESIZE_WORKER_TRANSPORTS_DIFFER` at worker start | the Resizers in one worker use different transport instances — share one instance, or run one worker process per transport |
+| `RESIZE_QUEUE_NOT_SERVED` at worker start | no transport can consume that queue (e.g. `SqsTransport` without it in `queues`) — add the queue URL, or start the worker for another queue |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
-| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` when the transport is created | raise the lease (`queue.leaseMs` in the config file, or the transport's `leaseMs`) or lower `lockTtlMs.worker` |
+| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` (when a plain `MongoTransport` is created; for `createFrameworkMongoTransport()` at first use, `verify()` or worker start) | raise the lease (`queue.leaseMs` in the config file, or the transport's `leaseMs`) or lower `lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |

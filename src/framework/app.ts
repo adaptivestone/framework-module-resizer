@@ -41,3 +41,8 @@ export const appLogger: ResizeLogger = {
   warn: (msg, ...rest) => getApp().logger.warn(msg, ...rest),
   error: (msg, ...rest) => getApp().logger.error(msg, ...rest),
 };
+
+/** An event bus that resolves the app's bus at emit time (a missing bus drops the event). */
+export const appEvents: ResizeEventBus = {
+  emit: (name, ...args) => getApp().events?.emit(name, ...args),
+};

@@ -17,6 +17,7 @@
 // here (documented — 05 · §10.3). It DOES report `completed` / `failed` through `onEvent`.
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { Consumer } from 'sqs-consumer';
+import { defaultQueueOptions } from '../config/resize.ts';
 import type { LockStore } from '../contracts/lockStore.ts';
 import {
   type EnqueueTask,
@@ -49,7 +50,6 @@ export interface SqsTransportOptions {
 
 export class SqsTransport extends QueueTransport {
   readonly locks: LockStore;
-  readonly lockTtlMs: { dispatch: number; worker: number } | undefined;
   readonly #opts: SqsTransportOptions;
   // Memoized per instance. A host-provided `opts.client` short-circuits construction.
   // Synchronous now that the SDK is a static import — built lazily on first use.
@@ -66,7 +66,15 @@ export class SqsTransport extends QueueTransport {
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
     this.locks = opts.locks;
-    this.lockTtlMs = opts.lockTtlMs;
+  }
+
+  /** Only `'default'` (queueUrl) and the names in `queues` can be consumed. */
+  servesQueue(queue: string): boolean {
+    return queue === 'default' || Object.hasOwn(this.#opts.queues ?? {}, queue);
+  }
+
+  getLockTtlMs(): { dispatch: number; worker: number } {
+    return this.#opts.lockTtlMs ?? defaultQueueOptions.lockTtlMs;
   }
 
   #getClient(): SQSClient {

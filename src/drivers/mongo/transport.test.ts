@@ -25,6 +25,7 @@ import {
   type TaskEventHandler,
 } from '../../resizer.ts';
 import { makeResizeConfig } from '../../testHelpers/resizeConfig.ts';
+import { withLocks } from '../../testHelpers/withLocks.ts';
 import type { MissingPreview } from '../../types.d.ts';
 import type { MongoTransport } from './transport.ts';
 
@@ -551,8 +552,11 @@ describe('MongoTransport.enqueue', () => {
     });
     const r = createFrameworkResizer({
       storage: fakeStorage,
-      transport,
-      lockProvider: { acquire: async () => false, release: async () => {} },
+      // The dispatch lock is held elsewhere: prewarm must confirm the existing task instead.
+      transport: withLocks(transport, {
+        acquire: async () => false,
+        release: async () => {},
+      }),
     });
     const result = await r.prewarm({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },
