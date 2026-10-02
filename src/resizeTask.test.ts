@@ -1737,7 +1737,7 @@ describe('one worker serves every Resizer', () => {
     assert.equal(captured.opts?.queue, 'bulk');
   });
 
-  test('Resizers with different transports stop the worker before it starts', async () => {
+  test('Resizers with different transports each get a worker loop on the queue', async () => {
     installApp({ worker: { enabled: true } });
     const a = capturingTransport();
     const b = capturingTransport();
@@ -1752,13 +1752,47 @@ describe('one worker serves every Resizer', () => {
       transport: withLocks(b.transport, makeLocks().lockProvider),
       mediaStore: makeMediaStore(null).mediaStore,
     });
-    await assert.rejects(
-      () => runResizeWorker(),
-      (err: unknown) =>
-        err instanceof ResizeSetupError &&
-        err.code === 'RESIZE_WORKER_TRANSPORTS_DIFFER',
-    );
-    assert.equal(a.captured.calls + b.captured.calls, 0);
+    await runResizeWorker({ queue: 'bulk' });
+    assert.equal(a.captured.calls, 1);
+    assert.equal(b.captured.calls, 1);
+    assert.equal(a.captured.opts?.queue, 'bulk');
+    assert.equal(b.captured.opts?.queue, 'bulk');
+  });
+
+  test('one failing transport loop stops the others and the worker rejects with its error', async () => {
+    installApp({ worker: { enabled: true } });
+    let otherStopped = false;
+    const failing: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async () => {
+        throw new Error('queue unreachable');
+      },
+    };
+    const waiting: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: (_handle, opts) =>
+        new Promise<void>((done) => {
+          opts.signal.addEventListener('abort', () => {
+            otherStopped = true;
+            done();
+          });
+        }),
+    };
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport: failing,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    createFrameworkResizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport: waiting,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await assert.rejects(() => runResizeWorker(), /queue unreachable/);
+    assert.equal(otherStopped, true);
   });
 
   test("task events reach only the owning Resizer's observers", async () => {

@@ -1,8 +1,8 @@
 // src/resizer.ts — the resize module's CONSTRUCTION SITE (scaffolded; edit freely).
 //
-// Load this file dynamically from API bootstrap AFTER `await server.init()`:
-//     const { resizer } = await import('./resizer.ts');
-// A static import runs before bootstrap code and is therefore too early.
+// Import it wherever you need the Resizer — a normal static import is fine: nothing is read from
+// the framework until first use. To check the config at boot, call `await resizer.verify()`
+// after `await server.init()`.
 // createFrameworkResizer fills config (src/config/resize.ts), the app logger and the media store
 // from the framework app.
 import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';

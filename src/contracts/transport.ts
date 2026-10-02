@@ -46,8 +46,8 @@ export abstract class QueueTransport {
    */
   abstract readonly locks: LockStore;
 
-  /** Lock TTLs in ms. Default `{ dispatch: 60000, worker: 60000 }`. */
-  declare readonly lockTtlMs?: { dispatch: number; worker: number };
+  /** Optional: lock TTLs in ms. Without it the defaults apply: `{ dispatch: 60000, worker: 60000 }`. */
+  getLockTtlMs?(): { dispatch: number; worker: number };
 
   /** Store a task. `taskId` is the receipt; `null` when the backend gives none. */
   abstract enqueue(task: EnqueueTask): Promise<{ taskId: string | null }>;
@@ -72,9 +72,9 @@ export abstract class QueueTransport {
 }
 
 /** A transport's lock TTLs, or the defaults when it sets none. */
-export function lockTtlMsOf(transport: Pick<QueueTransport, 'lockTtlMs'>): {
+export function lockTtlMsOf(transport: Pick<QueueTransport, 'getLockTtlMs'>): {
   dispatch: number;
   worker: number;
 } {
-  return transport.lockTtlMs ?? defaultQueueOptions.lockTtlMs;
+  return transport.getLockTtlMs?.() ?? defaultQueueOptions.lockTtlMs;
 }

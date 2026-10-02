@@ -147,7 +147,7 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
       {
         target: COMMAND,
         validate: (c) => COMMAND_MARKERS.every((marker) => c.includes(marker)),
-        hint: 'must extend the module command and load ../resizer.ts in run() — delete it and re-run resize-scaffold',
+        hint: 'must import ../resizer.ts and export the module command — delete it and re-run resize-scaffold',
       },
     );
   }
@@ -215,11 +215,11 @@ Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
 Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — createFrameworkResizer({ transport, storage, pipelines })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
-  src/commands/ResizeWorker.ts  the module's worker command; loads src/resizer.ts before it starts
+  src/commands/ResizeWorker.ts  imports src/resizer.ts and re-exports the module's worker command
   src/config/resize.ts      host overrides over module defaults (framework merges environment overrides)
 
 Options:
-  --check      verify the shims exist + reference the module (and the worker command loads
+  --check      verify the shims exist + reference the module (and the worker command imports
                src/resizer.ts); exit 1 on missing/drift (no writes)
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
   --eager      eager-mode hosts: emit only src/resizer.ts (LocalFsStorage, no transport) + src/config/resize.ts
@@ -296,23 +296,20 @@ export async function runScaffold(
   await writeAgentsPointer(root, agents as AgentsMode);
   if (values.eager) {
     console.log(
-      '\nDone. Next: set `mediaModelName` in src/config/resize.ts, construct the',
+      '\nDone. Next: set `mediaModelName` in src/config/resize.ts, import src/resizer.ts where',
     );
     console.log(
-      "Resizer after Server.init() with `await import('./resizer.ts')` (or lazily), then call generate() at upload.",
+      'you need the Resizer (a static import is fine), then call generate() at upload.',
     );
   } else {
     console.log(
       '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
     );
     console.log(
-      "src/config/resize.ts, then run `await import('./resizer.ts')` only AFTER",
+      'src/config/resize.ts, and import src/resizer.ts where you need the Resizer (a static import',
     );
     console.log(
-      '`await Server.init()` in the API process (a static import runs too early).',
-    );
-    console.log(
-      'The scaffolded ResizeWorker command loads it in the worker process.',
+      'is fine). The scaffolded ResizeWorker command imports it in the worker process.',
     );
   }
   return code;

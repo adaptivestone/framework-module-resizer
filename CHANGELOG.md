@@ -128,9 +128,16 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   `npm run cli ResizeWorker -- --queue=<name>` consumes only that queue; without the flag it consumes `'default'`. `SqsTransport` maps queue
   names to URLs with the new `queues` option (`RESIZE_SQS_QUEUE_UNKNOWN` for an unknown name).
 - One worker process serves every Resizer constructed in it, routing each task to the Resizer
-  named in it. Its Resizers must share one transport instance (`RESIZE_WORKER_TRANSPORTS_DIFFER`
-  otherwise), and every media store's `verify()` runs before leasing. Named Resizers may have a
-  transport. `listResizers()` lists the registered Resizers.
+  named in it. It runs one consume loop per distinct transport for the queue (if one loop fails,
+  the others stop and the worker rejects with that error), and every media store's `verify()` runs
+  before leasing. Named Resizers may have a transport. `listResizers()` lists the registered
+  Resizers.
+- The framework adapter reads the app lazily. `createFrameworkResizer` and
+  `createFrameworkMongoTransport` read config, models, logger and events on first use, so
+  `src/resizer.ts` can be imported statically anywhere, even before `Server.init()`. The new
+  `resizer.verify()` checks the config, the transport timing and the media store at boot.
+  `new Resizer({ config })` also accepts a function, read on first use; `MongoTransport` takes
+  `getTiming`. The transport contract's optional `getLockTtlMs()` reports lock TTLs.
 - `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
   and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
   `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
@@ -158,9 +165,9 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 
 - `npm run cli ResizeWorker` no longer starts with no Resizer. The scaffolded
   `src/commands/ResizeWorker.ts` was a bare re-export, so nothing built the host's Resizers in the
-  CLI process. It is now a subclass that loads `src/resizer.ts` before the worker starts.
-  `resize-scaffold --check` reports the old re-export as drift, and the framework worker
-  rejects an empty registry with `RESIZE_NO_RESIZER` and that fix in the message. Hosts:
+  CLI process. It is now `import '../resizer.ts'` plus a re-export of the module's command.
+  `resize-scaffold --check` reports a command that does not import it as drift, and the framework
+  worker rejects an empty registry with `RESIZE_NO_RESIZER` and that fix in the message. Hosts:
   delete `src/commands/ResizeWorker.ts` and re-run `npx resize-scaffold`.
 - `LocalFsStorage` normalizes root paths before deriving the private root and rejects a
   `privateRootDir` equal to or inside the public root. A trailing slash no longer places private

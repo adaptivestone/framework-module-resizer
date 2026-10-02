@@ -41,7 +41,7 @@ describe('runResizeWorker', () => {
         assert.equal(err.code, 'RESIZE_NO_RESIZER');
         assert.match(
           err.message,
-          /src\/commands\/ResizeWorker\.ts must load src\/resizer\.ts/,
+          /src\/commands\/ResizeWorker\.ts must import src\/resizer\.ts/,
         );
         return true;
       },

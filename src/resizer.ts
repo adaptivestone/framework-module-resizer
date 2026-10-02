@@ -11,13 +11,14 @@ import type { MediaStore } from './contracts/mediaStore.ts';
 // The driver contracts live in src/contracts/ so drivers import them without this module. They
 // are re-exported here (types only) for the core files that import them from resizer.ts.
 import type { ResizeStorage } from './contracts/storage.ts';
-import type {
-  EnqueueTask,
-  LeasedTask,
-  QueueTransport,
-  StartWorkerOpts,
-  TaskEvent,
-  TaskEventHandler,
+import {
+  type EnqueueTask,
+  type LeasedTask,
+  lockTtlMsOf,
+  type QueueTransport,
+  type StartWorkerOpts,
+  type TaskEvent,
+  type TaskEventHandler,
 } from './contracts/transport.ts';
 import {
   type PrewarmOpts,
@@ -145,7 +146,9 @@ export type HookFn = (...args: any[]) => unknown;
 
 export interface ResizerOptions {
   name?: string; // registry key; default 'default'
-  config?: ResizeConfig; // the complete image config; default: the package defaults
+  // The complete image config (default: the package defaults), or a function returning it, which
+  // is called and validated on first use (the framework adapter reads its config file lazily).
+  config?: ResizeConfig | (() => ResizeConfig);
   logger?: ResizeLogger; // default: console
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
   storage: ResizeStorage; // REQUIRED (05 · §10.4)
@@ -195,7 +198,8 @@ const FRAMEWORK_HINT =
 export class Resizer {
   readonly name: string;
   readonly queue: string;
-  readonly config: ResizeConfig;
+  readonly #config: () => ResizeConfig;
+  #resolvedConfig: ResizeConfig | undefined;
   readonly logger: ResizeLogger;
   readonly #events: ResizeEventBus | undefined;
   readonly storage: ResizeStorage;
@@ -251,7 +255,13 @@ export class Resizer {
     }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
-    this.config = validateResizeConfig(opts.config ?? defaultResizeConfig);
+    const config = opts.config ?? defaultResizeConfig;
+    if (typeof config === 'function') {
+      this.#config = config;
+    } else {
+      this.#resolvedConfig = validateResizeConfig(config);
+      this.#config = () => config;
+    }
     this.logger = opts.logger ?? console;
     this.#events = opts.events;
     this.name = name;
@@ -282,6 +292,25 @@ export class Resizer {
     } else {
       this.#hooks.set(name, [fn as HookFn]);
     }
+  }
+
+  /** The validated image config; a lazy config (a function) is read and validated on first use. */
+  get config(): ResizeConfig {
+    this.#resolvedConfig ??= validateResizeConfig(this.#config());
+    return this.#resolvedConfig;
+  }
+
+  /**
+   * Optional startup check: resolve and validate the config, check the transport's timing, and
+   * run the media store's verify(). Framework hosts call it after `Server.init()` to fail at boot
+   * instead of at the first upload or read.
+   */
+  async verify(): Promise<void> {
+    void this.config;
+    if (this.transport) {
+      lockTtlMsOf(this.transport);
+    }
+    await this.mediaStore.verify?.();
   }
 
   /** Register a named pipeline — last-wins per name (04 · §8). */

@@ -63,12 +63,9 @@ export const resizer = createFrameworkResizer({
 });
 ```
 
-```ts
-// src/server.ts: create the Resizer after init(); a static import would run too early
-await server.init();
-await import('./resizer.ts');
-await server.startServer();
-```
+Import `src/resizer.ts` wherever you need it; a normal static import is fine, because nothing is
+read from the framework until first use. To fail at boot on a bad config, call
+`await resizer.verify()` after `await server.init()`.
 
 Add `...resizeMediaSchemaFragment` (from the main entry) to your media model's schema, then:
 
@@ -95,7 +92,8 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 3. Create the indexes through your migration process.
 4. Run `npm run cli ResizeWorker` as a separate process.
 
-The scaffolded command loads `src/resizer.ts` before the worker starts. Keep that import, and run
+The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
+worker has the same Resizers as the API. Keep that import, and run
 `npx resize-scaffold --check` in CI to catch drift.
 
 ## Without the framework
@@ -145,7 +143,7 @@ the module never creates them at runtime.
 | `…/drivers/s3.js` | `S3Storage` |
 | `…/drivers/mongo.js` | `MongoTransport`, `MongoMediaStore`, `MongoLockStore`, `createResizeModels`, the schemas |
 | `…/drivers/sqs.js` | `SqsTransport` |
-| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `createFrameworkMongoTransport`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `getResizeConfig`, `FrameworkResizeConfig` |
+| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `createFrameworkMongoTransport`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` |
 
 ## Drivers
 

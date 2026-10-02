@@ -21,7 +21,7 @@ export async function runResizeWorker(
   // The core worker rejects an empty registry too; this message names the framework fix.
   if (listResizers().length === 0) {
     throw new ResizeSetupError(
-      'resize worker: no Resizer constructed in the worker process — src/commands/ResizeWorker.ts must load src/resizer.ts before super.run() (delete it and re-run resize-scaffold)',
+      'resize worker: no Resizer constructed in the worker process — src/commands/ResizeWorker.ts must import src/resizer.ts (delete it and re-run resize-scaffold)',
       { code: 'RESIZE_NO_RESIZER' },
     );
   }

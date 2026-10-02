@@ -31,7 +31,11 @@ const transport: QueueTransport = {
 
 function installApp(configs: Record<string, unknown> = {}) {
   const asked: string[] = [];
-  const logger = { info() {}, warn() {}, error() {} };
+  const logger: Record<string, (...a: unknown[]) => void> = {
+    info() {},
+    warn() {},
+    error() {},
+  };
   const events = { emit() {} };
   setAppInstance({
     getConfig: (name: string) => configs[name] ?? makeResizeConfig(),
@@ -52,8 +56,13 @@ afterEach(() => {
 
 test('fills config, logger, events and the media store from the app', async () => {
   const { asked, logger } = installApp();
+  const seen: unknown[] = [];
+  logger.info = (msg: unknown) => {
+    seen.push(msg);
+  };
   const r = createFrameworkResizer({ storage });
-  assert.equal(r.logger, logger);
+  r.logger.info('hello');
+  assert.deepEqual(seen, ['hello']); // the app logger, resolved at call time
   assert.deepEqual(r.config.formats, ['jpeg', 'webp', 'avif']);
   assert.ok(r.mediaStore instanceof FrameworkMediaStore);
   await r.mediaStore.load('m1');
@@ -118,7 +127,7 @@ test('createFrameworkMongoTransport takes timing from the config file', () => {
   const t = createFrameworkMongoTransport();
   assert.ok(t instanceof MongoTransport);
   assert.equal(t.leaseMs, 1234);
-  assert.deepEqual(t.lockTtlMs, { dispatch: 60000, worker: 1000 });
+  assert.deepEqual(t.getLockTtlMs(), { dispatch: 60000, worker: 1000 });
   assert.equal(
     createFrameworkMongoTransport({
       leaseMs: 99,
@@ -158,5 +167,16 @@ test('a core MongoTransport needs one model and locks, and validates its timing'
   );
   const t = new MongoTransport({ model: {}, locks });
   assert.equal(t.leaseMs, 60_000);
-  assert.deepEqual(t.lockTtlMs, { dispatch: 60_000, worker: 60_000 });
+  assert.deepEqual(t.getLockTtlMs(), { dispatch: 60_000, worker: 60_000 });
+});
+
+test('createFrameworkMongoTransport reads nothing until first use', () => {
+  resetAppInstance();
+  const t = createFrameworkMongoTransport(); // no app yet: must not throw
+  installApp({
+    resize: makeResizeConfig({
+      queue: { leaseMs: 4321, lockTtlMs: { dispatch: 60000, worker: 1000 } },
+    }),
+  });
+  assert.equal(t.leaseMs, 4321);
 });
