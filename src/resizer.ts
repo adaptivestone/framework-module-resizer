@@ -20,8 +20,6 @@ import type {
   TaskEventHandler,
 } from './contracts/transport.ts';
 import {
-  type EnqueueRequiredOpts,
-  enqueueRequiredImpl,
   type PrewarmOpts,
   prewarmImpl,
   type ResolveOpts,
@@ -32,12 +30,12 @@ import { uploadOriginalImpl } from './original.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
 import type {
-  EnqueueRequiredResult,
   MediaLike,
   MissingPreview,
   Original,
   Preview,
   PreviewFormat,
+  PrewarmResult,
   ReadDecision,
   ResizeConfig,
   ResizeEventBus,
@@ -361,24 +359,13 @@ export class Resizer {
   }
 
   /**
-   * Pre-warm mode (11 · Modes §11.1b) — queue the catalog's variants at UPLOAD without blocking
-   * on image work, so the previews are (usually) already there by the first real read. Delegates
-   * to the engine (src/engine.ts): the `resolveSizes` waterfall (real ctx reaches the taps) →
-   * expand sizes × formats, skipping identities already in `media.previews` and SVG originals
-   * that storage proves are already public → `beforeEnqueue` waterfall → hand survivors to the SAME
-   * dispatch-lock `enqueue()` as the read path. NEVER throws (same guarantee as `resolve`); with
-   * no transport it logs once and returns `{ enqueued: 0 }`. `enqueued` = variants handed to the
-   * transport (dispatch-lock survivors).
+   * Pre-warm at upload: queue every missing variant of the catalog without waiting for image work,
+   * so the previews are usually ready by the first read. Reports each variant (ready / accepted /
+   * not required / unconfirmed, with task receipts and issues); a held dispatch lock never counts as
+   * queued. NEVER throws (same guarantee as `resolve`): an internal error is `status: 'incomplete'`.
    */
-  async prewarm(opts: PrewarmOpts): Promise<{ enqueued: number }> {
+  async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
     return prewarmImpl(this, opts);
-  }
-
-  /** Strict queueing API: never equates a held lock with a durable task receipt. */
-  async enqueueRequired(
-    opts: EnqueueRequiredOpts,
-  ): Promise<EnqueueRequiredResult> {
-    return enqueueRequiredImpl(this, opts);
   }
 
   /**

@@ -223,7 +223,7 @@ describe('SqsTransport.enqueue', () => {
     assert.equal(res.taskId, null);
   });
 
-  test('enqueueRequired accepts a successful SQS MessageId receipt', async () => {
+  test('prewarm accepts a successful SQS MessageId receipt', async () => {
     installFakeApp();
     const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
     const transport = new SqsTransport({
@@ -239,7 +239,7 @@ describe('SqsTransport.enqueue', () => {
       },
       transport,
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -248,7 +248,7 @@ describe('SqsTransport.enqueue', () => {
     assert.equal(result.tasks[0].taskId, 'mid-strict');
   });
 
-  test('enqueueRequired leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
+  test('prewarm leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
     installFakeApp();
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
     const transport = new SqsTransport({
@@ -264,7 +264,7 @@ describe('SqsTransport.enqueue', () => {
       },
       transport,
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],

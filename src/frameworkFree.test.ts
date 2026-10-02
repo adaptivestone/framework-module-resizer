@@ -138,7 +138,10 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
   });
   const file = await File.create({ original, previews: [] });
   const sizes = [{ width: 16, height: 16 }];
-  assert.equal((await resizer.prewarm({ media: file, sizes })).enqueued, 1);
+  assert.equal(
+    (await resizer.prewarm({ media: file, sizes })).accepted.length,
+    1,
+  );
 
   const stop = new AbortController();
   const worker = runWorker({ signal: stop.signal, logger: silent });

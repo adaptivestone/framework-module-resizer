@@ -129,7 +129,7 @@ a private original.
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model and
    the framework's `Lock` model declare their indexes; the host's normal lifecycle or an explicit
-   migration must create them before `resolve`, `prewarm`, `enqueueRequired`, or the worker can
+   migration must create them before `resolve`, `prewarm`, or the worker can
    run. The module does not create, synchronize, drop, or repair indexes, and it has no
    `prepareQueue()` API. The partial unique active-request index on `{ fileId, pipeline,
    requestKey }` is required for the Mongo deduplication guarantee; verify it in the host's DB
@@ -160,7 +160,7 @@ sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable 
 is rejected. The module does not sanitize SVG markup. The worker rasterizes accepted SVG
 into the same configured public preview formats as other images.
 
-Persist every original privately, then call the same `prewarm()` / `enqueueRequired()` path for
+Persist every original privately, then call the same `prewarm()` path for
 raster and SVG. The worker creates the requested Sharp previews for both. SVG is an input
 format only; public upload of an SVG original is rejected. Configure a distinct private S3
 bucket, or for `LocalFsStorage` keep its private root outside the static server's public root.
@@ -188,23 +188,20 @@ const { decision, output } = await getResizer().resolve({
 const picture = output ?? formatPictureUrls(decision, { id: String(fileDoc.id) });
 ```
 
-Upload handler, pre-warm mode (non-blocking; the worker fills the cache before the first read):
+Upload handler, pre-warm mode (non-blocking; the worker fills the cache before the first read).
+`prewarm` reports every requested variant and never throws:
 
 ```ts
-const { enqueued } = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
+const result = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
+// result.status: ready | accepted | not-required | incomplete
+// result.unconfirmed: variants without a confirmed task; result.issues: why, and issue.retryable
 ```
 
-When every required variant needs a confirmed receipt, use the separate strict operation:
-
-```ts
-const result = await getResizer().enqueueRequired({ media: fileDoc, sizes: catalog });
-// ready | accepted | not-required | incomplete; inspect unconfirmed/tasks/issues
-```
-
-`prewarm` stays best-effort. A held lock is not accepted proof. Mongo confirms only an exact
-canonical active payload; conflicting payloads with one preview identity are explicit errors.
-SQS/custom transports without `findActive` report lock races as retryable `incomplete`. Delivery
-remains at-least-once, not exactly-once.
+A held dispatch lock is not accepted proof. Mongo confirms only an exact canonical active
+payload; conflicting payloads with one preview identity are explicit errors. SQS/custom
+transports without `findActive` report lock races as retryable `incomplete`. An unexpected
+internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue. Delivery remains
+at-least-once, not exactly-once.
 
 Upload handler, eager mode (blocking; a transport-backed Resizer is also supported):
 

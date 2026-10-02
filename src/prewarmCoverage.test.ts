@@ -58,7 +58,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-describe('enqueueRequired — explicit coverage', () => {
+describe('prewarm — explicit coverage', () => {
   test('returns accepted variants and the durable transport receipt', async () => {
     installApp();
     const calls: MissingPreview[][] = [];
@@ -73,7 +73,7 @@ describe('enqueueRequired — explicit coverage', () => {
       storage,
       transport: withLocks(transport, locks().lockProvider),
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
@@ -114,12 +114,12 @@ describe('enqueueRequired — explicit coverage', () => {
       id: 'm1',
       original: { storageRef: { key: 'original.jpg' } },
     };
-    await r.enqueueRequired({
+    await r.prewarm({
       media,
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
-    await r.enqueueRequired({
+    await r.prewarm({
       media,
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
@@ -142,7 +142,7 @@ describe('enqueueRequired — explicit coverage', () => {
       storage,
       transport: withLocks(transport, locks().lockProvider),
     });
-    const readyResult = await ready.enqueueRequired({
+    const readyResult = await ready.prewarm({
       media: {
         id: 'm1',
         original: { storageRef: { key: 'original.jpg' } },
@@ -166,7 +166,7 @@ describe('enqueueRequired — explicit coverage', () => {
       storage,
       transport: withLocks(transport, locks().lockProvider),
     });
-    const svgResult = await svg.enqueueRequired({
+    const svgResult = await svg.prewarm({
       media: {
         id: 'm2',
         original: {
@@ -184,7 +184,7 @@ describe('enqueueRequired — explicit coverage', () => {
     const empty = createFrameworkResizer({ storage, transport });
     assert.equal(
       (
-        await empty.enqueueRequired({
+        await empty.prewarm({
           media: { id: 'm3', original: { storageRef: { key: 'x.jpg' } } },
           sizes: [],
         })
@@ -198,7 +198,7 @@ describe('enqueueRequired — explicit coverage', () => {
       transport,
       hooks: { beforeEnqueue: () => [] },
     });
-    const filteredResult = await filtered.enqueueRequired({
+    const filteredResult = await filtered.prewarm({
       media: { id: 'm4', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -211,7 +211,7 @@ describe('enqueueRequired — explicit coverage', () => {
   test('reports no transport, no original, and null taskId as incomplete', async () => {
     installApp();
     const noTransport = createFrameworkResizer({ storage });
-    const missingTransport = await noTransport.enqueueRequired({
+    const missingTransport = await noTransport.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -231,7 +231,7 @@ describe('enqueueRequired — explicit coverage', () => {
       storage,
       transport: withLocks(transport, locks().lockProvider),
     });
-    const missingOriginal = await noOriginal.enqueueRequired({
+    const missingOriginal = await noOriginal.prewarm({
       media: { id: 'm2' },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -239,7 +239,7 @@ describe('enqueueRequired — explicit coverage', () => {
     assert.equal(missingOriginal.status, 'incomplete');
     assert.equal(missingOriginal.issues[0].code, 'RESIZE_ENQUEUE_NO_ORIGINAL');
 
-    const nullTask = await noOriginal.enqueueRequired({
+    const nullTask = await noOriginal.prewarm({
       media: { id: 'm3', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -260,7 +260,7 @@ describe('enqueueRequired — explicit coverage', () => {
       storage,
       transport: withLocks(transport, locks().lockProvider),
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -270,7 +270,7 @@ describe('enqueueRequired — explicit coverage', () => {
   });
 });
 
-describe('enqueueRequired — lock races and retries', () => {
+describe('prewarm — lock races and retries', () => {
   test('a held lock is incomplete when the transport cannot prove an active task', async () => {
     installApp();
     let enqueueCalls = 0;
@@ -285,7 +285,7 @@ describe('enqueueRequired — lock races and retries', () => {
       storage,
       transport: withLocks(transport, locks(false).lockProvider),
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -309,7 +309,7 @@ describe('enqueueRequired — lock races and retries', () => {
       storage,
       transport: withLocks(transport, locks(false).lockProvider),
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -337,7 +337,7 @@ describe('enqueueRequired — lock races and retries', () => {
       transport: withLocks(transport, locks(false).lockProvider),
     });
 
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -372,7 +372,7 @@ describe('enqueueRequired — lock races and retries', () => {
       },
     });
 
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -408,7 +408,7 @@ describe('enqueueRequired — lock races and retries', () => {
         },
       });
 
-      const result = await r.enqueueRequired({
+      const result = await r.prewarm({
         media: { id: `m-${label}`, original: { storageRef: { key: 'x.jpg' } } },
         sizes: [{ width: 300, height: 300 }],
         formats: ['jpeg'],
@@ -441,7 +441,7 @@ describe('enqueueRequired — lock races and retries', () => {
       },
     });
 
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm-same', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -470,7 +470,7 @@ describe('enqueueRequired — lock races and retries', () => {
       },
     });
 
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm-filters', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -499,7 +499,7 @@ describe('enqueueRequired — lock races and retries', () => {
       transport: withLocks(transport, locks(false).lockProvider),
     });
 
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['webp'],
@@ -533,7 +533,7 @@ describe('enqueueRequired — lock races and retries', () => {
       transport: withLocks(transport, locks(false).lockProvider),
     });
 
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm-separate', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
@@ -567,13 +567,13 @@ describe('enqueueRequired — lock races and retries', () => {
       storage,
       transport: withLocks(transport, lockProvider),
     });
-    const opts: Parameters<Resizer['enqueueRequired']>[0] = {
+    const opts: Parameters<Resizer['prewarm']>[0] = {
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     };
-    const first = await r.enqueueRequired(opts);
-    const second = await r.enqueueRequired(opts);
+    const first = await r.prewarm(opts);
+    const second = await r.prewarm(opts);
     assert.equal(first.status, 'incomplete');
     assert.equal(first.issues[0].code, 'RESIZE_ENQUEUE_TRANSPORT_FAILED');
     assert.equal(released.length, 1);
@@ -594,7 +594,7 @@ describe('enqueueRequired — lock races and retries', () => {
         locks((key) => key.includes(':jpeg:')).lockProvider,
       ),
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
@@ -611,7 +611,7 @@ describe('enqueueRequired — lock races and retries', () => {
   });
 });
 
-describe('enqueueRequired — pipelines are part of identity', () => {
+describe('prewarm — pipelines are part of identity', () => {
   test('a default preview does not make a watermark request ready', async () => {
     installApp();
     const transport: QueueTransport = {
@@ -635,9 +635,9 @@ describe('enqueueRequired — pipelines are part of identity', () => {
       ],
     };
     const sizes = [{ width: 300, height: 300 }];
-    const clean = await r.enqueueRequired({ media, sizes, formats: ['jpeg'] });
+    const clean = await r.prewarm({ media, sizes, formats: ['jpeg'] });
     assert.equal(clean.status, 'ready');
-    const watermarked = await r.enqueueRequired({
+    const watermarked = await r.prewarm({
       media,
       sizes,
       formats: ['jpeg'],

@@ -106,7 +106,7 @@ describe('prewarm — happy path', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
         { width: 300, height: 300 },
@@ -119,7 +119,7 @@ describe('prewarm — happy path', () => {
     assert.equal(calls[0].mediaId, 'm1');
     assert.equal(calls[0].pipeline, 'photo');
     assert.equal(calls[0].previews.length, 4);
-    assert.equal(enqueued, 4);
+    assert.equal(accepted.length, 4);
     assert.deepEqual(
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`).sort(),
       ['100x100:jpeg', '100x100:webp', '300x300:jpeg', '300x300:webp'],
@@ -226,12 +226,12 @@ describe('prewarm — skip existing & dedup', () => {
         },
       ],
     };
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media,
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
       ['300x300:webp'],
@@ -246,7 +246,7 @@ describe('prewarm — skip existing & dedup', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
         { width: 300, height: 300 },
@@ -254,7 +254,7 @@ describe('prewarm — skip existing & dedup', () => {
       ],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.equal(calls[0].previews.length, 1);
   });
 
@@ -266,12 +266,12 @@ describe('prewarm — skip existing & dedup', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{}, { width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.equal(calls[0].previews[0].sizeKey, '300x300');
   });
 });
@@ -285,7 +285,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: {
         id: 'm1',
         original: {
@@ -296,7 +296,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(enqueued, 2);
+    assert.equal(accepted.length, 2);
     assert.equal(calls.length, 1);
     assert.equal(acquired.length, 2);
   });
@@ -309,7 +309,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: {
         id: 'm1',
         original: { storageRef: { key: 'logo' }, format: 'svg' },
@@ -317,7 +317,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.equal(calls.length, 1);
   });
 });
@@ -337,12 +337,12 @@ describe('prewarm — waterfall hooks', () => {
         ],
       },
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 2);
+    assert.equal(accepted.length, 2);
     assert.deepEqual(calls[0].previews.map((p) => p.sizeKey).sort(), [
       '100x100',
       '200x200',
@@ -362,7 +362,7 @@ describe('prewarm — waterfall hooks', () => {
           missing.filter((m) => m.sizeKey === '300x300' && m.format === 'jpeg'),
       },
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
         { width: 300, height: 300 },
@@ -370,14 +370,14 @@ describe('prewarm — waterfall hooks', () => {
       ],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
       ['300x300:jpeg'],
     );
   });
 
-  test('a beforeEnqueue tap that empties the set → { enqueued: 0 }, no transport call', async () => {
+  test('a beforeEnqueue tap that empties the set → nothing accepted, no transport call', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
@@ -386,21 +386,21 @@ describe('prewarm — waterfall hooks', () => {
       transport: withLocks(transport, lockProvider),
       hooks: { beforeEnqueue: () => [] },
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
+    assert.equal(accepted.length, 0);
     assert.equal(calls.length, 0);
   });
 });
 
 describe('prewarm — no transport (eager-only host)', () => {
-  test('warns once and returns { enqueued: 0 } without throwing', async () => {
-    const { warn } = installFakeApp();
+  test('reports every variant unconfirmed with a NO_TRANSPORT issue, without throwing', async () => {
+    installFakeApp();
     const r = createFrameworkResizer({ storage: makeStorage() });
-    const { enqueued } = await r.prewarm({
+    const { accepted, status, unconfirmed, issues } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
         { width: 300, height: 300 },
@@ -408,8 +408,10 @@ describe('prewarm — no transport (eager-only host)', () => {
       ],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
-    assert.equal(warn.length, 1);
+    assert.equal(accepted.length, 0);
+    assert.equal(status, 'incomplete');
+    assert.equal(unconfirmed.length, 2);
+    assert.equal(issues[0].code, 'RESIZE_ENQUEUE_NO_TRANSPORT');
   });
 });
 
@@ -423,19 +425,19 @@ describe('prewarm — dispatch-lock survivors only', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => p.format),
       ['jpeg'],
     );
   });
 
-  test('no lock survives → { enqueued: 0 } and the transport is not called', async () => {
+  test('no lock survives → nothing accepted and the transport is not called', async () => {
     installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(false);
@@ -443,18 +445,18 @@ describe('prewarm — dispatch-lock survivors only', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
+    assert.equal(accepted.length, 0);
     assert.equal(calls.length, 0);
   });
 });
 
 describe('prewarm — never throws', () => {
-  test('transport.enqueue throwing → { enqueued: 0 }, dispatch locks released, no reject', async () => {
+  test('transport.enqueue throwing → nothing accepted, dispatch locks released, no reject', async () => {
     installFakeApp();
     const { transport } = makeTransport(() => {
       throw new Error('transport down');
@@ -464,18 +466,18 @@ describe('prewarm — never throws', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
+    assert.equal(accepted.length, 0);
     assert.deepEqual(released, [
       'resize_dispatch:m1:default:default:300x300:jpeg:none',
     ]);
   });
 
-  test('an internal error (lockProvider.acquire throws) is caught → { enqueued: 0 }, logged', async () => {
+  test('an internal error (lockProvider.acquire throws) is caught → nothing accepted, logged', async () => {
     const { errors } = installFakeApp();
     const { transport } = makeTransport();
     const lockProvider: LockStore = {
@@ -488,12 +490,12 @@ describe('prewarm — never throws', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
+    assert.equal(accepted.length, 0);
     assert.ok(errors.length >= 1);
   });
 
@@ -510,17 +512,17 @@ describe('prewarm — never throws', () => {
         },
       },
     });
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.equal(calls[0].previews[0].sizeKey, '300x300');
     assert.ok(errors.length >= 1);
   });
 
-  test('media with no id/_id → logged { enqueued: 0 } (never-throw wrapper absorbs requireMediaId)', async () => {
+  test('media with no id/_id → incomplete with a non-retryable INTERNAL_ERROR, never a throw', async () => {
     const { errors } = installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider } = makeLocks(true);
@@ -528,12 +530,15 @@ describe('prewarm — never throws', () => {
       storage: makeStorage(),
       transport: withLocks(transport, lockProvider),
     });
-    const { enqueued } = await r.prewarm({
+    const result = await r.prewarm({
       media: { original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 0);
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.accepted.length, 0);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false); // a media without an id never improves
     assert.equal(calls.length, 0);
     assert.ok(errors.length >= 1);
   });
@@ -559,12 +564,12 @@ describe('prewarm — fast-path is NOT consulted', () => {
         height: 150,
       },
     };
-    const { enqueued } = await r.prewarm({
+    const { accepted } = await r.prewarm({
       media,
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(enqueued, 1);
+    assert.equal(accepted.length, 1);
     assert.deepEqual(
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
       ['300x300:jpeg'],
@@ -595,7 +600,7 @@ describe('prewarm — pipelines are part of identity', () => {
     };
     const sizes = [{ width: 300, height: 300 }];
     assert.equal(
-      (await r.prewarm({ media, sizes, formats: ['webp'] })).enqueued,
+      (await r.prewarm({ media, sizes, formats: ['webp'] })).accepted.length,
       0,
     );
     assert.equal(
@@ -606,7 +611,7 @@ describe('prewarm — pipelines are part of identity', () => {
           formats: ['webp'],
           pipeline: 'watermark',
         })
-      ).enqueued,
+      ).accepted.length,
       1,
     );
     assert.equal(calls[0].pipeline, 'watermark');

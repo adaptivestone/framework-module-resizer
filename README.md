@@ -15,7 +15,7 @@ driver, and turns the record on your media document into image URLs.
 | Workflow | Call | Needs |
 |---|---|---|
 | **Eager**: previews ready when the upload finishes | `generate()` | storage + media model |
-| **Pre-warm**: fast upload, previews made in the background | `prewarm()` / `enqueueRequired()` | + a transport and a worker |
+| **Pre-warm**: fast upload, previews made in the background | `prewarm()` | + a transport and a worker |
 | **Lazy**: previews only for sizes readers request | `resolve()` with a transport | + a transport and a worker |
 
 All three write the same `previews[]` and read URLs with `resolve()`, so you can mix them or
@@ -229,7 +229,7 @@ comes from `createResizeModels(connection)`.
   `resizer` and `queue`.
   - `startWorker(handle, { signal, queue, onEvent })` consumes only that queue and reports
     `onEvent('completed' | 'failed' | 'deadLettered', task, error?)`.
-  - Optionally, `findActive(task)` lets `enqueueRequired()` confirm work that another request
+  - Optionally, `findActive(task)` lets `prewarm()` confirm work that another request
     queued.
 
 ## Config reference

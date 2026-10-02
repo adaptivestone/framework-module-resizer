@@ -120,7 +120,7 @@ export interface ReadDecision {
   missing: MissingPreview[];
 }
 
-export type EnqueueRequiredStatus =
+export type PrewarmStatus =
   | 'ready'
   | 'accepted'
   | 'not-required'
@@ -140,14 +140,18 @@ export interface EnqueueIssue {
     | 'RESIZE_ENQUEUE_TRANSPORT_FAILED'
     | 'RESIZE_ENQUEUE_UNCONFIRMED'
     | 'RESIZE_ENQUEUE_CONFIRM_FAILED'
-    | 'RESIZE_ENQUEUE_VARIANT_CONFLICT';
+    | 'RESIZE_ENQUEUE_VARIANT_CONFLICT'
+    | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)
   message: string;
   retryable: boolean;
   previews: MissingPreview[];
 }
 
-export interface EnqueueRequiredResult {
-  status: EnqueueRequiredStatus;
+// What prewarm() reports for every requested variant. ready / accepted / notRequired / unconfirmed
+// split the requested catalog; `tasks` holds the transport receipts; `issues` say why a variant is
+// unconfirmed and whether a retry can help.
+export interface PrewarmResult {
+  status: PrewarmStatus;
   reason?: 'empty-request' | 'filtered';
   requested: MissingPreview[];
   ready: MissingPreview[];

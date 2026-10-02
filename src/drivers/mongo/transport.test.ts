@@ -532,7 +532,7 @@ describe('MongoTransport.enqueue', () => {
     assert.deepEqual(other, []);
   });
 
-  test('enqueueRequired confirms an existing Mongo task after losing its dispatch lock', async () => {
+  test('prewarm confirms an existing Mongo task after losing its dispatch lock', async () => {
     installFakeApp();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const existing = await transport.enqueue({
@@ -554,7 +554,7 @@ describe('MongoTransport.enqueue', () => {
       transport,
       lockProvider: { acquire: async () => false, release: async () => {} },
     });
-    const result = await r.enqueueRequired({
+    const result = await r.prewarm({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
