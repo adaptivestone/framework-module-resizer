@@ -97,10 +97,11 @@ export function buildRequestKey(task: {
  * `taskId === null` soft failure). On success the locks are deliberately left to expire
  * — they collapse concurrent read fan-out into this single task.
  *
- * Returns the number of variants HANDED TO the transport — the lock-winners on a successful
- * enqueue (prewarm's `enqueued`, 11 · §11.1b step 4). Every non-success path returns 0: no
- * transport, no surviving lock, a throw, or a `taskId === null` soft failure (the released
- * locks let a later read retry, so nothing durable was queued). resolve() ignores the count.
+ * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead). Returns the number
+ * of variants HANDED TO the transport — the lock-winners on a successful enqueue. Every
+ * non-success path returns 0: no transport, no surviving lock, a throw, or a `taskId === null`
+ * soft failure (the released locks let a later read retry, so nothing durable was queued).
+ * resolve() ignores the count.
  */
 export async function enqueue(
   resizer: Resizer,
@@ -308,7 +309,7 @@ export async function enqueueConfirmed(
       }
     } catch (error) {
       resizer.logger.error(
-        `resize enqueueRequired: dispatch-lock acquire failed for ${lockKey}`,
+        `resize prewarm: dispatch-lock acquire failed for ${lockKey}`,
         error,
       );
       lockFailed.push(preview);
@@ -351,7 +352,7 @@ export async function enqueueConfirmed(
       }
     } catch (error) {
       resizer.logger.error(
-        `resize enqueueRequired: transport.enqueue threw for media ${mediaId}`,
+        `resize prewarm: transport.enqueue threw for media ${mediaId}`,
         error,
       );
       issues.push({
@@ -412,7 +413,7 @@ export async function enqueueConfirmed(
       }
     } catch (error) {
       resizer.logger.error(
-        `resize enqueueRequired: active-task confirmation failed for media ${mediaId}`,
+        `resize prewarm: active-task confirmation failed for media ${mediaId}`,
         error,
       );
       issues.push({

@@ -172,8 +172,14 @@ test('one worker serves two Resizers that share a transport', async () => {
     mediaStore: memoryMediaStore(mediaB),
   });
 
-  assert.equal((await media.prewarm({ media: mediaA, sizes })).enqueued, 1);
-  assert.equal((await listings.prewarm({ media: mediaB, sizes })).enqueued, 1);
+  assert.equal(
+    (await media.prewarm({ media: mediaA, sizes })).accepted.length,
+    1,
+  );
+  assert.equal(
+    (await listings.prewarm({ media: mediaB, sizes })).accepted.length,
+    1,
+  );
 
   const done = runResizeWorker();
   await waitFor(
@@ -206,7 +212,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
     mediaStore: memoryMediaStore(media),
   });
   assert.equal(
-    (await resizer.prewarm({ media, sizes, queue: 'bulk' })).enqueued,
+    (await resizer.prewarm({ media, sizes, queue: 'bulk' })).accepted.length,
     1,
   );
 

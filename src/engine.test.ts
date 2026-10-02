@@ -639,7 +639,7 @@ describe('resolve — enqueue wiring', () => {
 
 describe('prewarm — missing original key', () => {
   test('returns zero without enqueueing or locking', async () => {
-    const { info } = installFakeApp();
+    installFakeApp();
     const { transport, calls } = makeTransport();
     const { lockProvider, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
@@ -651,10 +651,10 @@ describe('prewarm — missing original key', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(result, { enqueued: 0 });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_NO_ORIGINAL');
     assert.equal(calls.length, 0);
     assert.equal(acquired.length, 0);
-    assert.equal(info.length, 1);
   });
 });
 

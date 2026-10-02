@@ -6,9 +6,9 @@
 // is the owner/admin-gated signedUrl (itself caught + fallen back). Imports the Resizer
 // TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
 import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
+import { ResizeMediaError } from './errors.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import {
-  expandMissingPreviews,
   expandPreviewRequests,
   getFilterSig,
   getPreviewIdentity,
@@ -20,12 +20,12 @@ import {
 } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
-  EnqueueRequiredResult,
   MediaLike,
   MissingPreview,
   Original,
   Preview,
   PreviewFormat,
+  PrewarmResult,
   ReadDecision,
   ReadyEntry,
   SizeInput,
@@ -49,8 +49,6 @@ export interface PrewarmOpts {
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
   queue?: string; // queue for missing variants; default resizer.queue
 }
-
-export type EnqueueRequiredOpts = PrewarmOpts;
 
 // Owner/admin private-original reads: short-lived by design (the only read-path I/O). A
 // small constant is fine — the URL is re-minted on every read, so it never needs to outlive
@@ -285,94 +283,52 @@ export async function resolveImpl(
 }
 
 /**
- * §11.1b — pre-warm the catalog at UPLOAD by queueing its variants without blocking on any image
- * work. Shares the read path's machinery: the same `resolveSizes`/`beforeEnqueue` waterfalls, the
- * same `expandMissingPreviews` skip-existing/dedup expansion, and the same dispatch-lock
- * `enqueue()`. Differences from `resolve`: no ready/URL building, and the "original already fits"
- * fast-path is NOT consulted (that is a read-time serving decision — a fits-eligible size still
- * generates a preview a later read may ignore). Like `resolve`, the ENTIRE body runs in a
- * never-throw guard (an upload must not fail because pre-warming hiccuped) and returns the safe
- * `{ enqueued: 0 }` on any internal error. `enqueued` = the count handed to `transport.enqueue`
- * (dispatch-lock survivors; lock losers are already in flight elsewhere and are not counted).
+ * Pre-warm the catalog at UPLOAD: queue every missing variant without blocking on image work, and
+ * report each requested variant (ready / accepted / not required / unconfirmed, with task receipts
+ * and issues). A held dispatch lock never counts as queued: the transport's findActive() must
+ * confirm it. Uses the read path's `resolveSizes` / `beforeEnqueue` waterfalls; the "original
+ * already fits" fast-path is not consulted (that is a read-time serving decision). NEVER throws:
+ * an upload must not fail because pre-warming hiccuped, so an unexpected error becomes
+ * `status: 'incomplete'` with a RESIZE_ENQUEUE_INTERNAL_ERROR issue.
  */
 export async function prewarmImpl(
   resizer: Resizer,
   opts: PrewarmOpts,
-): Promise<{ enqueued: number }> {
+): Promise<PrewarmResult> {
   try {
-    const ctx = opts.ctx ?? {};
-    const { media } = opts;
-    const pipeline = opts.pipeline ?? 'default';
-    // Inside the never-throw try: no id/_id logs + returns { enqueued: 0 } (04 · papercut).
-    const mediaId = requireMediaId(media);
-
-    // 1. Host size magic (same waterfall as resolve; real ctx reaches the taps).
-    const sizes = (await resizer.runWaterfall(
-      'resolveSizes',
-      opts.sizes,
-      ctx,
-    )) as SizeInput[];
-
-    // 2. Expand sizes × formats → deduped MissingPreview[], skipping unbuildable sizes + existing
-    //    identities. The fast-path is deliberately NOT consulted here (see the doc comment).
-    const formats = opts.formats ?? resizer.config.formats;
-    const expanded = expandMissingPreviews(media, sizes, formats, {
-      resizer: resizer.name,
-      pipeline,
-    });
-
-    // 3. beforeEnqueue — REASSIGN the (post-hook) set so the enqueue sees exactly what a host tap
-    //    left (same assign-back semantics as resolve step 8).
-    const missing = (await resizer.runWaterfall(
-      'beforeEnqueue',
-      expanded,
-      ctx,
-    )) as MissingPreview[];
-    if (missing.length === 0) {
-      return { enqueued: 0 };
-    }
-
-    if (media.original?.storageRef == null) {
-      resizer.logger.info(
-        `resize prewarm: media ${mediaId} has no original storage ref — nothing enqueued`,
-      );
-      return { enqueued: 0 };
-    }
-
-    // 4. No transport → this host is eager-only; warn once and enqueue nothing.
-    if (!resizer.transport) {
-      resizer.logger.warn(
-        'resize prewarm: previews to warm but no transport is registered — nothing enqueued (eager-only host? construct the Resizer with a transport for pre-warm/lazy mode)',
-      );
-      return { enqueued: 0 };
-    }
-
-    // 4. Hand the survivors to the SAME dispatch-lock enqueue as the read path; its return value
-    //    is the count actually queued (post lock-loser filtering, 0 on any failure).
-    const enqueued = await enqueue(
-      resizer,
-      mediaId,
-      pipeline,
-      missing,
-      opts.queue ?? resizer.queue,
-    );
-    return { enqueued };
+    return await prewarmStrict(resizer, opts);
   } catch (err) {
-    // 5. Never-throw guard (same guarantee as resolve): an upload must not fail on a prewarm hiccup.
     logNeverThrow(
       resizer,
-      'resize prewarm: unexpected internal error — nothing enqueued',
+      'resize prewarm: unexpected internal error — nothing confirmed',
       err,
     );
-    return { enqueued: 0 };
+    return {
+      status: 'incomplete',
+      requested: [],
+      ready: [],
+      accepted: [],
+      notRequired: [],
+      unconfirmed: [],
+      tasks: [],
+      issues: [
+        {
+          code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
+          message: err instanceof Error ? err.message : String(err),
+          // A media the module can't use (e.g. no id) won't improve on retry.
+          retryable: !(err instanceof ResizeMediaError),
+          previews: [],
+        },
+      ],
+    };
   }
 }
 
-/** Strict pre-warm: every missing identity is either confirmed by a task receipt or explicit. */
-export async function enqueueRequiredImpl(
+/** The pre-warm itself: every missing identity is either confirmed by a task receipt or explicit. */
+async function prewarmStrict(
   resizer: Resizer,
-  opts: EnqueueRequiredOpts,
-): Promise<EnqueueRequiredResult> {
+  opts: PrewarmOpts,
+): Promise<PrewarmResult> {
   const ctx = opts.ctx ?? {};
   const { media } = opts;
   const pipeline = opts.pipeline ?? 'default';
@@ -385,7 +341,7 @@ export async function enqueueRequiredImpl(
   const formats = opts.formats ?? resizer.config.formats;
   const scope = { resizer: resizer.name, pipeline };
   const requestedBeforePolicy = expandPreviewRequests(sizes, formats, scope);
-  const empty = (): EnqueueRequiredResult => ({
+  const empty = (): PrewarmResult => ({
     status: 'not-required',
     reason: 'empty-request',
     requested: [],

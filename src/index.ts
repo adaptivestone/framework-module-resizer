@@ -22,7 +22,6 @@ export {
 } from './contracts/transport.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type {
-  EnqueueRequiredOpts,
   PrewarmOpts,
   ResolveOpts,
 } from './engine.ts';

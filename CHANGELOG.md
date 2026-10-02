@@ -123,8 +123,8 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   `@adaptivestone/framework`.
 - Each framework Resizer can read its own config file:
   `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
-- Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()`,
-  `prewarm()` and `enqueueRequired()` accept a per-call `queue`.
+- Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()` and
+  `prewarm()` accept a per-call `queue`.
   `npm run cli ResizeWorker -- --queue=<name>` consumes only that queue; without the flag it consumes `'default'`. `SqsTransport` maps queue
   names to URLs with the new `queues` option (`RESIZE_SQS_QUEUE_UNKNOWN` for an unknown name).
 - One worker process serves every Resizer constructed in it, routing each task to the Resizer
@@ -134,11 +134,14 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
   and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
   `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
-- Strict `enqueueRequired()` partitions ready, accepted, not-required and unconfirmed variants. A
+- `prewarm()` reports every requested variant: `{ status, ready, accepted, notRequired,
+  unconfirmed, tasks, issues }` (`PrewarmResult`), instead of an `{ enqueued }` count, and still
+  never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue). A
   held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
   through the optional `QueueTransport.findActive()`, while SQS/custom transports without it
   report lock races as retryable `incomplete`. Conflicting payloads with one preview identity are
-  explicit errors.
+  explicit errors. There is no separate strict method: the pre-release `enqueueRequired()` is
+  merged into `prewarm()`.
 - The Mongo transport deduplicates identical active requests with a canonical SHA-256
   `requestKey` and a partial unique index on `{ fileId, pipeline, requestKey }`. The module does not
   create indexes; prepare them through the host's migration or lifecycle before rollout.
