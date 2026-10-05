@@ -50,49 +50,39 @@ a private original.
    # npx resize-scaffold --eject # full editable ResizeTask model
    ```
 
-   `--eager` emits `src/resizer.ts` (LocalFsStorage already wired) + `src/config/resize.ts`.
+   `--eager` emits `src/resizer.ts` + `src/config/resize.ts` (local storage, no queue).
    Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts`
    (`import '../resizer.ts'` plus a re-export of the module's command).
    Appends a pointer to this guide into the host's `AGENTS.md`
    (`--agents claude|print|skip` to redirect or suppress it).
 
-3. Wire the drivers in `src/resizer.ts` — ONE construction call. `createFrameworkResizer`
-   (framework adapter) fills `config` (the image settings from `src/config/resize.ts`), the app
-   logger and the database (`FrameworkDatabase`: the app's media model, the framework `Lock`
-   model, and the scaffolded `ResizeTask` model as its task queue). `storage` is REQUIRED; pass
-   `tasks: true` for background generation (omit it for eager-only hosts):
+3. `src/resizer.ts` holds behaviour only — ONE construction call, `new FrameworkResizer({
+   pipelines, hooks })`. It builds every part from the config file on first use: the image
+   settings, `storage`, the task queue (`queue`), the database (`FrameworkDatabase`: the app's
+   media model, the framework `Lock` model, the scaffolded `ResizeTask` model) and the app logger:
 
    ```ts
-   import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
-   import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
+   import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
 
-   export const resizer = createFrameworkResizer({
-     storage: new LocalFsStorage({
-       rootDir: './var/media',
-       publicBaseUrl: '/media',
-     }),
-   });
+   export const resizer = new FrameworkResizer({ pipelines: { default: {} } });
    ```
 
    Nothing is read from the framework until first use, so this file can be imported statically
-   anywhere, even before `Server.init()`.
+   anywhere, even before `Server.init()`. Options win over the config: `storage` (e.g. an
+   `S3Storage` with the host's own `client`), `db`, `tasks` (a `TaskQueue`, or `false` = eager
+   only), `logger`, `events`, `config`, `configName`, `queue` (the queue name), `name`.
 
-   Other shipped drivers: `S3Storage` from
-   `@adaptivestone/framework-module-resize/drivers/s3.js` (options: `bucketPublic` required;
-   `publicBaseUrl` — alias of the old `publicUrl` for one minor; `client` first when the host
-   already has an `S3Client`), and `SqsTaskQueue` from
-   `@adaptivestone/framework-module-resize/drivers/sqs.js` as `tasks` (options: `queueUrl`
-   required, for the `'default'` queue; `queues` maps other queue names to URLs;
-   `deadLetterQueueUrl`; `timing`; `waitTimeSeconds`; `region`, `endpoint`, `client`, `logger` —
-   pass `appLogger` from the framework adapter). Media and locks stay in the database.
-   Without the framework, `@adaptivestone/framework-module-resize/drivers/mongo.js` ships
-   `mongoDatabase(connection, { mediaModel, timing? })` (media, locks and `.tasks` with the
-   package's `ResizeTask` / `ResizeLock` models), plus `MongoDatabase`, `MongoTaskQueue` and
-   `createResizeModels`. A custom driver extends the exported abstract class (`ResizeStorage`,
-   `ResizeDatabase`, `TaskQueue`) or is any object of the same shape — no `app` parameter; a
-   driver closes over its own client. The core owns the queue logic (worker loop, retries,
-   dead-letters, events); a `TaskQueue` only implements atomic `add` / `claim` / `renew` /
-   `complete` / `fail`.
+   Without the framework: `new Resizer({ storage, db, tasks? })` from the main entry, with
+   `@adaptivestone/framework-module-resize/drivers/mongo.js` → `mongoDatabase(connection, {
+   mediaModel, timing? })` (media, locks and `.tasks` with the package's `ResizeTask` /
+   `ResizeLock` models; also `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`),
+   `…/drivers/fs.js` → `LocalFsStorage`, `…/drivers/s3.js` → `S3Storage`, `…/drivers/sqs.js` →
+   `SqsTaskQueue`. Any part may be a function (sync or async) called once on first use. A custom
+   driver extends the exported abstract class (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`) or
+   is any object of the same shape — no `app` parameter; a driver closes over its own client. The
+   core owns the queue logic (worker loop, retries, dead-letters, events); a `TaskQueue` only
+   implements atomic `add` / `claim` / `renew` / `complete` / `fail`. `claim` may wait for a task
+   (long poll), but must return once its `signal` aborts and never claim ahead of the call.
 
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
    on a bad config, call `await getResizer().verify()` after `Server.init()`; otherwise a config
@@ -102,14 +92,22 @@ a private original.
 
 5. The scaffolded `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
    `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
-   FrameworkResizeConfig`. Set `mediaModelName: 'File'` (your host media model's name) and keep
-   only host overrides there. The image settings go to the Resizer; the adapter reads
-   `mediaModelName`, `queue` (the task queue's timing and lock TTLs) and `worker` (the worker
-   command). Variant parallelism is the top-level `concurrency`. A second Resizer can read its own file:
-   `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
-   Put environment-only changes in `resize.<NODE_ENV>.ts` (for example,
-   `resize.production.ts`); the framework merges that file before
-   this module reads and validates the resolved config. Do not add a second runtime merge.
+   FrameworkResizeConfig`. Set `mediaModelName: 'File'` (your host media model's name). The
+   image settings go to the Resizer; `FrameworkResizer` reads:
+   - `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or
+     `{ driver: 's3', bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?,
+     forcePathStyle? }` (S3 is imported only when selected; credentials from the AWS chain);
+   - `queue`: `{ driver: 'database' }` or `{ driver: 'sqs', queueUrl, queues?, deadLetterQueueUrl?,
+     waitTimeSeconds?, region?, endpoint? }`, plus any timing key (`leaseMs`, `lockTtlMs`,
+     `maxAttempts`, …; the rest default). Missing or `false` = eager only;
+   - `worker`: the worker command's settings.
+
+   Variant parallelism is the top-level `concurrency`. A second Resizer can read its own file:
+   `new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`.
+   Put environment-only changes in `resize.<NODE_ENV>.ts` (for example, S3 in
+   `resize.production.ts`); the framework merges that file field by field before this module
+   reads and validates the resolved config. Do not add a second runtime merge. When an
+   environment file switches the storage driver, set `publicBaseUrl` there too.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
    instead of hand-writing those fields (single source of truth for schema + types):
@@ -132,7 +130,8 @@ a private original.
    requestKey }` is required for the Mongo deduplication guarantee; verify it in the host's DB
    rollout. Never add index creation to HTTP bootstrap or the first enqueue.
 
-8. Lazy / pre-warm modes: set `worker.enabled: true` in the host `src/config/resize.ts`
+8. Lazy / pre-warm modes: keep `queue: { driver: 'database' }` (or SQS) and set
+   `worker.enabled: true` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`
    (queue `'default'`; `npm run cli ResizeWorker -- --queue=bulk` consumes only `'bulk'`).
    The flag permits the command to run; it does not start a worker in the API. The worker consumes
@@ -194,9 +193,10 @@ const result = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
 // result.unconfirmed: variants without a confirmed task; result.issues: why, and issue.retryable
 ```
 
-A held dispatch lock is not accepted proof. Mongo confirms only an exact canonical active
-payload; conflicting payloads with one preview identity are explicit errors. SQS/custom
-task queues without `findActive` report lock races as retryable `incomplete`. An unexpected
+A held dispatch lock is not accepted proof. A task queue with `findActive` (the database queue)
+confirms only an exact canonical active payload; conflicting payloads with one preview identity
+are explicit errors. A queue without it (SQS, many custom ones) reports lock races as retryable
+`incomplete`. An unexpected
 internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue. Delivery remains
 at-least-once, not exactly-once.
 
@@ -253,7 +253,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 
 - `sizes` is an ALLOWLIST. Never pass client-supplied dimensions through — resolve them against
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
-- Construct each Resizer ONCE, at one construction site, with `createFrameworkResizer`. Most
+- Construct each Resizer ONCE, at one construction site, with `new FrameworkResizer`. Most
   hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
   config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
   for one queue (`--queue`, default `'default'`), with one consume loop per distinct task queue.
@@ -281,7 +281,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | Symptom | Cause → fix |
 |---|---|
 | `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
-| `RESIZE_DATABASE_REQUIRED` at construction | `new Resizer()` takes its `db` explicitly — framework hosts use `createFrameworkResizer` from `…/framework.js`; plain Node: `mongoDatabase(connection, { mediaModel })` |
+| `RESIZE_DATABASE_REQUIRED` at construction | `new Resizer()` takes its `db` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `mongoDatabase(connection, { mediaModel })` |
+| `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config file named in the message, or pass `storage` to `new FrameworkResizer()` |
+| `RESIZE_NOT_READY` | host code read `resizer.storage` / `db` / `tasks` before the drivers loaded — `await resizer.ready()` first (the Resizer's methods do this themselves) |
 | `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`, `worker.concurrency` to `concurrency` |
 | `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | the `ResizeTask` model (or the media model) does not resolve — scaffold `src/models/ResizeTask.ts`, check the model name |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoDatabase()` / `new MongoTaskQueue()` needs a model or a getter — or use `mongoDatabase(connection, { mediaModel })` |

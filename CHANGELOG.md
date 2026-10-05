@@ -60,7 +60,11 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   leases and the heartbeat, the task timeout, retry with backoff, dead-lettering (after
   `maxAttempts`, or at once for a media without an original), the request de-duplication key and the
   `completed` / `failed` / `deadLettered` events, identically for every queue. Tasks carry their
-  `resizer` and `queue`; events go to the owning Resizer's observers.
+  `resizer` and `queue`; events go to the owning Resizer's observers. An idle worker polls every
+  `idlePollMs`, counted from the start of the claim, so a long-polling claim (SQS) is not followed
+  by an extra sleep; claim errors back off (doubling up to 10× `idlePollMs`, reset by the next
+  successful claim). `claim` may wait for a task, which is how a driver can deliver tasks by
+  notification without a contract change.
 - `new Resizer({ storage, db, tasks?, queue? })`. `db` is required (`RESIZE_DATABASE_REQUIRED`);
   `tasks` enables queued work (prewarm, lazy reads, the worker). Locks come from the database, with
   the worker-lock TTL of the queue that delivered the task. `config` is optional (the package
@@ -94,26 +98,37 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   `expandPreviewRequests` take a scope; `isCatalogCovered` takes an optional one. The
   "use distinct filters per pipeline" workaround is no longer needed.
 - The framework is an adapter. The main entry imports no framework code; framework wiring lives in
-  `@adaptivestone/framework-module-resize/framework.js`. `createFrameworkResizer({ storage,
-  tasks: true })` fills config, logger, events and `FrameworkDatabase` (the app's media model, the
-  framework `Lock` model, and the scaffolded `ResizeTask` model as its queue). The main entry no
-  longer exports `ResizeWorker`, `ResizeTaskModel`, `runResizeWorker` or the `TResizeTask` type.
+  `@adaptivestone/framework-module-resize/framework.js`. `new FrameworkResizer({ pipelines, hooks
+  })` (a `Resizer` subclass) builds every part from the config file on first use: the image
+  settings, `storage`, the task queue, `FrameworkDatabase` (the app's media model, the framework
+  `Lock` model, and the scaffolded `ResizeTask` model as its queue), and the app logger and
+  events. Options win over the config (`storage`, `db`, `tasks` — a `TaskQueue` or `false` —,
+  `config`, `configName`, `logger`, `events`). The main entry no longer exports `ResizeWorker`,
+  `ResizeTaskModel`, `runResizeWorker` or the `TResizeTask` type.
+- The scaffolded `src/resizer.ts` holds behaviour only (`new FrameworkResizer({ pipelines })`);
+  storage and the queue live in `src/config/resize.ts`. `--eager` emits the same construction site
+  with a config without `queue`.
 - The core config holds image settings only. `ResizeConfig` loses `queue` and `worker` (a core
   config containing them fails with `RESIZE_CONFIG_REMOVED_KEY`), and `worker.concurrency` becomes
   the top-level `concurrency`. Queue timing and lock TTLs belong to the task queue (`timing`); the
   core validates them, including worker lock ≤ lease (`RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`), on first
   use, in `verify()` and at worker start. Sharp process tuning is `runWorker({ sharp })`.
-- Framework config files keep `mediaModelName`, `queue` and `worker` and spread
+- Framework config files hold `mediaModelName`, `storage`, `queue` and `worker` and spread
   `defaultFrameworkResizeConfig` (from `…/config/resize.js`, which also exports
-  `defaultQueueOptions` and `defaultWorkerOptions`). `queue` and `worker` may be omitted (the
-  defaults apply). `getResizeConfig()` returns `{ image, mediaModelName, queue, worker }`.
+  `defaultQueueOptions` and `defaultWorkerOptions`).
+  - `storage`: `{ driver: 'local', … }` or `{ driver: 's3', … }` (S3 imported only when selected;
+    `RESIZE_CONFIG_STORAGE_MISSING` when neither the config nor the code gives one).
+  - `queue`: `{ driver: 'database' }` or `{ driver: 'sqs', queueUrl, … }` with any timing keys (the
+    rest default). Missing or `false` means eager only; `defaultFrameworkResizeConfig` no longer
+    contains `queue`, so add `queue: { driver: 'database' }` for background generation.
+  - `getResizeConfig()` returns `{ image, mediaModelName, storage, queue, timing, worker }`.
   `ResizeConfig` no longer contains `mediaModelName`; `FrameworkResizeConfig` does.
 - `prewarm()` reports every requested variant: `{ status, ready, accepted, notRequired,
   unconfirmed, tasks, issues }` (`PrewarmResult`), instead of an `{ enqueued }` count, and still
   never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue). A
-  held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
-  through the optional `TaskQueue.findActive()`, while SQS/custom queues without it report lock
-  races as retryable `incomplete`. Conflicting payloads with one preview identity are explicit
+  held lock is not treated as a task receipt: a task queue with the optional
+  `TaskQueue.findActive()` (the Mongo queue) proves exact canonical active-payload coverage, while
+  one without it (SQS) reports lock races as retryable `incomplete`. Conflicting payloads with one preview identity are explicit
   errors. There is no separate strict method: the pre-release `enqueueRequired()` is merged into
   `prewarm()`.
 
@@ -124,7 +139,13 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   with MongoDB writes no driver code: `mongoDatabase(connection, { mediaModel })` gives the media,
   locks and task queue, and the core `runWorker({ queue, signal, logger, sharp })` runs the worker.
 - Each framework Resizer can read its own config file:
-  `createFrameworkResizer({ name: 'listings', configName: 'resizeListings', storage })`.
+  `new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`.
+- Per-environment drivers: `resize.production.ts` can switch storage to S3 or the queue to SQS
+  without code changes.
+- Lazy drivers: `storage`, `db` and `tasks` may be functions (sync or async), called once on first
+  use. `resizer.ready()` loads them; every Resizer method and the worker await it, and `resolve()`
+  / `prewarm()` keep their never-throw guarantee when loading fails. Reading `resizer.storage` /
+  `db` / `tasks` before then throws `RESIZE_NOT_READY`.
 - Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()` and
   `prewarm()` accept a per-call `queue`. `npm run cli ResizeWorker -- --queue=<name>` consumes
   only that queue; without the flag it consumes `'default'`. `SqsTaskQueue` maps queue names to

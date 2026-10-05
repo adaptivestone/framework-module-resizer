@@ -17,8 +17,8 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import defaultResizeConfig, {
   defaultFrameworkResizeConfig,
-} from '../config/resize.ts';
-import { getResizeConfig } from '../framework/config.ts';
+} from '../../config/resize.ts';
+import { getResizeConfig } from '../config.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -68,17 +68,17 @@ describe('runScaffold — default run', () => {
     assert.equal(code, 0);
 
     const resizer = await read(RESIZER);
-    assert.match(resizer, /createFrameworkResizer\(/);
-    assert.match(resizer, /tasks: true/);
+    assert.match(resizer, /new FrameworkResizer\(\{/);
     assert.match(resizer, /framework\.js/);
+    assert.doesNotMatch(
+      resizer,
+      /^\s*(storage|tasks|db):/m,
+      'drivers live in the config',
+    );
     assert.match(
       resizer,
       /a normal static import is fine[\s\S]+resizer\.verify\(\)/,
       'the framework is read lazily, so the guidance is a static import (+ verify() at boot)',
-    );
-    assert.match(
-      resizer,
-      /Queue indexes are declared[\s\S]+normal migration\/lifecycle process[\s\S]+does not create or[\s\S]+synchronize indexes/,
     );
     assert.match(await read(MODEL), /extends ResizeTaskModel/);
     const command = await read(COMMAND);
@@ -98,11 +98,24 @@ describe('runScaffold — default run', () => {
     );
     assert.match(configSource, /\.\.\.defaultFrameworkResizeConfig/);
     assert.match(configSource, /satisfies FrameworkResizeConfig/);
+    assert.match(configSource, /storage: \{ driver: 'local'/);
+    assert.match(configSource, /^ {2}queue: \{ driver: 'database' \},$/m);
+    assert.match(
+      configSource,
+      /indexes[\s\S]+migration process; the module never creates them/,
+    );
 
     assert.match(configSource, /mediaModelName: 'File'/);
+    // The template's effective config, mirrored here so it is checked by the resolver.
     const scaffoldedConfig = {
       ...defaultFrameworkResizeConfig,
       mediaModelName: 'File',
+      storage: {
+        driver: 'local' as const,
+        rootDir: './var/media',
+        publicBaseUrl: '/media',
+      },
+      queue: { driver: 'database' as const },
     };
     assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
     assert.equal(scaffoldedConfig.worker.enabled, false);
@@ -116,6 +129,7 @@ describe('runScaffold — default run', () => {
     const resolved = getResizeConfig();
     assert.equal(resolved.mediaModelName, 'File');
     assert.strictEqual(resolved.queue, scaffoldedConfig.queue);
+    assert.strictEqual(resolved.storage, scaffoldedConfig.storage);
     assert.strictEqual(resolved.image.encode, scaffoldedConfig.encode);
   });
 
@@ -212,7 +226,7 @@ describe('runScaffold — --eject', () => {
 });
 
 describe('runScaffold — --eager', () => {
-  test('emits only resizer.ts + config, wired to LocalFsStorage (no task queue)', async () => {
+  test('emits only resizer.ts + config, with local storage and no task queue', async () => {
     const { code } = await run(['--eager']);
     assert.equal(code, 0);
 
@@ -223,12 +237,11 @@ describe('runScaffold — --eager', () => {
 
     const resizer = await read(RESIZER);
     assert.match(resizer, /a normal static import is fine/);
-    assert.doesNotMatch(resizer, /tasks: true/);
-    assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
-    assert.match(resizer, /LocalFsStorage/);
-    assert.match(resizer, /drivers\/fs\.js/);
-    assert.match(resizer, /publicBaseUrl/);
-    assert.match(resizer, /no task queue or worker/);
+    assert.match(resizer, /new FrameworkResizer\(\{/);
+    const configSource = await read(CONFIG);
+    assert.match(configSource, /storage: \{ driver: 'local'[^}]*publicBaseUrl/);
+    assert.doesNotMatch(configSource, /^\s*queue:/m, 'eager: no task queue');
+    assert.match(configSource, /Eager mode: no task queue/);
   });
 });
 
@@ -447,14 +460,17 @@ describe('packaging smoke', () => {
     assert.equal(src.split('\n')[0], '#!/usr/bin/env node');
   });
 
-  test('package.json bin points at dist/scaffold/command.js', async () => {
+  test('package.json bin points at dist/framework/scaffold/command.js', async () => {
     const pkg = JSON.parse(
       await readFile(
-        fileURLToPath(new URL('../../package.json', import.meta.url)),
+        fileURLToPath(new URL('../../../package.json', import.meta.url)),
         'utf8',
       ),
     );
-    assert.equal(pkg.bin['resize-scaffold'], './dist/scaffold/command.js');
+    assert.equal(
+      pkg.bin['resize-scaffold'],
+      './dist/framework/scaffold/command.js',
+    );
   });
 });
 
@@ -463,7 +479,7 @@ describe('scaffolded ResizeWorker command', () => {
     await run([]);
     // The temp root cannot resolve the package name; point the shim at this checkout's command.
     const moduleCommand = pathToFileURL(
-      fileURLToPath(new URL('../framework/index.ts', import.meta.url)),
+      fileURLToPath(new URL('../index.ts', import.meta.url)),
     ).href;
     const shim = (await read(COMMAND)).replace(
       '@adaptivestone/framework-module-resize/framework.js',

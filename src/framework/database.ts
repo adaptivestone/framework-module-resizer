@@ -1,27 +1,33 @@
 // FrameworkDatabase: MongoDatabase over the framework app's models, resolved by name on each use.
-// - media: `modelName`, or `mediaModelName` from the config file `configName`;
+// - media: `modelName`, or `mediaModelName` from the config;
 // - locks: the framework's own `Lock` model (no extra collection);
-// - tasks: the scaffolded `ResizeTask` model, with timing from the config file's `queue` section.
-// Nothing is read from the app until first use.
+// - tasks: the scaffolded `ResizeTask` model, with timing from the config's `queue` section.
+// The config is the file `configName` (default 'resize'), or an explicit `config`. Nothing is read
+// from the app until first use.
 import { MongoDatabase } from '../drivers/mongo/database.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
+import type { FrameworkResizeConfig } from '../types.d.ts';
 import { appLogger, getApp } from './app.ts';
-import { getResizeConfig } from './config.ts';
+import { getResizeConfig, resolveFrameworkConfig } from './config.ts';
 
 export interface FrameworkDatabaseOptions {
-  modelName?: string; // the host media model; default: mediaModelName from the config file
-  configName?: string; // default 'resize'
+  modelName?: string; // the host media model; default: mediaModelName from the config
+  configName?: string; // the config file; default 'resize'
+  config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
 }
 
 export class FrameworkDatabase extends MongoDatabase {
   constructor(opts: FrameworkDatabaseOptions = {}) {
+    const read = () =>
+      opts.config
+        ? resolveFrameworkConfig(opts.config, opts.configName)
+        : getResizeConfig(opts.configName);
     super({
       // An unregistered name is a config error, never "media missing": the worker completes tasks
       // for deleted media as no-ops, so a missing model would silently drop every task.
       getMediaModel: () => {
-        const name =
-          opts.modelName ?? getResizeConfig(opts.configName).mediaModelName;
+        const name = opts.modelName ?? read().mediaModelName;
         const model = getApp().getModel(name);
         if (!model) {
           throw new ResizeConfigError(
@@ -33,7 +39,7 @@ export class FrameworkDatabase extends MongoDatabase {
       },
       tasks: new MongoTaskQueue({
         getModel: () => getApp().getModel('ResizeTask'),
-        getTiming: () => getResizeConfig(opts.configName).queue,
+        getTiming: () => read().timing,
         logger: appLogger,
       }),
     });

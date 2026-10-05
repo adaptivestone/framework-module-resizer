@@ -5,7 +5,7 @@
 // files in the host's src/). So this generator is STANDALONE: NO framework, NO getApp, NO other
 // module imports — only node builtins. Paths resolve from process.cwd() (or --out <dir>).
 //
-// Templates live beside this file (src/scaffold/templates → dist/scaffold/templates, copied by
+// Templates live beside this file (src/framework/scaffold/templates → dist/framework/scaffold/templates, copied by
 // postBuild), so they resolve relative to import.meta.url in BOTH the source and built layouts.
 //
 // House rule: a CLI procedure is functions, not a class (no stateful driver here). The programmatic
@@ -25,7 +25,7 @@ const CONFIG = 'src/config/resize.ts';
 
 // Load-bearing substrings `--check` verifies (also documents what each shim MUST reference).
 // A construction site builds its Resizer through the framework adapter or the core class.
-const RESIZER_MARKERS = ['createFrameworkResizer(', 'new Resizer('];
+const RESIZER_MARKERS = ['new FrameworkResizer(', 'new Resizer('];
 // The model shim extends ResizeTaskModel from the framework adapter (the old …/models/ResizeTask.js
 // subpath no longer exists).
 const MODEL_MARKERS = [
@@ -85,15 +85,18 @@ async function fileExists(abs: string): Promise<boolean> {
   }
 }
 
-/** The files a run emits, given the flags. Eager mode drops the model + command shims. */
+/**
+ * The files a run emits, given the flags. Eager mode drops the model + command shims and the
+ * config's queue; the construction site is the same in both modes (the config holds the drivers).
+ */
 function planFiles(opts: { eject: boolean; eager: boolean }): FileSpec[] {
-  const resizer: FileSpec = opts.eager
-    ? { target: RESIZER, template: 'resizer.eager.ts.tpl' }
-    : {
-        target: RESIZER,
-        template: 'resizer.ts.tpl',
-      };
-  const config: FileSpec = { target: CONFIG, template: 'resize.config.ts.tpl' };
+  const resizer: FileSpec = { target: RESIZER, template: 'resizer.ts.tpl' };
+  const config: FileSpec = {
+    target: CONFIG,
+    template: opts.eager
+      ? 'resize.config.eager.ts.tpl'
+      : 'resize.config.ts.tpl',
+  };
   if (opts.eager) {
     return [resizer, config];
   }
@@ -229,16 +232,16 @@ const USAGE = `resize-scaffold — vendor the resize module's integration files 
 Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
 
 Emits (into process.cwd(), or --out <dir>):
-  src/resizer.ts            construction site — createFrameworkResizer({ storage, tasks, pipelines })
+  src/resizer.ts            construction site — new FrameworkResizer({ pipelines, hooks })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
   src/commands/ResizeWorker.ts  imports src/resizer.ts and re-exports the module's worker command
-  src/config/resize.ts      host overrides over module defaults (framework merges environment overrides)
+  src/config/resize.ts      media model, storage, queue and overrides (framework merges environment files)
 
 Options:
   --check      verify the shims exist + reference the module (and the worker command imports
                src/resizer.ts); exit 1 on missing/drift (no writes)
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
-  --eager      eager-mode hosts: emit only src/resizer.ts (LocalFsStorage, no task queue) + src/config/resize.ts
+  --eager      eager-mode hosts: emit only src/resizer.ts + src/config/resize.ts (local storage, no queue)
   --force      overwrite existing files (default: never overwrite)
   --agents <m> host pointer to the shipped AGENTS.md: agents (default: append to the host
                AGENTS.md, create if missing), claude (CLAUDE.md), print (stdout only), skip.
@@ -319,13 +322,13 @@ export async function runScaffold(
     );
   } else {
     console.log(
-      '\nDone. Next: fill the `storage` TODO in src/resizer.ts, set `mediaModelName` in',
+      '\nDone. Next: set `mediaModelName` (and check `storage`) in src/config/resize.ts, create',
     );
     console.log(
-      'src/config/resize.ts, and import src/resizer.ts where you need the Resizer (a static import',
+      'the ResizeTask and Lock indexes through your migrations, and import src/resizer.ts where you',
     );
     console.log(
-      'is fine). The scaffolded ResizeWorker command imports it in the worker process.',
+      'need the Resizer (a static import is fine). The ResizeWorker command imports it too.',
     );
   }
   return code;

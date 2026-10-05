@@ -1,6 +1,10 @@
 // End-to-end worker routing on a real Mongo queue: one worker process serves two Resizers that
-// share a task queue, and named queues are isolated from each other.
+// share a task queue, named queues are isolated from each other, and a FrameworkResizer wired only
+// by its config file runs through the framework worker entry.
 import assert from 'node:assert/strict';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import {
   resetAppInstance,
@@ -10,16 +14,18 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
-import type { ResizeDatabase } from './contracts/database.ts';
-import type { ResizeStorage } from './contracts/storage.ts';
-import { FrameworkDatabase } from './framework/database.ts';
-import ResizeTaskModel from './framework/ResizeTaskModel.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
-import { resetResizerForTests } from './resizer.ts';
-import { fakeDb } from './testHelpers/fakes.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import type { MediaLike, Preview } from './types.d.ts';
-import { runWorker } from './worker.ts';
+import type { ResizeDatabase } from '../contracts/database.ts';
+import type { ResizeStorage } from '../contracts/storage.ts';
+import { resizeMediaSchemaFragment } from '../mediaFragment.ts';
+import { resetResizerForTests } from '../resizer.ts';
+import { fakeDb } from '../testHelpers/fakes.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import type { MediaLike, Preview } from '../types.d.ts';
+import { runWorker } from '../worker.ts';
+import { FrameworkDatabase } from './database.ts';
+import ResizeTaskModel from './ResizeTaskModel.ts';
+import { FrameworkResizer } from './resizer.ts';
+import { runResizeWorker } from './worker.ts';
 
 const png = await sharp({
   create: {
@@ -147,12 +153,12 @@ test('one worker serves two Resizers that share a task queue', async () => {
   const mediaB = newMedia();
   const a = memoryStorage();
   const b = memoryStorage();
-  const media = createFrameworkResizer({
+  const media = new FrameworkResizer({
     storage: a.storage,
     tasks,
     db: memoryDatabase(mediaA, shared),
   });
-  const listings = createFrameworkResizer({
+  const listings = new FrameworkResizer({
     name: 'listings',
     storage: b.storage,
     tasks,
@@ -198,7 +204,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   const tasks = shared.tasks;
 
   const first = new AbortController();
-  const resizer = createFrameworkResizer({
+  const resizer = new FrameworkResizer({
     storage: memory.storage,
     tasks,
     db: memoryDatabase(media, shared),
@@ -232,4 +238,84 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   }
   const done = await taskModel.findOne({}).lean();
   assert.equal(done?.status, 'completed');
+});
+
+test('a FrameworkResizer wired only by its config file runs through runResizeWorker', async () => {
+  await taskModel.deleteMany({});
+  const root = await mkdtemp(join(tmpdir(), 'resize-e2e-'));
+  const fileModel =
+    connection.models.File ??
+    connection.model(
+      'File',
+      new mongoose.Schema(
+        { ...resizeMediaSchemaFragment },
+        { minimize: false },
+      ),
+    );
+  resetResizerForTests();
+  resetAppInstance();
+  setAppInstance({
+    getConfig: () =>
+      makeResizeConfig({
+        formats: ['webp'],
+        worker: { enabled: true },
+        storage: {
+          driver: 'local',
+          rootDir: join(root, 'public'),
+          publicBaseUrl: '/media',
+        },
+        queue: {
+          driver: 'database',
+          leaseMs: 5000,
+          idlePollMs: 20,
+          lockTtlMs: { dispatch: 60000, worker: 5000 },
+        },
+      }),
+    getModel: (name: string) =>
+      ({ ResizeTask: taskModel, Lock: lockModel, File: fileModel })[name] ??
+      false,
+    logger: { info() {}, warn() {}, error() {} },
+  } as never);
+  try {
+    const resizer = new FrameworkResizer(); // everything from the config file
+    await resizer.verify();
+    const original = await resizer.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    const doc = await fileModel.create({ original, previews: [] });
+    const media = { id: String(doc._id), original, previews: [] };
+    const result = await resizer.prewarm({ media, sizes });
+    assert.equal(result.status, 'accepted');
+
+    const worker = runResizeWorker();
+    try {
+      const until = Date.now() + 20000;
+      while (
+        ((await fileModel.findById(doc._id).lean())?.previews as unknown[])
+          ?.length !== 1
+      ) {
+        assert.ok(Date.now() < until, 'the worker did not store the preview');
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    } finally {
+      process.emit('SIGTERM');
+      await worker;
+    }
+    const stored = await fileModel.findById(doc._id).lean();
+    const [preview] = (stored?.previews ?? []) as Preview[];
+    assert.equal(preview.format, 'webp');
+    assert.equal(
+      resizer.storage.publicUrl(preview.storageRef),
+      `/media/${(preview.storageRef as { path: string }).path}`,
+    );
+    assert.equal(
+      (await readdir(join(root, 'public'), { recursive: true })).length > 0,
+      true,
+    );
+    const task = await taskModel.findOne({}).lean();
+    assert.equal(task?.status, 'completed');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -9,7 +9,7 @@ import defaultFolders from '@adaptivestone/framework/folderConfig.js';
 import { resetAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
 import Server from '@adaptivestone/framework/server.js';
 import { getResizeConfig } from '../framework/config.ts';
-import { runScaffold } from '../scaffold/command.ts';
+import { runScaffold } from '../framework/scaffold/command.ts';
 
 let root: string | undefined;
 let previousEnv: string | undefined;

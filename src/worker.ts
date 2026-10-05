@@ -33,6 +33,7 @@ export async function processTask(
   tasks?: TaskQueue, // the delivering queue; default: the Resizer's own
 ): Promise<void> {
   const resizer = getResizer(task.resizer);
+  await resizer.ready();
   return processTaskWith(resizer, task, taskOpts, tasks ?? resizer.tasks);
 }
 
@@ -55,6 +56,8 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       { code: 'RESIZE_NO_RESIZER' },
     );
   }
+  // Drivers given as functions load now, so each Resizer's task queue is known.
+  await Promise.all(resizers.map((resizer) => resizer.ready()));
   const queues = new Set<TaskQueue>();
   for (const resizer of resizers) {
     if (resizer.tasks) {

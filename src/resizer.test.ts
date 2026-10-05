@@ -6,7 +6,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { FrameworkDatabase } from './framework/database.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
+import { FrameworkResizer } from './framework/resizer.ts';
 import {
   getResizer,
   listResizers,
@@ -24,7 +24,7 @@ import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
 // Fakes. The Resizer stores passed driver references verbatim (identity checks);
-// createFrameworkResizer fills omitted parts with framework-driver instances (instanceof
+// FrameworkResizer fills omitted parts with framework-driver instances (instanceof
 // checks) and takes the logger/events from the recording fake app installed here.
 // ---------------------------------------------------------------------------
 
@@ -85,12 +85,12 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('createFrameworkResizer fills the database; locks stay on the database', () => {
-    const eager = createFrameworkResizer(baseOpts());
+  test('FrameworkResizer fills the database; locks stay on the database', () => {
+    const eager = new FrameworkResizer(baseOpts());
     assert.ok(eager.db instanceof FrameworkDatabase);
     resetResizerForTests();
     const tasks = new MemoryTaskQueue();
-    const queued = createFrameworkResizer({ ...baseOpts(), tasks });
+    const queued = new FrameworkResizer({ ...baseOpts(), tasks });
     assert.ok(queued.db instanceof FrameworkDatabase);
     assert.equal(queued.tasks, tasks);
     // the passed queue is used, not the database's own
@@ -101,7 +101,7 @@ describe('Resizer constructor — driver wiring', () => {
     const storage = fakeStorage();
     const tasks = new MemoryTaskQueue();
     const db = fakeDb();
-    const r = createFrameworkResizer({
+    const r = new FrameworkResizer({
       storage,
       tasks,
       db,
@@ -111,15 +111,25 @@ describe('Resizer constructor — driver wiring', () => {
     assert.equal(r.db, db);
   });
 
-  test('task queue is undefined when omitted (eager-only host)', () => {
-    const r = createFrameworkResizer(baseOpts());
+  test('task queue is undefined when the config has no queue (eager-only host)', async () => {
+    const r = new FrameworkResizer(baseOpts());
+    await r.ready();
     assert.equal(r.tasks, undefined);
+    assert.equal(
+      new Resizer({ ...baseOpts(), name: 'core', db: fakeDb() }).tasks,
+      undefined,
+    );
   });
 
-  test('throws a named error when storage is missing (JS host / half-filled scaffold)', () => {
-    // A JS host or half-filled scaffold could omit the required `storage` — fail loudly at
-    // construction with a NAMED error, not a downstream TypeError (02 · §6 review fix).
-    assert.throws(() => createFrameworkResizer({} as never), /storage/);
+  test('throws a named error when storage is missing (JS host / half-filled wiring)', () => {
+    // A JS host could omit the required `storage` — fail loudly at construction with a NAMED
+    // error, not a downstream TypeError (02 · §6 review fix).
+    assert.throws(
+      () => new Resizer({ db: fakeDb() } as never),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_STORAGE_REQUIRED',
+    );
     // The bad construction must NOT have claimed the active slot.
     assert.throws(() => getResizer(), /no Resizer named 'default'/);
   });
@@ -141,7 +151,7 @@ describe('Resizer constructor — driver wiring', () => {
   test('a framework Resizer reads its config file lazily; verify() reports a bad one', async () => {
     // Constructed before any framework app exists: nothing is read yet.
     resetAppInstance();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     setAppInstance({
       getConfig: () => ({ mediaModelName: 'File', upload: null }),
       getModel: () => ({}),
@@ -152,7 +162,7 @@ describe('Resizer constructor — driver wiring', () => {
 
   test('a framework Resizer built before the app works once the app exists', () => {
     resetAppInstance();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     setAppInstance({
       getConfig: () => makeResizeConfig({ formats: ['webp'] }),
       getModel: () => ({}),
@@ -172,12 +182,12 @@ describe('Resizer constructor — driver wiring', () => {
       },
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    const photos = createFrameworkResizer({
+    const photos = new FrameworkResizer({
       ...baseOpts(),
       name: 'photos',
       config: makeResizeConfig({ mediaModelName: 'Photo' }),
     });
-    const files = createFrameworkResizer(baseOpts());
+    const files = new FrameworkResizer(baseOpts());
     await photos.db.loadMedia('m1');
     await files.db.loadMedia('m2');
     assert.deepEqual(asked, ['Photo', 'File']);
@@ -185,13 +195,13 @@ describe('Resizer constructor — driver wiring', () => {
 
   test('seeds pipelines from options', () => {
     const photo: Pipeline = { beforeSteps: [] };
-    const r = createFrameworkResizer({ ...baseOpts(), pipelines: { photo } });
+    const r = new FrameworkResizer({ ...baseOpts(), pipelines: { photo } });
     assert.equal(r.getPipeline('photo'), photo);
   });
 
   test('seeds hooks from options — single fn form threads through runWaterfall', async () => {
     installFakeApp();
-    const r = createFrameworkResizer({
+    const r = new FrameworkResizer({
       ...baseOpts(),
       hooks: { resolveSizes: (v: number) => v + 1 },
     });
@@ -200,7 +210,7 @@ describe('Resizer constructor — driver wiring', () => {
 
   test('seeds hooks from options — array form runs every tap in order', async () => {
     installFakeApp();
-    const r = createFrameworkResizer({
+    const r = new FrameworkResizer({
       ...baseOpts(),
       hooks: {
         resolveSizes: [(v: number) => v + 1, async (v: number) => v * 2],
@@ -214,11 +224,140 @@ describe('Resizer constructor — driver wiring', () => {
 // Named registry: several Resizers per process, one per name
 // ---------------------------------------------------------------------------
 
+describe('drivers given as functions', () => {
+  const silent = { info() {}, warn() {}, error() {} };
+
+  test('are called once, on first use, sync or async — even under concurrent calls', async () => {
+    const storage = fakeStorage();
+    const db = fakeDb();
+    const tasks = new MemoryTaskQueue();
+    const calls: string[] = [];
+    const r = new Resizer({
+      logger: silent,
+      storage: () => {
+        calls.push('storage');
+        return storage;
+      },
+      db: async () => {
+        calls.push('db');
+        return db;
+      },
+      tasks: async () => {
+        calls.push('tasks');
+        return tasks;
+      },
+    });
+    assert.deepEqual(calls, []);
+    for (const part of ['storage', 'db', 'tasks'] as const) {
+      assert.throws(
+        () => r[part],
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_NOT_READY' &&
+          err.message.includes(part),
+      );
+    }
+    await Promise.all([r.ready(), r.ready(), r.verify()]);
+    assert.deepEqual(calls.sort(), ['db', 'storage', 'tasks']);
+    assert.equal(r.storage, storage);
+    assert.equal(r.db, db);
+    assert.equal(r.tasks, tasks);
+    await r.ready();
+    assert.equal(calls.length, 3);
+  });
+
+  test('a part given as an object is usable while another is still loading', () => {
+    const db = fakeDb();
+    const r = new Resizer({
+      logger: silent,
+      storage: async () => fakeStorage(),
+      db,
+    });
+    assert.equal(r.db, db);
+    assert.equal(r.tasks, undefined); // not given: eager only, nothing to wait for
+    assert.throws(() => r.storage, /has not loaded `storage`/);
+  });
+
+  test('a failed load rejects, and the next call tries again', async () => {
+    let attempts = 0;
+    const storage = fakeStorage();
+    const r = new Resizer({
+      logger: silent,
+      db: fakeDb(),
+      storage: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error('optional peer missing');
+        }
+        return storage;
+      },
+    });
+    await assert.rejects(() => r.verify(), /optional peer missing/);
+    await r.ready();
+    assert.equal(attempts, 2);
+    assert.equal(r.storage, storage);
+  });
+
+  test('a loader that returns nothing for a required part is a setup error', async () => {
+    const noStorage = new Resizer({
+      name: 'a',
+      logger: silent,
+      storage: () => undefined as never,
+      db: fakeDb(),
+    });
+    await assert.rejects(
+      () => noStorage.ready(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_STORAGE_REQUIRED',
+    );
+    const noDb = new Resizer({
+      name: 'b',
+      logger: silent,
+      storage: fakeStorage(),
+      db: async () => null as never,
+    });
+    await assert.rejects(
+      () => noDb.ready(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_DATABASE_REQUIRED',
+    );
+  });
+
+  test('resolve() and prewarm() never throw when loading fails; generate() rejects', async () => {
+    const errors: unknown[][] = [];
+    const r = new Resizer({
+      logger: { ...silent, error: (...args: unknown[]) => errors.push(args) },
+      db: fakeDb(),
+      storage: async () => {
+        throw new ResizeConfigError('no storage configured', {
+          code: 'TEST_NO_STORAGE',
+        });
+      },
+    });
+    const media = { id: 'm1', original: { storageRef: { key: 'k' } } };
+    const sizes = [{ width: 10, height: 10 }];
+    const { decision, output } = await r.resolve({ media, sizes });
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(output, undefined);
+    const result = await r.prewarm({ media, sizes });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.issues[0].retryable, false);
+    assert.ok(errors.length >= 2);
+    await assert.rejects(
+      () => r.generate({ media, sizes }),
+      (err: unknown) =>
+        err instanceof ResizeConfigError && err.code === 'TEST_NO_STORAGE',
+    );
+  });
+});
+
 describe('Resizer registry', () => {
   test('a second Resizer with the same name throws a clear error', () => {
-    createFrameworkResizer(baseOpts());
+    new FrameworkResizer(baseOpts());
     assert.throws(
-      () => createFrameworkResizer(baseOpts()),
+      () => new FrameworkResizer(baseOpts()),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_DUPLICATE_RESIZER' &&
@@ -227,8 +366,8 @@ describe('Resizer registry', () => {
   });
 
   test('Resizers with different names coexist and are found by name', () => {
-    const media = createFrameworkResizer(baseOpts());
-    const listings = createFrameworkResizer({
+    const media = new FrameworkResizer(baseOpts());
+    const listings = new FrameworkResizer({
       ...baseOpts(),
       name: 'listings',
     });
@@ -240,11 +379,11 @@ describe('Resizer registry', () => {
   });
 
   test('each Resizer keeps its own config', () => {
-    const a = createFrameworkResizer({
+    const a = new FrameworkResizer({
       ...baseOpts(),
       config: makeResizeConfig({ formats: ['webp'] }),
     });
-    const b = createFrameworkResizer({
+    const b = new FrameworkResizer({
       ...baseOpts(),
       name: 'b',
       config: makeResizeConfig({ formats: ['jpeg'] }),
@@ -254,7 +393,7 @@ describe('Resizer registry', () => {
   });
 
   test('getResizer() names the missing Resizer', () => {
-    createFrameworkResizer({ ...baseOpts(), name: 'listings' });
+    new FrameworkResizer({ ...baseOpts(), name: 'listings' });
     assert.throws(
       () => getResizer(),
       (err: unknown) =>
@@ -267,18 +406,18 @@ describe('Resizer registry', () => {
   test('an invalid config throws at construction and does not claim the name', () => {
     assert.throws(
       () =>
-        createFrameworkResizer({
+        new FrameworkResizer({
           ...baseOpts(),
           config: { mediaModelName: 'File' } as never,
         }),
       (err: unknown) => err instanceof ResizeConfigError,
     );
-    assert.doesNotThrow(() => createFrameworkResizer(baseOpts()));
+    assert.doesNotThrow(() => new FrameworkResizer(baseOpts()));
   });
 
   test('a named Resizer may have a task queue', () => {
     const tasks = new MemoryTaskQueue();
-    const listings = createFrameworkResizer({
+    const listings = new FrameworkResizer({
       ...baseOpts(),
       name: 'listings',
       tasks,
@@ -287,8 +426,8 @@ describe('Resizer registry', () => {
   });
 
   test('queue defaults to "default" and can be set per Resizer', () => {
-    const media = createFrameworkResizer(baseOpts());
-    const bulk = createFrameworkResizer({
+    const media = new FrameworkResizer(baseOpts());
+    const bulk = new FrameworkResizer({
       ...baseOpts(),
       name: 'bulk',
       queue: 'bulk',
@@ -299,15 +438,15 @@ describe('Resizer registry', () => {
 
   test('an empty queue name is rejected', () => {
     assert.throws(
-      () => createFrameworkResizer({ ...baseOpts(), queue: '' }),
+      () => new FrameworkResizer({ ...baseOpts(), queue: '' }),
       (err: unknown) =>
         err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_INVALID',
     );
   });
 
   test('listResizers() returns every registered Resizer in construction order', () => {
-    const a = createFrameworkResizer(baseOpts());
-    const b = createFrameworkResizer({ ...baseOpts(), name: 'b' });
+    const a = new FrameworkResizer(baseOpts());
+    const b = new FrameworkResizer({ ...baseOpts(), name: 'b' });
     assert.deepEqual(listResizers(), [a, b]);
     resetResizerForTests();
     assert.deepEqual(listResizers(), []);
@@ -315,7 +454,7 @@ describe('Resizer registry', () => {
 
   test('an empty name is rejected', () => {
     assert.throws(
-      () => createFrameworkResizer({ ...baseOpts(), name: '' }),
+      () => new FrameworkResizer({ ...baseOpts(), name: '' }),
       (err: unknown) =>
         err instanceof ResizeSetupError && err.code === 'RESIZE_NAME_INVALID',
     );
@@ -352,10 +491,10 @@ describe('Resizer registry', () => {
   });
 
   test('resetResizerForTests() forgets every Resizer', () => {
-    const first = createFrameworkResizer(baseOpts());
-    createFrameworkResizer({ ...baseOpts(), name: 'listings' });
+    const first = new FrameworkResizer(baseOpts());
+    new FrameworkResizer({ ...baseOpts(), name: 'listings' });
     resetResizerForTests();
-    const second = createFrameworkResizer(baseOpts());
+    const second = new FrameworkResizer(baseOpts());
     assert.notEqual(first, second);
     assert.equal(getResizer(), second);
     assert.throws(() => getResizer('listings'), /no Resizer named 'listings'/);
@@ -368,14 +507,14 @@ describe('Resizer registry', () => {
 
 describe('named pipelines', () => {
   test('a registered pipeline is retrievable', () => {
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const p: Pipeline = { beforeSteps: [] };
     r.registerPipeline('photo', p);
     assert.equal(r.getPipeline('photo'), p);
   });
 
   test('re-registering a name replaces it (last-wins)', () => {
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const p1: Pipeline = { beforeSteps: [] };
     const p2: Pipeline = { variantSteps: [] };
     r.registerPipeline('photo', p1);
@@ -384,7 +523,7 @@ describe('named pipelines', () => {
   });
 
   test('unknown name → structurally empty pipeline {}, and frozen', () => {
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const empty = r.getPipeline('nope');
     assert.deepEqual(empty, {});
     assert.equal(Object.isFrozen(empty), true);
@@ -398,7 +537,7 @@ describe('named pipelines', () => {
 describe('runWaterfall', () => {
   test('threads the value through taps in registration order', async () => {
     installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     r.hook('resolveSizes', (v: number) => v + 1);
     r.hook('resolveSizes', async (v: number) => v * 2);
     const out = await r.runWaterfall('resolveSizes', 1, {});
@@ -407,7 +546,7 @@ describe('runWaterfall', () => {
 
   test('threads ctx to each tap', async () => {
     installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const ctx = { entity: 'event' };
     let seen: unknown;
     r.hook('beforeEnqueue', (v: unknown, c: unknown) => {
@@ -420,7 +559,7 @@ describe('runWaterfall', () => {
 
   test('a throwing tap is logged and skipped (prior value kept); later taps still run', async () => {
     const { errors } = installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     r.hook('resolveSizes', (v: number) => v + 1);
     r.hook('resolveSizes', () => {
       throw new Error('boom');
@@ -434,7 +573,7 @@ describe('runWaterfall', () => {
 
   test('with no taps returns the input unchanged', async () => {
     installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const value = { a: 1 };
     assert.equal(await r.runWaterfall('formatPublicUrls', value, {}), value);
   });
@@ -447,7 +586,7 @@ describe('runWaterfall', () => {
 describe('runObservers', () => {
   test('awaits every tap in registration order', async () => {
     installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const order: number[] = [];
     r.hook('afterTaskComplete', async () => {
       await Promise.resolve();
@@ -462,7 +601,7 @@ describe('runObservers', () => {
 
   test('a throwing tap is logged and does not stop later taps', async () => {
     const { errors } = installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const seen: string[] = [];
     r.hook('onTaskFailed', () => {
       throw new Error('boom');
@@ -478,7 +617,7 @@ describe('runObservers', () => {
 
   test('mirrors onto app.events as resize:<name> BEFORE the taps run', async () => {
     const { emitted } = installFakeApp({ withEvents: true });
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     let emittedLenWhenTapRan = -1;
     r.hook('onPreviewGenerated', () => {
       emittedLenWhenTapRan = emitted.length;
@@ -494,7 +633,7 @@ describe('runObservers', () => {
 
   test('a missing app.events is fine — taps still run', async () => {
     installFakeApp(); // no events
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const seen: string[] = [];
     r.hook('afterTaskComplete', () => {
       seen.push('ran');
@@ -505,7 +644,7 @@ describe('runObservers', () => {
 
   test('a THROWING app.events.emit is caught (logged) and taps still run', async () => {
     const { errors } = installFakeApp({ withEvents: true, emitThrows: true });
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const seen: string[] = [];
     r.hook('onTaskDeadLettered', () => {
       seen.push('ran');
@@ -527,7 +666,7 @@ describe('typed hooks', () => {
   test('a correctly-typed constructor hook + late .hook() both run through the bus', async () => {
     installFakeApp();
     const injected: SizeInput = { width: 10, height: 10 };
-    const r = createFrameworkResizer({
+    const r = new FrameworkResizer({
       ...baseOpts(),
       hooks: {
         resolveSizes: (sizes: SizeInput[]) => [...sizes, injected],
@@ -557,7 +696,7 @@ describe('typed hooks', () => {
 describe('resolve/generate stubs', () => {
   test('resolve delegates to the engine (no longer a stub)', async () => {
     installFakeApp();
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const { decision, output } = await r.resolve({
       media: {},
       sizes: [],
@@ -575,7 +714,7 @@ describe('resolve/generate stubs', () => {
       getModel: () => ({}),
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    const r = createFrameworkResizer(baseOpts());
+    const r = new FrameworkResizer(baseOpts());
     const result = await r.generate({
       media: {
         id: 'm1',

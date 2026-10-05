@@ -53,7 +53,16 @@ export abstract class TaskQueue {
   /**
    * Atomically claim the oldest due task of `queue` for `leaseMs`: a waiting task whose retry time
    * has passed, or a task whose previous lease expired. Increments `attempts` and returns a new
-   * `token`, or `null` when nothing is due. May wait (long poll) until `signal` aborts.
+   * `token`, or `null` when nothing is due.
+   *
+   * This is how a worker receives tasks; how the queue finds them is its own business. It may
+   * return at once (the core then waits until idlePollMs has passed since the call) or wait for a
+   * task first — a long poll, LISTEN/NOTIFY, a change stream. A waiting claim must:
+   * - return (null) or throw promptly once `signal` aborts;
+   * - claim only when called, never ahead: a prefetched task's lease would run out with no
+   *   heartbeat for it;
+   * - treat a notification as a hint to try the atomic claim, not as ownership: several workers
+   *   may wake for one task, and only one claim wins.
    */
   abstract claim(
     queue: string,

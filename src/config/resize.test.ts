@@ -40,21 +40,30 @@ describe('getResizeConfig', () => {
       'gif',
       'svg',
     ]);
-    // The core config holds image settings only; the framework defaults add queue and worker.
+    // The core config holds image settings only; the framework defaults add the worker section.
+    // Storage and the queue are the host's choice: no defaults (no queue = eager only).
     assert.equal('queue' in defaultResizeConfig, false);
     assert.equal('worker' in defaultResizeConfig, false);
     assert.equal(defaultResizeConfig.concurrency, 4);
     assert.equal(defaultFrameworkResizeConfig.worker.enabled, false);
-    assert.equal(defaultFrameworkResizeConfig.queue, defaultQueueOptions);
+    assert.equal('queue' in defaultFrameworkResizeConfig, false);
+    assert.equal('storage' in defaultFrameworkResizeConfig, false);
   });
 
   test('returns the final framework config without merging another defaults object', () => {
-    const config = makeResizeConfig({ formats: ['webp'] });
+    const config = makeResizeConfig({
+      formats: ['webp'],
+      storage: { driver: 'local', rootDir: './m', publicBaseUrl: '/m' },
+      queue: { driver: 'database', maxAttempts: 3 },
+    });
     install(config);
     const resolved = getResizeConfig();
     assert.strictEqual(getResizeConfig(), resolved);
     assert.strictEqual(resolved.image.formats, config.formats);
+    assert.strictEqual(resolved.storage, config.storage);
     assert.strictEqual(resolved.queue, config.queue);
+    assert.equal(resolved.timing.maxAttempts, 3);
+    assert.equal(resolved.timing.leaseMs, defaultQueueOptions.leaseMs);
     assert.deepEqual(resolved.image.formats, ['webp']);
   });
 
@@ -226,11 +235,30 @@ describe('config split: core validation vs framework loading', () => {
     }
   });
 
-  test('a framework config file may omit queue and worker; the defaults apply', () => {
-    const { queue: _q, worker: _w, ...file } = makeResizeConfig();
+  test('a framework config file may omit storage, queue and worker; the defaults apply', () => {
+    const { worker: _w, ...file } = makeResizeConfig();
     install(file);
-    assert.strictEqual(getResizeConfig().queue, defaultQueueOptions);
+    assert.equal(getResizeConfig().storage, undefined);
+    assert.equal(getResizeConfig().queue, false); // eager only
+    assert.deepEqual(getResizeConfig().timing, defaultQueueOptions);
     assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
+  });
+
+  test('queue: false is eager only, and invalid queue timing is a config error', () => {
+    install(makeResizeConfig({ queue: false }));
+    assert.equal(getResizeConfig().queue, false);
+    resetAppInstance();
+    install(
+      makeResizeConfig({
+        queue: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 5000 } },
+      }),
+    );
+    assert.throws(
+      () => getResizeConfig(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+    );
   });
 
   test('sees app.updateConfig()-style changes to the same config object', () => {

@@ -2,7 +2,7 @@
 // exported from the main entry.
 //
 // Contract (UNCHANGED): resolve after `ms` ms, OR resolve EARLY the moment `signal` aborts —
-// including a signal that is already aborted on entry. Callers (the mongo idle-poll loop) treat
+// including a signal that is already aborted on entry. Callers (the worker's idle-poll loop) treat
 // abort as "wake early", not an error, so this MUST resolve, never reject, on abort.
 //
 // That resolve-on-abort semantic is the whole reason this wrapper still exists: node:timers/promises

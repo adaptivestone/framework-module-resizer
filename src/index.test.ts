@@ -58,7 +58,7 @@ const DRIVER_NAMES = [
   'ResizeTaskModel',
   'ResizeWorker',
   'runResizeWorker',
-  'createFrameworkResizer',
+  'FrameworkResizer',
 ];
 
 const asRecord = api as unknown as Record<string, unknown>;

@@ -75,6 +75,7 @@ export async function resolveImpl(
   const decision: ReadDecision = { ready, missing: [] };
 
   try {
+    await resizer.ready(); // drivers given as functions load here, inside the never-throw guard
     const ctx = opts.ctx ?? {};
     const storage = resizer.storage; // required constructor option — always present (§17.3)
     const pipeline = opts.pipeline ?? 'default';
@@ -300,6 +301,7 @@ export async function prewarmImpl(
   opts: PrewarmOpts,
 ): Promise<PrewarmResult> {
   try {
+    await resizer.ready(); // inside the never-throw guard
     return await prewarmStrict(resizer, opts);
   } catch (err) {
     logNeverThrow(

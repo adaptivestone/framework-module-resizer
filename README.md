@@ -53,22 +53,32 @@ import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-re
 export default {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
+  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
 } satisfies FrameworkResizeConfig;
 ```
 
 ```ts
-// src/resizer.ts
-import { createFrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
-import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
+// src/resizer.ts — behaviour only; the drivers come from the config file
+import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
 
-export const resizer = createFrameworkResizer({
-  storage: new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' }),
-});
+export const resizer = new FrameworkResizer({ pipelines: { default: {} } });
 ```
 
-Import `src/resizer.ts` wherever you need it; a normal static import is fine, because nothing is
-read from the framework until first use. To fail at boot on a bad config, call
-`await resizer.verify()` after `await server.init()`.
+`FrameworkResizer` builds every part from the config file on first use: the image settings, the
+storage, the task queue, the database (`FrameworkDatabase`) and the app logger and events. Import
+`src/resizer.ts` wherever you need it; a normal static import is fine. To fail at boot on a bad
+config, call `await resizer.verify()` after `await server.init()`. Switch to S3 per environment
+in `resize.production.ts`:
+
+```ts
+// src/config/resize.production.ts — merged over resize.ts by the framework
+export default {
+  storage: { driver: 's3', bucketPublic: 'cdn', bucketPrivate: 'originals', publicBaseUrl: 'https://cdn.example.com' },
+};
+```
+
+Options win over the config: `new FrameworkResizer({ storage: new S3Storage({ …, client }) })`
+reuses your own S3 client, and `tasks: false` keeps a Resizer eager whatever the config says.
 
 Add `...resizeMediaSchemaFragment` (from the main entry) to your media model's schema, then:
 
@@ -90,7 +100,8 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 **Background generation.** Run `npx resize-scaffold` (without `--eager`) to add the
 `ResizeTask` model and the `ResizeWorker` command, then:
 
-1. Pass `tasks: true` to `createFrameworkResizer` (tasks wait in the `ResizeTask` model).
+1. Set `queue: { driver: 'database' }` in the config (tasks wait in the `ResizeTask` model), or
+   `{ driver: 'sqs', queueUrl }`.
 2. Set `worker.enabled: true` in the config.
 3. Create the indexes through your migration process.
 4. Run `npm run cli ResizeWorker` as a separate process.
@@ -138,7 +149,7 @@ the module never creates them at runtime (`createResizeModels` sets `autoIndex: 
 | `…/drivers/s3.js` | `S3Storage` |
 | `…/drivers/mongo.js` | `mongoDatabase`, `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`, the schemas |
 | `…/drivers/sqs.js` | `SqsTaskQueue` |
-| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` and its section types |
 
 ## Drivers
 
@@ -151,8 +162,10 @@ A `Resizer` takes three parts:
 The core owns the queue logic (the worker loop, lease heartbeat, task timeout, retry with backoff,
 dead-lettering, de-duplication keys and events), so every queue behaves the same; adapters only
 implement atomic operations. Drivers receive no `app` argument; each one uses its own clients.
-`createFrameworkResizer` builds `FrameworkDatabase`: the app's media model, the framework's own
-`Lock` model, and the scaffolded `ResizeTask` model as its queue.
+`FrameworkResizer` builds `FrameworkDatabase`: the app's media model, the framework's own
+`Lock` model, and the scaffolded `ResizeTask` model as its queue. Any part may also be a function
+(sync or async), called once on first use: `new Resizer({ storage: async () => …, db, tasks })`.
+`await resizer.ready()` loads them; the Resizer's own methods and the worker do it for you.
 
 **`LocalFsStorage`**
 
@@ -199,7 +212,7 @@ getModel, timing | getTiming, logger })` take the models directly.
 Credentials come from the AWS provider chain. Retries and dead-lettering are the core's, the same
 as for Mongo (attempts = `ApproximateReceiveCount`), and `onTaskDeadLettered` fires for SQS too. Use
 it with any `db`: media and locks stay in the database. Its timing is its own `timing` option (the
-framework config's `queue` section is for the Mongo queue). A redrive policy on the SQS queue is
+framework config's `queue` section passes its timing). A redrive policy on the SQS queue is
 optional; if you keep one, set its `maxReceiveCount` above `maxAttempts`, so the module
 dead-letters a task first. SQS fences less strictly than Mongo: it accepts a delete with an
 outdated receipt, so a task whose lease ran out can report `completed` and still run again (the
@@ -223,7 +236,11 @@ first holder's late release removes it, and at worst a variant is generated twic
   - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews, requestKey }`; an active task
     with the same `requestKey` may be returned instead.
   - `claim(queue, leaseMs, signal?)` takes the oldest due task (a waiting one whose retry time has
-    passed, or one whose lease expired), increments `attempts` and returns a fencing `token`.
+    passed, or one whose lease expired), increments `attempts` and returns a fencing `token`. It is
+    how a worker receives tasks: it may return `null` at once (the core polls every `idlePollMs`)
+    or wait for a task first (long poll, LISTEN/NOTIFY, a change stream). A waiting claim returns
+    once `signal` aborts, claims only when called (a prefetched task's lease would run out), and
+    treats a notification as a hint, since only one of the woken workers' claims wins.
   - `renew(task, leaseMs)`, `complete(task)`, `fail(task, { retryAt } | 'dead', error)` act only
     while the token still holds (`false` = lease lost).
   - Optionally `findActive({ resizer, mediaId, pipeline })` (lets `prewarm()` confirm work queued by
@@ -253,7 +270,7 @@ created; a config function (the framework adapter passes one) on first use or `v
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
 Queue timing and lock TTLs belong to the **task queue** (`timing` on `MongoTaskQueue`,
-`mongoDatabase` and `SqsTaskQueue`; the framework reads them from the config file's `queue`
+`mongoDatabase` and `SqsTaskQueue`; `FrameworkResizer` reads them from the config file's `queue`
 section). The core validates them on first use or in `verify()`. Their defaults are
 `defaultQueueOptions` in `…/config/resize.js`:
 
@@ -263,26 +280,33 @@ section). The core validates them on first use or in `verify()`. Their defaults 
 | `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
 | `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
-| `idlePollMs` | `1000` | Sleep after an empty poll |
+| `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. Claim errors back off from it up to 10× |
 | `taskTimeoutMs` | `600000` | A longer task is failed |
 
 Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
 `concurrency × sharp.concurrency ≈ CPU cores`.
 
 **Framework config file.** `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
-`…/config/resize.js` and adds `mediaModelName`. The framework merges `resize.<NODE_ENV>.ts` over
-it (objects merge field by field, arrays are replaced); the module does not merge again. Only the
-adapter reads the extra keys:
+`…/config/resize.js` and adds `mediaModelName`, `storage` and `queue`. The framework merges
+`resize.<NODE_ENV>.ts` over it (objects merge field by field, arrays are replaced); the module
+does not merge again. Only `FrameworkResizer` reads the extra keys:
 - `mediaModelName` (required): the host media model, used by `FrameworkDatabase`.
-- `queue`: the queue timing above, used by `FrameworkDatabase`'s task queue.
+- `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or `{ driver: 's3',
+  bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?, forcePathStyle? }`. Required
+  unless the code passes `storage`. S3 is imported only when selected; credentials come from the
+  AWS SDK's default chain. Switching the driver in an environment file keeps the other keys of
+  the merged section, so set `publicBaseUrl` there too.
+- `queue`: `{ driver: 'database' }` (the database's own queue: the `ResizeTask` model; the
+  default driver) or `{ driver: 'sqs', queueUrl, queues?, deadLetterQueueUrl?, waitTimeSeconds?,
+  region?, endpoint? }`, plus any of the timing options above (the rest default). Missing or
+  `false`: eager only.
 - `worker`: `{ enabled: false, sharpConcurrency: 1, sharpCache: false }`, used by the
   `ResizeWorker` command. `enabled` allows the command to run.
 
-`queue` and `worker` may be omitted (the defaults apply), but a section that is present must be
-complete. A second Resizer can read its own file with
-`createFrameworkResizer({ configName: 'resizeListings', … })`.
+A second Resizer can read its own file with
+`new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`.
 
-Buckets, URLs and queue URLs are not config; they are driver options. The 0.2.x keys
+Without the framework, buckets, URLs and queue URLs are driver options. The 0.2.x keys
 `webpAvifOnly`, `encode.quality`, `encode.effort`, `encode.mozjpeg`, `encode.chromaSubsampling`
 and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do `queue` and
 `worker` in a core config.

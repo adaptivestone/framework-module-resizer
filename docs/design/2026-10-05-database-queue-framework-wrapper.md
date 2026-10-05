@@ -118,7 +118,7 @@ export default {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  queue: { driver: 'mongo' },             // or { driver: 'sqs', queueUrl, … } or false (eager only)
+  queue: { driver: 'database' },          // or { driver: 'sqs', queueUrl, … } or false (eager only)
   worker: { enabled: false },
 } satisfies FrameworkResizeConfig;
 

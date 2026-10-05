@@ -7,14 +7,14 @@ import {
 import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import type { ResizeStorage } from './contracts/storage.ts';
-import { buildRequestKey } from './enqueue.ts';
-import { FrameworkDatabase } from './framework/database.ts';
-import ResizeTaskModel from './framework/ResizeTaskModel.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
-import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
-import { resetResizerForTests } from './resizer.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import type { ResizeStorage } from '../contracts/storage.ts';
+import { buildRequestKey } from '../enqueue.ts';
+import { DEFAULT_SCOPE, getPreviewIdentity } from '../images.ts';
+import { resetResizerForTests } from '../resizer.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import { FrameworkDatabase } from './database.ts';
+import ResizeTaskModel from './ResizeTaskModel.ts';
+import { FrameworkResizer } from './resizer.ts';
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -238,10 +238,10 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       true,
     );
 
-    const resizer = createFrameworkResizer({
+    const resizer = new FrameworkResizer({
       storage,
       db: fixture.db,
-      tasks: true,
+      tasks: fixture.db.tasks,
     });
     const result = await resizer.prewarm({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },

@@ -233,11 +233,53 @@ export interface FrameworkWorkerConfig {
   sharpCache: boolean; // default false — sharp.cache()
 }
 
+// Where a FrameworkResizer keeps files: the config file's `storage` section. Credentials are not
+// config: the AWS SDK reads them from its default provider chain.
+export interface FrameworkLocalStorageConfig {
+  driver: 'local'; // LocalFsStorage
+  rootDir: string; // public previews; serve only this directory
+  publicBaseUrl: string; // URL prefix, e.g. '/media'
+  privateRootDir?: string; // private originals; default rootDir + '-private'
+}
+export interface FrameworkS3StorageConfig {
+  driver: 's3'; // S3Storage (needs @aws-sdk/client-s3 and @aws-sdk/s3-request-presigner)
+  bucketPublic: string; // previews
+  bucketPrivate?: string; // originals; must differ from bucketPublic
+  publicBaseUrl?: string; // CDN/base URL
+  region?: string;
+  endpoint?: string; // S3-compatible: MinIO / localstack / R2
+  forcePathStyle?: boolean;
+}
+export type FrameworkStorageConfig =
+  | FrameworkLocalStorageConfig
+  | FrameworkS3StorageConfig;
+
+// Where a FrameworkResizer's tasks wait: the config file's `queue` section, with the queue's
+// timing (any QueueTimingOptions key; the rest default).
+export interface FrameworkDatabaseQueueConfig
+  extends Partial<QueueTimingOptions> {
+  driver?: 'database'; // the database's own queue: the ResizeTask model (default driver)
+}
+export interface FrameworkSqsQueueConfig extends Partial<QueueTimingOptions> {
+  driver: 'sqs'; // SqsTaskQueue (needs @aws-sdk/client-sqs)
+  queueUrl: string; // the 'default' queue
+  queues?: Record<string, string>; // other named queues → URLs
+  deadLetterQueueUrl?: string;
+  waitTimeSeconds?: number; // long poll per claim; default 10
+  region?: string;
+  endpoint?: string;
+}
+export type FrameworkQueueConfig =
+  | FrameworkDatabaseQueueConfig
+  | FrameworkSqsQueueConfig;
+
 // The config file a framework host writes (`src/config/resize.ts`, or another file per Resizer).
-// The image settings go to the Resizer; the framework adapter reads the rest: the media model,
-// the task queue's timing (`queue`) and the worker command's settings (`worker`).
+// The image settings go to the Resizer; FrameworkResizer builds the rest: the media model, the
+// storage, the task queue and the worker command's settings. resize.<NODE_ENV>.ts overrides any
+// of them per environment.
 export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
-  queue?: QueueTimingOptions; // default: defaultQueueOptions (a present section must be complete)
+  storage?: FrameworkStorageConfig; // required unless the code passes `storage`
+  queue?: FrameworkQueueConfig | false; // missing or false: eager only (no task queue)
   worker?: FrameworkWorkerConfig; // default: defaultWorkerOptions
 }

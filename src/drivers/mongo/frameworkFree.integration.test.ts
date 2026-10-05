@@ -7,15 +7,15 @@ import { resetAppInstance } from '@adaptivestone/framework/helpers/appInstance.j
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
-import defaultResizeConfig from './config/resize.ts';
-import type { ResizeDatabase } from './contracts/database.ts';
-import type { ResizeStorage } from './contracts/storage.ts';
-import { mongoDatabase } from './drivers/mongo/index.ts';
-import { Resizer, resetResizerForTests } from './index.ts';
-import { resizeMediaSchemaFragment } from './mediaFragment.ts';
-import { fakeDb } from './testHelpers/fakes.ts';
-import type { MediaLike, Preview } from './types.d.ts';
-import { runWorker } from './worker.ts';
+import defaultResizeConfig from '../../config/resize.ts';
+import type { ResizeDatabase } from '../../contracts/database.ts';
+import type { ResizeStorage } from '../../contracts/storage.ts';
+import { Resizer, resetResizerForTests } from '../../index.ts';
+import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
+import { fakeDb } from '../../testHelpers/fakes.ts';
+import type { MediaLike, Preview } from '../../types.d.ts';
+import { runWorker } from '../../worker.ts';
+import { mongoDatabase } from './index.ts';
 
 const png = await sharp({
   create: { width: 64, height: 48, channels: 3, background: '#3366cc' },

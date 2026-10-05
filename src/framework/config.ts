@@ -1,12 +1,16 @@
 // Loads a Resizer's config file from the framework app. Each Resizer may read its own file
 // (`configName`, default 'resize'); the framework has already merged resize.<NODE_ENV>.ts over it.
 // The file holds the image settings (passed to the Resizer) plus what only this adapter reads:
-// `mediaModelName`, `queue` (the task queue's timing) and `worker` (the worker command).
-import { defaultQueueOptions, defaultWorkerOptions } from '../config/resize.ts';
+// `mediaModelName`, `storage`, `queue` (the task queue and its timing) and `worker` (the worker
+// command).
+import { defaultWorkerOptions } from '../config/resize.ts';
 import { ResizeConfigError } from '../errors.ts';
-import { validateQueueTiming, validateResizeConfig } from '../resizeConfig.ts';
+import { fillTiming } from '../queue.ts';
+import { validateResizeConfig } from '../resizeConfig.ts';
 import type {
+  FrameworkQueueConfig,
   FrameworkResizeConfig,
+  FrameworkStorageConfig,
   FrameworkWorkerConfig,
   QueueTimingOptions,
   ResizeConfig,
@@ -17,9 +21,14 @@ import { getApp } from './app.ts';
 export interface ResolvedFrameworkConfig {
   image: ResizeConfig; // the Resizer's config
   mediaModelName: string;
-  queue: QueueTimingOptions; // the file's `queue`, or the defaults
+  storage: FrameworkStorageConfig | undefined; // the file's `storage`, if any
+  queue: FrameworkQueueConfig | false; // the file's `queue`; false when missing (eager only)
+  timing: QueueTimingOptions; // the queue's timing, with the defaults filled in
   worker: FrameworkWorkerConfig; // the file's `worker`, or the defaults
 }
+
+const STORAGE_DRIVERS = ['local', 's3'];
+const QUEUE_DRIVERS = [undefined, 'database', 'sqs'];
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -61,7 +70,7 @@ export function resolveFrameworkConfig(
       { code: 'RESIZE_CONFIG_INVALID' },
     );
   }
-  const { mediaModelName, queue, worker, ...image } = raw;
+  const { mediaModelName, storage, queue, worker, ...image } = raw;
   if (
     typeof mediaModelName !== 'string' ||
     mediaModelName.trim().length === 0
@@ -71,8 +80,37 @@ export function resolveFrameworkConfig(
       { code: 'RESIZE_CONFIG_MEDIA_MODEL_MISSING' },
     );
   }
-  const queueOptions = queue ?? defaultQueueOptions;
-  validateQueueTiming(queueOptions);
+  const file = `src/config/${configName}.ts`;
+  if (
+    storage !== undefined &&
+    !(isRecord(storage) && STORAGE_DRIVERS.includes(storage.driver as string))
+  ) {
+    throw new ResizeConfigError(
+      `resize config: \`storage\` in ${file} needs driver 'local' or 's3'`,
+      { code: 'RESIZE_CONFIG_INVALID' },
+    );
+  }
+  if (
+    queue !== undefined &&
+    queue !== false &&
+    !(isRecord(queue) && QUEUE_DRIVERS.includes(queue.driver as string))
+  ) {
+    throw new ResizeConfigError(
+      `resize config: \`queue\` in ${file} must be false or have driver 'database' or 'sqs'`,
+      { code: 'RESIZE_CONFIG_INVALID' },
+    );
+  }
+  if (
+    isRecord(queue) &&
+    queue.driver === 'sqs' &&
+    (typeof queue.queueUrl !== 'string' || queue.queueUrl.length === 0)
+  ) {
+    throw new ResizeConfigError(
+      `resize config: \`queue.queueUrl\` in ${file} is required for the 'sqs' driver`,
+      { code: 'RESIZE_CONFIG_INVALID' },
+    );
+  }
+  const timing = fillTiming(isRecord(queue) ? queue : {});
   const workerOptions = worker ?? defaultWorkerOptions;
   if (
     !isRecord(workerOptions) ||
@@ -83,14 +121,16 @@ export function resolveFrameworkConfig(
     workerOptions.sharpConcurrency <= 0
   ) {
     throw new ResizeConfigError(
-      `resize config: \`worker\` in src/config/${configName}.ts needs enabled (boolean), sharpConcurrency (positive integer) and sharpCache (boolean)`,
+      `resize config: \`worker\` in ${file} needs enabled (boolean), sharpConcurrency (positive integer) and sharpCache (boolean)`,
       { code: 'RESIZE_CONFIG_INVALID' },
     );
   }
   const result: ResolvedFrameworkConfig = {
     image: validateResizeConfig(image),
     mediaModelName,
-    queue: queueOptions,
+    storage: storage as FrameworkStorageConfig | undefined,
+    queue: isRecord(queue) ? (queue as unknown as FrameworkQueueConfig) : false,
+    timing,
     worker: workerOptions as unknown as FrameworkWorkerConfig,
   };
   resolved.set(raw, { result, values: new Map(Object.entries(raw)) });

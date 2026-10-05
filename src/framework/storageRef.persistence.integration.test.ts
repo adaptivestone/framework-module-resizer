@@ -11,14 +11,14 @@ import { defaultOptions } from '@adaptivestone/framework/modules/BaseModel.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
-import type { ResizeStorage } from './contracts/storage.ts';
-import { LocalFsStorage } from './drivers/fs.ts';
-import { S3Storage } from './drivers/s3.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
-import { resizeMediaSchemaFragment } from './mediaFragment.ts';
-import { resetResizerForTests } from './resizer.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import type { MediaLike } from './types.d.ts';
+import type { ResizeStorage } from '../contracts/storage.ts';
+import { LocalFsStorage } from '../drivers/fs.ts';
+import { S3Storage } from '../drivers/s3.ts';
+import { resizeMediaSchemaFragment } from '../mediaFragment.ts';
+import { resetResizerForTests } from '../resizer.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import type { MediaLike } from '../types.d.ts';
+import { FrameworkResizer } from './resizer.ts';
 
 let mongo: MongoMemoryServer | undefined;
 let connection: mongoose.Connection | undefined;
@@ -93,7 +93,7 @@ test('refs survive media save/load and fresh-driver preview generation', async (
   for (const [name, createStorage] of Object.entries(factory)) {
     for (const namespace of [undefined, 'products/p1']) {
       resetResizerForTests();
-      const uploader = createFrameworkResizer({ storage: createStorage() });
+      const uploader = new FrameworkResizer({ storage: createStorage() });
       const original = await uploader.uploadOriginal({
         body: bytes,
         visibility: 'private',
@@ -106,7 +106,7 @@ test('refs survive media save/load and fresh-driver preview generation', async (
       assert.deepEqual(loaded.original?.storageRef, original.storageRef);
 
       resetResizerForTests();
-      const worker = createFrameworkResizer({ storage: createStorage() });
+      const worker = new FrameworkResizer({ storage: createStorage() });
       const result = await worker.generate({
         media: loaded,
         sizes: [{ width: 8, height: 8 }],

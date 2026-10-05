@@ -6,7 +6,7 @@
 //   …/drivers/s3.js     S3Storage                      (optional peers: AWS S3 SDK)
 //   …/drivers/mongo.js  mongoDatabase, MongoDatabase, MongoTaskQueue, createResizeModels
 //   …/drivers/sqs.js    SqsTaskQueue                   (optional peer: AWS SQS SDK)
-//   …/framework.js      the framework adapter: createFrameworkResizer, FrameworkDatabase, …
+//   …/framework.js      the framework adapter: FrameworkResizer, FrameworkDatabase, …
 
 // --- driver contracts: abstract classes a custom driver extends (or any object of the same shape) ---
 export { ResizeDatabase } from './contracts/database.ts';
@@ -65,6 +65,7 @@ export type {
   HookFn,
   HookName,
   HookSignatures,
+  LazyPart,
   ObserverName,
   Pipeline,
   ResizerOptions,
