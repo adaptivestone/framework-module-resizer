@@ -126,6 +126,17 @@ describe('MongoMediaStore', () => {
     assert.equal(await store.load(String(new mongoose.Types.ObjectId())), null);
   });
 
+  test('a getter that resolves to no model fails verify() with a setup error', () => {
+    const store = new MongoMediaStore({
+      getModel: () => connection.models.MisspelledMedia,
+    });
+    assert.throws(
+      () => store.verify(),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_MONGO_MODEL_MISSING',
+    );
+  });
+
   test('needs exactly one of model or getModel', () => {
     assert.throws(
       () => new MongoMediaStore({}),

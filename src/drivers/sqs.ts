@@ -27,6 +27,7 @@ import {
   type TaskEvent,
 } from '../contracts/transport.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { validateLockTtlMs } from '../resizeConfig.ts';
 import type { ResizeLogger } from '../types.d.ts';
 
 export interface SqsTransportOptions {
@@ -62,6 +63,9 @@ export class SqsTransport extends QueueTransport {
         'resize sqs transport: `locks` is required (e.g. new MongoLockStore({ model: ResizeLock }) or FrameworkLockStore)',
         { code: 'RESIZE_LOCKS_REQUIRED' },
       );
+    }
+    if (opts.lockTtlMs !== undefined) {
+      validateLockTtlMs(opts.lockTtlMs);
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;

@@ -217,7 +217,19 @@ import {
   LockStore,
   type QueueTransport,
 } from '@adaptivestone/framework-module-resize';
-import { FrameworkLockStore } from '@adaptivestone/framework-module-resize/framework.js';
+import {
+  FrameworkLockStore,
+  type FrameworkResizeConfig,
+} from '@adaptivestone/framework-module-resize/framework.js';
+import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
+
+// The scaffolded config with its commented-out worker line enabled must stay a complete config.
+const hostConfig = {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'File',
+  worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
+} satisfies FrameworkResizeConfig;
+void hostConfig;
 import { MongoTransport } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
 
 class MemoryLocks extends LockStore {

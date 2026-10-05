@@ -32,6 +32,11 @@ const MODEL_MARKERS = [
   'extends ResizeTaskModel',
   '@adaptivestone/framework-module-resize/framework.js',
 ];
+// An ejected model (`--eject`) owns its schema: a full BaseModel subclass.
+const EJECTED_MODEL_MARKERS = [
+  'extends BaseModel',
+  '@adaptivestone/framework/modules/BaseModel.js',
+];
 // The worker command imports the construction site AND re-exports the module's command, so the
 // worker process has the Resizers its tasks name (a bare re-export starts with none).
 const COMMAND_MARKERS = [
@@ -150,8 +155,10 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
     items.push(
       {
         target: MODEL,
-        validate: (c) => MODEL_MARKERS.every((marker) => c.includes(marker)),
-        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework.js — delete it and re-run resize-scaffold',
+        validate: (c) =>
+          MODEL_MARKERS.every((marker) => c.includes(marker)) ||
+          EJECTED_MODEL_MARKERS.every((marker) => c.includes(marker)),
+        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework.js (or be an ejected BaseModel) — re-run resize-scaffold for a fresh shim, or --eject for the full model',
       },
       {
         target: COMMAND,

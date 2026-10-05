@@ -212,6 +212,10 @@ scaffolded model, the app logger and the config's `queue` timing):
 Credentials come from the AWS provider chain. Dead-lettering is native SQS: set the redrive
 policy's `maxReceiveCount` to `queue.maxAttempts`. `onTaskDeadLettered` does not fire for SQS.
 
+Locks only prevent duplicate work; correctness never depends on them. `release(key)` deletes by
+key, as the framework `Lock` model does: if a lock expired and another holder took it over, the
+first holder's late release removes it, and at worst a variant is generated twice.
+
 **`MongoMediaStore`**, **`MongoLockStore`**: `{ model }`, or `{ getModel }` when the model is
 registered later. The media model's schema spreads `resizeMediaSchemaFragment`; the lock model
 comes from `createResizeModels(connection)`.
@@ -230,7 +234,8 @@ comes from `createResizeModels(connection)`.
   `{ resizer, queue, mediaId, pipeline, previews }`; store `resizer` and `queue`.
   - `startWorker(handle, { signal, queue, onEvent })` consumes only that queue and reports
     `onEvent('completed' | 'failed' | 'deadLettered', task, error?)`.
-  - Optionally, `findActive(task)` lets `prewarm()` confirm work that another request
+  - Optionally, `verify()` fails at boot when the transport cannot work, and `findActive(task)`
+    lets `prewarm()` confirm work that another request
     queued; `getLockTtlMs()` returns lock TTLs (default 60 s each); `servesQueue(queue)` tells
     the worker which queues it can consume (default: all).
 
@@ -258,7 +263,8 @@ created; a config function (the framework adapter passes one) on first use or `v
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
 Queue timing and lock TTLs are **transport options** (`MongoTransport`; `SqsTransport` takes
-`lockTtlMs`), validated in the transport's constructor. Their defaults are `defaultQueueOptions`
+`lockTtlMs`), validated by the transport: a plain `MongoTransport` and `SqsTransport` when
+created, `createFrameworkMongoTransport()` on first use or `verify()`. Their defaults are `defaultQueueOptions`
 in `…/config/resize.js`:
 
 | Option | Default | Notes |

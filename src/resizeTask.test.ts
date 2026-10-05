@@ -1796,6 +1796,40 @@ describe('one worker serves every Resizer', () => {
     assert.equal(otherStopped, true);
   });
 
+  test('the worker rejects with the failure that stopped it, not a sibling abort', async () => {
+    installApp({ worker: { enabled: true } });
+    // Registered first: it rejects only because the other loop's failure aborts it.
+    const aborted: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: (_handle, opts) =>
+        new Promise<void>((_done, fail) => {
+          opts.signal.addEventListener('abort', () =>
+            fail(new Error('aborted by sibling')),
+          );
+        }),
+    };
+    const failing: QueueTransport = {
+      locks: makeLocks().lockProvider,
+      enqueue: async () => ({ taskId: null }),
+      startWorker: async () => {
+        throw new Error('queue unreachable');
+      },
+    };
+    createFrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      transport: aborted,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    createFrameworkResizer({
+      name: 'listings',
+      storage: makeStorage(redPng).storage,
+      transport: failing,
+      mediaStore: makeMediaStore(null).mediaStore,
+    });
+    await assert.rejects(() => runResizeWorker(), /queue unreachable/);
+  });
+
   test('a transport that does not serve the queue is skipped; the others run', async () => {
     installApp({ worker: { enabled: true } });
     const served = capturingTransport();

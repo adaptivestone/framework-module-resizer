@@ -31,9 +31,19 @@ export class MongoMediaStore extends MediaStore {
     this.#getModel = getModel ?? (() => model as MongoMediaModel);
   }
 
-  /** The media model; subclasses may resolve it differently. */
+  /**
+   * The media model. A getter that resolves to nothing (e.g. a misspelled model name) is a setup
+   * error, never "media missing": the worker would otherwise retry every task until it is dead.
+   */
   protected getModel(): MongoMediaModel {
-    return this.#getModel();
+    const model = this.#getModel();
+    if (!model) {
+      throw new ResizeSetupError(
+        'resize: MongoMediaStore getModel() returned no model — check the model name',
+        { code: 'RESIZE_MONGO_MODEL_MISSING' },
+      );
+    }
+    return model;
   }
 
   /** Worker startup check: the model must resolve. */

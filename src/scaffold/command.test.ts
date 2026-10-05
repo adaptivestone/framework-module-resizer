@@ -257,6 +257,13 @@ describe('runScaffold — --check', () => {
     assert.match(out, /drift/);
   });
 
+  test('an ejected model passes --check (it owns its schema)', async () => {
+    await run(['--eject']);
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 0, out);
+    assert.doesNotMatch(out, /drift/);
+  });
+
   test('an old model shim importing the removed subpath → exit 1 + drift', async () => {
     await run([]);
     await writeFile(

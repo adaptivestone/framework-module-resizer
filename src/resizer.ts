@@ -301,14 +301,25 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: resolve and validate the config, check the transport's timing, and
-   * run the media store's verify(). Framework hosts call it after `Server.init()` to fail at boot
-   * instead of at the first upload or read.
+   * Optional startup check: resolve and validate the config; check the transport (its own
+   * verify(), lock TTLs, and that it serves this Resizer's queue); run the media store's verify().
+   * Framework hosts call it after `Server.init()` to fail at boot instead of at the first upload or
+   * read. The worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
     void this.config;
     if (this.transport) {
+      await this.transport.verify?.();
       lockTtlMsOf(this.transport);
+      if (
+        this.transport.servesQueue &&
+        !this.transport.servesQueue(this.queue)
+      ) {
+        throw new ResizeSetupError(
+          `resize: Resizer '${this.name}' queues to '${this.queue}', which its transport does not serve`,
+          { code: 'RESIZE_QUEUE_NOT_SERVED' },
+        );
+      }
     }
     await this.mediaStore.verify?.();
   }
