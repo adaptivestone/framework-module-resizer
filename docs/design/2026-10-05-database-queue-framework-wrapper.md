@@ -50,13 +50,14 @@ abstract class ResizeDatabase {         // records
 }
 
 abstract class TaskQueue {              // queued tasks; every method is one atomic operation
-  abstract add(task, requestKey): Promise<{ taskId: string; existing: boolean }>;
-  abstract claim(queue, leaseMs): Promise<ClaimedTask | null>; // next due task, with a lease token
+  abstract add(task): Promise<{ taskId: string | null }>; // task carries the core's requestKey
+  abstract claim(queue, leaseMs, signal?): Promise<ClaimedTask | null>; // next due task + lease token
   abstract renew(task, leaseMs): Promise<boolean>;
   abstract complete(task): Promise<boolean>;
   abstract fail(task, next: { retryAt: Date } | 'dead', error): Promise<boolean>;
-  findActive?(resizer, mediaId, pipeline): Promise<ActiveTask[]>;
+  findActive?({ resizer, mediaId, pipeline }): Promise<ActiveTask[]>;
   servesQueue?(queue): boolean;
+  getTiming?(): Partial<QueueTimingOptions>; // lease, retries, lock TTLs for this queue
   verify?(): void | Promise<void>;
 }
 ```
@@ -73,14 +74,18 @@ handles:
 - de-duplication (`requestKey`, computed in the core);
 - the events `completed`, `failed` and `deadLettered`.
 
-Mongo and SQS therefore behave the same. The timing is the Resizer's queue policy (see E4).
+Mongo and SQS therefore behave the same. The timing (`lockTtlMs`, `leaseMs`, `retryBackoffMs`,
+`maxAttempts`, `idlePollMs`, `taskTimeoutMs`) belongs to the queue: the core reads
+`tasks.getTiming()` once, fills today's defaults and validates it (`timingOf(tasks)`). A claimed
+task already delivered more than `maxAttempts` times (a crash loop) is dead-lettered without
+running, which replaces the old Mongo sweep.
 
 **E3. The adapters.**
 
 | Adapter | Implements | How |
 |---|---|---|
-| `mongoDatabase(connection, { mediaModel })` | `ResizeDatabase` + `tasks` | `findOneAndUpdate` claims; documents hold the locks; `ResizeTask` / `ResizeLock` models from the package schemas |
-| `sqsQueue({ queueUrl, queues?, deadLetterQueueUrl? })` | `TaskQueue` | claim = ReceiveMessage (visibility = lease); renew = ChangeMessageVisibility; complete = DeleteMessage; retry = ChangeMessageVisibility(delay); dead = send to `deadLetterQueueUrl` if set, then delete. `sqs-consumer` is no longer needed. |
+| `mongoDatabase(connection, { mediaModel, timing? })` (or `new MongoDatabase` / `new MongoTaskQueue`) | `ResizeDatabase` + `tasks` | `findOneAndUpdate` claims; documents hold the locks; `ResizeTask` / `ResizeLock` models from the package schemas |
+| `new SqsTaskQueue({ queueUrl, queues?, deadLetterQueueUrl?, timing? })` | `TaskQueue` | claim = ReceiveMessage (visibility = lease); renew = ChangeMessageVisibility; complete = DeleteMessage; retry = ChangeMessageVisibility(delay); dead = send to `deadLetterQueueUrl` if set, then delete. `sqs-consumer` is no longer needed. |
 | `LocalFsStorage`, `S3Storage` | `ResizeStorage` | unchanged |
 
 **E4. Core wiring.**
@@ -89,14 +94,13 @@ Mongo and SQS therefore behave the same. The timing is the Resizer's queue polic
 new Resizer({
   storage,                                // ResizeStorage
   db,                                     // ResizeDatabase
-  queue: { tasks: db.tasks, name: 'default', ...timing }, // omit → eager only
+  tasks: db.tasks,                        // any TaskQueue; omit → eager only
+  queue: 'default',                       // the queue name this Resizer enqueues to
 });
 ```
 
-- `queue.tasks` may be any `TaskQueue`, for example `sqsQueue(…)` with a Mongo `db`. The
-  timing is `lockTtlMs`, `leaseMs`, `retryBackoffMs`, `maxAttempts`, `idlePollMs` and
-  `taskTimeoutMs`, with today's defaults.
-- `storage`, `db` and `queue` may also be functions, sync or async, resolved once before the
+- `tasks` may be any `TaskQueue`, for example `new SqsTaskQueue(…)` with a Mongo `db`.
+- (R2) `storage`, `db` and `tasks` may also be functions, sync or async, resolved once before the
   first call. That lets the framework wrapper read the app lazily and import the S3 adapter
   (an optional peer) only when the config asks for it.
 
@@ -156,7 +160,7 @@ host's own S3 client. `createFrameworkResizer` and `createFrameworkMongoTranspor
    - Replace `src/resizer.ts` with `new FrameworkResizer({ pipelines, hooks })`.
    - Keep the `ResizeTask` shim.
 2. **Plain Node apps:** replace the three Mongo drivers with
-   `mongoDatabase(connection, { mediaModel })`, and `SqsTransport` with `sqsQueue(…)`.
+   `mongoDatabase(connection, { mediaModel })`, and `SqsTransport` with `new SqsTaskQueue(…)`.
 3. **Custom drivers:** implement `ResizeDatabase` / `TaskQueue` instead of `MediaStore` /
    `LockStore` / `QueueTransport`.
 
@@ -166,6 +170,5 @@ Each phase is one PR with tests, plus README, AGENTS.md, CHANGELOG and docs-site
 
 | Phase | Scope | Done when |
 |---|---|---|
-| **R1** Database + core queue | E1, E2, E4; `mongoDatabase`; the worker loop moves from `MongoTransport` into the core; Mongo tests ported | No queue logic lives in an adapter; an in-memory `TaskQueue` test runs the whole lifecycle |
-| **R2** SQS as a `TaskQueue` | E3 SQS row; `sqs-consumer` removed | SQS and Mongo pass the same lifecycle tests, including `deadLettered` events |
-| **R3** `FrameworkResizer` | E5; lazy async parts; scaffold; config-driven storage and queue | A framework host's `src/resizer.ts` is one line; switching to S3 in production is a config change |
+| **R1** Database + core queue | E1–E4; `mongoDatabase`; the worker loop moves from `MongoTransport` into the core; SQS becomes `SqsTaskQueue` in the same PR (the old transport contract is gone, so it cannot wait); `sqs-consumer` removed; tests ported | No queue logic lives in an adapter; an in-memory `TaskQueue` test runs the whole lifecycle; SQS reports `failed` / `deadLettered` like Mongo |
+| **R2** `FrameworkResizer` | E5; lazy async parts; scaffold; config-driven storage and queue | A framework host's `src/resizer.ts` is one line; switching to S3 in production is a config change |

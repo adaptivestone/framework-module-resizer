@@ -69,7 +69,7 @@ describe('runScaffold — default run', () => {
 
     const resizer = await read(RESIZER);
     assert.match(resizer, /createFrameworkResizer\(/);
-    assert.match(resizer, /createFrameworkMongoTransport\(\)/);
+    assert.match(resizer, /tasks: true/);
     assert.match(resizer, /framework\.js/);
     assert.match(
       resizer,
@@ -212,7 +212,7 @@ describe('runScaffold — --eject', () => {
 });
 
 describe('runScaffold — --eager', () => {
-  test('emits only resizer.ts + config, wired to LocalFsStorage (no Mongo transport)', async () => {
+  test('emits only resizer.ts + config, wired to LocalFsStorage (no task queue)', async () => {
     const { code } = await run(['--eager']);
     assert.equal(code, 0);
 
@@ -223,12 +223,12 @@ describe('runScaffold — --eager', () => {
 
     const resizer = await read(RESIZER);
     assert.match(resizer, /a normal static import is fine/);
-    assert.doesNotMatch(resizer, /MongoTransport/);
+    assert.doesNotMatch(resizer, /tasks: true/);
     assert.doesNotMatch(resizer, /PROVIDE_YOUR_STORAGE_DRIVER/);
     assert.match(resizer, /LocalFsStorage/);
     assert.match(resizer, /drivers\/fs\.js/);
     assert.match(resizer, /publicBaseUrl/);
-    assert.match(resizer, /no transport or worker/);
+    assert.match(resizer, /no task queue or worker/);
   });
 });
 

@@ -4,16 +4,16 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
+import { type ResizeStorage, resetResizerForTests } from './resizer.ts';
 import {
-  type LockStore,
-  type QueueTransport,
-  type ResizeStorage,
-  resetResizerForTests,
-} from './resizer.ts';
+  type FakeLocks,
+  fakeDb,
+  MemoryTaskQueue,
+} from './testHelpers/fakes.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { withLocks } from './testHelpers/withLocks.ts';
 import type { MissingPreview, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -42,32 +42,20 @@ const storage: ResizeStorage = {
   publicUrl: (ref: StorageRef) => `https://cdn/${ref.key}`,
 };
 
-type EnqueueTask = {
-  resizer: string;
-  queue: string;
-  mediaId: string;
-  pipeline: string;
-  previews: MissingPreview[];
-};
-
-function makeTransport(
-  behavior?: (task: EnqueueTask) => { taskId: string | null },
-) {
-  const calls: EnqueueTask[] = [];
-  const transport: QueueTransport = {
-    enqueue: async (task) => {
-      calls.push(task);
-      return behavior ? behavior(task) : { taskId: 't1' };
-    },
-    startWorker: async () => {},
+function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
+  const calls: NewTask[] = [];
+  const tasks = new MemoryTaskQueue();
+  tasks.add = async (task) => {
+    calls.push(task);
+    return behavior ? behavior(task) : { taskId: 't1' };
   };
-  return { transport, calls };
+  return { tasks, calls };
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const lockProvider: LockStore = {
+  const locks: FakeLocks = {
     acquire: async (key, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
@@ -76,24 +64,15 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
       released.push(key);
     },
   };
-  return { lockProvider, acquired, released };
+  return { locks, acquired, released };
 }
 
-function makeResizer(opts: {
-  transport?: QueueTransport;
-  lockProvider?: LockStore;
-}) {
-  const { transport, lockProvider } = opts;
+function makeResizer(opts: { tasks?: TaskQueue; locks?: FakeLocks }) {
+  const { tasks, locks } = opts;
   return createFrameworkResizer({
     storage,
-    ...(transport
-      ? {
-          transport: withLocks(
-            transport,
-            lockProvider ?? makeLocks(true).lockProvider,
-          ),
-        }
-      : {}),
+    db: fakeDb({ locks }),
+    tasks,
   });
 }
 
@@ -153,9 +132,9 @@ describe('enqueue', () => {
 
   test('dedups variants by identity before acquiring locks', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(
       r,
       'm1',
@@ -166,14 +145,14 @@ describe('enqueue', () => {
     assert.equal(acquired.length, 1);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].previews.length, 1);
-    assert.equal(enqueued, 1); // returns the count handed to the transport
+    assert.equal(enqueued, 1); // returns the count handed to the task queue
   });
 
   test('keeps distinct nested filter values as distinct preview identities', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
 
     const enqueued = await enqueue(
       r,
@@ -194,9 +173,9 @@ describe('enqueue', () => {
 
   test('keeps nested string and number filter leaves distinct', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
 
     const enqueued = await enqueue(
       r,
@@ -217,9 +196,10 @@ describe('enqueue', () => {
 
   test('acquires a dispatch lock per identity with the configured TTL', async () => {
     installFakeApp();
-    const { transport } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
+    tasks.getTiming = () => ({ lockTtlMs: { dispatch: 12345, worker: 60000 } });
+    const r = makeResizer({ tasks, locks });
     await enqueue(
       r,
       'm1',
@@ -234,16 +214,16 @@ describe('enqueue', () => {
         'resize_dispatch:m1:default:default:300x300:webp:none',
       ],
     );
-    assert.equal(acquired[0].ttl, 60000);
+    assert.equal(acquired[0].ttl, 12345);
   });
 
   test('keeps only lock-winners; a held lock is skipped', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(
       (key) => key.endsWith(':jpeg:none'), // only the jpeg lock is won
     );
-    const r = makeResizer({ transport, lockProvider });
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(
       r,
       'm1',
@@ -261,10 +241,10 @@ describe('enqueue', () => {
 
   test('a rejecting dispatch-lock acquire skips that variant; earlier survivors still enqueue', async () => {
     const { errors } = installFakeApp();
-    const { transport, calls } = makeTransport();
-    const lockProvider: LockStore = {
+    const { tasks, calls } = makeTasks();
+    const locks: FakeLocks = {
       // jpeg acquires fine; the webp acquire REJECTS — that variant is not a survivor (log +
-      // continue), and the earlier jpeg survivor still reaches the transport (1.2b).
+      // continue), and the earlier jpeg survivor still reaches the task queue (1.2b).
       acquire: async (key) => {
         if (key.endsWith(':webp:none')) {
           throw new Error('lock backend down');
@@ -273,7 +253,7 @@ describe('enqueue', () => {
       },
       release: async () => {},
     };
-    const r = makeResizer({ transport, lockProvider });
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(
       r,
       'm1',
@@ -290,11 +270,11 @@ describe('enqueue', () => {
     assert.ok(errors.length >= 1);
   });
 
-  test('does not call the transport when no lock survives', async () => {
+  test('does not call the task queue when no lock survives', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(false);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(false);
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.equal(calls.length, 0);
     assert.equal(enqueued, 0); // no survivor → nothing handed over
@@ -302,21 +282,21 @@ describe('enqueue', () => {
 
   test('on success (non-null taskId) the survivor locks are NOT released', async () => {
     installFakeApp();
-    const { transport } = makeTransport();
-    const { lockProvider, released } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks } = makeTasks();
+    const { locks, released } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.equal(released.length, 0);
     assert.equal(enqueued, 1); // success → the one survivor is counted
   });
 
-  test('releases survivor locks when the transport throws (never rethrows)', async () => {
+  test('releases survivor locks when the task queue throws (never rethrows)', async () => {
     const { errors } = installFakeApp();
-    const { transport } = makeTransport(() => {
+    const { tasks } = makeTasks(() => {
       throw new Error('down');
     });
-    const { lockProvider, released } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { locks, released } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.deepEqual(released, [
       'resize_dispatch:m1:default:default:300x300:jpeg:none',
@@ -327,9 +307,9 @@ describe('enqueue', () => {
 
   test('releases survivor locks when taskId is null (soft failure)', async () => {
     const { errors } = installFakeApp();
-    const { transport } = makeTransport(() => ({ taskId: null }));
-    const { lockProvider, released } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks } = makeTasks(() => ({ taskId: null }));
+    const { locks, released } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
     assert.deepEqual(released, [
       'resize_dispatch:m1:default:default:300x300:jpeg:none',
@@ -338,26 +318,28 @@ describe('enqueue', () => {
     assert.equal(enqueued, 0); // null taskId → soft failure → not counted
   });
 
-  test('passes mediaId + pipeline + survivors through to the transport', async () => {
+  test('passes mediaId + pipeline + survivors through to the task queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = makeResizer({ transport, lockProvider });
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
     const v = variant({ requestedWidth: 300, requestedHeight: 300 });
     await enqueue(r, 'm1', 'photo', [v], 'default');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].mediaId, 'm1');
     assert.equal(calls[0].pipeline, 'photo');
+    assert.equal(calls[0].requestKey, buildRequestKey(calls[0]));
     assert.deepEqual(calls[0].previews, [v]);
   });
 
   test('enqueue sends the resizer name and the given queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
     const resizer = createFrameworkResizer({
       storage,
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
       name: 'listings',
     });
     await enqueue(
@@ -397,19 +379,19 @@ describe('buildRequestKey', () => {
 });
 
 describe('dispatch locks are scoped per resizer and pipeline', () => {
-  test('two pipelines of the same variant both reach the transport', async () => {
+  test('two pipelines of the same variant both reach the task queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
+    const { tasks, calls } = makeTasks();
     const held = new Set<string>();
     // Grants each lock key once: a second request for the SAME key is a loser.
-    const { lockProvider, acquired } = makeLocks((key) => {
+    const { locks, acquired } = makeLocks((key) => {
       if (held.has(key)) {
         return false;
       }
       held.add(key);
       return true;
     });
-    const r = makeResizer({ transport, lockProvider });
+    const r = makeResizer({ tasks, locks });
     await enqueue(r, 'm1', 'default', [variant()], 'default');
     await enqueue(r, 'm1', 'watermark', [variant()], 'default');
     assert.equal(calls.length, 2);

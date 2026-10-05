@@ -5,28 +5,19 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import type { ResizeStorage } from '../contracts/storage.ts';
-import type { QueueTransport } from '../contracts/transport.ts';
-import { MongoTransport } from '../drivers/mongo/transport.ts';
+import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
+import { timingOf } from '../queue.ts';
 import { resetResizerForTests } from '../resizer.ts';
+import { fakeDb, MemoryTaskQueue } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
-import { withLocks } from '../testHelpers/withLocks.ts';
-import { FrameworkLockStore } from './lockStore.ts';
-import { FrameworkMediaStore } from './mediaStore.ts';
-import {
-  createFrameworkMongoTransport,
-  createFrameworkResizer,
-} from './resizer.ts';
+import { FrameworkDatabase } from './database.ts';
+import { createFrameworkResizer } from './resizer.ts';
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
   upload: async ({ key }) => ({ key }),
   publicUrl: () => '',
-};
-const transport: QueueTransport = {
-  locks: { acquire: async () => true, release: async () => {} },
-  enqueue: async () => ({ taskId: null }),
-  startWorker: async () => {},
 };
 
 function installApp(configs: Record<string, unknown> = {}) {
@@ -54,28 +45,66 @@ afterEach(() => {
   resetAppInstance();
 });
 
-test('fills config, logger, events and the media store from the app', async () => {
-  const { asked, logger } = installApp();
+test('fills config, logger, events and the database from the app', async () => {
+  const { asked, logger, events } = installApp();
   const seen: unknown[] = [];
+  const emitted: unknown[][] = [];
   logger.info = (msg: unknown) => {
     seen.push(msg);
+  };
+  events.emit = (...args: unknown[]) => {
+    emitted.push(args);
   };
   const r = createFrameworkResizer({ storage });
   r.logger.info('hello');
   assert.deepEqual(seen, ['hello']); // the app logger, resolved at call time
   assert.deepEqual(r.config.formats, ['jpeg', 'webp', 'avif']);
-  assert.ok(r.mediaStore instanceof FrameworkMediaStore);
-  await r.mediaStore.load('m1');
+  assert.ok(r.db instanceof FrameworkDatabase);
+  assert.equal(r.tasks, undefined); // eager-only unless tasks are requested
+  await r.db.loadMedia('m1');
   assert.deepEqual(asked, ['File']);
+  await r.runObservers('onPreviewGenerated', 'preview', {});
+  assert.deepEqual(emitted, [['resize:onPreviewGenerated', 'preview', {}]]);
 });
 
-test('createFrameworkMongoTransport coordinates through the framework Lock model', () => {
-  installApp();
-  assert.ok(
-    createFrameworkMongoTransport().locks instanceof FrameworkLockStore,
-  );
-  const locks = { acquire: async () => true, release: async () => {} };
-  assert.equal(createFrameworkMongoTransport({ locks }).locks, locks);
+test('tasks: true uses the database queue and coordinates through the framework Lock model', async () => {
+  const calls: unknown[][] = [];
+  setAppInstance({
+    getConfig: () => makeResizeConfig(),
+    getModel: (name: string) => {
+      assert.equal(name, 'Lock');
+      return {
+        acquireLock: async (key: string, seconds: number) => {
+          calls.push(['acquire', key, seconds]);
+          return true;
+        },
+        releaseLock: async (key: string) => {
+          calls.push(['release', key]);
+        },
+      };
+    },
+  } as never);
+  const r = createFrameworkResizer({ storage, tasks: true });
+  assert.ok(r.db instanceof FrameworkDatabase);
+  assert.ok(r.tasks instanceof MongoTaskQueue);
+  assert.equal(r.tasks, r.db.tasks);
+  assert.equal(await r.db.acquireLock('variant', 1001), true);
+  await r.db.releaseLock('variant');
+  assert.deepEqual(calls, [
+    ['acquire', 'variant', 2],
+    ['release', 'variant'],
+  ]);
+
+  const tasks = new MemoryTaskQueue();
+  const db = fakeDb({ tasks });
+  const custom = createFrameworkResizer({
+    name: 'custom',
+    storage,
+    db,
+    tasks: true,
+  });
+  assert.equal(custom.db, db);
+  assert.equal(custom.tasks, tasks);
 });
 
 test('configName selects the config file, including its media model', async () => {
@@ -93,107 +122,118 @@ test('configName selects the config file, including its media model', async () =
   const media = createFrameworkResizer({ storage });
   assert.deepEqual(listings.config.formats, ['webp']);
   assert.deepEqual(media.config.formats, ['jpeg', 'webp', 'avif']);
-  await listings.mediaStore.load('m1');
-  await media.mediaStore.load('m2');
+  await listings.db.loadMedia('m1');
+  await media.db.loadMedia('m2');
   assert.deepEqual(asked, ['Photo', 'File']);
 });
 
 test('explicit options win over every default', () => {
   installApp();
   const logger = { info() {}, warn() {}, error() {} };
-  const mediaStore = { load: async () => null, appendPreviews: async () => {} };
-  const lockProvider = { acquire: async () => true, release: async () => {} };
+  const events = { emit() {} };
+  const db = fakeDb();
+  const tasks = new MemoryTaskQueue();
   const config = makeResizeConfig({ formats: ['avif'] });
   const r = createFrameworkResizer({
     storage,
-    transport: withLocks(transport, lockProvider),
+    tasks,
     config,
     logger,
-    mediaStore,
+    events,
+    db,
   });
   assert.deepEqual(r.config.formats, ['avif']);
   assert.equal(r.config.encode, config.encode);
   assert.equal(r.logger, logger);
-  assert.equal(r.mediaStore, mediaStore);
-  assert.equal(r.transport?.locks, lockProvider);
+  assert.equal(r.db, db);
+  assert.equal(r.tasks, tasks);
 });
 
-test('createFrameworkMongoTransport takes timing from the config file', () => {
+test('the framework database queue takes timing from the selected config file', () => {
   installApp({
-    resize: makeResizeConfig({
+    resizeListings: makeResizeConfig({
       queue: { leaseMs: 1234, lockTtlMs: { dispatch: 60000, worker: 1000 } },
     }),
   });
-  const t = createFrameworkMongoTransport();
-  assert.ok(t instanceof MongoTransport);
-  assert.equal(t.leaseMs, 1234);
-  assert.deepEqual(t.getLockTtlMs(), { dispatch: 60000, worker: 1000 });
-  assert.equal(
-    createFrameworkMongoTransport({
-      leaseMs: 99,
-      lockTtlMs: { dispatch: 60000, worker: 50 },
-    }).leaseMs,
-    99,
-  );
+  const r = createFrameworkResizer({
+    storage,
+    configName: 'resizeListings',
+    tasks: true,
+  });
+  assert.ok(r.tasks instanceof MongoTaskQueue);
+  assert.equal(timingOf(r.tasks).leaseMs, 1234);
+  assert.deepEqual(timingOf(r.tasks).lockTtlMs, {
+    dispatch: 60000,
+    worker: 1000,
+  });
+  const custom = createFrameworkResizer({
+    name: 'custom',
+    storage,
+    tasks: new MongoTaskQueue({
+      model: {},
+      timing: { leaseMs: 99, lockTtlMs: { dispatch: 60000, worker: 50 } },
+    }),
+  });
+  assert.ok(custom.tasks);
+  assert.equal(timingOf(custom.tasks).leaseMs, 99);
 });
 
-test('a core MongoTransport needs one model and locks, and validates its timing', () => {
-  const locks = { acquire: async () => true, release: async () => {} };
-  for (const opts of [{ locks }, { model: {}, getModel: () => ({}), locks }]) {
+test('a core MongoTaskQueue needs one model, and the core validates its timing', () => {
+  for (const opts of [{}, { model: {}, getModel: () => ({}) }]) {
     assert.throws(
-      () => new MongoTransport(opts as never),
+      () => new MongoTaskQueue(opts as never),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_MONGO_MODEL_REQUIRED',
     );
   }
-  assert.throws(
-    () => new MongoTransport({ model: {} } as never),
-    (err: unknown) =>
-      err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
-  );
-  // A worker lock must expire within the lease (checked here now, not by the worker).
+  // Locks come from the database; queue timing is validated by the core on first use.
   assert.throws(
     () =>
-      new MongoTransport({
-        model: {},
-        locks,
-        leaseMs: 1000,
-        lockTtlMs: { dispatch: 60000, worker: 2000 },
-      }),
+      timingOf(
+        new MongoTaskQueue({
+          model: {},
+          timing: {
+            leaseMs: 1000,
+            lockTtlMs: { dispatch: 60000, worker: 2000 },
+          },
+        }),
+      ),
     (err: unknown) =>
       err instanceof ResizeConfigError &&
       err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
   );
-  const t = new MongoTransport({ model: {}, locks });
-  assert.equal(t.leaseMs, 60_000);
-  assert.deepEqual(t.getLockTtlMs(), { dispatch: 60_000, worker: 60_000 });
+  const t = new MongoTaskQueue({ model: {} });
+  assert.equal(timingOf(t).leaseMs, 60_000);
+  assert.deepEqual(timingOf(t).lockTtlMs, {
+    dispatch: 60_000,
+    worker: 60_000,
+  });
 });
 
-test('createFrameworkMongoTransport reads nothing until first use', () => {
+test('the framework resizer and its database queue read nothing until first use', () => {
   resetAppInstance();
-  const t = createFrameworkMongoTransport(); // no app yet: must not throw
+  const r = createFrameworkResizer({ storage, tasks: true }); // no app yet: must not throw
   installApp({
     resize: makeResizeConfig({
       queue: { leaseMs: 4321, lockTtlMs: { dispatch: 60000, worker: 1000 } },
     }),
   });
-  assert.equal(t.leaseMs, 4321);
+  assert.ok(r.tasks);
+  assert.equal(timingOf(r.tasks).leaseMs, 4321);
 });
 
 test('undefined values from getTiming never override the defaults', () => {
-  const locks = { acquire: async () => true, release: async () => {} };
-  const t = new MongoTransport({
+  const t = new MongoTaskQueue({
     model: {},
-    locks,
     getTiming: () => ({ leaseMs: undefined, maxAttempts: 7 }),
   });
-  assert.equal(t.leaseMs, 60_000);
+  assert.equal(timingOf(t).leaseMs, 60_000);
+  assert.equal(timingOf(t).maxAttempts, 7);
 });
 
-test('MongoTransport.verify() fails when the task model is not registered', async () => {
-  const locks = { acquire: async () => true, release: async () => {} };
-  const t = new MongoTransport({ getModel: () => undefined, locks });
+test('MongoTaskQueue.verify() fails when the task model is not registered', async () => {
+  const t = new MongoTaskQueue({ getModel: () => undefined });
   assert.throws(
     () => t.verify(),
     (err: unknown) =>
@@ -209,7 +249,7 @@ test('MongoTransport.verify() fails when the task model is not registered', asyn
   } as never);
   const r = createFrameworkResizer({
     storage,
-    transport: createFrameworkMongoTransport(),
+    tasks: true,
   });
   await assert.rejects(
     () => r.verify(),
@@ -219,15 +259,14 @@ test('MongoTransport.verify() fails when the task model is not registered', asyn
   );
 });
 
-test('verify() fails when the transport does not serve the Resizer queue', async () => {
+test('verify() fails when the task queue does not serve the Resizer queue', async () => {
   installApp();
+  const tasks = new MemoryTaskQueue();
+  Object.assign(tasks, { servesQueue: (queue: string) => queue === 'default' });
   const r = createFrameworkResizer({
     storage,
     queue: 'bulk',
-    transport: {
-      ...transport,
-      servesQueue: (queue: string) => queue === 'default',
-    },
+    tasks,
   });
   await assert.rejects(
     () => r.verify(),
@@ -238,7 +277,7 @@ test('verify() fails when the transport does not serve the Resizer queue', async
 
 test('prewarm reports a config error as a non-retryable issue', async () => {
   installApp({ resize: { mediaModelName: 'File', upload: null } });
-  const r = createFrameworkResizer({ storage, transport });
+  const r = createFrameworkResizer({ storage, tasks: new MemoryTaskQueue() });
   const result = await r.prewarm({
     media: { id: 'm1', original: { storageRef: { key: 'k' } } },
     sizes: [{ width: 10, height: 10 }],

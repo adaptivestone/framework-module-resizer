@@ -229,7 +229,7 @@ const USAGE = `resize-scaffold — vendor the resize module's integration files 
 Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
 
 Emits (into process.cwd(), or --out <dir>):
-  src/resizer.ts            construction site — createFrameworkResizer({ transport, storage, pipelines })
+  src/resizer.ts            construction site — createFrameworkResizer({ storage, tasks, pipelines })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
   src/commands/ResizeWorker.ts  imports src/resizer.ts and re-exports the module's worker command
   src/config/resize.ts      host overrides over module defaults (framework merges environment overrides)
@@ -238,7 +238,7 @@ Options:
   --check      verify the shims exist + reference the module (and the worker command imports
                src/resizer.ts); exit 1 on missing/drift (no writes)
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
-  --eager      eager-mode hosts: emit only src/resizer.ts (LocalFsStorage, no transport) + src/config/resize.ts
+  --eager      eager-mode hosts: emit only src/resizer.ts (LocalFsStorage, no task queue) + src/config/resize.ts
   --force      overwrite existing files (default: never overwrite)
   --agents <m> host pointer to the shipped AGENTS.md: agents (default: append to the host
                AGENTS.md, create if missing), claude (CLAUDE.md), print (stdout only), skip.

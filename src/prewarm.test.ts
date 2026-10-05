@@ -1,110 +1,130 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
-import {
-  resetAppInstance,
-  setAppInstance,
-} from '@adaptivestone/framework/helpers/appInstance.js';
-import { createFrameworkResizer } from './framework/resizer.ts';
-import {
-  type LockStore,
-  type QueueTransport,
-  type ResizeStorage,
-  resetResizerForTests,
-} from './resizer.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { withLocks } from './testHelpers/withLocks.ts';
-import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
+import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
+import { Resizer, resetResizerForTests } from './resizer.ts';
+import type { FakeLocks } from './testHelpers/fakes.ts';
+import { fakeDb, MemoryTaskQueue, memoryLocks } from './testHelpers/fakes.ts';
+import { makeImageConfig } from './testHelpers/resizeConfig.ts';
+import type {
+  MediaLike,
+  MissingPreview,
+  ResizeLogger,
+  StorageRef,
+} from './types.d.ts';
 
 // ---------------------------------------------------------------------------
-// Harness — recording app + recording driver fakes (mirrors engine.test.ts). prewarm reads
-// logger/config via getApp() at CALL time, so installing the fake before each run is enough.
+// Harness — a core Resizer with a memory task queue and database-owned locks.
 // ---------------------------------------------------------------------------
 
 function installFakeApp() {
   const info: unknown[][] = [];
   const warn: unknown[][] = [];
   const errors: unknown[][] = [];
-  setAppInstance({
-    getConfig: () => makeResizeConfig(),
-    getModel: () => ({}),
-    logger: {
-      info(...a: unknown[]) {
-        info.push(a);
-      },
-      warn(...a: unknown[]) {
-        warn.push(a);
-      },
-      error(...a: unknown[]) {
-        errors.push(a);
-      },
+  currentLogger = {
+    info(...a: unknown[]) {
+      info.push(a);
     },
-  } as never);
+    warn(...a: unknown[]) {
+      warn.push(a);
+    },
+    error(...a: unknown[]) {
+      errors.push(a);
+    },
+  };
   return { info, warn, errors };
 }
+
+let currentLogger: ResizeLogger = { info() {}, warn() {}, error() {} };
 
 function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   return {
     download: async () => Buffer.alloc(0),
     upload: async () => ({ key: 'k' }),
-    publicUrl: (ref: StorageRef) => `https://cdn/${ref.key}`,
+    publicUrl: (ref: StorageRef) =>
+      `https://cdn/${(ref as { key: string }).key}`,
     ...o,
   };
 }
 
-type EnqueueTask = {
-  resizer: string;
-  queue: string;
-  mediaId: string;
-  pipeline: string;
-  previews: MissingPreview[];
-};
-
-function makeTransport(
-  behavior?: (task: EnqueueTask) => { taskId: string | null },
+function makeTaskQueue(
+  behavior?: (task: NewTask) => { taskId: string | null },
 ) {
-  const calls: EnqueueTask[] = [];
-  const transport: QueueTransport = {
-    enqueue: async (task) => {
+  const memory = new MemoryTaskQueue();
+  const calls: NewTask[] = [];
+  const tasks: TaskQueue = {
+    add: async (task) => {
       calls.push(task);
-      return behavior ? behavior(task) : { taskId: 't1' };
+      return behavior ? behavior(task) : memory.add(task);
     },
-    startWorker: async () => {},
+    claim: (queue, leaseMs) => memory.claim(queue, leaseMs),
+    renew: (task, leaseMs) => memory.renew(task, leaseMs),
+    complete: (task) => memory.complete(task),
+    fail: (task, next, error) => memory.fail(task, next, error),
+    findActive: (query) => memory.findActive(query),
+    getTiming: () => memory.getTiming(),
   };
-  return { transport, calls };
+  return { tasks, calls };
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
+  const base = memoryLocks();
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const lockProvider: LockStore = {
+  const dbLocks: FakeLocks = {
     acquire: async (key, ttl) => {
       acquired.push({ key, ttl });
-      return typeof acquire === 'function' ? acquire(key) : acquire;
+      const allowed = typeof acquire === 'function' ? acquire(key) : acquire;
+      return allowed ? base.acquire(key) : false;
     },
     release: async (key) => {
       released.push(key);
+      await base.release(key);
     },
   };
-  return { lockProvider, acquired, released };
+  return { dbLocks, acquired, released };
+}
+
+function makeResizer(
+  options: {
+    storage?: ResizeStorage;
+    tasks?: TaskQueue;
+    dbLocks?: FakeLocks;
+    name?: string;
+    queue?: string;
+    hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
+  } = {},
+) {
+  return new Resizer({
+    storage: options.storage ?? makeStorage(),
+    db: fakeDb({ locks: options.dbLocks }),
+    tasks: options.tasks,
+    config: makeImageConfig(),
+    logger: currentLogger,
+    name: options.name,
+    queue: options.queue,
+    hooks: options.hooks,
+  });
 }
 
 afterEach(() => {
   resetResizerForTests();
-  resetAppInstance();
+  currentLogger = { info() {}, warn() {}, error() {} };
 });
 
 // ---------------------------------------------------------------------------
-// §11.1b prewarm — expand sizes×formats → enqueue via the dispatch-lock path, never throw
+// §11.1b prewarm — expand sizes×formats → add task-queue work via dispatch locks, never throw
 // ---------------------------------------------------------------------------
 
 describe('prewarm — happy path', () => {
-  test('expands N sizes × M formats, enqueues the survivors once, returns their count', async () => {
+  test('expands N sizes × M formats, adds one task with the surviving variants', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -126,13 +146,14 @@ describe('prewarm — happy path', () => {
     );
   });
 
-  test('carries requestedWidth/Height/filters/fit onto the enqueued variants', async () => {
+  test('carries requestedWidth/Height/filters/fit onto the task variants', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -158,11 +179,12 @@ describe('prewarm — happy path', () => {
 describe('prewarm — queue', () => {
   test('without queue sends resizer.queue; with queue sends that queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
       name: 'listings',
       queue: 'interactive',
     });
@@ -189,11 +211,12 @@ describe('prewarm — queue', () => {
 
   test('a Resizer without a queue option sends "default"', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -206,13 +229,14 @@ describe('prewarm — queue', () => {
 });
 
 describe('prewarm — skip existing & dedup', () => {
-  test('identities already in media.previews are not enqueued', async () => {
+  test('identities already in media.previews are not added to the task queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -240,11 +264,12 @@ describe('prewarm — skip existing & dedup', () => {
 
   test('duplicate sizes within the request are deduped to one identity', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -258,13 +283,14 @@ describe('prewarm — skip existing & dedup', () => {
     assert.equal(calls[0].previews.length, 1);
   });
 
-  test('a getSizeKey-throwing size is skipped; the others still enqueue', async () => {
+  test('a getSizeKey-throwing size is skipped; the others are added', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -277,13 +303,14 @@ describe('prewarm — skip existing & dedup', () => {
 });
 
 describe('prewarm — SVG original uses the normal queue', () => {
-  test('private SVG enqueues publication work', async () => {
+  test('private SVG adds publication work to the task queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks, acquired } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: {
@@ -301,13 +328,14 @@ describe('prewarm — SVG original uses the normal queue', () => {
     assert.equal(acquired.length, 2);
   });
 
-  test('SVG detected via original.format === "svg" too', async () => {
+  test('SVG detected via original.format === "svg" is added to the task queue too', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: {
@@ -322,14 +350,15 @@ describe('prewarm — SVG original uses the normal queue', () => {
   });
 });
 
-describe('prewarm — waterfall hooks', () => {
+describe('prewarm — size and task hooks', () => {
   test('resolveSizes tap expands the set fed to the expansion', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
       hooks: {
         resolveSizes: () => [
           { width: 100, height: 100 },
@@ -351,11 +380,12 @@ describe('prewarm — waterfall hooks', () => {
 
   test('beforeEnqueue tap filters the remainder (assign-back semantics)', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
       hooks: {
         // drop everything but the jpeg 300x300 variant
         beforeEnqueue: (missing: MissingPreview[]) =>
@@ -377,13 +407,14 @@ describe('prewarm — waterfall hooks', () => {
     );
   });
 
-  test('a beforeEnqueue tap that empties the set → nothing accepted, no transport call', async () => {
+  test('a beforeEnqueue tap that empties the set → nothing accepted, no task queue call', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
       hooks: { beforeEnqueue: () => [] },
     });
     const { accepted } = await r.prewarm({
@@ -396,10 +427,10 @@ describe('prewarm — waterfall hooks', () => {
   });
 });
 
-describe('prewarm — no transport (eager-only host)', () => {
-  test('reports every variant unconfirmed with a NO_TRANSPORT issue, without throwing', async () => {
+describe('prewarm — no task queue (eager-only host)', () => {
+  test('reports every variant unconfirmed with a NO_QUEUE issue, without throwing', async () => {
     installFakeApp();
-    const r = createFrameworkResizer({ storage: makeStorage() });
+    const r = makeResizer({ storage: makeStorage() });
     const { accepted, status, unconfirmed, issues } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [
@@ -411,19 +442,20 @@ describe('prewarm — no transport (eager-only host)', () => {
     assert.equal(accepted.length, 0);
     assert.equal(status, 'incomplete');
     assert.equal(unconfirmed.length, 2);
-    assert.equal(issues[0].code, 'RESIZE_ENQUEUE_NO_TRANSPORT');
+    assert.equal(issues[0].code, 'RESIZE_ENQUEUE_NO_QUEUE');
   });
 });
 
-describe('prewarm — dispatch-lock survivors only', () => {
-  test('lock losers are not counted; enqueued reflects the winners handed to the transport', async () => {
+describe('prewarm — dispatch-lock winners only', () => {
+  test('lock losers are not counted; added tasks contain only the winners', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
+    const { tasks, calls } = makeTaskQueue();
     // Only the jpeg dispatch lock is won; the webp one is already in flight elsewhere.
-    const { lockProvider } = makeLocks((key) => key.endsWith(':jpeg:none'));
-    const r = createFrameworkResizer({
+    const { dbLocks } = makeLocks((key) => key.endsWith(':jpeg:none'));
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -437,13 +469,14 @@ describe('prewarm — dispatch-lock survivors only', () => {
     );
   });
 
-  test('no lock survives → nothing accepted and the transport is not called', async () => {
+  test('no lock survives → nothing accepted and the task queue is not called', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(false);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(false);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -455,16 +488,17 @@ describe('prewarm — dispatch-lock survivors only', () => {
   });
 });
 
-describe('prewarm — never throws', () => {
-  test('transport.enqueue throwing → nothing accepted, dispatch locks released, no reject', async () => {
+describe('prewarm — queue and lock failures never throw', () => {
+  test('task queue add throwing → nothing accepted, dispatch locks released, no reject', async () => {
     installFakeApp();
-    const { transport } = makeTransport(() => {
-      throw new Error('transport down');
+    const { tasks } = makeTaskQueue(() => {
+      throw new Error('task queue down');
     });
-    const { lockProvider, released } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { dbLocks, released } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -477,18 +511,19 @@ describe('prewarm — never throws', () => {
     ]);
   });
 
-  test('an internal error (lockProvider.acquire throws) is caught → nothing accepted, logged', async () => {
+  test('an internal error (db.acquireLock throws) is caught → nothing accepted, logged', async () => {
     const { errors } = installFakeApp();
-    const { transport } = makeTransport();
-    const lockProvider: LockStore = {
+    const { tasks } = makeTaskQueue();
+    const dbLocks: FakeLocks = {
       acquire: async () => {
         throw new Error('lock backend down');
       },
       release: async () => {},
     };
-    const r = createFrameworkResizer({
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -501,11 +536,12 @@ describe('prewarm — never throws', () => {
 
   test('a throwing resolveSizes tap does not reject; prewarm proceeds on the prior value', async () => {
     const { errors } = installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
       hooks: {
         resolveSizes: () => {
           throw new Error('boom');
@@ -524,11 +560,12 @@ describe('prewarm — never throws', () => {
 
   test('media with no id/_id → incomplete with a non-retryable INTERNAL_ERROR, never a throw', async () => {
     const { errors } = installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const result = await r.prewarm({
       media: { original: { storageRef: { key: 'orig.jpg' } } },
@@ -545,13 +582,14 @@ describe('prewarm — never throws', () => {
 });
 
 describe('prewarm — fast-path is NOT consulted', () => {
-  test('a size the original already fits still gets enqueued (generation decision, not serving)', async () => {
+  test('a size the original already fits still gets added (generation decision, not serving)', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -578,13 +616,14 @@ describe('prewarm — fast-path is NOT consulted', () => {
 });
 
 describe('prewarm — pipelines are part of identity', () => {
-  test('a default preview does not satisfy a watermark prewarm', async () => {
+  test('a default pipeline preview does not satisfy a watermark pipeline prewarm', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
-    const r = createFrameworkResizer({
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      dbLocks,
     });
     const media = {
       id: 'm1',

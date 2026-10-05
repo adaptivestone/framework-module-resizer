@@ -1,7 +1,7 @@
 // Loads a Resizer's config file from the framework app. Each Resizer may read its own file
 // (`configName`, default 'resize'); the framework has already merged resize.<NODE_ENV>.ts over it.
 // The file holds the image settings (passed to the Resizer) plus what only this adapter reads:
-// `mediaModelName`, `queue` (Mongo transport timing) and `worker` (the worker command).
+// `mediaModelName`, `queue` (the task queue's timing) and `worker` (the worker command).
 import { defaultQueueOptions, defaultWorkerOptions } from '../config/resize.ts';
 import { ResizeConfigError } from '../errors.ts';
 import { validateQueueTiming, validateResizeConfig } from '../resizeConfig.ts';

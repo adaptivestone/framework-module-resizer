@@ -5,25 +5,21 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError, ResizeSetupError } from './errors.ts';
-import { FrameworkLockStore } from './framework/lockStore.ts';
-import { FrameworkMediaStore } from './framework/mediaStore.ts';
+import { FrameworkDatabase } from './framework/database.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import {
   getResizer,
-  type LockStore,
   listResizers,
-  type MediaStore,
   type Pipeline,
-  type QueueTransport,
   Resizer,
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
+import { fakeDb, MemoryTaskQueue } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
-import { withLocks } from './testHelpers/withLocks.ts';
 import type { MissingPreview, SizeInput } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -32,23 +28,10 @@ import type { MissingPreview, SizeInput } from './types.d.ts';
 // checks) and takes the logger/events from the recording fake app installed here.
 // ---------------------------------------------------------------------------
 
-const fakeTransport = (): QueueTransport => ({
-  locks: fakeLockProvider(),
-  enqueue: async () => ({ taskId: null }),
-  startWorker: async () => {},
-});
 const fakeStorage = (): ResizeStorage => ({
   download: async () => Buffer.alloc(0),
   upload: async () => ({ key: 'k' }),
   publicUrl: () => '',
-});
-const fakeMediaStore = (): MediaStore => ({
-  load: async () => null,
-  appendPreviews: async () => {},
-});
-const fakeLockProvider = (): LockStore => ({
-  acquire: async () => true,
-  release: async () => {},
 });
 
 // A recording fake app: logger.error pushes to `errors`; events.emit (when present)
@@ -102,36 +85,35 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('createFrameworkResizer fills mediaStore; locks stay on the transport', () => {
+  test('createFrameworkResizer fills the database; locks stay on the database', () => {
     const eager = createFrameworkResizer(baseOpts());
-    assert.ok(eager.mediaStore instanceof FrameworkMediaStore);
+    assert.ok(eager.db instanceof FrameworkDatabase);
     resetResizerForTests();
-    const transport = fakeTransport();
-    const queued = createFrameworkResizer({ ...baseOpts(), transport });
-    assert.ok(queued.mediaStore instanceof FrameworkMediaStore);
-    assert.equal(queued.transport?.locks, transport.locks);
-    assert.ok(!(transport.locks instanceof FrameworkLockStore));
+    const tasks = new MemoryTaskQueue();
+    const queued = createFrameworkResizer({ ...baseOpts(), tasks });
+    assert.ok(queued.db instanceof FrameworkDatabase);
+    assert.equal(queued.tasks, tasks);
+    // the passed queue is used, not the database's own
+    assert.notEqual(queued.tasks, queued.db.tasks);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
     const storage = fakeStorage();
-    const transport = fakeTransport();
-    const mediaStore = fakeMediaStore();
-    const lockProvider = fakeLockProvider();
+    const tasks = new MemoryTaskQueue();
+    const db = fakeDb();
     const r = createFrameworkResizer({
       storage,
-      transport: withLocks(transport, lockProvider),
-      mediaStore,
+      tasks,
+      db,
     });
     assert.equal(r.storage, storage);
-    assert.equal(r.transport, transport);
-    assert.equal(r.mediaStore, mediaStore);
-    assert.equal(r.transport?.locks, lockProvider);
+    assert.equal(r.tasks, tasks);
+    assert.equal(r.db, db);
   });
 
-  test('transport is undefined when omitted (eager-only host)', () => {
+  test('task queue is undefined when omitted (eager-only host)', () => {
     const r = createFrameworkResizer(baseOpts());
-    assert.equal(r.transport, undefined);
+    assert.equal(r.tasks, undefined);
   });
 
   test('throws a named error when storage is missing (JS host / half-filled scaffold)', () => {
@@ -148,7 +130,7 @@ describe('Resizer constructor — driver wiring', () => {
       () =>
         new Resizer({
           storage: fakeStorage(),
-          mediaStore: fakeMediaStore(),
+          db: fakeDb(),
           config: { ...makeImageConfig(), upload: null } as never,
         }),
       /upload must be an object/,
@@ -179,7 +161,7 @@ describe('Resizer constructor — driver wiring', () => {
     assert.deepEqual(r.config.formats, ['webp']);
   });
 
-  test('the default media store loads from the Resizer’s own media model', async () => {
+  test('the default database loads from the Resizer’s own media model', async () => {
     const asked: string[] = [];
     resetAppInstance();
     setAppInstance({
@@ -196,8 +178,8 @@ describe('Resizer constructor — driver wiring', () => {
       config: makeResizeConfig({ mediaModelName: 'Photo' }),
     });
     const files = createFrameworkResizer(baseOpts());
-    await photos.mediaStore.load('m1');
-    await files.mediaStore.load('m2');
+    await photos.db.loadMedia('m1');
+    await files.db.loadMedia('m2');
     assert.deepEqual(asked, ['Photo', 'File']);
   });
 
@@ -294,14 +276,14 @@ describe('Resizer registry', () => {
     assert.doesNotThrow(() => createFrameworkResizer(baseOpts()));
   });
 
-  test('a named Resizer may have a transport', () => {
-    const transport = fakeTransport();
+  test('a named Resizer may have a task queue', () => {
+    const tasks = new MemoryTaskQueue();
     const listings = createFrameworkResizer({
       ...baseOpts(),
       name: 'listings',
-      transport,
+      tasks,
     });
-    assert.equal(listings.transport, transport);
+    assert.equal(listings.tasks, tasks);
   });
 
   test('queue defaults to "default" and can be set per Resizer', () => {
@@ -341,39 +323,31 @@ describe('Resizer registry', () => {
 
   test('explicit config, logger and drivers need no framework app', () => {
     resetAppInstance();
+    const db = fakeDb();
     const r = new Resizer({
       storage: fakeStorage(),
-      mediaStore: fakeMediaStore(),
-      transport: withLocks(undefined, fakeLockProvider()),
+      db,
       config: makeImageConfig(),
       logger: { info() {}, warn() {}, error() {} },
     });
     assert.equal(r.name, 'default');
+    assert.equal(r.db, db);
     assert.equal(getResizer(), r);
   });
 
-  test('a core Resizer requires mediaStore and a transport with locks; config defaults', () => {
+  test('a core Resizer requires a database but not a task queue; config defaults', () => {
     resetAppInstance();
-    const core = { storage: fakeStorage(), mediaStore: fakeMediaStore() };
+    const core = { storage: fakeStorage(), db: fakeDb() };
     const rejects = (opts: unknown, code: string) =>
       assert.throws(
         () => new Resizer(opts as never),
         (err: unknown) => err instanceof ResizeSetupError && err.code === code,
       );
-    rejects({ ...core, mediaStore: undefined }, 'RESIZE_MEDIA_STORE_REQUIRED');
-    rejects(
-      {
-        ...core,
-        transport: {
-          enqueue: async () => ({ taskId: null }),
-          startWorker: async () => {},
-        },
-      },
-      'RESIZE_LOCKS_REQUIRED',
-    );
+    rejects({ ...core, db: undefined }, 'RESIZE_DATABASE_REQUIRED');
     // None of the rejected constructions claimed the name; config defaults to the package's.
     const r = new Resizer(core);
     assert.equal(r.logger, console);
+    assert.equal(r.tasks, undefined);
     assert.deepEqual(r.config.formats, ['jpeg', 'webp', 'avif']);
   });
 

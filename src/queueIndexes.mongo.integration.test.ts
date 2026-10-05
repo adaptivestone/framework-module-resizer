@@ -8,16 +8,13 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from './contracts/storage.ts';
-import { FrameworkLockStore } from './framework/lockStore.ts';
+import { buildRequestKey } from './enqueue.ts';
+import { FrameworkDatabase } from './framework/database.ts';
 import ResizeTaskModel from './framework/ResizeTaskModel.ts';
-import {
-  createFrameworkMongoTransport,
-  createFrameworkResizer,
-} from './framework/resizer.ts';
+import { createFrameworkResizer } from './framework/resizer.ts';
 import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { withLocks } from './testHelpers/withLocks.ts';
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -30,7 +27,9 @@ function hasExactKey(key: unknown, expected: Record<string, number>): boolean {
 }
 
 async function createFixture(name: string) {
-  const server = await MongoMemoryServer.create();
+  const server = await MongoMemoryServer.create({
+    instance: { ip: '127.0.0.1' },
+  });
   const dbName = `resize_${name}_${process.pid}_${Date.now()}`;
   const connection = await mongoose
     .createConnection(server.getUri(), { autoIndex: false, dbName })
@@ -80,13 +79,15 @@ async function createFixture(name: string) {
     logger: { info() {}, warn() {}, error() {} },
   } as never);
 
+  const db = new FrameworkDatabase();
+  assert.ok(db.tasks);
   return {
     server,
     connection,
     taskModel,
     lockModel,
-    transport: createFrameworkMongoTransport(),
-    lockProvider: new FrameworkLockStore(),
+    db,
+    tasks: db.tasks,
   };
 }
 
@@ -103,14 +104,35 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
   const fixture = await createFixture('no_effects');
   try {
     const mediaId = new mongoose.Types.ObjectId().toString();
-    await fixture.transport.enqueue({
+    const { taskId } = await fixture.tasks.add({
       resizer: 'default',
       queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' }],
+      requestKey: 'index-side-effect-test',
     });
-    await fixture.lockProvider.acquire('resize_dispatch:test', 60_000);
+    assert.ok(taskId);
+    fixture.tasks.verify();
+    assert.equal(
+      await fixture.db.acquireLock('resize_dispatch:test', 60_000),
+      true,
+    );
+    const claimed = await fixture.tasks.claim('default', 60_000);
+    assert.ok(claimed);
+    assert.equal(await fixture.tasks.renew(claimed, 60_000), true);
+    assert.equal(
+      await fixture.tasks.fail(
+        claimed,
+        { retryAt: new Date(Date.now() - 1000) },
+        'retry',
+      ),
+      true,
+    );
+    const retried = await fixture.tasks.claim('default', 60_000);
+    assert.ok(retried);
+    assert.equal(await fixture.tasks.complete(retried), true);
+    await fixture.db.releaseLock('resize_dispatch:test');
 
     assert.deepEqual(
       (await fixture.taskModel.collection.listIndexes().toArray()).map(
@@ -172,7 +194,9 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
       previews: [{ sizeKey: '640x480', format: 'webp' as const }],
     };
     const receipts = await Promise.all(
-      Array.from({ length: 20 }, () => fixture.transport.enqueue(request)),
+      Array.from({ length: 20 }, () =>
+        fixture.tasks.add({ ...request, requestKey: buildRequestKey(request) }),
+      ),
     );
     const taskIds = receipts.map(({ taskId }) => taskId);
     assert.ok(taskIds.every((taskId) => typeof taskId === 'string' && taskId));
@@ -207,7 +231,7 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
 
     const identity = getPreviewIdentity(DEFAULT_SCOPE, '30w', 'webp');
     assert.equal(
-      await fixture.lockProvider.acquire(
+      await fixture.db.acquireLock(
         `resize_dispatch:${mediaId}:${identity}`,
         60_000,
       ),
@@ -216,7 +240,8 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
 
     const resizer = createFrameworkResizer({
       storage,
-      transport: withLocks(fixture.transport, fixture.lockProvider),
+      db: fixture.db,
+      tasks: true,
     });
     const result = await resizer.prewarm({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },

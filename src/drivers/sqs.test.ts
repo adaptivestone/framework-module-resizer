@@ -1,29 +1,27 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
-import {
-  resetAppInstance,
-  setAppInstance,
-} from '@adaptivestone/framework/helpers/appInstance.js';
+import type { SQSClient } from '@aws-sdk/client-sqs';
+import type {
+  ClaimedTask,
+  LeasedTask,
+  NewTask,
+  TaskEventHandler,
+} from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { createFrameworkResizer } from '../framework/resizer.ts';
-import {
-  type LeasedTask,
-  resetResizerForTests,
-  type TaskEventHandler,
-} from '../resizer.ts';
-import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
-import { memoryLocks } from '../testHelpers/withLocks.ts';
-import type { MissingPreview } from '../types.d.ts';
-import { SqsTransport } from './sqs.ts';
+import { consumeQueue, timingOf } from '../queue.ts';
+import { Resizer, resetResizerForTests } from '../resizer.ts';
+import { fakeDb } from '../testHelpers/fakes.ts';
+import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
+import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
+import { SqsTaskQueue } from './sqs.ts';
 
-// No live AWS and NO test-only seam in the driver. The driver statically imports
-// `@aws-sdk/client-sqs` for the command classes and `sqs-consumer` for the Consumer (both
-// installed as devDeps here), but the CLIENT is a legitimate public option (`client?:
-// SQSClient`) — bring-your-own configured instance. We pass a fake client whose recording
-// `send(cmd)` inspects the REAL command's `constructor.name` + `cmd.input`. For `startWorker`
-// we drive the REAL `sqs-consumer` (which natively accepts an injected `sqs` client) through
-// a fake implementing the ReceiveMessage → handler → DeleteMessage round-trip.
-
+// No live AWS or test-only driver seam: the public `client` option accepts this recording fake.
+// Route real SDK command classes by constructor name and supply canned outputs/errors.
+type CommandName =
+  | 'SendMessageCommand'
+  | 'ReceiveMessageCommand'
+  | 'DeleteMessageCommand'
+  | 'ChangeMessageVisibilityCommand';
 interface FakeCommand {
   input: Record<string, unknown>;
   constructor: { name: string };
@@ -32,132 +30,172 @@ interface FakeMessage {
   MessageId?: string;
   Body?: string;
   ReceiptHandle?: string;
+  Attributes?: { ApproximateReceiveCount?: string };
 }
-
-// A recording fake SQS client covering both the enqueue path (SendMessageCommand) and the
-// consumer poll loop (ReceiveMessage → one message, then empties; DeleteMessage / ChangeVis
-// recorded). Routes on the REAL command's `constructor.name`.
 function makeFakeSqsClient(
-  opts: { messageId?: string; message?: FakeMessage } = {},
+  opts: {
+    messageId?: string;
+    message?: FakeMessage;
+    outputs?: Partial<Record<CommandName, (Record<string, unknown> | Error)[]>>;
+  } = {},
 ) {
+  const commands: FakeCommand[] = [];
   const sent: FakeCommand[] = [];
   const deletes: Record<string, unknown>[] = [];
   const changeVis: Record<string, unknown>[] = [];
   const receiveParams: Record<string, unknown>[] = [];
+  const receiveOptions: { abortSignal?: AbortSignal }[] = [];
+  const outputs = Object.fromEntries(
+    Object.entries(opts.outputs ?? {}).map(([name, values]) => [
+      name,
+      [...values],
+    ]),
+  );
   let delivered = false;
   const client = {
-    async send(command: FakeCommand) {
-      switch (command.constructor.name) {
+    async send(
+      command: FakeCommand,
+      options: { abortSignal?: AbortSignal } = {},
+    ) {
+      const name = command.constructor.name;
+      commands.push(command);
+      switch (name) {
         case 'ReceiveMessageCommand':
           receiveParams.push(command.input);
-          if (opts.message && !delivered) {
-            delivered = true;
-            return { Messages: [opts.message] };
-          }
-          return {}; // empty poll
+          receiveOptions.push(options);
+          break;
         case 'DeleteMessageCommand':
           deletes.push(command.input);
-          return {};
+          break;
         case 'ChangeMessageVisibilityCommand':
           changeVis.push(command.input);
-          return {};
-        default: // SendMessageCommand (enqueue)
+          break;
+        case 'SendMessageCommand':
           sent.push(command);
-          return { MessageId: opts.messageId };
+          break;
+        default:
+          throw new Error(`unexpected SQS command ${name}`);
       }
+      const output = outputs[name]?.shift();
+      if (output instanceof Error) {
+        throw output;
+      }
+      if (output !== undefined) {
+        return output;
+      }
+      if (name === 'ReceiveMessageCommand' && opts.message && !delivered) {
+        delivered = true;
+        return { Messages: [opts.message] };
+      }
+      return name === 'SendMessageCommand' ? { MessageId: opts.messageId } : {};
     },
+  } as unknown as SQSClient;
+  return {
+    client,
+    commands,
+    sent,
+    deletes,
+    changeVis,
+    receiveParams,
+    receiveOptions,
   };
-  return { client, sent, deletes, changeVis, receiveParams };
 }
-
 const variant = (over: Partial<MissingPreview> = {}): MissingPreview => ({
   sizeKey: '300x300',
   format: 'jpeg',
   ...over,
 });
-
-function installFakeApp() {
+const newTask = (over: Partial<NewTask> = {}): NewTask => ({
+  resizer: 'default',
+  queue: 'default',
+  mediaId: 'm1',
+  pipeline: 'photo',
+  previews: [variant()],
+  requestKey: 'request-key',
+  ...over,
+});
+const message = (over: Partial<FakeMessage> = {}): FakeMessage => ({
+  MessageId: 'mid',
+  ReceiptHandle: 'rh',
+  Body: JSON.stringify({
+    mediaId: 'm1',
+    pipeline: 'photo',
+    previews: [variant()],
+  }),
+  ...over,
+});
+const claimedTask = (over: Partial<ClaimedTask> = {}): ClaimedTask => ({
+  taskId: 'mid',
+  resizer: 'default',
+  queue: 'default',
+  mediaId: 'm1',
+  pipeline: 'photo',
+  previews: [variant()],
+  token: JSON.stringify(['q', 'rh']),
+  attempts: 1,
+  ...over,
+});
+function recordingLogger() {
   const errors: unknown[][] = [];
   const logger = {
     info() {},
     warn() {},
-    error(...a: unknown[]) {
-      errors.push(a);
+    error(...args: unknown[]) {
+      errors.push(args);
     },
   };
-  setAppInstance({
-    getConfig: () => makeResizeConfig(),
-    getModel: () => ({}),
-    logger,
-  } as never);
   return { errors, logger };
 }
-
-// Task events are reported through the startWorker `onEvent` callback (the worker routes them
-// to the owning Resizer's observers); this recorder stands in for it.
 interface Recorder {
   completed: { task: LeasedTask }[];
   failed: { task: LeasedTask; err: unknown }[];
+  deadLettered: { task: LeasedTask; err: unknown }[];
   onEvent: TaskEventHandler;
 }
 function makeEvents(): Recorder {
-  const rec = { completed: [], failed: [] } as unknown as Recorder;
+  const rec: Recorder = {
+    completed: [],
+    failed: [],
+    deadLettered: [],
+    onEvent: () => {},
+  };
   rec.onEvent = (event, task, error) => {
     if (event === 'completed') {
       rec.completed.push({ task });
-    }
-    if (event === 'failed') {
-      rec.failed.push({ task, err: error });
+    } else {
+      rec[event].push({ task, err: error });
     }
   };
   return rec;
 }
-
 const BULK_URL = 'https://q/bulk';
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function waitForReal(
-  pred: () => boolean,
-  {
-    timeoutMs = 2000,
-    stepMs = 5,
-  }: { timeoutMs?: number; stepMs?: number } = {},
-) {
+const DEAD_URL = 'https://q/dead';
+const fastTiming: Partial<QueueTimingOptions> = {
+  idlePollMs: 1,
+  retryBackoffMs: { base: 1000, max: 1000 },
+};
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitForReal(pred: () => boolean) {
   const start = Date.now();
   while (!pred()) {
-    if (Date.now() - start > timeoutMs) {
+    if (Date.now() - start > 2000) {
       throw new Error('waitForReal timed out');
     }
-    await sleep(stepMs);
+    await sleep(5);
   }
 }
+afterEach(resetResizerForTests);
 
-afterEach(() => {
-  resetResizerForTests();
-  resetAppInstance();
-});
-
-// ---------------------------------------------------------------------------
-// enqueue (05 · §10.3) — via the fake client passed as the `client` option
-// ---------------------------------------------------------------------------
-
-describe('SqsTransport.enqueue', () => {
+describe('SqsTaskQueue.add', () => {
   test('sends the default queue to opts.queueUrl with the task JSON body and returns MessageId', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'mid-1' });
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+    const tasks = new SqsTaskQueue({
       queueUrl: 'https://q/url',
       region: 'us-east-1',
       queues: { bulk: BULK_URL },
       client,
     });
-    const res = await t.enqueue({
-      resizer: 'default',
-      queue: 'default',
-      mediaId: 'm1',
-      pipeline: 'photo',
-      previews: [variant()],
-    });
+    const res = await tasks.add(newTask());
     assert.equal(res.taskId, 'mid-1');
     assert.equal(sent[0].input.QueueUrl, 'https://q/url');
     assert.deepEqual(JSON.parse(String(sent[0].input.MessageBody)), {
@@ -168,40 +206,24 @@ describe('SqsTransport.enqueue', () => {
       previews: [variant()],
     });
   });
-
   test('a named queue is sent to its URL from `queues`, and the body names resizer and queue', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'mid-2' });
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+    const tasks = new SqsTaskQueue({
       queueUrl: 'https://q/url',
       queues: { bulk: BULK_URL },
       client,
     });
-    await t.enqueue({
-      resizer: 'listings',
-      queue: 'bulk',
-      mediaId: 'm1',
-      pipeline: 'photo',
-      previews: [variant()],
-    });
+    await tasks.add(newTask({ resizer: 'listings', queue: 'bulk' }));
     assert.equal(sent[0].input.QueueUrl, BULK_URL);
     const body = JSON.parse(String(sent[0].input.MessageBody));
     assert.equal(body.resizer, 'listings');
     assert.equal(body.queue, 'bulk');
   });
-
   test('an unknown queue rejects with RESIZE_SQS_QUEUE_UNKNOWN and sends nothing', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     await assert.rejects(
-      () =>
-        t.enqueue({
-          resizer: 'default',
-          queue: 'bulk',
-          mediaId: 'm1',
-          pipeline: 'p',
-          previews: [],
-        }),
+      () => tasks.add(newTask({ queue: 'bulk' })),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_SQS_QUEUE_UNKNOWN' &&
@@ -209,37 +231,25 @@ describe('SqsTransport.enqueue', () => {
     );
     assert.equal(sent.length, 0);
   });
-
   test('returns a null taskId when the send response has no MessageId', async () => {
-    const { client } = makeFakeSqsClient({ messageId: undefined });
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
-    const res = await t.enqueue({
-      resizer: 'default',
-      queue: 'default',
-      mediaId: 'm1',
-      pipeline: 'p',
-      previews: [],
-    });
-    assert.equal(res.taskId, null);
+    const { client } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    assert.equal((await tasks.add(newTask())).taskId, null);
   });
-
   test('prewarm accepts a successful SQS MessageId receipt', async () => {
-    installFakeApp();
     const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
-    const transport = new SqsTransport({
-      queueUrl: 'q',
-      client,
-      locks: { acquire: async () => true, release: async () => {} },
-    });
-    const r = createFrameworkResizer({
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const resizer = new Resizer({
+      config: makeImageConfig(),
       storage: {
         download: async () => Buffer.alloc(0),
         upload: async ({ key }) => ({ key }),
         publicUrl: () => '',
       },
-      transport,
+      db: fakeDb(),
+      tasks,
     });
-    const result = await r.prewarm({
+    const result = await resizer.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -247,24 +257,22 @@ describe('SqsTransport.enqueue', () => {
     assert.equal(result.status, 'accepted');
     assert.equal(result.tasks[0].taskId, 'mid-strict');
   });
-
   test('prewarm leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
-    installFakeApp();
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
-    const transport = new SqsTransport({
-      queueUrl: 'q',
-      client,
-      locks: { acquire: async () => false, release: async () => {} },
-    });
-    const r = createFrameworkResizer({
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const resizer = new Resizer({
+      config: makeImageConfig(),
       storage: {
         download: async () => Buffer.alloc(0),
         upload: async ({ key }) => ({ key }),
         publicUrl: () => '',
       },
-      transport,
+      db: fakeDb({
+        locks: { acquire: async () => false, release: async () => {} },
+      }),
+      tasks,
     });
-    const result = await r.prewarm({
+    const result = await resizer.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
@@ -275,404 +283,659 @@ describe('SqsTransport.enqueue', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// startWorker (05 · §10.3) — drives the REAL sqs-consumer with the fake client
-// ---------------------------------------------------------------------------
-
-describe('SqsTransport.startWorker', () => {
-  test('a resolving handleTask reports completed and acks (DeleteMessage on the receipt handle)', async () => {
-    installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh-1',
-      Body: JSON.stringify({
-        mediaId: 'm1',
-        pipeline: 'photo',
-        previews: [variant()],
-      }),
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    const seen: unknown[] = [];
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
-    const rec = makeEvents();
-    const ctrl = new AbortController();
-    const p = t.startWorker(
-      async (task) => {
-        seen.push(task);
-      },
-      { signal: ctrl.signal, queue: 'default', onEvent: rec.onEvent },
-    );
-    // The ack (DeleteMessage) is sent AFTER handleMessage returns, i.e. after the completed
-    // event was reported — so a delivered delete proves the whole round-trip.
-    await waitForReal(() => deletes.length >= 1);
-    assert.equal(deletes[0].ReceiptHandle, 'rh-1');
-    assert.equal(rec.completed.length, 1);
-    assert.equal(seen.length, 1);
-    assert.equal(rec.completed[0].task.mediaId, 'm1');
-    ctrl.abort();
-    await p;
-  });
-
-  test('a throwing handleTask reports failed with the ORIGINAL error and does NOT ack (SQS redelivers)', async () => {
-    installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh',
-      Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    const boom = new Error('handler boom');
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
-    const rec = makeEvents();
-    const ctrl = new AbortController();
-    const p = t.startWorker(
-      async () => {
-        throw boom;
-      },
-      { signal: ctrl.signal, queue: 'default', onEvent: rec.onEvent },
-    );
-    await waitForReal(() => rec.failed.length >= 1);
-    assert.equal(rec.failed[0].err, boom); // the original error reaches the event callback
-    assert.equal(rec.completed.length, 0);
-    await sleep(20); // let a couple more polls run — still no ack
-    assert.equal(deletes.length, 0); // not deleted → left for SQS to redeliver
-    ctrl.abort();
-    await p;
-  });
-
-  test('a recurring consumer error is logged EVERY time (on, not once)', async () => {
-    // Recurring consumer errors (e.g. heartbeat ChangeMessageVisibility failures) must all be
-    // logged: `once` would capture only the FIRST and drop every later one (05 · §10.3 fix a).
-    const { errors, logger } = installFakeApp();
-    let polls = 0;
-    const client = {
-      async send(command: FakeCommand) {
-        if (command.constructor.name === 'ReceiveMessageCommand') {
-          polls += 1;
-          throw new Error(`poll fail ${polls}`);
-        }
-        return {};
-      },
-    };
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+describe('SqsTaskQueue.claim', () => {
+  test('a malformed message body is logged and left for SQS redelivery without calling the handler', async (t) => {
+    // Malformed messages never become tasks, so claim logs them without task events.
+    const { errors, logger } = recordingLogger();
+    const { client, deletes } = makeFakeSqsClient({
+      message: message({ Body: 'not json{{{' }),
+    });
+    const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       client,
       logger,
+      timing: fastTiming,
     });
+    const rec = makeEvents();
+    let handlerCalls = 0;
     const ctrl = new AbortController();
-    const p = t.startWorker(async () => {}, {
+    const loop = consumeQueue(tasks, {
       signal: ctrl.signal,
       queue: 'default',
-    });
-    const consumerErrors = () =>
-      errors.filter((e) => e[0] === 'resize sqs consumer error');
-    await waitForReal(() => consumerErrors().length >= 2);
-    assert.ok(consumerErrors().length >= 2);
-    ctrl.abort();
-    await p;
-  });
-
-  test('a malformed message body reports failed then rethrows (no ack; SQS redelivers)', async () => {
-    // The body JSON.parse runs INSIDE the guarded region: a malformed body reports failed
-    // before rethrowing, consistent with a handler throw.
-    installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh',
-      Body: 'not json{{{',
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    let handlerCalls = 0;
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
-    const rec = makeEvents();
-    const ctrl = new AbortController();
-    const p = t.startWorker(
-      async () => {
+      handle: async () => {
         handlerCalls += 1;
       },
-      { signal: ctrl.signal, queue: 'default', onEvent: rec.onEvent },
-    );
-    await waitForReal(() => rec.failed.length >= 1);
-    assert.equal(handlerCalls, 0); // parse failed before the handler ran
-    assert.equal(rec.completed.length, 0);
-    await sleep(20);
-    assert.equal(deletes.length, 0); // not acked → left for SQS to redeliver
-    ctrl.abort();
-    await p;
-  });
-
-  test('aborting opts.signal stops the consumer and resolves startWorker', async () => {
-    installFakeApp();
-    const { client, receiveParams } = makeFakeSqsClient({});
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
-    const ctrl = new AbortController();
-    const p = t.startWorker(async () => {}, {
-      signal: ctrl.signal,
-      queue: 'default',
+      onEvent: rec.onEvent,
+      logger,
     });
-    await waitForReal(() => receiveParams.length >= 1); // consumer started + polling
-    ctrl.abort();
-    await p; // resolves only when the consumer emits 'stopped'
-    assert.ok(receiveParams.length >= 1);
+    t.after(async () => {
+      ctrl.abort();
+      await loop;
+    });
+    await waitForReal(() => errors.length >= 1);
+    assert.equal(handlerCalls, 0);
+    assert.deepEqual(rec.completed, []);
+    assert.deepEqual(rec.failed, []);
+    assert.deepEqual(rec.deadLettered, []);
+    assert.equal(deletes.length, 0);
+    assert.match(String(errors[0][0]), /malformed task body.*mid/);
   });
-
-  test('passes visibilityTimeout to the consumer (observed in ReceiveMessage params) — absent when not provided', async () => {
-    installFakeApp();
-    const { client, receiveParams } = makeFakeSqsClient({});
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+  test('uses the lease as visibility timeout, including the default queue timing', async () => {
+    const { client, receiveParams } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({
       queueUrl: 'q',
-      visibilityTimeout: 30,
       client,
-    });
-    const ctrl = new AbortController();
-    const p = t.startWorker(async () => {}, {
-      signal: ctrl.signal,
-      queue: 'default',
-    });
-    await waitForReal(() => receiveParams.length >= 1);
-    assert.equal(receiveParams[0].VisibilityTimeout, 30);
-    ctrl.abort();
-    await p;
-
-    resetResizerForTests();
-    const { client: client2, receiveParams: rp2 } = makeFakeSqsClient({});
-    const t2 = new SqsTransport({
-      locks: memoryLocks(),
-      queueUrl: 'q',
-      client: client2,
-    });
-    const ctrl2 = new AbortController();
-    const p2 = t2.startWorker(async () => {}, {
-      signal: ctrl2.signal,
-      queue: 'default',
-    });
-    await waitForReal(() => rp2.length >= 1);
-    assert.equal(rp2[0].VisibilityTimeout, undefined);
-    ctrl2.abort();
-    await p2;
-  });
-
-  test('passes heartbeatInterval to the consumer (heartbeat renews visibility while processing)', async () => {
-    installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh',
-      Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
-    };
-    const { client, changeVis, deletes } = makeFakeSqsClient({ message });
-    // sqs-consumer validation requires heartbeatInterval < visibilityTimeout; a 10ms heartbeat
-    // renews visibility repeatedly while the (gated) handler is in flight.
-    const t = new SqsTransport({
-      locks: memoryLocks(),
-      queueUrl: 'q',
-      visibilityTimeout: 1,
-      heartbeatInterval: 0.01,
-      client,
-    });
-    let release!: () => void;
-    const gate = new Promise<void>((r) => {
-      release = r;
-    });
-    const ctrl = new AbortController();
-    const p = t.startWorker(
-      async () => {
-        await gate;
+      timing: {
+        leaseMs: 30_000,
+        lockTtlMs: { dispatch: 60_000, worker: 30_000 },
       },
-      { signal: ctrl.signal, queue: 'default' },
-    );
-    // A ChangeMessageVisibility while the handler is gated proves heartbeatInterval was wired.
-    await waitForReal(() => changeVis.length >= 1);
-    assert.equal(changeVis[0].VisibilityTimeout, 1); // renews to the configured visibilityTimeout
-    release(); // let the handler finish → heartbeat interval cleared → message acked
-    await waitForReal(() => deletes.length >= 1);
-    ctrl.abort();
-    await p;
+    });
+    await tasks.claim('default', timingOf(tasks).leaseMs);
+    assert.equal(receiveParams[0].VisibilityTimeout, 30);
+    const { client: client2, receiveParams: receiveParams2 } =
+      makeFakeSqsClient();
+    const defaults = new SqsTaskQueue({ queueUrl: 'q', client: client2 });
+    await defaults.claim('default', timingOf(defaults).leaseMs);
+    assert.equal(receiveParams2[0].VisibilityTimeout, 60);
   });
-
   test('a named queue is consumed from its URL in `queues`', async () => {
-    installFakeApp();
-    const { client, receiveParams } = makeFakeSqsClient({});
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+    const { client, receiveParams } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       queues: { bulk: BULK_URL },
       client,
     });
-    const ctrl = new AbortController();
-    const p = t.startWorker(async () => {}, {
-      signal: ctrl.signal,
-      queue: 'bulk',
-    });
-    await waitForReal(() => receiveParams.length >= 1);
+    await tasks.claim('bulk', 60_000);
     assert.equal(receiveParams[0].QueueUrl, BULK_URL);
-    ctrl.abort();
-    await p;
   });
-
   test('an unknown queue rejects with RESIZE_SQS_QUEUE_UNKNOWN before polling', async () => {
-    installFakeApp();
-    const { client, receiveParams } = makeFakeSqsClient({});
-    const t = new SqsTransport({ locks: memoryLocks(), queueUrl: 'q', client });
+    const { client, receiveParams } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     await assert.rejects(
-      () =>
-        t.startWorker(async () => {}, {
-          signal: new AbortController().signal,
-          queue: 'bulk',
-        }),
+      () => tasks.claim('bulk', 60_000),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_SQS_QUEUE_UNKNOWN',
     );
     assert.equal(receiveParams.length, 0);
   });
-
-  test('a body naming resizer and queue becomes the leased task', async () => {
-    installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh',
-      Body: JSON.stringify({
+  test('a body naming resizer and queue becomes the claimed task with its receipt and attempt count', async () => {
+    const { client, receiveParams, receiveOptions } = makeFakeSqsClient({
+      message: message({
+        Body: JSON.stringify({
+          resizer: 'listings',
+          queue: 'bulk',
+          mediaId: 'm1',
+          pipeline: 'photo',
+          previews: [variant()],
+        }),
+        Attributes: { ApproximateReceiveCount: '3' },
+      }),
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      queues: { bulk: BULK_URL },
+      client,
+      waitTimeSeconds: 7,
+    });
+    const ctrl = new AbortController();
+    const task = await tasks.claim('bulk', 1250, ctrl.signal);
+    assert.deepEqual(
+      task,
+      claimedTask({
         resizer: 'listings',
         queue: 'bulk',
-        mediaId: 'm1',
-        pipeline: 'p',
-        previews: [],
+        token: JSON.stringify([BULK_URL, 'rh']),
+        attempts: 3,
       }),
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    const seen: LeasedTask[] = [];
-    const t = new SqsTransport({
-      locks: memoryLocks(),
-      queueUrl: 'q',
-      queues: { bulk: BULK_URL },
-      client,
-    });
-    const ctrl = new AbortController();
-    const p = t.startWorker(
-      async (task) => {
-        seen.push(task);
-      },
-      { signal: ctrl.signal, queue: 'bulk' },
     );
-    await waitForReal(() => deletes.length >= 1);
-    assert.equal(seen[0].resizer, 'listings');
-    assert.equal(seen[0].queue, 'bulk');
-    ctrl.abort();
-    await p;
+    assert.deepEqual(receiveParams[0], {
+      QueueUrl: BULK_URL,
+      MaxNumberOfMessages: 1,
+      WaitTimeSeconds: 7,
+      VisibilityTimeout: 2,
+      MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+    });
+    assert.equal(receiveOptions[0].abortSignal, ctrl.signal);
   });
-
   test('a body without resizer/queue reads as the default Resizer on the consumed queue', async () => {
-    installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh',
-      Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+    const { client } = makeFakeSqsClient({ message: message() });
+    const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       queues: { bulk: BULK_URL },
       client,
     });
-    const rec = makeEvents();
-    const ctrl = new AbortController();
-    const p = t.startWorker(async () => {}, {
-      signal: ctrl.signal,
-      queue: 'bulk',
-      onEvent: rec.onEvent,
-    });
-    await waitForReal(() => deletes.length >= 1);
-    assert.equal(rec.completed[0].task.resizer, 'default');
-    assert.equal(rec.completed[0].task.queue, 'bulk');
-    ctrl.abort();
-    await p;
+    const task = await tasks.claim('bulk', 60_000);
+    assert.equal(task.resizer, 'default');
+    assert.equal(task.queue, 'bulk');
+    assert.equal(task.attempts, 1);
   });
-
-  test('a throwing onEvent after success is logged and the message is still acked', async () => {
-    const { errors, logger } = installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh-ok',
-      Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({
-      locks: memoryLocks(),
+  test('long-polls 10 seconds by default, and the queue named in the body wins', async () => {
+    const { client, receiveParams } = makeFakeSqsClient({
+      message: message({
+        Body: JSON.stringify({
+          resizer: 'listings',
+          queue: 'bulk',
+          mediaId: 'm1',
+          pipeline: 'photo',
+          previews: [variant()],
+        }),
+      }),
+    });
+    const tasks = new SqsTaskQueue({
       queueUrl: 'q',
+      queues: { bulk: BULK_URL },
       client,
-      logger,
     });
-    const ctrl = new AbortController();
-    const p = t.startWorker(async () => {}, {
-      signal: ctrl.signal,
-      queue: 'default',
-      onEvent: () => {
-        throw new Error('observer bug');
-      },
-    });
-    await waitForReal(() => deletes.length >= 1);
-    assert.equal(deletes[0].ReceiptHandle, 'rh-ok');
-    assert.ok(
-      errors.some((e) => e[0] === 'resize sqs: completed event handler failed'),
-    );
-    ctrl.abort();
-    await p;
+    const task = await tasks.claim('default', 60_000);
+    assert.equal(receiveParams[0].WaitTimeSeconds, 10);
+    assert.equal(receiveParams[0].QueueUrl, 'q');
+    assert.equal(task?.queue, 'bulk');
   });
-
-  test('a throwing onEvent after a handler failure is logged and the message is still not acked', async () => {
-    const { errors, logger } = installFakeApp();
-    const message: FakeMessage = {
-      MessageId: 'mid',
-      ReceiptHandle: 'rh',
-      Body: JSON.stringify({ mediaId: 'm1', pipeline: 'p', previews: [] }),
-    };
-    const { client, deletes } = makeFakeSqsClient({ message });
-    const t = new SqsTransport({
-      locks: memoryLocks(),
-      queueUrl: 'q',
-      client,
-      logger,
+  test('empty receives and messages without a receipt handle return null', async () => {
+    const { client } = makeFakeSqsClient({
+      message: message({ ReceiptHandle: undefined }),
     });
-    let handlerCalls = 0;
-    const ctrl = new AbortController();
-    const p = t.startWorker(
-      async () => {
-        handlerCalls += 1;
-        throw new Error('handler boom');
-      },
-      {
-        signal: ctrl.signal,
-        queue: 'default',
-        onEvent: async () => {
-          throw new Error('observer bug');
-        },
-      },
-    );
-    await waitForReal(() =>
-      errors.some((e) => e[0] === 'resize sqs: failed event handler failed'),
-    );
-    await sleep(20); // a couple more polls — still no ack
-    assert.equal(handlerCalls, 1);
-    assert.equal(deletes.length, 0);
-    ctrl.abort();
-    await p;
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    assert.equal(await tasks.claim('default', 60_000), null);
+    assert.equal(await tasks.claim('default', 60_000), null);
+  });
+  test('a missing MessageId falls back to the receipt handle', async () => {
+    const { client } = makeFakeSqsClient({
+      message: message({ MessageId: undefined }),
+    });
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    assert.equal((await tasks.claim('default', 60_000)).taskId, 'rh');
+  });
+  test('malformed task bodies go to the configured dead-letter queue before deletion', async () => {
+    for (const body of ['not json{{{', JSON.stringify({ mediaId: 'm1' })]) {
+      const { client, commands, sent, deletes } = makeFakeSqsClient({
+        message: message({ Body: body }),
+      });
+      const { logger } = recordingLogger();
+      const tasks = new SqsTaskQueue({
+        queueUrl: 'q',
+        client,
+        logger,
+        deadLetterQueueUrl: DEAD_URL,
+      });
+      assert.equal(await tasks.claim('default', 60_000), null);
+      assert.deepEqual(
+        commands.map((cmd) => cmd.constructor.name),
+        ['ReceiveMessageCommand', 'SendMessageCommand', 'DeleteMessageCommand'],
+      );
+      assert.deepEqual(sent[0].input, {
+        QueueUrl: DEAD_URL,
+        MessageBody: body,
+      });
+      assert.deepEqual(deletes[0], { QueueUrl: 'q', ReceiptHandle: 'rh' });
+    }
   });
 });
 
-describe('SqsTransport options', () => {
+describe('SqsTaskQueue lease operations', () => {
+  test('renew and complete use the queue URL and receipt in the token', async () => {
+    const { client, changeVis, deletes } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const task = claimedTask({
+      queue: 'bulk',
+      token: JSON.stringify([BULK_URL, 'bulk-rh']),
+    });
+    assert.equal(await tasks.renew(task, 1250), true);
+    assert.deepEqual(changeVis[0], {
+      QueueUrl: BULK_URL,
+      ReceiptHandle: 'bulk-rh',
+      VisibilityTimeout: 2,
+    });
+    assert.equal(await tasks.complete(task), true);
+    assert.deepEqual(deletes[0], {
+      QueueUrl: BULK_URL,
+      ReceiptHandle: 'bulk-rh',
+    });
+  });
+  test('retry changes visibility to the retry delay without deleting the message', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+    const { client, changeVis, deletes } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    for (const [delayMs, visibility] of [
+      [1250, 2],
+      [-1000, 0],
+      [43_200_001, 43_200],
+    ]) {
+      assert.equal(
+        await tasks.fail(
+          claimedTask(),
+          { retryAt: new Date(Date.now() + delayMs) },
+          'retry',
+        ),
+        true,
+      );
+      assert.deepEqual(changeVis.at(-1), {
+        QueueUrl: 'q',
+        ReceiptHandle: 'rh',
+        VisibilityTimeout: visibility,
+      });
+    }
+    assert.equal(deletes.length, 0);
+  });
+  test('a dead task is sent with its error and attempt count before deletion', async () => {
+    const { client, commands, sent, deletes } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      deadLetterQueueUrl: DEAD_URL,
+    });
+    assert.equal(
+      await tasks.fail(claimedTask({ attempts: 5 }), 'dead', 'handler boom'),
+      true,
+    );
+    assert.deepEqual(
+      commands.map((cmd) => cmd.constructor.name),
+      ['SendMessageCommand', 'DeleteMessageCommand'],
+    );
+    assert.equal(sent[0].input.QueueUrl, DEAD_URL);
+    assert.deepEqual(JSON.parse(String(sent[0].input.MessageBody)), {
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'photo',
+      previews: [variant()],
+      attempts: 5,
+      error: 'handler boom',
+    });
+    assert.deepEqual(deletes[0], { QueueUrl: 'q', ReceiptHandle: 'rh' });
+  });
+  test('a dead task whose lease was lost keeps its dead-letter copy and reports false', async () => {
+    const { client, sent, deletes } = makeFakeSqsClient({
+      outputs: {
+        DeleteMessageCommand: [
+          Object.assign(new Error('lease lost'), {
+            name: 'ReceiptHandleIsInvalid',
+          }),
+        ],
+      },
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      deadLetterQueueUrl: DEAD_URL,
+    });
+    assert.equal(
+      await tasks.fail(claimedTask(), 'dead', 'handler boom'),
+      false,
+    );
+    // copied before the delete: a duplicate in the dead-letter queue, never a lost task
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].input.QueueUrl, DEAD_URL);
+    assert.equal(deletes.length, 1);
+  });
+  test('a dead task without a dead-letter queue is logged and deleted', async () => {
+    const { client, deletes, sent } = makeFakeSqsClient();
+    const { logger, errors } = recordingLogger();
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client, logger });
+    assert.equal(await tasks.fail(claimedTask(), 'dead', 'handler boom'), true);
+    assert.equal(sent.length, 0);
+    assert.equal(deletes.length, 1);
+    assert.match(
+      String(errors[0][0]),
+      /mid is dead.*no deadLetterQueueUrl.*handler boom/,
+    );
+  });
+  test('lost receipt errors report false for renew, complete, and fail', async () => {
+    for (const name of [
+      'ReceiptHandleIsInvalid',
+      'MessageNotInflight',
+      'InvalidParameterValue',
+    ]) {
+      for (const operation of ['renew', 'complete', 'retry', 'dead']) {
+        const command =
+          operation === 'renew' || operation === 'retry'
+            ? 'ChangeMessageVisibilityCommand'
+            : 'DeleteMessageCommand';
+        const { client } = makeFakeSqsClient({
+          outputs: {
+            [command]: [Object.assign(new Error('lease lost'), { name })],
+          },
+        });
+        const { logger } = recordingLogger();
+        const tasks = new SqsTaskQueue({ queueUrl: 'q', client, logger });
+        const task = claimedTask();
+        const held =
+          operation === 'renew'
+            ? await tasks.renew(task, 60_000)
+            : operation === 'complete'
+              ? await tasks.complete(task)
+              : await tasks.fail(
+                  task,
+                  operation === 'dead' ? 'dead' : { retryAt: new Date() },
+                  'failed',
+                );
+        assert.equal(held, false, `${operation}: ${name}`);
+      }
+    }
+  });
+  test('operational errors propagate and a failed dead-letter send leaves the message undeleted', async () => {
+    const boom = new Error('AWS unavailable');
+    const { client, deletes } = makeFakeSqsClient({
+      outputs: {
+        ChangeMessageVisibilityCommand: [boom, boom],
+        DeleteMessageCommand: [boom],
+        SendMessageCommand: [boom],
+      },
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      deadLetterQueueUrl: DEAD_URL,
+    });
+    await assert.rejects(
+      () => tasks.renew(claimedTask(), 60_000),
+      (err) => err === boom,
+    );
+    await assert.rejects(
+      () => tasks.complete(claimedTask()),
+      (err) => err === boom,
+    );
+    await assert.rejects(
+      () => tasks.fail(claimedTask(), { retryAt: new Date() }, 'failed'),
+      (err) => err === boom,
+    );
+    await assert.rejects(
+      () => tasks.fail(claimedTask(), 'dead', 'failed'),
+      (err) => err === boom,
+    );
+    assert.equal(deletes.length, 1); // Only the attempted complete, before the dead-letter failure.
+  });
+});
+
+describe('consumeQueue with SqsTaskQueue', () => {
+  test('a resolving handler reports completed and deletes the receipt handle', async () => {
+    const { client, deletes } = makeFakeSqsClient({
+      message: message({ ReceiptHandle: 'rh-1' }),
+    });
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const rec = makeEvents();
+    const seen: LeasedTask[] = [];
+    const ctrl = new AbortController();
+    let deletesAtEvent = 0;
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async (task) => {
+        seen.push(task);
+      },
+      onEvent: async (event, task, error) => {
+        deletesAtEvent = deletes.length;
+        await rec.onEvent(event, task, error);
+        ctrl.abort();
+      },
+    });
+    assert.deepEqual(deletes[0], { QueueUrl: 'q', ReceiptHandle: 'rh-1' });
+    assert.equal(deletesAtEvent, 1); // The event follows confirmed completion.
+    assert.equal(rec.completed.length, 1);
+    assert.deepEqual(seen, [rec.completed[0].task]);
+    assert.deepEqual(seen[0], {
+      taskId: 'mid',
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'photo',
+      previews: [variant()],
+    });
+  });
+  test('a throwing handler reports failed with the original error and schedules redelivery without deletion', async () => {
+    const { client, deletes, changeVis } = makeFakeSqsClient({
+      message: message(),
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: fastTiming,
+    });
+    const rec = makeEvents();
+    const boom = new Error('handler boom');
+    const ctrl = new AbortController();
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async () => {
+        throw boom;
+      },
+      onEvent: async (event, task, error) => {
+        await rec.onEvent(event, task, error);
+        ctrl.abort();
+      },
+    });
+    assert.equal(rec.failed[0].err, boom);
+    assert.equal(rec.completed.length, 0);
+    assert.equal(deletes.length, 0);
+    assert.deepEqual(changeVis[0], {
+      QueueUrl: 'q',
+      ReceiptHandle: 'rh',
+      VisibilityTimeout: 1,
+    });
+  });
+  test('recurring claim errors are logged every time and the core keeps polling', async () => {
+    const boom1 = new Error('poll fail 1');
+    const boom2 = new Error('poll fail 2');
+    const { client, receiveParams } = makeFakeSqsClient({
+      outputs: { ReceiveMessageCommand: [boom1, boom2] },
+    });
+    const { errors, logger } = recordingLogger();
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: fastTiming,
+    });
+    const ctrl = new AbortController();
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async () => {},
+      logger: {
+        ...logger,
+        error: (...args) => {
+          logger.error(...args);
+          if (errors.length === 2) {
+            ctrl.abort();
+          }
+        },
+      },
+    });
+    assert.equal(receiveParams.length, 2);
+    assert.deepEqual(
+      errors.map((entry) => entry[1]),
+      [boom1, boom2],
+    );
+    assert.ok(
+      errors.every((entry) =>
+        String(entry[0]).includes('claiming a task failed'),
+      ),
+    );
+  });
+  test('aborting opts.signal stops polling and resolves consumeQueue', async (t) => {
+    const { client, receiveParams, receiveOptions } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: fastTiming,
+    });
+    const ctrl = new AbortController();
+    const loop = consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async () => {},
+    });
+    t.after(async () => {
+      ctrl.abort();
+      await loop;
+    });
+    await waitForReal(() => receiveParams.length >= 1);
+    ctrl.abort();
+    await loop;
+    const polls = receiveParams.length;
+    await sleep(5);
+    assert.equal(receiveParams.length, polls);
+    assert.equal(receiveOptions[0].abortSignal, ctrl.signal);
+  });
+  test('the core heartbeat renews visibility at half the lease while processing', async (t) => {
+    const { client, changeVis, deletes } = makeFakeSqsClient({
+      message: message(),
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: {
+        ...fastTiming,
+        leaseMs: 20,
+        lockTtlMs: { dispatch: 20, worker: 20 },
+      },
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ctrl = new AbortController();
+    const loop = consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async () => {
+        await gate;
+      },
+      onEvent: () => ctrl.abort(),
+    });
+    t.after(async () => {
+      release();
+      ctrl.abort();
+      await loop;
+    });
+    await waitForReal(() => changeVis.length >= 1);
+    assert.deepEqual(changeVis[0], {
+      QueueUrl: 'q',
+      ReceiptHandle: 'rh',
+      VisibilityTimeout: 1,
+    });
+    release();
+    await loop;
+    assert.equal(deletes.length, 1);
+    const renewals = changeVis.length;
+    await sleep(20);
+    assert.equal(changeVis.length, renewals);
+  });
+  test('a throwing completed observer is logged after the message is deleted', async () => {
+    const { errors, logger } = recordingLogger();
+    const { client, deletes } = makeFakeSqsClient({
+      message: message({ ReceiptHandle: 'rh-ok' }),
+    });
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const ctrl = new AbortController();
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async () => {},
+      logger,
+      onEvent: () => {
+        ctrl.abort();
+        throw new Error('observer bug');
+      },
+    });
+    assert.equal(deletes[0].ReceiptHandle, 'rh-ok');
+    assert.equal(errors[0][0], 'resize worker: completed event handler failed');
+  });
+  test('a throwing failed observer is logged and leaves the message scheduled for redelivery', async () => {
+    const { errors, logger } = recordingLogger();
+    const { client, deletes, changeVis } = makeFakeSqsClient({
+      message: message(),
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: fastTiming,
+    });
+    let handlerCalls = 0;
+    const ctrl = new AbortController();
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      logger,
+      handle: async () => {
+        handlerCalls += 1;
+        throw new Error('handler boom');
+      },
+      onEvent: async () => {
+        ctrl.abort();
+        throw new Error('observer bug');
+      },
+    });
+    assert.equal(handlerCalls, 1);
+    assert.equal(deletes.length, 0);
+    assert.equal(changeVis.length, 1);
+    assert.equal(errors[0][0], 'resize worker: failed event handler failed');
+  });
+  test('an exhausted task reports deadLettered with the original error and is moved then deleted', async () => {
+    const { client, sent, deletes, changeVis } = makeFakeSqsClient({
+      message: message({ Attributes: { ApproximateReceiveCount: '3' } }),
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      deadLetterQueueUrl: DEAD_URL,
+      timing: { maxAttempts: 3 },
+    });
+    const rec = makeEvents();
+    const boom = new Error('handler boom');
+    const ctrl = new AbortController();
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: async () => {
+        throw boom;
+      },
+      onEvent: async (event, task, error) => {
+        await rec.onEvent(event, task, error);
+        ctrl.abort();
+      },
+    });
+    assert.equal(rec.deadLettered[0].err, boom);
+    assert.equal(rec.failed.length, 0);
+    assert.equal(sent[0].input.QueueUrl, DEAD_URL);
+    assert.equal(JSON.parse(String(sent[0].input.MessageBody)).attempts, 3);
+    assert.equal(deletes.length, 1);
+    assert.equal(changeVis.length, 0);
+  });
+});
+
+describe('SqsTaskQueue options', () => {
   test('rejects invalid lock TTLs at construction', () => {
     assert.throws(
       () =>
-        new SqsTransport({
+        new SqsTaskQueue({
           queueUrl: 'q',
-          locks: memoryLocks(),
-          lockTtlMs: { dispatch: 0, worker: 0 },
+          timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
         }),
       (err: Error & { code?: string }) =>
         err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
     );
+  });
+  test('requires queueUrl at construction', () => {
+    assert.throws(
+      () => new SqsTaskQueue({ queueUrl: '' }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_SQS_QUEUE_URL_REQUIRED',
+    );
+  });
+  test('serves only the default queue and configured names and exposes its timing', () => {
+    const timing = { idlePollMs: 123 };
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      queues: { bulk: BULK_URL },
+      timing,
+    });
+    assert.equal(tasks.servesQueue('default'), true);
+    assert.equal(tasks.servesQueue('bulk'), true);
+    assert.equal(tasks.servesQueue('unknown'), false);
+    assert.equal(tasks.getTiming(), timing);
+    assert.deepEqual(new SqsTaskQueue({ queueUrl: 'q' }).getTiming(), {});
   });
 });

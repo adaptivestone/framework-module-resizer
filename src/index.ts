@@ -4,22 +4,21 @@
 // host's own import line:
 //   …/drivers/fs.js     LocalFsStorage
 //   …/drivers/s3.js     S3Storage                      (optional peers: AWS S3 SDK)
-//   …/drivers/mongo.js  MongoTransport, MongoMediaStore, MongoLockStore, createResizeModels
-//   …/drivers/sqs.js    SqsTransport                   (optional peers: AWS SQS SDK, sqs-consumer)
-//   …/framework.js      the framework adapter: createFrameworkResizer, createFrameworkMongoTransport, …
+//   …/drivers/mongo.js  mongoDatabase, MongoDatabase, MongoTaskQueue, createResizeModels
+//   …/drivers/sqs.js    SqsTaskQueue                   (optional peer: AWS SQS SDK)
+//   …/framework.js      the framework adapter: createFrameworkResizer, FrameworkDatabase, …
 
 // --- driver contracts: abstract classes a custom driver extends (or any object of the same shape) ---
-export { LockStore } from './contracts/lockStore.ts';
-export { MediaStore } from './contracts/mediaStore.ts';
+export { ResizeDatabase } from './contracts/database.ts';
 export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
 export {
-  type EnqueueTask,
+  type ClaimedTask,
   type LeasedTask,
-  QueueTransport,
-  type StartWorkerOpts,
+  type NewTask,
   type TaskEvent,
   type TaskEventHandler,
-} from './contracts/transport.ts';
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 // --- read-path / eager option types (type-only) — hosts annotate their call sites ---
 export type {
   PrewarmOpts,
@@ -56,6 +55,8 @@ export {
   resizeMediaPaths,
   resizeMediaSchemaFragment,
 } from './mediaFragment.ts';
+// --- the core queue logic (custom workers / tests); runWorker below is the normal entry ---
+export { consumeQueue, timingOf } from './queue.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,

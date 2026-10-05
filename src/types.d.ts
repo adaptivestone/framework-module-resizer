@@ -2,7 +2,7 @@
 // This file is copied verbatim into dist by postBuild.ts (tsc does not emit it),
 // so it MUST stay dependency-free: no imports of source (.ts) modules and no
 // runtime imports. Source-coupled types (Pipeline, BeforeStep, VariantStep,
-// QueueTransport, ResizeStorage, MediaStore, LockStore, HookName, HookFn)
+// ResizeStorage, ResizeDatabase, TaskQueue, HookName, HookFn)
 // live next to their code.
 
 // Recursive partial for environment-specific config overrides. Arrays stay whole because
@@ -134,10 +134,10 @@ export interface EnqueueReceipt {
 export interface EnqueueIssue {
   code:
     | 'RESIZE_ENQUEUE_NO_ORIGINAL'
-    | 'RESIZE_ENQUEUE_NO_TRANSPORT'
+    | 'RESIZE_ENQUEUE_NO_QUEUE'
     | 'RESIZE_ENQUEUE_LOCK_CONTENDED'
     | 'RESIZE_ENQUEUE_LOCK_FAILED'
-    | 'RESIZE_ENQUEUE_TRANSPORT_FAILED'
+    | 'RESIZE_ENQUEUE_QUEUE_FAILED'
     | 'RESIZE_ENQUEUE_UNCONFIRMED'
     | 'RESIZE_ENQUEUE_CONFIRM_FAILED'
     | 'RESIZE_ENQUEUE_VARIANT_CONFLICT'
@@ -148,7 +148,7 @@ export interface EnqueueIssue {
 }
 
 // What prewarm() reports for every requested variant. ready / accepted / notRequired / unconfirmed
-// split the requested catalog; `tasks` holds the transport receipts; `issues` say why a variant is
+// split the requested catalog; `tasks` holds the task-queue receipts; `issues` say why a variant is
 // unconfirmed and whether a retry can help.
 export interface PrewarmResult {
   status: PrewarmStatus;
@@ -178,10 +178,10 @@ export interface PictureUrls {
 // Config (the framework returns the fully resolved value from app.getConfig('resize'))
 //
 // MODULE behavior only. Storage-specific options (buckets, base URL, signed-URL
-// settings) live in the storage driver; transport-specific options (SQS queue URL,
-// region) live in the transport driver — both drivers are passed to the Resizer
-// constructor (see 05). The core config never knows what a "bucket" or "queue URL" is, so a new
-// storage/transport driver is self-contained and the module never changes.
+// settings) live in the storage driver; queue-specific options (SQS queue URL, region) live in
+// the task queue — both are passed to the Resizer constructor. The core config never knows what a
+// "bucket" or "queue URL" is, so a new storage driver or task queue is self-contained and the
+// module never changes.
 // ---------------------------------------------------------------------------
 
 export interface ResizeConfig {
@@ -215,8 +215,8 @@ export interface ResizeConfig {
   concurrency: number;
 }
 
-// Queue timing and lock TTLs: options of the queue transport (MongoTransport takes all of them;
-// the framework config file's `queue` section feeds createFrameworkMongoTransport()).
+// Queue timing and lock TTLs: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the
+// framework config file's `queue` section feeds the framework's queue).
 export interface QueueTimingOptions {
   lockTtlMs: { dispatch: number; worker: number }; // worker must be ≤ leaseMs
   leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
@@ -235,7 +235,7 @@ export interface FrameworkWorkerConfig {
 
 // The config file a framework host writes (`src/config/resize.ts`, or another file per Resizer).
 // The image settings go to the Resizer; the framework adapter reads the rest: the media model,
-// the Mongo transport's timing (`queue`) and the worker command's settings (`worker`).
+// the task queue's timing (`queue`) and the worker command's settings (`worker`).
 export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   queue?: QueueTimingOptions; // default: defaultQueueOptions (a present section must be complete)

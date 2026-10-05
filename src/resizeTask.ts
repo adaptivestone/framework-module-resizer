@@ -1,21 +1,20 @@
 // The async resize CORE (07 · Worker §11, 11 · Modes §11.1). ONE sharp pipeline shared by
 // both generation modes:
-//   - processTaskWith() = the core + lease/lock/transport bookkeeping (queued/lazy worker)
-//   - generateImpl()    = the core WITHOUT locks/transport (eager `resizer.generate`)
+//   - processTaskWith() = the core + lock bookkeeping (queued/lazy worker)
+//   - generateImpl()    = the core WITHOUT locks (eager `resizer.generate`)
 // Steps 2–8 (download once → metadata guards + orientation normalize → beforeSteps once →
 // decode once + bounded per-variant resize/encode/upload → one appendPreviews) live in
 // generatePreviews(). Every function receives its Resizer as an argument, and resizer.ts is
 // imported for types only, so the resizer↔resizeTask cycle is runtime-free. sharp is a hard
 // dep; this is the only place besides worker.ts that decodes.
 import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
-import type { LockStore } from './contracts/lockStore.ts';
-import { lockTtlMsOf, type QueueTransport } from './contracts/transport.ts';
+import { defaultQueueOptions } from './config/resize.ts';
+import type { TaskQueue } from './contracts/taskQueue.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
-  ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
@@ -29,6 +28,7 @@ import {
   previewScope,
   requireMediaId,
 } from './images.ts';
+import { timingOf } from './queue.ts';
 import type {
   GenerateOpts,
   GenerateResult,
@@ -49,7 +49,7 @@ const asBuffer = (b: Buffer | Uint8Array): Buffer =>
 
 // ---------------------------------------------------------------------------
 // The shared core (07 steps 2–8; 11 · §11.1 step 4). Both modes expand their inputs into a
-// `requested` MissingPreview[] and call this. `locks` (queued mode only: the transport's lock store)
+// `requested` MissingPreview[] and call this. `locks` (queued mode only: the database's locks)
 // enables the two-tier locks (dispatch release on skip-existing + best-effort worker lock); `persist` toggles the
 // single appendPreviews + onPreviewGenerated firing (eager `persist:false` returns raw).
 // ---------------------------------------------------------------------------
@@ -60,8 +60,8 @@ export interface GenerateCoreArgs {
   requested: MissingPreview[];
   pipeline: string;
   ctx: Record<string, unknown>;
-  // Queued mode: the transport's lock store and worker-lock TTL. Eager mode passes none.
-  locks?: { store: LockStore; workerTtlMs: number };
+  // Queued mode: take the database's locks with this worker-lock TTL. Eager mode passes none.
+  locks?: { workerTtlMs: number };
   persist: boolean;
   signal?: AbortSignal;
 }
@@ -255,7 +255,7 @@ export async function generatePreviews(
     // can re-enqueue a sibling promptly.
     if (existing.has(identity)) {
       if (locks) {
-        await releaseLock(resizer, locks.store, dispatchKey);
+        await releaseLock(resizer, dispatchKey);
       }
       return;
     }
@@ -268,7 +268,7 @@ export async function generatePreviews(
     if (locks) {
       let acquired: boolean;
       try {
-        acquired = await locks.store.acquire(workerKey, locks.workerTtlMs);
+        acquired = await resizer.db.acquireLock(workerKey, locks.workerTtlMs);
       } catch (err) {
         logger.error(
           `resize worker: worker-lock acquire failed for ${identity} on media ${mediaId} — leaving variant missing`,
@@ -405,7 +405,7 @@ export async function generatePreviews(
       failedCount += 1;
       if (locks) {
         heldLocks.delete(workerKey);
-        await releaseLock(resizer, locks.store, workerKey);
+        await releaseLock(resizer, workerKey);
       }
     }
   };
@@ -422,7 +422,7 @@ export async function generatePreviews(
         original.width === undefined || original.height === undefined
           ? { width: dispW, height: dispH }
           : undefined;
-      await resizer.mediaStore.appendPreviews(mediaId, generated, backfillDims);
+      await resizer.db.appendPreviews(mediaId, generated, backfillDims);
       for (const preview of generated) {
         await resizer.runObservers('onPreviewGenerated', preview, {});
       }
@@ -431,7 +431,7 @@ export async function generatePreviews(
     // 9. Release every held dispatch + worker lock (success AND error paths).
     if (locks) {
       for (const key of heldLocks) {
-        await releaseLock(resizer, locks.store, key);
+        await releaseLock(resizer, key);
       }
     }
   }
@@ -440,47 +440,36 @@ export async function generatePreviews(
 }
 
 /** Best-effort lock release; a failing release is logged, never thrown. */
-async function releaseLock(
-  resizer: Resizer,
-  store: LockStore,
-  key: string,
-): Promise<void> {
+async function releaseLock(resizer: Resizer, key: string): Promise<void> {
   try {
-    await store.release(key);
+    await resizer.db.releaseLock(key);
   } catch (err) {
     resizer.logger.error(`resize worker: failed to release lock ${key}`, err);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Queued entry (07 · §11). The transport-owned lease/complete/retry loop calls this per task;
-// it SUCCEEDS by returning and FAILS by throwing (which engages the transport's retry → DLQ).
+// Queued entry (07 · §11). The core queue loop (src/queue.ts) calls this per task; it SUCCEEDS
+// by returning and FAILS by throwing (which engages the queue's retry → dead-letter).
 // ---------------------------------------------------------------------------
 
 export async function processTaskWith(
   resizer: Resizer,
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
-  // The transport that delivered the task: its locks and TTLs match the lease it holds. Default:
-  // the Resizer's own transport.
-  transport: QueueTransport | undefined = resizer.transport,
+  // The queue that delivered the task: its worker-lock TTL fits the lease it holds. Default: the
+  // Resizer's own queue (and the default TTL when processTask is called without one).
+  tasks: TaskQueue | undefined = resizer.tasks,
 ): Promise<void> {
   const { logger } = resizer;
-  // Queued tasks are coordinated with the transport's locks; a Resizer without one can't run them.
-  if (!transport) {
-    throw new ResizeSetupError(
-      `resize worker: Resizer '${resizer.name}' has no transport — a queued task needs its locks`,
-      { code: 'RESIZE_TRANSPORT_REQUIRED' },
-    );
-  }
   // ctx does NOT cross the queue (04 · §8) — the worker's pipeline steps depend on media/metadata.
   const ctx: Record<string, unknown> = {};
 
-  // 1. Load the media doc. A deleted media row is a logged no-op success (the transport
+  // 1. Load the media doc. A deleted media row is a logged no-op success (the queue
   // completes it), but a live row whose persisted original is absent/malformed is a terminal
   // media error. In particular, `{ original: {} }` must not reach storage.download: it has no
   // usable locator and retrying it cannot make the source appear.
-  const media = await resizer.mediaStore.load(task.mediaId);
+  const media = await resizer.db.loadMedia(task.mediaId);
   if (!media) {
     logger.info(
       `resize worker: media ${task.mediaId} missing (no doc) — no-op complete`,
@@ -514,8 +503,9 @@ export async function processTaskWith(
     pipeline: task.pipeline,
     ctx,
     locks: {
-      store: transport.locks,
-      workerTtlMs: lockTtlMsOf(transport).worker,
+      workerTtlMs: tasks
+        ? timingOf(tasks).lockTtlMs.worker
+        : defaultQueueOptions.lockTtlMs.worker,
     },
     persist: true,
     signal: taskOpts?.signal,
@@ -524,7 +514,7 @@ export async function processTaskWith(
   // 10. A queued task is complete only when every requested identity is now persisted. Re-read
   // once so a worker-lock loser can observe a concurrent worker's write. Our own generated rows
   // are included too: appendPreviews returned successfully before generatePreviews returned.
-  const refreshed = await resizer.mediaStore.load(task.mediaId);
+  const refreshed = await resizer.db.loadMedia(task.mediaId);
   if (!refreshed) {
     logger.info(
       `resize worker: media ${task.mediaId} was deleted while processing — no-op complete`,
@@ -580,7 +570,7 @@ export async function processTaskWith(
 }
 
 // ---------------------------------------------------------------------------
-// Eager entry (11 · Modes §11.1). Same core, NO locks/transport; the caller's real ctx reaches
+// Eager entry (11 · Modes §11.1). Same core, NO locks; the caller's real ctx reaches
 // the pipeline steps (unlike the queued worker's ctx === {}). `resizer.generate` delegates here.
 // ---------------------------------------------------------------------------
 

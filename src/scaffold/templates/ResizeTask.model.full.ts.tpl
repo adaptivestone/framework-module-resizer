@@ -55,7 +55,7 @@ export default class ResizeTask extends BaseModel {
         enum: ['pending', 'processing', 'completed', 'dead'],
         default: 'pending',
       },
-      // Capped by the transport's maxAttempts (config `queue.maxAttempts`), then dead-lettered.
+      // Capped by the queue's maxAttempts (config `queue.maxAttempts`), then dead-lettered.
       attempts: { type: Number, default: 0 },
       leasedBy: { type: String },
       leaseToken: { type: String }, // fencing token (05 · §10.2)

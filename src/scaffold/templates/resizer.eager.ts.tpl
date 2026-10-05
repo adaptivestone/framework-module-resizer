@@ -24,4 +24,4 @@ export const resizer = createFrameworkResizer({
   // hooks: { formatPublicUrls: (decision, ctx) => formatPictureUrls(decision, { id: String(ctx.id) }) },
 });
 
-// Eager-only has no transport or worker. Queue indexes are not involved in this mode.
+// Eager-only has no task queue or worker. Queue indexes are not involved in this mode.
