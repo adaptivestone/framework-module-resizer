@@ -126,8 +126,10 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     stop.abort();
   }
   opts.signal.addEventListener('abort', onAbort, { once: true });
+  // The first loop to fail is the cause; the others may then reject only because of the abort.
+  let firstFailure: { error: unknown } | undefined;
   try {
-    const results = await Promise.allSettled(
+    await Promise.allSettled(
       [...transports].map(async (transport) => {
         try {
           await transport.startWorker(
@@ -135,17 +137,16 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
             { signal: stop.signal, queue, onEvent },
           );
         } catch (err) {
+          firstFailure ??= { error: err };
           stop.abort();
-          throw err;
         }
       }),
     );
-    const failed = results.find((r) => r.status === 'rejected');
-    if (failed) {
-      throw (failed as PromiseRejectedResult).reason;
-    }
   } finally {
     opts.signal.removeEventListener('abort', onAbort);
+  }
+  if (firstFailure) {
+    throw firstFailure.error;
   }
   logger.info('resize worker stopped');
 }

@@ -661,3 +661,18 @@ describe('SqsTransport.startWorker', () => {
     await p;
   });
 });
+
+describe('SqsTransport options', () => {
+  test('rejects invalid lock TTLs at construction', () => {
+    assert.throws(
+      () =>
+        new SqsTransport({
+          queueUrl: 'q',
+          locks: memoryLocks(),
+          lockTtlMs: { dispatch: 0, worker: 0 },
+        }),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
+    );
+  });
+});

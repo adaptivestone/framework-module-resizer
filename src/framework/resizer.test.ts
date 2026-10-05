@@ -190,3 +190,60 @@ test('undefined values from getTiming never override the defaults', () => {
   });
   assert.equal(t.leaseMs, 60_000);
 });
+
+test('MongoTransport.verify() fails when the task model is not registered', async () => {
+  const locks = { acquire: async () => true, release: async () => {} };
+  const t = new MongoTransport({ getModel: () => undefined, locks });
+  assert.throws(
+    () => t.verify(),
+    (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_MONGO_MODEL_MISSING',
+  );
+  // Through the framework: verify() at boot catches a missing src/models/ResizeTask.ts.
+  setAppInstance({
+    getConfig: () => makeResizeConfig(),
+    getModel: (name: string) =>
+      name === 'ResizeTask' ? false : { findById: async () => null },
+    logger: { info() {}, warn() {}, error() {} },
+  } as never);
+  const r = createFrameworkResizer({
+    storage,
+    transport: createFrameworkMongoTransport(),
+  });
+  await assert.rejects(
+    () => r.verify(),
+    (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_MONGO_MODEL_MISSING',
+  );
+});
+
+test('verify() fails when the transport does not serve the Resizer queue', async () => {
+  installApp();
+  const r = createFrameworkResizer({
+    storage,
+    queue: 'bulk',
+    transport: {
+      ...transport,
+      servesQueue: (queue: string) => queue === 'default',
+    },
+  });
+  await assert.rejects(
+    () => r.verify(),
+    (err: unknown) =>
+      err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_NOT_SERVED',
+  );
+});
+
+test('prewarm reports a config error as a non-retryable issue', async () => {
+  installApp({ resize: { mediaModelName: 'File', upload: null } });
+  const r = createFrameworkResizer({ storage, transport });
+  const result = await r.prewarm({
+    media: { id: 'm1', original: { storageRef: { key: 'k' } } },
+    sizes: [{ width: 10, height: 10 }],
+  });
+  assert.equal(result.status, 'incomplete');
+  assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+  assert.equal(result.issues[0].retryable, false);
+});

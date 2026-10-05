@@ -110,6 +110,14 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - The driver contracts `ResizeStorage`, `MediaStore`, `QueueTransport` and `LockStore` are
   exported abstract classes (runtime values) instead of interfaces. A custom driver `extends` one,
   or stays any object of the same shape.
+- `prewarm()` reports every requested variant: `{ status, ready, accepted, notRequired,
+  unconfirmed, tasks, issues }` (`PrewarmResult`), instead of an `{ enqueued }` count, and still
+  never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue). A
+  held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
+  through the optional `QueueTransport.findActive()`, while SQS/custom transports without it
+  report lock races as retryable `incomplete`. Conflicting payloads with one preview identity are
+  explicit errors. There is no separate strict method: the pre-release `enqueueRequired()` is
+  merged into `prewarm()`.
 
 **Features**
 
@@ -138,20 +146,16 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - The framework adapter reads the app lazily. `createFrameworkResizer` and
   `createFrameworkMongoTransport` read config, models, logger and events on first use, so
   `src/resizer.ts` can be imported statically anywhere, even before `Server.init()`. The new
-  `resizer.verify()` checks the config, the transport timing and the media store at boot.
+  `resizer.verify()` checks at boot what would otherwise only be logged per call: the config, the
+  transport (its optional `verify()` — `MongoTransport` fails with `RESIZE_MONGO_MODEL_MISSING`
+  when the `ResizeTask` model is not registered —, lock TTLs, and that it serves the Resizer's
+  queue) and the media store (`MongoMediaStore` fails when its model does not resolve). The worker
+  runs it for every Resizer before leasing.
   `new Resizer({ config })` also accepts a function, read on first use; `MongoTransport` takes
   `getTiming`. The transport contract's optional `getLockTtlMs()` reports lock TTLs.
 - `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
   and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
   `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
-- `prewarm()` reports every requested variant: `{ status, ready, accepted, notRequired,
-  unconfirmed, tasks, issues }` (`PrewarmResult`), instead of an `{ enqueued }` count, and still
-  never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue). A
-  held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
-  through the optional `QueueTransport.findActive()`, while SQS/custom transports without it
-  report lock races as retryable `incomplete`. Conflicting payloads with one preview identity are
-  explicit errors. There is no separate strict method: the pre-release `enqueueRequired()` is
-  merged into `prewarm()`.
 - The Mongo transport deduplicates identical active requests with a canonical SHA-256
   `requestKey` and a partial unique index on `{ fileId, pipeline, requestKey }`. The module does not
   create indexes; prepare them through the host's migration or lifecycle before rollout.

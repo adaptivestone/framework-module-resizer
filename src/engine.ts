@@ -6,7 +6,11 @@
 // is the owner/admin-gated signedUrl (itself caught + fallen back). Imports the Resizer
 // TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
 import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
-import { ResizeMediaError } from './errors.ts';
+import {
+  ResizeConfigError,
+  ResizeMediaError,
+  ResizeSetupError,
+} from './errors.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import {
   expandPreviewRequests,
@@ -315,8 +319,12 @@ export async function prewarmImpl(
         {
           code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
           message: err instanceof Error ? err.message : String(err),
-          // A media the module can't use (e.g. no id) won't improve on retry.
-          retryable: !(err instanceof ResizeMediaError),
+          // An unusable media (e.g. no id) or a wiring/config mistake won't improve on retry.
+          retryable: !(
+            err instanceof ResizeMediaError ||
+            err instanceof ResizeConfigError ||
+            err instanceof ResizeSetupError
+          ),
           previews: [],
         },
       ],

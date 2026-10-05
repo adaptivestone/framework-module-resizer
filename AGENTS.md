@@ -287,6 +287,7 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `RESIZE_MEDIA_STORE_REQUIRED` at construction | `new Resizer()` takes its media store explicitly — framework hosts use `createFrameworkResizer` from `…/framework.js` |
 | `RESIZE_LOCKS_REQUIRED` | the transport needs `locks` (a `LockStore`) — `createFrameworkMongoTransport()` adds `FrameworkLockStore`; plain Node: `new MongoTransport({ model, locks: new MongoLockStore({ model }) })` |
 | `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the transport options, `worker.concurrency` to `concurrency` |
+| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | the transport's `ResizeTask` model (or the media store's model) does not resolve — scaffold `src/models/ResizeTask.ts`, check the model name |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoTransport()` needs `{ model }` or `{ getModel }` — framework hosts use `createFrameworkMongoTransport()` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |

@@ -47,6 +47,12 @@ export abstract class QueueTransport {
   abstract readonly locks: LockStore;
 
   /**
+   * Optional startup check, awaited by `Resizer.verify()` and before the worker leases anything:
+   * throw when the transport cannot work (e.g. its task model is not registered).
+   */
+  verify?(): void | Promise<void>;
+
+  /**
    * Optional: whether this transport can consume `queue` (e.g. SQS knows only its configured
    * queue URLs). Without it every queue is served. The worker skips a transport that can't serve
    * its queue, so one Resizer's missing queue never stops the others.

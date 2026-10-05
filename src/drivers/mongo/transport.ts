@@ -218,6 +218,21 @@ export class MongoTransport extends QueueTransport {
     return this.#resolveTiming().lockTtlMs;
   }
 
+  /**
+   * Startup check: the task model must resolve and the timing must be valid. At runtime a missing
+   * model is only logged (reads never throw), so this is what makes it fail at boot.
+   */
+  verify(): void {
+    this.#resolveTiming();
+    const model = this.#getModel ? this.#getModel() : this.#model;
+    if (!model) {
+      throw new ResizeSetupError(
+        'resize mongo transport: the ResizeTask model is not registered — scaffold src/models/ResizeTask.ts (or pass `model`)',
+        { code: 'RESIZE_MONGO_MODEL_MISSING' },
+      );
+    }
+  }
+
   // Resolve the model, tolerating a falsy getter result (a mis-registered host model) with a
   // logged soft-fail rather than a TypeError.
   #taskModel(): TaskModel | null {

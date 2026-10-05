@@ -53,11 +53,15 @@ export const defaultWorkerOptions: FrameworkWorkerConfig = {
   sharpCache: false,
 };
 
-/** What a framework host's config file spreads; it adds `mediaModelName`. */
+/**
+ * What a framework host's config file spreads; it adds `mediaModelName`. `queue` and `worker` are
+ * typed as present, so `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` stays
+ * a complete section under strict TypeScript.
+ */
 export const defaultFrameworkResizeConfig: Omit<
   FrameworkResizeConfig,
-  'mediaModelName'
-> = {
+  'mediaModelName' | 'queue' | 'worker'
+> & { queue: QueueTimingOptions; worker: FrameworkWorkerConfig } = {
   ...defaultResizeConfig,
   queue: defaultQueueOptions,
   worker: defaultWorkerOptions,
