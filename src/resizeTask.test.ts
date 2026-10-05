@@ -22,7 +22,7 @@ import {
   ResizeSetupError,
 } from './errors.ts';
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
+import { FrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
 import {
   type Pipeline,
@@ -250,7 +250,7 @@ describe('processTask — source handling', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(null);
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -275,7 +275,7 @@ describe('processTask — source handling', () => {
       original: {},
       previews: [],
     } as MediaLike);
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -302,7 +302,7 @@ describe('processTask — source handling', () => {
         },
       }),
     );
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -331,7 +331,7 @@ describe('processTask — source handling', () => {
       Buffer.from('this is definitely not an image'),
     );
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -342,7 +342,7 @@ describe('processTask — source handling', () => {
     installApp({ limits: { sourcePixels: 10 } }); // redPng is 64×48 = 3072 px
     const { storage, uploads } = makeStorage(redPng);
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -360,7 +360,7 @@ describe('processTask — source handling', () => {
     installApp({ limits: { inputPixels: 100 } }); // orientedJpeg 64×48 = 3072 px > 100
     const { storage, uploads } = makeStorage(orientedJpeg);
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -388,7 +388,7 @@ describe('processTask — source handling', () => {
       ],
     };
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -407,7 +407,7 @@ describe('processTask — source handling', () => {
       beforeSteps: [async (buf) => sharp(buf).toBuffer()],
     };
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -437,7 +437,7 @@ describe('processTask — variants', () => {
       mediaDoc({ previews: [existing] }),
     );
     const { lockProvider, released } = makeLocks(true);
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
     });
@@ -454,7 +454,7 @@ describe('processTask — variants', () => {
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(mediaDoc());
     const { lockProvider, acquired } = makeLocks(false); // acquire always fails
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
     });
@@ -488,7 +488,7 @@ describe('processTask — variants', () => {
         released.push(key);
       },
     };
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
     });
@@ -533,7 +533,7 @@ describe('processTask — variants', () => {
       ],
     };
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -553,7 +553,7 @@ describe('processTask — variants', () => {
       ],
     };
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -574,7 +574,7 @@ describe('processTask — variants', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -621,7 +621,7 @@ describe('processTask — variants', () => {
     });
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -640,7 +640,7 @@ describe('processTask — variants', () => {
     });
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -660,7 +660,7 @@ describe('processTask — variants', () => {
     installApp();
     const { storage, uploads } = makeStorage(alphaPng);
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -686,7 +686,7 @@ describe('processTask — variants', () => {
     installApp({ limits: { resultDimension: 100 } });
     const { storage } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -710,7 +710,7 @@ describe('processTask — variants', () => {
     installApp();
     const { storage } = makeStorage(redPng); // 64×48
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -731,7 +731,7 @@ describe('processTask — persistence & failure handling', () => {
     installApp();
     const { storage } = makeStorage(orientedJpeg); // display 48×64
     const { db, appendCalls } = makeDatabase(mediaDoc()); // no original dims
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -762,7 +762,7 @@ describe('processTask — persistence & failure handling', () => {
         },
       }),
     );
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -776,7 +776,7 @@ describe('processTask — persistence & failure handling', () => {
     const { storage } = makeStorage(redPng);
     const { db } = makeDatabase(mediaDoc());
     const fired: Preview[] = [];
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       hooks: {
@@ -805,7 +805,7 @@ describe('processTask — persistence & failure handling', () => {
     };
     const { db, appendCalls } = makeDatabase(mediaDoc());
     const { lockProvider, released } = makeLocks(true);
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
       pipelines: { default: pipeline },
@@ -837,7 +837,7 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { db, appendCalls } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -882,7 +882,7 @@ describe('processTask — persistence & failure handling', () => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
     };
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -932,7 +932,7 @@ describe('processTask — persistence & failure handling', () => {
       },
       appendPreviews: async () => {},
     };
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks(false).lockProvider) },
     });
@@ -951,7 +951,7 @@ describe('processTask — persistence & failure handling', () => {
         media.previews = [...(media.previews ?? []), ...previews];
       },
     };
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -972,7 +972,7 @@ describe('processTask — persistence & failure handling', () => {
     const controller = new AbortController();
     const { storage, uploads } = makeStorage(redPng, () => controller.abort());
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
     });
@@ -1022,7 +1022,7 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -1068,7 +1068,7 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { db } = makeDatabase(mediaDoc());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
       pipelines: { default: pipeline },
@@ -1107,7 +1107,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(null); // load unused in eager mode
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const result = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -1123,7 +1123,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const media = mediaDoc();
     const { created } = await r.generate({
       media,
@@ -1138,7 +1138,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const media = mediaDoc();
     const { created } = await r.generate({
       media,
@@ -1162,7 +1162,7 @@ describe('generate (eager)', () => {
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { db, appendCalls } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const result = await r.generate({
       media: mediaDoc({ previews: [existing] }),
       sizes: [{ width: 20, height: 20 }],
@@ -1178,7 +1178,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     await assert.rejects(
       () =>
         r.generate({
@@ -1199,7 +1199,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
     const { db, appendCalls } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const result = await r.generate({
       media: mediaDoc({
         original: {
@@ -1230,7 +1230,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const result = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -1289,7 +1289,7 @@ describe('generate (eager)', () => {
     );
     const { storage, uploads } = makeStorage(svg);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const result = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -1311,7 +1311,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     await assert.rejects(
       () =>
         r.generate({
@@ -1338,7 +1338,7 @@ describe('generate (eager)', () => {
       upload: async () => false,
       publicUrl: () => '/preview',
     };
-    const r = createFrameworkResizer({ storage });
+    const r = new FrameworkResizer({ storage });
     const result = await r.generate({
       media: { id: 'scalar', original: { storageRef: 0 } },
       sizes: [{ width: 20, height: 20 }],
@@ -1356,7 +1356,7 @@ describe('generate (eager)', () => {
       upload: async () => null,
       publicUrl: () => '/preview',
     };
-    const r = createFrameworkResizer({ storage });
+    const r = new FrameworkResizer({ storage });
     await assert.rejects(
       () =>
         r.generate({
@@ -1381,7 +1381,7 @@ describe('generate (eager)', () => {
       upload: async () => ({ key: 'unused' }),
       publicUrl: () => '',
     };
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     await assert.rejects(
       () =>
         r.generate({
@@ -1412,7 +1412,7 @@ describe('generate (eager)', () => {
       },
       publicUrl: () => '',
     };
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     await assert.rejects(
       () =>
         r.generate({
@@ -1433,7 +1433,7 @@ describe('generate (eager)', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { db, appendCalls } = makeDatabase(null);
-    const r = createFrameworkResizer({
+    const r = new FrameworkResizer({
       storage,
       db,
       pipelines: {
@@ -1480,7 +1480,7 @@ describe('generate (eager)', () => {
         },
       ],
     };
-    const r = createFrameworkResizer({
+    const r = new FrameworkResizer({
       storage,
       db,
       pipelines: { photo: pipeline },
@@ -1526,7 +1526,7 @@ describe('runResizeWorker', () => {
   test('worker.enabled=false → clean no-op (claim NOT called); log says how to enable', async () => {
     const { logs } = installApp();
     const { tasks, claimedQueues } = observedQueue();
-    createFrameworkResizer({ storage: makeStorage(redPng).storage, tasks });
+    new FrameworkResizer({ storage: makeStorage(redPng).storage, tasks });
     await runResizeWorker();
     assert.deepEqual(claimedQueues, []);
     assert.ok(
@@ -1536,7 +1536,7 @@ describe('runResizeWorker', () => {
 
   test('no task queue → logs an error and returns without preparing framework drivers', async () => {
     const { logs, getModelCalls } = installApp({ worker: { enabled: true } });
-    createFrameworkResizer({ storage: makeStorage(redPng).storage });
+    new FrameworkResizer({ storage: makeStorage(redPng).storage });
     await runResizeWorker();
     assert.ok(logs.error.length >= 1);
     assert.equal(getModelCalls(), 0);
@@ -1562,7 +1562,7 @@ describe('runResizeWorker', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
     const { tasks, claimedQueues } = observedQueue();
-    createFrameworkResizer({ storage: makeStorage(redPng).storage, tasks });
+    new FrameworkResizer({ storage: makeStorage(redPng).storage, tasks });
     await assert.rejects(
       () => runResizeWorker(),
       (err: unknown) =>
@@ -1579,7 +1579,7 @@ describe('runResizeWorker', () => {
       events.push('claim');
       process.emit('SIGTERM');
     });
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
       db: fakeDb({
@@ -1600,7 +1600,7 @@ describe('runResizeWorker', () => {
     assert.deepEqual(events, ['verify']);
     resetResizerForTests();
     events.length = 0;
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
       db: fakeDb({
@@ -1617,7 +1617,7 @@ describe('runResizeWorker', () => {
     installApp({ worker: { enabled: true } });
     const { tasks } = observedQueue();
     let loads = 0;
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
       db: fakeDb({
@@ -1636,7 +1636,7 @@ describe('runResizeWorker', () => {
 
 describe('one worker serves every Resizer', () => {
   function register(tasks: MemoryTaskQueue, name = 'default', db = fakeDb()) {
-    return createFrameworkResizer({
+    return new FrameworkResizer({
       name,
       storage: makeStorage(redPng).storage,
       tasks,
@@ -1803,6 +1803,31 @@ describe('one worker serves every Resizer', () => {
     assert.deepEqual(unserved.claimedQueues, []);
   });
 
+  test('drivers given as functions are loaded before the worker groups its loops', {
+    timeout: 5000,
+  }, async () => {
+    installApp();
+    const controller = new AbortController();
+    const { tasks, claimedQueues } = observedQueue(() => controller.abort());
+    let loads = 0;
+    new Resizer({
+      storage: makeStorage(redPng).storage,
+      db: async () =>
+        fakeDb({
+          load: async () => {
+            loads++;
+            return null;
+          },
+        }),
+      tasks: async () => tasks,
+    });
+    await addTask(tasks);
+    await runWorker({ signal: controller.signal });
+    assert.deepEqual(claimedQueues, ['default', 'default']);
+    assert.equal(loads, 1); // the task reached the lazily loaded database
+    assert.equal(tasks.rows[0].status, 'completed');
+  });
+
   test('a queue no task queue serves is a setup error', async () => {
     installApp();
     const tasks = new MemoryTaskQueue();
@@ -1876,7 +1901,7 @@ describe('one worker serves every Resizer', () => {
     });
     const seen: unknown[][] = [];
     const boom = new Error('boom');
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       db: fakeDb(),
       tasks,
@@ -1886,7 +1911,7 @@ describe('one worker serves every Resizer', () => {
         },
       },
     });
-    createFrameworkResizer({
+    new FrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
       tasks,
@@ -1955,7 +1980,7 @@ describe('one worker serves every Resizer', () => {
     const controller = new AbortController();
     const { tasks, claimedQueues } = observedQueue(() => controller.abort());
     register(tasks);
-    createFrameworkResizer({
+    new FrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
       db: fakeDb({
@@ -2003,7 +2028,7 @@ describe('scoped generation', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -2013,7 +2038,7 @@ describe('scoped generation', () => {
     assert.equal(created[0].pipeline, 'default');
 
     resetResizerForTests();
-    const listings = createFrameworkResizer({
+    const listings = new FrameworkResizer({
       name: 'listings',
       storage,
       db,
@@ -2032,7 +2057,7 @@ describe('scoped generation', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { db } = makeDatabase(null);
-    const r = createFrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, db });
     const media = mediaDoc({ previews: [cleanPreview] });
     const same = await r.generate({
       media,
@@ -2056,7 +2081,7 @@ describe('scoped generation', () => {
     const media = mediaDoc();
     const { db } = makeDatabase(media);
     const { lockProvider, acquired } = makeLocks(true);
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
     });
@@ -2072,7 +2097,7 @@ describe('scoped generation', () => {
     const { db } = makeDatabase(media);
     // The worker lock for the watermark variant is held elsewhere, so nothing is generated.
     const { lockProvider } = makeLocks(false);
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
     });
@@ -2090,7 +2115,7 @@ describe('runWorker (core)', () => {
     installApp(); // worker.enabled is false: only the framework entry checks it
     const controller = new AbortController();
     const { tasks, claimedQueues } = observedQueue(() => controller.abort());
-    createFrameworkResizer({
+    new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
       db: fakeDb(),

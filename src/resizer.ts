@@ -3,8 +3,8 @@
 // lifetime — no register-call sequence, no hidden global registries. The class also
 // carries the named-pipeline set (04 · §8) and the cross-cutting hook bus (04 · §9).
 // Each Resizer owns its config, logger and event bus, all passed in explicitly: the core never
-// reads a framework app. Framework hosts get them filled by createFrameworkResizer
-// (src/framework/resizer.ts).
+// reads a framework app. Framework hosts use FrameworkResizer (src/framework/resizer.ts), which
+// builds every part from the app's config file.
 import type { Metadata, Sharp } from 'sharp';
 import defaultResizeConfig from './config/resize.ts';
 // The driver contracts live in src/contracts/ so drivers import them without this module. They
@@ -138,10 +138,17 @@ export interface HookSignatures {
 export type HookFn = (...args: any[]) => unknown;
 
 // ---------------------------------------------------------------------------
-// Constructor options (02 · §6). `storage` is the ONE required option — both modes need
-// it (05 · §10.4), so a missing driver is a boot-time type/throw error, not a runtime
+// Constructor options (02 · §6). `storage` and `db` are required — both modes need them
+// (05 · §10.4), so a missing driver is a boot-time type/throw error, not a runtime
 // degradation. `tasks` is optional (eager-only hosts omit it — 11 · Modes).
 // ---------------------------------------------------------------------------
+
+/**
+ * A part given as a function: called once, on first use, sync or async. It lets a Resizer be
+ * constructed at import time and build a driver later, e.g. from config that is not loaded yet or
+ * from an optional peer imported only when selected.
+ */
+export type LazyPart<T> = () => T | Promise<T>;
 
 export interface ResizerOptions {
   name?: string; // registry key; default 'default'
@@ -150,11 +157,11 @@ export interface ResizerOptions {
   config?: ResizeConfig | (() => ResizeConfig);
   logger?: ResizeLogger; // default: console
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
-  storage: ResizeStorage; // REQUIRED: files (originals, previews)
-  db: ResizeDatabase; // REQUIRED: media documents and locks
+  storage: ResizeStorage | LazyPart<ResizeStorage>; // REQUIRED: files (originals, previews)
+  db: ResizeDatabase | LazyPart<ResizeDatabase>; // REQUIRED: media documents and locks
   // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. `db.tasks` or an
-  // SqsTaskQueue. Omit for eager-only hosts.
-  tasks?: TaskQueue;
+  // SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
+  tasks?: TaskQueue | LazyPart<TaskQueue | undefined>;
   queue?: string; // default queue name for this Resizer's tasks; default 'default'
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
@@ -189,12 +196,25 @@ const resizers = new Map<string, Resizer>();
 
 // How framework hosts get the parts below filled in from their app.
 const FRAMEWORK_HINT =
-  "framework hosts: use createFrameworkResizer() from '@adaptivestone/framework-module-resize/framework.js'";
+  "framework hosts: use new FrameworkResizer() from '@adaptivestone/framework-module-resize/framework.js'";
+
+const storageRequired = () =>
+  new ResizeSetupError(
+    'resize: `storage` is required — construct `new Resizer({ storage: … })` with a ResizeStorage driver (e.g. new S3Storage({ … })); both the read path (publicUrl) and the worker (download/upload) need it (05 · §10.4)',
+    { code: 'RESIZE_STORAGE_REQUIRED' },
+  );
+
+const databaseRequired = () =>
+  new ResizeSetupError(
+    `resize: \`db\` is required — it loads media, saves preview metadata and holds locks (e.g. mongoDatabase(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
+    { code: 'RESIZE_DATABASE_REQUIRED' },
+  );
 
 /**
  * A named resize engine: config, drivers, pipelines and hooks. Most hosts construct one
  * (named 'default'); a host that needs different storage, media models or formats constructs
- * more, each under its own name. Drivers are fixed at construction.
+ * more, each under its own name. Drivers are fixed at construction: objects, or functions called
+ * once on first use (see `ready()`).
  */
 export class Resizer {
   readonly name: string;
@@ -203,9 +223,13 @@ export class Resizer {
   #resolvedConfig: ResizeConfig | undefined;
   readonly logger: ResizeLogger;
   readonly #events: ResizeEventBus | undefined;
-  readonly storage: ResizeStorage;
-  readonly db: ResizeDatabase;
-  readonly tasks: TaskQueue | undefined;
+  // The drivers. A part given as a function stays unset until ready() has loaded it.
+  readonly #sources: Pick<ResizerOptions, 'storage' | 'db' | 'tasks'>;
+  #storage: ResizeStorage | undefined;
+  #db: ResizeDatabase | undefined;
+  #tasks: TaskQueue | undefined;
+  #loaded = false;
+  #loading: Promise<void> | undefined;
   // Named pipelines: last-wins per name (04 · §8).
   readonly #pipelines: Map<string, Pipeline>;
   // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
@@ -217,10 +241,7 @@ export class Resizer {
     // a half-filled scaffold would otherwise fail with a downstream TypeError at the first
     // publicUrl/download — throw a NAMED error at construction instead.
     if (!opts?.storage) {
-      throw new ResizeSetupError(
-        'resize: `storage` is required — construct `new Resizer({ storage: … })` with a ResizeStorage driver (e.g. new S3Storage({ … })); both the read path (publicUrl) and the worker (download/upload) need it (05 · §10.4)',
-        { code: 'RESIZE_STORAGE_REQUIRED' },
-      );
+      throw storageRequired();
     }
     const name = opts.name ?? 'default';
     if (typeof name !== 'string' || name.trim().length === 0) {
@@ -242,10 +263,7 @@ export class Resizer {
     }
     // The core takes every part explicitly; it never reads a framework app.
     if (!opts.db) {
-      throw new ResizeSetupError(
-        `resize: \`db\` is required — it loads media, saves preview metadata and holds locks (e.g. mongoDatabase(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
-        { code: 'RESIZE_DATABASE_REQUIRED' },
-      );
+      throw databaseRequired();
     }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
@@ -261,9 +279,20 @@ export class Resizer {
     this.name = name;
     this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
-    this.storage = opts.storage;
-    this.db = opts.db;
-    this.tasks = opts.tasks;
+    this.#sources = { storage: opts.storage, db: opts.db, tasks: opts.tasks };
+    // Parts given as objects are usable at once; functions wait for ready().
+    if (typeof opts.storage !== 'function') {
+      this.#storage = opts.storage;
+    }
+    if (typeof opts.db !== 'function') {
+      this.#db = opts.db;
+    }
+    if (typeof opts.tasks !== 'function') {
+      this.#tasks = opts.tasks;
+    }
+    this.#loaded = ![opts.storage, opts.db, opts.tasks].some(
+      (part) => typeof part === 'function',
+    );
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().
@@ -288,6 +317,67 @@ export class Resizer {
     }
   }
 
+  /** Files: originals and previews. Available once the parts are loaded (see `ready()`). */
+  get storage(): ResizeStorage {
+    return this.#storage ?? this.#notReady('storage');
+  }
+
+  /** Media documents and locks. Available once the parts are loaded (see `ready()`). */
+  get db(): ResizeDatabase {
+    return this.#db ?? this.#notReady('db');
+  }
+
+  /** Where tasks wait (undefined: eager only). Available once the parts are loaded. */
+  get tasks(): TaskQueue | undefined {
+    if (typeof this.#sources.tasks === 'function' && !this.#loaded) {
+      this.#notReady('tasks');
+    }
+    return this.#tasks;
+  }
+
+  #notReady(part: string): never {
+    throw new ResizeSetupError(
+      `resize: Resizer '${this.name}' has not loaded \`${part}\` yet — await resizer.ready() before reading it (the Resizer's own methods do this)`,
+      { code: 'RESIZE_NOT_READY' },
+    );
+  }
+
+  /**
+   * Load the parts given as functions, once. Every method of the Resizer (and the worker) awaits
+   * it first, so hosts only need it before reading `storage`, `db` or `tasks` directly. A failed
+   * load is retried by the next call.
+   */
+  async ready(): Promise<void> {
+    if (this.#loaded) {
+      return;
+    }
+    this.#loading ??= this.#load().catch((err: unknown) => {
+      this.#loading = undefined;
+      throw err;
+    });
+    await this.#loading;
+  }
+
+  async #load(): Promise<void> {
+    const call = async <T>(part: T | LazyPart<T>): Promise<T> =>
+      typeof part === 'function' ? (part as LazyPart<T>)() : part;
+    const [storage, db, tasks] = await Promise.all([
+      call(this.#sources.storage),
+      call(this.#sources.db),
+      call(this.#sources.tasks),
+    ]);
+    if (!storage) {
+      throw storageRequired();
+    }
+    if (!db) {
+      throw databaseRequired();
+    }
+    this.#storage = storage;
+    this.#db = db;
+    this.#tasks = tasks ?? undefined;
+    this.#loaded = true;
+  }
+
   /** The validated image config; a lazy config (a function) is read and validated on first use. */
   get config(): ResizeConfig {
     this.#resolvedConfig ??= validateResizeConfig(this.#config());
@@ -295,12 +385,14 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: resolve and validate the config; run the database's verify(); check
-   * the task queue (its own verify(), its timing, and that it serves this Resizer's queue).
+   * Optional startup check: load the drivers; resolve and validate the config; run the database's
+   * verify(); check the task queue (its own verify(), its timing, and that it serves this
+   * Resizer's queue).
    * Framework hosts call it after `Server.init()` to fail at boot instead of at the first upload or
    * read. The worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
+    await this.ready();
     void this.config;
     await this.db.verify?.();
     if (this.tasks) {
@@ -408,11 +500,13 @@ export class Resizer {
    * db.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
+    await this.ready();
     return generateImpl(this, opts);
   }
 
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
   async uploadOriginal(opts: UploadOriginalOpts): Promise<Original> {
+    await this.ready();
     return uploadOriginalImpl(this, opts);
   }
 }

@@ -14,7 +14,7 @@ import sharp from 'sharp';
 import type { ResizeStorage } from './contracts/storage.ts';
 import { LocalFsStorage } from './drivers/fs.ts';
 import { S3Storage } from './drivers/s3.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
+import { FrameworkResizer } from './framework/resizer.ts';
 import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
@@ -93,7 +93,7 @@ test('refs survive media save/load and fresh-driver preview generation', async (
   for (const [name, createStorage] of Object.entries(factory)) {
     for (const namespace of [undefined, 'products/p1']) {
       resetResizerForTests();
-      const uploader = createFrameworkResizer({ storage: createStorage() });
+      const uploader = new FrameworkResizer({ storage: createStorage() });
       const original = await uploader.uploadOriginal({
         body: bytes,
         visibility: 'private',
@@ -106,7 +106,7 @@ test('refs survive media save/load and fresh-driver preview generation', async (
       assert.deepEqual(loaded.original?.storageRef, original.storageRef);
 
       resetResizerForTests();
-      const worker = createFrameworkResizer({ storage: createStorage() });
+      const worker = new FrameworkResizer({ storage: createStorage() });
       const result = await worker.generate({
         media: loaded,
         sizes: [{ width: 8, height: 8 }],

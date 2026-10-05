@@ -91,7 +91,7 @@ for (const driver of [
   'ResizeTaskModel',
   'ResizeWorker',
   'runResizeWorker',
-  'createFrameworkResizer',
+  'FrameworkResizer',
 ]) {
   assert.ok(!(driver in mod), 'driver/adapter must stay subpath-only, not on main entry: ' + driver);
 }
@@ -134,7 +134,7 @@ const safe = [
   ['/framework.js', 'FrameworkDatabase'],
   ['/framework.js', 'ResizeTaskModel'],
   ['/framework.js', 'ResizeWorker'],
-  ['/framework.js', 'createFrameworkResizer'],
+  ['/framework.js', 'FrameworkResizer'],
   ['/framework.js', 'runResizeWorker'],
 ];
 for (const [sub, exp] of safe) {
@@ -221,6 +221,7 @@ import {
 } from '@adaptivestone/framework-module-resize';
 import {
   FrameworkDatabase,
+  FrameworkResizer,
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
 import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
@@ -229,9 +230,18 @@ import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-re
 const hostConfig = {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
+  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+  queue: { driver: 'mongo' },
   worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
 } satisfies FrameworkResizeConfig;
-void hostConfig;
+// An environment file switching both drivers.
+const productionConfig = {
+  storage: { driver: 's3', bucketPublic: 'cdn', bucketPrivate: 'originals' },
+  queue: { driver: 'sqs', queueUrl: 'https://sqs.example/resize', maxAttempts: 3 },
+} satisfies Partial<FrameworkResizeConfig>;
+// The scaffolded construction site (never called here: it would register a Resizer).
+const construct = () => new FrameworkResizer({ pipelines: { default: {} } });
+void [hostConfig, productionConfig, construct];
 import { MongoTaskQueue } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
 
 class MemoryDatabase extends ResizeDatabase {

@@ -1,8 +1,7 @@
 // src/config/resize.ts — host extension of the module defaults.
 // Put environment-only changes in resize.<NODE_ENV>.ts; @adaptivestone/framework merges that file
 // over this one (objects field by field) before getConfig('resize') is called.
-// The image settings go to the Resizer; FrameworkResizer builds `storage` and `queue` from this
-// file, and `worker` configures the worker command.
+// The image settings go to the Resizer; FrameworkResizer builds `storage` from this file.
 import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
 import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
 
@@ -14,10 +13,6 @@ export default {
   // come from the AWS SDK's default chain):
   //   storage: { driver: 's3', bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: 'https://…' },
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  // Background generation: tasks wait in the scaffolded ResizeTask model. Create its indexes (and
-  // the framework Lock model's) through your migration process; the module never creates them.
-  // Or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs); false = eager only.
-  queue: { driver: 'mongo' },
-  // Allow the worker command, then run `npm run cli ResizeWorker` as its own process.
-  // worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
+  // Eager mode: no task queue. For background generation re-run resize-scaffold without --eager
+  // (it adds the ResizeTask model and the worker command) and set queue: { driver: 'mongo' }.
 } satisfies FrameworkResizeConfig;

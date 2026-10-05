@@ -7,8 +7,8 @@ import type {
 
 // Canonical defaults, pure data. The default export is the core image config (what
 // `new Resizer({ config })` takes). Framework hosts spread `defaultFrameworkResizeConfig`, which adds
-// the `queue` and `worker` sections the framework adapter reads; the framework applies
-// resize.<NODE_ENV>.ts overrides.
+// the `worker` section, and set `mediaModelName`, `storage` and `queue` themselves; the framework
+// applies resize.<NODE_ENV>.ts overrides.
 const defaultResizeConfig: ResizeConfig = {
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
@@ -54,16 +54,16 @@ export const defaultWorkerOptions: FrameworkWorkerConfig = {
 };
 
 /**
- * What a framework host's config file spreads; it adds `mediaModelName`. `queue` and `worker` are
- * typed as present, so `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` stays
- * a complete section under strict TypeScript.
+ * What a framework host's config file spreads; it adds `mediaModelName`, `storage` and (for
+ * background generation) `queue`. `worker` is typed as present, so
+ * `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` stays a complete section
+ * under strict TypeScript.
  */
 export const defaultFrameworkResizeConfig: Omit<
   FrameworkResizeConfig,
-  'mediaModelName' | 'queue' | 'worker'
-> & { queue: QueueTimingOptions; worker: FrameworkWorkerConfig } = {
+  'mediaModelName' | 'worker'
+> & { worker: FrameworkWorkerConfig } = {
   ...defaultResizeConfig,
-  queue: defaultQueueOptions,
   worker: defaultWorkerOptions,
 };
 

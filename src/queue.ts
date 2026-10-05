@@ -26,6 +26,24 @@ const TIMING_KEYS = [
 const timings = new WeakMap<object, QueueTimingOptions>();
 
 /**
+ * Complete queue timing: the timing keys set in `own` over the defaults (other keys are ignored),
+ * validated. Throws ResizeConfigError for invalid timing.
+ */
+export function fillTiming(
+  own: Partial<QueueTimingOptions> | Record<string, unknown>,
+): QueueTimingOptions {
+  const timing: Record<string, unknown> = { ...defaultQueueOptions };
+  for (const key of TIMING_KEYS) {
+    const value = (own as Record<string, unknown>)[key];
+    if (value !== undefined) {
+      timing[key] = value;
+    }
+  }
+  validateQueueTiming(timing);
+  return timing as unknown as QueueTimingOptions;
+}
+
+/**
  * A queue's timing: its getTiming() over the defaults, validated once per queue instance (a lazy
  * getTiming is read on first use). Throws ResizeConfigError for invalid timing.
  */
@@ -34,14 +52,7 @@ export function timingOf(tasks: TaskQueue): QueueTimingOptions {
   if (cached) {
     return cached;
   }
-  const own = tasks.getTiming?.() ?? {};
-  const timing: Record<string, unknown> = { ...defaultQueueOptions };
-  for (const key of TIMING_KEYS) {
-    if (own[key] !== undefined) {
-      timing[key] = own[key];
-    }
-  }
-  validateQueueTiming(timing);
+  const timing = fillTiming(tasks.getTiming?.() ?? {});
   timings.set(tasks, timing);
   return timing;
 }

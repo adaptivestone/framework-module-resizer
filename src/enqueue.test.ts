@@ -6,7 +6,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
-import { createFrameworkResizer } from './framework/resizer.ts';
+import { FrameworkResizer } from './framework/resizer.ts';
 import { type ResizeStorage, resetResizerForTests } from './resizer.ts';
 import {
   type FakeLocks,
@@ -69,7 +69,7 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
 
 function makeResizer(opts: { tasks?: TaskQueue; locks?: FakeLocks }) {
   const { tasks, locks } = opts;
-  return createFrameworkResizer({
+  return new FrameworkResizer({
     storage,
     db: fakeDb({ locks }),
     tasks,
@@ -336,7 +336,7 @@ describe('enqueue', () => {
     installFakeApp();
     const { tasks, calls } = makeTasks();
     const { locks } = makeLocks(true);
-    const resizer = createFrameworkResizer({
+    const resizer = new FrameworkResizer({
       storage,
       tasks,
       db: fakeDb({ locks }),
