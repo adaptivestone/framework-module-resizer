@@ -171,11 +171,14 @@ test('a missing storage section is a config error at verify(), and resolve() sti
   );
 });
 
-test("queue { driver: 'mongo' } uses the database's queue and the framework Lock model", async () => {
+test("queue { driver: 'database' } uses the database's own queue and the framework Lock model", async () => {
   const calls: unknown[][] = [];
   setAppInstance({
     getConfig: () =>
-      makeResizeConfig({ storage: localStorage, queue: { driver: 'mongo' } }),
+      makeResizeConfig({
+        storage: localStorage,
+        queue: { driver: 'database' },
+      }),
     getModel: (name: string) => {
       assert.equal(name, 'Lock');
       return {
@@ -202,7 +205,7 @@ test("queue { driver: 'mongo' } uses the database's queue and the framework Lock
   ]);
 });
 
-test('a queue section without a driver is the Mongo queue; its timing fills the defaults', async () => {
+test("a queue section without a driver is the database's queue; its timing fills the defaults", async () => {
   installApp({
     resizeListings: makeResizeConfig({
       storage: localStorage,
@@ -247,7 +250,7 @@ test("queue { driver: 'sqs' } builds an SqsTaskQueue with the config's URLs and 
 test('invalid storage or queue sections are config errors', async () => {
   for (const [override, message] of [
     [{ storage: { driver: 'ftp' } }, /storage.*'local' or 's3'/],
-    [{ queue: { driver: 'redis' } }, /queue.*'mongo' or 'sqs'/],
+    [{ queue: { driver: 'redis' } }, /queue.*'database' or 'sqs'/],
     [{ queue: { driver: 'sqs' } }, /queueUrl.*required/],
   ] as const) {
     installApp({ resize: { ...makeResizeConfig(), ...override } });
@@ -288,7 +291,7 @@ test('explicit options win over the config file', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'mongo' },
+      queue: { driver: 'database' },
     }),
   });
   const logger = { info() {}, warn() {}, error() {} };
@@ -316,7 +319,7 @@ test('tasks: false is eager only, even when the config has a queue', async () =>
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'mongo' },
+      queue: { driver: 'database' },
     }),
   });
   const r = new FrameworkResizer({ tasks: false });
@@ -337,11 +340,11 @@ test('an explicit config also feeds the database queue timing', async () => {
   assert.equal(timingOf(r.tasks).leaseMs, 4000);
 });
 
-test('the Mongo queue needs a database with its own queue', async () => {
+test("the 'database' queue needs a database with its own queue", async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'mongo' },
+      queue: { driver: 'database' },
     }),
   });
   const r = new FrameworkResizer({ db: fakeDb() });
@@ -426,7 +429,10 @@ test('verify() fails at boot when the ResizeTask model is not registered', async
   // Through the framework: verify() at boot catches a missing src/models/ResizeTask.ts.
   setAppInstance({
     getConfig: () =>
-      makeResizeConfig({ storage: localStorage, queue: { driver: 'mongo' } }),
+      makeResizeConfig({
+        storage: localStorage,
+        queue: { driver: 'database' },
+      }),
     getModel: (name: string) =>
       name === 'ResizeTask' ? false : { findById: async () => null },
     logger: { info() {}, warn() {}, error() {} },

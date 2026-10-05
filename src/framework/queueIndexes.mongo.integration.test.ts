@@ -7,14 +7,14 @@ import {
 import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import type { ResizeStorage } from './contracts/storage.ts';
-import { buildRequestKey } from './enqueue.ts';
-import { FrameworkDatabase } from './framework/database.ts';
-import ResizeTaskModel from './framework/ResizeTaskModel.ts';
-import { FrameworkResizer } from './framework/resizer.ts';
-import { DEFAULT_SCOPE, getPreviewIdentity } from './images.ts';
-import { resetResizerForTests } from './resizer.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import type { ResizeStorage } from '../contracts/storage.ts';
+import { buildRequestKey } from '../enqueue.ts';
+import { DEFAULT_SCOPE, getPreviewIdentity } from '../images.ts';
+import { resetResizerForTests } from '../resizer.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import { FrameworkDatabase } from './database.ts';
+import ResizeTaskModel from './ResizeTaskModel.ts';
+import { FrameworkResizer } from './resizer.ts';
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),

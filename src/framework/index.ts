@@ -5,8 +5,8 @@
 //   export const resizer = new FrameworkResizer({ pipelines, hooks }); // the rest is config
 
 export type {
+  FrameworkDatabaseQueueConfig,
   FrameworkLocalStorageConfig,
-  FrameworkMongoQueueConfig,
   FrameworkQueueConfig,
   FrameworkResizeConfig,
   FrameworkS3StorageConfig,

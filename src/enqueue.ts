@@ -41,8 +41,8 @@ function normalizeVariant(variant: MissingPreview): MissingPreview {
 /**
  * Canonicalize a complete queue payload: normalize nested filter keys, remove exact
  * duplicate variants, and sort the result by the canonical representation. The
- * stable result is used by Mongo enqueue so list permutation cannot create another
- * durable task.
+ * stable result goes into the request key, so a list permutation cannot create another
+ * durable task in a queue that deduplicates by it.
  */
 export function canonicalizeVariants(
   variants: readonly MissingPreview[],
@@ -65,7 +65,8 @@ export function canonicalizeVariants(
 }
 
 /**
- * Build a bounded request identity for the durable Mongo dedupe index. The complete
+ * Build a bounded request identity a task queue can deduplicate by (e.g. the Mongo queue's
+ * unique index). The complete
  * file + resizer + queue + pipeline identity is included before hashing; the hash keeps the
  * indexed value small even when filters or the variant catalog are large. The queue is part
  * of the key, so the same request on another queue is a separate task: an interactive
@@ -120,7 +121,7 @@ export async function enqueue(
 
   // 1. Canonicalize first so equivalent nested filter objects and list permutations
   // reach the task queue in a stable form. The dispatch lock remains per preview
-  // identity (not per whole catalog) by design; durable Mongo dedupe handles the
+  // identity (not per whole catalog) by design; a deduplicating task queue handles the
   // complete request key.
   const canonical = canonicalizeVariants(missing);
 

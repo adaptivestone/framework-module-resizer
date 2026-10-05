@@ -4,7 +4,7 @@
 // - config: the file's image settings;
 // - db: FrameworkDatabase (the app's media model, the framework Lock model, the ResizeTask queue);
 // - storage: the file's `storage` section ('local' or 's3');
-// - tasks: the file's `queue` section ('mongo', 'sqs', or false / missing for eager only);
+// - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
 // - logger and events: the app's.
 // Options win over the config file. Nothing is read from the app until first use, and the AWS
 // drivers (optional peers) are imported only when the config selects them.
@@ -157,10 +157,10 @@ async function buildQueue(
       logger: appLogger,
     });
   }
-  // 'mongo': the database's own queue (FrameworkDatabase: the ResizeTask model).
+  // 'database': the database's own queue (FrameworkDatabase: the ResizeTask model).
   if (!database.tasks) {
     throw new ResizeConfigError(
-      `resize config: \`queue\` in ${file} selects the 'mongo' driver, but the database passed to new FrameworkResizer() has no task queue — pass \`tasks\`, or set queue: false`,
+      `resize config: \`queue\` in ${file} selects the 'database' driver, but the database passed to new FrameworkResizer() has no task queue — pass \`tasks\`, or set queue: false`,
       { code: 'RESIZE_CONFIG_INVALID' },
     );
   }

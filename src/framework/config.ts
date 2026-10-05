@@ -28,7 +28,7 @@ export interface ResolvedFrameworkConfig {
 }
 
 const STORAGE_DRIVERS = ['local', 's3'];
-const QUEUE_DRIVERS = [undefined, 'mongo', 'sqs'];
+const QUEUE_DRIVERS = [undefined, 'database', 'sqs'];
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -96,7 +96,7 @@ export function resolveFrameworkConfig(
     !(isRecord(queue) && QUEUE_DRIVERS.includes(queue.driver as string))
   ) {
     throw new ResizeConfigError(
-      `resize config: \`queue\` in ${file} must be false or have driver 'mongo' or 'sqs'`,
+      `resize config: \`queue\` in ${file} must be false or have driver 'database' or 'sqs'`,
       { code: 'RESIZE_CONFIG_INVALID' },
     );
   }

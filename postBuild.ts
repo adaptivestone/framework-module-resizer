@@ -5,7 +5,7 @@ console.time('postBuild. Done');
 
 // Assets tsc does not emit. Some are optional and may not exist yet during early
 // development, so copy each independently and skip the ones that are absent.
-const paths = ['types.d.ts', 'assets', 'scaffold/templates'];
+const paths = ['types.d.ts', 'assets', 'framework/scaffold/templates'];
 
 await Promise.all(
   paths.map(async (path) => {

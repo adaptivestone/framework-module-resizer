@@ -97,7 +97,7 @@ a private original.
    - `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or
      `{ driver: 's3', bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?,
      forcePathStyle? }` (S3 is imported only when selected; credentials from the AWS chain);
-   - `queue`: `{ driver: 'mongo' }` or `{ driver: 'sqs', queueUrl, queues?, deadLetterQueueUrl?,
+   - `queue`: `{ driver: 'database' }` or `{ driver: 'sqs', queueUrl, queues?, deadLetterQueueUrl?,
      waitTimeSeconds?, region?, endpoint? }`, plus any timing key (`leaseMs`, `lockTtlMs`,
      `maxAttempts`, …; the rest default). Missing or `false` = eager only;
    - `worker`: the worker command's settings.
@@ -130,7 +130,7 @@ a private original.
    requestKey }` is required for the Mongo deduplication guarantee; verify it in the host's DB
    rollout. Never add index creation to HTTP bootstrap or the first enqueue.
 
-8. Lazy / pre-warm modes: keep `queue: { driver: 'mongo' }` (or SQS) and set
+8. Lazy / pre-warm modes: keep `queue: { driver: 'database' }` (or SQS) and set
    `worker.enabled: true` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`
    (queue `'default'`; `npm run cli ResizeWorker -- --queue=bulk` consumes only `'bulk'`).
@@ -193,9 +193,10 @@ const result = await getResizer().prewarm({ media: fileDoc, sizes: catalog });
 // result.unconfirmed: variants without a confirmed task; result.issues: why, and issue.retryable
 ```
 
-A held dispatch lock is not accepted proof. Mongo confirms only an exact canonical active
-payload; conflicting payloads with one preview identity are explicit errors. SQS/custom
-task queues without `findActive` report lock races as retryable `incomplete`. An unexpected
+A held dispatch lock is not accepted proof. A task queue with `findActive` (the database queue)
+confirms only an exact canonical active payload; conflicting payloads with one preview identity
+are explicit errors. A queue without it (SQS, many custom ones) reports lock races as retryable
+`incomplete`. An unexpected
 internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue. Delivery remains
 at-least-once, not exactly-once.
 

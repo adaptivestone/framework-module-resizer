@@ -54,7 +54,7 @@ describe('getResizeConfig', () => {
     const config = makeResizeConfig({
       formats: ['webp'],
       storage: { driver: 'local', rootDir: './m', publicBaseUrl: '/m' },
-      queue: { driver: 'mongo', maxAttempts: 3 },
+      queue: { driver: 'database', maxAttempts: 3 },
     });
     install(config);
     const resolved = getResizeConfig();

@@ -5,7 +5,7 @@
 // files in the host's src/). So this generator is STANDALONE: NO framework, NO getApp, NO other
 // module imports — only node builtins. Paths resolve from process.cwd() (or --out <dir>).
 //
-// Templates live beside this file (src/scaffold/templates → dist/scaffold/templates, copied by
+// Templates live beside this file (src/framework/scaffold/templates → dist/framework/scaffold/templates, copied by
 // postBuild), so they resolve relative to import.meta.url in BOTH the source and built layouts.
 //
 // House rule: a CLI procedure is functions, not a class (no stateful driver here). The programmatic

@@ -100,7 +100,7 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 **Background generation.** Run `npx resize-scaffold` (without `--eager`) to add the
 `ResizeTask` model and the `ResizeWorker` command, then:
 
-1. Set `queue: { driver: 'mongo' }` in the config (tasks wait in the `ResizeTask` model), or
+1. Set `queue: { driver: 'database' }` in the config (tasks wait in the `ResizeTask` model), or
    `{ driver: 'sqs', queueUrl }`.
 2. Set `worker.enabled: true` in the config.
 3. Create the indexes through your migration process.
@@ -296,9 +296,10 @@ does not merge again. Only `FrameworkResizer` reads the extra keys:
   unless the code passes `storage`. S3 is imported only when selected; credentials come from the
   AWS SDK's default chain. Switching the driver in an environment file keeps the other keys of
   the merged section, so set `publicBaseUrl` there too.
-- `queue`: `{ driver: 'mongo' }` (the `ResizeTask` model; the default driver) or `{ driver:
-  'sqs', queueUrl, queues?, deadLetterQueueUrl?, waitTimeSeconds?, region?, endpoint? }`, plus
-  any of the timing options above (the rest default). Missing or `false`: eager only.
+- `queue`: `{ driver: 'database' }` (the database's own queue: the `ResizeTask` model; the
+  default driver) or `{ driver: 'sqs', queueUrl, queues?, deadLetterQueueUrl?, waitTimeSeconds?,
+  region?, endpoint? }`, plus any of the timing options above (the rest default). Missing or
+  `false`: eager only.
 - `worker`: `{ enabled: false, sharpConcurrency: 1, sharpCache: false }`, used by the
   `ResizeWorker` command. `enabled` allows the command to run.
 

@@ -17,8 +17,8 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import defaultResizeConfig, {
   defaultFrameworkResizeConfig,
-} from '../config/resize.ts';
-import { getResizeConfig } from '../framework/config.ts';
+} from '../../config/resize.ts';
+import { getResizeConfig } from '../config.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -99,7 +99,7 @@ describe('runScaffold — default run', () => {
     assert.match(configSource, /\.\.\.defaultFrameworkResizeConfig/);
     assert.match(configSource, /satisfies FrameworkResizeConfig/);
     assert.match(configSource, /storage: \{ driver: 'local'/);
-    assert.match(configSource, /^ {2}queue: \{ driver: 'mongo' \},$/m);
+    assert.match(configSource, /^ {2}queue: \{ driver: 'database' \},$/m);
     assert.match(
       configSource,
       /indexes[\s\S]+migration process; the module never creates them/,
@@ -115,7 +115,7 @@ describe('runScaffold — default run', () => {
         rootDir: './var/media',
         publicBaseUrl: '/media',
       },
-      queue: { driver: 'mongo' as const },
+      queue: { driver: 'database' as const },
     };
     assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
     assert.equal(scaffoldedConfig.worker.enabled, false);
@@ -460,14 +460,17 @@ describe('packaging smoke', () => {
     assert.equal(src.split('\n')[0], '#!/usr/bin/env node');
   });
 
-  test('package.json bin points at dist/scaffold/command.js', async () => {
+  test('package.json bin points at dist/framework/scaffold/command.js', async () => {
     const pkg = JSON.parse(
       await readFile(
-        fileURLToPath(new URL('../../package.json', import.meta.url)),
+        fileURLToPath(new URL('../../../package.json', import.meta.url)),
         'utf8',
       ),
     );
-    assert.equal(pkg.bin['resize-scaffold'], './dist/scaffold/command.js');
+    assert.equal(
+      pkg.bin['resize-scaffold'],
+      './dist/framework/scaffold/command.js',
+    );
   });
 });
 
@@ -476,7 +479,7 @@ describe('scaffolded ResizeWorker command', () => {
     await run([]);
     // The temp root cannot resolve the package name; point the shim at this checkout's command.
     const moduleCommand = pathToFileURL(
-      fileURLToPath(new URL('../framework/index.ts', import.meta.url)),
+      fileURLToPath(new URL('../index.ts', import.meta.url)),
     ).href;
     const shim = (await read(COMMAND)).replace(
       '@adaptivestone/framework-module-resize/framework.js',

@@ -19,7 +19,7 @@
     "./drivers/sqs.js": "./dist/drivers/sqs.js"
   },
   "bin": {
-    "resize-scaffold": "./dist/scaffold/command.js"
+    "resize-scaffold": "./dist/framework/scaffold/command.js"
   },
   "repository": {
     "type": "git",

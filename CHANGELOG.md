@@ -118,17 +118,17 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   `defaultQueueOptions` and `defaultWorkerOptions`).
   - `storage`: `{ driver: 'local', … }` or `{ driver: 's3', … }` (S3 imported only when selected;
     `RESIZE_CONFIG_STORAGE_MISSING` when neither the config nor the code gives one).
-  - `queue`: `{ driver: 'mongo' }` or `{ driver: 'sqs', queueUrl, … }` with any timing keys (the
+  - `queue`: `{ driver: 'database' }` or `{ driver: 'sqs', queueUrl, … }` with any timing keys (the
     rest default). Missing or `false` means eager only; `defaultFrameworkResizeConfig` no longer
-    contains `queue`, so add `queue: { driver: 'mongo' }` for background generation.
+    contains `queue`, so add `queue: { driver: 'database' }` for background generation.
   - `getResizeConfig()` returns `{ image, mediaModelName, storage, queue, timing, worker }`.
   `ResizeConfig` no longer contains `mediaModelName`; `FrameworkResizeConfig` does.
 - `prewarm()` reports every requested variant: `{ status, ready, accepted, notRequired,
   unconfirmed, tasks, issues }` (`PrewarmResult`), instead of an `{ enqueued }` count, and still
   never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue). A
-  held lock is not treated as a task receipt: Mongo proves exact canonical active-payload coverage
-  through the optional `TaskQueue.findActive()`, while SQS/custom queues without it report lock
-  races as retryable `incomplete`. Conflicting payloads with one preview identity are explicit
+  held lock is not treated as a task receipt: a task queue with the optional
+  `TaskQueue.findActive()` (the Mongo queue) proves exact canonical active-payload coverage, while
+  one without it (SQS) reports lock races as retryable `incomplete`. Conflicting payloads with one preview identity are explicit
   errors. There is no separate strict method: the pre-release `enqueueRequired()` is merged into
   `prewarm()`.
 

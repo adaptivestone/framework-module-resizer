@@ -231,7 +231,7 @@ const hostConfig = {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  queue: { driver: 'mongo' },
+  queue: { driver: 'database' },
   worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
 } satisfies FrameworkResizeConfig;
 // An environment file switching both drivers.

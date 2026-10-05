@@ -14,5 +14,5 @@ export default {
   //   storage: { driver: 's3', bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: 'https://…' },
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
   // Eager mode: no task queue. For background generation re-run resize-scaffold without --eager
-  // (it adds the ResizeTask model and the worker command) and set queue: { driver: 'mongo' }.
+  // (it adds the ResizeTask model and the worker command) and set queue: { driver: 'database' }.
 } satisfies FrameworkResizeConfig;

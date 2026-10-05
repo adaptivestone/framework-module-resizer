@@ -256,8 +256,9 @@ export type FrameworkStorageConfig =
 
 // Where a FrameworkResizer's tasks wait: the config file's `queue` section, with the queue's
 // timing (any QueueTimingOptions key; the rest default).
-export interface FrameworkMongoQueueConfig extends Partial<QueueTimingOptions> {
-  driver?: 'mongo'; // the scaffolded ResizeTask model (default driver)
+export interface FrameworkDatabaseQueueConfig
+  extends Partial<QueueTimingOptions> {
+  driver?: 'database'; // the database's own queue: the ResizeTask model (default driver)
 }
 export interface FrameworkSqsQueueConfig extends Partial<QueueTimingOptions> {
   driver: 'sqs'; // SqsTaskQueue (needs @aws-sdk/client-sqs)
@@ -269,7 +270,7 @@ export interface FrameworkSqsQueueConfig extends Partial<QueueTimingOptions> {
   endpoint?: string;
 }
 export type FrameworkQueueConfig =
-  | FrameworkMongoQueueConfig
+  | FrameworkDatabaseQueueConfig
   | FrameworkSqsQueueConfig;
 
 // The config file a framework host writes (`src/config/resize.ts`, or another file per Resizer).

@@ -14,18 +14,18 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
-import type { ResizeDatabase } from './contracts/database.ts';
-import type { ResizeStorage } from './contracts/storage.ts';
-import { FrameworkDatabase } from './framework/database.ts';
-import ResizeTaskModel from './framework/ResizeTaskModel.ts';
-import { FrameworkResizer } from './framework/resizer.ts';
-import { runResizeWorker } from './framework/worker.ts';
-import { resizeMediaSchemaFragment } from './mediaFragment.ts';
-import { resetResizerForTests } from './resizer.ts';
-import { fakeDb } from './testHelpers/fakes.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import type { MediaLike, Preview } from './types.d.ts';
-import { runWorker } from './worker.ts';
+import type { ResizeDatabase } from '../contracts/database.ts';
+import type { ResizeStorage } from '../contracts/storage.ts';
+import { resizeMediaSchemaFragment } from '../mediaFragment.ts';
+import { resetResizerForTests } from '../resizer.ts';
+import { fakeDb } from '../testHelpers/fakes.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import type { MediaLike, Preview } from '../types.d.ts';
+import { runWorker } from '../worker.ts';
+import { FrameworkDatabase } from './database.ts';
+import ResizeTaskModel from './ResizeTaskModel.ts';
+import { FrameworkResizer } from './resizer.ts';
+import { runResizeWorker } from './worker.ts';
 
 const png = await sharp({
   create: {
@@ -265,7 +265,7 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
           publicBaseUrl: '/media',
         },
         queue: {
-          driver: 'mongo',
+          driver: 'database',
           leaseMs: 5000,
           idlePollMs: 20,
           lockTtlMs: { dispatch: 60000, worker: 5000 },
