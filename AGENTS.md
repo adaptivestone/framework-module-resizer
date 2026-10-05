@@ -38,8 +38,8 @@ a private original.
 
    ```bash
    npm i @adaptivestone/framework-module-resize
-   # SQS task queue only: npm i @aws-sdk/client-sqs
-   # S3 storage only:     npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+   # SQS task queue only: npm i @aws-sdk/client-sqs   (>= 3.572)
+   # S3 storage only:     npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner   (>= 3.572)
    ```
 
 2. Scaffold the integration files (never overwrites existing files; `--force` to regenerate):
