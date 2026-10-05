@@ -236,7 +236,11 @@ first holder's late release removes it, and at worst a variant is generated twic
   - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews, requestKey }`; an active task
     with the same `requestKey` may be returned instead.
   - `claim(queue, leaseMs, signal?)` takes the oldest due task (a waiting one whose retry time has
-    passed, or one whose lease expired), increments `attempts` and returns a fencing `token`.
+    passed, or one whose lease expired), increments `attempts` and returns a fencing `token`. It is
+    how a worker receives tasks: it may return `null` at once (the core polls every `idlePollMs`)
+    or wait for a task first (long poll, LISTEN/NOTIFY, a change stream). A waiting claim returns
+    once `signal` aborts, claims only when called (a prefetched task's lease would run out), and
+    treats a notification as a hint, since only one of the woken workers' claims wins.
   - `renew(task, leaseMs)`, `complete(task)`, `fail(task, { retryAt } | 'dead', error)` act only
     while the token still holds (`false` = lease lost).
   - Optionally `findActive({ resizer, mediaId, pipeline })` (lets `prewarm()` confirm work queued by
@@ -276,7 +280,7 @@ section). The core validates them on first use or in `verify()`. Their defaults 
 | `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
 | `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
-| `idlePollMs` | `1000` | Sleep after an empty poll |
+| `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. Claim errors back off from it up to 10× |
 | `taskTimeoutMs` | `600000` | A longer task is failed |
 
 Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep

@@ -60,7 +60,11 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   leases and the heartbeat, the task timeout, retry with backoff, dead-lettering (after
   `maxAttempts`, or at once for a media without an original), the request de-duplication key and the
   `completed` / `failed` / `deadLettered` events, identically for every queue. Tasks carry their
-  `resizer` and `queue`; events go to the owning Resizer's observers.
+  `resizer` and `queue`; events go to the owning Resizer's observers. An idle worker polls every
+  `idlePollMs`, counted from the start of the claim, so a long-polling claim (SQS) is not followed
+  by an extra sleep; claim errors back off (doubling up to 10× `idlePollMs`, reset by the next
+  successful claim). `claim` may wait for a task, which is how a driver can deliver tasks by
+  notification without a contract change.
 - `new Resizer({ storage, db, tasks?, queue? })`. `db` is required (`RESIZE_DATABASE_REQUIRED`);
   `tasks` enables queued work (prewarm, lazy reads, the worker). Locks come from the database, with
   the worker-lock TTL of the queue that delivered the task. `config` is optional (the package

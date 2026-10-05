@@ -154,6 +154,8 @@ export class MongoTaskQueue extends TaskQueue {
     return { taskId: null };
   }
 
+  // One findOneAndUpdate that returns at once (the core polls every idlePollMs), so it takes no
+  // abort signal.
   async claim(queue: string, leaseMs: number): Promise<ClaimedTask | null> {
     const model = this.#model();
     if (!model) {

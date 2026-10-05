@@ -89,9 +89,15 @@ export interface ConsumeQueueOptions {
   logger?: ResizeLogger;
 }
 
+// Consecutive claim failures wait idlePollMs × 2^(n-1), up to this many idlePollMs, so a down
+// database is not hit (and logged) by every worker every idlePollMs.
+const MAX_CLAIM_ERROR_BACKOFF = 10;
+
 /**
- * Consume `queue` from `tasks` until `signal` aborts. A storage hiccup never kills the loop: it is
- * logged and retried after idlePollMs.
+ * Consume `queue` from `tasks` until `signal` aborts. When nothing is due the loop waits until
+ * idlePollMs has passed since the claim started, so a claim that already waited (a long poll)
+ * is retried at once. A storage hiccup never kills the loop: it is logged and retried with a
+ * growing delay that resets after the next successful claim.
  */
 export async function consumeQueue(
   tasks: TaskQueue,
@@ -146,23 +152,33 @@ export async function consumeQueue(
     }
   };
 
+  let claimFailures = 0;
   while (!opts.signal.aborted) {
     let task: ClaimedTask | null;
+    const claimStarted = Date.now();
     try {
       task = await tasks.claim(opts.queue, leaseMs, opts.signal);
     } catch (err) {
       if (opts.signal.aborted) {
         break;
       }
+      claimFailures += 1;
+      const waitMs =
+        idlePollMs *
+        Math.min(2 ** (claimFailures - 1), MAX_CLAIM_ERROR_BACKOFF);
       logger.error(
-        'resize worker: claiming a task failed — retrying after idlePollMs',
+        `resize worker: claiming a task failed (${claimFailures} in a row) — retrying in ${waitMs} ms`,
         err,
       );
-      await sleep(idlePollMs, opts.signal);
+      await sleep(waitMs, opts.signal);
       continue;
     }
+    claimFailures = 0;
     if (!task) {
-      await sleep(idlePollMs, opts.signal);
+      const waited = Date.now() - claimStarted;
+      if (waited < idlePollMs) {
+        await sleep(idlePollMs - waited, opts.signal);
+      }
       continue;
     }
     // Delivered more often than allowed (its workers kept crashing mid-task): dead, not retried.

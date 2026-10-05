@@ -237,6 +237,82 @@ describe('consumeQueue', () => {
     assert.equal(errors.length, 2);
   });
 
+  test('consecutive claim errors back off (doubling, capped) and reset after a successful claim', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, idlePollMs: 10 },
+    });
+    // fail ×5, then empty (success), then fail once more, then empty for good
+    const script = ['fail', 'fail', 'fail', 'fail', 'fail', 'empty', 'fail'];
+    const starts: number[] = [];
+    const ends: number[] = [];
+    const errors: string[] = [];
+    tasks.claim = async () => {
+      starts.push(Date.now());
+      const step = script[starts.length - 1] ?? 'empty';
+      ends.push(Date.now());
+      if (step === 'fail') {
+        throw new Error('db down');
+      }
+      return null;
+    };
+    await runUntil(
+      tasks,
+      async () => {},
+      () => starts.length >= script.length + 1,
+      { ...silent, error: (msg: unknown) => errors.push(String(msg)) },
+    );
+    const waitAfter = (i: number) => starts[i + 1] - ends[i];
+    // 10, 20, 40, 80, then capped at 10 × idlePollMs = 100
+    assert.ok(waitAfter(2) >= 38, `third retry waited ${waitAfter(2)} ms`);
+    assert.ok(waitAfter(3) >= 78, `fourth retry waited ${waitAfter(3)} ms`);
+    assert.ok(waitAfter(4) >= 98, `fifth retry waited ${waitAfter(4)} ms`);
+    assert.ok(waitAfter(4) < 160, `the backoff is capped (${waitAfter(4)} ms)`);
+    // After the successful (empty) claim the next failure starts again from idlePollMs.
+    assert.ok(
+      waitAfter(6) < 60,
+      `reset after success: waited ${waitAfter(6)} ms`,
+    );
+    assert.match(errors[0], /failed \(1 in a row\) — retrying in 10 ms/);
+    assert.match(errors[4], /failed \(5 in a row\) — retrying in 100 ms/);
+    assert.match(errors[5], /failed \(1 in a row\)/);
+  });
+
+  test('an empty claim that already waited (a long poll) is retried at once; a quick one waits idlePollMs', async () => {
+    for (const [claimWaitMs, expectGap] of [
+      [80, 'none'],
+      [0, 'idle'],
+    ] as const) {
+      const tasks = new MemoryTaskQueue({
+        timing: { ...fastTiming, idlePollMs: 60 },
+      });
+      const starts: number[] = [];
+      const ends: number[] = [];
+      tasks.claim = async () => {
+        starts.push(Date.now());
+        await new Promise((r) => setTimeout(r, claimWaitMs));
+        ends.push(Date.now());
+        return null;
+      };
+      await runUntil(
+        tasks,
+        async () => {},
+        () => starts.length >= 3,
+      );
+      const gap = starts[1] - ends[0];
+      if (expectGap === 'none') {
+        assert.ok(
+          gap < 30,
+          `a long poll is not followed by a sleep (${gap} ms)`,
+        );
+      } else {
+        assert.ok(
+          gap >= 55,
+          `a quick empty claim waits idlePollMs (${gap} ms)`,
+        );
+      }
+    }
+  });
+
   test('a throwing observer is logged; the task state stands', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());

@@ -81,7 +81,8 @@ a private original.
    driver extends the exported abstract class (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`) or
    is any object of the same shape — no `app` parameter; a driver closes over its own client. The
    core owns the queue logic (worker loop, retries, dead-letters, events); a `TaskQueue` only
-   implements atomic `add` / `claim` / `renew` / `complete` / `fail`.
+   implements atomic `add` / `claim` / `renew` / `complete` / `fail`. `claim` may wait for a task
+   (long poll), but must return once its `signal` aborts and never claim ahead of the call.
 
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
    on a bad config, call `await getResizer().verify()` after `Server.init()`; otherwise a config
