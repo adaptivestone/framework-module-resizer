@@ -1,6 +1,7 @@
 // The core queue logic, the same for every TaskQueue backend: the worker loop (claim, lease
-// heartbeat, task timeout), the retry policy (backoff, dead-lettering after maxAttempts, terminal
-// errors) and task events. Backends only implement the atomic TaskQueue operations.
+// heartbeat, task timeout, giving tasks back at shutdown), the retry policy (backoff,
+// dead-lettering after maxAttempts, terminal errors) and task events. Backends only implement the
+// atomic TaskQueue operations.
 import { defaultQueueOptions } from './config/resize.ts';
 import type {
   ClaimedTask,
@@ -78,9 +79,26 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
   };
 }
 
+// Errors no retry can fix: the media row has no original, or its source has no dimensions or is
+// over the pixel limits. Each retry would only download and decode the original again. Errors
+// cross module boundaries as plain objects, so match the stable code, not the class.
+const TERMINAL_ERROR_CODES: ReadonlySet<unknown> = new Set([
+  'RESIZE_NO_ORIGINAL',
+  'RESIZE_SOURCE_METADATA_MISSING',
+  'RESIZE_SOURCE_TOO_LARGE',
+]);
+
+const isTerminal = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'code' in error &&
+  TERMINAL_ERROR_CODES.has((error as { code?: unknown }).code);
+
 export interface ConsumeQueueOptions {
   queue: string;
-  signal: AbortSignal; // stops the loop: the current task finishes or aborts, then it returns
+  // Stops the loop: the current task finishes, or goes back to the queue unprocessed if the stop
+  // aborted it; then it returns.
+  signal: AbortSignal;
   handle: (
     task: LeasedTask,
     taskOpts: { signal: AbortSignal },
@@ -124,16 +142,7 @@ export async function consumeQueue(
     error: unknown,
     forceDead = false,
   ): Promise<void> => {
-    // A media row without an original is terminal: retrying cannot make it appear. Errors cross
-    // module boundaries as plain objects, so match the stable code, not the class.
-    const code =
-      typeof error === 'object' && error !== null && 'code' in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-    const dead =
-      forceDead ||
-      code === 'RESIZE_NO_ORIGINAL' ||
-      task.attempts >= maxAttempts;
+    const dead = forceDead || isTerminal(error) || task.attempts >= maxAttempts;
     try {
       const held = await tasks.fail(
         task,
@@ -149,6 +158,31 @@ export async function consumeQueue(
       }
     } catch (err) {
       logger.error(`resize worker: failing task ${task.taskId} failed`, err);
+    }
+  };
+  // The worker's shutdown stopped the task: it was not processed, so it goes back with no event,
+  // no backoff and, where the queue can release it, without counting the delivery. A queue without
+  // `release` retries it at once through `fail`; the delivery then counts, but it is never
+  // dead-lettered here.
+  const giveBack = async (task: ClaimedTask): Promise<void> => {
+    try {
+      const held = tasks.release
+        ? await tasks.release(task)
+        : await tasks.fail(
+            task,
+            { retryAt: new Date() },
+            `resize worker: task ${task.taskId} was stopped by a worker shutdown`,
+          );
+      if (held) {
+        logger.info(
+          `resize worker: shutdown — task ${task.taskId} is back in the queue`,
+        );
+      }
+    } catch (err) {
+      logger.error(
+        `resize worker: giving task ${task.taskId} back failed`,
+        err,
+      );
     }
   };
 
@@ -193,21 +227,25 @@ export async function consumeQueue(
       );
       continue;
     }
+    // The shutdown arrived while the claim ran (a claim that returns at once ignores the signal).
+    if (opts.signal.aborted) {
+      await giveBack(task);
+      break;
+    }
 
     // Per-task lease-loss signal; worker shutdown also aborts the current task, so it finishes
-    // its current variant, skips the rest, and the loop exits promptly.
+    // its current variant, skips the rest, goes back to the queue, and the loop exits promptly.
     const taskController = new AbortController();
     const onShutdown = () => taskController.abort();
     opts.signal.addEventListener('abort', onShutdown, { once: true });
-    if (opts.signal.aborted) {
-      taskController.abort();
-    }
     const claimed = task;
+    let leaseLost = false;
     const heartbeat = setInterval(() => {
       tasks
         .renew(claimed, leaseMs)
         .then((held) => {
           if (!held) {
+            leaseLost = true;
             taskController.abort();
           }
         })
@@ -271,6 +309,10 @@ export async function consumeQueue(
           err,
         );
       }
+    } else if (opts.signal.aborted && !leaseLost && !isTerminal(handlerError)) {
+      // Stopped by the shutdown, not by its own failure: not an attempt. A terminal error still
+      // dead-letters: the task proved it can never succeed before the shutdown stopped it.
+      await giveBack(task);
     } else {
       await finish(task, handlerError);
     }

@@ -1,4 +1,4 @@
-// src/models/ResizeTask.ts — EJECTED full model (scaffolded with `--eject`, 08 · §12).
+// src/models/ResizeTask.ts — EJECTED full model (scaffolded with `--eject`).
 //
 // ⚠️  This is a VENDORED COPY of the module's ResizeTaskModel schema + indexes, for hosts that
 //     need custom fields/indexes. Unlike the thin `extends ResizeTaskModel` shim, this copy will
@@ -58,7 +58,7 @@ export default class ResizeTask extends BaseModel {
       // Capped by the queue's maxAttempts (config `queue.maxAttempts`), then dead-lettered.
       attempts: { type: Number, default: 0 },
       leasedBy: { type: String },
-      leaseToken: { type: String }, // fencing token (05 · §10.2)
+      leaseToken: { type: String }, // fencing token
       leaseExpiresAt: { type: Date },
       completedAt: { type: Date },
       deadAt: { type: Date },

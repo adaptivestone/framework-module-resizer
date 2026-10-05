@@ -1,9 +1,12 @@
 # Releasing `@adaptivestone/framework-module-resize`
 
 Releases are **manual** (same as the sibling repos — `@adaptivestone/framework` and
-`@adaptivestone/framework-module-email` ship without a publish workflow). CI (`.github/workflows/ci.yml`)
-and the packaging smoke (`.github/workflows/packaging.yml`) gate every push/PR; publishing is a
-human step run from a clean `main`.
+`@adaptivestone/framework-module-email` ship without a publish workflow). CI
+(`.github/workflows/ci.yml`: the latest Node with the locked dependencies, plus a `min-versions`
+job on the oldest supported Node major, at its newest 24.x release, with every peer at its
+declared minimum) and the packaging smoke
+(`.github/workflows/packaging.yml`) gate every push/PR; publishing is a human step run from a
+clean `main`.
 
 ## 1. Pre-flight gates (all must be green)
 
@@ -35,9 +38,15 @@ Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
 Bump with `npm version <patch|minor|major>` (updates `package.json` + creates the git tag — see
 §4), or edit `version` by hand and tag manually.
 
+> **Check `version` first.** `package.json` may already hold the next version (it was bumped
+> ahead of the release, while `CHANGELOG.md` still says `# Unreleased`). Compare it with
+> `npm view @adaptivestone/framework-module-resize version`: if it is already ahead, do not run
+> `npm version` on top of it (that would skip a version); rename the `# Unreleased` heading,
+> commit and tag by hand.
+
 **Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
-heading, with `**Breaking changes**` / `**Features**` / `**Internal**` groups — the format the
-sibling `framework-module-email` uses. It is NOT in `files`, so it stays on GitHub and never
+heading, with `**Breaking changes**` / `**Features**` / `**Fixes**` / `**Internal**` groups —
+the format the sibling `framework-module-email` uses. It is NOT in `files`, so it stays on GitHub and never
 ships in the tarball (same as the sibling). Write it for a host developer deciding whether to
 upgrade: what breaks, what is new, and what they must change.
 
@@ -70,10 +79,11 @@ all that ships.
 
 Tag the release commit `vX.Y.Z`.
 
-> **Note:** the sibling repos actually tag **without** the `v` prefix (`framework` uses `5.3.1`,
-> `framework-module-email` uses `2.0.0`) — an earlier version of this file claimed otherwise. This
-> repo already published `v0.1.0` and `v0.2.0` with the prefix, so it keeps `v` for internal
-> consistency rather than switching mid-stream. Use `v` here; don't "fix" it to match the siblings.
+> **Note:** the sibling repos tag **without** the `v` prefix (`framework` uses `5.3.1`,
+> `framework-module-email` uses `2.0.0`). This repo's existing tags are mixed: `v0.1.0` has the
+> prefix, `0.2.0` does not, and 0.2.1 has no tag at all (`git tag` lists them). This file keeps
+> the `v` prefix, npm's default; pick one convention before the next release and use it from
+> then on.
 
 ```bash
 git tag v0.1.0
@@ -106,13 +116,19 @@ _Placeholder — the one check the automated smoke can't do: wire the published 
 actual framework host and run it against real infra._
 
 - [ ] In a real `@adaptivestone/framework` host: `npm i @adaptivestone/framework-module-resize`,
-      run `npx resize-scaffold`, fill the `storage` TODO in `src/resizer.ts` + `mediaModelName`
-      in `src/config/resize.ts`, `import ./resizer.ts` from `src/server.ts`.
-- [ ] Confirm `npm run gen` (the framework's AST codegen) types the scaffolded
-      `class ResizeTask extends ResizeTaskModel {}`.
-- [ ] Boot the server, upload an image, confirm a `resolve()` read enqueues and the
-      `ResizeWorker` command generates + persists previews (mongo transport + S3 storage).
-- [ ] Confirm eager mode (`generate()`, no transport) on a host wired without a queue.
+      run `npx resize-scaffold`, and in `src/config/resize.ts` set `mediaModelName`, `storage`
+      (S3), `queue: { driver: 'database' }` and `worker.enabled: true`. `src/resizer.ts` stays
+      `new FrameworkResizer({ pipelines })`. Create the `ResizeTask` indexes through the host's
+      migration, and call `await resizer.verify()` after `server.init()`.
+- [ ] `npx resize-scaffold --check` passes, and `npm run gen` (the framework's AST codegen) types
+      `getModel('ResizeTask')` through the scaffolded shim.
+- [ ] Boot the server, upload an image, confirm a `resolve()` read queues the missing variants and
+      `npm run cli ResizeWorker` generates and persists the previews (database queue + S3
+      storage). If the host uses SQS, repeat with `queue: { driver: 'sqs', … }`.
+- [ ] Stop the worker during a task (SIGTERM): the task goes back to `pending` and the next
+      worker finishes it.
+- [ ] Confirm eager mode (`generate()`, no `queue` in the config) on a host scaffolded with
+      `--eager`; `npx resize-scaffold --check --eager` passes.
 
 ## Notes
 

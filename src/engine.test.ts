@@ -439,6 +439,7 @@ describe('resolve — enqueue wiring', () => {
       storage: makeStorage(),
       tasks,
       db: fakeDb({ locks }),
+      pipelines: { photo: {} },
     });
     const media: MediaLike = {
       id: 'm1',
@@ -992,6 +993,72 @@ describe('resolve — original-fits fast-path', () => {
     assert.equal(publicUrlCalls, 0);
   });
 
+  test('a pipeline with a variant step never serves the original: the variant is missing and queued', async () => {
+    installFakeApp();
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      tasks,
+      db: fakeDb({ locks }),
+      pipelines: { watermark: { variantSteps: [(img) => img] } },
+    });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'orig.jpg' },
+          contentType: 'image/jpeg',
+          width: 100,
+          height: 100,
+        },
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      pipeline: 'watermark',
+    });
+    assert.deepEqual(decision.ready, []);
+    assert.deepEqual(decision.missing, [
+      {
+        sizeKey: '300x300',
+        format: 'jpeg',
+        requestedWidth: 300,
+        requestedHeight: 300,
+      },
+    ]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].pipeline, 'watermark');
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.sizeKey),
+      ['300x300'],
+    );
+  });
+
+  test('a pipeline with a before step never serves the original; one without steps still does', async () => {
+    installFakeApp();
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      pipelines: {
+        redact: { beforeSteps: [(buffer) => buffer] },
+        plain: { beforeSteps: [], variantSteps: [] },
+      },
+    });
+    const read = (pipeline: string) =>
+      r.resolve({
+        media: fitsMedia(),
+        sizes: [{ width: 300, height: 300 }],
+        formats: ['jpeg'],
+        pipeline,
+        enqueueMissing: false,
+      });
+    const redacted = await read('redact');
+    assert.deepEqual(redacted.decision.ready, []);
+    assert.equal(redacted.decision.missing.length, 1);
+    const plain = await read('plain');
+    assert.equal(plain.decision.ready[0]?.isOriginal, true);
+    assert.deepEqual(plain.decision.missing, []);
+  });
+
   test('a custom storage without canServeOriginalPublicly has no original fast-path', async () => {
     installFakeApp();
     const storage: ResizeStorage = {
@@ -1016,48 +1083,132 @@ describe('resolve — original-fits fast-path', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolve — never throws', () => {
-  test('a mid-loop storage.publicUrl throw yields the safe value (ready-so-far, empty missing)', async () => {
-    const { errors } = installFakeApp();
-    const storage = makeStorage({
+  // p2's ref is rejected by the driver (e.g. its bucket is no longer allowlisted).
+  const throwingStorage = () =>
+    makeStorage({
       publicUrl: (ref: StorageRef) => {
         if (ref.key === 'p2') {
-          throw new Error('cdn boom');
+          throw new Error('bucket is not allowlisted');
         }
         return `https://cdn/${ref.key}`;
       },
     });
-    const r = new FrameworkResizer({ storage });
-    const media: MediaLike = {
-      id: 'm1',
-      previews: [
-        {
-          storageRef: { key: 'p1' },
-          contentType: 'image/jpeg',
-          sizeKey: '300x300',
-          format: 'jpeg',
-        },
-        {
-          storageRef: { key: 'p2' },
-          contentType: 'image/jpeg',
-          sizeKey: '100x100',
-          format: 'jpeg',
-        },
-      ],
-    };
+  const storedPreview = (key: string, sizeKey: string) => ({
+    storageRef: { key },
+    contentType: 'image/jpeg',
+    sizeKey,
+    format: 'jpeg',
+  });
+  const threeStored = (): MediaLike => ({
+    id: 'm1',
+    original: { storageRef: { key: 'orig.jpg' }, width: 4000, height: 3000 },
+    previews: [
+      storedPreview('p1', '300x300'),
+      storedPreview('p2', '100x100'),
+      storedPreview('p3', '50x50'),
+    ],
+  });
+  const sizes = [
+    { width: 300, height: 300 },
+    { width: 100, height: 100 },
+    { width: 50, height: 50 },
+    { width: 600, height: 600 },
+  ];
+
+  test('a publicUrl throw skips only that cell: later cells, the hook and the enqueue proceed', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
+    const r = new FrameworkResizer({
+      storage: throwingStorage(),
+      tasks,
+      db: fakeDb({ locks }),
+      hooks: {
+        formatPublicUrls: (decision) =>
+          decision.ready.map((entry) => entry.url),
+      },
+    });
     const { decision, output } = await r.resolve({
-      media,
-      sizes: [
-        { width: 300, height: 300 },
-        { width: 100, height: 100 },
-      ],
+      media: threeStored(),
+      sizes,
+      formats: ['jpeg'],
+      enqueueMissing: true,
+    });
+    assert.deepEqual(
+      decision.ready.map((entry) => entry.url),
+      ['https://cdn/p1', 'https://cdn/p3'],
+    );
+    // The rejected preview is neither ready nor missing; the absent size still queues.
+    assert.deepEqual(
+      decision.missing.map((m) => m.sizeKey),
+      ['600x600'],
+    );
+    assert.deepEqual(output, ['https://cdn/p1', 'https://cdn/p3']);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.sizeKey),
+      ['600x600'],
+    );
+    assert.equal(errors.length, 1);
+  });
+
+  test('a publicUrl throw without enqueueing still returns every other cell', async () => {
+    const { errors } = installFakeApp();
+    const r = new FrameworkResizer({ storage: throwingStorage() });
+    const { decision } = await r.resolve({
+      media: threeStored(),
+      sizes,
       formats: ['jpeg'],
       enqueueMissing: false,
     });
-    assert.equal(decision.ready.length, 1);
-    assert.equal(decision.ready[0].url, 'https://cdn/p1');
-    assert.equal(decision.missing.length, 0);
+    assert.deepEqual(
+      decision.ready.map((entry) => entry.url),
+      ['https://cdn/p1', 'https://cdn/p3'],
+    );
+    assert.deepEqual(
+      decision.missing.map((m) => m.sizeKey),
+      ['600x600'],
+    );
+    assert.equal(errors.length, 1);
+  });
+
+  test('a publicUrl throw for a public original leaves that variant missing', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
+    const r = new FrameworkResizer({
+      storage: makeStorage({
+        publicUrl: () => {
+          throw new Error('bucket is not allowlisted');
+        },
+      }),
+      tasks,
+      db: fakeDb({ locks }),
+    });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'm1',
+        original: { storageRef: { key: 'orig.jpg' }, width: 100, height: 100 },
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(decision.ready, []);
+    assert.deepEqual(
+      decision.missing.map((m) => m.sizeKey),
+      ['300x300'],
+    );
+    assert.equal(calls.length, 1);
+    assert.equal(errors.length, 1);
+  });
+
+  test('resolve(undefined) returns the logged safe empty decision', async () => {
+    const { errors } = installFakeApp();
+    const r = new FrameworkResizer({ storage: makeStorage() });
+    const { decision, output } = await r.resolve(undefined as never);
+    assert.deepEqual(decision, { ready: [], missing: [] });
     assert.equal(output, undefined);
-    assert.ok(errors.length >= 1);
+    assert.equal(errors.length, 1);
   });
 
   test('media with no id/_id → logged safe empty decision (never-throw wrapper absorbs requireMediaId)', async () => {
@@ -1076,6 +1227,191 @@ describe('resolve — never throws', () => {
     assert.deepEqual(decision, { ready: [], missing: [] });
     assert.equal(output, undefined);
     assert.ok(errors.length >= 1);
+  });
+});
+
+describe('resolve — unknown pipeline', () => {
+  test('serves stored previews of that pipeline, reports nothing missing, queues nothing and logs', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
+    let beforeEnqueueCalls = 0;
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      tasks,
+      db: fakeDb({ locks }),
+      hooks: {
+        beforeEnqueue: (missing) => {
+          beforeEnqueueCalls += 1;
+          return [...missing, { sizeKey: '10x10', format: 'jpeg' }];
+        },
+        formatPublicUrls: (decision) =>
+          decision.ready.map((entry) => entry.url),
+      },
+    });
+    const media: MediaLike = {
+      id: 'm1',
+      // Public and small enough for the shortcut: it must not be served for an unknown pipeline.
+      original: { storageRef: { key: 'orig.jpg' }, width: 100, height: 100 },
+      previews: [
+        {
+          storageRef: { key: 'retired.webp' },
+          contentType: 'image/webp',
+          sizeKey: '300x300',
+          format: 'webp',
+          pipeline: 'retired',
+        },
+        {
+          storageRef: { key: 'default.jpg' },
+          contentType: 'image/jpeg',
+          sizeKey: '300x300',
+          format: 'jpeg',
+        },
+      ],
+    };
+    const { decision, output } = await r.resolve({
+      media,
+      sizes: [{ width: 300, height: 300 }, { width: 600 }],
+      formats: ['jpeg', 'webp'],
+      pipeline: 'retired',
+      enqueueMissing: true,
+    });
+    assert.deepEqual(
+      decision.ready.map((entry) => entry.url),
+      ['https://cdn/retired.webp'],
+    );
+    assert.deepEqual(decision.missing, []);
+    assert.deepEqual(output, ['https://cdn/retired.webp']);
+    assert.equal(beforeEnqueueCalls, 0);
+    assert.equal(calls.length, 0);
+    assert.equal(acquired.length, 0);
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0][0]), /'retired'/);
+  });
+
+  test('"default" is always known, registered or not', async () => {
+    const { errors } = installFakeApp();
+    const r = new FrameworkResizer({ storage: makeStorage() });
+    const { decision } = await r.resolve({
+      media: { id: 'm1' },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      pipeline: 'default',
+      enqueueMissing: false,
+    });
+    assert.equal(decision.missing.length, 1);
+    assert.equal(errors.length, 0);
+  });
+});
+
+describe('resolve — per-call formats', () => {
+  test('formats without an encode.formats entry are dropped with one logged error', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      tasks,
+      db: fakeDb({ locks }),
+    });
+    const { decision } = await r.resolve({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [
+        { width: 100, height: 100 },
+        { width: 200, height: 200 },
+      ],
+      // 'toString' is inherited, not an own key of encode.formats.
+      formats: ['jpg', 'webp', '../../etc', 'toString', 'jpg'],
+    });
+    assert.deepEqual(
+      decision.missing.map((m) => `${m.sizeKey}:${m.format}`),
+      ['100x100:webp', '200x200:webp'],
+    );
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.format),
+      ['webp', 'webp'],
+    );
+    assert.equal(errors.length, 1);
+    const message = String(errors[0][0]);
+    for (const dropped of ['jpg', '../../etc', 'toString']) {
+      assert.ok(message.includes(dropped), `${dropped} named in: ${message}`);
+    }
+    assert.ok(!message.includes('webp'));
+  });
+
+  test('a beforeEnqueue tap cannot queue a format without an encode.formats entry', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      tasks,
+      db: fakeDb({ locks }),
+      hooks: {
+        beforeEnqueue: (missing) => [
+          ...missing,
+          {
+            sizeKey: '300x300',
+            format: 'jpg',
+            requestedWidth: 300,
+            requestedHeight: 300,
+          },
+        ],
+      },
+    });
+    const { decision } = await r.resolve({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['webp'],
+    });
+    assert.deepEqual(
+      decision.missing.map((m) => m.format),
+      ['webp'],
+    );
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.format),
+      ['webp'],
+    );
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0][0]), /"jpg".*beforeEnqueue/);
+  });
+
+  test('a stored preview of an unconfigured format is not served', async () => {
+    const { errors } = installFakeApp();
+    const r = new FrameworkResizer({ storage: makeStorage() });
+    const { decision } = await r.resolve({
+      media: {
+        id: 'm1',
+        previews: [
+          {
+            storageRef: { key: 'old.png' },
+            contentType: 'image/png',
+            sizeKey: '300x300',
+            format: 'png',
+          },
+        ],
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['png'],
+      enqueueMissing: false,
+    });
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(errors.length, 1);
+  });
+
+  test('the configured default formats log nothing', async () => {
+    const { errors } = installFakeApp();
+    const r = new FrameworkResizer({ storage: makeStorage() });
+    const { decision } = await r.resolve({
+      media: { id: 'm1' },
+      sizes: [{ width: 300, height: 300 }],
+      enqueueMissing: false,
+    });
+    assert.deepEqual(
+      decision.missing.map((m) => m.format),
+      ['jpeg', 'webp', 'avif'],
+    );
+    assert.equal(errors.length, 0);
   });
 });
 
@@ -1137,7 +1473,10 @@ describe('pipelines are part of preview identity', () => {
 
   test('a default preview is not served for another pipeline', async () => {
     installFakeApp();
-    const r = new FrameworkResizer({ storage: makeStorage() });
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      pipelines: { watermark: {} },
+    });
     const media = { id: 'm1', previews: [stored] };
     const clean = await r.resolve({ media, sizes, formats: ['webp'] });
     const watermarked = await r.resolve({
@@ -1153,7 +1492,10 @@ describe('pipelines are part of preview identity', () => {
 
   test('a preview stored for a pipeline is served only to that pipeline', async () => {
     installFakeApp();
-    const r = new FrameworkResizer({ storage: makeStorage() });
+    const r = new FrameworkResizer({
+      storage: makeStorage(),
+      pipelines: { watermark: {} },
+    });
     const media = {
       id: 'm1',
       previews: [{ ...stored, pipeline: 'watermark' }],

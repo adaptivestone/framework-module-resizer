@@ -13,17 +13,27 @@ import type {
   SizeInput,
 } from './types.d.ts';
 
+/** A size dimension rounded to whole pixels; undefined when not finite or below 1 once rounded. */
+function keyDimension(n: number | undefined): number | undefined {
+  if (!isPositiveFinite(n)) {
+    return undefined;
+  }
+  const rounded = Math.round(n);
+  return rounded >= 1 ? rounded : undefined;
+}
+
 /**
  * Canonical size key (size only — never format or filters). `fit` wins; a dimension
- * counts only if finite and > 0; each is Math.round-ed so the key round-trips through
- * parseSizeKey's integer regexes. Throws when nothing usable is provided.
+ * counts only if finite and still ≥ 1 once Math.round-ed (so the key round-trips through
+ * parseSizeKey's integer regexes and never asks sharp for 0 pixels). Throws when nothing
+ * usable is provided.
  */
 export function getSizeKey({ width, height, fit }: SizeInput): string {
   if (fit) {
     return 'fit';
   }
-  const w = isPositiveFinite(width) ? Math.round(width) : undefined;
-  const h = isPositiveFinite(height) ? Math.round(height) : undefined;
+  const w = keyDimension(width);
+  const h = keyDimension(height);
   if (w !== undefined && h !== undefined) {
     return `${w}x${h}`;
   }
@@ -97,7 +107,15 @@ export function canonicalizeFilterValue(value: unknown): unknown {
       // JSON.stringify omits undefined object values. The request-key payload
       // does too, so omit them here before identity construction.
       if (record[key] !== undefined) {
-        result[key] = canonicalizeFilterValue(record[key]);
+        // Define, never assign: `result['__proto__'] = …` would hit the prototype setter
+        // and drop an own "__proto__" key (JSON.parse creates one), so two different
+        // filter objects would share one identity.
+        Object.defineProperty(result, key, {
+          value: canonicalizeFilterValue(record[key]),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
     }
     return result;
@@ -238,23 +256,37 @@ export function expandPreviewRequests(
         continue;
       }
       seen.add(identity);
-      const mp: MissingPreview = { sizeKey, format };
-      if (size.filters && Object.keys(size.filters).length > 0) {
-        mp.filters = size.filters;
-      }
-      if (isPositiveFinite(size.width)) {
-        mp.requestedWidth = size.width;
-      }
-      if (isPositiveFinite(size.height)) {
-        mp.requestedHeight = size.height;
-      }
-      if (size.fit) {
-        mp.fit = true;
-      }
-      requested.push(mp);
+      requested.push(toMissingPreview(size, sizeKey, format));
     }
   }
   return requested;
+}
+
+/**
+ * Task payload for one size × format. The dimensions come from the size key, so the payload is
+ * a pure function of the preview identity: a fractional input is rounded exactly as the key
+ * rounds it, and a `fit` size carries no dimensions (fit ignores them).
+ */
+export function toMissingPreview(
+  size: SizeInput,
+  sizeKey: string,
+  format: PreviewFormat,
+): MissingPreview {
+  const parsed = parseSizeKey(sizeKey);
+  const mp: MissingPreview = { sizeKey, format };
+  if (size.filters && Object.keys(size.filters).length > 0) {
+    mp.filters = size.filters;
+  }
+  if (parsed.width !== undefined) {
+    mp.requestedWidth = parsed.width;
+  }
+  if (parsed.height !== undefined) {
+    mp.requestedHeight = parsed.height;
+  }
+  if (parsed.fit) {
+    mp.fit = true;
+  }
+  return mp;
 }
 
 /**
@@ -304,7 +336,8 @@ export interface ResizedDimensions {
 /**
  * cover (!fit): pass target dims straight through (either may be undefined for a
  * width-/height-only key — sharp resizes by the provided side). fit: scale to fit
- * INSIDE maxSize preserving aspect, never upscaling beyond the original; sides rounded.
+ * INSIDE maxSize preserving aspect, never upscaling beyond the original; sides rounded
+ * and kept ≥ 1 (an extreme aspect ratio would otherwise round one side to 0).
  * origW/origH MUST be DISPLAY dims (post-EXIF-orient) — see 07 · Worker.
  */
 export function calculateResizedDimensions(
@@ -320,7 +353,35 @@ export function calculateResizedDimensions(
   }
   const scale = Math.min(maxSize.width / origW, maxSize.height / origH, 1);
   return {
-    width: Math.round(origW * scale),
-    height: Math.round(origH * scale),
+    width: Math.max(1, Math.round(origW * scale)),
+    height: Math.max(1, Math.round(origH * scale)),
   };
+}
+
+/**
+ * The box a cover (cropping) variant is resized to. Each requested side is rounded to whole
+ * pixels (an old task payload may still carry a fraction) and capped at `cap`
+ * (limits.resultDimension). A width-only or height-only size keeps the source aspect ratio,
+ * unless the derived side would exceed `cap`: then the box is the requested side × `cap` and
+ * the cover resize crops, so no output side is ever larger than `cap`. srcW/srcH MUST be
+ * DISPLAY dims of one frame.
+ */
+export function coverDimensions(
+  srcW: number,
+  srcH: number,
+  targetW: number | undefined,
+  targetH: number | undefined,
+  cap: number,
+): ResizedDimensions {
+  const side = (n: number | undefined) =>
+    n === undefined ? undefined : Math.min(cap, Math.max(1, Math.round(n)));
+  const width = side(targetW);
+  const height = side(targetH);
+  if (width !== undefined && height === undefined) {
+    return { width, height: (width * srcH) / srcW > cap ? cap : undefined };
+  }
+  if (height !== undefined && width === undefined) {
+    return { width: (height * srcW) / srcH > cap ? cap : undefined, height };
+  }
+  return { width, height };
 }

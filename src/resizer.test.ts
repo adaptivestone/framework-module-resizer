@@ -128,7 +128,9 @@ describe('Resizer constructor — driver wiring', () => {
       () => new Resizer({ db: fakeDb() } as never),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
-        err.code === 'RESIZE_STORAGE_REQUIRED',
+        err.code === 'RESIZE_STORAGE_REQUIRED' &&
+        // The message points at nothing the package does not ship.
+        !err.message.includes('§'),
     );
     // The bad construction must NOT have claimed the active slot.
     assert.throws(() => getResizer(), /no Resizer named 'default'/);
@@ -296,6 +298,61 @@ describe('drivers given as functions', () => {
     await r.ready();
     assert.equal(attempts, 2);
     assert.equal(r.storage, storage);
+  });
+
+  test('a part that loaded is kept when a sibling fails; only the failed part is retried', async () => {
+    let storageCalls = 0;
+    let dbCalls = 0;
+    const storage = fakeStorage();
+    const db = fakeDb();
+    const r = new Resizer({
+      logger: silent,
+      storage: async () => {
+        storageCalls += 1;
+        return storage;
+      },
+      db: async () => {
+        dbCalls += 1;
+        if (dbCalls === 1) {
+          throw new Error('db not up');
+        }
+        return db;
+      },
+    });
+    await assert.rejects(() => r.ready(), /db not up/);
+    // Concurrent calls after the failure share one retry of the failed part.
+    await Promise.all([r.ready(), r.ready()]);
+    await r.ready();
+    assert.equal(storageCalls, 1);
+    assert.equal(dbCalls, 2);
+    assert.equal(r.storage, storage);
+    assert.equal(r.db, db);
+  });
+
+  test('a failed lazy task queue stays not ready until it loads', async () => {
+    let taskCalls = 0;
+    const tasks = new MemoryTaskQueue();
+    const r = new Resizer({
+      logger: silent,
+      storage: fakeStorage(),
+      db: fakeDb(),
+      tasks: async () => {
+        taskCalls += 1;
+        if (taskCalls === 1) {
+          throw new Error('queue not up');
+        }
+        return tasks;
+      },
+    });
+    await assert.rejects(() => r.ready(), /queue not up/);
+    assert.throws(
+      () => r.tasks,
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_NOT_READY',
+    );
+    await r.ready();
+    assert.equal(r.tasks, tasks);
+    assert.equal(taskCalls, 2);
   });
 
   test('a loader that returns nothing for a required part is a setup error', async () => {

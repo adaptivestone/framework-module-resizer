@@ -125,12 +125,44 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   `ResizeConfig` no longer contains `mediaModelName`; `FrameworkResizeConfig` does.
 - `prewarm()` reports every requested variant: `{ status, ready, accepted, notRequired,
   unconfirmed, tasks, issues }` (`PrewarmResult`), instead of an `{ enqueued }` count, and still
-  never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue). A
+  never throws (an internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue that
+  lists the variants requested so far). A
   held lock is not treated as a task receipt: a task queue with the optional
   `TaskQueue.findActive()` (the Mongo queue) proves exact canonical active-payload coverage, while
   one without it (SQS) reports lock races as retryable `incomplete`. Conflicting payloads with one preview identity are explicit
-  errors. There is no separate strict method: the pre-release `enqueueRequired()` is merged into
-  `prewarm()`.
+  errors. Issues describe only the variants that remain unconfirmed. There is no separate strict
+  method: the pre-release `enqueueRequired()` is merged into `prewarm()`.
+- An unregistered pipeline name (anything but `'default'`, which always exists) is no longer
+  rendered as an empty pipeline. `resolve()` logs an error, serves only previews already stored
+  for that pipeline, reports nothing missing and queues nothing; `prewarm()` returns `incomplete`
+  with one non-retryable `RESIZE_PIPELINE_UNKNOWN` issue; `generate()` and the worker throw
+  `ResizeSetupError` (`RESIZE_PIPELINE_UNKNOWN`), so a queued task retries, then dead-letters.
+  Register a new or renamed pipeline in the worker process before the API requests it (deploy
+  workers first). New: `resizer.hasPipeline(name)`.
+- Per-call `formats`, and the variants a `beforeEnqueue` tap adds or rewrites, must use keys of
+  `encode.formats`. `resolve()` leaves the others out of `decision.missing` and logs an error,
+  `prewarm()` reports them in `unconfirmed` with the non-retryable issue
+  `RESIZE_FORMAT_NOT_CONFIGURED`, and `generate()` throws `ResizeSetupError`
+  (`RESIZE_FORMAT_NOT_CONFIGURED`) before any hook runs.
+- `resolve()` serves the original in place of a variant ("original already fits") only when the
+  pipeline has no `beforeSteps` and no `variantSteps`; otherwise the variant is generated like
+  any other.
+- `RESIZE_SOURCE_TOO_LARGE` and `RESIZE_SOURCE_METADATA_MISSING` dead-letter a task on the first
+  failure, like `RESIZE_NO_ORIGINAL`: no retry can fix them.
+- `worker.concurrency` in a framework config file fails with `RESIZE_CONFIG_REMOVED_KEY`; move it to
+  the top-level `concurrency`.
+- The scaffolded `src/models/ResizeTask.ts` imports the new
+  `@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js` export (the model class as
+  its default export), which lets the framework's `npm run gen` type `getModel('ResizeTask')`.
+  `resize-scaffold --check` reports a shim that still imports `…/framework.js` as drift: delete
+  `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite
+  `src/resizer.ts` and `src/config/resize.ts`).
+- An ejected or hand-written `ResizeTask` model must declare the `resizer`, `queue` and
+  `requestKey` fields; Mongoose would drop them, filing every task under Resizer and queue
+  `'default'`. `resize-scaffold --check` reports such a model, and `MongoTaskQueue.verify()` (so
+  `resizer.verify()` and worker start) throws `ResizeSetupError` `RESIZE_MONGO_MODEL_OUTDATED`.
+- A task's `leasedBy` is `<hostname>:<pid>` instead of `resizer-<pid>`, so pods with the same pid
+  are told apart.
 
 **Features**
 
@@ -144,8 +176,9 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   without code changes.
 - Lazy drivers: `storage`, `db` and `tasks` may be functions (sync or async), called once on first
   use. `resizer.ready()` loads them; every Resizer method and the worker await it, and `resolve()`
-  / `prewarm()` keep their never-throw guarantee when loading fails. Reading `resizer.storage` /
-  `db` / `tasks` before then throws `RESIZE_NOT_READY`.
+  / `prewarm()` keep their never-throw guarantee when loading fails. When one part fails to load,
+  the next call retries only that part. Reading `resizer.storage` / `db` / `tasks` before then
+  throws `RESIZE_NOT_READY`.
 - Named queues. A Resizer has a default `queue` (default `'default'`), and `resolve()` and
   `prewarm()` accept a per-call `queue`. `npm run cli ResizeWorker -- --queue=<name>` consumes
   only that queue; without the flag it consumes `'default'`. `SqsTaskQueue` maps queue names to
@@ -174,6 +207,20 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   and the worker await them once before claiming tasks, so custom drivers can fail fast too;
   `MongoDatabase.verify()` checks the media and lock models, and `FrameworkDatabase.verify()`
   checks that `mediaModelName` names a registered model and that the framework `Lock` model exists.
+- Worker shutdown gives the stopped task back. The variants in progress finish and are saved, and
+  the task returns to the queue with no `onTaskFailed` / `onTaskDeadLettered` event and no
+  backoff, through the new optional `TaskQueue.release(task)`; a terminal media error
+  (`RESIZE_NO_ORIGINAL`, `RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`) is still
+  dead-lettered with its event. `MongoTaskQueue` does not count the attempt; `SqsTaskQueue` makes
+  the message visible again but still counts the delivery (SQS counts receives); a custom queue
+  without `release` is retried at once through `fail`, which also counts.
+- `npm run cli ResizeWorker -- --config=<name>` picks the config file whose `worker` section (the
+  `enabled` switch and Sharp tuning) the worker process uses; default `resize`. A host with only
+  named config files must pass it.
+- A driver selected in a framework config file whose optional AWS SDK peer is not installed fails
+  at first use or in `verify()` with `ResizeSetupError` `RESIZE_PEER_MISSING`, naming the packages
+  and the config file.
+- `…/framework.js` also exports `appLogger`, `appEvents` and `getApp`.
 
 **Fixes**
 
@@ -196,6 +243,38 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
   counts from `MessageSystemAttributeNames`, which older `@aws-sdk/client-sqs` versions silently
   drop: every delivery then counted as attempt 1, so a failing task was never dead-lettered. It
   now also warns once when SQS returns no `ApproximateReceiveCount`.
+- `animated: true` works. WebP and GIF previews keep the animation, up to
+  `limits.animationFrames` frames, for a pipeline without `variantSteps`; every other format, and
+  every preview of a pipeline with variant steps (a watermark would land on one frame), gets the
+  first frame instead of all frames stacked into one tall image. `actualWidth` / `actualHeight`
+  are the size of one frame. `limits.sourcePixels` applies to one frame, and an animation with
+  more frames than `limits.sourcePixels` or `limits.inputPixels` allow is shortened to the frames
+  that fit instead of failing. An animation with an EXIF orientation is rendered from its first
+  frame.
+- No output side of a width-only or height-only size exceeds `limits.resultDimension`: when the
+  side derived from the aspect ratio would, the image is cropped to the cap.
+- Fractional size dimensions are rounded in the size key, the task and the stored preview; a
+  dimension that rounds to 0 is ignored; a `fit` result is at least 1 px per side.
+- An EXIF-rotated original is no longer re-encoded before resizing when the pipeline has no
+  `beforeSteps` (no quality loss, faster). With `beforeSteps`, the steps still get upright pixels,
+  re-encoded in the same format without visible loss.
+- Very long or thin SVG originals render instead of failing at librsvg's size limit.
+- When recording previews fails after their upload, the error log lists the storage refs that
+  were uploaded but not recorded.
+- A storage `publicUrl` that throws for one stored preview leaves out only that size and format;
+  the rest of the read and the enqueue continue.
+- `S3Storage.publicUrl` with `forcePathStyle: true` and no `endpoint` returns
+  `https://s3.<region>.amazonaws.com/<bucket>/<key>` instead of a relative path, and China
+  regions (`cn-…`) use the `amazonaws.com.cn` domain in both URL forms.
+- `S3Storage` uploads `image/svg+xml` objects with `ContentDisposition: attachment`.
+- Filters with an own `__proto__` key (as `JSON.parse` creates) keep their own preview identity.
+- The dispatch locks of one read or pre-warm are acquired concurrently, not one after another.
+- `package.json` points to the right repository (`adaptivestone/framework-module-resizer`).
+
+**Internal**
+
+- A new CI job, `min-versions`, runs the type check, build and tests on the oldest supported Node
+  major (the newest 24.x release) with every peer at the lowest version its range allows.
 
 # 0.2.1
 

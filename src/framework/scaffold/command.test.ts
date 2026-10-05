@@ -148,6 +148,22 @@ describe('runScaffold — default run', () => {
     assert.match(out, new RegExp(RESIZER));
     assert.match(out, new RegExp(MODEL));
   });
+
+  test('the model shim imports the defining file so codegen can follow its ancestor', async () => {
+    await run([]);
+    assert.match(
+      await read(MODEL),
+      /^import ResizeTaskModel from '@adaptivestone\/framework-module-resize\/framework\/ResizeTaskModel\.js';$/m,
+    );
+  });
+
+  test('next steps explain the queue and worker switch required to run the worker', async () => {
+    const { out } = await run([]);
+    assert.match(out, /queue: \{ driver: 'database' \}/);
+    assert.match(out, /'sqs'/);
+    assert.match(out, /worker\.enabled: true/);
+    assert.match(out, /for the worker to run/);
+  });
 });
 
 describe('runScaffold — idempotency & --force', () => {
@@ -268,6 +284,11 @@ describe('runScaffold — --check', () => {
     const { code, out } = await run(['--check']);
     assert.equal(code, 1);
     assert.match(out, /drift/);
+    assert.match(
+      out,
+      /delete the file and re-run resize-scaffold for a fresh shim/,
+    );
+    assert.doesNotMatch(out, /--force/);
   });
 
   test('an ejected model passes --check (it owns its schema)', async () => {
@@ -276,6 +297,67 @@ describe('runScaffold — --check', () => {
     assert.equal(code, 0, out);
     assert.doesNotMatch(out, /drift/);
   });
+
+  test('a shim importing the defining model subpath passes --check', async () => {
+    await run([]);
+    await writeFile(
+      join(root, MODEL),
+      "import ResizeTaskModel from '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js';\nexport default class ResizeTask extends ResizeTaskModel {}\n",
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 0, out);
+  });
+
+  test('the old barrel import is drift with a regeneration hint that keeps the host files', async () => {
+    await run([]);
+    const oldShim =
+      "import { ResizeTaskModel } from '@adaptivestone/framework-module-resize/framework.js';\nexport default class ResizeTask extends ResizeTaskModel {}\n";
+    await writeFile(join(root, MODEL), oldShim);
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 1);
+    assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
+    assert.match(out, /framework\/ResizeTaskModel\.js/);
+    assert.match(
+      out,
+      /delete the file and re-run resize-scaffold for a fresh shim/,
+    );
+    assert.doesNotMatch(out, /--force/);
+    assert.equal(
+      await read(MODEL),
+      oldShim,
+      '--check never rewrites the host model',
+    );
+  });
+
+  for (const fields of [
+    ['resizer'],
+    ['queue'],
+    ['requestKey'],
+    ['resizer', 'queue', 'requestKey'],
+  ]) {
+    test(`an ejected model missing ${fields.join(', ')} is drift even with its indexes intact`, async () => {
+      await run(['--eject']);
+      let model = await read(MODEL);
+      for (const field of fields) {
+        model = model.replace(
+          new RegExp(`^ {6}${field}: \\{[^\\n]+\\n`, 'm'),
+          '',
+        );
+      }
+      await writeFile(join(root, MODEL), model);
+      const { code, out } = await run(['--check']);
+      assert.equal(code, 1);
+      assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
+      assert.match(out, /port the resizer, queue and requestKey fields/);
+      assert.match(out, /delete the file and re-run resize-scaffold --eject/);
+      assert.doesNotMatch(out, /--force/);
+      assert.equal(
+        await read(MODEL),
+        model,
+        '--check never rewrites an ejected model',
+      );
+    });
+  }
 
   test('an old model shim importing the removed subpath → exit 1 + drift', async () => {
     await run([]);
@@ -452,6 +534,26 @@ describe('runScaffold — --agents pointer', () => {
 
 // Build/packaging smoke — cheap source assertions (no real build in the unit suite).
 describe('packaging smoke', () => {
+  test('repository metadata points at framework-module-resizer', async () => {
+    const pkg = JSON.parse(
+      await readFile(new URL('../../../package.json', import.meta.url), 'utf8'),
+    );
+    assert.equal(
+      pkg.repository.url,
+      'git+https://github.com/adaptivestone/framework-module-resizer.git',
+    );
+  });
+
+  test('package exports the defining model file for scaffold codegen', async () => {
+    const pkg = JSON.parse(
+      await readFile(new URL('../../../package.json', import.meta.url), 'utf8'),
+    );
+    assert.equal(
+      pkg.exports['./framework/ResizeTaskModel.js'],
+      './dist/framework/ResizeTaskModel.js',
+    );
+  });
+
   test('command.ts starts with the node shebang', async () => {
     const src = await readFile(
       fileURLToPath(new URL('./command.ts', import.meta.url)),

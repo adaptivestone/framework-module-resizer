@@ -84,7 +84,7 @@ export class S3Storage extends ResizeStorage {
       return;
     }
     throw new ResizeSecurityError(
-      `resize s3: ref.bucket "${bucket}" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access (05 · §10.5)`,
+      `resize s3: ref.bucket "${bucket}" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access`,
       { code: 'RESIZE_S3_BUCKET_NOT_ALLOWED' },
     );
   }
@@ -181,6 +181,9 @@ export class S3Storage extends ResizeStorage {
         Key: physicalKey,
         Body: body,
         ContentType: contentType,
+        ...(contentType === 'image/svg+xml'
+          ? { ContentDisposition: 'attachment' }
+          : {}),
       }),
     );
     return {
@@ -234,11 +237,17 @@ export class S3Storage extends ResizeStorage {
     if (publicBase) {
       return `${publicBase.replace(/\/+$/, '')}/${key}`;
     }
+    // AWS's own host name: the China regions live under amazonaws.com.cn.
+    const region = this.#opts.region ?? 'us-east-1';
+    const awsHost = `s3.${region}.amazonaws.com${region.startsWith('cn-') ? '.cn' : ''}`;
     if (this.#opts.endpoint !== undefined || this.#opts.forcePathStyle) {
-      const base = (this.#opts.endpoint ?? '').replace(/\/+$/, '');
+      const base = (this.#opts.endpoint ?? `https://${awsHost}`).replace(
+        /\/+$/,
+        '',
+      );
       return `${base}/${bucket}/${key}`;
     }
-    return `https://${bucket}.s3.${this.#opts.region ?? 'us-east-1'}.amazonaws.com/${key}`;
+    return `https://${bucket}.${awsHost}/${key}`;
   }
 
   // Time-limited signed URL for owner/admin reads of a private original.

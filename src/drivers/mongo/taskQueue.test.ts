@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { hostname } from 'node:os';
 import {
   after,
   afterEach,
@@ -31,6 +32,7 @@ import type {
   QueueTimingOptions,
   ResizeLogger,
 } from '../../types.d.ts';
+import { resizeTaskFields } from './schemas.ts';
 import { MongoTaskQueue } from './taskQueue.ts';
 
 // Real MongoDB atomic semantics, using the same schema and indexes as framework hosts.
@@ -331,8 +333,49 @@ describe('MongoTaskQueue setup', () => {
     assert.equal(await tasks.renew(claimed, 300), false);
     assert.equal(await tasks.complete(claimed), false);
     assert.equal(await tasks.fail(claimed, 'dead', 'error'), false);
+    assert.equal(await tasks.release(claimed), false);
     assert.deepEqual(await tasks.findActive(claimed), []);
-    assert.equal(errors.length, 6);
+    assert.equal(errors.length, 7);
+  });
+
+  test('verify rejects a model without the fields the queue writes (an ejected 0.2 model)', () => {
+    // Strict mode would silently drop these from every insert: each task would then read as
+    // Resizer 'default' on queue 'default'.
+    const {
+      resizer: _resizer,
+      queue: _queue,
+      requestKey: _requestKey,
+      ...oldFields
+    } = resizeTaskFields('File');
+    const Old =
+      connection.models.OldResizeTask ??
+      connection.model(
+        'OldResizeTask',
+        new mongoose.Schema(oldFields, { timestamps: true, autoIndex: false }),
+      );
+    const queue = new MongoTaskQueue({ model: Old });
+    assert.throws(
+      () => queue.verify(),
+      (error: unknown) =>
+        error instanceof ResizeSetupError &&
+        error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
+        /resizer, queue, requestKey/.test(error.message) &&
+        /delete src\/models\/ResizeTask\.ts and re-run resize-scaffold/.test(
+          error.message,
+        ) &&
+        /--eject/.test(error.message) &&
+        /resizeTaskFields\(\)/.test(error.message) &&
+        // --force would also overwrite the host's own resizer.ts and config file.
+        !/--force/.test(error.message),
+    );
+  });
+
+  test('verify accepts the package model and a model-shaped object without a schema', () => {
+    assert.doesNotThrow(() => tasks.verify());
+    const schemaless = new MongoTaskQueue({
+      model: { findOneAndUpdate: async () => null },
+    });
+    assert.doesNotThrow(() => schemaless.verify());
   });
 });
 
@@ -699,7 +742,8 @@ describe('MongoTaskQueue.claim', () => {
     assert.ok(leased.token);
     const row = await M.findById(leased.taskId).lean();
     assert.equal(row?.status, 'processing');
-    assert.equal(row?.leasedBy, `resizer-${process.pid}`);
+    // Which pod holds the lease: every container's main process is pid 1.
+    assert.equal(row?.leasedBy, `${hostname().slice(0, 64)}:${process.pid}`);
   });
 
   test('reclaims an expired processing lease and bumps attempts', async () => {
@@ -982,18 +1026,27 @@ describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
   test('RESIZE_NO_ORIGINAL with a stale token is a fenced no-op with no event', async () => {
     const inserted = await insert();
     const rec = makeEvents();
+    // Stop once the fenced fail has run (a shutdown before it would give the task back instead).
+    const failResults: boolean[] = [];
+    const realFail = tasks.fail.bind(tasks);
+    tasks.fail = async (...args) => {
+      const held = await realFail(...args);
+      failResults.push(held);
+      consumer.ctrl.abort();
+      return held;
+    };
     const consumer = startConsumer(
       async (task) => {
         await M.updateOne(
           { _id: task.taskId },
           { $set: { leaseToken: 'another-worker' } },
         );
-        consumer.ctrl.abort();
         throw new ResizeNoOriginalError(task.mediaId);
       },
       { onEvent: rec.onEvent },
     );
     await consumer.done;
+    assert.deepEqual(failResults, [false]);
     const row = await M.findById(inserted._id).lean();
     assert.equal(row?.status, 'processing');
     assert.equal(row?.deadAt, undefined);
@@ -1086,6 +1139,39 @@ describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
     assert.equal(row?.error, 'fatal error');
     assert.ok(row?.deadAt instanceof Date);
     assert.equal(await tasks.fail(leased, 'dead', 'again'), false);
+  });
+});
+
+describe('MongoTaskQueue.release', () => {
+  test('returns a claimed task to pending, due at once, without counting the delivery', async () => {
+    const inserted = await insert({ attempts: 2, error: 'earlier failure' });
+    const leased = await tasks.claim('default', 60_000);
+    assert.ok(leased);
+    assert.equal(leased.attempts, 3);
+    assert.equal(await tasks.release(leased), true);
+    const row = await M.findById(inserted._id).lean();
+    assert.equal(row?.status, 'pending');
+    assert.equal(row?.attempts, 2);
+    assert.equal(row?.leaseToken, null);
+    assert.equal(row?.leaseExpiresAt, null);
+    assert.equal(row?.error, 'earlier failure');
+    const again = await tasks.claim('default', 300);
+    assert.equal(again?.taskId, leased.taskId);
+    assert.equal(again?.attempts, 3);
+    assert.notEqual(again?.token, leased.token);
+  });
+
+  test('a stale token releases nothing', async () => {
+    await insert();
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    assert.equal(await tasks.release({ ...leased, token: 'stale' }), false);
+    const row = await M.findById(leased.taskId).lean();
+    assert.equal(row?.status, 'processing');
+    assert.equal(row?.leaseToken, leased.token);
+    assert.equal(row?.attempts, 1);
+    assert.equal(await tasks.complete(leased), true);
+    assert.equal(await tasks.release(leased), false);
   });
 });
 
@@ -1265,6 +1351,54 @@ describe('consumeQueue with MongoTaskQueue', () => {
     releaseGate();
     await consumer.done;
   });
+
+  for (const prior of [0, 2]) {
+    test(`a shutdown mid-task releases the task without counting it (${prior} earlier attempts of 3)`, {
+      timeout: 10_000,
+    }, async () => {
+      const inserted = await insert({ attempts: prior });
+      const rec = makeEvents();
+      let started = false;
+      const consumer = startConsumer(
+        // Like the worker: on abort it skips the remaining variants and rejects as incomplete.
+        (task, { signal }) =>
+          new Promise<void>((_resolve, reject) => {
+            started = true;
+            signal.addEventListener(
+              'abort',
+              () =>
+                reject(
+                  new ResizeGenerateError({
+                    mediaId: task.mediaId,
+                    failed: 1,
+                    requested: 1,
+                    code: 'RESIZE_WORKER_INCOMPLETE',
+                  }),
+                ),
+              { once: true },
+            );
+          }),
+        { onEvent: rec.onEvent },
+      );
+      await waitFor(() => started);
+      consumer.ctrl.abort();
+      await consumer.done;
+      const row = await M.findById(inserted._id).lean();
+      assert.equal(row?.status, 'pending');
+      assert.equal(row?.attempts, prior);
+      assert.equal(row?.leaseToken, null);
+      assert.equal(row?.deadAt, undefined);
+      assert.equal(row?.error, undefined);
+      assert.deepEqual(
+        [rec.completed.length, rec.failed.length, rec.dead.length],
+        [0, 0, 0],
+      );
+      // The next worker takes it at once, as the same attempt.
+      const next = await tasks.claim('default', 300);
+      assert.equal(next?.taskId, String(inserted._id));
+      assert.equal(next?.attempts, prior + 1);
+    });
+  }
 
   test('an idle worker stops promptly when its signal aborts', async () => {
     configureQueue(undefined, { idlePollMs: 10_000 });

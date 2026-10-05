@@ -33,6 +33,24 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
   });
 
+  test('the disabled message names the config file the worker read', async () => {
+    const lines: string[] = [];
+    setAppInstance({
+      getConfig: () => ({
+        ...defaultResizeConfig,
+        mediaModelName: 'File',
+        worker: { ...defaultWorkerOptions, enabled: false },
+      }),
+      getModel: () => undefined,
+      logger: { info: (m: string) => lines.push(m), warn() {}, error() {} },
+    } as never);
+    await runResizeWorker({ configName: 'resizeListings' });
+    assert.match(lines.join('\n'), /src\/config\/resizeListings\.ts/);
+    lines.length = 0;
+    await runResizeWorker();
+    assert.match(lines.join('\n'), /src\/config\/resize\.ts/);
+  });
+
   test('names the command fix when the worker process built no Resizer', async () => {
     installApp(true);
     await assert.rejects(

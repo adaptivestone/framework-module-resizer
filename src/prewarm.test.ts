@@ -93,6 +93,7 @@ function makeResizer(
     name?: string;
     queue?: string;
     hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
+    pipelines?: ConstructorParameters<typeof Resizer>[0]['pipelines'];
   } = {},
 ) {
   return new Resizer({
@@ -104,6 +105,7 @@ function makeResizer(
     name: options.name,
     queue: options.queue,
     hooks: options.hooks,
+    pipelines: options.pipelines,
   });
 }
 
@@ -125,6 +127,7 @@ describe('prewarm — happy path', () => {
       storage: makeStorage(),
       tasks,
       dbLocks,
+      pipelines: { photo: {} },
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -624,6 +627,7 @@ describe('prewarm — pipelines are part of identity', () => {
       storage: makeStorage(),
       tasks,
       dbLocks,
+      pipelines: { watermark: {} },
     });
     const media = {
       id: 'm1',
@@ -654,5 +658,180 @@ describe('prewarm — pipelines are part of identity', () => {
       1,
     );
     assert.equal(calls[0].pipeline, 'watermark');
+  });
+});
+
+describe('prewarm — unknown pipeline', () => {
+  test('every requested variant is unconfirmed with one non-retryable RESIZE_PIPELINE_UNKNOWN issue', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks, acquired } = makeLocks(true);
+    const r = makeResizer({ tasks, dbLocks });
+    const result = await r.prewarm({
+      media: {
+        id: 'm1',
+        original: { storageRef: { key: 'orig.jpg' } },
+        // Stored for that pipeline name: still not reported as ready.
+        previews: [
+          {
+            storageRef: { key: 'p.jpg' },
+            sizeKey: '300x300',
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+            pipeline: 'retired',
+          },
+        ],
+      },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+      pipeline: 'retired',
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      result.requested.map((p) => `${p.sizeKey}:${p.format}`),
+      ['300x300:jpeg', '300x300:webp'],
+    );
+    assert.deepEqual(result.unconfirmed, result.requested);
+    assert.deepEqual(result.ready, []);
+    assert.deepEqual(result.accepted, []);
+    assert.deepEqual(result.notRequired, []);
+    assert.deepEqual(result.tasks, []);
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_PIPELINE_UNKNOWN');
+    assert.equal(result.issues[0].retryable, false);
+    assert.match(result.issues[0].message, /'retired'/);
+    assert.deepEqual(result.issues[0].previews, result.requested);
+    assert.equal(calls.length, 0);
+    assert.equal(acquired.length, 0);
+    assert.equal(errors.length, 1);
+  });
+});
+
+describe('prewarm — per-call formats', () => {
+  test('formats without an encode.formats entry are unconfirmed with a non-retryable issue; the rest queue', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({ tasks, dbLocks });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpg', 'webp'],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.format),
+      ['webp'],
+    );
+    assert.deepEqual(
+      result.accepted.map((p) => p.format),
+      ['webp'],
+    );
+    assert.deepEqual(
+      result.unconfirmed.map((p) => p.format),
+      ['jpg'],
+    );
+    assert.deepEqual(result.requested.map((p) => p.format).sort(), [
+      'jpg',
+      'webp',
+    ]);
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_FORMAT_NOT_CONFIGURED');
+    assert.equal(result.issues[0].retryable, false);
+    assert.deepEqual(result.issues[0].previews, result.unconfirmed);
+    assert.equal(errors.length, 1);
+  });
+
+  test('only unconfigured formats: nothing queued, incomplete rather than an empty request', async () => {
+    installFakeApp();
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({ tasks, dbLocks });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpg'],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.reason, undefined);
+    assert.equal(result.unconfirmed.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_FORMAT_NOT_CONFIGURED');
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe('prewarm — formats from a beforeEnqueue tap', () => {
+  const jpg300: MissingPreview = {
+    sizeKey: '300x300',
+    format: 'jpg',
+    requestedWidth: 300,
+    requestedHeight: 300,
+  };
+
+  test('an unconfigured format a tap adds is unconfirmed with a non-retryable issue; the rest queue', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks, acquired } = makeLocks(true);
+    const r = makeResizer({
+      tasks,
+      dbLocks,
+      hooks: { beforeEnqueue: (missing) => [...missing, jpg300] },
+    });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['webp'],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      calls[0].previews.map((p) => p.format),
+      ['webp'],
+    );
+    assert.equal(acquired.length, 1);
+    assert.deepEqual(
+      result.accepted.map((p) => p.format),
+      ['webp'],
+    );
+    assert.deepEqual(result.unconfirmed, [jpg300]);
+    assert.deepEqual(result.requested.map((p) => p.format).sort(), [
+      'jpg',
+      'webp',
+    ]);
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_FORMAT_NOT_CONFIGURED');
+    assert.equal(result.issues[0].retryable, false);
+    assert.deepEqual(result.issues[0].previews, [jpg300]);
+    assert.equal(errors.length, 1);
+  });
+
+  test('a tap that rewrites every variant to an unconfigured format queues nothing; a per-call duplicate is reported once', async () => {
+    installFakeApp();
+    const { tasks, calls } = makeTaskQueue();
+    const { dbLocks } = makeLocks(true);
+    const r = makeResizer({
+      tasks,
+      dbLocks,
+      hooks: {
+        beforeEnqueue: (missing) =>
+          missing.map((m) => ({ ...m, format: 'jpg' })),
+      },
+    });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpg', 'webp'],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.reason, undefined);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(result.unconfirmed, [jpg300]);
+    assert.deepEqual(
+      result.notRequired.map((p) => p.format),
+      ['webp'],
+    );
+    assert.deepEqual(
+      result.issues.map((issue) => [issue.code, issue.previews.length]),
+      [['RESIZE_FORMAT_NOT_CONFIGURED', 1]],
+    );
   });
 });

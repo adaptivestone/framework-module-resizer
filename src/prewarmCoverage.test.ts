@@ -69,6 +69,7 @@ function makeResizer(
     name?: string;
     queue?: string;
     hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
+    pipelines?: ConstructorParameters<typeof Resizer>[0]['pipelines'];
   } = {},
 ) {
   return new Resizer({
@@ -80,6 +81,7 @@ function makeResizer(
     name: options.name,
     queue: options.queue,
     hooks: options.hooks,
+    pipelines: options.pipelines,
   });
 }
 
@@ -637,6 +639,7 @@ describe('prewarm — pipeline scope is part of preview identity', () => {
       storage,
       tasks,
       dbLocks: locks().dbLocks,
+      pipelines: { watermark: {} },
     });
     const media = {
       id: 'm1',
@@ -661,5 +664,165 @@ describe('prewarm — pipeline scope is part of preview identity', () => {
     });
     assert.equal(watermarked.status, 'accepted');
     assert.equal(watermarked.accepted.length, 1);
+  });
+});
+
+describe('prewarm — issues describe only what stays unconfirmed', () => {
+  for (const [label, add, code] of [
+    ['a null taskId', async () => ({ taskId: null }), 'UNCONFIRMED'],
+    [
+      'a throwing add',
+      async () => {
+        throw new Error('connection dropped after insert');
+      },
+      'QUEUE_FAILED',
+    ],
+  ] as const) {
+    test(`${label} confirmed by findActive leaves no RESIZE_ENQUEUE_${code} issue`, async () => {
+      const { tasks } = makeTaskQueue({
+        add,
+        findActive: async () => [
+          { taskId: 'active-1', previews: [taskPreview('jpeg')] },
+        ],
+      });
+      const r = makeResizer({ storage, tasks, dbLocks: locks().dbLocks });
+      const result = await r.prewarm({
+        media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+        sizes: [{ width: 300, height: 300 }],
+        formats: ['jpeg'],
+      });
+      assert.equal(result.status, 'accepted');
+      assert.deepEqual(result.unconfirmed, []);
+      assert.deepEqual(result.issues, []);
+      assert.deepEqual(result.tasks, [
+        { taskId: 'active-1', previews: [taskPreview('jpeg')] },
+      ]);
+    });
+  }
+
+  test('a partly confirmed failure keeps its issue for the unconfirmed previews only', async () => {
+    const { tasks } = makeTaskQueue({
+      add: async () => {
+        throw new Error('connection dropped after insert');
+      },
+      findActive: async () => [
+        { taskId: 'active-1', previews: [taskPreview('jpeg')] },
+      ],
+    });
+    const r = makeResizer({ storage, tasks, dbLocks: locks().dbLocks });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.accepted, [taskPreview('jpeg')]);
+    assert.deepEqual(result.unconfirmed, [taskPreview('webp')]);
+    assert.deepEqual(result.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+        message: 'adding the task failed; outcome is unconfirmed',
+        retryable: true,
+        previews: [taskPreview('webp')],
+      },
+    ]);
+  });
+});
+
+describe('prewarm — an internal error after expansion', () => {
+  test('echoes the expanded request, all of it unconfirmed', async () => {
+    const { tasks, added } = makeTaskQueue();
+    const r = makeResizer({
+      storage,
+      tasks,
+      dbLocks: locks().dbLocks,
+      // A host bug: the tap returns nothing, which the policy step cannot read.
+      hooks: { beforeEnqueue: (() => undefined) as never },
+    });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+    const expanded = [taskPreview('jpeg'), taskPreview('webp')];
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.requested, expanded);
+    assert.deepEqual(result.unconfirmed, expanded);
+    assert.deepEqual(result.ready, []);
+    assert.deepEqual(result.accepted, []);
+    assert.deepEqual(result.notRequired, []);
+    assert.deepEqual(result.tasks, []);
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, true);
+    assert.deepEqual(result.issues[0].previews, expanded);
+    assert.equal(added.length, 0);
+  });
+
+  test('a config error before expansion still reports an empty request', async () => {
+    const r = new Resizer({
+      storage,
+      db: fakeDb(),
+      logger,
+      config: () => ({ ...makeImageConfig(), upload: null }) as never,
+    });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.requested, []);
+    assert.deepEqual(result.unconfirmed, []);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false);
+  });
+});
+
+describe('prewarm — dispatch locks', () => {
+  test('are acquired in parallel; contended and failed locks are still reported', async () => {
+    const { tasks, added } = makeTaskQueue({
+      add: async () => ({ taskId: 'task-1' }),
+      findActive: async () => [],
+    });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const r = makeResizer({
+      storage,
+      tasks,
+      dbLocks: locks(async (key) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setImmediate(resolve));
+        inFlight -= 1;
+        if (key.includes(':avif:')) {
+          throw new Error('lock backend down');
+        }
+        return !key.includes(':webp:');
+      }).dbLocks,
+    });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp', 'avif'],
+    });
+    assert.equal(maxInFlight, 3);
+    assert.deepEqual(
+      added[0]?.previews.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.deepEqual(
+      result.accepted.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.deepEqual(
+      result.issues.map((issue) => [
+        issue.code,
+        issue.previews.map((p) => p.format),
+      ]),
+      [
+        ['RESIZE_ENQUEUE_LOCK_CONTENDED', ['webp']],
+        ['RESIZE_ENQUEUE_LOCK_FAILED', ['avif']],
+      ],
+    );
   });
 });

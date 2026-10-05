@@ -1,8 +1,9 @@
 // Task queue contract: where queued tasks wait. A database can hold them (MongoDatabase.tasks) or a
 // message broker can (SqsTaskQueue). Every method is ONE atomic operation; the core owns everything
-// else — the worker loop, lease heartbeat, task timeout, retry with backoff, dead-lettering, request
-// de-duplication keys and task events — so every backend behaves the same. Extend this class, or
-// pass any object of the same shape (the core never checks `instanceof`).
+// else — the worker loop, lease heartbeat, task timeout, retry with backoff, dead-lettering, giving
+// tasks back at shutdown, request de-duplication keys and task events — so every backend behaves
+// the same. Extend this class, or pass any object of the same shape (the core never checks
+// `instanceof`).
 import type {
   EnqueueReceipt,
   MissingPreview,
@@ -85,6 +86,14 @@ export abstract class TaskQueue {
     next: { retryAt: Date } | 'dead',
     error: string,
   ): Promise<boolean>;
+
+  /**
+   * Optional: give a claimed task back unprocessed (the worker is shutting down). It becomes
+   * claimable at once, and this delivery should not count as an attempt; a backend that cannot take
+   * a delivery back (SQS counts receives) may still count it. `false` means the lease was already
+   * lost. Without it the core retries the task at once through `fail`, so the delivery counts.
+   */
+  release?(task: ClaimedTask): Promise<boolean>;
 
   /**
    * Optional: active tasks of this Resizer + media + pipeline on any queue, so prewarm can confirm

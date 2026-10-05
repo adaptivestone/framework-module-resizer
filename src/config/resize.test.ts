@@ -180,6 +180,24 @@ describe('getResizeConfig', () => {
     }
   });
 
+  test('rejects worker.concurrency and names the config file and replacement', () => {
+    for (const value of [8, undefined]) {
+      install({
+        ...makeResizeConfig(),
+        worker: { ...defaultWorkerOptions, concurrency: value },
+      });
+      assert.throws(
+        () => getResizeConfig('resizeListings'),
+        (error: unknown) =>
+          error instanceof ResizeConfigError &&
+          error.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+          error.message.includes('`worker.concurrency`') &&
+          error.message.includes('src/config/resizeListings.ts') &&
+          error.message.includes('top-level `concurrency`'),
+      );
+    }
+  });
+
   test('requires an encode.formats entry for every generated format', () => {
     // 'jpg' is a Sharp alias: it would encode JPEG without the 'jpeg' options or flatten.
     install(makeResizeConfig({ formats: ['jpg', 'webp'] }));

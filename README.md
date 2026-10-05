@@ -37,9 +37,11 @@ part that uses it:
 | S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` `@aws-sdk/s3-request-presigner` ≥ 3.572 |
 | SQS: `queue: { driver: 'sqs' }` or `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` ≥ 3.572 |
 
-A missing optional peer fails at your own import line (or, for a driver chosen in the config, when
-the Resizer first loads it), not at the first upload. An older SQS client does not return receive
-counts, so failing tasks would never be dead-lettered; `SqsTaskQueue` warns if that happens.
+A missing optional peer fails at your own import line when you import a driver subpath. A driver
+chosen in the config fails when the Resizer first loads it (the first call, or `verify()`) with
+`ResizeSetupError` `RESIZE_PEER_MISSING`, which names the packages and the config file. An older
+SQS client does not return receive counts, so failing tasks would never be dead-lettered;
+`SqsTaskQueue` warns if that happens.
 
 ## Quick start (framework, eager)
 
@@ -110,7 +112,11 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 
 The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
 worker has the same Resizers as the API. Keep that import, and run
-`npx resize-scaffold --check` in CI to catch drift.
+`npx resize-scaffold --check` in CI to catch drift (`--check --eager` for an eager app). The model
+shim extends the default export of `…/framework/ResizeTaskModel.js`, which lets `npm run gen` type
+`getModel('ResizeTask')`; `--check` reports a shim from an older scaffold (fix: delete
+`src/models/ResizeTask.ts` and re-run `npx resize-scaffold`; `--force` would also overwrite
+`src/resizer.ts` and `src/config/resize.ts`).
 
 ## Without the framework
 
@@ -138,8 +144,9 @@ export const resizer = new Resizer({
 await runWorker({ signal, queue: 'default', sharp: { concurrency: 1, cache: false } });
 ```
 
-Create the indexes through your migration process (for example `ResizeTask.createIndexes()`);
-the module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
+Create the indexes of both models through your migration process (for example
+`await mongoose.connection.models.ResizeTask.createIndexes()`, and the same for `ResizeLock`); the
+module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
 
 ## Package exports
 
@@ -151,7 +158,8 @@ the module never creates them at runtime (`createResizeModels` sets `autoIndex: 
 | `…/drivers/s3.js` | `S3Storage` |
 | `…/drivers/mongo.js` | `mongoDatabase`, `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`, the schemas |
 | `…/drivers/sqs.js` | `SqsTaskQueue` |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` and its section types |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getApp`, `getResizeConfig`, `FrameworkResizeConfig` and its section types |
+| `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim |
 
 ## Drivers
 
@@ -167,7 +175,8 @@ implement atomic operations. Drivers receive no `app` argument; each one uses it
 `FrameworkResizer` builds `FrameworkDatabase`: the app's media model, the framework's own
 `Lock` model, and the scaffolded `ResizeTask` model as its queue. Any part may also be a function
 (sync or async), called once on first use: `new Resizer({ storage: async () => …, db, tasks })`.
-`await resizer.ready()` loads them; the Resizer's own methods and the worker do it for you.
+`await resizer.ready()` loads them; the Resizer's own methods and the worker do it for you. When
+one part fails to load, the next call retries only that part.
 
 **`LocalFsStorage`**
 
@@ -191,7 +200,11 @@ symlinks into the public tree.
 
 The ref is `{ bucket, key, namespace? }`. Every read accepts only the two configured buckets, so a
 tampered `bucket` cannot reach another bucket. `publicUrl()` does no I/O, and public access is a
-bucket policy, not a per-object ACL.
+bucket policy, not a per-object ACL. Without `publicBaseUrl`, URLs are virtual-hosted
+(`https://<bucket>.s3.<region>.amazonaws.com/<key>`), or path-style with `endpoint` or
+`forcePathStyle` (`<endpoint>/<bucket>/<key>`; without an endpoint,
+`https://s3.<region>.amazonaws.com/<bucket>/<key>`). China regions (`cn-…`) use
+`amazonaws.com.cn` in both forms. SVG objects are uploaded with `Content-Disposition: attachment`.
 
 **`mongoDatabase(connection, { mediaModel, timing?, logger? })`** builds a `MongoDatabase` with the
 package's `ResizeTask` and `ResizeLock` models on that connection (registered with `autoIndex` off:
@@ -245,6 +258,14 @@ first holder's late release removes it, and at worst a variant is generated twic
     treats a notification as a hint, since only one of the woken workers' claims wins.
   - `renew(task, leaseMs)`, `complete(task)`, `fail(task, { retryAt } | 'dead', error)` act only
     while the token still holds (`false` = lease lost).
+  - Optionally `release(task)`: give a claimed task back unprocessed (`false` = lease lost). It
+    becomes claimable at once, and the delivery should not count as an attempt; a backend that
+    cannot take a delivery back may still count it (`MongoTaskQueue` takes the attempt back;
+    `SqsTaskQueue` cannot, since SQS counts receives). The worker calls it at shutdown for a task
+    it stopped, with no `onTaskFailed` / `onTaskDeadLettered` event and no backoff; a terminal
+    media error (`RESIZE_NO_ORIGINAL`, `RESIZE_SOURCE_METADATA_MISSING`,
+    `RESIZE_SOURCE_TOO_LARGE`) is still dead-lettered with its event. Without `release`, the core
+    retries the task at once through `fail`, which counts.
   - Optionally `findActive({ resizer, mediaId, pipeline })` (lets `prewarm()` confirm work queued by
     another request), `servesQueue(queue)`, `getTiming()` and `verify()`.
 
@@ -260,14 +281,14 @@ created; a config function (the framework adapter passes one) on first use or `v
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
-| `animated` | `false` | `true` keeps GIF/WebP frames |
+| `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `variantSteps`; other formats, pipelines with variant steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 80, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp decoder limit |
-| `limits.sourcePixels` | `50000000` | Rejected before decoding |
-| `limits.resultDimension` | `5000` | Largest output side for cropped sizes |
-| `limits.animationFrames` | `64` | Frame limit for animated input |
+| `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
+| `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
+| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit `sourcePixels` and `inputPixels` |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -303,7 +324,10 @@ does not merge again. Only `FrameworkResizer` reads the extra keys:
   region?, endpoint? }`, plus any of the timing options above (the rest default). Missing or
   `false`: eager only.
 - `worker`: `{ enabled: false, sharpConcurrency: 1, sharpCache: false }`, used by the
-  `ResizeWorker` command. `enabled` allows the command to run.
+  `ResizeWorker` command. `enabled` allows the command to run. The worker process reads `worker`
+  from `resize.ts`, whatever files its Resizers read;
+  `npm run cli ResizeWorker -- --config=<name>` reads it from another file (needed when the app
+  has no `resize.ts`).
 
 A second Resizer can read its own file with
 `new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`.
@@ -311,13 +335,17 @@ A second Resizer can read its own file with
 Without the framework, buckets, URLs and queue URLs are driver options. The 0.2.x keys
 `webpAvifOnly`, `encode.quality`, `encode.effort`, `encode.mozjpeg`, `encode.chromaSubsampling`
 and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do `queue` and
-`worker` in a core config.
+`worker` in a core config and `worker.concurrency` in a framework config file (use the top-level
+`concurrency`).
 
 ## Operations
 
 - **Task states (Mongo):** `pending → processing → completed`.
   - A failed attempt returns to `pending` with backoff.
-  - After `maxAttempts` the task is `dead`, and the lease never reclaims it.
+  - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
+    once when no retry can help: the media has no original (`RESIZE_NO_ORIGINAL`), or the source
+    has no dimensions or exceeds the pixel limits (`RESIZE_SOURCE_METADATA_MISSING`,
+    `RESIZE_SOURCE_TOO_LARGE`).
   - Completed rows expire after 24 h and dead rows after ~30 days (the `expireAfterSeconds` in
     the model).
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that

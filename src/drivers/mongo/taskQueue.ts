@@ -1,6 +1,7 @@
 // MongoTaskQueue: the task queue as documents of a ResizeTask model (see createResizeModels). Each
 // method is one atomic findOneAndUpdate; the lease token fences every write after a claim, so a
-// worker that lost its lease can never complete or fail a task another worker now holds.
+// worker that lost its lease can never complete, fail or release a task another worker now holds.
+import { hostname } from 'node:os';
 import {
   type ClaimedTask,
   type NewTask,
@@ -28,6 +29,29 @@ export interface MongoTaskQueueOptions {
   getTiming?: () => Partial<QueueTimingOptions>;
   logger?: ResizeLogger; // default: console
 }
+
+// The schema paths this queue writes. Mongoose strict mode silently drops a path its schema lacks:
+// a model ejected before tasks carried a Resizer, queue and request key would file every task under
+// Resizer 'default' on queue 'default'.
+const WRITTEN_PATHS = [
+  'fileId',
+  'resizer',
+  'queue',
+  'pipeline',
+  'requestKey',
+  'previews',
+  'status',
+  'attempts',
+  'leasedBy',
+  'leaseToken',
+  'leaseExpiresAt',
+  'completedAt',
+  'deadAt',
+  'error',
+] as const;
+
+// Who holds a lease: the host name tells pods apart (every container's main process is pid 1).
+const LEASE_HOLDER = `${hostname().slice(0, 64)}:${process.pid}`;
 
 // The fields of a ResizeTask document this queue reads.
 interface TaskDoc {
@@ -64,12 +88,27 @@ export class MongoTaskQueue extends TaskQueue {
     return this.#getTiming();
   }
 
-  /** Startup check: the ResizeTask model must be registered. */
+  /**
+   * Startup check: the ResizeTask model must be registered, and its schema (when the model exposes
+   * one) must have every field this queue writes.
+   */
   verify(): void {
-    if (!this.#getModel()) {
+    const model = this.#getModel();
+    if (!model) {
       throw new ResizeSetupError(
         'resize: the ResizeTask model is not registered — scaffold src/models/ResizeTask.ts (or pass `model`)',
         { code: 'RESIZE_MONGO_MODEL_MISSING' },
+      );
+    }
+    const schema = model.schema;
+    if (typeof schema?.path !== 'function') {
+      return;
+    }
+    const missing = WRITTEN_PATHS.filter((path) => !schema.path(path));
+    if (missing.length > 0) {
+      throw new ResizeSetupError(
+        `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
+        { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
       );
     }
   }
@@ -180,7 +219,7 @@ export class MongoTaskQueue extends TaskQueue {
       {
         $set: {
           status: 'processing',
-          leasedBy: `resizer-${process.pid}`,
+          leasedBy: LEASE_HOLDER,
           leaseToken: randomHex(),
           leaseExpiresAt: new Date(now.getTime() + leaseMs),
         },
@@ -222,6 +261,14 @@ export class MongoTaskQueue extends TaskQueue {
             },
           },
     );
+  }
+
+  // Due at once (a null lease is claimable) and the claim's attempt taken back.
+  async release(task: ClaimedTask): Promise<boolean> {
+    return this.#fenced(task, {
+      $set: { status: 'pending', leaseToken: null, leaseExpiresAt: null },
+      $inc: { attempts: -1 },
+    });
   }
 
   // Any queue: a task already waiting on another queue still covers the request.

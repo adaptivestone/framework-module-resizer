@@ -12,7 +12,7 @@ import type { ResizeDatabase } from '../contracts/database.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
-import { ResizeConfigError } from '../errors.ts';
+import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
 import { Resizer, type ResizerOptions } from '../resizer.ts';
 import type {
   FrameworkResizeConfig,
@@ -87,6 +87,34 @@ export class FrameworkResizer extends Resizer {
   }
 }
 
+async function importDriver<T>(
+  load: () => Promise<T>,
+  driver: string,
+  peers: string[],
+  file: string,
+): Promise<T> {
+  try {
+    return await load();
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      'code' in err &&
+      (err.code === 'ERR_MODULE_NOT_FOUND' || err.code === 'MODULE_NOT_FOUND')
+    ) {
+      const missing = /^Cannot find (?:package|module) ['"]([^'"]+)['"]/.exec(
+        err.message,
+      )?.[1];
+      if (missing && peers.includes(missing)) {
+        throw new ResizeSetupError(
+          `resize config: the '${driver}' driver selected in ${file} requires missing optional peer \`${missing}\` — install ${peers.join(' ')}`,
+          { code: 'RESIZE_PEER_MISSING', cause: err },
+        );
+      }
+    }
+    throw err;
+  }
+}
+
 async function buildStorage(
   config: ResolvedFrameworkConfig,
   file: string,
@@ -116,7 +144,12 @@ async function buildStorage(
     endpoint,
     forcePathStyle,
   } = storage;
-  const { S3Storage } = await import('../drivers/s3.ts');
+  const { S3Storage } = await importDriver(
+    () => import('../drivers/s3.ts'),
+    's3',
+    ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'],
+    file,
+  );
   return new S3Storage(
     Object.fromEntries(
       Object.entries({
@@ -141,7 +174,12 @@ async function buildQueue(
     return undefined;
   }
   if (queue.driver === 'sqs') {
-    const { SqsTaskQueue } = await import('../drivers/sqs.ts');
+    const { SqsTaskQueue } = await importDriver(
+      () => import('../drivers/sqs.ts'),
+      'sqs',
+      ['@aws-sdk/client-sqs'],
+      file,
+    );
     return new SqsTaskQueue({
       queueUrl: queue.queueUrl,
       ...(queue.queues ? { queues: queue.queues } : {}),

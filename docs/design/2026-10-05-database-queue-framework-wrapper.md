@@ -1,6 +1,6 @@
 # Database, queue and framework wrapper
 
-Status: **proposal**, 2026-10-05. Follows
+Status: **implemented** in pull requests #46 and #47 (proposed 2026-10-05). Follows
 [drivers and framework independence](./2026-10-02-drivers-and-framework-independence.md) (Q1–Q4,
 merged). Pre-release: breaking changes are fine; hosts migrate their own data.
 

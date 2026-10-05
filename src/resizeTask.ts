@@ -2,12 +2,17 @@
 // both generation modes:
 //   - processTaskWith() = the core + lock bookkeeping (queued/lazy worker)
 //   - generateImpl()    = the core WITHOUT locks (eager `resizer.generate`)
-// Steps 2–8 (download once → metadata guards + orientation normalize → beforeSteps once →
-// decode once + bounded per-variant resize/encode/upload → one appendPreviews) live in
+// Steps 2–8 (download once → metadata guards → beforeSteps once, after an orientation
+// normalize → decode once + bounded per-variant resize/encode/upload → one appendPreviews) live in
 // generatePreviews(). Every function receives its Resizer as an argument, and resizer.ts is
 // imported for types only, so the resizer↔resizeTask cycle is runtime-free. sharp is a hard
 // dep; this is the only place besides worker.ts that decodes.
-import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
+import sharp, {
+  type FormatEnum,
+  type Metadata,
+  type OutputOptions,
+  type Sharp,
+} from 'sharp';
 import { defaultQueueOptions } from './config/resize.ts';
 import type { TaskQueue } from './contracts/taskQueue.ts';
 import { canonicalizeVariants } from './enqueue.ts';
@@ -15,13 +20,15 @@ import {
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
+  ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
-import { isAvifBuffer } from './helpers/imageFormat.ts';
+import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
 import {
   calculateResizedDimensions,
+  coverDimensions,
   expandMissingPreviews,
   getPreviewIdentity,
   isUsablePreview,
@@ -46,6 +53,104 @@ import type {
 /** Normalize a driver download / beforeStep result to a Node Buffer for the next sharp(). */
 const asBuffer = (b: Buffer | Uint8Array): Buffer =>
   Buffer.isBuffer(b) ? b : Buffer.from(b);
+
+// librsvg refuses to render an SVG whose raster side is larger than this.
+const SVG_MAX_SIDE = 32767;
+
+/**
+ * An unregistered pipeline must not render: its previews would be stored under that pipeline's
+ * identity without its steps, and `resolve` would serve them for good (a renamed watermark
+ * pipeline during a rolling deploy would lose its watermark). `default` always exists.
+ */
+function requirePipeline(resizer: Resizer, name: string): void {
+  if (!resizer.hasPipeline(name)) {
+    throw new ResizeSetupError(
+      `resize: pipeline '${name}' is not registered on Resizer '${resizer.name}' — register it in every process that generates previews (API and worker) before using it`,
+      { code: 'RESIZE_PIPELINE_UNKNOWN' },
+    );
+  }
+}
+
+/**
+ * Formats that are not an own key of `encode.formats`: an alias such as 'jpg' would skip the
+ * JPEG options and the flatten step, and an arbitrary Sharp id such as 'raw' would publish a
+ * pixel dump.
+ */
+function unconfiguredFormats(
+  encoders: Record<string, unknown>,
+  formats: readonly string[],
+): string[] {
+  return [...new Set(formats)].filter(
+    (format) => !Object.hasOwn(encoders, format),
+  );
+}
+
+/** A per-call argument names an unconfigured format: a wiring error at the call site. */
+function formatNotConfiguredError(formats: string[]): ResizeSetupError {
+  return new ResizeSetupError(
+    `resize: formats [${formats.join(', ')}] have no encode.formats entry — request configured Sharp format ids such as 'jpeg', not aliases such as 'jpg'`,
+    { code: 'RESIZE_FORMAT_NOT_CONFIGURED' },
+  );
+}
+
+/**
+ * Encode an orientation-normalized original in its own format without visible loss. Sharp's
+ * defaults are lossy for some formats (JPEG quality 80 with 4:2:0, TIFF with JPEG compression),
+ * and every variant is made from this buffer. The buffer is an in-memory intermediate, so encode
+ * time matters more than size: WebP uses quality 95 at the lowest effort (lossless WebP of a
+ * 49 MP photo took 16.5 s and 63 MB on one thread, close to the processing timeout), and the
+ * lossless AVIF path uses the lowest effort too.
+ */
+function withoutVisibleLoss(img: Sharp, format: string | undefined): Sharp {
+  switch (format) {
+    case 'jpeg':
+      return img.jpeg({ quality: 100, chromaSubsampling: '4:4:4' });
+    case 'webp':
+      return img.webp({ quality: 95, effort: 0 });
+    case 'heif': // AVIF reports its HEIF container
+      return img.heif({ compression: 'av1', lossless: true, effort: 0 });
+    case 'tiff':
+      return img.tiff({ compression: 'lzw' });
+    default:
+      return img; // PNG and GIF are lossless at Sharp's defaults
+  }
+}
+
+/**
+ * True when Sharp's SVG shrink-on-load would re-render a raster of `rasterW`×`rasterH` past
+ * librsvg's side limit for a cover resize to `width`×`height`. Sharp re-renders an SVG at the
+ * scale the resize needs, which for a cover crop of an extreme aspect ratio (a 1×5000 strip
+ * at 300×300) is the whole uncropped image: 300×1,500,000.
+ */
+function svgReloadExceedsLimit(
+  rasterW: number,
+  rasterH: number,
+  width: number | undefined,
+  height: number | undefined,
+): boolean {
+  const shrink =
+    width !== undefined && height !== undefined
+      ? Math.min(rasterW / width, rasterH / height)
+      : width !== undefined
+        ? rasterW / width
+        : height !== undefined
+          ? rasterH / height
+          : 1;
+  return Math.max(rasterW, rasterH) / shrink > SVG_MAX_SIDE;
+}
+
+/** Uploaded locators for a log line; an opaque ref that JSON cannot encode is still named. */
+function describeRefs(previews: Preview[]): string {
+  return previews
+    .map((preview) => {
+      try {
+        return JSON.stringify(preview.storageRef) ?? String(preview.storageRef);
+      } catch {
+        return String(preview.storageRef);
+      }
+    })
+    .join(', ');
+}
 
 // ---------------------------------------------------------------------------
 // The shared core (07 steps 2–8; 11 · §11.1 step 4). Both modes expand their inputs into a
@@ -88,6 +193,9 @@ export async function generatePreviews(
   const { config, logger } = resizer;
   const storage = resizer.storage;
 
+  // Before any download or decode, in both modes; the queue retries it like any failure.
+  requirePipeline(resizer, pipelineName);
+
   const generated: Preview[] = [];
   let failedCount = 0;
 
@@ -106,9 +214,9 @@ export async function generatePreviews(
   // 2. Download the original ONCE.
   let buf = asBuffer(await storage.download(original.storageRef));
 
-  // 3. Metadata + decode-bomb guards + orientation normalization (07 · §11 step 3). EVERY worker
-  // sharp() call carries limitInputPixels (01 · §16), so an oversized-for-inputPixels source is
-  // rejected consistently at this first probe rather than slipping through to a per-variant decode.
+  // 3. Metadata + decode-bomb guards (07 · §11 step 3). EVERY worker sharp() call carries
+  // limitInputPixels (01 · §16), so an oversized-for-inputPixels source is rejected
+  // consistently at this first probe rather than slipping through to a per-variant decode.
   const origMeta = await sharp(buf, {
     limitInputPixels: config.limits.inputPixels,
   })
@@ -126,49 +234,82 @@ export async function generatePreviews(
     orientation >= 5
       ? [origMeta.height, origMeta.width]
       : [origMeta.width, origMeta.height];
-  const frames = config.animated
-    ? Math.min(origMeta.pages ?? 1, config.limits.animationFrames)
-    : 1;
-  if (origMeta.width * origMeta.height * frames > config.limits.sourcePixels) {
+  // One frame must fit; how many frames are decoded is bounded below.
+  if (origMeta.width * origMeta.height > config.limits.sourcePixels) {
     throw new ResizeMediaError(
-      `resize: source ${origMeta.width}×${origMeta.height}×${frames}f exceeds limits.sourcePixels (${config.limits.sourcePixels}) for media ${mediaId}`,
+      `resize: source ${origMeta.width}×${origMeta.height} exceeds limits.sourcePixels (${config.limits.sourcePixels}) for media ${mediaId}`,
       { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE' },
     );
   }
-  // Normalize orientation ONCE, before beforeSteps, so every step + variant sees DISPLAY-
-  // orientation pixels (and a beforeStep that round-trips sharp() cannot re-strip a live EXIF
-  // orientation and desync the result). Per-variant `.rotate()` below is then defense-in-depth.
-  let displayMeta = origMeta;
-  if (orientation > 1) {
-    buf = await sharp(buf, {
-      failOn: 'none',
+  const pixelBudget = Math.min(
+    config.limits.sourcePixels,
+    config.limits.inputPixels,
+  );
+
+  const pipeline = resizer.getPipeline(pipelineName);
+  // A preview keeps the animation only in an animated format and only without variantSteps: a
+  // step sees every frame stacked into one tall image, so a composited watermark would land on
+  // a single frame. Everything else is rendered from the first frame.
+  const animates =
+    config.animated &&
+    (pipeline.variantSteps ?? []).length === 0 &&
+    requested.some((v) => isAnimatedFormat(v.format));
+  // Frames to decode: the source's own count (asking for more pages than exist fails the
+  // decode), up to limits.animationFrames and to what fits the pixel budget (Sharp counts every
+  // decoded frame against limitInputPixels). libvips cannot rotate a multi-page image, so an
+  // animation that carries an EXIF orientation is rendered from its first frame.
+  const framesOf = (meta: Metadata, frameW: number, frameH: number): number =>
+    animates && (meta.orientation ?? 1) <= 1
+      ? Math.max(
+          1,
+          Math.min(
+            meta.pages ?? 1,
+            config.limits.animationFrames,
+            Math.floor(pixelBudget / (frameW * frameH)),
+          ),
+        )
+      : 1;
+
+  // 4. beforeSteps — the ordered, awaited chain, ONCE, over display-orientation pixels.
+  // Without steps the original is used as downloaded: each variant's `.rotate()` applies the
+  // EXIF orientation, so nothing is re-encoded before the variants are made.
+  const beforeSteps = pipeline.beforeSteps ?? [];
+  let procMeta = origMeta;
+  let procW = dispW;
+  let procH = dispH;
+  if (beforeSteps.length > 0) {
+    // Normalize orientation ONCE so every step sees DISPLAY-orientation pixels (and a step that
+    // round-trips sharp() cannot re-strip a live EXIF orientation and desync the result),
+    // re-encoded in the same format without visible loss.
+    let stepMeta = origMeta;
+    if (orientation > 1) {
+      buf = await withoutVisibleLoss(
+        sharp(buf, {
+          failOn: 'none',
+          limitInputPixels: config.limits.inputPixels,
+        }).rotate(),
+        origMeta.format,
+      )
+        .timeout({ seconds: config.limits.processingTimeoutSeconds })
+        .toBuffer();
+      stepMeta = await sharp(buf, {
+        limitInputPixels: config.limits.inputPixels,
+      }).metadata();
+    }
+    for (const step of beforeSteps) {
+      buf = asBuffer(await step(buf, { media, metadata: stepMeta, ctx }));
+    }
+
+    // 5. Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
+    procMeta = await sharp(buf, {
       limitInputPixels: config.limits.inputPixels,
     })
-      .rotate()
-      .toBuffer();
-    displayMeta = await sharp(buf, {
-      limitInputPixels: config.limits.inputPixels,
-    }).metadata();
+      .timeout({ seconds: config.limits.processingTimeoutSeconds })
+      .metadata();
+    procW = procMeta.width ?? dispW;
+    procH = procMeta.height ?? dispH;
   }
-
-  // 4. beforeSteps — the ordered, awaited chain, ONCE, over the display-orientation buffer.
-  const pipeline = resizer.getPipeline(pipelineName);
-  for (const step of pipeline.beforeSteps ?? []) {
-    buf = asBuffer(await step(buf, { media, metadata: displayMeta, ctx }));
-  }
-
-  // 5. Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
-  const procMeta = await sharp(buf, {
-    limitInputPixels: config.limits.inputPixels,
-  })
-    .timeout({ seconds: config.limits.processingTimeoutSeconds })
-    .metadata();
-  const procW = procMeta.width ?? dispW;
-  const procH = procMeta.height ?? dispH;
-  if (
-    procW * procH >
-    Math.min(config.limits.sourcePixels, config.limits.inputPixels)
-  ) {
+  if (procW * procH > pixelBudget) {
     throw new ResizeMediaError(
       `resize: processed source exceeds pixel limits for media ${mediaId}`,
       { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE' },
@@ -190,58 +331,59 @@ export async function generatePreviews(
   // 7. Decode the original ONCE; clone the base per variant so the decode is shared.
   // SVG is decoded at the largest requested scale before the shared preview pipeline.
   // Cap the intermediate raster by the same source/input pixel budgets as other inputs.
-  const pixelBudget = Math.min(
-    config.limits.sourcePixels,
-    config.limits.inputPixels,
-  );
-  const largestScale =
-    procMeta.format === 'svg'
-      ? Math.max(
-          1,
-          ...requested
-            .filter((variant) => !variant.fit)
-            .map((variant) =>
-              Math.max(
-                (variant.requestedWidth ?? 0) / procW,
-                (variant.requestedHeight ?? 0) / procH,
-              ),
-            ),
-        )
-      : 1;
-  const density =
-    procMeta.format === 'svg'
-      ? Math.max(
-          72,
-          Math.min(
-            100_000,
-            Math.floor(
-              72 *
-                Math.min(
-                  largestScale,
-                  Math.sqrt(pixelBudget / (procW * procH)),
-                ),
-            ),
+  const isSvg = procMeta.format === 'svg';
+  let density: number | undefined;
+  if (isSvg) {
+    const largestScale = Math.max(
+      1,
+      ...requested
+        .filter((variant) => !variant.fit)
+        .map((variant) =>
+          Math.max(
+            (variant.requestedWidth ?? 0) / procW,
+            (variant.requestedHeight ?? 0) / procH,
           ),
-        )
-      : undefined;
-  const base = sharp(buf, {
-    failOn: procMeta.format === 'svg' ? 'warning' : 'none',
-    sequentialRead: true,
-    limitInputPixels: config.limits.inputPixels,
-    animated: config.animated,
-    pages: config.animated ? config.limits.animationFrames : 1,
-    ...(density !== undefined ? { density } : {}),
-  });
+        ),
+    );
+    const scale = Math.min(
+      Math.max(
+        1,
+        Math.min(largestScale, Math.sqrt(pixelBudget / (procW * procH))),
+      ),
+      // librsvg's side limit holds whatever the pixel budget allows (a 1×5000 strip).
+      SVG_MAX_SIDE / Math.max(procW, procH),
+    );
+    density = Math.max(1, Math.min(100_000, Math.floor(72 * scale)));
+  }
+  const decode = (pages: number, svgDensity?: number): Sharp =>
+    sharp(buf, {
+      failOn: isSvg ? 'warning' : 'none',
+      sequentialRead: true,
+      limitInputPixels: config.limits.inputPixels,
+      pages,
+      ...(svgDensity !== undefined ? { density: svgDensity } : {}),
+    });
+  // Formats that cannot hold an animation decode only the first frame (otherwise Sharp stacks
+  // every frame into one tall image).
+  const frames = framesOf(procMeta, procW, procH);
+  const base = decode(1, density);
+  const animatedBase = frames > 1 ? decode(frames) : undefined;
   const fitBase =
     density !== undefined && density > 72 && requested.some((v) => v.fit)
-      ? sharp(buf, {
-          failOn: 'warning',
-          sequentialRead: true,
-          limitInputPixels: config.limits.inputPixels,
-          animated: config.animated,
-          pages: config.animated ? config.limits.animationFrames : 1,
-        })
+      ? decode(1)
       : undefined;
+  // Below 72 dpi (an SVG longer than the side limit) fit stays on the scaled raster: the 72 dpi
+  // decode is unusable whenever Sharp does not re-render it (a 1×40000 strip). The raster's
+  // rounded aspect ratio would shift an `inside` resize (a 40000×300 SVG gave 1997×15), so fit
+  // fills the box calculateResizedDimensions computed from the SVG's own size.
+  const exactFit = density !== undefined && density < 72;
+  // The SVG raster size at `density`, for the shrink-on-load guard below.
+  const svgRaster = isSvg
+    ? await base
+        .clone()
+        .timeout({ seconds: config.limits.processingTimeoutSeconds })
+        .metadata()
+    : undefined;
 
   // Locks held for processed variants; released once after the pool (success AND error).
   const heldLocks = new Set<string>();
@@ -284,38 +426,57 @@ export async function generatePreviews(
     }
 
     try {
-      // Cover: dims pass straight through, clamped per provided side to limits.resultDimension.
-      // Fit: already capped to config.maxSize by calculateResizedDimensions.
-      const dims = calculateResizedDimensions(
-        procW,
-        procH,
-        v.requestedWidth,
-        v.requestedHeight,
-        v.fit ?? false,
-        config.maxSize,
-      );
-      let width = dims.width;
-      let height = dims.height;
-      if (!v.fit) {
-        const cap = config.limits.resultDimension;
-        if (typeof width === 'number' && width > cap) {
-          width = cap;
-        }
-        if (typeof height === 'number' && height > cap) {
-          height = cap;
-        }
+      // A task payload can name any format; only configured encoders run (no sharp work here).
+      if (!Object.hasOwn(config.encode.formats, v.format)) {
+        throw formatNotConfiguredError([v.format]);
       }
+      // Fit: capped to config.maxSize by calculateResizedDimensions. Cover: requested sides
+      // rounded and capped to limits.resultDimension, a derived side included.
+      const { width, height } = v.fit
+        ? calculateResizedDimensions(
+            procW,
+            procH,
+            undefined,
+            undefined,
+            true,
+            config.maxSize,
+          )
+        : coverDimensions(
+            procW,
+            procH,
+            v.requestedWidth,
+            v.requestedHeight,
+            config.limits.resultDimension,
+          );
 
-      // Clone the shared decode; `.rotate()` on EVERY branch (defense-in-depth); normalize the
-      // working colorspace BEFORE variantSteps so composited overlay colors are predictable.
-      let img = (v.fit && fitBase ? fitBase : base)
+      // Clone the shared decode; `.rotate()` on EVERY branch applies the EXIF orientation;
+      // normalize the working colorspace BEFORE variantSteps so composited overlay colors are
+      // predictable.
+      const animate = animatedBase !== undefined && isAnimatedFormat(v.format);
+      let source = (v.fit && fitBase ? fitBase : animate ? animatedBase : base)
         .clone()
-        .rotate()
+        .rotate();
+      if (
+        !v.fit &&
+        svgRaster?.width !== undefined &&
+        svgRaster.height !== undefined &&
+        svgReloadExceedsLimit(svgRaster.width, svgRaster.height, width, height)
+      ) {
+        // An extract before the resize turns Sharp's SVG re-render off: the variant is cut from
+        // the raster decoded at `density`, which fits the limit.
+        source = source.extract({
+          left: 0,
+          top: 0,
+          width: svgRaster.width,
+          height: svgRaster.height,
+        });
+      }
+      let img = source
         .resize(
           width,
           height,
           v.fit
-            ? { fit: 'inside', withoutEnlargement: true }
+            ? { fit: exactFit ? 'fill' : 'inside', withoutEnlargement: true }
             : { fit: 'cover', position: 'center' },
         )
         .toColorspace('srgb');
@@ -380,17 +541,18 @@ export async function generatePreviews(
         sizeKey: v.sizeKey,
         format: v.format,
         contentType,
+        // One frame: an animated output reports the height of all frames stacked.
         actualWidth: info.width,
-        actualHeight: info.height,
+        actualHeight: info.pageHeight ?? info.height,
       };
       if (v.filters) {
         preview.filters = v.filters;
       }
       if (v.requestedWidth !== undefined) {
-        preview.requestedWidth = v.requestedWidth;
+        preview.requestedWidth = Math.round(v.requestedWidth);
       }
       if (v.requestedHeight !== undefined) {
-        preview.requestedHeight = v.requestedHeight;
+        preview.requestedHeight = Math.round(v.requestedHeight);
       }
       if (v.fit) {
         preview.fit = true;
@@ -422,7 +584,17 @@ export async function generatePreviews(
         original.width === undefined || original.height === undefined
           ? { width: dispW, height: dispH }
           : undefined;
-      await resizer.db.appendPreviews(mediaId, generated, backfillDims);
+      try {
+        await resizer.db.appendPreviews(mediaId, generated, backfillDims);
+      } catch (err) {
+        // The files are stored but no row points at them: name them so an operator can find
+        // (or delete) them.
+        logger.error(
+          `resize: recording ${generated.length} preview(s) failed for media ${mediaId}; uploaded but unrecorded storage refs: ${describeRefs(generated)}`,
+          err,
+        );
+        throw err;
+      }
       for (const preview of generated) {
         await resizer.runObservers('onPreviewGenerated', preview, {});
       }
@@ -590,14 +762,20 @@ export async function generateImpl(
   if (original?.storageRef == null) {
     throw new ResizeNoOriginalError(mediaId);
   }
+  // Caller bugs fail before any host hook, download or decode.
+  requirePipeline(resizer, pipeline);
+  const formats = opts.formats ?? config.formats;
+  const unconfigured = unconfiguredFormats(config.encode.formats, formats);
+  if (unconfigured.length > 0) {
+    throw formatNotConfiguredError(unconfigured);
+  }
 
-  // Host size magic (real ctx in eager mode), then the active format list.
+  // Host size magic (real ctx in eager mode).
   const sizes = (await resizer.runWaterfall(
     'resolveSizes',
     opts.sizes,
     ctx,
   )) as SizeInput[];
-  const formats = opts.formats ?? config.formats;
 
   // Expand sizes × formats; skip unbuildable sizes + existing identities (idempotent).
   const requested = expandMissingPreviews(media, sizes, formats, {

@@ -133,6 +133,7 @@ const safe = [
   ['/drivers/fs.js', 'LocalFsStorage'],
   ['/framework.js', 'FrameworkDatabase'],
   ['/framework.js', 'ResizeTaskModel'],
+  ['/framework/ResizeTaskModel.js', 'default'],
   ['/framework.js', 'ResizeWorker'],
   ['/framework.js', 'FrameworkResizer'],
   ['/framework.js', 'runResizeWorker'],
@@ -142,6 +143,9 @@ for (const [sub, exp] of safe) {
   assert.ok(exp in m, sub + ' should export ' + exp);
   console.log('  ok  ' + sub + ' imports (exports ' + exp + ')');
 }
+const taskModel = await import(PKG + '/framework/ResizeTaskModel.js');
+const framework = await import(PKG + '/framework.js');
+assert.strictEqual(taskModel.default, framework.ResizeTaskModel);
 const { MongoTaskQueue, MongoDatabase } = await import(PKG + '/drivers/mongo.js');
 for (const Driver of [MongoTaskQueue, MongoDatabase]) {
   assert.equal(
@@ -224,7 +228,12 @@ import {
   FrameworkResizer,
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
+import ResizeTaskModel from '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js';
 import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
+
+// The scaffold imports the defining model file so framework codegen can detect its ancestor.
+class ResizeTask extends ResizeTaskModel {}
+void ResizeTask;
 
 // The scaffolded config with its commented-out worker line enabled must stay a complete config.
 const hostConfig = {

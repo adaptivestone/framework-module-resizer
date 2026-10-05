@@ -112,6 +112,12 @@ export function resolveFrameworkConfig(
   }
   const timing = fillTiming(isRecord(queue) ? queue : {});
   const workerOptions = worker ?? defaultWorkerOptions;
+  if (isRecord(workerOptions) && Object.hasOwn(workerOptions, 'concurrency')) {
+    throw new ResizeConfigError(
+      `resize config: \`worker.concurrency\` in ${file} is no longer supported — move the value to the top-level \`concurrency\``,
+      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+    );
+  }
   if (
     !isRecord(workerOptions) ||
     typeof workerOptions.enabled !== 'boolean' ||

@@ -13,6 +13,7 @@
     "./package.json": "./package.json",
     "./config/resize.js": "./dist/config/resize.js",
     "./framework.js": "./dist/framework/index.js",
+    "./framework/ResizeTaskModel.js": "./dist/framework/ResizeTaskModel.js",
     "./drivers/fs.js": "./dist/drivers/fs.js",
     "./drivers/s3.js": "./dist/drivers/s3.js",
     "./drivers/mongo.js": "./dist/drivers/mongo/index.js",
@@ -23,7 +24,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/adaptivestone/framework-module-resize.git"
+    "url": "git+https://github.com/adaptivestone/framework-module-resizer.git"
   },
   "homepage": "https://framework.adaptivestone.com/docs/resize",
   "keywords": [

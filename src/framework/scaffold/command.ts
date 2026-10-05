@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // `resize-scaffold` — the package bin that vendors the resize module's integration files into a
-// host project (08 · §12). It runs BEFORE any host wiring exists (chicken-and-egg: the framework
+// host project. It runs BEFORE any host wiring exists (chicken-and-egg: the framework
 // discovers models/commands by scanning host folders, so ResizeTask + ResizeWorker must be real
 // files in the host's src/). So this generator is STANDALONE: NO framework, NO getApp, NO other
 // module imports — only node builtins. Paths resolve from process.cwd() (or --out <dir>).
@@ -26,16 +26,22 @@ const CONFIG = 'src/config/resize.ts';
 // Load-bearing substrings `--check` verifies (also documents what each shim MUST reference).
 // A construction site builds its Resizer through the framework adapter or the core class.
 const RESIZER_MARKERS = ['new FrameworkResizer(', 'new Resizer('];
-// The model shim extends ResizeTaskModel from the framework adapter (the old …/models/ResizeTask.js
-// subpath no longer exists).
+// The model shim imports the defining file so framework codegen can parse its BaseModel ancestor.
 const MODEL_MARKERS = [
   'extends ResizeTaskModel',
-  '@adaptivestone/framework-module-resize/framework.js',
+  '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js',
 ];
-// An ejected model (`--eject`) owns its schema: a full BaseModel subclass.
+// An ejected model (`--eject`) owns its schema: a full BaseModel subclass with the current
+// task identity fields. The patterns match schema declarations however the host formats them,
+// and not requestKey's partial index filter.
 const EJECTED_MODEL_MARKERS = [
   'extends BaseModel',
   '@adaptivestone/framework/modules/BaseModel.js',
+];
+const EJECTED_MODEL_FIELDS = [
+  /\bresizer:\s*\{\s*type:/,
+  /\bqueue:\s*\{\s*type:/,
+  /\brequestKey:\s*\{\s*type:/,
 ];
 // The worker command imports the construction site AND re-exports the module's command, so the
 // worker process has the Resizers its tasks name (a bare re-export starts with none).
@@ -160,8 +166,9 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
         target: MODEL,
         validate: (c) =>
           MODEL_MARKERS.every((marker) => c.includes(marker)) ||
-          EJECTED_MODEL_MARKERS.every((marker) => c.includes(marker)),
-        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework.js (or be an ejected BaseModel) — re-run resize-scaffold for a fresh shim, or --eject for the full model',
+          (EJECTED_MODEL_MARKERS.every((marker) => c.includes(marker)) &&
+            EJECTED_MODEL_FIELDS.every((field) => field.test(c))),
+        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework/ResizeTaskModel.js (or be an ejected BaseModel with resizer, queue and requestKey fields) — delete the file and re-run resize-scaffold for a fresh shim; for an ejected model, port the resizer, queue and requestKey fields, or delete the file and re-run resize-scaffold --eject',
       },
       {
         target: COMMAND,
@@ -329,6 +336,9 @@ export async function runScaffold(
     );
     console.log(
       'need the Resizer (a static import is fine). The ResizeWorker command imports it too.',
+    );
+    console.log(
+      "Set queue: { driver: 'database' } (or 'sqs') and worker.enabled: true in src/config/resize.ts for the worker to run.",
     );
   }
   return code;

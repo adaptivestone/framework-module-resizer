@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { S3Client } from '@aws-sdk/client-s3';
+import { ResizeSecurityError } from '../errors.ts';
 import { S3Storage } from './s3.ts';
 
 function fakeClient() {
@@ -91,6 +92,118 @@ describe('S3Storage', () => {
       virtual.publicUrl({ bucket: 'pub', key: 'a.jpg' }),
       'https://pub.s3.eu-west-1.amazonaws.com/a.jpg',
     );
+  });
+
+  for (const region of ['eu-west-1', undefined]) {
+    test(`AWS path-style URL uses ${region ?? 'us-east-1 by default'} without an endpoint`, () => {
+      const { client, sent } = fakeClient();
+      const s = new S3Storage({
+        bucketPublic: 'pub',
+        region,
+        forcePathStyle: true,
+        client,
+      });
+      assert.equal(
+        s.publicUrl({ bucket: 'pub', key: 'previews/a.jpg' }),
+        `https://s3.${region ?? 'us-east-1'}.amazonaws.com/pub/previews/a.jpg`,
+      );
+      assert.equal(sent.length, 0);
+    });
+  }
+
+  test('AWS China regions use the amazonaws.com.cn domain in both URL forms', () => {
+    const ref = { bucket: 'pub', key: 'previews/a.jpg' };
+    assert.equal(
+      new S3Storage({ bucketPublic: 'pub', region: 'cn-north-1' }).publicUrl(
+        ref,
+      ),
+      'https://pub.s3.cn-north-1.amazonaws.com.cn/previews/a.jpg',
+    );
+    assert.equal(
+      new S3Storage({
+        bucketPublic: 'pub',
+        region: 'cn-northwest-1',
+        forcePathStyle: true,
+      }).publicUrl(ref),
+      'https://s3.cn-northwest-1.amazonaws.com.cn/pub/previews/a.jpg',
+    );
+  });
+
+  test('explicit endpoint and CDN URL keep precedence over the AWS path-style base', () => {
+    const opts = {
+      bucketPublic: 'pub',
+      endpoint: 'http://localhost:9000///',
+      region: 'eu-west-1',
+      forcePathStyle: true,
+    };
+    const ref = { bucket: 'pub', key: 'previews/a.jpg' };
+    assert.equal(
+      new S3Storage(opts).publicUrl(ref),
+      'http://localhost:9000/pub/previews/a.jpg',
+    );
+    assert.equal(
+      new S3Storage({
+        ...opts,
+        publicBaseUrl: 'https://cdn.example.com///',
+      }).publicUrl(ref),
+      'https://cdn.example.com/previews/a.jpg',
+    );
+  });
+
+  test('bucket allowlist errors keep their security code without archived citations', async () => {
+    const { client, sent } = fakeClient();
+    const s = new S3Storage({ bucketPublic: 'pub', client });
+    await assert.rejects(
+      () => s.download({ bucket: 'attacker', key: 'a.jpg' }),
+      (error) => {
+        assert.ok(error instanceof ResizeSecurityError);
+        assert.equal(error.code, 'RESIZE_S3_BUCKET_NOT_ALLOWED');
+        assert.equal(
+          error.message,
+          'resize s3: ref.bucket "attacker" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access',
+        );
+        return true;
+      },
+    );
+    assert.equal(sent.length, 0);
+  });
+
+  test('SVG uploads set attachment disposition while preserving their bytes and content type', async () => {
+    const { client, sent } = fakeClient();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    const upload = {
+      ...args('originals/a.svg', 'private'),
+      body: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'),
+      contentType: 'image/svg+xml',
+    };
+    await s.upload(upload);
+    assert.equal(sent[0].constructor.name, 'PutObjectCommand');
+    assert.deepEqual(sent[0].input, {
+      Bucket: 'priv',
+      Key: upload.key,
+      Body: upload.body,
+      ContentType: upload.contentType,
+      ContentDisposition: 'attachment',
+    });
+  });
+
+  test('non-SVG uploads keep their original PutObject input without a disposition', async () => {
+    const { client, sent } = fakeClient();
+    const s = new S3Storage({ bucketPublic: 'pub', client });
+    for (const contentType of ['image/jpeg', 'image/png', 'image/webp']) {
+      const upload = { ...args('previews/a', 'public'), contentType };
+      await s.upload(upload);
+      assert.deepEqual(sent.at(-1)?.input, {
+        Bucket: 'pub',
+        Key: upload.key,
+        Body: upload.body,
+        ContentType: contentType,
+      });
+    }
   });
 
   test('refuses private URL, unknown bucket, missing bucket and invalid refs', async () => {
