@@ -58,8 +58,7 @@
     "@aws-sdk/client-s3": "*",
     "@aws-sdk/client-sqs": "*",
     "@aws-sdk/s3-request-presigner": "*",
-    "mongoose": "*",
-    "sqs-consumer": "*"
+    "mongoose": "*"
   },
   "peerDependenciesMeta": {
     "@adaptivestone/framework": {
@@ -76,9 +75,6 @@
     },
     "mongoose": {
       "optional": true
-    },
-    "sqs-consumer": {
-      "optional": true
     }
   },
   "devDependencies": {
@@ -91,7 +87,6 @@
     "@types/node": "^26.1.0",
     "mongodb-memory-server": "^11.0.0",
     "mongoose": "^9.0.0",
-    "sqs-consumer": "^15.0.2",
     "typescript": "^7.0.2"
   }
 }

@@ -15,8 +15,8 @@ driver, and turns the record on your media document into image URLs.
 | Workflow | Call | Needs |
 |---|---|---|
 | **Eager**: previews ready when the upload finishes | `generate()` | storage + media model |
-| **Pre-warm**: fast upload, previews made in the background | `prewarm()` | + a transport and a worker |
-| **Lazy**: previews only for sizes readers request | `resolve()` with a transport | + a transport and a worker |
+| **Pre-warm**: fast upload, previews made in the background | `prewarm()` | + a task queue and a worker |
+| **Lazy**: previews only for sizes readers request | `resolve()` with a task queue | + a task queue and a worker |
 
 All three write the same `previews[]` and read URLs with `resolve()`, so you can mix them or
 switch later without migrating data. `sharp` never runs on the read path.
@@ -35,7 +35,7 @@ part that uses it:
 | `…/framework.js` (framework apps) | `@adaptivestone/framework` `mongoose` (already in a framework app) |
 | `…/drivers/mongo.js` | `mongoose` |
 | `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` `@aws-sdk/s3-request-presigner` |
-| `SqsTransport` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` `sqs-consumer` |
+| `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` |
 
 A missing optional peer fails at your own import line, not at the first upload.
 
@@ -90,7 +90,7 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 **Background generation.** Run `npx resize-scaffold` (without `--eager`) to add the
 `ResizeTask` model and the `ResizeWorker` command, then:
 
-1. Pass `transport: createFrameworkMongoTransport()` to `createFrameworkResizer`.
+1. Pass `tasks: true` to `createFrameworkResizer` (tasks wait in the `ResizeTask` model).
 2. Set `worker.enabled: true` in the config.
 3. Create the indexes through your migration process.
 4. Run `npm run cli ResizeWorker` as a separate process.
@@ -109,24 +109,16 @@ import mongoose from 'mongoose';
 import { Resizer, runWorker } from '@adaptivestone/framework-module-resize';
 import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/resize.js';
 import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
-import {
-  createResizeModels,
-  MongoLockStore,
-  MongoMediaStore,
-  MongoTransport,
-} from '@adaptivestone/framework-module-resize/drivers/mongo.js';
+import { mongoDatabase } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
 
-// ResizeTask (the queue) and ResizeLock, with the package's schemas and indexes
-const { ResizeTask, ResizeLock } = createResizeModels(mongoose.connection);
+// Media, locks and the task queue, with the package's ResizeTask / ResizeLock models
+const db = mongoDatabase(mongoose.connection, { mediaModel: File }); // File spreads resizeMediaSchemaFragment
 
 export const resizer = new Resizer({
   config: { ...defaultResizeConfig, formats: ['webp', 'avif'] }, // optional; image settings only
   storage: new LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' }),
-  mediaStore: new MongoMediaStore({ model: File }), // File spreads resizeMediaSchemaFragment
-  transport: new MongoTransport({ // queued workflows only
-    model: ResizeTask,
-    locks: new MongoLockStore({ model: ResizeLock }),
-  }),
+  db,
+  tasks: db.tasks, // queued workflows only; or new SqsTaskQueue({ queueUrl })
 });
 
 // Worker process; abort the signal on SIGTERM to stop it
@@ -140,23 +132,27 @@ the module never creates them at runtime (`createResizeModels` sets `autoIndex: 
 
 | Import | Contents |
 |---|---|
-| `@adaptivestone/framework-module-resize` | `Resizer`, `getResizer`, `listResizers`, `runWorker`, the driver contracts (`ResizeStorage`, `MediaStore`, `QueueTransport`, `LockStore`), helpers (`formatPictureUrls`, `isCatalogCovered`, `resizeMediaPaths`, `resizeMediaSchemaFragment`), errors, types |
+| `@adaptivestone/framework-module-resize` | `Resizer`, `getResizer`, `listResizers`, `runWorker`, `consumeQueue`, the contracts (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`), helpers (`formatPictureUrls`, `isCatalogCovered`, `resizeMediaPaths`, `resizeMediaSchemaFragment`), errors, types |
 | `…/config/resize.js` | Default config |
 | `…/drivers/fs.js` | `LocalFsStorage` |
 | `…/drivers/s3.js` | `S3Storage` |
-| `…/drivers/mongo.js` | `MongoTransport`, `MongoMediaStore`, `MongoLockStore`, `createResizeModels`, the schemas |
-| `…/drivers/sqs.js` | `SqsTransport` |
-| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `createFrameworkMongoTransport`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` |
+| `…/drivers/mongo.js` | `mongoDatabase`, `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`, the schemas |
+| `…/drivers/sqs.js` | `SqsTaskQueue` |
+| `…/framework.js` | Framework adapter: `createFrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getResizeConfig`, `FrameworkResizeConfig` |
 
 ## Drivers
 
-A `Resizer` takes one driver per seam: `storage` (required), `mediaStore` (required) and
-`transport` (queued workflows). The transport owns its `locks` (a `LockStore`), because locks
-exist only for queued work. Drivers receive
-no `app` argument; each one uses its own clients. `createFrameworkResizer` adds
-`FrameworkMediaStore`, and `createFrameworkMongoTransport()` adds `FrameworkLockStore`. Those are
-thin wrappers: the Mongo media store with the model taken from the app, and the framework's own
-`Lock` model.
+A `Resizer` takes three parts:
+- `storage` (required, a `ResizeStorage`): files;
+- `db` (required, a `ResizeDatabase`): media documents and locks;
+- `tasks` (queued workflows, a `TaskQueue`): where tasks wait — the database's own `db.tasks`, or
+  an `SqsTaskQueue`.
+
+The core owns the queue logic (the worker loop, lease heartbeat, task timeout, retry with backoff,
+dead-lettering, de-duplication keys and events), so every queue behaves the same; adapters only
+implement atomic operations. Drivers receive no `app` argument; each one uses its own clients.
+`createFrameworkResizer` builds `FrameworkDatabase`: the app's media model, the framework's own
+`Lock` model, and the scaffolded `ResizeTask` model as its queue.
 
 **`LocalFsStorage`**
 
@@ -182,43 +178,36 @@ The ref is `{ bucket, key, namespace? }`. Every read accepts only the two config
 tampered `bucket` cannot reach another bucket. `publicUrl()` does no I/O, and public access is a
 bucket policy, not a per-object ACL.
 
-**`MongoTransport`**, or `createFrameworkMongoTransport()` in framework apps (it uses the
-scaffolded model, the app logger and the config's `queue` timing):
+**`mongoDatabase(connection, { mediaModel, timing?, logger? })`** builds a `MongoDatabase` with the
+package's `ResizeTask` and `ResizeLock` models on that connection (registered with `autoIndex` off:
+create their indexes through your migration process). For other setups, `new MongoDatabase({
+mediaModel | getMediaModel, lockModel | getLockModel, tasks })` and `new MongoTaskQueue({ model |
+getModel, timing | getTiming, logger })` take the models directly.
 
-| Option | Default | |
-|---|---|---|
-| `model` / `getModel` | one required | The `ResizeTask` model, or a getter called on each use |
-| `locks` | required | A `LockStore`: `MongoLockStore`, or `FrameworkLockStore` in framework apps |
-| `lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | `worker` must be ≤ `leaseMs` |
-| `leaseMs` | `60000` | Heartbeat renews the lease at `leaseMs / 2` |
-| `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Delay before a failed task is retried |
-| `maxAttempts` | `5` | Attempts before the task is `dead` |
-| `idlePollMs` | `1000` | Sleep after an empty poll |
-| `taskTimeoutMs` | `600000` | A longer task is failed |
-| `logger` | `console` | |
-
-**`SqsTransport`**
+**`SqsTaskQueue`**
 
 | Option | | |
 |---|---|---|
 | `queueUrl` | required | The `'default'` queue |
-| `locks` | required | A `LockStore` (SQS has no lock primitive) |
-| `lockTtlMs` | optional | Default `{ dispatch: 60000, worker: 60000 }` |
 | `queues` | optional | Other named queues: `{ bulk: 'https://sqs…/bulk' }` |
+| `deadLetterQueueUrl` | optional | Dead tasks are sent here with their error, then deleted; without it they are logged and deleted |
+| `timing` | optional | Queue timing (below); the lease is the message visibility timeout |
+| `waitTimeSeconds` | `10` | Long poll per claim (0–20) |
 | `region`, `endpoint`, `client` | optional | An existing `SQSClient`, or one built on first use |
-| `visibilityTimeout`, `heartbeatInterval` | optional | Seconds; the heartbeat extends visibility during long tasks |
 | `logger` | `console` | Framework apps: `appLogger` |
 
-Credentials come from the AWS provider chain. Dead-lettering is native SQS: set the redrive
-policy's `maxReceiveCount` to `queue.maxAttempts`. `onTaskDeadLettered` does not fire for SQS.
+Credentials come from the AWS provider chain. Retries and dead-lettering are the core's, the same
+as for Mongo (attempts = `ApproximateReceiveCount`), and `onTaskDeadLettered` fires for SQS too. Use
+it with any `db`: media and locks stay in the database. Its timing is its own `timing` option (the
+framework config's `queue` section is for the Mongo queue). A redrive policy on the SQS queue is
+optional; if you keep one, set its `maxReceiveCount` above `maxAttempts`, so the module
+dead-letters a task first. SQS fences less strictly than Mongo: it accepts a delete with an
+outdated receipt, so a task whose lease ran out can report `completed` and still run again (the
+worker skips previews that exist), and a dead task can reach the dead-letter queue twice.
 
-Locks only prevent duplicate work; correctness never depends on them. `release(key)` deletes by
+Locks only prevent duplicate work; correctness never depends on them. `releaseLock(key)` deletes by
 key, as the framework `Lock` model does: if a lock expired and another holder took it over, the
 first holder's late release removes it, and at worst a variant is generated twice.
-
-**`MongoMediaStore`**, **`MongoLockStore`**: `{ model }`, or `{ getModel }` when the model is
-registered later. The media model's schema spreads `resizeMediaSchemaFragment`; the lock model
-comes from `createResizeModels(connection)`.
 
 **Custom drivers** extend the exported abstract class, or are any object of the same shape:
 
@@ -227,17 +216,18 @@ comes from `createResizeModels(connection)`.
   - The ref you return from `upload()` is opaque to the module and comes back unchanged.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
     original's ref, for previews). Never both.
-- `MediaStore`: `load`, `appendPreviews`, and an optional `verify()` that the worker awaits once
-  at startup. Throw there to stop the worker before it leases anything.
-- `LockStore`: `acquire(key, ttlMs)` (resolves `true` when taken) and `release(key)`.
-- `QueueTransport`: `locks` (a `LockStore`, required) and `enqueue(task)` with
-  `{ resizer, queue, mediaId, pipeline, previews }`; store `resizer` and `queue`.
-  - `startWorker(handle, { signal, queue, onEvent })` consumes only that queue and reports
-    `onEvent('completed' | 'failed' | 'deadLettered', task, error?)`.
-  - Optionally, `verify()` fails at boot when the transport cannot work, and `findActive(task)`
-    lets `prewarm()` confirm work that another request
-    queued; `getLockTtlMs()` returns lock TTLs (default 60 s each); `servesQueue(queue)` tells
-    the worker which queues it can consume (default: all).
+- `ResizeDatabase`: `loadMedia(id)`, `appendPreviews(id, previews, dims?)`, `acquireLock(key,
+  ttlMs)` (resolves `true` when taken), `releaseLock(key)`; optionally `tasks` (its own queue) and
+  `verify()`, awaited at startup — throw there to stop the worker before it claims anything.
+- `TaskQueue` — each method one atomic operation:
+  - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews, requestKey }`; an active task
+    with the same `requestKey` may be returned instead.
+  - `claim(queue, leaseMs, signal?)` takes the oldest due task (a waiting one whose retry time has
+    passed, or one whose lease expired), increments `attempts` and returns a fencing `token`.
+  - `renew(task, leaseMs)`, `complete(task)`, `fail(task, { retryAt } | 'dead', error)` act only
+    while the token still holds (`false` = lease lost).
+  - Optionally `findActive({ resizer, mediaId, pipeline })` (lets `prewarm()` confirm work queued by
+    another request), `servesQueue(queue)`, `getTiming()` and `verify()`.
 
 ## Config reference
 
@@ -262,10 +252,10 @@ created; a config function (the framework adapter passes one) on first use or `v
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
-Queue timing and lock TTLs are **transport options** (`MongoTransport`; `SqsTransport` takes
-`lockTtlMs`), validated by the transport: a plain `MongoTransport` and `SqsTransport` when
-created, `createFrameworkMongoTransport()` on first use or `verify()`. Their defaults are `defaultQueueOptions`
-in `…/config/resize.js`:
+Queue timing and lock TTLs belong to the **task queue** (`timing` on `MongoTaskQueue`,
+`mongoDatabase` and `SqsTaskQueue`; the framework reads them from the config file's `queue`
+section). The core validates them on first use or in `verify()`. Their defaults are
+`defaultQueueOptions` in `…/config/resize.js`:
 
 | Option | Default | Notes |
 |---|---|---|
@@ -283,8 +273,8 @@ Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cach
 `…/config/resize.js` and adds `mediaModelName`. The framework merges `resize.<NODE_ENV>.ts` over
 it (objects merge field by field, arrays are replaced); the module does not merge again. Only the
 adapter reads the extra keys:
-- `mediaModelName` (required): the host media model, used by `FrameworkMediaStore`.
-- `queue`: the transport options above, used by `createFrameworkMongoTransport()`.
+- `mediaModelName` (required): the host media model, used by `FrameworkDatabase`.
+- `queue`: the queue timing above, used by `FrameworkDatabase`'s task queue.
 - `worker`: `{ enabled: false, sharpConcurrency: 1, sharpCache: false }`, used by the
   `ResizeWorker` command. `enabled` allows the command to run.
 

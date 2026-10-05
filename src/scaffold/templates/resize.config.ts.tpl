@@ -1,7 +1,7 @@
 // src/config/resize.ts — host extension of the module defaults.
 // Put environment-only changes in resize.<NODE_ENV>.ts; @adaptivestone/framework
 // merges that file over this one before getConfig('resize') is called.
-// The image settings go to the Resizer; `queue` (Mongo transport timing) and `worker` (the
+// The image settings go to the Resizer; `queue` (the task queue's timing) and `worker` (the
 // worker command) are read by the framework adapter.
 import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
 import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';

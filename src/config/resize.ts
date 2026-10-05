@@ -36,7 +36,7 @@ const defaultResizeConfig: ResizeConfig = {
   concurrency: 4,
 };
 
-/** Mongo transport timing and lock TTL defaults (also MongoTransport's own defaults). */
+/** Queue timing and lock TTL defaults (a task queue's missing timing values). */
 export const defaultQueueOptions: QueueTimingOptions = {
   lockTtlMs: { dispatch: 60_000, worker: 60_000 },
   leaseMs: 60_000,

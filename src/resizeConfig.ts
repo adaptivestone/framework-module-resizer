@@ -22,10 +22,10 @@ const REMOVED_KEYS: Record<string, string> = {
   'encode.mozjpeg': 'encode.formats.jpeg.mozjpeg',
   'encode.chromaSubsampling': 'encode.formats.jpeg.chromaSubsampling',
   'encode.flattenBackground': 'encode.flatten.background',
-  // Moved out of the image config: queue timing is a transport option, and `worker.concurrency`
+  // Moved out of the image config: queue timing is a task-queue option, and `worker.concurrency`
   // is the top-level `concurrency`.
   queue:
-    'the queue transport options (e.g. new MongoTransport({ leaseMs, lockTtlMs })); framework hosts keep `queue` in the config file',
+    'the task queue timing (e.g. new MongoTaskQueue({ model, timing: { leaseMs } }) or mongoDatabase(connection, { mediaModel, timing })); framework hosts keep `queue` in the config file',
   worker:
     '`concurrency`, and runWorker({ sharp }) for Sharp tuning; framework hosts keep `worker` in the config file',
 };
@@ -187,7 +187,7 @@ export function validateLockTtlMs(
 }
 
 /**
- * Validate queue timing and lock TTLs (MongoTransport options, and the framework config file's
+ * Validate queue timing and lock TTLs (a task queue's timing, and the framework config file's
  * `queue` section). A worker lock must expire within the lease.
  */
 export function validateQueueTiming(

@@ -11,10 +11,10 @@ import sharp from 'sharp';
 import { LocalFsStorage } from './drivers/fs.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
-import type { QueueTransport, ResizeStorage } from './resizer.ts';
+import type { ResizeStorage } from './resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
+import { MemoryTaskQueue } from './testHelpers/fakes.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { memoryLocks, withLocks } from './testHelpers/withLocks.ts';
 
 const png = await sharp({
   create: {
@@ -234,17 +234,10 @@ describe('uploadOriginal — private SVG source', () => {
   test('reads SVG metadata and stores the exact source bytes without queue work', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();
-    let queueCalls = 0;
-    const transport: QueueTransport = {
-      enqueue: async () => {
-        queueCalls++;
-        return { taskId: 'unexpected' };
-      },
-      startWorker: async () => {},
-    };
+    const tasks = new MemoryTaskQueue();
     const r = createFrameworkResizer({
       storage,
-      transport: withLocks(transport, memoryLocks()),
+      tasks,
     });
     const body = Buffer.from(
       '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="120px" height="80px" viewBox="0 0 240 100"><path d="M0 0h1v1z"/></svg>',
@@ -261,7 +254,7 @@ describe('uploadOriginal — private SVG source', () => {
       /^originals\/[a-f0-9]{32}\.svg$/,
     );
     assert.deepEqual(uploads[0].body, body);
-    assert.equal(queueCalls, 0);
+    assert.equal(tasks.added.length, 0);
   });
 
   test('rejects a public SVG original before writing to storage', async () => {

@@ -7,11 +7,11 @@ import {
 import { ResizeConfigError } from '../errors.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { Preview } from '../types.d.ts';
-import { FrameworkMediaStore } from './mediaStore.ts';
+import { FrameworkDatabase } from './database.ts';
 
 // One stateless instance drives the whole file (option-less constructor; every
 // method reaches the model/config ambiently through getApp()).
-const store = new FrameworkMediaStore();
+const db = new FrameworkDatabase();
 
 // Install a fake ambient app whose getConfig('resize') carries mediaModelName and whose
 // getModel returns the given (recording) model. mediaModelName is required or
@@ -40,7 +40,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-describe('FrameworkMediaStore.load', () => {
+describe('FrameworkDatabase.loadMedia', () => {
   test('resolves the model by config.mediaModelName and returns findById(mediaId)', async () => {
     const doc = { id: 'm1' };
     const findByIdCalls: string[] = [];
@@ -59,7 +59,7 @@ describe('FrameworkMediaStore.load', () => {
       logger: { info() {}, warn() {}, error() {} },
     } as never);
 
-    const out = await store.load('m1');
+    const out = await db.loadMedia('m1');
     assert.equal(modelAsked, 'Media');
     assert.deepEqual(findByIdCalls, ['m1']);
     assert.equal(out, doc);
@@ -69,20 +69,20 @@ describe('FrameworkMediaStore.load', () => {
     installApp(false, { mediaModelName: 'Nope' });
     // A null here would let the worker complete every task as a deleted-media no-op.
     await assert.rejects(
-      () => store.load('x'),
+      () => db.loadMedia('x'),
       (err: unknown) =>
         err instanceof ResizeConfigError &&
         err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN' &&
         err.message.includes("'Nope'"),
     );
     await assert.rejects(
-      () => store.appendPreviews('x', []),
+      () => db.appendPreviews('x', []),
       (err: unknown) =>
         err instanceof ResizeConfigError &&
         err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN',
     );
     assert.throws(
-      () => store.verify(),
+      () => db.verify(),
       (err: unknown) =>
         err instanceof ResizeConfigError &&
         err.code === 'RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN',
@@ -100,17 +100,31 @@ describe('FrameworkMediaStore.load', () => {
       },
       logger: { info() {}, warn() {}, error() {} },
     } as never);
-    await new FrameworkMediaStore({ modelName: 'Photo' }).load('m1');
+    await new FrameworkDatabase({ modelName: 'Photo' }).loadMedia('m1');
     assert.deepEqual(asked, ['Photo']);
   });
 
   test('verify() passes when the configured media model is registered', () => {
     installApp({}, { mediaModelName: 'Media' });
-    assert.doesNotThrow(() => store.verify());
+    assert.doesNotThrow(() => db.verify());
+  });
+
+  test("verify() fails when the framework's Lock model is not registered", () => {
+    setAppInstance({
+      getConfig: () => makeResizeConfig({ mediaModelName: 'File' }),
+      getModel: (name: string) => (name === 'Lock' ? undefined : {}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    assert.throws(
+      () => db.verify(),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_MONGO_MODEL_MISSING' &&
+        /Lock model/.test(err.message),
+    );
   });
 });
 
-describe('FrameworkMediaStore.appendPreviews', () => {
+describe('FrameworkDatabase.appendPreviews', () => {
   test('issues exactly ONE findByIdAndUpdate with $push {$each} and no $set without dims', async () => {
     const calls: Array<[string, Record<string, unknown>]> = [];
     const model = {
@@ -124,7 +138,7 @@ describe('FrameworkMediaStore.appendPreviews', () => {
       { sizeKey: '100x100', format: 'webp' },
     ] as unknown as Preview[];
 
-    await store.appendPreviews('m1', previews);
+    await db.appendPreviews('m1', previews);
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], 'm1');
@@ -144,7 +158,7 @@ describe('FrameworkMediaStore.appendPreviews', () => {
     };
     installApp(model);
 
-    await store.appendPreviews('m1', [] as Preview[], {
+    await db.appendPreviews('m1', [] as Preview[], {
       width: 800,
       height: 600,
     });
@@ -155,5 +169,69 @@ describe('FrameworkMediaStore.appendPreviews', () => {
       'original.width': 800,
       'original.height': 600,
     });
+  });
+});
+
+describe('FrameworkDatabase locks', () => {
+  test('acquireLock resolves the Lock model and rounds milliseconds up to seconds', async () => {
+    const asked: string[] = [];
+    const acquired: Array<[string, number]> = [];
+    setAppInstance({
+      getModel: (name: string) => {
+        asked.push(name);
+        return {
+          acquireLock: async (key: string, seconds: number) => {
+            acquired.push([key, seconds]);
+            return true;
+          },
+        };
+      },
+    } as never);
+
+    assert.equal(await db.acquireLock('subsecond', 1), true);
+    assert.equal(await db.acquireLock('exact', 2000), true);
+    assert.equal(await db.acquireLock('rounded', 2001), true);
+    assert.deepEqual(asked, ['Lock', 'Lock', 'Lock']);
+    assert.deepEqual(acquired, [
+      ['subsecond', 1],
+      ['exact', 2],
+      ['rounded', 3],
+    ]);
+  });
+
+  test('acquireLock returns a boolean for the framework model result', async () => {
+    const results = [null, false, undefined, { id: 'lock' }, true];
+    setAppInstance({
+      getModel: () => ({ acquireLock: async () => results.shift() }),
+    } as never);
+
+    for (const expected of [false, false, false, true, true]) {
+      assert.equal(await db.acquireLock('key', 1000), expected);
+    }
+  });
+
+  test('releaseLock resolves the Lock model and awaits its release', async () => {
+    const asked: string[] = [];
+    const released: string[] = [];
+    const error = new Error('release failed');
+    setAppInstance({
+      getModel: (name: string) => {
+        asked.push(name);
+        return {
+          releaseLock: async (key: string) => {
+            released.push(key);
+            if (key === 'broken') {
+              throw error;
+            }
+            return true;
+          },
+        };
+      },
+    } as never);
+
+    assert.equal(await db.releaseLock('key'), undefined);
+    await assert.rejects(() => db.releaseLock('broken'), error);
+    assert.deepEqual(asked, ['Lock', 'Lock']);
+    assert.deepEqual(released, ['key', 'broken']);
   });
 });

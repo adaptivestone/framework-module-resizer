@@ -14,6 +14,7 @@ const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 const EXPECTED_VALUE_EXPORTS = [
   'Resizer',
   'ResizeConfigError',
+  'ResizeDatabase',
   'ResizeError',
   'ResizeGenerateError',
   'ResizeMediaError',
@@ -23,6 +24,7 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeSetupError',
   'ResizeStorageError',
   'calculateResizedDimensions',
+  'consumeQueue',
   'formatPictureUrls',
   'getFilterSig',
   'getImageContentType',
@@ -31,9 +33,6 @@ const EXPECTED_VALUE_EXPORTS = [
   'getSizeKey',
   'isCatalogCovered',
   'listResizers',
-  'LockStore',
-  'MediaStore',
-  'QueueTransport',
   'ResizeStorage',
   'parseSizeKey',
   'processTask',
@@ -41,25 +40,25 @@ const EXPECTED_VALUE_EXPORTS = [
   'resizeMediaPaths',
   'resizeMediaSchemaFragment',
   'runWorker',
+  'TaskQueue',
+  'timingOf',
 ];
 
 // Drivers are SUBPATH-ONLY (the uniform rule 02 · §6) — they must NEVER appear on the main entry.
 const DRIVER_NAMES = [
-  'MongoTransport',
-  'SqsTransport',
+  'MongoTaskQueue',
+  'SqsTaskQueue',
   'S3Storage',
   'LocalFsStorage',
-  'FrameworkMediaStore',
-  'FrameworkLockStore',
-  'MongoMediaStore',
-  'MongoLockStore',
+  'FrameworkDatabase',
+  'MongoDatabase',
+  'mongoDatabase',
   'createResizeModels',
   // The framework adapter lives at …/framework.js, never on the framework-free main entry.
   'ResizeTaskModel',
   'ResizeWorker',
   'runResizeWorker',
   'createFrameworkResizer',
-  'createFrameworkMongoTransport',
 ];
 
 const asRecord = api as unknown as Record<string, unknown>;
@@ -76,9 +75,8 @@ describe('public API surface (src/index.ts)', () => {
     for (const name of [
       'Resizer',
       'ResizeStorage',
-      'MediaStore',
-      'QueueTransport',
-      'LockStore',
+      'ResizeDatabase',
+      'TaskQueue',
     ]) {
       const v = asRecord[name];
       assert.equal(typeof v, 'function', `${name} should be a class/function`);
@@ -96,6 +94,8 @@ describe('public API surface (src/index.ts)', () => {
       'listResizers',
       'runWorker',
       'processTask',
+      'consumeQueue',
+      'timingOf',
       'getSizeKey',
       'parseSizeKey',
       'getFilterSig',

@@ -1,5 +1,5 @@
 // End-to-end worker routing on a real Mongo queue: one worker process serves two Resizers that
-// share a transport, and named queues are isolated from each other.
+// share a task queue, and named queues are isolated from each other.
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import {
@@ -10,20 +10,16 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
-import type { MediaStore } from './contracts/mediaStore.ts';
+import type { ResizeDatabase } from './contracts/database.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type { MongoTransport } from './drivers/mongo/transport.ts';
-import { FrameworkLockStore } from './framework/lockStore.ts';
+import { FrameworkDatabase } from './framework/database.ts';
 import ResizeTaskModel from './framework/ResizeTaskModel.ts';
-import {
-  createFrameworkMongoTransport,
-  createFrameworkResizer,
-} from './framework/resizer.ts';
-import { runResizeWorker } from './framework/worker.ts';
-import { type QueueTransport, resetResizerForTests } from './resizer.ts';
+import { createFrameworkResizer } from './framework/resizer.ts';
+import { resetResizerForTests } from './resizer.ts';
+import { fakeDb } from './testHelpers/fakes.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
-import { withLocks } from './testHelpers/withLocks.ts';
 import type { MediaLike, Preview } from './types.d.ts';
+import { runWorker } from './worker.ts';
 
 const png = await sharp({
   create: {
@@ -42,7 +38,7 @@ let taskModel: mongoose.Model<Record<string, unknown>>;
 let lockModel: mongoose.Model<Record<string, unknown>>;
 
 before(async () => {
-  server = await MongoMemoryServer.create();
+  server = await MongoMemoryServer.create({ instance: { ip: '127.0.0.1' } });
   connection = await mongoose
     .createConnection(server.getUri(), {
       dbName: `resize_worker_${process.pid}`,
@@ -103,14 +99,21 @@ function memoryStorage(): { storage: ResizeStorage; uploads: string[] } {
   return { storage, uploads };
 }
 
-// In-memory media store holding one media document.
-function memoryMediaStore(media: MediaLike): MediaStore {
-  return {
+// In-memory media with the shared database's real Mongo locks.
+function memoryDatabase(
+  media: MediaLike,
+  shared: ResizeDatabase,
+): ResizeDatabase {
+  return fakeDb({
     load: async (id) => (id === media.id ? media : null),
     appendPreviews: async (_id, previews: Preview[]) => {
       media.previews = [...(media.previews ?? []), ...previews];
     },
-  };
+    locks: {
+      acquire: (key, ttlMs) => shared.acquireLock(key, ttlMs),
+      release: (key) => shared.releaseLock(key),
+    },
+  });
 }
 
 function newMedia(): MediaLike {
@@ -119,24 +122,6 @@ function newMedia(): MediaLike {
     original: { storageRef: { key: 'originals/a.png' }, format: 'png' },
     previews: [],
   };
-}
-
-// A host-side wrapper so the test can stop the worker without process signals.
-function stoppable(real: MongoTransport): {
-  transport: QueueTransport;
-  stop: AbortController;
-} {
-  const stop = new AbortController();
-  const transport: QueueTransport = {
-    enqueue: (task) => real.enqueue(task),
-    findActive: (task) => real.findActive(task),
-    startWorker: (handle, opts) =>
-      real.startWorker(handle, {
-        ...opts,
-        signal: AbortSignal.any([opts.signal, stop.signal]),
-      }),
-  };
-  return { transport, stop };
 }
 
 async function waitFor(pred: () => boolean, ms = 20000): Promise<void> {
@@ -151,25 +136,27 @@ async function waitFor(pred: () => boolean, ms = 20000): Promise<void> {
 
 const sizes = [{ width: 16, height: 16 }];
 
-test('one worker serves two Resizers that share a transport', async () => {
+test('one worker serves two Resizers that share a task queue', async () => {
   installApp();
   await taskModel.deleteMany({});
-  const { transport, stop } = stoppable(createFrameworkMongoTransport());
-  const lockProvider = new FrameworkLockStore();
+  const shared = new FrameworkDatabase();
+  assert.ok(shared.tasks);
+  const tasks = shared.tasks;
+  const stop = new AbortController();
   const mediaA = newMedia();
   const mediaB = newMedia();
   const a = memoryStorage();
   const b = memoryStorage();
   const media = createFrameworkResizer({
     storage: a.storage,
-    transport: withLocks(transport, lockProvider),
-    mediaStore: memoryMediaStore(mediaA),
+    tasks,
+    db: memoryDatabase(mediaA, shared),
   });
   const listings = createFrameworkResizer({
     name: 'listings',
     storage: b.storage,
-    transport: withLocks(transport, lockProvider),
-    mediaStore: memoryMediaStore(mediaB),
+    tasks,
+    db: memoryDatabase(mediaB, shared),
   });
 
   assert.equal(
@@ -181,13 +168,17 @@ test('one worker serves two Resizers that share a transport', async () => {
     1,
   );
 
-  const done = runResizeWorker();
-  await waitFor(
-    () =>
-      (mediaA.previews?.length ?? 0) > 0 && (mediaB.previews?.length ?? 0) > 0,
-  );
-  stop.abort();
-  await done;
+  const done = runWorker({ signal: stop.signal });
+  try {
+    await waitFor(
+      () =>
+        (mediaA.previews?.length ?? 0) > 0 &&
+        (mediaB.previews?.length ?? 0) > 0,
+    );
+  } finally {
+    stop.abort();
+    await done;
+  }
 
   // Each media was generated through its own Resizer's storage.
   assert.equal(a.uploads.length, 1);
@@ -202,14 +193,15 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   await taskModel.deleteMany({});
   const media = newMedia();
   const memory = memoryStorage();
-  const real = createFrameworkMongoTransport();
-  const lockProvider = new FrameworkLockStore();
+  const shared = new FrameworkDatabase();
+  assert.ok(shared.tasks);
+  const tasks = shared.tasks;
 
-  const first = stoppable(real);
+  const first = new AbortController();
   const resizer = createFrameworkResizer({
     storage: memory.storage,
-    transport: withLocks(first.transport, lockProvider),
-    mediaStore: memoryMediaStore(media),
+    tasks,
+    db: memoryDatabase(media, shared),
   });
   assert.equal(
     (await resizer.prewarm({ media, sizes, queue: 'bulk' })).accepted.length,
@@ -217,27 +209,27 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   );
 
   // The default-queue worker leaves the bulk task alone.
-  const defaultWorker = runResizeWorker();
-  await new Promise((r) => setTimeout(r, 300));
-  first.stop.abort();
-  await defaultWorker;
+  const defaultWorker = runWorker({ signal: first.signal });
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+  } finally {
+    first.abort();
+    await defaultWorker;
+  }
   assert.equal(media.previews?.length ?? 0, 0);
   const pending = await taskModel.findOne({}).lean();
   assert.equal(pending?.status, 'pending');
   assert.equal(pending?.queue, 'bulk');
 
-  // A bulk worker (same Resizer, a fresh stoppable wrapper) processes it.
-  resetResizerForTests();
-  const second = stoppable(real);
-  createFrameworkResizer({
-    storage: memory.storage,
-    transport: withLocks(second.transport, lockProvider),
-    mediaStore: memoryMediaStore(media),
-  });
-  const bulkWorker = runResizeWorker({ queue: 'bulk' });
-  await waitFor(() => (media.previews?.length ?? 0) > 0);
-  second.stop.abort();
-  await bulkWorker;
+  // A bulk worker for the same Resizer and task queue processes it.
+  const second = new AbortController();
+  const bulkWorker = runWorker({ queue: 'bulk', signal: second.signal });
+  try {
+    await waitFor(() => (media.previews?.length ?? 0) > 0);
+  } finally {
+    second.abort();
+    await bulkWorker;
+  }
   const done = await taskModel.findOne({}).lean();
   assert.equal(done?.status, 'completed');
 });

@@ -4,20 +4,23 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import type { NewTask } from './contracts/taskQueue.ts';
 import { createFrameworkResizer } from './framework/resizer.ts';
 import {
-  type LockStore,
-  type QueueTransport,
   Resizer,
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
 import {
+  type FakeLocks,
+  fakeDb,
+  MemoryTaskQueue,
+} from './testHelpers/fakes.ts';
+import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
-import { withLocks } from './testHelpers/withLocks.ts';
-import type { MediaLike, MissingPreview, StorageRef } from './types.d.ts';
+import type { MediaLike, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
 // Harness — a recording ambient app (getConfig('resize') → { mediaModelName },
@@ -59,32 +62,20 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   };
 }
 
-type EnqueueTask = {
-  resizer: string;
-  queue: string;
-  mediaId: string;
-  pipeline: string;
-  previews: MissingPreview[];
-};
-
-function makeTransport(
-  behavior?: (task: EnqueueTask) => { taskId: string | null },
-) {
-  const calls: EnqueueTask[] = [];
-  const transport: QueueTransport = {
-    enqueue: async (task) => {
-      calls.push(task);
-      return behavior ? behavior(task) : { taskId: 't1' };
-    },
-    startWorker: async () => {},
+function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
+  const calls: NewTask[] = [];
+  const tasks = new MemoryTaskQueue();
+  tasks.add = async (task) => {
+    calls.push(task);
+    return behavior ? behavior(task) : { taskId: 't1' };
   };
-  return { transport, calls };
+  return { tasks, calls };
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const lockProvider: LockStore = {
+  const locks: FakeLocks = {
     acquire: async (key, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
@@ -93,7 +84,7 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
       released.push(key);
     },
   };
-  return { lockProvider, acquired, released };
+  return { locks, acquired, released };
 }
 
 afterEach(() => {
@@ -176,11 +167,12 @@ describe('resolve — partitioning', () => {
 
   test('a null original preserves cached previews, missing variants, and the formatting hook', async () => {
     const { errors } = installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
       hooks: {
         formatPublicUrls: (decision) =>
           decision.ready.map((entry) => entry.url),
@@ -227,11 +219,12 @@ describe('resolve — partitioning', () => {
       resetResizerForTests();
       resetAppInstance();
       const { errors } = installFakeApp();
-      const { transport, calls } = makeTransport();
-      const { lockProvider } = makeLocks(true);
+      const { tasks, calls } = makeTasks();
+      const { locks } = makeLocks(true);
       const r = createFrameworkResizer({
         storage: makeStorage({ canServeOriginalPublicly: check }),
-        transport: withLocks(transport, lockProvider),
+        tasks,
+        db: fakeDb({ locks }),
       });
       const { decision } = await r.resolve({
         media: {
@@ -440,11 +433,12 @@ describe('resolve — waterfall hooks', () => {
 describe('resolve — enqueue wiring', () => {
   test('threads the pipeline name and enqueues only the missing variants', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -476,11 +470,12 @@ describe('resolve — enqueue wiring', () => {
 
   test('sends the Resizer name and its queue, or the per-call queue', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
       name: 'listings',
       queue: 'interactive',
     });
@@ -510,11 +505,12 @@ describe('resolve — enqueue wiring', () => {
 
   test('nothing is enqueued when nothing is missing', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -538,11 +534,12 @@ describe('resolve — enqueue wiring', () => {
 
   test('uses String(media._id) for the dispatch lock when id is absent', async () => {
     installFakeApp();
-    const { transport } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
+    const { tasks } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     await r.resolve({
       media: {
@@ -559,15 +556,16 @@ describe('resolve — enqueue wiring', () => {
     );
   });
 
-  test('resolve does not throw when transport.enqueue throws; survivor locks released', async () => {
+  test('resolve does not throw when tasks.add throws; survivor locks released', async () => {
     installFakeApp();
-    const { transport } = makeTransport(() => {
-      throw new Error('transport down');
+    const { tasks } = makeTasks(() => {
+      throw new Error('task queue down');
     });
-    const { lockProvider, released } = makeLocks(true);
+    const { locks, released } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -580,13 +578,14 @@ describe('resolve — enqueue wiring', () => {
     ]);
   });
 
-  test('resolve does not throw when transport returns taskId null; locks released', async () => {
+  test('resolve does not throw when task queue returns taskId null; locks released', async () => {
     installFakeApp();
-    const { transport } = makeTransport(() => ({ taskId: null }));
-    const { lockProvider, released } = makeLocks(true);
+    const { tasks } = makeTasks(() => ({ taskId: null }));
+    const { locks, released } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -600,11 +599,12 @@ describe('resolve — enqueue wiring', () => {
 
   test('an original without a key leaves variants missing without enqueueing or locking', async () => {
     const { info } = installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -619,11 +619,12 @@ describe('resolve — enqueue wiring', () => {
 
   test('an absent original leaves variants missing without enqueueing or locking', async () => {
     const { info } = installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
@@ -640,11 +641,12 @@ describe('resolve — enqueue wiring', () => {
 describe('prewarm — missing original key', () => {
   test('returns zero without enqueueing or locking', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider, acquired } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks, acquired } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -659,10 +661,10 @@ describe('prewarm — missing original key', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 step 9 — no transport on the instance
+// §17 step 9 — no task queue on the instance
 // ---------------------------------------------------------------------------
 
-describe('resolve — no transport (eager-only host)', () => {
+describe('resolve — no task queue (eager-only host)', () => {
   test('defaults enqueueMissing to false: missing intact, no warn', async () => {
     const { warn } = installFakeApp();
     const r = createFrameworkResizer({ storage: makeStorage() });
@@ -678,7 +680,7 @@ describe('resolve — no transport (eager-only host)', () => {
     assert.equal(warn.length, 0);
   });
 
-  test('explicit enqueueMissing:true with no transport still warns once', async () => {
+  test('explicit enqueueMissing:true with no task queue still warns once', async () => {
     const { warn } = installFakeApp();
     const r = createFrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
@@ -699,11 +701,12 @@ describe('resolve — no transport (eager-only host)', () => {
 describe('resolve — SVG raster previews', () => {
   test('queues missing size×format variants instead of exposing a public original', async () => {
     installFakeApp();
-    const { transport, calls } = makeTransport();
-    const { lockProvider } = makeLocks(true);
+    const { tasks, calls } = makeTasks();
+    const { locks } = makeLocks(true);
     const r = createFrameworkResizer({
       storage: makeStorage(),
-      transport: withLocks(transport, lockProvider),
+      tasks,
+      db: fakeDb({ locks }),
     });
     const media: MediaLike = {
       id: 'm1',
@@ -1088,20 +1091,17 @@ describe('several Resizers in one process', () => {
       },
     });
     // Core Resizers with explicit parts: no framework app is installed in this test.
-    const mediaStore = {
-      load: async () => null,
-      appendPreviews: async () => {},
-    };
+    const db = fakeDb();
     const a = new Resizer({
       storage: makeStorage(),
-      mediaStore,
+      db,
       config: makeImageConfig({ formats: ['webp'] }),
       logger: logger(errorsA),
     });
     const b = new Resizer({
       name: 'listings',
       storage: makeStorage(),
-      mediaStore,
+      db,
       config: makeImageConfig({ formats: ['jpeg'] }),
       logger: logger(errorsB),
     });

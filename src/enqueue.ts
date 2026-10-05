@@ -1,12 +1,13 @@
 // The enqueue half of the HTTP-side path (06 · §18). Turns the read's `missing`
 // variants into ONE queued task, collapsing a concurrent read fan-out into a single
 // dispatch via per-identity dispatch locks. Never throws into the caller's read: on any
-// transport failure it logs + releases the survivors' locks so a later read can retry.
+// task-queue failure it logs + releases the survivors' locks so a later read can retry.
 // Takes the Resizer type-only (the resizer.ts → engine.ts → enqueue.ts value chain never
 // closes back on this module at runtime — 05 · design delta).
 import { createHash } from 'node:crypto';
-import { lockTtlMsOf, type QueueTransport } from './contracts/transport.ts';
+import type { NewTask } from './contracts/taskQueue.ts';
 import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
+import { timingOf } from './queue.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   EnqueueIssue,
@@ -98,8 +99,8 @@ export function buildRequestKey(task: {
  * — they collapse concurrent read fan-out into this single task.
  *
  * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead). Returns the number
- * of variants HANDED TO the transport — the lock-winners on a successful enqueue. Every
- * non-success path returns 0: no transport, no surviving lock, a throw, or a `taskId === null`
+ * of variants HANDED TO the task queue — the lock-winners on a successful enqueue. Every
+ * non-success path returns 0: no task queue, no surviving lock, a throw, or a `taskId === null`
  * soft failure (the released locks let a later read retry, so nothing durable was queued).
  * resolve() ignores the count.
  */
@@ -110,15 +111,15 @@ export async function enqueue(
   missing: MissingPreview[],
   queue: string,
 ): Promise<number> {
-  // Defensive: resolve guarantees a transport before calling us (§17 step 9), but never
+  // Defensive: resolve guarantees a task queue before calling us (§17 step 9), but never
   // assume — bail before grabbing any lock we could not use.
-  const { transport } = resizer;
-  if (!transport) {
+  const { tasks } = resizer;
+  if (!tasks) {
     return 0;
   }
 
   // 1. Canonicalize first so equivalent nested filter objects and list permutations
-  // reach the transport in a stable form. The dispatch lock remains per preview
+  // reach the task queue in a stable form. The dispatch lock remains per preview
   // identity (not per whole catalog) by design; durable Mongo dedupe handles the
   // complete request key.
   const canonical = canonicalizeVariants(missing);
@@ -136,16 +137,16 @@ export async function enqueue(
 
   // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
   // in flight from a concurrent read). TTL in ms — the framework driver converts to s.
-  const dispatchTtlMs = lockTtlMsOf(transport).dispatch;
+  const dispatchTtlMs = timingOf(tasks).lockTtlMs.dispatch;
   const survivors: MissingPreview[] = [];
   const survivorLockKeys: string[] = [];
   for (const [identity, m] of byIdentity) {
     const lockKey = `resize_dispatch:${mediaId}:${identity}`;
     // A rejecting acquire = this variant is NOT a survivor (log + continue); earlier survivors are
-    // unaffected and still reach the transport. enqueue must never throw into the read (1.2b).
+    // unaffected and still reach the task queue. enqueue must never throw into the read (1.2b).
     let acquired: boolean;
     try {
-      acquired = await transport.locks.acquire(lockKey, dispatchTtlMs);
+      acquired = await resizer.db.acquireLock(lockKey, dispatchTtlMs);
     } catch (err) {
       resizer.logger.error(
         `resize enqueue: dispatch-lock acquire failed for ${lockKey} on media ${mediaId} — skipping this variant`,
@@ -167,28 +168,24 @@ export async function enqueue(
   // 5/6. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
   // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
   try {
-    const { taskId } = await transport.enqueue({
-      resizer: resizer.name,
-      queue,
-      mediaId,
-      pipeline,
-      previews: survivors,
-    });
+    const { taskId } = await tasks.add(
+      newTask(resizer.name, queue, mediaId, pipeline, survivors),
+    );
     if (taskId === null) {
       resizer.logger.error(
-        `resize enqueue: transport returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
+        `resize enqueue: the task queue returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       );
-      await releaseAll(resizer, transport, survivorLockKeys);
+      await releaseAll(resizer, survivorLockKeys);
       return 0;
     }
     // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
     return survivors.length;
   } catch (err) {
     resizer.logger.error(
-      `resize enqueue: transport.enqueue threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
+      `resize enqueue: adding the task threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       err,
     );
-    await releaseAll(resizer, transport, survivorLockKeys);
+    await releaseAll(resizer, survivorLockKeys);
     return 0;
   }
 }
@@ -248,7 +245,7 @@ function groupVariants(
 /**
  * Strict counterpart to enqueue(). A dispatch lock is only an optimization: losing it is
  * never reported as accepted. Coverage is accepted only from a non-null enqueue receipt or
- * from an optional transport findActive() proof.
+ * from an optional TaskQueue.findActive() proof.
  */
 export async function enqueueConfirmed(
   resizer: Resizer,
@@ -257,17 +254,17 @@ export async function enqueueConfirmed(
   missing: MissingPreview[],
   queue: string,
 ): Promise<ConfirmedEnqueueResult> {
-  const transport = resizer.transport;
+  const taskQueue = resizer.tasks;
   const canonical = canonicalizeVariants(missing);
-  if (!transport) {
+  if (!taskQueue) {
     return {
       accepted: [],
       unconfirmed: canonical,
       tasks: [],
       issues: [
         {
-          code: 'RESIZE_ENQUEUE_NO_TRANSPORT',
-          message: 'no queue transport is configured',
+          code: 'RESIZE_ENQUEUE_NO_QUEUE',
+          message: 'no task queue is configured',
           retryable: false,
           previews: canonical,
         },
@@ -275,7 +272,7 @@ export async function enqueueConfirmed(
     };
   }
 
-  // Receipts from findActive belong to the same Resizer and pipeline (the transport filters by
+  // Receipts from findActive belong to the same Resizer and pipeline (the task queue filters by
   // both), so one scope covers every identity built here.
   const scope: PreviewScope = { resizer: resizer.name, pipeline };
   const requestedGroups = groupVariants(canonical, scope);
@@ -296,12 +293,12 @@ export async function enqueueConfirmed(
   }
   const lockContended: MissingPreview[] = [];
   const lockFailed: MissingPreview[] = [];
-  const dispatchTtlMs = lockTtlMsOf(transport).dispatch;
+  const dispatchTtlMs = timingOf(taskQueue).lockTtlMs.dispatch;
 
   for (const [identity, preview] of byIdentity) {
     const lockKey = `resize_dispatch:${mediaId}:${identity}`;
     try {
-      if (await transport.locks.acquire(lockKey, dispatchTtlMs)) {
+      if (await resizer.db.acquireLock(lockKey, dispatchTtlMs)) {
         winners.push(preview);
         winnerKeys.push(lockKey);
       } else {
@@ -321,21 +318,17 @@ export async function enqueueConfirmed(
   const activeReceiptConflicts = new Map<string, MissingPreview>();
   if (winners.length > 0) {
     try {
-      const { taskId } = await transport.enqueue({
-        resizer: resizer.name,
-        queue,
-        mediaId,
-        pipeline,
-        previews: winners,
-      });
+      const { taskId } = await taskQueue.add(
+        newTask(resizer.name, queue, mediaId, pipeline, winners),
+      );
       if (typeof taskId !== 'string' || taskId.length === 0) {
         issues.push({
           code: 'RESIZE_ENQUEUE_UNCONFIRMED',
-          message: 'transport returned a null taskId',
+          message: 'the task queue returned a null taskId',
           retryable: true,
           previews: winners,
         });
-        await releaseAll(resizer, transport, winnerKeys);
+        await releaseAll(resizer, winnerKeys);
       } else {
         const receipt = { taskId, previews: winners };
         tasks.push(receipt);
@@ -352,28 +345,27 @@ export async function enqueueConfirmed(
       }
     } catch (error) {
       resizer.logger.error(
-        `resize prewarm: transport.enqueue threw for media ${mediaId}`,
+        `resize prewarm: adding the task threw for media ${mediaId}`,
         error,
       );
       issues.push({
-        code: 'RESIZE_ENQUEUE_TRANSPORT_FAILED',
-        message: 'transport enqueue failed; outcome is unconfirmed',
+        code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+        message: 'adding the task failed; outcome is unconfirmed',
         retryable: true,
         previews: winners,
       });
-      await releaseAll(resizer, transport, winnerKeys);
+      await releaseAll(resizer, winnerKeys);
     }
   }
 
-  if (unresolved.size > 0 && transport.findActive) {
+  if (unresolved.size > 0 && taskQueue.findActive) {
     try {
-      const confirmations = await transport.findActive({
-        resizer: resizer.name,
-        queue,
-        mediaId,
-        pipeline,
-        previews: [...unresolved.values()],
-      });
+      const confirmations = (
+        await taskQueue.findActive({ resizer: resizer.name, mediaId, pipeline })
+      ).map((receipt) => ({
+        taskId: receipt.taskId,
+        previews: canonicalizeVariants(receipt.previews ?? []),
+      }));
       const unresolvedByPayload = new Map(
         [...unresolved.entries()].map(([identity, preview]) => [
           variantPayloadKey(preview),
@@ -418,7 +410,7 @@ export async function enqueueConfirmed(
       );
       issues.push({
         code: 'RESIZE_ENQUEUE_CONFIRM_FAILED',
-        message: 'transport could not confirm active task coverage',
+        message: 'the task queue could not confirm active task coverage',
         retryable: true,
         previews: [...unresolved.values()],
       });
@@ -495,14 +487,10 @@ export async function enqueueConfirmed(
 }
 
 /** Best-effort release of every given lock key; a failing release is logged, not thrown. */
-async function releaseAll(
-  resizer: Resizer,
-  transport: QueueTransport,
-  lockKeys: string[],
-): Promise<void> {
+async function releaseAll(resizer: Resizer, lockKeys: string[]): Promise<void> {
   for (const key of lockKeys) {
     try {
-      await transport.locks.release(key);
+      await resizer.db.releaseLock(key);
     } catch (err) {
       resizer.logger.error(
         `resize enqueue: failed to release dispatch lock ${key}`,
@@ -510,4 +498,29 @@ async function releaseAll(
       );
     }
   }
+}
+
+/** A task for the queue: canonical variants plus the key that de-duplicates identical requests. */
+function newTask(
+  resizer: string,
+  queue: string,
+  mediaId: string,
+  pipeline: string,
+  variants: MissingPreview[],
+): NewTask {
+  const previews = canonicalizeVariants(variants);
+  return {
+    resizer,
+    queue,
+    mediaId,
+    pipeline,
+    previews,
+    requestKey: buildRequestKey({
+      mediaId,
+      resizer,
+      queue,
+      pipeline,
+      previews,
+    }),
+  };
 }

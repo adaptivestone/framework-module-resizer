@@ -1,18 +1,18 @@
-// The transport-agnostic worker (07 · Worker §11), framework-free. `runWorker()` serves every
-// registered Resizer for ONE named queue: it consumes that queue on each distinct transport the
-// Resizers use (one loop per transport), after verifying every media store. Each TRANSPORT owns
-// lease → complete | fail and reports task events; the worker runs each task with the Resizer
-// named in it and routes the events to that Resizer's observers. Framework
-// hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
-// `worker.enabled` switch, process signals and the app logger.
+// The worker (07 · Worker §11), framework-free. `runWorker()` serves every registered Resizer for
+// ONE named queue: it runs the core queue loop (src/queue.ts) once per distinct TaskQueue the
+// Resizers use, after verifying every Resizer. Each task runs with the Resizer named in it, and its
+// events go to that Resizer's observers. Framework hosts start it through `runResizeWorker()`
+// (src/framework/worker.ts), which adds the `worker.enabled` switch, process signals and the app
+// logger.
 import sharp from 'sharp';
 import type {
   LeasedTask,
-  QueueTransport,
   TaskEvent,
   TaskEventHandler,
-} from './contracts/transport.ts';
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
+import { consumeQueue } from './queue.ts';
 import { getResizer, listResizers, type ObserverName } from './resizer.ts';
 import { processTaskWith } from './resizeTask.ts';
 import type { ResizeLogger } from './types.d.ts';
@@ -24,22 +24,16 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 };
 
 /**
- * Run one leased task with the Resizer it names. An unknown name rejects with
- * RESIZE_NO_RESIZER, so the task retries and dead-letters instead of running with another
- * Resizer's storage and config.
+ * Run one task with the Resizer it names. An unknown name rejects with RESIZE_NO_RESIZER, so the
+ * task retries and dead-letters instead of running with another Resizer's storage and config.
  */
 export async function processTask(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
-  transport?: QueueTransport, // the delivering transport; default: the Resizer's own
+  tasks?: TaskQueue, // the delivering queue; default: the Resizer's own
 ): Promise<void> {
   const resizer = getResizer(task.resizer);
-  return processTaskWith(
-    resizer,
-    task,
-    taskOpts,
-    transport ?? resizer.transport,
-  );
+  return processTaskWith(resizer, task, taskOpts, tasks ?? resizer.tasks);
 }
 
 export interface RunWorkerOptions {
@@ -61,36 +55,36 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       { code: 'RESIZE_NO_RESIZER' },
     );
   }
-  const transports = new Set<QueueTransport>();
+  const queues = new Set<TaskQueue>();
   for (const resizer of resizers) {
-    if (resizer.transport) {
-      transports.add(resizer.transport);
+    if (resizer.tasks) {
+      queues.add(resizer.tasks);
     }
   }
-  if (transports.size === 0) {
+  if (queues.size === 0) {
     logger.error(
-      'resize worker: no Resizer was constructed with a transport (eager-only wiring)',
+      'resize worker: no Resizer has a task queue (eager-only wiring)',
     );
     return;
   }
-  // A transport that can't consume this queue (e.g. SQS without that queue URL) is skipped, so
-  // one Resizer's missing queue never stops the others.
-  for (const transport of [...transports]) {
-    if (transport.servesQueue && !transport.servesQueue(queue)) {
-      transports.delete(transport);
+  // A task queue that can't consume this queue name (e.g. SQS without that queue URL) is skipped,
+  // so one Resizer's missing queue never stops the others.
+  for (const tasks of [...queues]) {
+    if (tasks.servesQueue && !tasks.servesQueue(queue)) {
+      queues.delete(tasks);
       logger.info(
-        `resize worker: a transport does not serve queue '${queue}' — skipping it`,
+        `resize worker: a task queue does not serve queue '${queue}' — skipping it`,
       );
     }
   }
-  if (transports.size === 0) {
+  if (queues.size === 0) {
     throw new ResizeSetupError(
-      `resize worker: no transport serves queue '${queue}'`,
+      `resize worker: no task queue serves queue '${queue}'`,
       { code: 'RESIZE_QUEUE_NOT_SERVED' },
     );
   }
-  // Fail before leasing anything: a bad config, transport timing or media store (e.g. a wrong
-  // mediaModelName) would otherwise surface only as per-task errors.
+  // Fail before claiming anything: a bad config, queue or database (e.g. a wrong mediaModelName)
+  // would otherwise surface only as per-task errors.
   for (const resizer of resizers) {
     await resizer.verify();
   }
@@ -116,26 +110,26 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     sharp.cache(opts.sharp.cache);
   }
 
-  // Each transport drives consumption its own way (poll OR push), owns completion/redelivery,
-  // and passes each task a per-task lease-loss signal. processTask SUCCEEDS by returning and
-  // FAILS by rejecting (never a synchronous throw). One loop per transport; if one loop fails,
-  // the others stop too, and the worker rejects with that error once all have returned.
+  // One loop per task queue, all on one stop signal. The first loop to fail is the cause; the
+  // others may then reject only because of the abort.
   const stop = new AbortController();
   const onAbort = () => stop.abort();
   if (opts.signal.aborted) {
     stop.abort();
   }
   opts.signal.addEventListener('abort', onAbort, { once: true });
-  // The first loop to fail is the cause; the others may then reject only because of the abort.
   let firstFailure: { error: unknown } | undefined;
   try {
     await Promise.allSettled(
-      [...transports].map(async (transport) => {
+      [...queues].map(async (tasks) => {
         try {
-          await transport.startWorker(
-            (task, taskOpts) => processTask(task, taskOpts, transport),
-            { signal: stop.signal, queue, onEvent },
-          );
+          await consumeQueue(tasks, {
+            queue,
+            signal: stop.signal,
+            handle: (task, taskOpts) => processTask(task, taskOpts, tasks),
+            onEvent,
+            logger,
+          });
         } catch (err) {
           firstFailure ??= { error: err };
           stop.abort();

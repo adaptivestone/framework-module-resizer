@@ -7,19 +7,18 @@
 // (src/framework/resizer.ts).
 import type { Metadata, Sharp } from 'sharp';
 import defaultResizeConfig from './config/resize.ts';
-import type { MediaStore } from './contracts/mediaStore.ts';
 // The driver contracts live in src/contracts/ so drivers import them without this module. They
 // are re-exported here (types only) for the core files that import them from resizer.ts.
+import type { ResizeDatabase } from './contracts/database.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import {
-  type EnqueueTask,
-  type LeasedTask,
-  lockTtlMsOf,
-  type QueueTransport,
-  type StartWorkerOpts,
-  type TaskEvent,
-  type TaskEventHandler,
-} from './contracts/transport.ts';
+import type {
+  ClaimedTask,
+  LeasedTask,
+  NewTask,
+  TaskEvent,
+  TaskEventHandler,
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import {
   type PrewarmOpts,
   prewarmImpl,
@@ -28,6 +27,7 @@ import {
 } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
 import { uploadOriginalImpl } from './original.ts';
+import { timingOf } from './queue.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
 import type {
@@ -45,16 +45,15 @@ import type {
   UploadOriginalOpts,
 } from './types.d.ts';
 
-export type { LockStore } from './contracts/lockStore.ts';
-export type { MediaStore } from './contracts/mediaStore.ts';
 export type {
-  EnqueueTask,
+  ClaimedTask,
   LeasedTask,
-  QueueTransport,
+  NewTask,
+  ResizeDatabase,
   ResizeStorage,
-  StartWorkerOpts,
   TaskEvent,
   TaskEventHandler,
+  TaskQueue,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,8 +96,8 @@ export type HookName = WaterfallName | ObserverName;
 // Per-hook tap signatures (04 · §9 review fix). The public `hook(name, fn)` + the `hooks:`
 // constructor option infer `fn`'s exact shape from `name`, so a typo'd tap body or a wrong
 // return shape is a COMPILE error instead of silent `any`. Waterfalls thread + return their
-// value; observers are fire-and-forget (return ignored). `task` is always the transport-agnostic
-// LeasedTask, and the worker/transport observers receive `ctx === {}`.
+// value; observers are fire-and-forget (return ignored). `task` is always the backend-agnostic
+// LeasedTask, and the worker observers receive `ctx === {}`.
 export interface HookSignatures {
   resolveSizes: (
     sizes: SizeInput[],
@@ -141,7 +140,7 @@ export type HookFn = (...args: any[]) => unknown;
 // ---------------------------------------------------------------------------
 // Constructor options (02 · §6). `storage` is the ONE required option — both modes need
 // it (05 · §10.4), so a missing driver is a boot-time type/throw error, not a runtime
-// degradation. `transport` is optional (eager-only hosts omit it — 11 · Modes).
+// degradation. `tasks` is optional (eager-only hosts omit it — 11 · Modes).
 // ---------------------------------------------------------------------------
 
 export interface ResizerOptions {
@@ -151,10 +150,12 @@ export interface ResizerOptions {
   config?: ResizeConfig | (() => ResizeConfig);
   logger?: ResizeLogger; // default: console
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
-  storage: ResizeStorage; // REQUIRED (05 · §10.4)
-  mediaStore: MediaStore; // REQUIRED: loads media, saves preview metadata (05 · §10.6)
-  transport?: QueueTransport; // lazy mode only (05 · §10.1)
-  queue?: string; // default queue for this Resizer's tasks; default 'default'
+  storage: ResizeStorage; // REQUIRED: files (originals, previews)
+  db: ResizeDatabase; // REQUIRED: media documents and locks
+  // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. `db.tasks` or an
+  // SqsTaskQueue. Omit for eager-only hosts.
+  tasks?: TaskQueue;
+  queue?: string; // default queue name for this Resizer's tasks; default 'default'
   pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
   // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
   hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
@@ -203,8 +204,8 @@ export class Resizer {
   readonly logger: ResizeLogger;
   readonly #events: ResizeEventBus | undefined;
   readonly storage: ResizeStorage;
-  readonly transport: QueueTransport | undefined;
-  readonly mediaStore: MediaStore;
+  readonly db: ResizeDatabase;
+  readonly tasks: TaskQueue | undefined;
   // Named pipelines: last-wins per name (04 · §8).
   readonly #pipelines: Map<string, Pipeline>;
   // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
@@ -240,17 +241,10 @@ export class Resizer {
       });
     }
     // The core takes every part explicitly; it never reads a framework app.
-    if (!opts.mediaStore) {
+    if (!opts.db) {
       throw new ResizeSetupError(
-        `resize: \`mediaStore\` is required — it loads media and saves preview metadata; ${FRAMEWORK_HINT}`,
-        { code: 'RESIZE_MEDIA_STORE_REQUIRED' },
-      );
-    }
-    // Locks belong to the transport; catch a transport without them here, not at the first read.
-    if (opts.transport && !opts.transport.locks) {
-      throw new ResizeSetupError(
-        'resize: the `transport` has no `locks` — queued work is coordinated with them (e.g. new MongoTransport({ model, locks: new MongoLockStore({ model: ResizeLock }) }))',
-        { code: 'RESIZE_LOCKS_REQUIRED' },
+        `resize: \`db\` is required — it loads media, saves preview metadata and holds locks (e.g. mongoDatabase(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
+        { code: 'RESIZE_DATABASE_REQUIRED' },
       );
     }
     // Validate before registering, so a bad config never claims the name and a corrected
@@ -268,8 +262,8 @@ export class Resizer {
     this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.storage = opts.storage;
-    this.transport = opts.transport;
-    this.mediaStore = opts.mediaStore;
+    this.db = opts.db;
+    this.tasks = opts.tasks;
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().
@@ -301,27 +295,24 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: resolve and validate the config; check the transport (its own
-   * verify(), lock TTLs, and that it serves this Resizer's queue); run the media store's verify().
+   * Optional startup check: resolve and validate the config; run the database's verify(); check
+   * the task queue (its own verify(), its timing, and that it serves this Resizer's queue).
    * Framework hosts call it after `Server.init()` to fail at boot instead of at the first upload or
    * read. The worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
     void this.config;
-    if (this.transport) {
-      await this.transport.verify?.();
-      lockTtlMsOf(this.transport);
-      if (
-        this.transport.servesQueue &&
-        !this.transport.servesQueue(this.queue)
-      ) {
+    await this.db.verify?.();
+    if (this.tasks) {
+      await this.tasks.verify?.();
+      timingOf(this.tasks);
+      if (this.tasks.servesQueue && !this.tasks.servesQueue(this.queue)) {
         throw new ResizeSetupError(
-          `resize: Resizer '${this.name}' queues to '${this.queue}', which its transport does not serve`,
+          `resize: Resizer '${this.name}' queues to '${this.queue}', which its task queue does not serve`,
           { code: 'RESIZE_QUEUE_NOT_SERVED' },
         );
       }
     }
-    await this.mediaStore.verify?.();
   }
 
   /** Register a named pipeline — last-wins per name (04 · §8). */
@@ -414,7 +405,7 @@ export class Resizer {
    * caller's REAL ctx → expand sizes × formats, skipping identities already in media.previews
    * (idempotent) → download once → beforeSteps once → per-variant resize/encode/upload
    * (bounded by config.concurrency, NO locks). `persist !== false` → one
-   * mediaStore.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
+   * db.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
     return generateImpl(this, opts);

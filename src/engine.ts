@@ -41,7 +41,7 @@ export interface ResolveOpts {
   pipeline?: string; // selects a registered pipeline; default 'default'
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // threaded to read-path hooks; ctx.isOwner/isAdmin gate signedUrl
-  enqueueMissing?: boolean; // default true when a transport is set, false otherwise
+  enqueueMissing?: boolean; // default true when a task queue is set, false otherwise
   queue?: string; // queue for missing variants; default resizer.queue
 }
 
@@ -232,17 +232,17 @@ export async function resolveImpl(
       ctx,
     )) as MissingPreview[];
 
-    // 9. Enqueue the missing variants. Default follows construction: a transport means
-    // lazy mode (enqueue), no transport means eager-only (do not log-on-every-read).
-    const enqueueMissing = opts.enqueueMissing ?? resizer.transport != null;
+    // 9. Enqueue the missing variants. Default follows construction: a task queue means
+    // lazy mode (enqueue), none means eager-only (do not log-on-every-read).
+    const enqueueMissing = opts.enqueueMissing ?? resizer.tasks != null;
     if (enqueueMissing && decision.missing.length > 0) {
       if (media.original?.storageRef == null) {
         resizer.logger.info(
           `resize resolve: media ${mediaId} has no original storage ref — nothing enqueued`,
         );
-      } else if (!resizer.transport) {
+      } else if (!resizer.tasks) {
         resizer.logger.warn(
-          'resize resolve: missing previews but no transport is registered — they stay placeholders (eager-only host? construct the Resizer with a transport for lazy mode)',
+          'resize resolve: missing previews but no task queue is configured — they stay placeholders (eager-only host? give the Resizer `tasks` for lazy mode)',
         );
       } else {
         try {
@@ -289,7 +289,7 @@ export async function resolveImpl(
 /**
  * Pre-warm the catalog at UPLOAD: queue every missing variant without blocking on image work, and
  * report each requested variant (ready / accepted / not required / unconfirmed, with task receipts
- * and issues). A held dispatch lock never counts as queued: the transport's findActive() must
+ * and issues). A held dispatch lock never counts as queued: the queue's findActive() must
  * confirm it. Uses the read path's `resolveSizes` / `beforeEnqueue` waterfalls; the "original
  * already fits" fast-path is not consulted (that is a read-time serving decision). NEVER throws:
  * an upload must not fail because pre-warming hiccuped, so an unexpected error becomes

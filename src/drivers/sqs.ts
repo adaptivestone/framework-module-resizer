@@ -1,87 +1,93 @@
-// SQS transport (05 · §10.3) — OPTIONAL, optional peer deps. A class (not a singleton): the
-// host passes `transport: new SqsTransport({ queueUrl, … })` and the instance keeps its options
-// in a `#private` field (engine-enforced, not a compile-time convention). One `SQSClient` is
-// memoized from the options on first use — unless the
-// host brings its own via `opts.client`. Credentials are NEVER options — they resolve via the
-// standard AWS provider chain.
-//
-// SUBPATH-ONLY ENTRY, STATIC SDK IMPORTS (05 · §10.3): `@aws-sdk/client-sqs` and `sqs-consumer`
-// are imported plainly at the top of this module. This is safe precisely because this driver is
-// NOT re-exported from the main package entry (02 · §6) — hosts import
-// `@adaptivestone/framework-module-resize/drivers/sqs.js` directly, so the optional peers are
-// resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the host's own
-// import line at bootstrap (no dynamic import(), no lazy loaders).
-//
-// Dead-letter is NATIVE (the queue's redrive policy → DLQ): the transport just throws on
-// failure and lets SQS redeliver up to maxReceiveCount, so no `deadLettered` event is reported
-// here (documented — 05 · §10.3). It DOES report `completed` / `failed` through `onEvent`.
-import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
-import { Consumer } from 'sqs-consumer';
-import { defaultQueueOptions } from '../config/resize.ts';
-import type { LockStore } from '../contracts/lockStore.ts';
+// SqsTaskQueue: the task queue on Amazon SQS. Each TaskQueue operation is one SQS call — the core
+// owns the worker loop, retries and dead-lettering, so SQS behaves exactly like the database queue:
+//   claim    = ReceiveMessage (visibility timeout = lease; ApproximateReceiveCount = attempts)
+//   renew    = ChangeMessageVisibility        complete = DeleteMessage
+//   retry    = ChangeMessageVisibility(delay) dead     = send to deadLetterQueueUrl (if set), delete
+// The SQS client is built from region/endpoint on first use unless the host passes `client`;
+// credentials come from the AWS provider chain. Subpath-only entry: the optional AWS SDK peer is
+// resolved only when this file is imported, so a missing SDK fails at the host's import line.
 import {
-  type EnqueueTask,
-  type LeasedTask,
-  QueueTransport,
-  type StartWorkerOpts,
-  type TaskEvent,
-} from '../contracts/transport.ts';
+  ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
+  type Message,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
+import {
+  type ClaimedTask,
+  type NewTask,
+  TaskQueue,
+} from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
 import { validateLockTtlMs } from '../resizeConfig.ts';
-import type { ResizeLogger } from '../types.d.ts';
+import type {
+  MissingPreview,
+  QueueTimingOptions,
+  ResizeLogger,
+} from '../types.d.ts';
 
-export interface SqsTransportOptions {
+export interface SqsTaskQueueOptions {
   queueUrl: string; // serves the 'default' queue
-  queues?: Record<string, string>; // extra named queues → queue URLs
-  // REQUIRED: the locks queued work is coordinated with (dispatch + worker locks). SQS has no
-  // lock primitive, so pass a store: MongoLockStore, FrameworkLockStore, or your own LockStore.
-  locks: LockStore;
-  lockTtlMs?: { dispatch: number; worker: number }; // default 60000 each
+  queues?: Record<string, string>; // other named queues → queue URLs
+  // Where dead tasks go (their body plus the error), before they are deleted. Without it a dead
+  // task is logged and deleted.
+  deadLetterQueueUrl?: string;
+  timing?: Partial<QueueTimingOptions>; // missing values use defaultQueueOptions
+  waitTimeSeconds?: number; // long poll per claim, 0–20; default 10
   logger?: ResizeLogger; // default: console
   region?: string;
   endpoint?: string;
-  visibilityTimeout?: number; // seconds; passed to sqs-consumer when provided
-  heartbeatInterval?: number; // seconds; sqs-consumer extends visibility while processing
-  // Bring-your-own configured client: a custom credential provider, proxy, retry strategy,
-  // or a shared instance. When absent the driver constructs one from region/endpoint. (This
-  // option is also the injection point exercised by the tests — the driver ships NO test-only
-  // seams.)
-  client?: SQSClient;
+  client?: SQSClient; // an existing client (custom credentials, proxy, shared instance)
 }
 
-export class SqsTransport extends QueueTransport {
-  readonly locks: LockStore;
-  readonly #opts: SqsTransportOptions;
-  // Memoized per instance. A host-provided `opts.client` short-circuits construction.
-  // Synchronous now that the SDK is a static import — built lazily on first use.
+// The message body: the durable, ctx-free task payload.
+interface TaskBody {
+  resizer?: string;
+  queue?: string;
+  mediaId: string;
+  pipeline: string;
+  previews: MissingPreview[];
+}
+
+const MAX_VISIBILITY_SECONDS = 43_200; // SQS limit: 12 hours
+
+const seconds = (ms: number): number =>
+  Math.min(MAX_VISIBILITY_SECONDS, Math.max(0, Math.ceil(ms / 1000)));
+
+// A receipt handle that no longer works means another receive took the message: the lease is lost.
+const isLostReceipt = (err: unknown): boolean => {
+  const name = (err as { name?: unknown })?.name;
+  return (
+    name === 'ReceiptHandleIsInvalid' ||
+    name === 'MessageNotInflight' ||
+    name === 'InvalidParameterValue'
+  );
+};
+
+export class SqsTaskQueue extends TaskQueue {
+  readonly #opts: SqsTaskQueueOptions;
   #client: SQSClient | undefined;
 
-  constructor(opts: SqsTransportOptions) {
+  constructor(opts: SqsTaskQueueOptions) {
     super();
-    if (!opts?.locks) {
-      throw new ResizeSetupError(
-        'resize sqs transport: `locks` is required (e.g. new MongoLockStore({ model: ResizeLock }) or FrameworkLockStore)',
-        { code: 'RESIZE_LOCKS_REQUIRED' },
-      );
+    if (!opts?.queueUrl) {
+      throw new ResizeSetupError('resize sqs: `queueUrl` is required', {
+        code: 'RESIZE_SQS_QUEUE_URL_REQUIRED',
+      });
     }
-    if (opts.lockTtlMs !== undefined) {
-      validateLockTtlMs(opts.lockTtlMs);
+    if (opts.timing?.lockTtlMs !== undefined) {
+      validateLockTtlMs(opts.timing.lockTtlMs);
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
-    this.locks = opts.locks;
   }
 
-  /** Only `'default'` (queueUrl) and the names in `queues` can be consumed. */
-  servesQueue(queue: string): boolean {
-    return queue === 'default' || Object.hasOwn(this.#opts.queues ?? {}, queue);
+  get #logger(): ResizeLogger {
+    return this.#opts.logger ?? console;
   }
 
-  getLockTtlMs(): { dispatch: number; worker: number } {
-    return this.#opts.lockTtlMs ?? defaultQueueOptions.lockTtlMs;
-  }
-
-  #getClient(): SQSClient {
+  #sqs(): SQSClient {
     if (this.#opts.client) {
       return this.#opts.client;
     }
@@ -95,137 +101,223 @@ export class SqsTransport extends QueueTransport {
   }
 
   // The URL for a named queue. An unknown name is a wiring error, reported before any send or
-  // poll so a typo never silently drops or ignores tasks.
+  // receive, so a typo never silently drops or ignores tasks.
   #queueUrl(queue: string): string {
     const url =
       queue === 'default' ? this.#opts.queueUrl : this.#opts.queues?.[queue];
     if (!url) {
       throw new ResizeSetupError(
-        `resize sqs: no queue URL for queue '${queue}' — add it to the SqsTransport \`queues\` option`,
+        `resize sqs: no queue URL for queue '${queue}' — add it to the SqsTaskQueue \`queues\` option`,
         { code: 'RESIZE_SQS_QUEUE_UNKNOWN' },
       );
     }
     return url;
   }
 
-  async enqueue(task: EnqueueTask): Promise<{ taskId: string | null }> {
-    // No local try/catch soft-fail: a throw is guarded by enqueue.ts; a successful send
-    // without a MessageId returns a null taskId (which enqueue.ts also treats as a soft
-    // failure). Body is the durable, ctx-free task payload (04 · §8).
-    const queueUrl = this.#queueUrl(task.queue);
-    const out = await this.#getClient().send(
+  /** Only `'default'` (queueUrl) and the names in `queues` can be consumed. */
+  servesQueue(queue: string): boolean {
+    return queue === 'default' || Object.hasOwn(this.#opts.queues ?? {}, queue);
+  }
+
+  getTiming(): Partial<QueueTimingOptions> {
+    return this.#opts.timing ?? {};
+  }
+
+  async add(task: NewTask): Promise<{ taskId: string | null }> {
+    const body: TaskBody = {
+      resizer: task.resizer,
+      queue: task.queue,
+      mediaId: task.mediaId,
+      pipeline: task.pipeline,
+      previews: task.previews,
+    };
+    const out = await this.#sqs().send(
       new SendMessageCommand({
-        QueueUrl: queueUrl,
-        MessageBody: JSON.stringify({
-          resizer: task.resizer,
-          queue: task.queue,
-          mediaId: task.mediaId,
-          pipeline: task.pipeline,
-          previews: task.previews,
-        }),
+        QueueUrl: this.#queueUrl(task.queue),
+        MessageBody: JSON.stringify(body),
       }),
     );
     return { taskId: out.MessageId ?? null };
   }
 
-  async startWorker(
-    handleTask: (
-      task: LeasedTask,
-      taskOpts?: { signal: AbortSignal },
-    ) => Promise<void>,
-    workerOpts: StartWorkerOpts,
-  ): Promise<void> {
-    const queueUrl = this.#queueUrl(workerOpts.queue);
-    // A throwing event handler (a host observer bug) is logged and never changes the
-    // ack/redelivery outcome of the message.
-    const report = async (
-      event: TaskEvent,
-      task: LeasedTask,
-      error?: unknown,
-    ): Promise<void> => {
-      if (!workerOpts.onEvent) {
-        return;
-      }
-      try {
-        await workerOpts.onEvent(event, task, error);
-      } catch (err) {
-        (this.#opts.logger ?? console).error(
-          `resize sqs: ${event} event handler failed`,
-          err,
-        );
-      }
+  async claim(
+    queue: string,
+    leaseMs: number,
+    signal?: AbortSignal,
+  ): Promise<ClaimedTask | null> {
+    const queueUrl = this.#queueUrl(queue);
+    const out = await this.#sqs().send(
+      new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 1,
+        WaitTimeSeconds: this.#opts.waitTimeSeconds ?? 10,
+        VisibilityTimeout: Math.max(1, seconds(leaseMs)),
+        MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+      }),
+      signal ? { abortSignal: signal } : {},
+    );
+    const message = out.Messages?.[0];
+    if (!message?.ReceiptHandle) {
+      return null;
+    }
+    const body = parseBody(message);
+    if (!body) {
+      await this.#discard(queueUrl, message, 'malformed task body');
+      return null;
+    }
+    return {
+      taskId: message.MessageId ?? message.ReceiptHandle,
+      resizer: body.resizer ?? 'default',
+      queue: body.queue ?? queue,
+      mediaId: body.mediaId,
+      pipeline: body.pipeline,
+      previews: body.previews ?? [],
+      // The URL travels with the token: complete/fail/renew act on the queue it came from.
+      token: JSON.stringify([queueUrl, message.ReceiptHandle]),
+      attempts: Number(message.Attributes?.ApproximateReceiveCount ?? 1),
     };
-    const consumer = Consumer.create({
-      queueUrl,
-      sqs: this.#getClient(),
-      // Returning the message ACKs it (sqs-consumer deletes it). Throwing leaves it for
-      // SQS to redeliver after the visibility timeout (→ DLQ via redrive policy).
-      // Arrow function: sqs-consumer invokes it detached, so `this` stays instance-bound.
-      handleMessage: async (message) => {
-        // The body JSON.parse is INSIDE the guarded region (05 · §10.3 fix b): a malformed body
-        // reports `failed` before rethrowing, consistent with a handler throw → SQS redelivers.
-        // `task` starts as a minimal LeasedTask (fields unknown until the body parses) so the
-        // event always carries a task-shaped payload.
-        let task: LeasedTask = {
-          taskId: message.MessageId ?? '',
-          resizer: 'default',
-          queue: workerOpts.queue,
-          mediaId: '',
-          pipeline: '',
-          previews: [],
-        };
-        try {
-          const body = JSON.parse(message.Body ?? '{}') as {
-            resizer?: string;
-            queue?: string;
-            mediaId: string;
-            pipeline: string;
-            previews: LeasedTask['previews'];
-          };
-          task = {
-            taskId: message.MessageId ?? '',
-            resizer: body.resizer ?? 'default',
-            queue: body.queue ?? workerOpts.queue,
-            mediaId: body.mediaId,
-            pipeline: body.pipeline,
-            previews: body.previews ?? [],
-          };
-          await handleTask(task);
-        } catch (err) {
-          await report('failed', task, err);
-          throw err; // let SQS redeliver → DLQ (no deadLettered event here — 05 · §10.3)
-        }
-        await report('completed', task);
-        return message;
-      },
-      // visibilityTimeout / heartbeatInterval only when the host provided them (else the
-      // queue default / no consumer-side heartbeat).
-      ...(this.#opts.visibilityTimeout !== undefined
-        ? { visibilityTimeout: this.#opts.visibilityTimeout }
-        : {}),
-      ...(this.#opts.heartbeatInterval !== undefined
-        ? { heartbeatInterval: this.#opts.heartbeatInterval }
-        : {}),
-    });
-
-    // Resolve when the consumer has fully stopped. Worker-wide shutdown wires
-    // workerOpts.signal → consumer.stop() (graceful: sqs-consumer finishes in-flight first).
-    await new Promise<void>((resolve) => {
-      consumer.once('stopped', () => resolve());
-      // `on`, NOT `once`: recurring consumer errors (e.g. heartbeat ChangeMessageVisibility
-      // failures) must ALL be logged — a `once` listener drops every error after the first,
-      // leaving later ones unhandled (05 · §10.3 fix a).
-      consumer.on('error', (err) => {
-        (this.#opts.logger ?? console).error('resize sqs consumer error', err);
-      });
-      const stop = () => consumer.stop();
-      if (workerOpts.signal.aborted) {
-        consumer.start();
-        stop();
-      } else {
-        workerOpts.signal.addEventListener('abort', stop, { once: true });
-        consumer.start();
-      }
-    });
   }
+
+  async renew(task: ClaimedTask, leaseMs: number): Promise<boolean> {
+    return this.#setVisibility(task, Math.max(1, seconds(leaseMs)));
+  }
+
+  // SQS fences less than Mongo: it accepts a delete with an outdated receipt handle and keeps the
+  // message. After a lost lease this may report true and the task runs again; the worker skips
+  // previews that already exist.
+  async complete(task: ClaimedTask): Promise<boolean> {
+    const [queueUrl, receiptHandle] = parseToken(task.token);
+    try {
+      await this.#sqs().send(
+        new DeleteMessageCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: receiptHandle,
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (isLostReceipt(err)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  async fail(
+    task: ClaimedTask,
+    next: { retryAt: Date } | 'dead',
+    error: string,
+  ): Promise<boolean> {
+    if (next !== 'dead') {
+      return this.#setVisibility(
+        task,
+        seconds(next.retryAt.getTime() - Date.now()),
+      );
+    }
+    const [queueUrl, receiptHandle] = parseToken(task.token);
+    // Copy first, then delete: a failed send leaves the message for a retry, so a dead task is
+    // never lost. If the delete then finds the lease lost, another worker holds the task and the
+    // dead-letter queue may get a second copy later — a rare duplicate, never a loss.
+    if (this.#opts.deadLetterQueueUrl) {
+      await this.#sqs().send(
+        new SendMessageCommand({
+          QueueUrl: this.#opts.deadLetterQueueUrl,
+          MessageBody: JSON.stringify({
+            resizer: task.resizer,
+            queue: task.queue,
+            mediaId: task.mediaId,
+            pipeline: task.pipeline,
+            previews: task.previews,
+            attempts: task.attempts,
+            error,
+          }),
+        }),
+      );
+    } else {
+      this.#logger.error(
+        `resize sqs: task ${task.taskId} is dead and no deadLetterQueueUrl is set — deleting it (${error})`,
+      );
+    }
+    try {
+      await this.#sqs().send(
+        new DeleteMessageCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: receiptHandle,
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (isLostReceipt(err)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  async #setVisibility(
+    task: ClaimedTask,
+    visibilitySeconds: number,
+  ): Promise<boolean> {
+    const [queueUrl, receiptHandle] = parseToken(task.token);
+    try {
+      await this.#sqs().send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: receiptHandle,
+          VisibilityTimeout: visibilitySeconds,
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (isLostReceipt(err)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  // A message the module can't read never becomes a task: move it to the dead-letter queue when
+  // there is one, otherwise leave it to the queue's own redrive policy.
+  async #discard(
+    queueUrl: string,
+    message: Message,
+    reason: string,
+  ): Promise<void> {
+    this.#logger.error(`resize sqs: ${reason} in message ${message.MessageId}`);
+    if (!this.#opts.deadLetterQueueUrl || !message.ReceiptHandle) {
+      return;
+    }
+    await this.#sqs().send(
+      new SendMessageCommand({
+        QueueUrl: this.#opts.deadLetterQueueUrl,
+        MessageBody: message.Body ?? '',
+      }),
+    );
+    await this.#sqs().send(
+      new DeleteMessageCommand({
+        QueueUrl: queueUrl,
+        ReceiptHandle: message.ReceiptHandle,
+      }),
+    );
+  }
+}
+
+function parseBody(message: Message): TaskBody | null {
+  try {
+    const body = JSON.parse(message.Body ?? '') as Partial<TaskBody>;
+    if (
+      typeof body?.mediaId !== 'string' ||
+      typeof body.pipeline !== 'string'
+    ) {
+      return null;
+    }
+    return body as TaskBody;
+  } catch {
+    return null;
+  }
+}
+
+function parseToken(token: string): [string, string] {
+  const [queueUrl, receiptHandle] = JSON.parse(token) as [string, string];
+  return [queueUrl, receiptHandle];
 }

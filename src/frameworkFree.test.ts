@@ -8,16 +8,12 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
 import defaultResizeConfig from './config/resize.ts';
-import type { MediaStore } from './contracts/mediaStore.ts';
+import type { ResizeDatabase } from './contracts/database.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import {
-  createResizeModels,
-  MongoLockStore,
-  MongoMediaStore,
-  MongoTransport,
-} from './drivers/mongo/index.ts';
+import { mongoDatabase } from './drivers/mongo/index.ts';
 import { Resizer, resetResizerForTests } from './index.ts';
 import { resizeMediaSchemaFragment } from './mediaFragment.ts';
+import { fakeDb } from './testHelpers/fakes.ts';
 import type { MediaLike, Preview } from './types.d.ts';
 import { runWorker } from './worker.ts';
 
@@ -50,8 +46,8 @@ function memoryStorage(): ResizeStorage {
   };
 }
 
-function memoryMediaStore(docs: Map<string, MediaLike>): MediaStore {
-  return {
+function memoryDatabase(docs: Map<string, MediaLike>): ResizeDatabase {
+  return fakeDb({
     load: async (id) => docs.get(id) ?? null,
     appendPreviews: async (id, previews: Preview[]) => {
       const doc = docs.get(id);
@@ -59,7 +55,7 @@ function memoryMediaStore(docs: Map<string, MediaLike>): MediaStore {
         doc.previews = [...(doc.previews ?? []), ...previews];
       }
     },
-  };
+  });
 }
 
 afterEach(() => {
@@ -73,7 +69,7 @@ test('eager: upload, generate and resolve with no framework app', async () => {
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
     storage: memoryStorage(),
-    mediaStore: memoryMediaStore(docs),
+    db: memoryDatabase(docs),
   });
   const media: MediaLike = {
     id: 'm1',
@@ -96,7 +92,7 @@ let server: MongoMemoryServer;
 let connection: mongoose.Connection;
 
 before(async () => {
-  server = await MongoMemoryServer.create();
+  server = await MongoMemoryServer.create({ instance: { ip: '127.0.0.1' } });
   connection = await mongoose
     .createConnection(server.getUri(), {
       dbName: `resize_framework_free_${process.pid}`,
@@ -115,22 +111,28 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
     'File',
     new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
   );
-  const { ResizeTask, ResizeLock } = createResizeModels(connection);
-  await Promise.all([File.init(), ResizeTask.init(), ResizeLock.init()]);
+  const db = mongoDatabase(connection, {
+    mediaModel: File,
+    timing: {
+      lockTtlMs: { dispatch: 60_000, worker: 5000 },
+      idlePollMs: 20,
+      leaseMs: 5000,
+    },
+    logger: silent,
+  });
+  const { ResizeTask, ResizeLock } = connection.models;
+  await Promise.all([
+    File.init(),
+    ResizeTask.createIndexes(),
+    ResizeLock.createIndexes(),
+  ]);
 
   const resizer = new Resizer({
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
     storage: memoryStorage(),
-    mediaStore: new MongoMediaStore({ model: File }),
-    transport: new MongoTransport({
-      model: ResizeTask,
-      locks: new MongoLockStore({ model: ResizeLock }),
-      lockTtlMs: { dispatch: 60_000, worker: 5000 },
-      logger: silent,
-      idlePollMs: 20,
-      leaseMs: 5000,
-    }),
+    db,
+    tasks: db.tasks,
   });
   const original = await resizer.uploadOriginal({
     body: png,
@@ -145,15 +147,26 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
 
   const stop = new AbortController();
   const worker = runWorker({ signal: stop.signal, logger: silent });
-  const until = Date.now() + 20_000;
+  const timeout = setTimeout(() => stop.abort(), 20_000);
   let stored = await File.findById(file.id);
-  while ((stored?.previews?.length ?? 0) === 0) {
-    assert.ok(Date.now() < until, 'the worker did not generate the preview');
-    await new Promise((r) => setTimeout(r, 20));
-    stored = await File.findById(file.id);
+  try {
+    const until = Date.now() + 20_000;
+    while (
+      (stored?.previews?.length ?? 0) === 0 ||
+      (await ResizeTask.findOne({}).lean())?.status !== 'completed'
+    ) {
+      assert.ok(
+        Date.now() < until,
+        'the worker did not complete the preview task',
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      stored = await File.findById(file.id);
+    }
+  } finally {
+    clearTimeout(timeout);
+    stop.abort();
+    await worker;
   }
-  stop.abort();
-  await worker;
   const { decision } = await resizer.resolve({
     media: stored as unknown as MediaLike,
     sizes,

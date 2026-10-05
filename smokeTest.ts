@@ -59,11 +59,12 @@ const expected = [
   'ResizeOriginalError',
   'getResizer',
   'listResizers',
-  'LockStore',
-  'MediaStore',
-  'QueueTransport',
+  'consumeQueue',
+  'timingOf',
   'Resizer',
+  'ResizeDatabase',
   'ResizeStorage',
+  'TaskQueue',
   'resetResizerForTests',
   'processTask',
   'runWorker',
@@ -79,14 +80,13 @@ assert.equal(
 );
 assert.deepEqual([...actual].sort(), [...expected].sort(), 'main entry export surface drift');
 for (const driver of [
-  'MongoTransport',
-  'SqsTransport',
+  'MongoDatabase',
+  'MongoTaskQueue',
+  'mongoDatabase',
+  'SqsTaskQueue',
   'S3Storage',
   'LocalFsStorage',
-  'FrameworkMediaStore',
-  'FrameworkLockStore',
-  'MongoMediaStore',
-  'MongoLockStore',
+  'FrameworkDatabase',
   'createResizeModels',
   'ResizeTaskModel',
   'ResizeWorker',
@@ -126,17 +126,15 @@ for (const [sub, sdk] of optional) {
 
 // (c) always-safe subpaths import successfully.
 const safe = [
-  ['/drivers/mongo.js', 'MongoTransport'],
-  ['/drivers/mongo.js', 'MongoMediaStore'],
-  ['/drivers/mongo.js', 'MongoLockStore'],
+  ['/drivers/mongo.js', 'mongoDatabase'],
+  ['/drivers/mongo.js', 'MongoDatabase'],
+  ['/drivers/mongo.js', 'MongoTaskQueue'],
   ['/drivers/mongo.js', 'createResizeModels'],
   ['/drivers/fs.js', 'LocalFsStorage'],
-  ['/framework.js', 'FrameworkMediaStore'],
-  ['/framework.js', 'FrameworkLockStore'],
+  ['/framework.js', 'FrameworkDatabase'],
   ['/framework.js', 'ResizeTaskModel'],
   ['/framework.js', 'ResizeWorker'],
   ['/framework.js', 'createFrameworkResizer'],
-  ['/framework.js', 'createFrameworkMongoTransport'],
   ['/framework.js', 'runResizeWorker'],
 ];
 for (const [sub, exp] of safe) {
@@ -144,19 +142,15 @@ for (const [sub, exp] of safe) {
   assert.ok(exp in m, sub + ' should export ' + exp);
   console.log('  ok  ' + sub + ' imports (exports ' + exp + ')');
 }
-const { MongoTransport } = await import(PKG + '/drivers/mongo.js');
-const { FrameworkLockStore } = await import(PKG + '/framework.js');
-assert.equal(
-  'prepare' in MongoTransport.prototype,
-  false,
-  'MongoTransport.prototype.prepare must not exist at runtime',
-);
-assert.equal(
-  'prepare' in FrameworkLockStore.prototype,
-  false,
-  'FrameworkLockStore.prototype.prepare must not exist at runtime',
-);
-console.log('  ok  MongoTransport + FrameworkLockStore have no runtime preparation methods');
+const { MongoTaskQueue, MongoDatabase } = await import(PKG + '/drivers/mongo.js');
+for (const Driver of [MongoTaskQueue, MongoDatabase]) {
+  assert.equal(
+    'prepare' in Driver.prototype,
+    false,
+    Driver.name + '.prototype.prepare must not exist at runtime',
+  );
+}
+console.log('  ok  MongoTaskQueue + MongoDatabase have no runtime preparation methods');
 `;
 
 // Runs in a consumer installed WITHOUT peer dependencies (no @adaptivestone/framework, no
@@ -171,24 +165,32 @@ const resizer = new mod.Resizer({
   config: defaultResizeConfig,
   logger: { info() {}, warn() {}, error() {} },
   storage: { download: async () => Buffer.alloc(0), upload: async () => ({}), publicUrl: () => '' },
-  mediaStore: { load: async () => null, appendPreviews: async () => {} },
+  // A plain object of the contract's shape works as well as a subclass.
+  db: {
+    loadMedia: async () => null,
+    appendPreviews: async () => {},
+    acquireLock: async () => true,
+    releaseLock: async () => {},
+  },
 });
 assert.equal(resizer.name, 'default');
 const mongo = await import(PKG + '/drivers/mongo.js');
 const fs = await import(PKG + '/drivers/fs.js');
-class MemoryMediaStore extends mod.MediaStore {
-  async load() { return null; }
+class MemoryDatabase extends mod.ResizeDatabase {
+  async loadMedia() { return null; }
   async appendPreviews() {}
+  async acquireLock() { return true; }
+  async releaseLock() {}
 }
 new mod.Resizer({
   name: 'drivers',
   config: defaultResizeConfig,
   logger: { info() {}, warn() {}, error() {} },
   storage: new fs.LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' }),
-  mediaStore: new MemoryMediaStore(),
+  db: new MemoryDatabase(),
 });
-new mongo.MongoMediaStore({ model: { findById: async () => null, findByIdAndUpdate: async () => null } });
-console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; a custom driver extends MediaStore');
+new mongo.MongoDatabase({ mediaModel: { findById: async () => null, findByIdAndUpdate: async () => null } });
+console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; a custom driver extends ResizeDatabase');
 let frameworkErr = null;
 try {
   await import(PKG + '/framework.js');
@@ -204,21 +206,21 @@ const CHECK_AWS = `import assert from 'node:assert/strict';
 const PKG = '@adaptivestone/framework-module-resize';
 
 const sqs = await import(PKG + '/drivers/sqs.js');
-assert.equal(typeof sqs.SqsTransport, 'function', 'SqsTransport should be a class');
+assert.equal(typeof sqs.SqsTaskQueue, 'function', 'SqsTaskQueue should be a class');
 const s3 = await import(PKG + '/drivers/s3.js');
 assert.equal(typeof s3.S3Storage, 'function', 'S3Storage should be a class');
-console.log('  ok  sqs + s3 subpaths import; SqsTransport + S3Storage are classes');
+console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classes');
 `;
 
 // Compiled inside the throwaway consumer so package resolution and declarations come from the
 // installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
 const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
 import {
-  LockStore,
-  type QueueTransport,
+  ResizeDatabase,
+  type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
-  FrameworkLockStore,
+  FrameworkDatabase,
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
 import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
@@ -230,21 +232,23 @@ const hostConfig = {
   worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
 } satisfies FrameworkResizeConfig;
 void hostConfig;
-import { MongoTransport } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
+import { MongoTaskQueue } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
 
-class MemoryLocks extends LockStore {
-  async acquire(): Promise<boolean> { return true; }
-  async release(): Promise<void> {}
+class MemoryDatabase extends ResizeDatabase {
+  async loadMedia(): Promise<null> { return null; }
+  async appendPreviews(): Promise<void> {}
+  async acquireLock(): Promise<boolean> { return true; }
+  async releaseLock(): Promise<void> {}
 }
-const locks: LockStore = new MemoryLocks();
-void [locks, FrameworkLockStore, MongoTransport];
+const db: ResizeDatabase = new MemoryDatabase();
+void [db, FrameworkDatabase, MongoTaskQueue];
 
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends
   (<T>() => T extends B ? 1 : 2) ? true : false;
 type ResizerHasPrepareQueue = 'prepareQueue' extends keyof Resizer ? true : false;
-type QueueHasPrepare = 'prepare' extends keyof QueueTransport ? true : false;
-type LockHasPrepare = 'prepare' extends keyof LockStore ? true : false;
+type QueueHasPrepare = 'prepare' extends keyof TaskQueue ? true : false;
+type LockHasPrepare = 'prepare' extends keyof ResizeDatabase ? true : false;
 
 const resizerHasPrepareQueue: Equal<ResizerHasPrepareQueue, false> = true;
 const queueHasPrepare: Equal<QueueHasPrepare, false> = true;
@@ -428,7 +432,6 @@ try {
       '@aws-sdk/client-s3',
       '@aws-sdk/s3-request-presigner',
       '@aws-sdk/client-sqs',
-      'sqs-consumer',
     ],
     consumer,
   );

@@ -11,7 +11,7 @@
 //   ResizeStorageError  — transient I/O; a retry may help
 //   ResizeSecurityError — a refusal (traversal, cross-bucket); never retry, log loudly
 //
-// Deliberately NOT branded: the mongo transport's `new Error(err)` that re-hydrates a PERSISTED
+// Deliberately NOT branded: the mongo queue's `new Error(err)` that re-hydrates a PERSISTED
 // failure string for the `onTaskDeadLettered` observer — that failure usually originated in host
 // pipeline code, so claiming module provenance for it would be a lie.
 
