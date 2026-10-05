@@ -21,6 +21,7 @@ import {
   TaskQueue,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { validateFailedLockTtl } from '../queue.ts';
 import { validateLockTtlMs } from '../resizeConfig.ts';
 import type {
   MissingPreview,
@@ -80,6 +81,7 @@ export class SqsTaskQueue extends TaskQueue {
     }
     if (opts.timing?.lockTtlMs !== undefined) {
       validateLockTtlMs(opts.timing.lockTtlMs);
+      validateFailedLockTtl(opts.timing.lockTtlMs.failed);
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;

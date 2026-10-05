@@ -12,11 +12,29 @@ import type {
 import { createResizeModels } from './models.ts';
 import { MongoTaskQueue } from './taskQueue.ts';
 
-/** The media model methods the database calls (any Mongoose model has them). */
+/**
+ * The media model methods the database calls (any Mongoose model has them). Writes go through
+ * `findOneAndUpdate`, so the host's findOneAndUpdate middleware sees them; it resolves with the
+ * matched document (only its `_id` is requested) or null. When the model also exposes its
+ * `schema`, verify() checks it keeps the preview fields the database relies on.
+ */
 export interface MongoMediaModel {
   modelName?: string;
   findById(id: string): PromiseLike<unknown>;
-  findByIdAndUpdate(id: string, update: object): PromiseLike<unknown>;
+  findOneAndUpdate(
+    filter: object,
+    update: object,
+    options: { projection: { _id: 1 } },
+  ): PromiseLike<unknown>;
+}
+
+// Each write asks for the matched document's id only, not the whole media document.
+const ID_ONLY = { projection: { _id: 1 as const } };
+
+// The part of a Mongoose schema verify() reads (types only: no mongoose import).
+interface SchemaLike {
+  path(path: string): unknown;
+  options: { strict?: unknown };
 }
 
 /** The lock model methods the database calls (any Mongoose model has them). */
@@ -91,8 +109,36 @@ export class MongoDatabase extends ResizeDatabase {
    * missing lock model would otherwise fail every variant at run time and dead-letter its tasks.
    */
   verify(): void {
-    this.mediaModel();
+    this.verifyMediaModel();
     this.lockModel();
+  }
+
+  /**
+   * The media model must resolve, and its preview rows must keep `identity`. Only rows declared as
+   * sub-documents with a strict shape lose it (Mongoose strict mode strips an undeclared field from
+   * every row, and every worker that renders a variant would then add its own row); a mixed or
+   * plain array, or rows with `strict: false`, keep any field.
+   */
+  protected verifyMediaModel(): void {
+    const model = this.mediaModel();
+    const schema = (model as { schema?: Partial<SchemaLike> }).schema;
+    if (typeof schema?.path !== 'function') {
+      return;
+    }
+    const previews = schema.path('previews') as
+      | { instance?: string; schema?: Partial<SchemaLike> }
+      | undefined;
+    const rows = previews?.instance === 'Array' ? previews.schema : undefined;
+    if (
+      typeof rows?.path === 'function' &&
+      rows.options?.strict !== false &&
+      !rows.path('identity')
+    ) {
+      throw new ResizeSetupError(
+        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no previews.identity field, so Mongoose would drop it and a preview rendered twice would be stored twice — spread the current resizeMediaSchemaFragment into the media model's schema`,
+        { code: 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' },
+      );
+    }
   }
 
   async loadMedia(mediaId: string): Promise<MediaLike | null> {
@@ -103,20 +149,42 @@ export class MongoDatabase extends ResizeDatabase {
     mediaId: string,
     previews: Preview[],
     backfillDims?: { width: number; height: number },
-  ): Promise<void> {
-    // One atomic write: push the previews and, when the worker measured the original, set its
-    // dimensions in the same update.
-    const update: {
-      $push: { previews: { $each: Preview[] } };
-      $set?: { 'original.width': number; 'original.height': number };
-    } = { $push: { previews: { $each: previews } } };
+  ): Promise<Preview[]> {
+    const model = this.mediaModel();
+    // When the worker measured the original, set its dimensions first: a reader that sees the
+    // previews then sees the dimensions too. Applied whether or not any preview is stored.
     if (backfillDims) {
-      update.$set = {
-        'original.width': backfillDims.width,
-        'original.height': backfillDims.height,
-      };
+      await model.findOneAndUpdate(
+        { _id: mediaId },
+        {
+          $set: {
+            'original.width': backfillDims.width,
+            'original.height': backfillDims.height,
+          },
+        },
+        ID_ONLY,
+      );
     }
-    await this.mediaModel().findByIdAndUpdate(mediaId, update);
+    // One conditional write per preview: the filter and the push are atomic on the document, so of
+    // two workers that rendered the same identity only one stores its row (the other matches
+    // nothing: null). A preview without an identity is always stored, and a row stored before rows
+    // carried one never blocks a new row. Missing media matches nothing: a silent no-op.
+    const stored: Preview[] = [];
+    for (const preview of previews) {
+      const filter =
+        preview.identity === undefined
+          ? { _id: mediaId }
+          : { _id: mediaId, 'previews.identity': { $ne: preview.identity } };
+      const matched = await model.findOneAndUpdate(
+        filter,
+        { $push: { previews: preview } },
+        ID_ONLY,
+      );
+      if (matched) {
+        stored.push(preview);
+      }
+    }
+    return stored;
   }
 
   // A lock is a document whose id is the key; a TTL index removes expired ones, and an expired

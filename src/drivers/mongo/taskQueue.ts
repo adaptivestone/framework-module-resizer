@@ -32,7 +32,7 @@ export interface MongoTaskQueueOptions {
 
 // The schema paths this queue writes. Mongoose strict mode silently drops a path its schema lacks:
 // a model ejected before tasks carried a Resizer, queue and request key would file every task under
-// Resizer 'default' on queue 'default'.
+// Resizer 'default' on queue 'default'; one without availableAt would lose every retry time.
 const WRITTEN_PATHS = [
   'fileId',
   'resizer',
@@ -42,6 +42,7 @@ const WRITTEN_PATHS = [
   'previews',
   'status',
   'attempts',
+  'availableAt',
   'leasedBy',
   'leaseToken',
   'leaseExpiresAt',
@@ -149,6 +150,7 @@ export class MongoTaskQueue extends TaskQueue {
             previews: task.previews,
             status: 'pending',
             attempts: 0,
+            availableAt: new Date(),
           },
         },
         {
@@ -194,26 +196,29 @@ export class MongoTaskQueue extends TaskQueue {
   }
 
   // One findOneAndUpdate that returns at once (the core polls every idlePollMs), so it takes no
-  // abort signal.
+  // abort signal. The earliest due task wins: a waiting task whose availableAt has passed, or a
+  // leased one whose lease ended. A lease keeps availableAt at its end, so tasks in backoff and
+  // live leases lie outside the { queue, status, availableAt } index bounds and a claim reads
+  // about one document, with no in-memory sort. Rows written before availableAt existed have none:
+  // they are due once their leaseExpiresAt (a retry time or a lease end) has passed.
   async claim(queue: string, leaseMs: number): Promise<ClaimedTask | null> {
     const model = this.#model();
     if (!model) {
       return null;
     }
     const now = new Date();
+    const leaseEnd = new Date(now.getTime() + leaseMs);
     const doc = (await model.findOneAndUpdate(
       {
         queue: named(queue),
+        status: { $in: ['pending', 'processing'] },
+        availableAt: { $not: { $gt: now } }, // due, or no availableAt yet
+        // Rows written by a worker that keeps times in leaseExpiresAt (before availableAt existed,
+        // or an older worker in a rolling deploy) still wait for it: a waiting row's retry time,
+        // a leased row's lease. New waiting rows have leaseExpiresAt null.
         $or: [
-          {
-            status: 'pending',
-            $or: [
-              { leaseExpiresAt: { $exists: false } },
-              { leaseExpiresAt: null },
-              { leaseExpiresAt: { $lt: now } },
-            ],
-          },
-          { status: 'processing', leaseExpiresAt: { $lt: now } },
+          { status: 'pending', leaseExpiresAt: { $not: { $gt: now } } },
+          { leaseExpiresAt: { $lt: now } },
         ],
       },
       {
@@ -221,18 +226,20 @@ export class MongoTaskQueue extends TaskQueue {
           status: 'processing',
           leasedBy: LEASE_HOLDER,
           leaseToken: randomHex(),
-          leaseExpiresAt: new Date(now.getTime() + leaseMs),
+          leaseExpiresAt: leaseEnd,
+          availableAt: leaseEnd,
         },
         $inc: { attempts: 1 },
       },
-      { sort: { createdAt: 1 }, returnDocument: 'after' },
+      { sort: { availableAt: 1 }, returnDocument: 'after' },
     )) as TaskDoc | null;
     return doc ? toClaimedTask(doc) : null;
   }
 
   async renew(task: ClaimedTask, leaseMs: number): Promise<boolean> {
+    const leaseEnd = new Date(Date.now() + leaseMs);
     return this.#fenced(task, {
-      $set: { leaseExpiresAt: new Date(Date.now() + leaseMs) },
+      $set: { leaseExpiresAt: leaseEnd, availableAt: leaseEnd },
     });
   }
 
@@ -252,21 +259,26 @@ export class MongoTaskQueue extends TaskQueue {
       next === 'dead'
         ? { $set: { status: 'dead', deadAt: new Date(), error } }
         : {
-            // A future leaseExpiresAt keeps a pending task unclaimable until the retry time.
             $set: {
               status: 'pending',
               leaseToken: null,
-              leaseExpiresAt: next.retryAt,
+              leaseExpiresAt: null,
+              availableAt: next.retryAt,
               error,
             },
           },
     );
   }
 
-  // Due at once (a null lease is claimable) and the claim's attempt taken back.
+  // Due at once, and the claim's attempt taken back.
   async release(task: ClaimedTask): Promise<boolean> {
     return this.#fenced(task, {
-      $set: { status: 'pending', leaseToken: null, leaseExpiresAt: null },
+      $set: {
+        status: 'pending',
+        leaseToken: null,
+        leaseExpiresAt: null,
+        availableAt: new Date(),
+      },
       $inc: { attempts: -1 },
     });
   }

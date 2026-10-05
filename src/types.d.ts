@@ -67,6 +67,9 @@ export interface PreviewScope {
 
 export interface Preview {
   storageRef: StorageRef;
+  // The full preview identity (resizer:pipeline:sizeKey:format:filters). The database stores one
+  // row per identity; absent on rows written before previews carried it.
+  identity?: string;
   resizer?: string; // Resizer that generated it; absent → 'default'
   pipeline?: string; // pipeline that generated it; absent → 'default'
   sizeKey: string; // canonical size key — see 03 · Identity
@@ -110,9 +113,8 @@ export interface ReadyEntry {
   format: PreviewFormat;
   filters?: Filters;
   url: string;
-  preview?: Preview; // present for generated previews; ABSENT for original-backed entries
-  isOriginal?: boolean; // true when `url` points at the untouched original
-  contentType?: string; // preview.contentType, or original.contentType when isOriginal
+  preview: Preview; // the stored preview this entry serves
+  contentType: string; // preview.contentType
 }
 
 export interface ReadDecision {
@@ -220,7 +222,11 @@ export interface ResizeConfig {
 // Queue timing and lock TTLs: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the
 // framework config file's `queue` section feeds the framework's queue).
 export interface QueueTimingOptions {
-  lockTtlMs: { dispatch: number; worker: number }; // worker must be ≤ leaseMs
+  // dispatch: default 60000 — one read's enqueue holds each variant this long;
+  // worker: default 60000, must be ≤ leaseMs;
+  // failed: default 600000 — after a task is dead-lettered, reads do not queue its variants again
+  // for this long.
+  lockTtlMs: { dispatch: number; worker: number; failed?: number };
   leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
   retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
   maxAttempts: number; // default 5 — deliveries before dead-letter (every lease counts, incl. reclaims)

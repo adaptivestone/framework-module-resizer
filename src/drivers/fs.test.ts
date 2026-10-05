@@ -37,7 +37,6 @@ describe('LocalFsStorage', () => {
       await assert.rejects(() => readFile(join(publicRoot, '-private', key)), {
         code: 'ENOENT',
       });
-      assert.equal(s.canServeOriginalPublicly(ref), false);
       assert.throws(() => s.publicUrl(ref), /private original/);
     }
   });
@@ -104,8 +103,8 @@ describe('LocalFsStorage', () => {
       await readFile(join(`${dir}-private`, 'originals/a.jpg')),
       Buffer.from('originals/a.jpg'),
     );
-    assert.equal(s.canServeOriginalPublicly(privateRef), false);
-    assert.equal(s.canServeOriginalPublicly(publicRef), true);
+    // Visibility is enforced where a URL is made; the driver has no separate visibility check.
+    assert.equal('canServeOriginalPublicly' in s, false);
     assert.throws(() => s.publicUrl(privateRef), /private original/);
     assert.equal(s.publicUrl(publicRef), '/media/originals/a.jpg');
   });
@@ -178,7 +177,6 @@ describe('LocalFsStorage', () => {
       },
     ]) {
       await assert.rejects(() => s.download(ref));
-      assert.throws(() => s.canServeOriginalPublicly(ref));
       assert.throws(() => s.publicUrl(ref));
     }
   });

@@ -185,8 +185,4 @@ export class LocalFsStorage extends ResizeStorage {
     }
     return `${this.#publicBaseUrl.replace(/\/+$/, '')}/${parsed.path}`;
   }
-
-  canServeOriginalPublicly(ref: StorageRef): boolean {
-    return this.#ref(ref).visibility === 'public';
-  }
 }

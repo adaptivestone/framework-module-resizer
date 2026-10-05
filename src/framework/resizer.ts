@@ -7,7 +7,9 @@
 // - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
 // - logger and events: the app's.
 // Options win over the config file. Nothing is read from the app until first use, and the AWS
-// drivers (optional peers) are imported only when the config selects them.
+// drivers (optional peers) are imported only when the config selects them. The task queues this
+// builds are shared per backend (see ./database.ts): Resizers whose config selects the same backend
+// get the same queue object, so the worker runs one loop for it, and their timing must agree.
 import type { ResizeDatabase } from '../contracts/database.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
@@ -25,7 +27,17 @@ import {
   type ResolvedFrameworkConfig,
   resolveFrameworkConfig,
 } from './config.ts';
-import { FrameworkDatabase } from './database.ts';
+import {
+  addQueueUser,
+  backendKey,
+  backendTiming,
+  checkQueueUser,
+  DATABASE_BACKEND,
+  databaseForResizer,
+  isAppTaskQueue,
+  type QueueUser,
+  sharedQueue,
+} from './database.ts';
 
 export interface FrameworkResizerOptions
   extends Omit<
@@ -48,6 +60,10 @@ export interface FrameworkResizerOptions
  * Call `await resizer.verify()` after `Server.init()` to check everything at boot.
  */
 export class FrameworkResizer extends Resizer {
+  // This Resizer's config as a user of a shared task queue; unset with an explicit `tasks` or
+  // `tasks: false`.
+  readonly #queueUser: QueueUser | undefined;
+
   constructor(opts: FrameworkResizerOptions = {}) {
     const {
       configName,
@@ -68,7 +84,7 @@ export class FrameworkResizer extends Resizer {
     const file = `src/config/${configName ?? 'resize'}.ts`;
     const database =
       db ??
-      new FrameworkDatabase(
+      databaseForResizer(
         explicitConfig
           ? { config: explicitConfig, configName }
           : { configName },
@@ -84,6 +100,34 @@ export class FrameworkResizer extends Resizer {
         ? {}
         : { tasks: tasks ?? (() => buildQueue(read(), database, file)) }),
     });
+    // Registered once constructed (a rejected name or config registers nothing). With the
+    // 'database' driver, the queue is shared only when it is the app's one ResizeTask queue.
+    if (tasks === undefined) {
+      this.#queueUser = {
+        source: explicit
+          ? `the config passed to new FrameworkResizer({ name: '${this.name}' })`
+          : file,
+        read,
+        backend: (config) => {
+          const key = backendKey(config.queue);
+          return key === DATABASE_BACKEND && !isAppTaskQueue(database.tasks)
+            ? undefined
+            : key;
+        },
+      };
+      addQueueUser(this.#queueUser);
+    }
+  }
+
+  /**
+   * The core checks, then the timing of the shared task queue again: a Resizer constructed after
+   * this one loaded its queue is compared here too.
+   */
+  async verify(): Promise<void> {
+    await super.verify();
+    if (this.#queueUser) {
+      checkQueueUser(this.#queueUser);
+    }
   }
 }
 
@@ -169,7 +213,7 @@ async function buildQueue(
   database: ResizeDatabase,
   file: string,
 ): Promise<TaskQueue | undefined> {
-  const { queue, timing } = config;
+  const { queue } = config;
   if (queue === false) {
     return undefined;
   }
@@ -180,27 +224,37 @@ async function buildQueue(
       ['@aws-sdk/client-sqs'],
       file,
     );
-    return new SqsTaskQueue({
-      queueUrl: queue.queueUrl,
-      ...(queue.queues ? { queues: queue.queues } : {}),
-      ...(queue.deadLetterQueueUrl
-        ? { deadLetterQueueUrl: queue.deadLetterQueueUrl }
-        : {}),
-      ...(queue.waitTimeSeconds === undefined
-        ? {}
-        : { waitTimeSeconds: queue.waitTimeSeconds }),
-      ...(queue.region ? { region: queue.region } : {}),
-      ...(queue.endpoint ? { endpoint: queue.endpoint } : {}),
-      timing,
-      logger: appLogger,
-    });
+    // One SqsTaskQueue per SQS queue in the process, with the timing its configs agree on.
+    return sharedQueue(
+      backendKey(queue) as string,
+      (timing) =>
+        new SqsTaskQueue({
+          queueUrl: queue.queueUrl,
+          ...(queue.queues ? { queues: queue.queues } : {}),
+          ...(queue.deadLetterQueueUrl
+            ? { deadLetterQueueUrl: queue.deadLetterQueueUrl }
+            : {}),
+          ...(queue.waitTimeSeconds === undefined
+            ? {}
+            : { waitTimeSeconds: queue.waitTimeSeconds }),
+          ...(queue.region ? { region: queue.region } : {}),
+          ...(queue.endpoint ? { endpoint: queue.endpoint } : {}),
+          timing,
+          logger: appLogger,
+        }),
+    );
   }
-  // 'database': the database's own queue (FrameworkDatabase: the ResizeTask model).
+  // 'database': the database's own queue (FrameworkDatabase: the app's one ResizeTask queue).
   if (!database.tasks) {
     throw new ResizeConfigError(
       `resize config: \`queue\` in ${file} selects the 'database' driver, but the database passed to new FrameworkResizer() has no task queue — pass \`tasks\`, or set queue: false`,
       { code: 'RESIZE_CONFIG_INVALID' },
     );
+  }
+  // The core reads a queue's timing once; check it here so every Resizer sees a conflict on its
+  // own first use.
+  if (isAppTaskQueue(database.tasks)) {
+    backendTiming(DATABASE_BACKEND);
   }
   return database.tasks;
 }

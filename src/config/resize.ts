@@ -19,7 +19,7 @@ const defaultResizeConfig: ResizeConfig = {
   animated: false,
   encode: {
     formats: {
-      jpeg: { quality: 80, mozjpeg: true, chromaSubsampling: '4:2:0' },
+      jpeg: { quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' },
       webp: { quality: 82, effort: 4 },
       avif: { quality: 64, effort: 4 },
     },
@@ -37,14 +37,14 @@ const defaultResizeConfig: ResizeConfig = {
 };
 
 /** Queue timing and lock TTL defaults (a task queue's missing timing values). */
-export const defaultQueueOptions: QueueTimingOptions = {
-  lockTtlMs: { dispatch: 60_000, worker: 60_000 },
+export const defaultQueueOptions = {
+  lockTtlMs: { dispatch: 60_000, worker: 60_000, failed: 600_000 },
   leaseMs: 60_000,
   retryBackoffMs: { base: 5_000, max: 300_000 },
   maxAttempts: 5,
   idlePollMs: 1_000,
   taskTimeoutMs: 600_000,
-};
+} satisfies QueueTimingOptions;
 
 /** Framework worker command defaults. */
 export const defaultWorkerOptions: FrameworkWorkerConfig = {

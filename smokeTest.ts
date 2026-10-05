@@ -38,11 +38,7 @@ const PKG = '@adaptivestone/framework-module-resize';
 // (a) main entry: exactly the expected runtime exports, and no driver class leaks into it.
 const mod = await import(PKG);
 const expected = [
-  'calculateResizedDimensions',
   'formatPictureUrls',
-  'getFilterSig',
-  'getImageContentType',
-  'getPreviewIdentity',
   'getSizeKey',
   'isCatalogCovered',
   'parseSizeKey',
@@ -58,15 +54,11 @@ const expected = [
   'ResizeNoOriginalError',
   'ResizeOriginalError',
   'getResizer',
-  'listResizers',
-  'consumeQueue',
-  'timingOf',
   'Resizer',
   'ResizeDatabase',
   'ResizeStorage',
   'TaskQueue',
   'resetResizerForTests',
-  'processTask',
   'runWorker',
 ];
 for (const name of expected) {
@@ -145,6 +137,18 @@ for (const [sub, exp] of safe) {
 }
 const taskModel = await import(PKG + '/framework/ResizeTaskModel.js');
 const framework = await import(PKG + '/framework.js');
+const expectedFramework = [
+  'FrameworkDatabase',
+  'FrameworkResizer',
+  'ResizeTaskModel',
+  'ResizeWorker',
+  'runResizeWorker',
+];
+assert.deepEqual(
+  Object.keys(framework).sort(),
+  [...expectedFramework].sort(),
+  'framework entry export surface drift',
+);
 assert.strictEqual(taskModel.default, framework.ResizeTaskModel);
 const { MongoTaskQueue, MongoDatabase } = await import(PKG + '/drivers/mongo.js');
 for (const Driver of [MongoTaskQueue, MongoDatabase]) {

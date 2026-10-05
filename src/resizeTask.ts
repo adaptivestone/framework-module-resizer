@@ -3,10 +3,11 @@
 //   - processTaskWith() = the core + lock bookkeeping (queued/lazy worker)
 //   - generateImpl()    = the core WITHOUT locks (eager `resizer.generate`)
 // Steps 2–8 (download once → metadata guards → beforeSteps once, after an orientation
-// normalize → decode once + bounded per-variant resize/encode/upload → one appendPreviews) live in
-// generatePreviews(). Every function receives its Resizer as an argument, and resizer.ts is
-// imported for types only, so the resizer↔resizeTask cycle is runtime-free. sharp is a hard
-// dep; this is the only place besides worker.ts that decodes.
+// normalize → an SVG rendered once to a raster → decode once + bounded per-variant
+// resize/encode/upload → one appendPreviews) live in generatePreviews(). Every function receives
+// its Resizer as an argument, and resizer.ts is imported for types only, so the
+// resizer↔resizeTask cycle is runtime-free. sharp is a hard dep; this is the only place besides
+// worker.ts that decodes (SVG rendering runs in a child process: helpers/svgRaster.ts).
 import sharp, {
   type FormatEnum,
   type Metadata,
@@ -15,7 +16,7 @@ import sharp, {
 } from 'sharp';
 import { defaultQueueOptions } from './config/resize.ts';
 import type { TaskQueue } from './contracts/taskQueue.ts';
-import { canonicalizeVariants } from './enqueue.ts';
+import { canonicalizeVariants, dispatchLockKey } from './enqueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
@@ -26,6 +27,7 @@ import {
 import { runBounded } from './helpers/concurrency.ts';
 import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
+import { rasterizeSvg } from './helpers/svgRaster.ts';
 import {
   calculateResizedDimensions,
   coverDimensions,
@@ -117,26 +119,60 @@ function withoutVisibleLoss(img: Sharp, format: string | undefined): Sharp {
 }
 
 /**
- * True when Sharp's SVG shrink-on-load would re-render a raster of `rasterW`×`rasterH` past
- * librsvg's side limit for a cover resize to `width`×`height`. Sharp re-renders an SVG at the
- * scale the resize needs, which for a cover crop of an extreme aspect ratio (a 1×5000 strip
- * at 300×300) is the whole uncropped image: 300×1,500,000.
+ * An SVG's own size to a fraction of a pixel. Its 72 dpi size (roundedW × roundedH) and any
+ * raster are rounded to whole pixels, so a side derived from them can be a pixel off (200×100
+ * rendered at 619×310 gives 620×311 for a 620 width), and a 1000×0.6 SVG reads as 1000×1. This
+ * is a header-only read (nothing is rendered) at the highest density whose size still fits
+ * limitInputPixels, which Sharp checks on the header too; the +2 margins absorb its rounding.
  */
-function svgReloadExceedsLimit(
-  rasterW: number,
-  rasterH: number,
-  width: number | undefined,
-  height: number | undefined,
-): boolean {
-  const shrink =
-    width !== undefined && height !== undefined
-      ? Math.min(rasterW / width, rasterH / height)
-      : width !== undefined
-        ? rasterW / width
-        : height !== undefined
-          ? rasterH / height
-          : 1;
-  return Math.max(rasterW, rasterH) / shrink > SVG_MAX_SIDE;
+async function svgNaturalSize(
+  svg: Buffer,
+  roundedW: number,
+  roundedH: number,
+  config: Resizer['config'],
+): Promise<{ width: number; height: number }> {
+  const density = Math.max(
+    72,
+    Math.min(
+      100_000,
+      Math.floor(
+        72 *
+          Math.sqrt(
+            config.limits.inputPixels / ((roundedW + 2) * (roundedH + 2)),
+          ),
+      ),
+    ),
+  );
+  const meta = await sharp(svg, {
+    density,
+    limitInputPixels: config.limits.inputPixels,
+  })
+    .timeout({ seconds: config.limits.processingTimeoutSeconds })
+    .metadata();
+  // Each side to within 1/scale of a pixel. A whole-number size inside that range is taken as
+  // exact: the read is coarse for a long strip (40000×300 allows only about 4.7×).
+  const scale = density / 72;
+  const side = (scaled: number | undefined, rounded: number) => {
+    const estimate = scaled === undefined ? rounded : scaled / scale;
+    return Math.abs(estimate - rounded) <= 1 / scale ? rounded : estimate;
+  };
+  return {
+    width: side(meta.width, roundedW),
+    height: side(meta.height, roundedH),
+  };
+}
+
+/** The identity a stored row answers for (rows written before previews carried one: derived). */
+function identityOf(preview: Preview): string {
+  return (
+    preview.identity ??
+    getPreviewIdentity(
+      previewScope(preview),
+      preview.sizeKey,
+      preview.format,
+      preview.filters,
+    )
+  );
 }
 
 /** Uploaded locators for a log line; an opaque ref that JSON cannot encode is still named. */
@@ -172,8 +208,11 @@ export interface GenerateCoreArgs {
 }
 
 export interface GenerateCoreResult {
+  // Previews this call stored (or, with persist:false, produced).
   generated: Preview[];
   failedCount: number;
+  // Identities the database already held from another worker: covered, not failed.
+  alreadyStored: string[];
 }
 
 export async function generatePreviews(
@@ -196,19 +235,52 @@ export async function generatePreviews(
   // Before any download or decode, in both modes; the queue retries it like any failure.
   requirePipeline(resizer, pipelineName);
 
-  const generated: Preview[] = [];
+  let generated: Preview[] = [];
   let failedCount = 0;
+  const alreadyStored: string[] = [];
 
   // Nothing requested (e.g. eager re-run where everything already exists) → no download.
   if (requested.length === 0) {
-    return { generated, failedCount };
+    return { generated, failedCount, alreadyStored };
   }
 
   const original = media.original;
   if (original?.storageRef == null) {
     // Callers guard this, but never assume — a media without an original has nothing to
     // resize from.
-    return { generated, failedCount };
+    return { generated, failedCount, alreadyStored };
+  }
+
+  // Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6). Stored
+  // previews keep their own scope, so another pipeline's rendering never counts as done here.
+  const scope: PreviewScope = { resizer: resizer.name, pipeline: pipelineName };
+  const existing = new Set<string>();
+  for (const p of media.previews ?? []) {
+    if (isUsablePreview(p)) {
+      existing.add(
+        getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
+      );
+    }
+  }
+  const pending = requested.filter(
+    (v) =>
+      !existing.has(getPreviewIdentity(scope, v.sizeKey, v.format, v.filters)),
+  );
+  // Everything requested is already stored: no download. In queued mode drop the dispatch locks
+  // so a later read can re-enqueue a sibling promptly.
+  if (pending.length === 0) {
+    if (locks) {
+      for (const v of requested) {
+        await releaseLock(
+          resizer,
+          dispatchLockKey(
+            mediaId,
+            getPreviewIdentity(scope, v.sizeKey, v.format, v.filters),
+          ),
+        );
+      }
+    }
+    return { generated, failedCount, alreadyStored };
   }
 
   // 2. Download the original ONCE.
@@ -270,18 +342,66 @@ export async function generatePreviews(
         )
       : 1;
 
-  // 4. beforeSteps — the ordered, awaited chain, ONCE, over display-orientation pixels.
+  // 4. An SVG is rendered ONCE, before anything else touches it, in a child process with a hard
+  // time limit, to a lossless raster at the largest scale the pending variants need (capped by
+  // the pixel budget and librsvg's side limit). From then on it is a regular image: beforeSteps
+  // receive the PNG, never SVG markup they could render in-process without a time limit.
+  // procW/procH stay the SVG's own size (fit sizes are computed from it and never exceed it);
+  // svgAspect is its real aspect ratio, for derived sides and the cap decision.
+  const fromSvg = origMeta.format === 'svg';
+  let svgAspect: number | undefined;
+  if (fromSvg) {
+    const natural = await svgNaturalSize(buf, dispW, dispH, config);
+    svgAspect = natural.width / natural.height;
+    const largestScale = Math.max(
+      1,
+      ...pending
+        .filter((variant) => !variant.fit)
+        .map((variant) =>
+          Math.max(
+            (variant.requestedWidth ?? 0) / natural.width,
+            (variant.requestedHeight ?? 0) / natural.height,
+          ),
+        ),
+    );
+    const scale = Math.min(
+      Math.max(
+        1,
+        Math.min(
+          largestScale,
+          Math.sqrt(pixelBudget / (natural.width * natural.height)),
+        ),
+      ),
+      // librsvg's side limit holds whatever the pixel budget allows (a 1×5000 strip).
+      SVG_MAX_SIDE / Math.max(natural.width, natural.height),
+    );
+    buf = await rasterizeSvg(buf, {
+      density: Math.max(1, Math.min(100_000, Math.floor(72 * scale))),
+      limitInputPixels: config.limits.inputPixels,
+      timeoutMs: config.limits.processingTimeoutSeconds * 1000,
+      signal,
+      mediaId,
+    });
+  }
+
+  // 5. beforeSteps — the ordered, awaited chain, ONCE, over display-orientation pixels.
   // Without steps the original is used as downloaded: each variant's `.rotate()` applies the
   // EXIF orientation, so nothing is re-encoded before the variants are made.
   const beforeSteps = pipeline.beforeSteps ?? [];
-  let procMeta = origMeta;
+  let procMeta = fromSvg
+    ? await sharp(buf, { limitInputPixels: config.limits.inputPixels })
+        .timeout({ seconds: config.limits.processingTimeoutSeconds })
+        .metadata()
+    : origMeta;
   let procW = dispW;
   let procH = dispH;
+  // The SVG sizing rules above apply while the pixels are the SVG's own raster.
+  let svgSizing = fromSvg;
   if (beforeSteps.length > 0) {
     // Normalize orientation ONCE so every step sees DISPLAY-orientation pixels (and a step that
     // round-trips sharp() cannot re-strip a live EXIF orientation and desync the result),
     // re-encoded in the same format without visible loss.
-    let stepMeta = origMeta;
+    let stepMeta = procMeta;
     if (orientation > 1) {
       buf = await withoutVisibleLoss(
         sharp(buf, {
@@ -300,14 +420,25 @@ export async function generatePreviews(
       buf = asBuffer(await step(buf, { media, metadata: stepMeta, ctx }));
     }
 
-    // 5. Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
-    procMeta = await sharp(buf, {
+    // Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
+    const after = await sharp(buf, {
       limitInputPixels: config.limits.inputPixels,
     })
       .timeout({ seconds: config.limits.processingTimeoutSeconds })
       .metadata();
-    procW = procMeta.width ?? dispW;
-    procH = procMeta.height ?? dispH;
+    if (
+      !fromSvg ||
+      after.width !== procMeta.width ||
+      after.height !== procMeta.height
+    ) {
+      // A step that resized the SVG's raster made a new image: from here it is sized by its
+      // own pixels, like any raster.
+      svgSizing = false;
+      svgAspect = undefined;
+      procW = after.width ?? dispW;
+      procH = after.height ?? dispH;
+    }
+    procMeta = after;
   }
   if (procW * procH > pixelBudget) {
     throw new ResizeMediaError(
@@ -316,81 +447,26 @@ export async function generatePreviews(
     );
   }
 
-  // 6. Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6). Stored
-  // previews keep their own scope, so another pipeline's rendering never counts as done here.
-  const scope: PreviewScope = { resizer: resizer.name, pipeline: pipelineName };
-  const existing = new Set<string>();
-  for (const p of media.previews ?? []) {
-    if (isUsablePreview(p)) {
-      existing.add(
-        getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
-      );
-    }
-  }
-
-  // 7. Decode the original ONCE; clone the base per variant so the decode is shared.
-  // SVG is decoded at the largest requested scale before the shared preview pipeline.
-  // Cap the intermediate raster by the same source/input pixel budgets as other inputs.
-  const isSvg = procMeta.format === 'svg';
-  let density: number | undefined;
-  if (isSvg) {
-    const largestScale = Math.max(
-      1,
-      ...requested
-        .filter((variant) => !variant.fit)
-        .map((variant) =>
-          Math.max(
-            (variant.requestedWidth ?? 0) / procW,
-            (variant.requestedHeight ?? 0) / procH,
-          ),
-        ),
-    );
-    const scale = Math.min(
-      Math.max(
-        1,
-        Math.min(largestScale, Math.sqrt(pixelBudget / (procW * procH))),
-      ),
-      // librsvg's side limit holds whatever the pixel budget allows (a 1×5000 strip).
-      SVG_MAX_SIDE / Math.max(procW, procH),
-    );
-    density = Math.max(1, Math.min(100_000, Math.floor(72 * scale)));
-  }
-  const decode = (pages: number, svgDensity?: number): Sharp =>
+  // Decode ONCE per kind; clone the base per variant so the decode is shared. Formats that
+  // cannot hold an animation decode only the first frame (otherwise Sharp stacks every frame
+  // into one tall image).
+  const decode = (pages: number): Sharp =>
     sharp(buf, {
-      failOn: isSvg ? 'warning' : 'none',
+      failOn: 'none',
       sequentialRead: true,
       limitInputPixels: config.limits.inputPixels,
       pages,
-      ...(svgDensity !== undefined ? { density: svgDensity } : {}),
     });
-  // Formats that cannot hold an animation decode only the first frame (otherwise Sharp stacks
-  // every frame into one tall image).
   const frames = framesOf(procMeta, procW, procH);
-  const base = decode(1, density);
+  const base = decode(1);
   const animatedBase = frames > 1 ? decode(frames) : undefined;
-  const fitBase =
-    density !== undefined && density > 72 && requested.some((v) => v.fit)
-      ? decode(1)
-      : undefined;
-  // Below 72 dpi (an SVG longer than the side limit) fit stays on the scaled raster: the 72 dpi
-  // decode is unusable whenever Sharp does not re-render it (a 1×40000 strip). The raster's
-  // rounded aspect ratio would shift an `inside` resize (a 40000×300 SVG gave 1997×15), so fit
-  // fills the box calculateResizedDimensions computed from the SVG's own size.
-  const exactFit = density !== undefined && density < 72;
-  // The SVG raster size at `density`, for the shrink-on-load guard below.
-  const svgRaster = isSvg
-    ? await base
-        .clone()
-        .timeout({ seconds: config.limits.processingTimeoutSeconds })
-        .metadata()
-    : undefined;
 
   // Locks held for processed variants; released once after the pool (success AND error).
   const heldLocks = new Set<string>();
 
   const processVariant = async (v: MissingPreview): Promise<void> => {
     const identity = getPreviewIdentity(scope, v.sizeKey, v.format, v.filters);
-    const dispatchKey = `resize_dispatch:${mediaId}:${identity}`;
+    const dispatchKey = dispatchLockKey(mediaId, identity);
     const workerKey = `resize_worker:${mediaId}:${identity}`;
 
     // Skip anything already generated; in queued mode drop its dispatch lock so a later read
@@ -431,8 +507,9 @@ export async function generatePreviews(
         throw formatNotConfiguredError([v.format]);
       }
       // Fit: capped to config.maxSize by calculateResizedDimensions. Cover: requested sides
-      // rounded and capped to limits.resultDimension, a derived side included.
-      const { width, height } = v.fit
+      // rounded and capped to limits.resultDimension, a derived side included. For an SVG the
+      // cap decision uses its real aspect ratio (a 1000×0.6 SVG reads as 1000×1).
+      let { width, height } = v.fit
         ? calculateResizedDimensions(
             procW,
             procH,
@@ -441,47 +518,73 @@ export async function generatePreviews(
             true,
             config.maxSize,
           )
-        : coverDimensions(
-            procW,
-            procH,
-            v.requestedWidth,
-            v.requestedHeight,
-            config.limits.resultDimension,
-          );
+        : svgAspect !== undefined
+          ? coverDimensions(
+              svgAspect,
+              1,
+              v.requestedWidth,
+              v.requestedHeight,
+              config.limits.resultDimension,
+            )
+          : coverDimensions(
+              procW,
+              procH,
+              v.requestedWidth,
+              v.requestedHeight,
+              config.limits.resultDimension,
+            );
+      // An SVG's width-only or height-only size under the cap: the other side from the SVG's
+      // real aspect ratio, and the raster resized to exactly that box (no crop).
+      const svgDerived =
+        svgAspect !== undefined &&
+        !v.fit &&
+        (width === undefined) !== (height === undefined);
+      if (svgDerived && svgAspect !== undefined) {
+        if (width !== undefined) {
+          height = Math.max(1, Math.round(width / svgAspect));
+        } else if (height !== undefined) {
+          width = Math.max(1, Math.round(height * svgAspect));
+        }
+      }
+
+      // A raster source that fits inside the requested WxH box is the whole image at its own
+      // size: no upscaling and no cropping (only the resultDimension cap may scale it down); the
+      // encode strips metadata. Only without variantSteps: a pipeline's steps keep the full box
+      // they were written for (a 200×50 watermark cannot be composited onto 150×150).
+      const ownSize =
+        !svgSizing &&
+        !v.fit &&
+        (pipeline.variantSteps ?? []).length === 0 &&
+        v.requestedWidth !== undefined &&
+        v.requestedHeight !== undefined &&
+        procW <= Math.round(v.requestedWidth) &&
+        procH <= Math.round(v.requestedHeight);
+      // Not sharpened when nothing was scaled.
+      const unscaled =
+        ownSize &&
+        (width === undefined || procW <= width) &&
+        (height === undefined || procH <= height);
 
       // Clone the shared decode; `.rotate()` on EVERY branch applies the EXIF orientation;
       // normalize the working colorspace BEFORE variantSteps so composited overlay colors are
-      // predictable.
+      // predictable. An SVG raster is filled into the exact box computed from the SVG itself
+      // (its rounded raster aspect ratio would shift an `inside` resize by a pixel).
       const animate = animatedBase !== undefined && isAnimatedFormat(v.format);
-      let source = (v.fit && fitBase ? fitBase : animate ? animatedBase : base)
+      let img = (animate ? animatedBase : base)
         .clone()
-        .rotate();
-      if (
-        !v.fit &&
-        svgRaster?.width !== undefined &&
-        svgRaster.height !== undefined &&
-        svgReloadExceedsLimit(svgRaster.width, svgRaster.height, width, height)
-      ) {
-        // An extract before the resize turns Sharp's SVG re-render off: the variant is cut from
-        // the raster decoded at `density`, which fits the limit.
-        source = source.extract({
-          left: 0,
-          top: 0,
-          width: svgRaster.width,
-          height: svgRaster.height,
-        });
-      }
-      let img = source
+        .rotate()
         .resize(
           width,
           height,
-          v.fit
-            ? { fit: exactFit ? 'fill' : 'inside', withoutEnlargement: true }
-            : { fit: 'cover', position: 'center' },
+          (v.fit && svgSizing) || svgDerived
+            ? { fit: 'fill' }
+            : v.fit || ownSize
+              ? { fit: 'inside', withoutEnlargement: true }
+              : { fit: 'cover', position: 'center' },
         )
         .toColorspace('srgb');
       const s = config.encode.sharpen;
-      const sharpenOn = s && (v.fit ? s.fit : s.cover);
+      const sharpenOn = s && !unscaled && (v.fit ? s.fit : s.cover);
       if (sharpenOn) {
         img = img.sharpen();
       }
@@ -536,6 +639,7 @@ export async function generatePreviews(
 
       const preview: Preview = {
         storageRef: ref,
+        identity,
         resizer: resizer.name,
         pipeline: pipelineName,
         sizeKey: v.sizeKey,
@@ -584,16 +688,74 @@ export async function generatePreviews(
         original.width === undefined || original.height === undefined
           ? { width: dispW, height: dispH }
           : undefined;
-      try {
-        await resizer.db.appendPreviews(mediaId, generated, backfillDims);
-      } catch (err) {
-        // The files are stored but no row points at them: name them so an operator can find
-        // (or delete) them.
-        logger.error(
-          `resize: recording ${generated.length} preview(s) failed for media ${mediaId}; uploaded but unrecorded storage refs: ${describeRefs(generated)}`,
-          err,
-        );
-        throw err;
+      // What the database holds now, read once after a failed or partial write: the identities
+      // stored on the media, null when the media is gone, undefined when the reload failed too.
+      const storedIdentities = async (): Promise<
+        Set<string> | null | undefined
+      > => {
+        try {
+          const reloaded = await resizer.db.loadMedia(mediaId);
+          return reloaded
+            ? new Set(
+                (reloaded.previews ?? [])
+                  .filter(isUsablePreview)
+                  .map(identityOf),
+              )
+            : null;
+        } catch {
+          return undefined;
+        }
+      };
+      const stored = await resizer.db
+        .appendPreviews(mediaId, generated, backfillDims)
+        .catch(async (err: unknown) => {
+          // The write may have stopped part-way (a driver can store one row at a time). Name
+          // only the uploads no row points at, so an operator can find (or delete) them; a file
+          // a stored row references is never offered.
+          const recorded = await storedIdentities();
+          const unrecorded = recorded
+            ? generated.filter((p) => !recorded.has(identityOf(p)))
+            : generated;
+          logger.error(
+            `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${generated.length} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
+            err,
+          );
+          throw err;
+        });
+      // The database keeps one row per identity and reports the rows it stored (nothing = all).
+      // The reload says why a row was left out: the media is gone, or another worker stored the
+      // same identity first (covered, not a failure).
+      if (Array.isArray(stored)) {
+        const kept = new Set(stored.map(identityOf));
+        const leftOut = generated.filter((p) => !kept.has(identityOf(p)));
+        if (leftOut.length > 0) {
+          generated = generated.filter((p) => kept.has(identityOf(p)));
+          const recorded = await storedIdentities();
+          if (recorded === null) {
+            logger.warn(
+              `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
+            );
+          } else {
+            // A failed reload trusts the database's answer: the rows are another worker's.
+            const duplicates = recorded
+              ? leftOut.filter((p) => recorded.has(identityOf(p)))
+              : leftOut;
+            const lost = recorded
+              ? leftOut.filter((p) => !recorded.has(identityOf(p)))
+              : [];
+            if (duplicates.length > 0) {
+              logger.warn(
+                `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
+              );
+              alreadyStored.push(...duplicates.map(identityOf));
+            }
+            if (lost.length > 0) {
+              logger.error(
+                `resize: the database left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
+              );
+            }
+          }
+        }
       }
       for (const preview of generated) {
         await resizer.runObservers('onPreviewGenerated', preview, {});
@@ -608,7 +770,7 @@ export async function generatePreviews(
     }
   }
 
-  return { generated, failedCount };
+  return { generated, failedCount, alreadyStored };
 }
 
 /** Best-effort lock release; a failing release is logged, never thrown. */
@@ -668,24 +830,28 @@ export async function processTaskWith(
     }
   }
   const requested = [...requestedByIdentity.values()];
-  const { generated, failedCount } = await generatePreviews(resizer, {
-    media,
-    mediaId: task.mediaId,
-    requested,
-    pipeline: task.pipeline,
-    ctx,
-    locks: {
-      workerTtlMs: tasks
-        ? timingOf(tasks).lockTtlMs.worker
-        : defaultQueueOptions.lockTtlMs.worker,
+  const { generated, failedCount, alreadyStored } = await generatePreviews(
+    resizer,
+    {
+      media,
+      mediaId: task.mediaId,
+      requested,
+      pipeline: task.pipeline,
+      ctx,
+      locks: {
+        workerTtlMs: tasks
+          ? timingOf(tasks).lockTtlMs.worker
+          : defaultQueueOptions.lockTtlMs.worker,
+      },
+      persist: true,
+      signal: taskOpts?.signal,
     },
-    persist: true,
-    signal: taskOpts?.signal,
-  });
+  );
 
   // 10. A queued task is complete only when every requested identity is now persisted. Re-read
   // once so a worker-lock loser can observe a concurrent worker's write. Our own generated rows
-  // are included too: appendPreviews returned successfully before generatePreviews returned.
+  // are included too: appendPreviews returned successfully before generatePreviews returned,
+  // and so are the identities the database reported as already stored by another worker.
   const refreshed = await resizer.db.loadMedia(task.mediaId);
   if (!refreshed) {
     logger.info(
@@ -693,7 +859,7 @@ export async function processTaskWith(
     );
     return;
   }
-  const covered = new Set<string>();
+  const covered = new Set<string>(alreadyStored);
   for (const preview of [
     ...(media.previews ?? []),
     ...(refreshed.previews ?? []),

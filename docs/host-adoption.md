@@ -29,21 +29,49 @@ the enclosing schema's options.
 
 ## Other changes a host must make for this version
 
-`CHANGELOG.md` (`# Unreleased`) has the details.
+`CHANGELOG.md` (`# 0.3.0`) has the details.
 
 - Construct the Resizer with `new FrameworkResizer({ pipelines, hooks })` in
   `src/resizer.ts`, and move `storage` and `queue` into `src/config/resize.ts`
   (`queue: { driver: 'database' }` for background generation). Move
   `worker.concurrency` to the top-level `concurrency`.
-- Create the `ResizeTask` indexes through the host's migration before rollout: the
-  lease index is now `{ queue, status, createdAt }` (it replaces
-  `{ status, createdAt }`), and the partial unique index on
-  `{ fileId, pipeline, requestKey }` is required for de-duplication.
+- Create the `ResizeTask` indexes through the host's migration: the claim index
+  `{ queue: 1, status: 1, availableAt: 1 }` before or together with the new
+  workers, then drop the old lease index (`{ status: 1, createdAt: 1 }`, or
+  `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). The partial
+  unique index on `{ fileId, pipeline, requestKey }` is required for
+  de-duplication. Backfilling `availableAt` is optional: rows without it still wait
+  for the retry time or lease end stored in `leaseExpiresAt`.
 - Regenerate the model shim, which now imports `…/framework/ResizeTaskModel.js`:
   delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force`
   would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or
-  hand-written model must add the `resizer`, `queue` and `requestKey` fields;
-  `resize-scaffold --check` and `resizer.verify()` report a model without them.
+  hand-written model must add the `resizer`, `queue`, `requestKey` and
+  `availableAt` fields and the claim index; `resize-scaffold --check` and
+  `resizer.verify()` report a model without the fields.
+- A hand-written media schema that declares preview rows as sub-documents must add
+  `identity: { type: String }` to them (the fragment already has it);
+  `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without it. Rows
+  written earlier have no identity and are not migrated. A custom model-shaped
+  `MongoMediaModel` needs `findById` and `findOneAndUpdate`. A `findOneAndUpdate`
+  middleware on the media model now runs once per preview write (and once for the
+  dimension backfill) and receives a document with only `_id`, or `null` when the
+  preview was already stored or the media is gone.
+- The original is never served. Code that read `isOriginal`, or relied on
+  `ctx.isOwner` / `ctx.isAdmin` to get the original from `resolve()`, must change:
+  to give an owner the private original, call
+  `storage.signedUrl(original.storageRef, ttlSeconds)`. For a pipeline without
+  `variantSteps`, a small raster original now gets a normal preview at its own
+  size, made by the worker.
+- SVG `beforeSteps` now receive the rendered PNG, not SVG markup. The render runs
+  in a child process: a host under Node's permission model needs
+  `--allow-child-process`, and a bundle must keep `svgRasterChild.js` next to
+  `svgRaster.js` (otherwise `RESIZE_SVG_RENDER_UNAVAILABLE`).
+- Resizers on the database queue (and Resizers with identical SQS settings) share
+  one task queue with one timing: config files that share a queue must set the same
+  timing keys (and effective SQS `waitTimeSeconds`), or `verify()` and worker start
+  fail with
+  `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`. Without the framework, call
+  `mongoDatabase()` once and pass its `tasks` to every Resizer.
 - A host whose Resizers read only named config files (no `resize.ts`) starts the
   worker with `npm run cli ResizeWorker -- --config=<name>`.
 - Previews stored before preview identity included the Resizer and the pipeline

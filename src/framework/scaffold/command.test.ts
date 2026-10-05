@@ -225,9 +225,15 @@ describe('runScaffold — --eject', () => {
     );
     assert.match(
       model,
-      /\{ queue: 1, status: 1, createdAt: 1 \}/,
-      'the ejected schema carries the queue-scoped lease index',
+      /availableAt:\s*\{\s*type:\s*Date,\s*default:\s*Date\.now\s*\}/,
+      'the ejected schema records when each task is due',
     );
+    assert.match(
+      model,
+      /\{ queue: 1, status: 1, availableAt: 1 \}/,
+      'the ejected schema carries the queue-scoped claim index',
+    );
+    assert.doesNotMatch(model, /\{ queue: 1, status: 1, createdAt: 1 \}/);
     // Still the full set of files.
     assert.equal(await exists(COMMAND), true);
     assert.equal(await exists(CONFIG), true);
@@ -333,7 +339,8 @@ describe('runScaffold — --check', () => {
     ['resizer'],
     ['queue'],
     ['requestKey'],
-    ['resizer', 'queue', 'requestKey'],
+    ['availableAt'],
+    ['resizer', 'queue', 'requestKey', 'availableAt'],
   ]) {
     test(`an ejected model missing ${fields.join(', ')} is drift even with its indexes intact`, async () => {
       await run(['--eject']);
@@ -348,7 +355,10 @@ describe('runScaffold — --check', () => {
       const { code, out } = await run(['--check']);
       assert.equal(code, 1);
       assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
-      assert.match(out, /port the resizer, queue and requestKey fields/);
+      assert.match(
+        out,
+        /port the resizer, queue, requestKey and availableAt fields/,
+      );
       assert.match(out, /delete the file and re-run resize-scaffold --eject/);
       assert.doesNotMatch(out, /--force/);
       assert.equal(

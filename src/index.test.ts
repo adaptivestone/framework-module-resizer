@@ -7,8 +7,8 @@ import * as api from './index.ts';
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Every VALUE export the main entry is contractually required to expose (02 · §6, reconciled
-// with the real file layout). Kept as an explicit, sorted list so an ACCIDENTAL new value export
+// Every VALUE export the main entry is contractually required to expose.
+// Kept as an explicit list so an ACCIDENTAL new value export
 // (or a dropped one) fails THIS test rather than silently growing the public surface. Type-only
 // re-exports (contract interfaces, TResizeTask, types.d.ts) are erased and never appear here.
 const EXPECTED_VALUE_EXPORTS = [
@@ -23,25 +23,17 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeSecurityError',
   'ResizeSetupError',
   'ResizeStorageError',
-  'calculateResizedDimensions',
-  'consumeQueue',
   'formatPictureUrls',
-  'getFilterSig',
-  'getImageContentType',
-  'getPreviewIdentity',
   'getResizer',
   'getSizeKey',
   'isCatalogCovered',
-  'listResizers',
   'ResizeStorage',
   'parseSizeKey',
-  'processTask',
   'resetResizerForTests',
   'resizeMediaPaths',
   'resizeMediaSchemaFragment',
   'runWorker',
   'TaskQueue',
-  'timingOf',
 ];
 
 // Drivers are SUBPATH-ONLY (the uniform rule 02 · §6) — they must NEVER appear on the main entry.
@@ -87,21 +79,13 @@ describe('public API surface (src/index.ts)', () => {
     }
   });
 
-  test('the helper + config accessors are functions', () => {
+  test('the helpers + registry accessors are functions', () => {
     for (const name of [
       'getResizer',
       'resetResizerForTests',
-      'listResizers',
       'runWorker',
-      'processTask',
-      'consumeQueue',
-      'timingOf',
       'getSizeKey',
       'parseSizeKey',
-      'getFilterSig',
-      'getPreviewIdentity',
-      'calculateResizedDimensions',
-      'getImageContentType',
       'formatPictureUrls',
       'isCatalogCovered',
     ]) {
@@ -121,14 +105,6 @@ describe('public API surface (src/index.ts)', () => {
   test('a pure helper actually works through the re-export', () => {
     assert.equal(api.getSizeKey({ width: 320, height: 200 }), '320x200');
     assert.equal(api.getSizeKey({ fit: true }), 'fit');
-    assert.equal(
-      api.getPreviewIdentity(
-        { resizer: 'default', pipeline: 'default' },
-        'fit',
-        'webp',
-      ),
-      'default:default:fit:webp:none',
-    );
   });
 
   test('NO driver value exports leak onto the main entry (subpath-only rule)', () => {

@@ -496,6 +496,14 @@ interface LockAttempt {
 }
 
 /**
+ * The dispatch lock of one preview identity of a media: while it is held, reads do not queue that
+ * variant. The worker holds it for a cooldown after the variant's task is dead-lettered.
+ */
+export function dispatchLockKey(mediaId: string, identity: string): string {
+  return `resize_dispatch:${mediaId}:${identity}`;
+}
+
+/**
  * Acquire one dispatch lock per identity, all at once: a read with many missing variants waits
  * for the slowest acquire, not for one database round trip after another. Never rejects; the
  * results keep the input order, and the caller decides how to report a held or failed lock.
@@ -508,7 +516,7 @@ async function acquireDispatchLocks(
 ): Promise<LockAttempt[]> {
   return Promise.all(
     [...byIdentity].map(async ([identity, preview]): Promise<LockAttempt> => {
-      const lockKey = `resize_dispatch:${mediaId}:${identity}`;
+      const lockKey = dispatchLockKey(mediaId, identity);
       try {
         const acquired = Boolean(await resizer.db.acquireLock(lockKey, ttlMs));
         return { preview, lockKey, acquired, failed: false };

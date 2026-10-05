@@ -1,23 +1,20 @@
 // The read-path engine (06 · §17). `resizer.resolve` delegates here: it partitions the
-// requested size×format grid into ready (served from an existing preview
-// or an "original already fits" raster original) vs missing (handed to enqueue), threading three
-// host waterfalls (resolveSizes / beforeEnqueue / formatPublicUrls) and never throwing into
-// the caller's read. All URLs come from the PURE, I/O-free storage.publicUrl; the only I/O
-// is the owner/admin-gated signedUrl (itself caught + fallen back). Imports the Resizer
-// TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
+// requested size×format grid into ready (served from a stored preview) vs missing (handed to
+// enqueue), threading three host waterfalls (resolveSizes / beforeEnqueue / formatPublicUrls)
+// and never throwing into the caller's read. The original itself is never served: an original
+// smaller than the box still gets a preview, made by the worker at the original's own size.
+// Every URL comes from the PURE, I/O-free storage.publicUrl of a stored preview. Imports the
+// Resizer TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
 import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
 import {
   ResizeConfigError,
   ResizeMediaError,
   ResizeSetupError,
 } from './errors.ts';
-import { isPositiveFinite } from './helpers/guards.ts';
 import {
   expandPreviewRequests,
-  getFilterSig,
   getPreviewIdentity,
   getSizeKey,
-  isSvgOriginal,
   isUsablePreview,
   previewScope,
   requireMediaId,
@@ -27,7 +24,6 @@ import type { Resizer } from './resizer.ts';
 import type {
   MediaLike,
   MissingPreview,
-  Original,
   Preview,
   PreviewFormat,
   PrewarmResult,
@@ -41,7 +37,7 @@ export interface ResolveOpts {
   sizes: SizeInput[];
   pipeline?: string; // selects a registered pipeline; default 'default'
   formats?: PreviewFormat[]; // default = config.formats
-  ctx?: Record<string, unknown>; // threaded to read-path hooks; ctx.isOwner/isAdmin gate signedUrl
+  ctx?: Record<string, unknown>; // threaded to the read-path hooks
   enqueueMissing?: boolean; // default true when a task queue is set, false otherwise
   queue?: string; // queue for missing variants; default resizer.queue
 }
@@ -54,11 +50,6 @@ export interface PrewarmOpts {
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
   queue?: string; // queue for missing variants; default resizer.queue
 }
-
-// Owner/admin private-original reads: short-lived by design (the only read-path I/O). A
-// small constant is fine — the URL is re-minted on every read, so it never needs to outlive
-// one response.
-const SIGNED_ORIGINAL_TTL_SECONDS = 300; // 5 minutes
 
 /**
  * §17 steps 1–11. See the module header for the shape. The ENTIRE body runs inside a
@@ -85,20 +76,13 @@ export async function resolveImpl(
     // rather than enqueueing under the literal 'undefined' key (04 · papercut).
     const mediaId = requireMediaId(media);
     // A pipeline this process does not know (e.g. registered only in another process) has
-    // unknown steps: serve what is already stored for it, but neither the original nor a task
-    // can be trusted to render it.
+    // unknown steps: serve what is already stored for it, but no task can be trusted to render it.
     const knownPipeline = resizer.hasPipeline(pipeline);
     if (!knownPipeline) {
       resizer.logger.error(
         `resize resolve: pipeline '${pipeline}' is not registered on Resizer '${resizer.name}' — serving stored previews only, nothing is queued`,
       );
     }
-    // The original stands in for a variant only when the pipeline would not change its pixels.
-    const steps = resizer.getPipeline(pipeline);
-    const originalMayStandIn =
-      knownPipeline &&
-      (steps.beforeSteps?.length ?? 0) === 0 &&
-      (steps.variantSteps?.length ?? 0) === 0;
 
     // 1. Host size magic (expand/inject/map/dedupe). Guarded per-tap inside runWaterfall.
     const sizes = (await resizer.runWaterfall(
@@ -127,35 +111,8 @@ export async function resolveImpl(
       }
     }
 
-    const original = media.original;
     const missing: MissingPreview[] = [];
     const missingSeen = new Set<string>();
-    const originalIsSvg = isSvgOriginal(original);
-    // Compute this lazily. A generated preview is independently public and must remain
-    // readable even when a legacy original now points to a retired/unavailable bucket.
-    // A driver that does not implement the check is deliberately conservative: a public URL
-    // from an arbitrary custom driver is not enough proof that an original is safe to expose.
-    let originalIsPublic: boolean | undefined;
-    const isOriginalPublic = (): boolean => {
-      if (originalIsPublic === undefined) {
-        try {
-          originalIsPublic =
-            original != null &&
-            original.storageRef != null &&
-            storage.canServeOriginalPublicly?.(original.storageRef) === true;
-        } catch (err) {
-          resizer.logger.error(
-            'resize resolve: canServeOriginalPublicly threw — treating original as private',
-            err,
-          );
-          originalIsPublic = false;
-        }
-      }
-      return originalIsPublic;
-    };
-    const authorizedOriginalRead = Boolean(
-      (ctx.isOwner || ctx.isAdmin) && storage.signedUrl,
-    );
 
     // 7. Per requested size × format.
     for (const size of sizes) {
@@ -205,44 +162,7 @@ export async function resolveImpl(
           continue; // stored previews only
         }
 
-        // "original already fits" fast-path — ALL of (a)–(d) must hold (§17 step 7).
-        // The pipeline must also have no steps that would change the original's pixels.
-        if (
-          originalMayStandIn &&
-          original &&
-          !originalIsSvg &&
-          (isOriginalPublic() || authorizedOriginalRead) &&
-          getFilterSig(size.filters) === 'none' && // (a) no filters
-          !size.fit &&
-          isPositiveFinite(size.width) && // (b) plain cover WxH
-          isPositiveFinite(size.height) &&
-          isPositiveFinite(original.width) && // (c) original dims known
-          isPositiveFinite(original.height) &&
-          original.width <= size.width && // (d) not larger than the box
-          original.height <= size.height
-        ) {
-          const url = await originalUrl(
-            resizer,
-            original,
-            ctx,
-            isOriginalPublic(),
-          );
-          if (url !== undefined) {
-            const fits: ReadyEntry = {
-              sizeKey,
-              format,
-              url,
-              isOriginal: true,
-            };
-            if (original.contentType) {
-              fits.contentType = original.contentType;
-            }
-            ready.push(fits);
-            continue;
-          }
-        }
-
-        // missing → deduped by identity.
+        // missing → deduped by identity, whatever the original's size or the reader's ctx.
         if (missingSeen.has(identity)) {
           continue;
         }
@@ -325,8 +245,7 @@ export async function resolveImpl(
  * Pre-warm the catalog at UPLOAD: queue every missing variant without blocking on image work, and
  * report each requested variant (ready / accepted / not required / unconfirmed, with task receipts
  * and issues). A held dispatch lock never counts as queued: the queue's findActive() must
- * confirm it. Uses the read path's `resolveSizes` / `beforeEnqueue` waterfalls; the "original
- * already fits" fast-path is not consulted (that is a read-time serving decision). NEVER throws:
+ * confirm it. Uses the read path's `resolveSizes` / `beforeEnqueue` waterfalls. NEVER throws:
  * an upload must not fail because pre-warming hiccuped, so an unexpected error becomes
  * `status: 'incomplete'` with a RESIZE_ENQUEUE_INTERNAL_ERROR issue.
  */
@@ -620,48 +539,6 @@ function withUnconfiguredFormats(
       },
     ],
   };
-}
-
-/**
- * The public URL for an original-backed ready entry. Owner/admin reads get a signed URL
- * when the driver supports it — the ONLY read-path I/O. A private original has no public URL
- * fallback: if signing fails, return undefined so raster callers leave the variant missing.
- */
-async function originalUrl(
-  resizer: Resizer,
-  original: Original,
-  ctx: Record<string, unknown>,
-  originalIsPublic: boolean,
-): Promise<string | undefined> {
-  const storage = resizer.storage;
-  if ((ctx.isOwner || ctx.isAdmin) && storage.signedUrl) {
-    try {
-      return await storage.signedUrl(
-        original.storageRef,
-        SIGNED_ORIGINAL_TTL_SECONDS,
-      );
-    } catch (err) {
-      resizer.logger.error(
-        'resize resolve: signedUrl failed — private original stays unavailable',
-        err,
-      );
-      if (!originalIsPublic) {
-        return undefined;
-      }
-    }
-  }
-  if (!originalIsPublic) {
-    return undefined;
-  }
-  try {
-    return storage.publicUrl(original.storageRef);
-  } catch (err) {
-    resizer.logger.error(
-      'resize resolve: publicUrl failed for the original — the variant stays missing',
-      err,
-    );
-    return undefined;
-  }
 }
 
 /**

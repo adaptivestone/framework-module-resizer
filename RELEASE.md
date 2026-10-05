@@ -38,11 +38,10 @@ Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
 Bump with `npm version <patch|minor|major>` (updates `package.json` + creates the git tag — see
 §4), or edit `version` by hand and tag manually.
 
-> **Check `version` first.** `package.json` may already hold the next version (it was bumped
-> ahead of the release, while `CHANGELOG.md` still says `# Unreleased`). Compare it with
-> `npm view @adaptivestone/framework-module-resize version`: if it is already ahead, do not run
-> `npm version` on top of it (that would skip a version); rename the `# Unreleased` heading,
-> commit and tag by hand.
+> **Check `version` first.** For 0.3.0 no bump is needed: `package.json` already holds `0.3.0`
+> and `CHANGELOG.md` has the `# 0.3.0` heading, so tag the release commit by hand. In general,
+> compare `version` with `npm view @adaptivestone/framework-module-resize version`; if it is
+> already ahead, do not run `npm version` on top of it (that would skip a version).
 
 **Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
 heading, with `**Breaking changes**` / `**Features**` / `**Fixes**` / `**Internal**` groups —

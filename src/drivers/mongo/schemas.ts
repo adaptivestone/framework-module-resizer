@@ -37,9 +37,12 @@ export function resizeTaskFields(mediaModelName: string) {
       default: 'pending',
     },
     attempts: { type: Number, default: 0 },
+    // When the task may next be claimed: now for a new or released task, the retry time after a
+    // failure, the end of the lease while a worker holds it. Claims take the earliest due task.
+    availableAt: { type: Date, default: Date.now },
     leasedBy: { type: String },
     leaseToken: { type: String }, // fencing token of the current lease
-    leaseExpiresAt: { type: Date },
+    leaseExpiresAt: { type: Date }, // the current lease ends; null while the task waits
     completedAt: { type: Date },
     deadAt: { type: Date },
     error: { type: String },
@@ -66,9 +69,11 @@ export const resizeTaskIndexes: readonly IndexSpec[] = [
       partialFilterExpression: { status: 'dead' },
     },
   ],
-  // Lease hot path: a worker consumes one queue, oldest task first.
-  [{ queue: 1, status: 1, createdAt: 1 }],
-  // Reclaiming expired leases. The partial filter, not sparseness, scopes it.
+  // Claim hot path: a worker consumes one queue, the earliest due task first. Tasks in backoff and
+  // live leases lie outside the claim's bounds, so a claim reads about one document.
+  [{ queue: 1, status: 1, availableAt: 1 }],
+  // Processing tasks by lease end, to find stuck leases (the claim does not need it). The partial
+  // filter, not sparseness, scopes it.
   [
     { leaseExpiresAt: 1 },
     { partialFilterExpression: { status: 'processing' } },

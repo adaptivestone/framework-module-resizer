@@ -32,11 +32,14 @@ export const resizeMediaSchemaFragment = {
     width: { type: Number },
     height: { type: Number },
   },
-  // A generated variant (the full Preview): the worker `$push`es one of these per
-  // (sizeKey, format, filters) identity.
+  // A generated variant (the full Preview): the database stores one of these per preview
+  // identity.
   previews: [
     {
       storageRef: { type: 'Mixed' },
+      // The full preview identity (resizer:pipeline:sizeKey:format:filters). The database
+      // stores one row per identity, so it needs this path: strict mode would strip it.
+      identity: { type: String },
       // Resizer and pipeline that generated this preview; absent means 'default'.
       resizer: { type: String },
       pipeline: { type: String },

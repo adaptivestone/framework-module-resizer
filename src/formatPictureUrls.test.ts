@@ -1,7 +1,24 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { formatPictureUrls } from './formatPictureUrls.ts';
-import type { ReadDecision } from './types.d.ts';
+import type { ReadDecision, ReadyEntry } from './types.d.ts';
+
+// A ready entry as resolve() builds it: always backed by a stored preview.
+function entry(
+  over: Partial<ReadyEntry> & Pick<ReadyEntry, 'sizeKey' | 'format' | 'url'>,
+): ReadyEntry {
+  const contentType = over.contentType ?? `image/${over.format}`;
+  return {
+    contentType,
+    preview: {
+      storageRef: { key: over.url },
+      sizeKey: over.sizeKey,
+      format: over.format,
+      contentType,
+    },
+    ...over,
+  };
+}
 
 describe('formatPictureUrls', () => {
   test('treats inherited size keys as data without modifying shared prototypes', () => {
@@ -17,11 +34,13 @@ describe('formatPictureUrls', () => {
     );
     try {
       const out = formatPictureUrls({
-        ready: sizeKeys.map((sizeKey) => ({
-          sizeKey,
-          format: 'webp',
-          url: `https://cdn/${sizeKey}.webp`,
-        })),
+        ready: sizeKeys.map((sizeKey) =>
+          entry({
+            sizeKey,
+            format: 'webp',
+            url: `https://cdn/${sizeKey}.webp`,
+          }),
+        ),
         missing: [],
       });
       assert.deepEqual(
@@ -34,7 +53,10 @@ describe('formatPictureUrls', () => {
       for (const sizeKey of sizeKeys) {
         assert.ok(Object.hasOwn(out.sizes, sizeKey));
         assert.deepEqual(out.sizes[sizeKey], {
-          webp: { url: `https://cdn/${sizeKey}.webp` },
+          webp: {
+            url: `https://cdn/${sizeKey}.webp`,
+            contentType: 'image/webp',
+          },
         });
       }
       assert.deepEqual(JSON.parse(JSON.stringify(out)), out);
@@ -53,18 +75,24 @@ describe('formatPictureUrls', () => {
   test('treats special format keys from untyped callers as own data properties', () => {
     const formatKeys = ['__proto__', 'constructor', 'toString'];
     const out = formatPictureUrls({
-      ready: formatKeys.map((format) => ({
-        sizeKey: '320w',
-        format: format as ReadDecision['ready'][number]['format'],
-        url: `https://cdn/${format}`,
-      })),
+      ready: formatKeys.map((format) =>
+        entry({
+          sizeKey: '320w',
+          format: format as ReadyEntry['format'],
+          url: `https://cdn/${format}`,
+          contentType: 'image/webp',
+        }),
+      ),
       missing: [],
     });
     const byFormat = out.sizes['320w'];
     assert.equal(Object.getPrototypeOf(byFormat), Object.prototype);
     for (const format of formatKeys) {
       assert.ok(Object.hasOwn(byFormat, format));
-      assert.deepEqual(byFormat[format], { url: `https://cdn/${format}` });
+      assert.deepEqual(byFormat[format], {
+        url: `https://cdn/${format}`,
+        contentType: 'image/webp',
+      });
     }
     assert.deepEqual(JSON.parse(JSON.stringify(out)), out);
   });
@@ -72,39 +100,13 @@ describe('formatPictureUrls', () => {
   test('groups ready entries by sizeKey then format', () => {
     const decision: ReadDecision = {
       ready: [
-        {
-          sizeKey: '320x320',
-          format: 'jpeg',
-          url: 'https://cdn/a.jpg',
-          preview: {
-            key: 'a.jpg',
-            sizeKey: '320x320',
-            format: 'jpeg',
-            contentType: 'image/jpeg',
-          },
-        },
-        {
+        entry({ sizeKey: '320x320', format: 'jpeg', url: 'https://cdn/a.jpg' }),
+        entry({
           sizeKey: '320x320',
           format: 'webp',
           url: 'https://cdn/a.webp',
-          preview: {
-            key: 'a.webp',
-            sizeKey: '320x320',
-            format: 'webp',
-            contentType: 'image/webp',
-          },
-        },
-        {
-          sizeKey: 'fit',
-          format: 'jpeg',
-          url: 'https://cdn/b.jpg',
-          preview: {
-            key: 'b.jpg',
-            sizeKey: 'fit',
-            format: 'jpeg',
-            contentType: 'image/jpeg',
-          },
-        },
+        }),
+        entry({ sizeKey: 'fit', format: 'jpeg', url: 'https://cdn/b.jpg' }),
       ],
       missing: [{ sizeKey: '620w', format: 'jpeg' }],
     };
@@ -124,61 +126,39 @@ describe('formatPictureUrls', () => {
     assert.equal('620w' in out.sizes, false);
   });
 
-  test('original-backed entries use contentType when known, never invent image/<format>', () => {
-    const decision: ReadDecision = {
+  test("each cell carries its entry's contentType", () => {
+    const out = formatPictureUrls({
       ready: [
-        {
+        entry({
           sizeKey: '300x300',
-          format: 'webp',
-          url: 'https://cdn/orig.svg',
-          isOriginal: true,
-          contentType: 'image/svg+xml',
-        },
+          format: 'jpeg',
+          url: 'https://cdn/a.jpg',
+          contentType: 'image/jpeg',
+        }),
       ],
       missing: [],
-    };
-    const out = formatPictureUrls(decision);
-    assert.equal(out.id, undefined);
-    assert.deepEqual(out.sizes['300x300'].webp, {
-      url: 'https://cdn/orig.svg',
-      contentType: 'image/svg+xml',
     });
-  });
-
-  test('omits contentType when unknown rather than guessing', () => {
-    const decision: ReadDecision = {
-      ready: [
-        {
-          sizeKey: '300x300',
-          format: 'webp',
-          url: 'https://cdn/orig.jpg',
-          isOriginal: true,
-        },
-      ],
-      missing: [],
-    };
-    const out = formatPictureUrls(decision);
-    assert.deepEqual(out.sizes['300x300'].webp, {
-      url: 'https://cdn/orig.jpg',
+    assert.equal(out.id, undefined);
+    assert.deepEqual(out.sizes['300x300'].jpeg, {
+      url: 'https://cdn/a.jpg',
+      contentType: 'image/jpeg',
     });
   });
 
   test('skips filtered variants so they cannot collide on sizeKey+format', () => {
     const decision: ReadDecision = {
       ready: [
-        {
+        entry({
           sizeKey: '300x300',
           format: 'jpeg',
           url: 'https://cdn/plain.jpg',
-          contentType: 'image/jpeg',
-        },
-        {
+        }),
+        entry({
           sizeKey: '300x300',
           format: 'jpeg',
           filters: { blur: 40 },
           url: 'https://cdn/blur.jpg',
-          contentType: 'image/jpeg',
-        },
+        }),
       ],
       missing: [],
     };

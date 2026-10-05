@@ -226,6 +226,7 @@ describe('consumeQueue', () => {
   for (const code of [
     'RESIZE_SOURCE_TOO_LARGE',
     'RESIZE_SOURCE_METADATA_MISSING',
+    'RESIZE_SVG_RENDER_TIMEOUT', // rendering cannot get faster on a retry
   ]) {
     test(`an unusable source (${code}) is dead on the first failure`, async () => {
       const tasks = new MemoryTaskQueue({ timing: fastTiming });
@@ -521,6 +522,7 @@ describe('consumeQueue shutdown', () => {
     'RESIZE_NO_ORIGINAL',
     'RESIZE_SOURCE_METADATA_MISSING',
     'RESIZE_SOURCE_TOO_LARGE',
+    'RESIZE_SVG_RENDER_TIMEOUT',
   ]) {
     test(`a terminal error (${code}) during shutdown is still dead-lettered, not given back`, async () => {
       const tasks = new ReleasingTaskQueue({ timing: fastTiming });
@@ -693,6 +695,43 @@ describe('timingOf / backoffMs', () => {
     timingOf(tasks);
     assert.equal(reads, 1);
   });
+
+  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes, also beside set lock TTLs', () => {
+    assert.equal(timingOf(new MemoryTaskQueue()).lockTtlMs.failed, 600_000);
+    const own = timingOf(
+      new MemoryTaskQueue({
+        timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
+      }),
+    );
+    assert.deepEqual(own.lockTtlMs, {
+      dispatch: 1000,
+      worker: 1000,
+      failed: 600_000,
+    });
+    const set = timingOf(
+      new MemoryTaskQueue({
+        timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 5000 } },
+      }),
+    );
+    assert.equal(set.lockTtlMs.failed, 5000);
+  });
+
+  for (const failed of [0, -1, 1.5, '600000', null]) {
+    test(`lockTtlMs.failed ${JSON.stringify(failed)} is a config error`, () => {
+      const tasks = new MemoryTaskQueue({
+        timing: {
+          lockTtlMs: { dispatch: 1000, worker: 1000, failed } as never,
+        },
+      });
+      assert.throws(
+        () => timingOf(tasks),
+        (err: unknown) =>
+          err instanceof ResizeConfigError &&
+          err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
+          /lockTtlMs\.failed/.test(err.message),
+      );
+    });
+  }
 
   test('invalid timing is a config error (worker lock must fit the lease)', () => {
     const tasks = new MemoryTaskQueue({

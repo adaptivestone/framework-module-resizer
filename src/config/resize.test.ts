@@ -262,6 +262,38 @@ describe('config split: core validation vs framework loading', () => {
     assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
   });
 
+  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes and is validated', () => {
+    assert.equal(defaultQueueOptions.lockTtlMs.failed, 600_000);
+    install(
+      makeResizeConfig({
+        queue: {
+          driver: 'database',
+          lockTtlMs: { dispatch: 30_000, worker: 30_000 },
+        },
+      }),
+    );
+    assert.deepEqual(getResizeConfig().timing.lockTtlMs, {
+      dispatch: 30_000,
+      worker: 30_000,
+      failed: 600_000,
+    });
+    resetAppInstance();
+    install(
+      makeResizeConfig({
+        queue: {
+          driver: 'database',
+          lockTtlMs: { dispatch: 30_000, worker: 30_000, failed: -5 },
+        },
+      }),
+    );
+    assert.throws(
+      () => getResizeConfig(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
+    );
+  });
+
   test('queue: false is eager only, and invalid queue timing is a config error', () => {
     install(makeResizeConfig({ queue: false }));
     assert.equal(getResizeConfig().queue, false);

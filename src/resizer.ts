@@ -551,7 +551,19 @@ export function listResizers(): Resizer[] {
   return [...resizers.values()];
 }
 
+// Per-process state an adapter keeps beside the registry (the framework adapter's shared task
+// queues), cleared with it.
+const resetHooks = new Set<() => void>();
+
+/** Run `reset` on every resetResizerForTests() (for an adapter's per-process state). */
+export function onResetResizerForTests(reset: () => void): void {
+  resetHooks.add(reset);
+}
+
 /** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */
 export function resetResizerForTests(): void {
   resizers.clear();
+  for (const reset of resetHooks) {
+    reset();
+  }
 }

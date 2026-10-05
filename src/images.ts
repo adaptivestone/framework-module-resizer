@@ -6,7 +6,6 @@ import type {
   Filters,
   MediaLike,
   MissingPreview,
-  Original,
   Preview,
   PreviewFormat,
   PreviewScope,
@@ -303,12 +302,6 @@ export function isCatalogCovered(
   return expandMissingPreviews(media, sizes, formats, scope).length === 0;
 }
 
-export function isSvgOriginal(original: Original | undefined): boolean {
-  return (
-    original?.format === 'svg' || original?.contentType === 'image/svg+xml'
-  );
-}
-
 export function isUsablePreview(preview: Preview): boolean {
   return Boolean(
     preview.storageRef != null &&
@@ -316,16 +309,6 @@ export function isUsablePreview(preview: Preview): boolean {
       preview.contentType !== 'image/svg+xml' &&
       preview.format !== 'svg',
   );
-}
-
-/**
- * Content type for a raster PREVIEW format only. Never pass an original's format —
- * originals carry their own `original.contentType` (e.g. 'image/svg+xml').
- */
-export function getImageContentType(
-  format?: PreviewFormat,
-): `image/${PreviewFormat}` | undefined {
-  return format ? `image/${format}` : undefined;
 }
 
 export interface ResizedDimensions {

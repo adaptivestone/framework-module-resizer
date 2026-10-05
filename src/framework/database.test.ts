@@ -4,7 +4,8 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import { ResizeConfigError } from '../errors.ts';
+import mongoose from 'mongoose';
+import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { Preview } from '../types.d.ts';
 import { FrameworkDatabase } from './database.ts';
@@ -125,50 +126,112 @@ describe('FrameworkDatabase.loadMedia', () => {
 });
 
 describe('FrameworkDatabase.appendPreviews', () => {
-  test('issues exactly ONE findByIdAndUpdate with $push {$each} and no $set without dims', async () => {
-    const calls: Array<[string, Record<string, unknown>]> = [];
-    const model = {
-      findByIdAndUpdate(id: string, update: Record<string, unknown>) {
-        calls.push([id, update]);
-        return Promise.resolve({});
+  // A media model that records each findOneAndUpdate; `matched` decides whether a document is
+  // returned (null: nothing matched).
+  function recordingModel(
+    matched: (filter: Record<string, unknown>) => boolean,
+  ) {
+    const calls: Array<[Record<string, unknown>, Record<string, unknown>]> = [];
+    const options: unknown[] = [];
+    return {
+      calls,
+      options,
+      model: {
+        findOneAndUpdate(
+          filter: Record<string, unknown>,
+          update: Record<string, unknown>,
+          opts: unknown,
+        ) {
+          calls.push([filter, update]);
+          options.push(opts);
+          return Promise.resolve(matched(filter) ? { _id: 'm1' } : null);
+        },
       },
     };
+  }
+
+  test('pushes each preview unless its identity is already stored, and resolves with the stored ones', async () => {
+    const { calls, options, model } = recordingModel(
+      (filter) =>
+        (filter['previews.identity'] as { $ne?: string } | undefined)?.$ne !==
+        'taken',
+    );
     installApp(model);
-    const previews = [
-      { sizeKey: '100x100', format: 'webp' },
-    ] as unknown as Preview[];
+    const fresh = { identity: 'fresh', sizeKey: '100x100' } as Preview;
+    const taken = { identity: 'taken', sizeKey: '200x200' } as Preview;
+    const legacy = { sizeKey: '300x300' } as Preview;
 
-    await db.appendPreviews('m1', previews);
-
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0][0], 'm1');
-    assert.deepEqual(calls[0][1], {
-      $push: { previews: { $each: previews } },
-    });
-    assert.equal('$set' in calls[0][1], false);
+    assert.deepEqual(await db.appendPreviews('m1', [fresh, taken, legacy]), [
+      fresh,
+      legacy,
+    ]);
+    assert.deepEqual(calls, [
+      [
+        { _id: 'm1', 'previews.identity': { $ne: 'fresh' } },
+        { $push: { previews: fresh } },
+      ],
+      [
+        { _id: 'm1', 'previews.identity': { $ne: 'taken' } },
+        { $push: { previews: taken } },
+      ],
+      // No identity: stored unconditionally.
+      [{ _id: 'm1' }, { $push: { previews: legacy } }],
+    ]);
+    // Only the id comes back, not the whole media document per preview.
+    for (const opts of options) {
+      assert.deepEqual(opts, { projection: { _id: 1 } });
+    }
   });
 
-  test('adds $set with dotted original.width/height ONLY when backfillDims is passed', async () => {
-    const calls: Array<Record<string, unknown>> = [];
-    const model = {
-      findByIdAndUpdate(_id: string, update: Record<string, unknown>) {
-        calls.push(update);
-        return Promise.resolve({});
-      },
-    };
+  test('sets the dotted original.width/height ONLY when backfillDims is passed, even with nothing to push', async () => {
+    const { calls, options, model } = recordingModel(() => true);
     installApp(model);
 
-    await db.appendPreviews('m1', [] as Preview[], {
-      width: 800,
-      height: 600,
-    });
+    assert.deepEqual(await db.appendPreviews('m1', []), []);
+    assert.equal(calls.length, 0);
 
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].$push, { previews: { $each: [] } });
-    assert.deepEqual(calls[0].$set, {
-      'original.width': 800,
-      'original.height': 600,
-    });
+    assert.deepEqual(
+      await db.appendPreviews('m1', [] as Preview[], {
+        width: 800,
+        height: 600,
+      }),
+      [],
+    );
+    assert.deepEqual(calls, [
+      [
+        { _id: 'm1' },
+        { $set: { 'original.width': 800, 'original.height': 600 } },
+      ],
+    ]);
+    assert.deepEqual(options, [{ projection: { _id: 1 } }]);
+  });
+});
+
+describe('FrameworkDatabase.verify: the media schema', () => {
+  // A model-shaped object with a real schema whose preview rows are declared as given.
+  const withRows = (modelName: string, row: Record<string, unknown>) => ({
+    modelName,
+    schema: new mongoose.Schema({ previews: [row] }),
+  });
+
+  test('a media model without previews.identity is a setup error naming the fragment', () => {
+    installApp(withRows('File', { storageRef: { type: 'Mixed' } }));
+    assert.throws(
+      () => db.verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes("'File'") &&
+        err.message.includes('resizeMediaSchemaFragment'),
+    );
+  });
+
+  test('a media model with previews.identity, or without a schema, passes', () => {
+    installApp(withRows('File', { identity: { type: String } }));
+    assert.doesNotThrow(() => db.verify());
+    resetAppInstance();
+    installApp({ findById: async () => null });
+    assert.doesNotThrow(() => db.verify());
   });
 });
 

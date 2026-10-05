@@ -8,7 +8,6 @@ import {
   DEFAULT_SCOPE,
   expandMissingPreviews,
   getFilterSig,
-  getImageContentType,
   getPreviewIdentity,
   getSizeKey,
   isCatalogCovered,
@@ -354,18 +353,6 @@ describe('expandMissingPreviews with a scope', () => {
       }),
       false,
     );
-  });
-});
-
-describe('getImageContentType', () => {
-  test('maps each raster preview format', () => {
-    assert.equal(getImageContentType('jpeg'), 'image/jpeg');
-    assert.equal(getImageContentType('webp'), 'image/webp');
-    assert.equal(getImageContentType('avif'), 'image/avif');
-  });
-
-  test('undefined format → undefined', () => {
-    assert.equal(getImageContentType(undefined), undefined);
   });
 });
 

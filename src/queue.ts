@@ -10,7 +10,7 @@ import type {
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-import { ResizeError } from './errors.ts';
+import { ResizeConfigError, ResizeError } from './errors.ts';
 import { sleep } from './helpers/sleep.ts';
 import { validateQueueTiming } from './resizeConfig.ts';
 import type { QueueTimingOptions, ResizeLogger } from './types.d.ts';
@@ -24,15 +24,37 @@ const TIMING_KEYS = [
   'taskTimeoutMs',
 ] as const;
 
-const timings = new WeakMap<object, QueueTimingOptions>();
+/** Complete queue timing: every key set, the optional lock TTLs included. */
+export type QueueTiming = QueueTimingOptions & {
+  lockTtlMs: Required<QueueTimingOptions['lockTtlMs']>;
+};
+
+const timings = new WeakMap<object, QueueTiming>();
+
+/**
+ * Check the optional dead-letter cooldown `lockTtlMs.failed` (ms) when it is set. Throws
+ * ResizeConfigError.
+ */
+export function validateFailedLockTtl(failed: unknown): void {
+  if (
+    failed !== undefined &&
+    !(typeof failed === 'number' && Number.isSafeInteger(failed) && failed > 0)
+  ) {
+    throw new ResizeConfigError(
+      'resize queue options: lockTtlMs.failed must be a positive safe integer (ms)',
+      { code: 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' },
+    );
+  }
+}
 
 /**
  * Complete queue timing: the timing keys set in `own` over the defaults (other keys are ignored),
- * validated. Throws ResizeConfigError for invalid timing.
+ * validated. A `lockTtlMs` without `failed` gets the default cooldown. Throws ResizeConfigError for
+ * invalid timing.
  */
 export function fillTiming(
   own: Partial<QueueTimingOptions> | Record<string, unknown>,
-): QueueTimingOptions {
+): QueueTiming {
   const timing: Record<string, unknown> = { ...defaultQueueOptions };
   for (const key of TIMING_KEYS) {
     const value = (own as Record<string, unknown>)[key];
@@ -40,15 +62,24 @@ export function fillTiming(
       timing[key] = value;
     }
   }
+  const lockTtlMs = timing.lockTtlMs;
+  if (typeof lockTtlMs === 'object' && lockTtlMs !== null) {
+    const failed = (lockTtlMs as { failed?: unknown }).failed;
+    validateFailedLockTtl(failed);
+    timing.lockTtlMs = {
+      ...lockTtlMs,
+      failed: failed ?? defaultQueueOptions.lockTtlMs.failed,
+    };
+  }
   validateQueueTiming(timing);
-  return timing as unknown as QueueTimingOptions;
+  return timing as unknown as QueueTiming;
 }
 
 /**
  * A queue's timing: its getTiming() over the defaults, validated once per queue instance (a lazy
  * getTiming is read on first use). Throws ResizeConfigError for invalid timing.
  */
-export function timingOf(tasks: TaskQueue): QueueTimingOptions {
+export function timingOf(tasks: TaskQueue): QueueTiming {
   const cached = timings.get(tasks);
   if (cached) {
     return cached;
@@ -79,13 +110,15 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
   };
 }
 
-// Errors no retry can fix: the media row has no original, or its source has no dimensions or is
-// over the pixel limits. Each retry would only download and decode the original again. Errors
-// cross module boundaries as plain objects, so match the stable code, not the class.
+// Errors no retry can fix: the media row has no original, its source has no dimensions or is over
+// the pixel limits, or its SVG takes longer to render than allowed. Each retry would only download
+// and decode the original again. Errors cross module boundaries as plain objects, so match the
+// stable code, not the class.
 const TERMINAL_ERROR_CODES: ReadonlySet<unknown> = new Set([
   'RESIZE_NO_ORIGINAL',
   'RESIZE_SOURCE_METADATA_MISSING',
   'RESIZE_SOURCE_TOO_LARGE',
+  'RESIZE_SVG_RENDER_TIMEOUT',
 ]);
 
 const isTerminal = (error: unknown): boolean =>

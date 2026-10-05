@@ -209,18 +209,13 @@ export class S3Storage extends ResizeStorage {
     return Buffer.from(bytes);
   }
 
-  canServeOriginalPublicly(ref: StorageRef): boolean {
-    const { bucket } = this.#ref(ref);
-    return bucket === this.#opts.bucketPublic;
-  }
-
   // PURE string building — no SDK, no I/O (called on the read path). Three forms:
   // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
   // virtual-hosted.
   publicUrl(ref: StorageRef): string {
     const { bucket, key } = this.#ref(ref);
     // A ref explicitly pointing at the configured private bucket must never be turned into a
-    // public CDN URL. The engine normally prevents this call; keep the driver safe when a host
+    // public CDN URL. The engine only asks for stored previews; keep the driver safe when a host
     // calls publicUrl directly too. If both buckets are the same, that bucket is intentionally
     // public and the check below does not reject it.
     if (

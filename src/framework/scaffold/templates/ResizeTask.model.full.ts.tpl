@@ -57,9 +57,12 @@ export default class ResizeTask extends BaseModel {
       },
       // Capped by the queue's maxAttempts (config `queue.maxAttempts`), then dead-lettered.
       attempts: { type: Number, default: 0 },
+      // When the task may next be claimed: now for a new or released task, the retry time after
+      // a failure, the end of the lease while a worker holds it. Claims take the earliest.
+      availableAt: { type: Date, default: Date.now },
       leasedBy: { type: String },
       leaseToken: { type: String }, // fencing token
-      leaseExpiresAt: { type: Date },
+      leaseExpiresAt: { type: Date }, // the current lease ends; null while the task waits
       completedAt: { type: Date },
       deadAt: { type: Date },
       error: { type: String },
@@ -84,9 +87,10 @@ export default class ResizeTask extends BaseModel {
         partialFilterExpression: { status: 'dead' },
       },
     );
-    // Lease hot path: a worker consumes one queue, oldest task first.
-    schema.index({ queue: 1, status: 1, createdAt: 1 });
-    // Sweep/reclaim stuck leases. NOT sparse: the partial filter on status:'processing' scopes it.
+    // Claim hot path: a worker consumes one queue, the earliest due task first.
+    schema.index({ queue: 1, status: 1, availableAt: 1 });
+    // Processing tasks by lease end, to find stuck leases. NOT sparse: the partial filter on
+    // status:'processing' scopes it.
     schema.index(
       { leaseExpiresAt: 1 },
       { partialFilterExpression: { status: 'processing' } },

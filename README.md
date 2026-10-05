@@ -19,7 +19,9 @@ driver, and turns the record on your media document into image URLs.
 | **Lazy**: previews only for sizes readers request | `resolve()` with a task queue | + a task queue and a worker |
 
 All three write the same `previews[]` and read URLs with `resolve()`, so you can mix them or
-switch later without migrating data. `sharp` never runs on the read path.
+switch later without migrating data. `sharp` never runs on the read path, and the original is
+never served: for a pipeline without `variantSteps`, a raster original no larger than a `WxH`
+size gets a preview at its own size (no upscaling, no cropping, metadata removed).
 
 ## Install
 
@@ -130,7 +132,8 @@ import defaultResizeConfig from '@adaptivestone/framework-module-resize/config/r
 import { LocalFsStorage } from '@adaptivestone/framework-module-resize/drivers/fs.js';
 import { mongoDatabase } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
 
-// Media, locks and the task queue, with the package's ResizeTask / ResizeLock models
+// Media, locks and the task queue, with the package's ResizeTask / ResizeLock models. Call it
+// once: each call makes its own task queue, so pass this db.tasks to every Resizer.
 const db = mongoDatabase(mongoose.connection, { mediaModel: File }); // File spreads resizeMediaSchemaFragment
 
 export const resizer = new Resizer({
@@ -152,13 +155,13 @@ module never creates them at runtime (`createResizeModels` sets `autoIndex: fals
 
 | Import | Contents |
 |---|---|
-| `@adaptivestone/framework-module-resize` | `Resizer`, `getResizer`, `listResizers`, `runWorker`, `consumeQueue`, the contracts (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`), helpers (`formatPictureUrls`, `isCatalogCovered`, `resizeMediaPaths`, `resizeMediaSchemaFragment`), errors, types |
+| `@adaptivestone/framework-module-resize` | `Resizer`, `getResizer`, `resetResizerForTests`, `runWorker`, the contracts (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`), helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `resizeMediaPaths`, `resizeMediaSchemaFragment`), errors, types |
 | `…/config/resize.js` | Default config |
 | `…/drivers/fs.js` | `LocalFsStorage` |
 | `…/drivers/s3.js` | `S3Storage` |
 | `…/drivers/mongo.js` | `mongoDatabase`, `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`, the schemas |
 | `…/drivers/sqs.js` | `SqsTaskQueue` |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `appLogger`, `appEvents`, `getApp`, `getResizeConfig`, `FrameworkResizeConfig` and its section types |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkDatabase`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `FrameworkResizeConfig` and its section types |
 | `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim |
 
 ## Drivers
@@ -210,7 +213,14 @@ bucket policy, not a per-object ACL. Without `publicBaseUrl`, URLs are virtual-h
 package's `ResizeTask` and `ResizeLock` models on that connection (registered with `autoIndex` off:
 create their indexes through your migration process). For other setups, `new MongoDatabase({
 mediaModel | getMediaModel, lockModel | getLockModel, tasks })` and `new MongoTaskQueue({ model |
-getModel, timing | getTiming, logger })` take the models directly.
+getModel, timing | getTiming, logger })` take the models directly; a model-shaped media object
+needs `findById` and `findOneAndUpdate`. Previews and the backfilled dimensions are written with
+`findOneAndUpdate`, one write per preview plus one for the backfill, so the media model's
+`findOneAndUpdate` middleware runs for each; the document it receives has only `_id`, and is
+`null` when the preview was already stored or the media is gone. `verify()` fails with
+`RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as sub-documents
+without `identity` (a mixed or plain `previews` array passes), and with
+`RESIZE_MONGO_MODEL_OUTDATED` when the `ResizeTask` schema lacks a field the queue writes.
 
 **`SqsTaskQueue`**
 
@@ -222,7 +232,7 @@ getModel, timing | getTiming, logger })` take the models directly.
 | `timing` | optional | Queue timing (below); the lease is the message visibility timeout |
 | `waitTimeSeconds` | `10` | Long poll per claim (0–20) |
 | `region`, `endpoint`, `client` | optional | An existing `SQSClient`, or one built on first use |
-| `logger` | `console` | Framework apps: `appLogger` |
+| `logger` | `console` | A queue built from a framework config file gets the app logger |
 
 Credentials come from the AWS provider chain. Retries and dead-lettering are the core's, the same
 as for Mongo (attempts = `ApproximateReceiveCount`), and `onTaskDeadLettered` fires for SQS too. Use
@@ -239,23 +249,29 @@ first holder's late release removes it, and at worst a variant is generated twic
 
 **Custom drivers** extend the exported abstract class, or are any object of the same shape:
 
-- `ResizeStorage`: `upload`, `download`, `publicUrl` (pure, no I/O), and optionally `signedUrl`
-  and `canServeOriginalPublicly`.
+- `ResizeStorage`: `upload`, `download`, `publicUrl` (pure, no I/O), and optionally
+  `signedUrl(ref, ttlSeconds)`. The module never calls `signedUrl`; a host calls it to give an
+  owner the private original.
   - The ref you return from `upload()` is opaque to the module and comes back unchanged.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
     original's ref, for previews). Never both.
 - `ResizeDatabase`: `loadMedia(id)`, `appendPreviews(id, previews, dims?)`, `acquireLock(key,
   ttlMs)` (resolves `true` when taken), `releaseLock(key)`; optionally `tasks` (its own queue) and
   `verify()`, awaited at startup — throw there to stop the worker before it claims anything.
+  - `appendPreviews` stores a preview only when its `identity` is not stored on the media yet, and
+    resolves with the previews it stored (nothing = all). The core logs a preview that another
+    worker stored first as a warning with its storage ref; it does not count as created and gets
+    no `onPreviewGenerated` event.
 - `TaskQueue` — each method one atomic operation:
   - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews, requestKey }`; an active task
     with the same `requestKey` may be returned instead.
-  - `claim(queue, leaseMs, signal?)` takes the oldest due task (a waiting one whose retry time has
-    passed, or one whose lease expired), increments `attempts` and returns a fencing `token`. It is
-    how a worker receives tasks: it may return `null` at once (the core polls every `idlePollMs`)
-    or wait for a task first (long poll, LISTEN/NOTIFY, a change stream). A waiting claim returns
-    once `signal` aborts, claims only when called (a prefetched task's lease would run out), and
-    treats a notification as a hint, since only one of the woken workers' claims wins.
+  - `claim(queue, leaseMs, signal?)` takes the task that became due first (a waiting one whose
+    retry time has passed, or one whose lease expired), increments `attempts` and returns a
+    fencing `token`. It is how a worker receives tasks: it may return `null` at once (the core
+    polls every `idlePollMs`) or wait for a task first (long poll, LISTEN/NOTIFY, a change
+    stream). A waiting claim returns once `signal` aborts, claims only when called (a
+    prefetched task's lease would run out), and treats a notification as a hint, since only one
+    of the woken workers' claims wins.
   - `renew(task, leaseMs)`, `complete(task)`, `fail(task, { retryAt } | 'dead', error)` act only
     while the token still holds (`false` = lease lost).
   - Optionally `release(task)`: give a claimed task back unprocessed (`false` = lease lost). It
@@ -282,7 +298,7 @@ created; a config function (the framework adapter passes one) on first use or `v
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `variantSteps`; other formats, pipelines with variant steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
-| `encode.formats` | jpeg `{ quality: 80, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
+| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp decoder limit |
@@ -294,12 +310,17 @@ created; a config function (the framework adapter passes one) on first use or `v
 
 Queue timing and lock TTLs belong to the **task queue** (`timing` on `MongoTaskQueue`,
 `mongoDatabase` and `SqsTaskQueue`; `FrameworkResizer` reads them from the config file's `queue`
-section). The core validates them on first use or in `verify()`. Their defaults are
+section). In a framework app, every Resizer and `FrameworkDatabase` on the database queue shares
+one task queue, and so do Resizers whose config selects SQS with the same settings; config files
+that share a queue must set the same timing (and SQS `waitTimeSeconds`, where unset counts as the
+default 10), or first use, `verify()`
+and worker start fail with `ResizeConfigError` `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`, naming both
+files and the keys. The core validates timing on first use or in `verify()`. Their defaults are
 `defaultQueueOptions` in `…/config/resize.js`:
 
 | Option | Default | Notes |
 |---|---|---|
-| `lockTtlMs` | `{ dispatch: 60000, worker: 60000 }` | `worker` must be ≤ `leaseMs` |
+| `lockTtlMs` | `{ dispatch: 60000, worker: 60000, failed: 600000 }` | `worker` must be ≤ `leaseMs`. `failed`: after a task is dead-lettered, `resolve()` and `prewarm()` do not queue its previews for that media again until it expires (`RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID` for a bad value) |
 | `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
 | `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
@@ -343,17 +364,20 @@ and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do 
 - **Task states (Mongo):** `pending → processing → completed`.
   - A failed attempt returns to `pending` with backoff.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
-    once when no retry can help: the media has no original (`RESIZE_NO_ORIGINAL`), or the source
+    once when no retry can help: the media has no original (`RESIZE_NO_ORIGINAL`), the source
     has no dimensions or exceeds the pixel limits (`RESIZE_SOURCE_METADATA_MISSING`,
-    `RESIZE_SOURCE_TOO_LARGE`).
+    `RESIZE_SOURCE_TOO_LARGE`), or an SVG render ran past `limits.processingTimeoutSeconds`
+    (`RESIZE_SVG_RENDER_TIMEOUT`).
   - Completed rows expire after 24 h and dead rows after ~30 days (the `expireAfterSeconds` in
     the model).
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that
-  already exist, so a repeat never duplicates them. A task completes only when every requested
+  already exist, and the database stores one row per preview identity, so a repeat never
+  duplicates them. A task completes only when every requested
   variant is stored. When an attempt is only partly successful, its previews are saved and the
   next attempt makes only the missing ones.
-- **Retrying a dead task:** after fixing the cause, call `prewarm()` for that media. To replay the
-  row itself, reset it only when no active row has the same request. The partial unique index
+- **Retrying a dead task:** after fixing the cause, call `prewarm()` for that media once the
+  `lockTtlMs.failed` cooldown has ended (until then it reports a retryable lock issue). To replay
+  the row itself, reset it only when no active row has the same request. The partial unique index
   allows one active copy:
 
 ```ts
@@ -366,7 +390,7 @@ const active = await ResizeTask.findOne({
 if (!active) {
   await ResizeTask.updateOne(
     { _id: row._id, status: 'dead' },
-    { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null } },
+    { $set: { status: 'pending', attempts: 0, leaseExpiresAt: null, availableAt: new Date() } },
   ); // a duplicate-key error (11000) means another operator re-queued it first
 }
 ```

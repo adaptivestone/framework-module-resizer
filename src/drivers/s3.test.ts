@@ -65,8 +65,13 @@ describe('S3Storage', () => {
     );
     assert.deepEqual(await s.download(parent), Buffer.from([1, 2, 3]));
     assert.equal(sent[2].input.Bucket, 'priv');
-    assert.equal(s.canServeOriginalPublicly(parent), false);
-    assert.equal(s.canServeOriginalPublicly(child), true);
+    // Visibility is enforced where a URL is made; the driver has no separate visibility check.
+    assert.equal('canServeOriginalPublicly' in s, false);
+    assert.throws(() => s.publicUrl(parent), /private bucket/);
+    assert.equal(
+      s.publicUrl(child),
+      'https://pub.s3.us-east-1.amazonaws.com/users/u1/previews/b.jpg',
+    );
   });
 
   test('ungrouped public object gets a public URL without client I/O', () => {
@@ -226,7 +231,6 @@ describe('S3Storage', () => {
       { bucket: 'pub', key: 'users/a/originals/x.jpg', namespace: 'users/b' },
     ]) {
       await assert.rejects(() => s.download(ref));
-      assert.throws(() => s.canServeOriginalPublicly(ref));
       assert.throws(() => s.publicUrl(ref));
     }
   });

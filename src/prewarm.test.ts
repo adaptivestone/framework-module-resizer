@@ -584,8 +584,8 @@ describe('prewarm — queue and lock failures never throw', () => {
   });
 });
 
-describe('prewarm — fast-path is NOT consulted', () => {
-  test('a size the original already fits still gets added (generation decision, not serving)', async () => {
+describe('prewarm — a small original', () => {
+  test('a box larger than the original is queued like any other size', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
     const { dbLocks } = makeLocks(true);
@@ -596,8 +596,8 @@ describe('prewarm — fast-path is NOT consulted', () => {
     });
     const media: MediaLike = {
       id: 'm1',
-      // original (200×150) fits inside the 300×300 box — resolve() would serve the original,
-      // but prewarm generates the preview regardless (11 · §11.1b step 2).
+      // The 200×150 original is smaller than the 300×300 box: the worker makes a preview at the
+      // original's own size, so the variant is queued like any other.
       original: {
         storageRef: { key: 'orig.jpg' },
         contentType: 'image/jpeg',
