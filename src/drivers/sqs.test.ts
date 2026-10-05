@@ -117,6 +117,7 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
 const message = (over: Partial<FakeMessage> = {}): FakeMessage => ({
   MessageId: 'mid',
   ReceiptHandle: 'rh',
+  Attributes: { ApproximateReceiveCount: '1' },
   Body: JSON.stringify({
     mediaId: 'm1',
     pipeline: 'photo',
@@ -409,6 +410,31 @@ describe('SqsTaskQueue.claim', () => {
     assert.equal(task.resizer, 'default');
     assert.equal(task.queue, 'bulk');
     assert.equal(task.attempts, 1);
+  });
+  test('no ApproximateReceiveCount (a client before 3.572) reads as attempt 1 and warns once', async () => {
+    const bare = { ...message(), Attributes: undefined };
+    const { client } = makeFakeSqsClient({
+      outputs: {
+        ReceiveMessageCommand: [{ Messages: [bare] }, { Messages: [bare] }],
+      },
+    });
+    const warnings: unknown[][] = [];
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      logger: {
+        info() {},
+        warn: (...args: unknown[]) => warnings.push(args),
+        error() {},
+      },
+    });
+    assert.equal((await tasks.claim('default', 60_000))?.attempts, 1);
+    assert.equal((await tasks.claim('default', 60_000))?.attempts, 1);
+    assert.equal(warnings.length, 1);
+    assert.match(
+      String(warnings[0][0]),
+      /never dead-lettered.*client-sqs >= 3\.572/,
+    );
   });
   test('long-polls 10 seconds by default, and the queue named in the body wins', async () => {
     const { client, receiveParams } = makeFakeSqsClient({

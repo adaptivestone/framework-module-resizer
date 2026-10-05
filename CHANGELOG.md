@@ -191,6 +191,11 @@ Pending changes since 0.2.1. The release version will be chosen when these chang
 - Host adoption documentation uses a generic checklist without internal project names or paths.
 - The resolved config object is validated once instead of on every `getResizeConfig()` call, so
   the read path no longer re-runs full validation per `resolve()`.
+- Optional peer ranges state what the code needs instead of `*`: `@adaptivestone/framework`
+  `^5.1.0`, `mongoose` `^9.0.0`, and the AWS SDK clients `^3.572.0`. `SqsTaskQueue` reads attempt
+  counts from `MessageSystemAttributeNames`, which older `@aws-sdk/client-sqs` versions silently
+  drop: every delivery then counted as attempt 1, so a failing task was never dead-lettered. It
+  now also warns once when SQS returns no `ApproximateReceiveCount`.
 
 # 0.2.1
 

@@ -32,12 +32,14 @@ part that uses it:
 
 | You use | Also install |
 |---|---|
-| `…/framework.js` (framework apps) | `@adaptivestone/framework` `mongoose` (already in a framework app) |
-| `…/drivers/mongo.js` | `mongoose` |
-| `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` `@aws-sdk/s3-request-presigner` |
-| `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` |
+| `…/framework.js` (framework apps) | `@adaptivestone/framework` ≥ 5.1 and `mongoose` 9 (already in a framework app) |
+| `…/drivers/mongo.js` | `mongoose` 9 |
+| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` `@aws-sdk/s3-request-presigner` ≥ 3.572 |
+| SQS: `queue: { driver: 'sqs' }` or `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` ≥ 3.572 |
 
-A missing optional peer fails at your own import line, not at the first upload.
+A missing optional peer fails at your own import line (or, for a driver chosen in the config, when
+the Resizer first loads it), not at the first upload. An older SQS client does not return receive
+counts, so failing tasks would never be dead-lettered; `SqsTaskQueue` warns if that happens.
 
 ## Quick start (framework, eager)
 

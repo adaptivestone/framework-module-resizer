@@ -68,6 +68,7 @@ const isLostReceipt = (err: unknown): boolean => {
 export class SqsTaskQueue extends TaskQueue {
   readonly #opts: SqsTaskQueueOptions;
   #client: SQSClient | undefined;
+  #warnedNoReceiveCount = false;
 
   constructor(opts: SqsTaskQueueOptions) {
     super();
@@ -165,6 +166,15 @@ export class SqsTaskQueue extends TaskQueue {
       await this.#discard(queueUrl, message, 'malformed task body');
       return null;
     }
+    const receiveCount = message.Attributes?.ApproximateReceiveCount;
+    if (receiveCount === undefined && !this.#warnedNoReceiveCount) {
+      // Clients before @aws-sdk/client-sqs 3.572 drop MessageSystemAttributeNames: every delivery
+      // then reads as attempt 1, so a failing task would be retried forever.
+      this.#warnedNoReceiveCount = true;
+      this.#logger.warn(
+        'resize sqs: ReceiveMessage returned no ApproximateReceiveCount — attempts cannot be counted, so failing tasks are never dead-lettered; use @aws-sdk/client-sqs >= 3.572',
+      );
+    }
     return {
       taskId: message.MessageId ?? message.ReceiptHandle,
       resizer: body.resizer ?? 'default',
@@ -174,7 +184,7 @@ export class SqsTaskQueue extends TaskQueue {
       previews: body.previews ?? [],
       // The URL travels with the token: complete/fail/renew act on the queue it came from.
       token: JSON.stringify([queueUrl, message.ReceiptHandle]),
-      attempts: Number(message.Attributes?.ApproximateReceiveCount ?? 1),
+      attempts: Number(receiveCount ?? 1),
     };
   }
 
