@@ -42,12 +42,21 @@ export default class ResizeWorker {
         description:
           "Queue to consume (default 'default'). Tasks on other queues are left for their own workers.",
       },
+      config: {
+        type: 'string',
+        description:
+          "Config file name whose 'worker' section the process uses (default 'resize').",
+      },
     } as const;
   }
 
   async run(): Promise<boolean> {
-    const queue = (this.args as { queue?: string } | undefined)?.queue;
-    await runResizeWorker(queue === undefined ? {} : { queue });
+    const { queue, config } =
+      (this.args as { queue?: string; config?: string } | undefined) ?? {};
+    await runResizeWorker({
+      ...(queue === undefined ? {} : { queue }),
+      ...(config === undefined ? {} : { configName: config }),
+    });
     return true;
   }
 }

@@ -39,24 +39,18 @@ export {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
-// --- pure identity + dimension helpers (03 · Identity) ---
+// --- public URL formatting and size catalog helpers ---
 export { formatPictureUrls } from './formatPictureUrls.ts';
 export {
-  calculateResizedDimensions,
-  getFilterSig,
-  getImageContentType,
-  getPreviewIdentity,
   getSizeKey,
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
-// --- optional `as const` media schema fragment the host spreads into File/Media (08 · §12) ---
+// --- optional `as const` media schema fragment the host spreads into File/Media ---
 export {
   resizeMediaPaths,
   resizeMediaSchemaFragment,
 } from './mediaFragment.ts';
-// --- the core queue logic (custom workers / tests); runWorker below is the normal entry ---
-export { consumeQueue, timingOf } from './queue.ts';
 // --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
 export type {
   BeforeStep,
@@ -72,14 +66,10 @@ export type {
   VariantStep,
   WaterfallName,
 } from './resizer.ts';
-// --- core: the Resizer + its registry accessors (constructor-wired; one per name) ---
-// `resetResizerForTests` is a TEST-ONLY escape hatch. 02 · §6 documents it as "not re-exported
-// from index.ts docs", but HOST test suites construct Resizers in their own tests (mirroring the
-// framework publicly exporting `resetAppInstance`), so it IS re-exported here — documented
-// deviation from that literal note.
+// --- core: the Resizer + named lookup (constructor-wired; one per name) ---
+// `resetResizerForTests` is a TEST-ONLY escape hatch for host test suites.
 export {
   getResizer,
-  listResizers,
   Resizer,
   resetResizerForTests,
 } from './resizer.ts';
@@ -87,4 +77,4 @@ export {
 export type * from './types.d.ts';
 // --- the framework-free worker (framework hosts run `runResizeWorker` from …/framework.js) ---
 export type { RunWorkerOptions } from './worker.ts';
-export { processTask, runWorker } from './worker.ts';
+export { runWorker } from './worker.ts';

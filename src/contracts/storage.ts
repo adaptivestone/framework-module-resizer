@@ -19,15 +19,15 @@ export abstract class ResizeStorage {
   /** Upload a new object and return the JSON-compatible locator to persist. */
   abstract upload(args: StorageUploadArgs): Promise<StorageRef>;
 
-  /** Public URL of an object. Pure and synchronous: the read path calls it, so no I/O. */
+  /**
+   * Public URL of an object. Pure and synchronous: the read path calls it for stored previews,
+   * so no I/O. It must refuse a ref it would not expose (e.g. a private original).
+   */
   abstract publicUrl(ref: StorageRef): string;
 
   /**
-   * Optional, pure: whether an original may be served to anonymous readers. Without it every
-   * original is treated as private.
+   * Optional: a time-limited URL for a private object. The module never calls it; a host calls it
+   * itself, e.g. to hand a private original to its owner.
    */
-  canServeOriginalPublicly?(ref: StorageRef): boolean;
-
-  /** Optional: a time-limited URL for an owner/admin read of a private original. */
   signedUrl?(ref: StorageRef, ttlSeconds: number): Promise<string>;
 }

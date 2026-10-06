@@ -141,23 +141,23 @@ export async function enqueue(
   const dispatchTtlMs = timingOf(tasks).lockTtlMs.dispatch;
   const survivors: MissingPreview[] = [];
   const survivorLockKeys: string[] = [];
-  for (const [identity, m] of byIdentity) {
-    const lockKey = `resize_dispatch:${mediaId}:${identity}`;
-    // A rejecting acquire = this variant is NOT a survivor (log + continue); earlier survivors are
-    // unaffected and still reach the task queue. enqueue must never throw into the read (1.2b).
-    let acquired: boolean;
-    try {
-      acquired = await resizer.db.acquireLock(lockKey, dispatchTtlMs);
-    } catch (err) {
+  const attempts = await acquireDispatchLocks(
+    resizer,
+    mediaId,
+    byIdentity,
+    dispatchTtlMs,
+  );
+  for (const attempt of attempts) {
+    // A rejecting acquire = this variant is NOT a survivor (log + continue); the other survivors
+    // are unaffected and still reach the task queue. enqueue must never throw into the read.
+    if (attempt.failed) {
       resizer.logger.error(
-        `resize enqueue: dispatch-lock acquire failed for ${lockKey} on media ${mediaId} — skipping this variant`,
-        err,
+        `resize enqueue: dispatch-lock acquire failed for ${attempt.lockKey} on media ${mediaId} — skipping this variant`,
+        attempt.error,
       );
-      continue;
-    }
-    if (acquired) {
-      survivors.push(m);
-      survivorLockKeys.push(lockKey);
+    } else if (attempt.acquired) {
+      survivors.push(attempt.preview);
+      survivorLockKeys.push(attempt.lockKey);
     }
   }
 
@@ -296,21 +296,24 @@ export async function enqueueConfirmed(
   const lockFailed: MissingPreview[] = [];
   const dispatchTtlMs = timingOf(taskQueue).lockTtlMs.dispatch;
 
-  for (const [identity, preview] of byIdentity) {
-    const lockKey = `resize_dispatch:${mediaId}:${identity}`;
-    try {
-      if (await resizer.db.acquireLock(lockKey, dispatchTtlMs)) {
-        winners.push(preview);
-        winnerKeys.push(lockKey);
-      } else {
-        lockContended.push(preview);
-      }
-    } catch (error) {
+  const attempts = await acquireDispatchLocks(
+    resizer,
+    mediaId,
+    byIdentity,
+    dispatchTtlMs,
+  );
+  for (const attempt of attempts) {
+    if (attempt.failed) {
       resizer.logger.error(
-        `resize prewarm: dispatch-lock acquire failed for ${lockKey}`,
-        error,
+        `resize prewarm: dispatch-lock acquire failed for ${attempt.lockKey}`,
+        attempt.error,
       );
-      lockFailed.push(preview);
+      lockFailed.push(attempt.preview);
+    } else if (attempt.acquired) {
+      winners.push(attempt.preview);
+      winnerKeys.push(attempt.lockKey);
+    } else {
+      lockContended.push(attempt.preview);
     }
   }
 
@@ -431,6 +434,27 @@ export async function enqueueConfirmed(
       previews: receiptConflictPreviews,
     });
   }
+  if (lockContended.length > 0) {
+    issues.push({
+      code: 'RESIZE_ENQUEUE_LOCK_CONTENDED',
+      message:
+        'dispatch lock is held but no active task coverage was confirmed',
+      retryable: true,
+      previews: lockContended,
+    });
+  }
+  if (lockFailed.length > 0) {
+    issues.push({
+      code: 'RESIZE_ENQUEUE_LOCK_FAILED',
+      message: 'dispatch lock could not be acquired or confirmed',
+      retryable: true,
+      previews: lockFailed,
+    });
+  }
+
+  // An issue explains only what stayed unconfirmed: a preview that findActive later confirmed
+  // drops out of it, and an issue left with none is removed, so an accepted request carries
+  // no retryable issue.
   const unresolvedIdentities = new Set(
     unconfirmed.map((preview) =>
       getPreviewIdentity(
@@ -441,50 +465,66 @@ export async function enqueueConfirmed(
       ),
     ),
   );
-  const remainingContended = lockContended.filter((preview) =>
-    unresolvedIdentities.has(
-      getPreviewIdentity(
-        scope,
-        preview.sizeKey,
-        preview.format,
-        preview.filters,
+  const remainingIssues = issues.flatMap((issue) => {
+    const previews = issue.previews.filter((preview) =>
+      unresolvedIdentities.has(
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
       ),
-    ),
-  );
-  const remainingFailed = lockFailed.filter((preview) =>
-    unresolvedIdentities.has(
-      getPreviewIdentity(
-        scope,
-        preview.sizeKey,
-        preview.format,
-        preview.filters,
-      ),
-    ),
-  );
-  if (remainingContended.length > 0) {
-    issues.push({
-      code: 'RESIZE_ENQUEUE_LOCK_CONTENDED',
-      message:
-        'dispatch lock is held but no active task coverage was confirmed',
-      retryable: true,
-      previews: remainingContended,
-    });
-  }
-  if (remainingFailed.length > 0) {
-    issues.push({
-      code: 'RESIZE_ENQUEUE_LOCK_FAILED',
-      message: 'dispatch lock could not be acquired or confirmed',
-      retryable: true,
-      previews: remainingFailed,
-    });
-  }
+    );
+    return previews.length > 0 ? [{ ...issue, previews }] : [];
+  });
 
   return {
     accepted: [...accepted.values()],
     unconfirmed,
     tasks,
-    issues,
+    issues: remainingIssues,
   };
+}
+
+interface LockAttempt {
+  preview: MissingPreview;
+  lockKey: string;
+  acquired: boolean; // false for a lock another request holds, and for a failed acquire
+  failed: boolean; // the acquire rejected (`error`)
+  error?: unknown;
+}
+
+/**
+ * The dispatch lock of one preview identity of a media: while it is held, reads do not queue that
+ * variant. The worker holds it for a cooldown after the variant's task is dead-lettered.
+ */
+export function dispatchLockKey(mediaId: string, identity: string): string {
+  return `resize_dispatch:${mediaId}:${identity}`;
+}
+
+/**
+ * Acquire one dispatch lock per identity, all at once: a read with many missing variants waits
+ * for the slowest acquire, not for one database round trip after another. Never rejects; the
+ * results keep the input order, and the caller decides how to report a held or failed lock.
+ */
+async function acquireDispatchLocks(
+  resizer: Resizer,
+  mediaId: string,
+  byIdentity: Map<string, MissingPreview>,
+  ttlMs: number,
+): Promise<LockAttempt[]> {
+  return Promise.all(
+    [...byIdentity].map(async ([identity, preview]): Promise<LockAttempt> => {
+      const lockKey = dispatchLockKey(mediaId, identity);
+      try {
+        const acquired = Boolean(await resizer.db.acquireLock(lockKey, ttlMs));
+        return { preview, lockKey, acquired, failed: false };
+      } catch (error) {
+        return { preview, lockKey, acquired: false, failed: true, error };
+      }
+    }),
+  );
 }
 
 /** Best-effort release of every given lock key; a failing release is logged, not thrown. */

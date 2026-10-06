@@ -14,7 +14,7 @@ export async function runResizeWorker(
   const { worker } = getResizeConfig(opts.configName);
   if (worker.enabled === false) {
     app.logger.info(
-      'resize worker disabled — set config.worker.enabled=true in the host src/config/resize.ts to run it',
+      `resize worker disabled — set config.worker.enabled=true in the host src/config/${opts.configName ?? 'resize'}.ts to run it`,
     );
     return;
   }

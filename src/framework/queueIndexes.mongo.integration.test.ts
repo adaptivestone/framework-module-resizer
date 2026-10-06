@@ -168,17 +168,20 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
     assert.ok(dedupe, 'fixture should create the active-request dedupe index');
     assert.ok(
       taskIndexes.some(({ key }) =>
-        hasExactKey(key, { queue: 1, status: 1, createdAt: 1 }),
+        hasExactKey(key, { queue: 1, status: 1, availableAt: 1 }),
       ),
-      'fixture should create the queue-scoped lease index',
+      'fixture should create the queue-scoped claim index',
     );
-    assert.equal(
-      taskIndexes.some(({ key }) =>
-        hasExactKey(key, { status: 1, createdAt: 1 }),
-      ),
-      false,
-      'the queue-less lease index is gone',
-    );
+    for (const old of [
+      { queue: 1, status: 1, createdAt: 1 },
+      { status: 1, createdAt: 1 },
+    ]) {
+      assert.equal(
+        taskIndexes.some(({ key }) => hasExactKey(key, old)),
+        false,
+        `the old lease index ${JSON.stringify(old)} is gone`,
+      );
+    }
     assert.equal(dedupe.unique, true);
     assert.deepEqual(dedupe.partialFilterExpression, {
       status: { $in: ['pending', 'processing'] },

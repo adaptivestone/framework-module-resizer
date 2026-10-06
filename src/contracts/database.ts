@@ -8,12 +8,18 @@ export abstract class ResizeDatabase {
   /** Load a media document; `null` (deleted media) makes its task a logged no-op. */
   abstract loadMedia(mediaId: string): Promise<MediaLike | null>;
 
-  /** Append generated previews, and optionally backfill the original's dimensions, atomically. */
+  /**
+   * Append generated previews, and optionally backfill the original's dimensions. A preview whose
+   * `identity` is already stored on the media is skipped, so two workers that rendered the same
+   * variant leave one row. Resolve with the previews that were stored; resolving with nothing means
+   * all of them were.
+   */
   abstract appendPreviews(
     mediaId: string,
     previews: Preview[],
     backfillDims?: { width: number; height: number },
-  ): Promise<void>;
+    // biome-ignore lint/suspicious/noConfusingVoidType: a driver that resolves with nothing (Promise<void>) stays valid
+  ): Promise<Preview[] | void>;
 
   /**
    * Take the lock `key` for `ttlMs`: `true` if taken, `false` if someone holds it. Locks only

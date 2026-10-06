@@ -3,9 +3,10 @@
 // framework's filename-keyed loader registers `getModel('ResizeTask')`. The fields and indexes come
 // from drivers/mongo/schemas.ts, the same source createResizeModels() uses.
 //
-// One of the two files that import `@adaptivestone/framework` (the other is src/framework/app.ts);
-// exported only from `…/framework.js`. It must stay a literal `class … extends BaseModel`: the
-// loader checks `prototype instanceof BaseModel`, and `npm run gen` walks the `extends` chain.
+// Exported from `…/framework.js` and directly from `…/framework/ResizeTaskModel.js`.
+// It must stay a literal `class … extends BaseModel`: the loader checks
+// `prototype instanceof BaseModel`, and `npm run gen` parses the superclass's defining file.
+// The scaffold's direct model import lets codegen find that BaseModel ancestor and type the shim.
 
 import type {
   GetModelTypeFromClass,

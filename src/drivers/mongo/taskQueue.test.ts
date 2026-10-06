@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { hostname } from 'node:os';
 import {
   after,
   afterEach,
@@ -31,6 +32,7 @@ import type {
   QueueTimingOptions,
   ResizeLogger,
 } from '../../types.d.ts';
+import { resizeTaskFields } from './schemas.ts';
 import { MongoTaskQueue } from './taskQueue.ts';
 
 // Real MongoDB atomic semantics, using the same schema and indexes as framework hosts.
@@ -331,14 +333,75 @@ describe('MongoTaskQueue setup', () => {
     assert.equal(await tasks.renew(claimed, 300), false);
     assert.equal(await tasks.complete(claimed), false);
     assert.equal(await tasks.fail(claimed, 'dead', 'error'), false);
+    assert.equal(await tasks.release(claimed), false);
     assert.deepEqual(await tasks.findActive(claimed), []);
-    assert.equal(errors.length, 6);
+    assert.equal(errors.length, 7);
+  });
+
+  test('verify rejects a model without the fields the queue writes (an ejected 0.2 model)', () => {
+    // Strict mode would silently drop these from every insert: each task would then read as
+    // Resizer 'default' on queue 'default'.
+    const {
+      resizer: _resizer,
+      queue: _queue,
+      requestKey: _requestKey,
+      availableAt: _availableAt,
+      ...oldFields
+    } = resizeTaskFields('File');
+    const Old =
+      connection.models.OldResizeTask ??
+      connection.model(
+        'OldResizeTask',
+        new mongoose.Schema(oldFields, { timestamps: true, autoIndex: false }),
+      );
+    const queue = new MongoTaskQueue({ model: Old });
+    assert.throws(
+      () => queue.verify(),
+      (error: unknown) =>
+        error instanceof ResizeSetupError &&
+        error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
+        /resizer, queue, requestKey, availableAt/.test(error.message) &&
+        /delete src\/models\/ResizeTask\.ts and re-run resize-scaffold/.test(
+          error.message,
+        ) &&
+        /--eject/.test(error.message) &&
+        /resizeTaskFields\(\)/.test(error.message) &&
+        // --force would also overwrite the host's own resizer.ts and config file.
+        !/--force/.test(error.message),
+    );
+  });
+
+  test('verify rejects a model ejected before tasks carried availableAt', () => {
+    // Without the path, strict mode drops every due time: retries would skip their backoff.
+    const { availableAt: _availableAt, ...fields } = resizeTaskFields('File');
+    const Old =
+      connection.models.ResizeTaskWithoutDueTime ??
+      connection.model(
+        'ResizeTaskWithoutDueTime',
+        new mongoose.Schema(fields, { timestamps: true, autoIndex: false }),
+      );
+    assert.throws(
+      () => new MongoTaskQueue({ model: Old }).verify(),
+      (error: unknown) =>
+        error instanceof ResizeSetupError &&
+        error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
+        /has no availableAt field/.test(error.message),
+    );
+  });
+
+  test('verify accepts the package model and a model-shaped object without a schema', () => {
+    assert.doesNotThrow(() => tasks.verify());
+    const schemaless = new MongoTaskQueue({
+      model: { findOneAndUpdate: async () => null },
+    });
+    assert.doesNotThrow(() => schemaless.verify());
   });
 });
 
 describe('MongoTaskQueue.add', () => {
   test('maps mediaId to fileId, stores pipeline and previews, returns the taskId', async () => {
     const payload = request({ pipeline: 'photo' });
+    const before = Date.now();
     const { taskId } = await tasks.add(payload);
     assert.ok(taskId);
     const doc = await M.findById(taskId).lean();
@@ -349,6 +412,10 @@ describe('MongoTaskQueue.add', () => {
     assert.equal(doc.attempts, 0);
     assert.equal((doc.previews as unknown[]).length, 1);
     assert.equal(doc.requestKey, payload.requestKey);
+    // Due at once.
+    const availableAt = (doc.availableAt as Date).getTime();
+    assert.ok(availableAt >= before && availableAt <= Date.now());
+    assert.equal(doc.leaseExpiresAt, undefined);
   });
 
   for (const { name, preview, errorPath } of [
@@ -688,22 +755,116 @@ describe('MongoTaskQueue.add', () => {
 });
 
 describe('MongoTaskQueue.claim', () => {
-  test('claims the oldest pending task by createdAt', async () => {
-    // The newer row goes in first, so _id order and createdAt order disagree.
-    await insert({}, new Date(5000));
-    const older = await insert({}, new Date(1000));
+  test('claims the task that became due first; while leased it is due when the lease ends', async () => {
+    // The later-due row is older and goes in first: _id, createdAt and due order disagree.
+    await insert({ availableAt: new Date(Date.now() - 1000) }, new Date(1000));
+    const first = await insert(
+      { availableAt: new Date(Date.now() - 5000) },
+      new Date(5000),
+    );
     const leased = await tasks.claim('default', 300);
     assert.ok(leased);
-    assert.equal(leased.taskId, String(older._id));
+    assert.equal(leased.taskId, String(first._id));
     assert.equal(leased.attempts, 1);
     assert.ok(leased.token);
     const row = await M.findById(leased.taskId).lean();
-    assert.equal(row?.status, 'processing');
-    assert.equal(row?.leasedBy, `resizer-${process.pid}`);
+    assert.ok(row);
+    assert.equal(row.status, 'processing');
+    // Which pod holds the lease: every container's main process is pid 1.
+    assert.equal(row.leasedBy, `${hostname().slice(0, 64)}:${process.pid}`);
+    assert.equal(
+      (row.availableAt as Date).getTime(),
+      (row.leaseExpiresAt as Date).getTime(),
+    );
+  });
+
+  test('a task in backoff is not claimed before its availableAt', async () => {
+    await insert({ availableAt: new Date(Date.now() + 60_000) });
+    const due = await insert({ availableAt: past() });
+    assert.equal((await tasks.claim('default', 300))?.taskId, String(due._id));
+    assert.equal(await tasks.claim('default', 300), null);
+  });
+
+  test('a legacy pending row keeps its retry time from leaseExpiresAt', async (t) => {
+    // Written by the previous code: the retry time five minutes ahead, no availableAt.
+    const start = Date.now();
+    const legacy = await insert({
+      leaseExpiresAt: new Date(start + 5 * 60_000),
+    });
+    await M.collection.updateOne(
+      { _id: legacy._id },
+      { $unset: { availableAt: '' } },
+    );
+    assert.equal(await tasks.claim('default', 300), null);
+    t.mock.timers.enable({ apis: ['Date'], now: start + 5 * 60_000 + 1000 });
+    assert.equal(
+      (await tasks.claim('default', 300))?.taskId,
+      String(legacy._id),
+    );
+  });
+
+  test('a retry written by an older worker (availableAt passed, leaseExpiresAt ahead) waits', async () => {
+    const retried = await insert({
+      availableAt: past(),
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    });
+    assert.equal(await tasks.claim('default', 300), null);
+    await M.updateOne(
+      { _id: retried._id },
+      { $set: { leaseExpiresAt: past() } },
+    );
+    assert.equal(
+      (await tasks.claim('default', 300))?.taskId,
+      String(retried._id),
+    );
+  });
+
+  test('rows written before availableAt existed: pending is due at once, processing once its lease ends', async () => {
+    const pending = await insert({});
+    const expired = await insert({
+      status: 'processing',
+      leaseExpiresAt: past(),
+    });
+    await insert({
+      status: 'processing',
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    });
+    await M.collection.updateMany({}, { $unset: { availableAt: '' } });
+    const claimed = [
+      (await tasks.claim('default', 300))?.taskId,
+      (await tasks.claim('default', 300))?.taskId,
+    ];
+    assert.deepEqual(
+      claimed.sort(),
+      [String(pending._id), String(expired._id)].sort(),
+    );
+    assert.equal(await tasks.claim('default', 300), null);
+  });
+
+  test('a live lease is respected even when its availableAt was not moved (an older worker)', async () => {
+    const leased = await insert({
+      status: 'processing',
+      availableAt: past(),
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    });
+    assert.equal(await tasks.claim('default', 300), null);
+    await M.updateOne(
+      { _id: leased._id },
+      { $set: { leaseExpiresAt: past() } },
+    );
+    assert.equal(
+      (await tasks.claim('default', 300))?.taskId,
+      String(leased._id),
+    );
   });
 
   test('reclaims an expired processing lease and bumps attempts', async () => {
-    await insert({ status: 'processing', leaseExpiresAt: past(), attempts: 1 });
+    await insert({
+      status: 'processing',
+      leaseExpiresAt: past(),
+      availableAt: past(),
+      attempts: 1,
+    });
     const leased = await tasks.claim('default', 300);
     assert.ok(leased);
     assert.equal(leased.attempts, 2);
@@ -714,18 +875,17 @@ describe('MongoTaskQueue.claim', () => {
   });
 
   test('claims exhausted pending and expired processing tasks so the core can dead-letter them', async () => {
-    const expired = await insert(
-      {
-        status: 'processing',
-        leaseExpiresAt: past(),
-        attempts: 3,
-      },
-      new Date(1000),
-    );
-    const pending = await insert(
-      { status: 'pending', attempts: 3 },
-      new Date(2000),
-    );
+    const expired = await insert({
+      status: 'processing',
+      leaseExpiresAt: past(),
+      availableAt: past(),
+      attempts: 3,
+    });
+    const pending = await insert({
+      status: 'pending',
+      availableAt: new Date(Date.now() - 1000),
+      attempts: 3,
+    });
     const a = await tasks.claim('default', 300);
     const b = await tasks.claim('default', 300);
     assert.equal(a?.taskId, String(expired._id));
@@ -743,19 +903,102 @@ describe('MongoTaskQueue.claim', () => {
     assert.equal((a === null) !== (b === null), true);
   });
 
-  test('pending tasks without a lease, with a null lease, or with a past retry date are due', async () => {
-    const a = await insert({}, new Date(1000));
-    const b = await insert({ leaseExpiresAt: null }, new Date(2000));
-    const c = await insert({ leaseExpiresAt: past() }, new Date(3000));
-    await insert({ leaseExpiresAt: new Date(Date.now() + 60_000) });
-    const claimed = [];
-    for (let index = 0; index < 3; index++) {
-      claimed.push((await tasks.claim('default', 300))?.taskId);
-    }
-    assert.deepEqual(
-      claimed,
-      [a, b, c].map((row) => String(row._id)),
-    );
+  // The claim's own filter and sort, explained against thousands of tasks that are not due: tasks
+  // in backoff and live leases must stay outside the index bounds, so after an outage a claim
+  // still reads about one document, with no in-memory sort.
+  async function explainClaim(): Promise<{
+    docs: number;
+    keys: number;
+    plan: string;
+  }> {
+    let captured:
+      | { filter: object; update: object; options: { sort?: object } }
+      | undefined;
+    const recording = new Proxy(M, {
+      get(target, property, receiver) {
+        if (property === 'findOneAndUpdate') {
+          return async (
+            filter: object,
+            update: object,
+            options: { sort?: object },
+          ) => {
+            captured = { filter, update, options };
+            return null;
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await new MongoTaskQueue({ model: recording }).claim('default', 300);
+    assert.ok(captured && connection.db);
+    const explained = await connection.db.command({
+      explain: {
+        findAndModify: M.collection.collectionName,
+        query: captured.filter,
+        sort: captured.options.sort,
+        update: captured.update,
+      },
+      verbosity: 'executionStats',
+    });
+    return {
+      docs: explained.executionStats.totalDocsExamined,
+      keys: explained.executionStats.totalKeysExamined,
+      plan: JSON.stringify(explained.queryPlanner.winningPlan),
+    };
+  }
+
+  async function seedNotDue() {
+    const row = (status: string, at: number, extra: object = {}) => ({
+      fileId: new mongoose.Types.ObjectId(),
+      queue: 'default',
+      resizer: 'default',
+      pipeline: 'default',
+      previews: [],
+      status,
+      attempts: 1,
+      availableAt: new Date(at),
+      ...extra,
+    });
+    const later = Date.now() + 300_000;
+    const leaseEnd = Date.now() + 60_000;
+    await M.collection.insertMany([
+      ...Array.from({ length: 2000 }, () => row('pending', later)),
+      ...Array.from({ length: 50 }, () =>
+        row('processing', leaseEnd, { leaseExpiresAt: new Date(leaseEnd) }),
+      ),
+      ...Array.from({ length: 500 }, () => row('completed', 0)),
+    ]);
+  }
+
+  for (const scenario of ['a due task', 'an expired lease'] as const) {
+    test(`claiming ${scenario} among 2000 tasks in backoff and 50 live leases reads one document`, async () => {
+      await seedNotDue();
+      const due =
+        scenario === 'a due task'
+          ? await insert({ availableAt: past() })
+          : await insert({
+              status: 'processing',
+              availableAt: past(),
+              leaseExpiresAt: past(),
+            });
+      const { docs, keys, plan } = await explainClaim();
+      assert.ok(docs <= 1, `documents examined: ${docs}`);
+      assert.ok(keys <= 10, `index keys examined: ${keys}`);
+      assert.doesNotMatch(plan, /"stage":"SORT"/, 'no in-memory sort');
+      assert.doesNotMatch(plan, /COLLSCAN/);
+      assert.match(plan, /"availableAt":1/);
+      assert.equal(
+        (await tasks.claim('default', 300))?.taskId,
+        String(due._id),
+      );
+    });
+  }
+
+  test('when nothing is due, a claim reads no document', async () => {
+    await seedNotDue();
+    const { docs, plan } = await explainClaim();
+    assert.equal(docs, 0);
+    assert.doesNotMatch(plan, /"stage":"SORT"/);
     assert.equal(await tasks.claim('default', 300), null);
   });
 });
@@ -905,9 +1148,10 @@ describe('MongoTaskQueue.complete fencing', () => {
     await insert();
     const first = await tasks.claim('default', 300);
     assert.ok(first);
+    // The lease ends: it is next claimable then.
     await M.updateOne(
       { _id: first.taskId },
-      { $set: { leaseExpiresAt: past() } },
+      { $set: { leaseExpiresAt: past(), availableAt: past() } },
     );
     const second = await tasks.claim('default', 300);
     assert.ok(second);
@@ -960,7 +1204,8 @@ describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
     assert.ok(row);
     assert.equal(row.status, 'pending');
     assert.equal(row.leaseToken, null);
-    assert.ok((row.leaseExpiresAt as Date).getTime() > before);
+    assert.equal(row.leaseExpiresAt, null);
+    assert.ok((row.availableAt as Date).getTime() > before);
     assert.equal(rec.failed.length, 1);
     assert.equal(rec.dead.length, 0);
   });
@@ -982,18 +1227,27 @@ describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
   test('RESIZE_NO_ORIGINAL with a stale token is a fenced no-op with no event', async () => {
     const inserted = await insert();
     const rec = makeEvents();
+    // Stop once the fenced fail has run (a shutdown before it would give the task back instead).
+    const failResults: boolean[] = [];
+    const realFail = tasks.fail.bind(tasks);
+    tasks.fail = async (...args) => {
+      const held = await realFail(...args);
+      failResults.push(held);
+      consumer.ctrl.abort();
+      return held;
+    };
     const consumer = startConsumer(
       async (task) => {
         await M.updateOne(
           { _id: task.taskId },
           { $set: { leaseToken: 'another-worker' } },
         );
-        consumer.ctrl.abort();
         throw new ResizeNoOriginalError(task.mediaId);
       },
       { onEvent: rec.onEvent },
     );
     await consumer.done;
+    assert.deepEqual(failResults, [false]);
     const row = await M.findById(inserted._id).lean();
     assert.equal(row?.status, 'processing');
     assert.equal(row?.deadAt, undefined);
@@ -1041,7 +1295,8 @@ describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
     assert.equal(await tasks.fail(leased, { retryAt }, 'boom'), true);
     const row = await M.findById(leased.taskId).lean();
     assert.ok(row);
-    assert.equal((row.leaseExpiresAt as Date).getTime(), retryAt.getTime());
+    assert.equal((row.availableAt as Date).getTime(), retryAt.getTime());
+    assert.equal(row.leaseExpiresAt, null); // no lease while it waits
     assert.equal(row?.leaseToken, null);
     assert.equal(row?.error, 'boom');
     assert.equal(await tasks.claim('default', 300), null);
@@ -1089,6 +1344,40 @@ describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
   });
 });
 
+describe('MongoTaskQueue.release', () => {
+  test('returns a claimed task to pending, due at once, without counting the delivery', async () => {
+    const inserted = await insert({ attempts: 2, error: 'earlier failure' });
+    const leased = await tasks.claim('default', 60_000);
+    assert.ok(leased);
+    assert.equal(leased.attempts, 3);
+    assert.equal(await tasks.release(leased), true);
+    const row = await M.findById(inserted._id).lean();
+    assert.equal(row?.status, 'pending');
+    assert.equal(row?.attempts, 2);
+    assert.equal(row?.leaseToken, null);
+    assert.equal(row?.leaseExpiresAt, null);
+    assert.ok(row && (row.availableAt as Date).getTime() <= Date.now());
+    assert.equal(row?.error, 'earlier failure');
+    const again = await tasks.claim('default', 300);
+    assert.equal(again?.taskId, leased.taskId);
+    assert.equal(again?.attempts, 3);
+    assert.notEqual(again?.token, leased.token);
+  });
+
+  test('a stale token releases nothing', async () => {
+    await insert();
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    assert.equal(await tasks.release({ ...leased, token: 'stale' }), false);
+    const row = await M.findById(leased.taskId).lean();
+    assert.equal(row?.status, 'processing');
+    assert.equal(row?.leaseToken, leased.token);
+    assert.equal(row?.attempts, 1);
+    assert.equal(await tasks.complete(leased), true);
+    assert.equal(await tasks.release(leased), false);
+  });
+});
+
 describe('MongoTaskQueue.renew fencing', () => {
   test('a valid token extends the lease; a stale token does not match', async () => {
     await insert();
@@ -1102,10 +1391,13 @@ describe('MongoTaskQueue.renew fencing', () => {
     assert.ok(row);
     const expiry = (row.leaseExpiresAt as Date).getTime();
     assert.ok(expiry > firstExpiry);
+    // The task stays unclaimable until the renewed lease ends.
+    assert.equal((row.availableAt as Date).getTime(), expiry);
     assert.equal(await tasks.renew({ ...leased, token: 'stale' }, 2000), false);
     const unchanged = await M.findById(leased.taskId).lean();
     assert.ok(unchanged);
     assert.equal((unchanged.leaseExpiresAt as Date).getTime(), expiry);
+    assert.equal((unchanged.availableAt as Date).getTime(), expiry);
   });
 });
 
@@ -1265,6 +1557,54 @@ describe('consumeQueue with MongoTaskQueue', () => {
     releaseGate();
     await consumer.done;
   });
+
+  for (const prior of [0, 2]) {
+    test(`a shutdown mid-task releases the task without counting it (${prior} earlier attempts of 3)`, {
+      timeout: 10_000,
+    }, async () => {
+      const inserted = await insert({ attempts: prior });
+      const rec = makeEvents();
+      let started = false;
+      const consumer = startConsumer(
+        // Like the worker: on abort it skips the remaining variants and rejects as incomplete.
+        (task, { signal }) =>
+          new Promise<void>((_resolve, reject) => {
+            started = true;
+            signal.addEventListener(
+              'abort',
+              () =>
+                reject(
+                  new ResizeGenerateError({
+                    mediaId: task.mediaId,
+                    failed: 1,
+                    requested: 1,
+                    code: 'RESIZE_WORKER_INCOMPLETE',
+                  }),
+                ),
+              { once: true },
+            );
+          }),
+        { onEvent: rec.onEvent },
+      );
+      await waitFor(() => started);
+      consumer.ctrl.abort();
+      await consumer.done;
+      const row = await M.findById(inserted._id).lean();
+      assert.equal(row?.status, 'pending');
+      assert.equal(row?.attempts, prior);
+      assert.equal(row?.leaseToken, null);
+      assert.equal(row?.deadAt, undefined);
+      assert.equal(row?.error, undefined);
+      assert.deepEqual(
+        [rec.completed.length, rec.failed.length, rec.dead.length],
+        [0, 0, 0],
+      );
+      // The next worker takes it at once, as the same attempt.
+      const next = await tasks.claim('default', 300);
+      assert.equal(next?.taskId, String(inserted._id));
+      assert.equal(next?.attempts, prior + 1);
+    });
+  }
 
   test('an idle worker stops promptly when its signal aborts', async () => {
     configureQueue(undefined, { idlePollMs: 10_000 });

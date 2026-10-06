@@ -2,12 +2,13 @@
 // generated with sharp itself; fakes for storage, database and task queues.
 // Fresh Resizer + fake ambient app per test (node:test = per-file process isolation).
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, test } from 'node:test';
+import { afterEach, describe, mock, test } from 'node:test';
 import {
   resetAppInstance,
   setAppInstance,
@@ -18,12 +19,14 @@ import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
 import {
   ResizeConfigError,
   ResizeGenerateError,
+  ResizeMediaError,
   ResizeNoOriginalError,
   ResizeSetupError,
 } from './errors.ts';
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
+import { getSizeKey, toMissingPreview } from './images.ts';
 import {
   type Pipeline,
   Resizer,
@@ -88,6 +91,128 @@ const orientedJpeg = await sharp({
   .withMetadata({ orientation: 6 })
   .toBuffer();
 
+/** Raw RGB frames of one solid colour each, stacked vertically (sharp's animation layout). */
+function solidFrames(colours: number[][], width: number, height: number) {
+  return Buffer.concat(
+    colours.map((colour) => {
+      const frame = Buffer.alloc(width * height * 3);
+      for (let i = 0; i < width * height; i++) {
+        frame.set(colour, i * 3);
+      }
+      return frame;
+    }),
+  );
+}
+
+const RGB = [
+  [255, 0, 0],
+  [0, 255, 0],
+  [0, 0, 255],
+];
+
+// Three 20×20 frames: red, green, blue.
+const animatedGif = await sharp(solidFrames(RGB, 20, 20), {
+  raw: { width: 20, height: 60, channels: 3, pageHeight: 20 },
+})
+  .gif({ delay: [100, 100, 100] })
+  .toBuffer();
+
+// Three 20×10 frames with EXIF orientation 6 → displayed 10×20.
+const orientedAnimatedWebp = await sharp(solidFrames(RGB, 20, 10), {
+  raw: { width: 20, height: 30, channels: 3, pageHeight: 10 },
+})
+  .webp({ delay: [100, 100, 100] })
+  .withMetadata({ orientation: 6 })
+  .toBuffer();
+
+const tallPng = await sharp({
+  create: { width: 1, height: 100, channels: 3, background: '#808080' },
+})
+  .png()
+  .toBuffer();
+
+const widePng = await sharp({
+  create: { width: 100, height: 1, channels: 3, background: '#808080' },
+})
+  .png()
+  .toBuffer();
+
+// A 1×5000 SVG: at the density a 300×300 cover needs, its long side would exceed librsvg's
+// 32767-pixel limit.
+const tallSvg = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="5000"><rect width="1" height="5000" fill="red"/></svg>',
+);
+
+// Six turbulence-filtered rects: librsvg needs more than 10 s for this 488-byte SVG, inside one
+// native call that sharp's `.timeout()` cannot interrupt.
+const heavySvg = Buffer.from(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000"><filter id="f" x="0" y="0" width="1" height="1"><feTurbulence baseFrequency="0.02" numOctaves="10"/></filter>${'<rect width="100%" height="100%" filter="url(#f)"/>'.repeat(6)}</svg>`,
+);
+
+// Larger than the boxes the fractional-size and cap tests request, so they still crop.
+const bigPng = await sharp({
+  create: { width: 400, height: 300, channels: 3, background: '#3366cc' },
+})
+  .png()
+  .toBuffer();
+
+// 100×80 photo-like JPEG carrying EXIF, including a GPS position.
+const exifJpeg = await sharp(texture(100, 80), {
+  raw: { width: 100, height: 80, channels: 3 },
+})
+  .jpeg({ quality: 90 })
+  .withExif({
+    IFD0: { Artist: 'Someone', Copyright: 'Someone' },
+    IFD3: {
+      GPSLatitudeRef: 'N',
+      GPSLatitude: '51/1 30/1 0/1',
+      GPSLongitudeRef: 'W',
+      GPSLongitude: '0/1 7/1 0/1',
+    },
+  })
+  .toBuffer();
+
+// Photo-like texture (smooth waves plus fine noise), so re-encoding loss is measurable.
+function texture(width: number, height: number): Buffer {
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 3;
+      const v =
+        128 +
+        50 * Math.sin(x / 7) * Math.cos(y / 11) +
+        30 * Math.sin((x + y) / 3.3) +
+        ((((x * 73856093) ^ (y * 19349663)) >>> 0) % 21) -
+        10;
+      raw[i] = Math.max(0, Math.min(255, v));
+      raw[i + 1] = Math.max(0, Math.min(255, 255 - v * 0.8));
+      raw[i + 2] = Math.max(0, Math.min(255, v * 0.5 + 60));
+    }
+  }
+  return raw;
+}
+
+// Identical stored pixels (300×200); only the EXIF orientation tag differs.
+const texturedJpeg = (orientation: number) =>
+  sharp(texture(300, 200), { raw: { width: 300, height: 200, channels: 3 } })
+    .jpeg({ quality: 95 })
+    .withMetadata({ orientation })
+    .toBuffer();
+
+/** Peak signal-to-noise ratio of two same-size images (Infinity when identical). */
+async function psnr(a: Buffer, b: Buffer): Promise<number> {
+  const x = await sharp(a).removeAlpha().raw().toBuffer();
+  const y = await sharp(b).removeAlpha().raw().toBuffer();
+  assert.equal(x.length, y.length);
+  let squared = 0;
+  for (let i = 0; i < x.length; i++) {
+    squared += (x[i] - y[i]) ** 2;
+  }
+  return squared === 0
+    ? Number.POSITIVE_INFINITY
+    : 10 * Math.log10((255 * 255 * x.length) / squared);
+}
+
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
@@ -143,7 +268,6 @@ function makeStorage(
       return { bucket: 'previews', key };
     },
     publicUrl: (ref) => `https://cdn/${ref.key}`,
-    canServeOriginalPublicly: (ref) => ref.bucket === 'previews',
   };
   return { storage, uploads };
 }
@@ -239,7 +363,14 @@ const fitVariant: MissingPreview = {
 afterEach(() => {
   resetResizerForTests();
   resetAppInstance();
+  mock.restoreAll();
 });
+
+/** Count SVG render processes (svgRaster spawns one node child per render). */
+function countRenders(): () => number {
+  const spawn = mock.method(childProcess, 'spawn');
+  return () => spawn.mock.callCount();
+}
 
 // ---------------------------------------------------------------------------
 // processTask — download / metadata / beforeSteps
@@ -684,7 +815,8 @@ describe('processTask — variants', () => {
 
   test('cover branch clamps each side to limits.resultDimension', async () => {
     installApp({ limits: { resultDimension: 100 } });
-    const { storage } = makeStorage(redPng);
+    // 400×300 is larger than the requested 300×300 box, so it is cover-cropped, to the cap.
+    const { storage } = makeStorage(bigPng);
     const { db, appendCalls } = makeDatabase(mediaDoc());
     new FrameworkResizer({
       storage,
@@ -694,9 +826,9 @@ describe('processTask — variants', () => {
       task({
         previews: [
           variant({
-            sizeKey: '5000x5000',
-            requestedWidth: 5000,
-            requestedHeight: 5000,
+            sizeKey: '300x300',
+            requestedWidth: 300,
+            requestedHeight: 300,
           }),
         ],
       }),
@@ -1498,6 +1630,1569 @@ describe('generate (eager)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Pipelines: an unregistered name never renders
+// ---------------------------------------------------------------------------
+
+describe('unknown pipeline', () => {
+  function countingStorage(fixture: Buffer) {
+    const base = makeStorage(fixture);
+    let downloads = 0;
+    const storage: ResizeStorage = {
+      ...base.storage,
+      download: async () => {
+        downloads += 1;
+        return fixture;
+      },
+    };
+    return { storage, uploads: base.uploads, downloads: () => downloads };
+  }
+
+  const isUnknownPipeline = (err: unknown) =>
+    err instanceof ResizeSetupError &&
+    err.code === 'RESIZE_PIPELINE_UNKNOWN' &&
+    err.message.includes("'watermark-v2'");
+
+  test('a queued task for an unregistered pipeline fails before download; nothing is stored', async () => {
+    installApp();
+    const { storage, uploads, downloads } = countingStorage(redPng);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { lockProvider, acquired } = makeLocks(true);
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(lockProvider) },
+      pipelines: { watermark: {} },
+    });
+    await assert.rejects(
+      () =>
+        processTask(task({ pipeline: 'watermark-v2', previews: [variant()] })),
+      isUnknownPipeline,
+    );
+    assert.equal(downloads(), 0);
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+    assert.deepEqual(acquired, []);
+  });
+
+  test('generate() with an unregistered pipeline throws before download', async () => {
+    installApp();
+    const { storage, uploads, downloads } = countingStorage(redPng);
+    const { db, appendCalls } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+          pipeline: 'watermark-v2',
+        }),
+      isUnknownPipeline,
+    );
+    assert.equal(downloads(), 0);
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+  });
+
+  test("'default' renders without being registered", async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db, pipelines: {} });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(created.length, 1);
+    assert.equal(uploads.length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Animated sources (config.animated)
+// ---------------------------------------------------------------------------
+
+describe('animated sources', () => {
+  const formats = ['webp', 'gif', 'avif', 'jpeg', 'png'];
+  const widthOnly = (format: string) =>
+    variant({
+      sizeKey: '10w',
+      format,
+      requestedWidth: 10,
+      requestedHeight: undefined,
+    });
+
+  async function framesOf(body: Buffer) {
+    const meta = await sharp(body, { animated: true }).metadata();
+    return {
+      pages: meta.pages ?? 1,
+      frameHeight: meta.pageHeight ?? meta.height,
+    };
+  }
+
+  async function pixelAt(body: Buffer, left: number, top: number) {
+    return [
+      ...(await sharp(body)
+        .removeAlpha()
+        .extract({ left, top, width: 1, height: 1 })
+        .raw()
+        .toBuffer()),
+    ];
+  }
+
+  const topLeftPixel = (body: Buffer) => pixelAt(body, 0, 0);
+
+  test('a 3-frame GIF: webp and gif keep every frame, other formats get the first frame', async () => {
+    installApp({
+      animated: true,
+      encode: { formats: { gif: {}, png: {} } },
+    });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await processTask(task({ previews: formats.map(widthOnly) }));
+
+    assert.equal(uploads.length, formats.length);
+    const bodies = new Map(uploads.map((u) => [u.key, u.body]));
+    const expectedPages: Record<string, number> = {
+      webp: 3,
+      gif: 3,
+      avif: 1,
+      jpeg: 1,
+      png: 1,
+    };
+    for (const row of appendCalls[0].previews) {
+      const { format } = row;
+      const body = bodies.get((row.storageRef as { key: string }).key);
+      assert.ok(body, `${format} uploaded`);
+      const { pages, frameHeight } = await framesOf(body);
+      assert.equal(pages, expectedPages[format], `${format} pages`);
+      assert.equal(frameHeight, 10, `${format} frame height`);
+      // Per-frame size recorded, not the height of all frames stacked.
+      assert.equal(row.actualWidth, 10, `${format} actualWidth`);
+      assert.equal(row.actualHeight, 10, `${format} actualHeight`);
+      if (expectedPages[format] === 1) {
+        const [r, g, b] = await topLeftPixel(body);
+        assert.ok(
+          r > 200 && g < 60 && b < 60,
+          `${format} is the first (red) frame`,
+        );
+      }
+    }
+    assert.deepEqual(
+      appendCalls[0].previews.map((p) => p.format).sort(),
+      [...formats].sort(),
+    );
+  });
+
+  test('an animation above limits.animationFrames keeps only the first frames', async () => {
+    installApp({ animated: true, limits: { animationFrames: 2 } });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await processTask(
+      task({ previews: [widthOnly('webp'), variant({ format: 'webp' })] }),
+    );
+    assert.equal(uploads.length, 2);
+    for (const upload of uploads) {
+      assert.equal((await framesOf(upload.body)).pages, 2);
+    }
+    const cover = appendCalls[0].previews.find((p) => p.sizeKey === '20x20');
+    assert.equal(cover?.actualWidth, 20);
+    assert.equal(cover?.actualHeight, 20);
+  });
+
+  test('animated: false (default) decodes only the first frame', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 10 }],
+      formats: ['webp'],
+    });
+    assert.deepEqual(await framesOf(uploads[0].body), {
+      pages: 1,
+      frameHeight: 10,
+    });
+  });
+
+  test('an animation with an EXIF orientation renders upright from its first frame', async () => {
+    // libvips cannot rotate a multi-page image, so orientation wins over the animation.
+    installApp({ animated: true });
+    const { storage, uploads } = makeStorage(orientedAnimatedWebp);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ fit: true }],
+      formats: ['webp'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created[0].actualWidth, 10);
+    assert.equal(created[0].actualHeight, 20);
+    assert.deepEqual(await framesOf(uploads[0].body), {
+      pages: 1,
+      frameHeight: 20,
+    });
+  });
+
+  test('a pipeline with variantSteps renders the first frame, so a watermark lands on every output', async () => {
+    installApp({ animated: true, encode: { formats: { gif: {} } } });
+    const mark = await sharp({
+      create: { width: 6, height: 6, channels: 3, background: '#ffffff' },
+    })
+      .png()
+      .toBuffer();
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      pipelines: {
+        default: {
+          variantSteps: [
+            async (img) =>
+              img.composite([{ input: mark, gravity: 'southeast' }]),
+          ],
+        },
+      },
+    });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['webp', 'gif'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 2);
+    for (const upload of uploads) {
+      assert.deepEqual(await framesOf(upload.body), {
+        pages: 1,
+        frameHeight: 20,
+      });
+      const [r0, g0, b0] = await topLeftPixel(upload.body);
+      assert.ok(r0 > 200 && g0 < 60 && b0 < 60, 'the first (red) frame');
+      const [r1, g1, b1] = await pixelAt(upload.body, 18, 18);
+      assert.ok(r1 > 200 && g1 > 200 && b1 > 200, 'the overlay is present');
+    }
+  });
+
+  test('limits.sourcePixels counts frames only when an output is animated', async () => {
+    // 20×20 frames: one frame (400 px) fits 800, all three (1200 px) do not.
+    installApp({ animated: true, limits: { sourcePixels: 800 } });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 10 }],
+      formats: ['jpeg', 'avif'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 2);
+    for (const upload of uploads) {
+      assert.equal((await framesOf(upload.body)).pages, 1);
+    }
+  });
+
+  test('an animation over limits.sourcePixels is shortened to the frames that fit', async () => {
+    installApp({ animated: true, limits: { sourcePixels: 800 } });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 10 }],
+      formats: ['webp'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created[0].actualHeight, 10);
+    assert.deepEqual(await framesOf(uploads[0].body), {
+      pages: 2,
+      frameHeight: 10,
+    });
+  });
+
+  test('a single animation frame over limits.sourcePixels is still refused', async () => {
+    installApp({ animated: true, limits: { sourcePixels: 300 } });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 10 }],
+          formats: ['webp'],
+        }),
+      (err: unknown) =>
+        err instanceof ResizeMediaError &&
+        err.code === 'RESIZE_SOURCE_TOO_LARGE',
+    );
+    assert.equal(uploads.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cover sizes: the derived side, fractional sizes
+// ---------------------------------------------------------------------------
+
+describe('cover sizes', () => {
+  test('width-only on a 1×100 source: the derived height is cropped to limits.resultDimension', async () => {
+    installApp({ limits: { resultDimension: 200 } });
+    const { storage, uploads } = makeStorage(tallPng);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '100w',
+            requestedWidth: 100,
+            requestedHeight: undefined,
+          }),
+        ],
+      }),
+    );
+    const meta = await sharp(uploads[0].body).metadata();
+    assert.deepEqual([meta.width, meta.height], [100, 200]);
+    assert.equal(appendCalls[0].previews[0].actualWidth, 100);
+    assert.equal(appendCalls[0].previews[0].actualHeight, 200);
+  });
+
+  test('height-only on a 100×1 source: the derived width is cropped to limits.resultDimension', async () => {
+    installApp({ limits: { resultDimension: 200 } });
+    const { storage, uploads } = makeStorage(widePng);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ height: 100 }],
+      formats: ['jpeg'],
+    });
+    const meta = await sharp(uploads[0].body).metadata();
+    assert.deepEqual([meta.width, meta.height], [200, 100]);
+    assert.equal(created[0].sizeKey, '100h');
+  });
+
+  test('width-only within the cap keeps the source aspect ratio', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng); // 64×48
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 32 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(created[0].actualWidth, 32);
+    assert.equal(created[0].actualHeight, 24);
+  });
+
+  test('a fractional size generates through generate()', async () => {
+    installApp();
+    const { storage } = makeStorage(bigPng);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 300.5, height: 200 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created[0].sizeKey, '301x200');
+    assert.equal(created[0].actualWidth, 301);
+    assert.equal(created[0].actualHeight, 200);
+  });
+
+  test('a fractional size generates through the queued path', async () => {
+    installApp();
+    const { storage } = makeStorage(bigPng);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    const size = { width: 300.5, height: 200 };
+    await processTask(
+      task({ previews: [toMissingPreview(size, getSizeKey(size), 'jpeg')] }),
+    );
+    const row = appendCalls[0].previews[0];
+    assert.equal(row.sizeKey, '301x200');
+    assert.equal(row.actualWidth, 301);
+    assert.equal(row.actualHeight, 200);
+  });
+
+  test('an old task payload with fractional dimensions is rounded before sharp', async () => {
+    installApp();
+    const { storage } = makeStorage(bigPng);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '301x200',
+            requestedWidth: 300.5,
+            requestedHeight: 199.8,
+          }),
+        ],
+      }),
+    );
+    const row = appendCalls[0].previews[0];
+    assert.equal(row.actualWidth, 301);
+    assert.equal(row.actualHeight, 200);
+    assert.equal(row.requestedWidth, 301);
+    assert.equal(row.requestedHeight, 200);
+  });
+
+  test('fit on an extreme aspect ratio keeps each side at least 1 pixel', async () => {
+    installApp();
+    // 1×5000 into the 2000×1200 box: scale 0.24 rounds the width to 0.
+    const needle = await sharp({
+      create: { width: 1, height: 5000, channels: 3, background: '#808080' },
+    })
+      .png()
+      .toBuffer();
+    const { storage } = makeStorage(needle);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ fit: true }],
+      formats: ['jpeg'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created[0].actualWidth, 1);
+    assert.equal(created[0].actualHeight, 1200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-call formats must be configured encoders
+// ---------------------------------------------------------------------------
+
+describe('unconfigured formats', () => {
+  test('generate() rejects formats without an encode.formats entry before any work', async () => {
+    installApp();
+    let downloads = 0;
+    const base = makeStorage(alphaPng);
+    const storage: ResizeStorage = {
+      ...base.storage,
+      download: async () => {
+        downloads += 1;
+        return alphaPng;
+      },
+    };
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg', 'jpg', 'raw', 'toString'],
+        }),
+      (err: unknown) => {
+        // A wrong per-call argument is a wiring error at the call site, not a boot-time config.
+        assert.ok(err instanceof ResizeSetupError);
+        assert.equal(err.code, 'RESIZE_FORMAT_NOT_CONFIGURED');
+        assert.match(err.message, /\[jpg, raw, toString\]/);
+        return true;
+      },
+    );
+    assert.equal(downloads, 0);
+    assert.equal(base.uploads.length, 0);
+  });
+
+  test('a queued variant with an unconfigured format fails alone and is logged', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(alphaPng);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await assert.rejects(
+      () =>
+        processTask(
+          task({ previews: [variant(), variant({ format: 'jpg' })] }),
+        ),
+      (err: unknown) =>
+        err instanceof ResizeGenerateError &&
+        err.missing.includes('default:default:20x20:jpg:none'),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].contentType, 'image/jpeg');
+    assert.deepEqual(
+      appendCalls[0].previews.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.ok(
+      logs.error.some(
+        (entry) =>
+          entry[1] instanceof ResizeSetupError &&
+          entry[1].code === 'RESIZE_FORMAT_NOT_CONFIGURED',
+      ),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EXIF orientation: no lossy re-encode of the original
+// ---------------------------------------------------------------------------
+
+describe('EXIF orientation quality', () => {
+  const sizes = [{ width: 100, height: 120 }, { fit: true }, { width: 100 }];
+
+  /** Generate PNG (lossless) previews and score each against a rotate-first reference. */
+  async function score(source: Buffer, pipeline?: Pipeline) {
+    resetResizerForTests();
+    resetAppInstance();
+    installApp({ encode: { formats: { png: {} } } });
+    const { storage, uploads } = makeStorage(source);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      ...(pipeline ? { pipelines: { default: pipeline } } : {}),
+    });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes,
+      formats: ['png'],
+    });
+    const scores = new Map<string, { dims: string; psnr: number }>();
+    for (const preview of created) {
+      const body = uploads.find(
+        (u) => u.key === (preview.storageRef as { key: string }).key,
+      )?.body as Buffer;
+      const reference = await (preview.fit
+        ? sharp(source)
+            .rotate()
+            .resize(2000, 1200, { fit: 'inside', withoutEnlargement: true })
+            .toColorspace('srgb')
+        : sharp(source)
+            .rotate()
+            .resize(preview.requestedWidth, preview.requestedHeight, {
+              fit: 'cover',
+              position: 'center',
+            })
+            .toColorspace('srgb')
+            .sharpen()
+      )
+        .png()
+        .toBuffer();
+      const out = await sharp(body).metadata();
+      const ref = await sharp(reference).metadata();
+      assert.deepEqual([out.width, out.height], [ref.width, ref.height]);
+      scores.set(preview.sizeKey, {
+        dims: `${out.width}x${out.height}`,
+        psnr: await psnr(body, reference),
+      });
+    }
+    return scores;
+  }
+
+  test('orientation 6 without beforeSteps: same dims and pixels as rotating first, no added loss', async () => {
+    const rotated = await score(await texturedJpeg(6));
+    const upright = await score(await texturedJpeg(1));
+    assert.deepEqual(
+      [...rotated].map(([key, s]) => `${key}=${s.dims}`).sort(),
+      ['100w=100x150', '100x120=100x120', 'fit=200x300'],
+    );
+    for (const [key, { psnr: db }] of rotated) {
+      assert.ok(db >= 50, `${key}: ${db.toFixed(2)} dB vs rotate-first`);
+      const baseline = upright.get(key)?.psnr ?? 0;
+      assert.ok(
+        db >= baseline - 0.5,
+        `${key}: ${db.toFixed(2)} dB vs orientation-1 ${baseline.toFixed(2)} dB`,
+      );
+    }
+  });
+
+  test('orientation 6 with beforeSteps: normalised first, without visible loss', async () => {
+    let seen: { width?: number; height?: number } = {};
+    const scores = await score(await texturedJpeg(6), {
+      beforeSteps: [
+        async (buf) => {
+          const meta = await sharp(buf).metadata();
+          seen = { width: meta.width, height: meta.height };
+          return buf;
+        },
+      ],
+    });
+    assert.deepEqual(seen, { width: 200, height: 300 });
+    assert.equal(scores.size, 3);
+    for (const [key, { psnr: db }] of scores) {
+      // A default-quality JPEG round trip of this texture scores about 35 dB.
+      assert.ok(db >= 45, `${key}: ${db.toFixed(2)} dB vs rotate-first`);
+    }
+  });
+
+  test('an oriented WebP with beforeSteps is normalised with a fast lossy encode', async () => {
+    // Lossless WebP of a large photo takes seconds and tens of MB; quality 95 is enough for
+    // an intermediate.
+    const source = await sharp(texture(300, 200), {
+      raw: { width: 300, height: 200, channels: 3 },
+    })
+      .webp({ quality: 95 })
+      .withMetadata({ orientation: 6 })
+      .toBuffer();
+    let chunk = '';
+    let seen: { width?: number; height?: number } = {};
+    installApp({ encode: { formats: { png: {} } } });
+    const { storage } = makeStorage(source);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      pipelines: {
+        default: {
+          beforeSteps: [
+            async (buf) => {
+              // Simple-format WebP: the first chunk names the codec (VP8 lossy, VP8L lossless).
+              chunk = Buffer.from(buf).toString('ascii', 12, 16);
+              const meta = await sharp(buf).metadata();
+              seen = { width: meta.width, height: meta.height };
+              return buf;
+            },
+          ],
+        },
+      },
+    });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 100 }],
+      formats: ['png'],
+    });
+    assert.equal(chunk, 'VP8 ');
+    assert.deepEqual(seen, { width: 200, height: 300 });
+    assert.equal(created[0].actualHeight, 150);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SVG rasterization stays within librsvg's side limit
+// ---------------------------------------------------------------------------
+
+describe('SVG raster size', () => {
+  test('a 1×5000 SVG renders cover and fit variants', async () => {
+    installApp();
+    const { storage } = makeStorage(tallSvg);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc({
+        original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+      }),
+      sizes: [{ width: 300, height: 300 }, { fit: true }],
+      formats: ['jpeg'],
+    });
+    assert.equal(failed, 0);
+    const dims = Object.fromEntries(
+      created.map((p) => [p.sizeKey, `${p.actualWidth}x${p.actualHeight}`]),
+    );
+    assert.deepEqual(dims, { '300x300': '300x300', fit: '1x1200' });
+  });
+
+  test('an SVG wider than the side limit keeps its exact fit size', async () => {
+    // 40000 px wide at 72 dpi: the cover decode drops below 72 dpi, fit must not.
+    installApp();
+    const wideSvg = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="40000" height="300"><rect width="40000" height="300" fill="red"/></svg>',
+    );
+    const { storage } = makeStorage(wideSvg);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc({
+        original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+      }),
+      sizes: [{ fit: true }, { width: 300, height: 300 }, { height: 25 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(failed, 0);
+    const dims = Object.fromEntries(
+      created.map((p) => [p.sizeKey, `${p.actualWidth}x${p.actualHeight}`]),
+    );
+    // 25 × 40000 / 300 = 3333.3: exact although the pixel limit allows only a coarse size read.
+    assert.deepEqual(dims, {
+      fit: '2000x15',
+      '300x300': '300x300',
+      '25h': '3333x25',
+    });
+  });
+
+  test('a 1×40000 SVG renders its fit variant (no 72 dpi decode over the side limit)', async () => {
+    installApp();
+    const needleSvg = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="40000"><rect width="1" height="40000" fill="red"/></svg>',
+    );
+    const { storage } = makeStorage(needleSvg);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc({
+        original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+      }),
+      sizes: [{ fit: true }, { width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(failed, 0);
+    const dims = Object.fromEntries(
+      created.map((p) => [p.sizeKey, `${p.actualWidth}x${p.actualHeight}`]),
+    );
+    assert.deepEqual(dims, { fit: '1x1200', '300x300': '300x300' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A failed persist names what was uploaded
+// ---------------------------------------------------------------------------
+
+describe('persist failure', () => {
+  test('logs the uploaded but unrecorded storage refs, then rethrows', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const dbDown = new Error('db down');
+    const db = fakeDb({
+      appendPreviews: async () => {
+        throw dbDown;
+      },
+    });
+    const r = new FrameworkResizer({ storage, db });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg', 'webp'],
+        }),
+      (err: unknown) => err === dbDown,
+    );
+    assert.equal(uploads.length, 2);
+    const entry = logs.error.find((l) => l[1] === dbDown);
+    assert.ok(entry, 'the persist failure is logged');
+    for (const upload of uploads) {
+      assert.ok(
+        String(entry[0]).includes(upload.key),
+        `${upload.key} is named in the log`,
+      );
+    }
+  });
+
+  /** A database that stores the first preview, then fails (a write of one row at a time). */
+  function failsAfterFirst(reload: () => Promise<MediaLike | null>) {
+    const media = mediaDoc();
+    const dbDown = new Error('db down after one row');
+    const db: ResizeDatabase = {
+      ...fakeDb(),
+      loadMedia: reload,
+      appendPreviews: async (_mediaId, previews) => {
+        media.previews = [previews[0]];
+        throw dbDown;
+      },
+    };
+    return { db, media, dbDown };
+  }
+
+  test('a write that stopped part-way names only the uploads that are not stored', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const state: { media?: MediaLike } = {};
+    const { db, media, dbDown } = failsAfterFirst(
+      async () => state.media ?? null,
+    );
+    state.media = media;
+    const r = new FrameworkResizer({ storage, db });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg', 'webp'],
+        }),
+      (err: unknown) => err === dbDown,
+    );
+    const entry = logs.error.find((l) => l[1] === dbDown);
+    assert.ok(entry);
+    const storedRef = media.previews?.[0]?.storageRef as
+      | { key: string }
+      | undefined;
+    assert.ok(storedRef, 'the first row was stored');
+    const storedKey = storedRef.key;
+    const unstored = uploads.filter((u) => u.key !== storedKey);
+    assert.equal(unstored.length, 1);
+    assert.ok(String(entry[0]).includes(unstored[0].key), 'unstored is named');
+    assert.ok(
+      !String(entry[0]).includes(storedKey),
+      'a stored row is never offered for deletion',
+    );
+  });
+
+  test('a failing reload after a failed write names every upload', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const { db, dbDown } = failsAfterFirst(async () => {
+      throw new Error('reload failed too');
+    });
+    const r = new FrameworkResizer({ storage, db });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg', 'webp'],
+        }),
+      (err: unknown) => err === dbDown,
+    );
+    const entry = logs.error.find((l) => l[1] === dbDown);
+    assert.ok(entry);
+    for (const upload of uploads) {
+      assert.ok(String(entry[0]).includes(upload.key), upload.key);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SVG: rendered once per task, in a child process with a hard time limit
+// ---------------------------------------------------------------------------
+
+describe('SVG rendering', () => {
+  const svgDoc = () =>
+    mediaDoc({
+      original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+    });
+
+  /** True while a process with `pid` exists (signal 0 only checks). */
+  function isRunning(pid: number | undefined): boolean {
+    if (pid === undefined) {
+      return false;
+    }
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  test('eager: one render however many sizes and formats are requested', async () => {
+    installApp();
+    const renders = countRenders();
+    const { storage, uploads } = makeStorage(smallSvg);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: svgDoc(),
+      sizes: [{ width: 200, height: 200 }, { width: 50 }, { fit: true }],
+      formats: ['jpeg', 'webp', 'avif'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 9);
+    assert.equal(uploads.length, 9);
+    assert.equal(renders(), 1);
+  });
+
+  test('queued: one render per task', async () => {
+    installApp();
+    const renders = countRenders();
+    const { storage, uploads } = makeStorage(smallSvg);
+    const { db, appendCalls } = makeDatabase(svgDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await processTask(
+      task({
+        previews: [
+          variant(),
+          variant({ format: 'webp' }),
+          variant({
+            sizeKey: '40w',
+            requestedWidth: 40,
+            requestedHeight: undefined,
+          }),
+          fitVariant,
+        ],
+      }),
+    );
+    assert.equal(uploads.length, 4);
+    assert.equal(appendCalls[0].previews.length, 4);
+    assert.equal(renders(), 1);
+  });
+
+  test('eager: a render over limits.processingTimeoutSeconds is killed (RESIZE_SVG_RENDER_TIMEOUT)', {
+    timeout: 8000,
+  }, async () => {
+    installApp({ limits: { processingTimeoutSeconds: 1 } });
+    const spawn = mock.method(childProcess, 'spawn');
+    const { storage, uploads } = makeStorage(heavySvg);
+    const { db, appendCalls } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const started = Date.now();
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: svgDoc(),
+          sizes: [{ width: 300, height: 300 }, { fit: true }],
+          formats: ['jpeg', 'webp'],
+        }),
+      (err: unknown) =>
+        err instanceof ResizeMediaError &&
+        err.code === 'RESIZE_SVG_RENDER_TIMEOUT' &&
+        err.mediaId === 'm1',
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 3500, `settled after ${elapsed} ms`);
+    assert.equal(spawn.mock.callCount(), 1);
+    assert.equal(
+      isRunning((spawn.mock.calls[0].result as { pid?: number }).pid),
+      false,
+    );
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+  });
+
+  test('queued: a render over the time limit fails the task (RESIZE_SVG_RENDER_TIMEOUT); nothing is stored', {
+    timeout: 8000,
+  }, async () => {
+    installApp({ limits: { processingTimeoutSeconds: 1 } });
+    const { storage, uploads } = makeStorage(heavySvg);
+    const { db, appendCalls } = makeDatabase(svgDoc());
+    const { lockProvider, acquired } = makeLocks(true);
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(lockProvider) },
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant(), fitVariant] })),
+      (err: unknown) =>
+        err instanceof ResizeMediaError &&
+        err.code === 'RESIZE_SVG_RENDER_TIMEOUT',
+    );
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+    assert.deepEqual(acquired, []);
+  });
+
+  /** Red, green and blue of the pixel at x, y. */
+  async function rgbAt(body: Buffer, x: number, y: number) {
+    return [
+      ...(await sharp(body)
+        .removeAlpha()
+        .extract({ left: x, top: y, width: 1, height: 1 })
+        .raw()
+        .toBuffer()),
+    ];
+  }
+  const isRed = ([r, g, b]: number[]) => r > 200 && g < 60 && b < 60;
+  const isBlue = ([r, g, b]: number[]) => b > 200 && r < 60 && g < 60;
+
+  test('beforeSteps receive the rendered PNG: one render, and a large size stays sharp', async () => {
+    installApp({ encode: { formats: { png: {} } } });
+    const renders = countRenders();
+    // Left half red, right half blue. A 2000 px preview upscaled from the 20×10 natural size
+    // would blur the edge over about 100 px.
+    const { storage, uploads } = makeStorage(
+      Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="10" height="10" fill="red"/><rect x="10" width="10" height="10" fill="blue"/></svg>',
+      ),
+    );
+    const { db } = makeDatabase(null);
+    const seen: Array<{ head: string; format?: string; width?: number }> = [];
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      pipelines: {
+        default: {
+          beforeSteps: [
+            async (buf, { metadata }) => {
+              seen.push({
+                head: Buffer.from(buf).subarray(0, 8).toString('latin1'),
+                format: metadata.format,
+                width: metadata.width,
+              });
+              // A step that decodes: it must get pixels, not SVG markup to render in-process.
+              return sharp(buf).toBuffer();
+            },
+          ],
+        },
+      },
+    });
+    const { created, failed } = await r.generate({
+      media: svgDoc(),
+      sizes: [{ width: 2000 }],
+      formats: ['png'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(renders(), 1);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].head, '\x89PNG\r\n\x1a\n');
+    assert.equal(seen[0].format, 'png');
+    assert.equal(seen[0].width, 2000);
+    assert.deepEqual(
+      [created[0].actualWidth, created[0].actualHeight],
+      [2000, 1000],
+    );
+    assert.ok(isRed(await rgbAt(uploads[0].body, 990, 500)), 'sharp edge');
+    assert.ok(isBlue(await rgbAt(uploads[0].body, 1010, 500)), 'sharp edge');
+  });
+
+  test('a derived side over the cap is cropped, even when the SVG size rounds it under', async () => {
+    // 1000×0.6 reports as 1000×1: at height 5 the real width is 8333, over the cap of 5000, so
+    // the preview is a 5000×5 crop of the middle, not the whole SVG squeezed into 5000×5.
+    installApp({ encode: { formats: { png: {} } } });
+    const { storage, uploads } = makeStorage(
+      Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="0.6"><rect width="300" height="0.6" fill="red"/><rect x="300" width="700" height="0.6" fill="blue"/></svg>',
+      ),
+    );
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: svgDoc(),
+      sizes: [{ height: 5 }],
+      formats: ['png'],
+    });
+    assert.equal(failed, 0);
+    assert.deepEqual(
+      [created[0].actualWidth, created[0].actualHeight],
+      [5000, 5],
+    );
+    // Cropped: x = 1200 shows SVG x ≈ 344 (blue). Squeezed it would show x = 240 (red).
+    assert.ok(isBlue(await rgbAt(uploads[0].body, 1200, 2)));
+  });
+
+  test('a derived side follows the SVG, not the rounded raster', async () => {
+    // 620w alone renders at density 223: the raster is 619×310 (619.4×309.7), from which a
+    // width-only resize would derive 310.5 → 311.
+    installApp();
+    const { storage } = makeStorage(
+      Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="red"/></svg>',
+      ),
+    );
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: svgDoc(),
+      sizes: [{ width: 620 }, { height: 25 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(failed, 0);
+    const dims = Object.fromEntries(
+      created.map((p) => [p.sizeKey, `${p.actualWidth}x${p.actualHeight}`]),
+    );
+    assert.deepEqual(dims, { '620w': '620x310', '25h': '50x25' });
+  });
+
+  test('a normal SVG keeps its output sizes for cover, fit, width-only and height-only sizes', async () => {
+    // A derived side (width-only, height-only) is the nearest whole pixel to the SVG's real
+    // aspect ratio, whatever density the shared raster was rendered at. The per-variant
+    // re-render this replaces usually agreed; where it was off by one, the comment says so.
+    const cases: Array<[string, Record<string, string>]> = [
+      [
+        'width="200" height="100"',
+        {
+          fit: '200x100',
+          // 620 × 100 / 200 = 310 exactly (the raster is 619×310 at this density).
+          '620w': '620x310',
+          '100w': '100x50',
+          '400h': '800x400',
+          '25h': '50x25',
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'width="300" height="200"',
+        {
+          fit: '300x200',
+          '620w': '620x413',
+          '100w': '100x67',
+          '400h': '600x400',
+          '25h': '38x25',
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'width="8" height="8"',
+        {
+          fit: '8x8',
+          '620w': '620x620',
+          '100w': '100x100',
+          '400h': '400x400',
+          '25h': '25x25',
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'width="1000" height="10"',
+        {
+          fit: '1000x10',
+          '620w': '620x6',
+          '100w': '100x1',
+          '400h': '5000x400',
+          '25h': '2500x25', // 25 × 1000 / 10; the re-render gave 2497
+
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'width="37" height="91"',
+        {
+          fit: '37x91',
+          '620w': '620x1525', // 620 × 91 / 37 = 1524.86; the re-render gave 1524
+
+          '100w': '100x246',
+          '400h': '163x400',
+          '25h': '10x25',
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'width="333.3" height="77.7"',
+        {
+          fit: '333x78',
+          '620w': '620x145', // 620 × 77.7 / 333.3 = 144.54
+          '100w': '100x23',
+          '400h': '1716x400', // 400 × 333.3 / 77.7 = 1715.83; the re-render gave 1717
+          '25h': '107x25',
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'viewBox="0 0 100 50"',
+        {
+          fit: '100x50',
+          '620w': '620x310',
+          '100w': '100x50',
+          '400h': '800x400',
+          '25h': '50x25',
+          '300x300': '300x300',
+        },
+      ],
+      [
+        'width="3000" height="2000"',
+        {
+          fit: '1800x1200',
+          '620w': '620x413',
+          '100w': '100x67',
+          '400h': '600x400',
+          '25h': '38x25',
+          '300x300': '300x300',
+        },
+      ],
+    ];
+    for (const [attributes, expected] of cases) {
+      resetResizerForTests();
+      resetAppInstance();
+      installApp();
+      const { storage, uploads } = makeStorage(
+        Buffer.from(
+          `<svg xmlns="http://www.w3.org/2000/svg" ${attributes}><rect width="100%" height="100%" fill="red"/></svg>`,
+        ),
+      );
+      const { db } = makeDatabase(null);
+      const r = new FrameworkResizer({ storage, db });
+      const { created, failed } = await r.generate({
+        media: svgDoc(),
+        sizes: [
+          { fit: true },
+          { width: 620 },
+          { width: 100 },
+          { height: 400 },
+          { height: 25 },
+          { width: 300, height: 300 },
+        ],
+        formats: ['jpeg'],
+      });
+      assert.equal(failed, 0, attributes);
+      const dims = Object.fromEntries(
+        created.map((p) => [p.sizeKey, `${p.actualWidth}x${p.actualHeight}`]),
+      );
+      assert.deepEqual(dims, expected, attributes);
+      for (const upload of uploads) {
+        assert.equal((await sharp(upload.body).metadata()).format, 'jpeg');
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One preview row per identity: the database reports what it stored
+// ---------------------------------------------------------------------------
+
+describe('one preview row per identity', () => {
+  /**
+   * A database that stores only the previews `keep` accepts, as if another worker won the rest.
+   * `load` answers every loadMedia (the worker's first read, then its reloads).
+   */
+  function partialDb(
+    load: () => MediaLike | null,
+    keep: (p: Preview) => boolean,
+  ) {
+    const appended: Preview[][] = [];
+    const db: ResizeDatabase = {
+      ...fakeDb({ load: async () => load() }),
+      appendPreviews: async (_mediaId, previews) => {
+        appended.push(previews);
+        return previews.filter(keep);
+      },
+    };
+    return { db, appended };
+  }
+
+  // The webp row another worker stored first.
+  const otherWorkersWebp: Preview = {
+    storageRef: { bucket: 'previews', key: 'other-worker.webp' },
+    identity: 'default:default:20x20:webp:none',
+    sizeKey: '20x20',
+    format: 'webp',
+    contentType: 'image/webp',
+  };
+
+  /** The media without previews on the first read, with the other worker's row afterwards. */
+  function racedMedia() {
+    let loads = 0;
+    return () => {
+      loads += 1;
+      return mediaDoc({ previews: loads === 1 ? [] : [otherWorkersWebp] });
+    };
+  }
+
+  test('every generated preview carries its identity', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { db, appendCalls } = makeDatabase(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      pipelines: { watermark: {} },
+    });
+    await processTask(
+      task({
+        pipeline: 'watermark',
+        previews: [variant({ filters: { blur: 3 } }), fitVariant],
+      }),
+    );
+    assert.deepEqual(appendCalls[0].previews.map((p) => p.identity).sort(), [
+      'default:watermark:20x20:jpeg:blur:3',
+      'default:watermark:fit:jpeg:none',
+    ]);
+
+    resetResizerForTests();
+    const r = new FrameworkResizer({ storage, db, name: 'listings' });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['webp'],
+    });
+    assert.equal(created[0].identity, 'listings:default:20x20:webp:none');
+  });
+
+  test('eager: rows the database left out are not created, not appended and logged once', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    // Eager generate never loads first: every read is the reload after the write.
+    const { db } = partialDb(
+      () => mediaDoc({ previews: [otherWorkersWebp] }),
+      (p) => p.format === 'jpeg',
+    );
+    const fired: Preview[] = [];
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      hooks: {
+        onPreviewGenerated: (preview: unknown) => {
+          fired.push(preview as Preview);
+        },
+      },
+    });
+    const media = mediaDoc();
+    const { created, failed } = await r.generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(failed, 0);
+    assert.deepEqual(
+      created.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.deepEqual(
+      media.previews?.map((p) => p.format),
+      ['jpeg'],
+    );
+    assert.deepEqual(
+      fired.map((p) => p.format),
+      ['jpeg'],
+    );
+    const webpKey = uploads.find((u) => u.contentType === 'image/webp')?.key;
+    assert.ok(webpKey);
+    const mentions = [...logs.warn, ...logs.error, ...logs.info].filter((l) =>
+      String(l[0]).includes(webpKey),
+    );
+    assert.equal(mentions.length, 1, 'the unrecorded upload is logged once');
+    assert.match(String(mentions[0][0]), /another worker/);
+    assert.equal(logs.error.length, 0);
+  });
+
+  test('queued: an identity another worker stored first counts as covered', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { db, appended } = partialDb(
+      racedMedia(),
+      (p) => p.format === 'jpeg',
+    );
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await processTask(
+      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    );
+    assert.equal(appended.length, 1);
+    assert.equal(appended[0].length, 2);
+  });
+
+  test('queued: a row left out that the reload does not show is not stored: the task is incomplete', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const { db } = partialDb(
+      () => mediaDoc(),
+      (p) => p.format === 'jpeg',
+    );
+    new FrameworkResizer({
+      storage,
+      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+    });
+    await assert.rejects(
+      () =>
+        processTask(
+          task({ previews: [variant(), variant({ format: 'webp' })] }),
+        ),
+      (err: unknown) =>
+        err instanceof ResizeGenerateError &&
+        err.code === 'RESIZE_WORKER_INCOMPLETE' &&
+        err.missing.includes('default:default:20x20:webp:none'),
+    );
+    const webpKey = uploads.find((u) => u.contentType === 'image/webp')?.key;
+    assert.ok(webpKey);
+    const entry = logs.error.find((l) => String(l[0]).includes(webpKey));
+    assert.ok(entry, 'the unrecorded upload is named');
+    assert.doesNotMatch(String(entry[0]), /another worker/);
+  });
+
+  test('rows left out because the media no longer exists are reported as such', async () => {
+    const { logs } = installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    // A driver resolves with an empty list when the media document is gone.
+    const { db } = partialDb(
+      () => null,
+      () => false,
+    );
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(failed, 0);
+    assert.deepEqual(created, []);
+    const entries = logs.warn.filter((l) =>
+      /no longer exists/.test(String(l[0])),
+    );
+    assert.equal(entries.length, 1);
+    for (const upload of uploads) {
+      assert.ok(String(entries[0][0]).includes(upload.key), upload.key);
+    }
+    assert.ok(
+      ![...logs.warn, ...logs.error].some((l) =>
+        /another worker/.test(String(l[0])),
+      ),
+    );
+  });
+
+  test('a database that resolves with nothing stored every row', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const media = mediaDoc();
+    const { created } = await r.generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(created.length, 2);
+    assert.equal(media.previews?.length, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A source no larger than a WxH box: a cleaned preview at its own size
+// ---------------------------------------------------------------------------
+
+describe('a source smaller than the box', () => {
+  test('a 100×80 JPEG with EXIF and GPS at 300×300 gives 100×80 in every format, without EXIF', async () => {
+    installApp();
+    assert.ok((await sharp(exifJpeg).metadata()).exif, 'fixture has EXIF');
+    const { storage, uploads } = makeStorage(exifJpeg);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp', 'avif'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 3);
+    for (const preview of created) {
+      assert.equal(preview.sizeKey, '300x300');
+      assert.equal(preview.actualWidth, 100, preview.format);
+      assert.equal(preview.actualHeight, 80, preview.format);
+    }
+    for (const upload of uploads) {
+      const meta = await sharp(upload.body).metadata();
+      assert.deepEqual([meta.width, meta.height], [100, 80], upload.key);
+      assert.equal(meta.exif, undefined, `${upload.key} has no EXIF`);
+    }
+  });
+
+  test('a pipeline with variantSteps keeps the full box its steps were written for', async () => {
+    // A 200×50 watermark composited onto a 150×150 own-size image would fail every time.
+    installApp();
+    const mark = await sharp({
+      create: { width: 200, height: 50, channels: 3, background: '#ffffff' },
+    })
+      .png()
+      .toBuffer();
+    const small = await sharp(texture(150, 150), {
+      raw: { width: 150, height: 150, channels: 3 },
+    })
+      .jpeg()
+      .withExif({ IFD0: { Artist: 'Someone' } })
+      .toBuffer();
+    const { storage, uploads } = makeStorage(small);
+    const { db } = makeDatabase(null);
+    let steps = 0;
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      pipelines: {
+        default: {
+          variantSteps: [
+            async (img) => {
+              steps += 1;
+              return img.composite([{ input: mark, gravity: 'southeast' }]);
+            },
+          ],
+        },
+      },
+    });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(steps, 2);
+    for (const preview of created) {
+      assert.deepEqual([preview.actualWidth, preview.actualHeight], [300, 300]);
+    }
+    for (const upload of uploads) {
+      const meta = await sharp(upload.body).metadata();
+      assert.deepEqual([meta.width, meta.height], [300, 300]);
+      assert.equal(meta.exif, undefined);
+      const corner = await sharp(upload.body)
+        .extract({ left: 290, top: 290, width: 1, height: 1 })
+        .raw()
+        .toBuffer();
+      assert.ok(
+        corner[0] > 200 && corner[1] > 200 && corner[2] > 200,
+        'overlay',
+      );
+    }
+  });
+
+  test('fitting is decided against the requested box, then the cap still applies', async () => {
+    // 120×60 fits the requested 200×200 box; the cap of 100 then scales it to 100×50 instead of
+    // cropping it to the capped 100×100.
+    installApp({ limits: { resultDimension: 100 } });
+    const source = await sharp({
+      create: { width: 120, height: 60, channels: 3, background: '#808080' },
+    })
+      .png()
+      .toBuffer();
+    const { storage } = makeStorage(source);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 200, height: 200 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(
+      [created[0].actualWidth, created[0].actualHeight],
+      [100, 50],
+    );
+  });
+
+  test('an image that is not scaled is not sharpened either', async () => {
+    installApp({ encode: { formats: { png: {} } } });
+    const { storage, uploads } = makeStorage(exifJpeg);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['png'],
+    });
+    // Lossless output of an unscaled, unsharpened image: the decoded source pixels.
+    assert.equal(
+      await psnr(uploads[0].body, exifJpeg),
+      Number.POSITIVE_INFINITY,
+    );
+  });
+
+  test('a source larger than the box in one direction is still cover-cropped', async () => {
+    installApp();
+    const wide = await sharp({
+      create: { width: 1000, height: 200, channels: 3, background: '#808080' },
+    })
+      .png()
+      .toBuffer();
+    const { storage } = makeStorage(wide);
+    const { db } = makeDatabase(null);
+    const r = new FrameworkResizer({ storage, db });
+    const { created } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(
+      [created[0].actualWidth, created[0].actualHeight],
+      [300, 300],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // runResizeWorker (07 · §11)
 // ---------------------------------------------------------------------------
 
@@ -2042,6 +3737,7 @@ describe('scoped generation', () => {
       name: 'listings',
       storage,
       db,
+      pipelines: { watermark: {} },
     });
     const watermarked = await listings.generate({
       media: mediaDoc(),
@@ -2057,7 +3753,11 @@ describe('scoped generation', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      pipelines: { watermark: {} },
+    });
     const media = mediaDoc({ previews: [cleanPreview] });
     const same = await r.generate({
       media,
@@ -2084,6 +3784,7 @@ describe('scoped generation', () => {
     new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
+      pipelines: { watermark: {} },
     });
     await processTask(task({ pipeline: 'watermark', previews: [variant()] }));
     assert.ok(acquired.some((key) => key.includes(':watermark:')));
@@ -2100,6 +3801,7 @@ describe('scoped generation', () => {
     new FrameworkResizer({
       storage,
       db: { ...db, ...fakeLockMethods(lockProvider) },
+      pipelines: { watermark: {} },
     });
     await assert.rejects(
       () => processTask(task({ pipeline: 'watermark', previews: [variant()] })),

@@ -90,6 +90,7 @@ describe('ResizeTaskModel.modelSchema — spec/08 §12 fields', () => {
   test('lease / timestamp / error fields are present', () => {
     const s = ResizeTaskModel.modelSchema;
     for (const k of [
+      'availableAt',
       'leasedBy',
       'leaseToken',
       'leaseExpiresAt',
@@ -137,15 +138,26 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     });
   });
 
-  test('{ queue:1, status:1, createdAt:1 } with no options (lease hot path)', () => {
-    const idx = byFields(buildIndexes(), { queue: 1, status: 1, createdAt: 1 });
+  test('{ queue:1, status:1, availableAt:1 } with no options (claim hot path)', () => {
+    const idx = byFields(buildIndexes(), {
+      queue: 1,
+      status: 1,
+      availableAt: 1,
+    });
     assert.ok(idx);
     assert.deepEqual(idx[1], {});
-    // The queue-less lease index is gone: every lease filters by queue.
-    assert.equal(
-      byFields(buildIndexes(), { status: 1, createdAt: 1 }),
-      undefined,
-    );
+    // The claim no longer orders by createdAt, and every claim filters by queue.
+    for (const old of [
+      { queue: 1, status: 1, createdAt: 1 },
+      { status: 1, createdAt: 1 },
+    ]) {
+      assert.equal(byFields(buildIndexes(), old), undefined);
+    }
+  });
+
+  test('availableAt defaults to the insert time', () => {
+    assert.equal(ResizeTaskModel.modelSchema.availableAt.type, Date);
+    assert.equal(ResizeTaskModel.modelSchema.availableAt.default, Date.now);
   });
 
   test('{ leaseExpiresAt:1 } partial to status:processing, NOT sparse', () => {

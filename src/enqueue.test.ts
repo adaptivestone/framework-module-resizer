@@ -270,6 +270,47 @@ describe('enqueue', () => {
     assert.ok(errors.length >= 1);
   });
 
+  test('acquires the dispatch locks in parallel; held and rejected locks still drop out', async () => {
+    const { errors } = installFakeApp();
+    const { tasks, calls } = makeTasks();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const locks: FakeLocks = {
+      acquire: async (key) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setImmediate(resolve));
+        inFlight -= 1;
+        if (key.endsWith(':avif:none')) {
+          throw new Error('lock backend down');
+        }
+        return !key.endsWith(':webp:none'); // webp is held by a concurrent read
+      },
+      release: async () => {},
+    };
+    const r = makeResizer({ tasks, locks });
+    const enqueued = await enqueue(
+      r,
+      'm1',
+      'default',
+      [
+        variant(),
+        variant({ format: 'webp' }),
+        variant({ format: 'avif' }),
+        variant({ sizeKey: '100x100' }),
+      ],
+      'default',
+    );
+    assert.equal(maxInFlight, 4);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(
+      calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
+      ['100x100:jpeg', '300x300:jpeg'],
+    );
+    assert.equal(enqueued, 2);
+    assert.equal(errors.length, 1);
+  });
+
   test('does not call the task queue when no lock survives', async () => {
     installFakeApp();
     const { tasks, calls } = makeTasks();

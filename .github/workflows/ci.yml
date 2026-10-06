@@ -53,3 +53,41 @@ jobs:
       # the flag onto the repo's own test script, so the strip-types flag stays single-sourced.
       - name: Run tests (with coverage)
         run: node --run test -- --experimental-test-coverage
+
+  # The `ci` job installs the newest versions. This one runs the same checks on the oldest
+  # supported Node major (the newest release of it) with every peer at the lowest version its
+  # range allows, so a declared minimum that stopped working is caught here and not in a host.
+  min-versions:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      MONGOMS_DISABLE_POSTINSTALL: '1'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Cache mongod binary (mongodb-memory-server)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongod-${{ runner.os }}-mms11
+
+      - name: npm clean install
+        run: npm ci
+
+      # Read the minimums from package.json, so this job follows the peer ranges.
+      - name: Install the minimum peer versions
+        run: |
+          npm install --no-save $(node -p "Object.entries(require('./package.json').peerDependencies).map(([name, range]) => name + '@' + range.replace(/^[^0-9]*/, '')).join(' ')")
+
+      - run: node --run types:check
+      - run: node --run build
+      - run: node --run test

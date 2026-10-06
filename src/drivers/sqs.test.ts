@@ -544,6 +544,19 @@ describe('SqsTaskQueue lease operations', () => {
     }
     assert.equal(deletes.length, 0);
   });
+  test('release makes the message visible again at once, without deleting it', async () => {
+    const { client, changeVis, deletes } = makeFakeSqsClient();
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const task = claimedTask({
+      queue: 'bulk',
+      token: JSON.stringify([BULK_URL, 'bulk-rh']),
+    });
+    assert.equal(await tasks.release(task), true);
+    assert.deepEqual(changeVis, [
+      { QueueUrl: BULK_URL, ReceiptHandle: 'bulk-rh', VisibilityTimeout: 0 },
+    ]);
+    assert.equal(deletes.length, 0);
+  });
   test('a dead task is sent with its error and attempt count before deletion', async () => {
     const { client, commands, sent, deletes } = makeFakeSqsClient();
     const tasks = new SqsTaskQueue({
@@ -607,15 +620,23 @@ describe('SqsTaskQueue lease operations', () => {
       /mid is dead.*no deadLetterQueueUrl.*handler boom/,
     );
   });
-  test('lost receipt errors report false for renew, complete, and fail', async () => {
+  test('lost receipt errors report false for renew, complete, fail, and release', async () => {
     for (const name of [
       'ReceiptHandleIsInvalid',
       'MessageNotInflight',
       'InvalidParameterValue',
     ]) {
-      for (const operation of ['renew', 'complete', 'retry', 'dead']) {
+      for (const operation of [
+        'renew',
+        'complete',
+        'retry',
+        'dead',
+        'release',
+      ]) {
         const command =
-          operation === 'renew' || operation === 'retry'
+          operation === 'renew' ||
+          operation === 'retry' ||
+          operation === 'release'
             ? 'ChangeMessageVisibilityCommand'
             : 'DeleteMessageCommand';
         const { client } = makeFakeSqsClient({
@@ -631,11 +652,13 @@ describe('SqsTaskQueue lease operations', () => {
             ? await tasks.renew(task, 60_000)
             : operation === 'complete'
               ? await tasks.complete(task)
-              : await tasks.fail(
-                  task,
-                  operation === 'dead' ? 'dead' : { retryAt: new Date() },
-                  'failed',
-                );
+              : operation === 'release'
+                ? await tasks.release(task)
+                : await tasks.fail(
+                    task,
+                    operation === 'dead' ? 'dead' : { retryAt: new Date() },
+                    'failed',
+                  );
         assert.equal(held, false, `${operation}: ${name}`);
       }
     }
@@ -898,6 +921,42 @@ describe('consumeQueue with SqsTaskQueue', () => {
     assert.equal(changeVis.length, 1);
     assert.equal(errors[0][0], 'resize worker: failed event handler failed');
   });
+  test('a shutdown mid-task makes the message visible at once, with no event and no delete', async () => {
+    const { client, changeVis, deletes, sent } = makeFakeSqsClient({
+      message: message({ Attributes: { ApproximateReceiveCount: '3' } }),
+    });
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      deadLetterQueueUrl: DEAD_URL,
+      timing: { ...fastTiming, maxAttempts: 3 },
+    });
+    const rec = makeEvents();
+    const ctrl = new AbortController();
+    await consumeQueue(tasks, {
+      signal: ctrl.signal,
+      queue: 'default',
+      handle: (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => reject(new Error('stopped before the remaining variants')),
+            { once: true },
+          );
+          ctrl.abort(); // SIGTERM while the task runs
+        }),
+      onEvent: rec.onEvent,
+    });
+    assert.deepEqual(changeVis, [
+      { QueueUrl: 'q', ReceiptHandle: 'rh', VisibilityTimeout: 0 },
+    ]);
+    assert.equal(deletes.length, 0);
+    assert.equal(sent.length, 0); // not dead-lettered on its last delivery
+    assert.deepEqual(
+      [rec.completed.length, rec.failed.length, rec.deadLettered.length],
+      [0, 0, 0],
+    );
+  });
   test('an exhausted task reports deadLettered with the original error and is moved then deleted', async () => {
     const { client, sent, deletes, changeVis } = makeFakeSqsClient({
       message: message({ Attributes: { ApproximateReceiveCount: '3' } }),
@@ -942,6 +1001,22 @@ describe('SqsTaskQueue options', () => {
       (err: Error & { code?: string }) =>
         err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
     );
+    assert.throws(
+      () =>
+        new SqsTaskQueue({
+          queueUrl: 'q',
+          timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
+        }),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
+        /lockTtlMs\.failed/.test(err.message),
+    );
+    // Optional: the default cooldown applies.
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
+    });
+    assert.equal(timingOf(tasks).lockTtlMs.failed, 600_000);
   });
   test('requires queueUrl at construction', () => {
     assert.throws(

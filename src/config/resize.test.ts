@@ -180,6 +180,24 @@ describe('getResizeConfig', () => {
     }
   });
 
+  test('rejects worker.concurrency and names the config file and replacement', () => {
+    for (const value of [8, undefined]) {
+      install({
+        ...makeResizeConfig(),
+        worker: { ...defaultWorkerOptions, concurrency: value },
+      });
+      assert.throws(
+        () => getResizeConfig('resizeListings'),
+        (error: unknown) =>
+          error instanceof ResizeConfigError &&
+          error.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+          error.message.includes('`worker.concurrency`') &&
+          error.message.includes('src/config/resizeListings.ts') &&
+          error.message.includes('top-level `concurrency`'),
+      );
+    }
+  });
+
   test('requires an encode.formats entry for every generated format', () => {
     // 'jpg' is a Sharp alias: it would encode JPEG without the 'jpeg' options or flatten.
     install(makeResizeConfig({ formats: ['jpg', 'webp'] }));
@@ -242,6 +260,38 @@ describe('config split: core validation vs framework loading', () => {
     assert.equal(getResizeConfig().queue, false); // eager only
     assert.deepEqual(getResizeConfig().timing, defaultQueueOptions);
     assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
+  });
+
+  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes and is validated', () => {
+    assert.equal(defaultQueueOptions.lockTtlMs.failed, 600_000);
+    install(
+      makeResizeConfig({
+        queue: {
+          driver: 'database',
+          lockTtlMs: { dispatch: 30_000, worker: 30_000 },
+        },
+      }),
+    );
+    assert.deepEqual(getResizeConfig().timing.lockTtlMs, {
+      dispatch: 30_000,
+      worker: 30_000,
+      failed: 600_000,
+    });
+    resetAppInstance();
+    install(
+      makeResizeConfig({
+        queue: {
+          driver: 'database',
+          lockTtlMs: { dispatch: 30_000, worker: 30_000, failed: -5 },
+        },
+      }),
+    );
+    assert.throws(
+      () => getResizeConfig(),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
+    );
   });
 
   test('queue: false is eager only, and invalid queue timing is a config error', () => {

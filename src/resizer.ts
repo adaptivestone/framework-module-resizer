@@ -194,13 +194,15 @@ const EMPTY_PIPELINE: Pipeline = Object.freeze({});
 // core code always receives its Resizer as an argument.
 const resizers = new Map<string, Resizer>();
 
+type PartName = 'storage' | 'db' | 'tasks';
+
 // How framework hosts get the parts below filled in from their app.
 const FRAMEWORK_HINT =
   "framework hosts: use new FrameworkResizer() from '@adaptivestone/framework-module-resize/framework.js'";
 
 const storageRequired = () =>
   new ResizeSetupError(
-    'resize: `storage` is required — construct `new Resizer({ storage: … })` with a ResizeStorage driver (e.g. new S3Storage({ … })); both the read path (publicUrl) and the worker (download/upload) need it (05 · §10.4)',
+    'resize: `storage` is required — construct `new Resizer({ storage: … })` with a ResizeStorage driver (e.g. new S3Storage({ … })); both the read path (publicUrl) and the worker (download/upload) need it',
     { code: 'RESIZE_STORAGE_REQUIRED' },
   );
 
@@ -228,8 +230,10 @@ export class Resizer {
   #storage: ResizeStorage | undefined;
   #db: ResizeDatabase | undefined;
   #tasks: TaskQueue | undefined;
-  #loaded = false;
-  #loading: Promise<void> | undefined;
+  // Each part loads once: the parts usable now (given as objects, or loaded) and the loads in
+  // flight. A part whose function failed is retried alone; the parts that loaded are kept.
+  readonly #loadedParts = new Set<PartName>();
+  readonly #loadingParts = new Map<PartName, Promise<void>>();
   // Named pipelines: last-wins per name (04 · §8).
   readonly #pipelines: Map<string, Pipeline>;
   // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
@@ -283,16 +287,16 @@ export class Resizer {
     // Parts given as objects are usable at once; functions wait for ready().
     if (typeof opts.storage !== 'function') {
       this.#storage = opts.storage;
+      this.#loadedParts.add('storage');
     }
     if (typeof opts.db !== 'function') {
       this.#db = opts.db;
+      this.#loadedParts.add('db');
     }
     if (typeof opts.tasks !== 'function') {
       this.#tasks = opts.tasks;
+      this.#loadedParts.add('tasks');
     }
-    this.#loaded = ![opts.storage, opts.db, opts.tasks].some(
-      (part) => typeof part === 'function',
-    );
     this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
     // A seeded hooks value may be a single fn or an array — normalize to arrays and
     // COPY them, so a caller mutating its own array later cannot bypass hook().
@@ -329,7 +333,7 @@ export class Resizer {
 
   /** Where tasks wait (undefined: eager only). Available once the parts are loaded. */
   get tasks(): TaskQueue | undefined {
-    if (typeof this.#sources.tasks === 'function' && !this.#loaded) {
+    if (!this.#loadedParts.has('tasks')) {
       this.#notReady('tasks');
     }
     return this.#tasks;
@@ -343,39 +347,53 @@ export class Resizer {
   }
 
   /**
-   * Load the parts given as functions, once. Every method of the Resizer (and the worker) awaits
-   * it first, so hosts only need it before reading `storage`, `db` or `tasks` directly. A failed
-   * load is retried by the next call.
+   * Load the parts given as functions, each once. Every method of the Resizer (and the worker)
+   * awaits it first, so hosts only need it before reading `storage`, `db` or `tasks` directly. A
+   * part whose function fails is retried by the next call; the parts that loaded are kept.
    */
   async ready(): Promise<void> {
-    if (this.#loaded) {
+    if (this.#loadedParts.size === 3) {
       return;
     }
-    this.#loading ??= this.#load().catch((err: unknown) => {
-      this.#loading = undefined;
-      throw err;
-    });
-    await this.#loading;
+    await Promise.all([
+      this.#loadPart('storage', this.#sources.storage, (storage) => {
+        if (!storage) {
+          throw storageRequired();
+        }
+        this.#storage = storage;
+      }),
+      this.#loadPart('db', this.#sources.db, (db) => {
+        if (!db) {
+          throw databaseRequired();
+        }
+        this.#db = db;
+      }),
+      this.#loadPart('tasks', this.#sources.tasks, (tasks) => {
+        this.#tasks = tasks ?? undefined;
+      }),
+    ]);
   }
 
-  async #load(): Promise<void> {
-    const call = async <T>(part: T | LazyPart<T>): Promise<T> =>
-      typeof part === 'function' ? (part as LazyPart<T>)() : part;
-    const [storage, db, tasks] = await Promise.all([
-      call(this.#sources.storage),
-      call(this.#sources.db),
-      call(this.#sources.tasks),
-    ]);
-    if (!storage) {
-      throw storageRequired();
+  /** Load one part given as a function; concurrent callers share its load while it runs. */
+  #loadPart<T>(
+    part: PartName,
+    source: T | LazyPart<T>,
+    keep: (value: T) => void,
+  ): Promise<void> {
+    if (this.#loadedParts.has(part)) {
+      return Promise.resolve();
     }
-    if (!db) {
-      throw databaseRequired();
+    let loading = this.#loadingParts.get(part);
+    if (!loading) {
+      loading = (async () => {
+        keep(await (source as LazyPart<T>)());
+        this.#loadedParts.add(part);
+      })().finally(() => {
+        this.#loadingParts.delete(part);
+      });
+      this.#loadingParts.set(part, loading);
     }
-    this.#storage = storage;
-    this.#db = db;
-    this.#tasks = tasks ?? undefined;
-    this.#loaded = true;
+    return loading;
   }
 
   /** The validated image config; a lazy config (a function) is read and validated on first use. */
@@ -415,6 +433,11 @@ export class Resizer {
   /** Look up a pipeline; an unknown name → the shared frozen empty pipeline (no steps). */
   getPipeline(name: string): Pipeline {
     return this.#pipelines.get(name) ?? EMPTY_PIPELINE;
+  }
+
+  /** True when `name` is registered. `default` always exists: unregistered, it has no steps. */
+  hasPipeline(name: string): boolean {
+    return name === 'default' || this.#pipelines.has(name);
   }
 
   /**
@@ -528,7 +551,19 @@ export function listResizers(): Resizer[] {
   return [...resizers.values()];
 }
 
+// Per-process state an adapter keeps beside the registry (the framework adapter's shared task
+// queues), cleared with it.
+const resetHooks = new Set<() => void>();
+
+/** Run `reset` on every resetResizerForTests() (for an adapter's per-process state). */
+export function onResetResizerForTests(reset: () => void): void {
+  resetHooks.add(reset);
+}
+
 /** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */
 export function resetResizerForTests(): void {
   resizers.clear();
+  for (const reset of resetHooks) {
+    reset();
+  }
 }

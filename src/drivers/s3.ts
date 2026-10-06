@@ -84,7 +84,7 @@ export class S3Storage extends ResizeStorage {
       return;
     }
     throw new ResizeSecurityError(
-      `resize s3: ref.bucket "${bucket}" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access (05 · §10.5)`,
+      `resize s3: ref.bucket "${bucket}" is not an allowlisted bucket (bucketPublic/bucketPrivate) — refusing cross-bucket access`,
       { code: 'RESIZE_S3_BUCKET_NOT_ALLOWED' },
     );
   }
@@ -181,6 +181,9 @@ export class S3Storage extends ResizeStorage {
         Key: physicalKey,
         Body: body,
         ContentType: contentType,
+        ...(contentType === 'image/svg+xml'
+          ? { ContentDisposition: 'attachment' }
+          : {}),
       }),
     );
     return {
@@ -206,18 +209,13 @@ export class S3Storage extends ResizeStorage {
     return Buffer.from(bytes);
   }
 
-  canServeOriginalPublicly(ref: StorageRef): boolean {
-    const { bucket } = this.#ref(ref);
-    return bucket === this.#opts.bucketPublic;
-  }
-
   // PURE string building — no SDK, no I/O (called on the read path). Three forms:
   // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
   // virtual-hosted.
   publicUrl(ref: StorageRef): string {
     const { bucket, key } = this.#ref(ref);
     // A ref explicitly pointing at the configured private bucket must never be turned into a
-    // public CDN URL. The engine normally prevents this call; keep the driver safe when a host
+    // public CDN URL. The engine only asks for stored previews; keep the driver safe when a host
     // calls publicUrl directly too. If both buckets are the same, that bucket is intentionally
     // public and the check below does not reject it.
     if (
@@ -234,11 +232,17 @@ export class S3Storage extends ResizeStorage {
     if (publicBase) {
       return `${publicBase.replace(/\/+$/, '')}/${key}`;
     }
+    // AWS's own host name: the China regions live under amazonaws.com.cn.
+    const region = this.#opts.region ?? 'us-east-1';
+    const awsHost = `s3.${region}.amazonaws.com${region.startsWith('cn-') ? '.cn' : ''}`;
     if (this.#opts.endpoint !== undefined || this.#opts.forcePathStyle) {
-      const base = (this.#opts.endpoint ?? '').replace(/\/+$/, '');
+      const base = (this.#opts.endpoint ?? `https://${awsHost}`).replace(
+        /\/+$/,
+        '',
+      );
       return `${base}/${bucket}/${key}`;
     }
-    return `https://${bucket}.s3.${this.#opts.region ?? 'us-east-1'}.amazonaws.com/${key}`;
+    return `https://${bucket}.${awsHost}/${key}`;
   }
 
   // Time-limited signed URL for owner/admin reads of a private original.

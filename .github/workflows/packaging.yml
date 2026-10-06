@@ -26,7 +26,7 @@ jobs:
         run: npm ci
 
       # Builds dist, packs the tarball, installs it into a throwaway consumer and verifies
-      # the PUBLISHED surface (17 core exports, the exports map, the optional subpaths'
+      # the PUBLISHED surface (the expected core exports, the exports map, the optional subpaths'
       # loud-fail without their AWS SDKs, the always-safe subpaths, the resize-scaffold bin)
       # — dist-only breakage the TS-source test suite can't see.
       - name: Packaging smoke test

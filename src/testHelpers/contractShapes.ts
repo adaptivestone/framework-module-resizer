@@ -26,6 +26,7 @@ export const fullTasks: TaskQueue = {
   renew: async () => true,
   complete: async () => true,
   fail: async () => true,
+  release: async () => true,
   findActive: async () => [],
   servesQueue: () => true,
   getTiming: () => ({ leaseMs: 1000 }),

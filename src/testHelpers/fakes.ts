@@ -36,24 +36,43 @@ export function memoryLocks(): FakeLocks {
   };
 }
 
-/** A ResizeDatabase from optional parts; missing parts are harmless no-ops. */
+/**
+ * A ResizeDatabase from optional parts; missing parts are harmless in-memory stand-ins. The default
+ * appendPreviews follows the database contract: it keeps one row per preview identity in
+ * `previews` (per media id; pass a map to seed or inspect it) and resolves with the previews it
+ * stored. A preview without an identity is always stored.
+ */
 export function fakeDb(
   parts: {
     load?: (mediaId: string) => Promise<MediaLike | null>;
-    appendPreviews?: (
-      mediaId: string,
-      previews: Preview[],
-      backfillDims?: { width: number; height: number },
-    ) => Promise<void>;
+    appendPreviews?: ResizeDatabase['appendPreviews'];
+    previews?: Map<string, Preview[]>;
     locks?: FakeLocks;
     tasks?: TaskQueue;
     verify?: () => void | Promise<void>;
   } = {},
 ): ResizeDatabase {
   const locks = parts.locks ?? memoryLocks();
+  const rows = parts.previews ?? new Map<string, Preview[]>();
+  const appendPreviews = async (mediaId: string, previews: Preview[]) => {
+    const media = rows.get(mediaId) ?? [];
+    rows.set(mediaId, media);
+    const stored: Preview[] = [];
+    for (const preview of previews) {
+      if (
+        preview.identity !== undefined &&
+        media.some((row) => row.identity === preview.identity)
+      ) {
+        continue;
+      }
+      media.push(preview);
+      stored.push(preview);
+    }
+    return stored;
+  };
   return {
     loadMedia: parts.load ?? (async () => null),
-    appendPreviews: parts.appendPreviews ?? (async () => {}),
+    appendPreviews: parts.appendPreviews ?? appendPreviews,
     acquireLock: (key, ttlMs) => locks.acquire(key, ttlMs),
     releaseLock: (key) => locks.release(key),
     ...(parts.tasks ? { tasks: parts.tasks } : {}),

@@ -272,11 +272,12 @@ published; the page still describes 0.2.
 
 **P5 — Later, each optional and separate.**
 - `worker.parallelTasks`.
-- Merge `prewarm` into `enqueueRequired`.
+- Merge `prewarm` into `enqueueRequired`. **Done:** `enqueueRequired` was merged into `prewarm`.
 - Strip archived-spec section references from comments.
 - Check the AVIF/WebP quality defaults on real photos.
 - Export a framework-free `ResizeTask` schema definition (fields + indexes). Today a host
-  without the framework copies them from `src/models/ResizeTask.ts`.
+  without the framework copies them from `src/models/ResizeTask.ts`. **Done:**
+  `resizeTaskFields` and `resizeTaskIndexes` (and `createResizeModels`) from `…/drivers/mongo.js`.
 
 ## 7. Non-goals
 

@@ -21,12 +21,10 @@ export function formatPictureUrls(
       byFormat = new Map();
       sizes.set(entry.sizeKey, byFormat);
     }
-    const contentType = entry.contentType ?? entry.preview?.contentType;
-    const cell: { url: string; contentType?: string } = { url: entry.url };
-    if (contentType) {
-      cell.contentType = contentType;
-    }
-    byFormat.set(entry.format, cell);
+    byFormat.set(entry.format, {
+      url: entry.url,
+      contentType: entry.contentType,
+    });
   }
   const out: PictureUrls = {
     // fromEntries creates own data properties, including for '__proto__', while

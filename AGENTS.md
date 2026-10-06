@@ -26,15 +26,19 @@ task. Preview identity is `resizer:pipeline:sizeKey:format:filterSig`: dispatch 
 locks and stored previews are separate per Resizer and per pipeline, so different renderings of
 the same media keep separate previews (rename a pipeline, e.g. `watermark-v2`, to regenerate its
 images). Preview rows without `resizer`/`pipeline` belong to `default`. Legacy task rows without
-a key remain valid. Storage drivers that can prove original
-visibility implement `canServeOriginalPublicly`; the engine never fabricates a public URL for
-a private original.
+a key remain valid. The original is never served: `resolve()` returns stored previews only. For a
+pipeline without `variantSteps`, a raster original no larger than a requested `WxH` box gets a
+preview at its own size (no upscaling, no cropping, metadata removed; only the
+`limits.resultDimension` cap can scale it down); a pipeline with `variantSteps` always gets the
+full box its steps were written for. To hand the private original to its owner, call
+`storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it.
 
 ## Integrate (in order)
 
 1. Install. Every peer is OPTIONAL: a framework app already has `@adaptivestone/framework` and
-   `mongoose`; the AWS SDKs are needed only for the driver subpaths that use them (a missing one
-   fails loudly at your own import line at bootstrap):
+   `mongoose`; the AWS SDKs are needed only for the drivers that use them. A missing one fails at
+   your own import line when you import a driver subpath, or, for a driver selected in the config
+   file, at first use or `verify()` with `RESIZE_PEER_MISSING` (naming the packages and the file):
 
    ```bash
    npm i @adaptivestone/framework-module-resize
@@ -51,8 +55,10 @@ a private original.
    ```
 
    `--eager` emits `src/resizer.ts` + `src/config/resize.ts` (local storage, no queue).
-   Default (lazy) also emits `src/models/ResizeTask.ts` and `src/commands/ResizeWorker.ts`
-   (`import '../resizer.ts'` plus a re-export of the module's command).
+   Default (lazy) also emits `src/models/ResizeTask.ts` (extends the default export of
+   `@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js`, so `npm run gen` types
+   `getModel('ResizeTask')`) and `src/commands/ResizeWorker.ts` (`import '../resizer.ts'` plus a
+   re-export of the module's command).
    Appends a pointer to this guide into the host's `AGENTS.md`
    (`--agents claude|print|skip` to redirect or suppress it).
 
@@ -75,13 +81,15 @@ a private original.
    Without the framework: `new Resizer({ storage, db, tasks? })` from the main entry, with
    `@adaptivestone/framework-module-resize/drivers/mongo.js` → `mongoDatabase(connection, {
    mediaModel, timing? })` (media, locks and `.tasks` with the package's `ResizeTask` /
-   `ResizeLock` models; also `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`),
+   `ResizeLock` models; also `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`; call it once
+   and pass that `.tasks` to every Resizer — each call makes its own queue),
    `…/drivers/fs.js` → `LocalFsStorage`, `…/drivers/s3.js` → `S3Storage`, `…/drivers/sqs.js` →
    `SqsTaskQueue`. Any part may be a function (sync or async) called once on first use. A custom
    driver extends the exported abstract class (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`) or
    is any object of the same shape — no `app` parameter; a driver closes over its own client. The
    core owns the queue logic (worker loop, retries, dead-letters, events); a `TaskQueue` only
-   implements atomic `add` / `claim` / `renew` / `complete` / `fail`. `claim` may wait for a task
+   implements atomic `add` / `claim` / `renew` / `complete` / `fail` (optional `release` gives a
+   task back at worker shutdown; see the README contract). `claim` may wait for a task
    (long poll), but must return once its `signal` aborts and never claim ahead of the call.
 
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
@@ -100,10 +108,15 @@ a private original.
    - `queue`: `{ driver: 'database' }` or `{ driver: 'sqs', queueUrl, queues?, deadLetterQueueUrl?,
      waitTimeSeconds?, region?, endpoint? }`, plus any timing key (`leaseMs`, `lockTtlMs`,
      `maxAttempts`, …; the rest default). Missing or `false` = eager only;
-   - `worker`: the worker command's settings.
+   - `worker`: the worker process's `enabled` switch and Sharp tuning.
 
    Variant parallelism is the top-level `concurrency`. A second Resizer can read its own file:
-   `new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`.
+   `new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`. Resizers on the same
+   backend share one task queue (every `queue: { driver: 'database' }`, or identical SQS
+   settings), and a queue has one timing: such files must set the same timing keys (and SQS
+   `waitTimeSeconds`; unset counts as the default 10). The worker process
+   reads `worker` from `resize.ts` whatever its Resizers read, unless started with
+   `npm run cli ResizeWorker -- --config=<name>` (required when the host has no `resize.ts`).
    Put environment-only changes in `resize.<NODE_ENV>.ts` (for example, S3 in
    `resize.production.ts`); the framework merges that file field by field before this module
    reads and validates the resolved config. Do not add a second runtime merge. When an
@@ -120,7 +133,9 @@ a private original.
 
    Keep `minimize: false` on the media schema (already the Framework `BaseModel`
    default). Direct Mongoose users must pass `{ minimize: false }` to `new Schema`.
-   Otherwise empty objects in opaque `storageRef` values can disappear on save/update.
+   Otherwise empty objects in opaque `storageRef` values can disappear on save/update. A
+   hand-written schema that declares preview rows as sub-documents must also give them
+   `identity: { type: String }`: the database stores one row per preview identity.
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model and
    the framework's `Lock` model declare their indexes; the host's normal lifecycle or an explicit
@@ -128,7 +143,10 @@ a private original.
    run. The module does not create, synchronize, drop, or repair indexes, and it has no
    `prepareQueue()` API. The partial unique active-request index on `{ fileId, pipeline,
    requestKey }` is required for the Mongo deduplication guarantee; verify it in the host's DB
-   rollout. Never add index creation to HTTP bootstrap or the first enqueue.
+   rollout. The claim index is `{ queue: 1, status: 1, availableAt: 1 }`; when upgrading, create
+   it before or with the new workers, then drop the old lease index (`{ status: 1, createdAt: 1 }`,
+   or `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). Never add index creation
+   to HTTP bootstrap or the first enqueue.
 
 8. Lazy / pre-warm modes: keep `queue: { driver: 'database' }` (or SQS) and set
    `worker.enabled: true` in the host `src/config/resize.ts`
@@ -153,8 +171,15 @@ const original = await getResizer().uploadOriginal({
 The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
 bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) as a private original. SVG
 sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
-is rejected. The module does not sanitize SVG markup. The worker rasterizes accepted SVG
-into the same configured public preview formats as other images.
+is rejected. The module does not sanitize SVG markup. The worker renders an SVG once per task,
+before any pipeline step, into a PNG, in a separate Node process, at the largest size the
+requested previews need; `beforeSteps` receive that PNG (never SVG markup), and every format is
+made from it. The render is killed after `limits.processingTimeoutSeconds`
+(`RESIZE_SVG_RENDER_TIMEOUT`, dead-lettered at once) or when the task aborts; a crashed render is
+`RESIZE_SVG_RENDER_FAILED` (retried). A render that cannot start is `ResizeSetupError`
+`RESIZE_SVG_RENDER_UNAVAILABLE`: the host must allow child processes (Node's permission model:
+`--allow-child-process`) and ship `svgRasterChild.js` next to `svgRaster.js` (watch out when
+bundling). Eager `generate()` throws all three.
 
 Persist every original privately, then call the same `prewarm()` path for
 raster and SVG. The worker creates the requested Sharp previews for both. SVG is an input
@@ -177,7 +202,6 @@ const { decision, output } = await getResizer().resolve({
   media: fileDoc,
   pipeline: 'default',
   sizes: [{ width: 620 }, { fit: true }, { width: 300, height: 300 }],
-  ctx: { isOwner },
 });
 // `output` is your formatPublicUrls hook (undefined if no hook / hook throws).
 // formatPictureUrls skips filtered variants — map `decision` for those.
@@ -256,22 +280,34 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 - Construct each Resizer ONCE, at one construction site, with `new FrameworkResizer`. Most
   hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
   config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
-  for one queue (`--queue`, default `'default'`), with one consume loop per distinct task queue.
+  for one queue (`--queue`, default `'default'`), with one consume loop per task queue (Resizers
+  on the same backend share one), one task at a time, each processed with its own Resizer.
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants).
+- Register every pipeline in `src/resizer.ts`, so the API and the worker both have it
+  (`resizer.hasPipeline(name)` checks). An unregistered name (anything but `'default'`) never
+  renders: `resolve()` serves only previews already stored for it and queues nothing, `prewarm()`
+  reports the non-retryable issue `RESIZE_PIPELINE_UNKNOWN`, and `generate()` and the worker throw
+  `ResizeSetupError` with that code (a queued task retries, then dead-letters). When you add or
+  rename a pipeline, deploy the worker before the API requests it.
 - The scaffolded `resize.ts` is complete. The framework merges environment overrides and the
   module reads that final config without a second merge. Arrays in environment overrides replace.
 - Format ids are open strings. `formats` controls generated outputs, `upload.formats` controls
-  accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options.
+  accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options. A
+  per-call `formats` entry (or a variant a `beforeEnqueue` tap adds or rewrites) without an
+  `encode.formats` key is never generated: `resolve()` leaves it out of `decision.missing`,
+  `prewarm()` reports it in `unconfirmed` with the non-retryable issue
+  `RESIZE_FORMAT_NOT_CONFIGURED`, and `generate()` throws `ResizeSetupError` with that code.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
   `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
 - The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
-  must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`.
-- SVG originals stay private. The worker rasterizes SVG into the requested public preview
-  formats through the normal durable task lifecycle. Neither `resolve()` nor the original-fits
-  shortcut returns uploaded SVG markup.
+  must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`
+  (`--check --eager` for an eager host, which has no model or command to check).
+- SVG originals stay private, and no original is ever served: `resolve()` returns stored previews
+  only, so uploaded SVG markup never reaches a reader. The worker renders SVG into the requested
+  raster preview formats through the normal durable task lifecycle.
 - Deleting storage objects when media is deleted is the HOST's job — the module only appends.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.
@@ -284,13 +320,19 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `RESIZE_DATABASE_REQUIRED` at construction | `new Resizer()` takes its `db` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `mongoDatabase(connection, { mediaModel })` |
 | `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config file named in the message, or pass `storage` to `new FrameworkResizer()` |
 | `RESIZE_NOT_READY` | host code read `resizer.storage` / `db` / `tasks` before the drivers loaded — `await resizer.ready()` first (the Resizer's methods do this themselves) |
-| `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`, `worker.concurrency` to `concurrency` |
-| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | the `ResizeTask` model (or the media model) does not resolve — scaffold `src/models/ResizeTask.ts`, check the model name |
+| `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`; `worker.concurrency` (in a framework config file too) moves to the top-level `concurrency` |
+| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), the lock model (the framework's `Lock`, or the `lockModel` passed to `MongoDatabase`), or the media model of a plain `MongoDatabase` (framework hosts get `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` instead) |
+| `RESIZE_MONGO_MODEL_OUTDATED`, or `resize-scaffold --check` reports drift in `src/models/ResizeTask.ts` | a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `requestKey` or `availableAt` fields: port them (and the `{ queue, status, availableAt }` index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx resize-scaffold --eject` |
+| `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` from `verify()` or at worker start | the media schema declares preview rows as sub-documents without `identity` (a mixed or plain `previews` array passes) — spread the current `resizeMediaSchemaFragment`, or add `identity: { type: String }` to the row |
+| `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
+| `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` | two config files share one task queue but set different timing (the message names both files and the keys) — set the same values in both |
+| a variant stays missing for ~10 min after its task was dead-lettered | `lockTtlMs.failed` (default 600000): reads do not queue a dead task's previews again until it expires — fix the cause in the logs first |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoDatabase()` / `new MongoTaskQueue()` needs a model or a getter — or use `mongoDatabase(connection, { mediaModel })` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |
-| `formats [...] have no encode.formats entry` | add `encode.formats.<id>` (`{}` for Sharp defaults); use `'jpeg'`, not the alias `'jpg'` |
-| `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import | optional peer not installed — see step 1 |
+| `formats [...] have no encode.formats entry`, `RESIZE_FORMAT_NOT_CONFIGURED` | add `encode.formats.<id>` (`{}` for Sharp defaults), or request only configured ids; use `'jpeg'`, not the alias `'jpg'` |
+| `RESIZE_PIPELINE_UNKNOWN` | the pipeline is not registered in that process — register it in `src/resizer.ts`; deploy the worker before the API requests a new or renamed pipeline |
+| `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config | optional peer not installed — install the packages named, see step 1 |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
 | `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |

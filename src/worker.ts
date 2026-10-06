@@ -1,9 +1,9 @@
-// The worker (07 · Worker §11), framework-free. `runWorker()` serves every registered Resizer for
-// ONE named queue: it runs the core queue loop (src/queue.ts) once per distinct TaskQueue the
-// Resizers use, after verifying every Resizer. Each task runs with the Resizer named in it, and its
-// events go to that Resizer's observers. Framework hosts start it through `runResizeWorker()`
-// (src/framework/worker.ts), which adds the `worker.enabled` switch, process signals and the app
-// logger.
+// The worker, framework-free. `runWorker()` serves every registered Resizer for ONE named queue: it
+// runs the core queue loop (src/queue.ts) once per distinct TaskQueue the Resizers use, after
+// verifying every Resizer. Each task runs with the Resizer named in it, and its events go to that
+// Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown.
+// Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
+// `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
 import type {
   LeasedTask,
@@ -11,9 +11,16 @@ import type {
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+import { canonicalizeVariants, dispatchLockKey } from './enqueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { consumeQueue } from './queue.ts';
-import { getResizer, listResizers, type ObserverName } from './resizer.ts';
+import { getPreviewIdentity } from './images.ts';
+import { consumeQueue, timingOf } from './queue.ts';
+import {
+  getResizer,
+  listResizers,
+  type ObserverName,
+  type Resizer,
+} from './resizer.ts';
 import { processTaskWith } from './resizeTask.ts';
 import type { ResizeLogger } from './types.d.ts';
 
@@ -35,6 +42,56 @@ export async function processTask(
   const resizer = getResizer(task.resizer);
   await resizer.ready();
   return processTaskWith(resizer, task, taskOpts, tasks ?? resizer.tasks);
+}
+
+/**
+ * After a dead-letter, hold the dispatch lock of every variant in the task for the delivering
+ * queue's lockTtlMs.failed, so reads (resolve, prewarm) do not queue the same failing work again
+ * until it ends. Release first, then acquire: the read path's shorter dispatch lock may still be
+ * held. Best effort and never rejects: a failing lock call is logged, and a read that takes the
+ * lock between the two calls simply queues the work once more.
+ */
+async function holdFailedCooldown(
+  resizer: Resizer,
+  task: LeasedTask,
+  tasks: TaskQueue,
+  logger: ResizeLogger,
+): Promise<void> {
+  try {
+    const ttlMs = timingOf(tasks).lockTtlMs.failed;
+    const scope = { resizer: resizer.name, pipeline: task.pipeline };
+    const keys = new Set(
+      canonicalizeVariants(task.previews).map((variant) =>
+        dispatchLockKey(
+          task.mediaId,
+          getPreviewIdentity(
+            scope,
+            variant.sizeKey,
+            variant.format,
+            variant.filters,
+          ),
+        ),
+      ),
+    );
+    await Promise.all(
+      [...keys].map(async (key) => {
+        try {
+          await resizer.db.releaseLock(key);
+          await resizer.db.acquireLock(key, ttlMs);
+        } catch (err) {
+          logger.error(
+            `resize worker: holding the dead-letter cooldown lock ${key} failed`,
+            err,
+          );
+        }
+      }),
+    );
+  } catch (err) {
+    logger.error(
+      `resize worker: the dead-letter cooldown of task ${task.taskId} failed`,
+      err,
+    );
+  }
 }
 
 export interface RunWorkerOptions {
@@ -92,21 +149,31 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     await resizer.verify();
   }
 
+  // Dead-letter cooldowns run beside the loop, so they never delay it or the observers; the worker
+  // waits for the pending ones before it returns.
+  const cooldowns = new Set<Promise<void>>();
   // Events are routed by the task's Resizer name, looked up when the event arrives.
-  const onEvent: TaskEventHandler = async (event, task, error) => {
-    const owner = listResizers().find((r) => r.name === task.resizer);
-    if (!owner) {
-      logger.error(
-        `resize worker: ${event} for task ${task.taskId} of unknown Resizer '${task.resizer}'`,
-      );
-      return;
-    }
-    if (event === 'completed') {
-      await owner.runObservers(OBSERVER[event], task, {});
-    } else {
-      await owner.runObservers(OBSERVER[event], task, error, {});
-    }
-  };
+  const eventsOf =
+    (tasks: TaskQueue): TaskEventHandler =>
+    async (event, task, error) => {
+      const owner = listResizers().find((r) => r.name === task.resizer);
+      if (!owner) {
+        logger.error(
+          `resize worker: ${event} for task ${task.taskId} of unknown Resizer '${task.resizer}'`,
+        );
+        return;
+      }
+      if (event === 'deadLettered') {
+        const cooldown = holdFailedCooldown(owner, task, tasks, logger);
+        cooldowns.add(cooldown);
+        void cooldown.then(() => cooldowns.delete(cooldown));
+      }
+      if (event === 'completed') {
+        await owner.runObservers(OBSERVER[event], task, {});
+      } else {
+        await owner.runObservers(OBSERVER[event], task, error, {});
+      }
+    };
 
   if (opts.sharp) {
     sharp.concurrency(opts.sharp.concurrency);
@@ -130,7 +197,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
             queue,
             signal: stop.signal,
             handle: (task, taskOpts) => processTask(task, taskOpts, tasks),
-            onEvent,
+            onEvent: eventsOf(tasks),
             logger,
           });
         } catch (err) {
@@ -142,6 +209,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   } finally {
     opts.signal.removeEventListener('abort', onAbort);
   }
+  await Promise.all(cooldowns);
   if (firstFailure) {
     throw firstFailure.error;
   }

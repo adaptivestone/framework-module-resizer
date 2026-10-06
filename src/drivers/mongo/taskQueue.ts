@@ -1,6 +1,7 @@
 // MongoTaskQueue: the task queue as documents of a ResizeTask model (see createResizeModels). Each
 // method is one atomic findOneAndUpdate; the lease token fences every write after a claim, so a
-// worker that lost its lease can never complete or fail a task another worker now holds.
+// worker that lost its lease can never complete, fail or release a task another worker now holds.
+import { hostname } from 'node:os';
 import {
   type ClaimedTask,
   type NewTask,
@@ -28,6 +29,30 @@ export interface MongoTaskQueueOptions {
   getTiming?: () => Partial<QueueTimingOptions>;
   logger?: ResizeLogger; // default: console
 }
+
+// The schema paths this queue writes. Mongoose strict mode silently drops a path its schema lacks:
+// a model ejected before tasks carried a Resizer, queue and request key would file every task under
+// Resizer 'default' on queue 'default'; one without availableAt would lose every retry time.
+const WRITTEN_PATHS = [
+  'fileId',
+  'resizer',
+  'queue',
+  'pipeline',
+  'requestKey',
+  'previews',
+  'status',
+  'attempts',
+  'availableAt',
+  'leasedBy',
+  'leaseToken',
+  'leaseExpiresAt',
+  'completedAt',
+  'deadAt',
+  'error',
+] as const;
+
+// Who holds a lease: the host name tells pods apart (every container's main process is pid 1).
+const LEASE_HOLDER = `${hostname().slice(0, 64)}:${process.pid}`;
 
 // The fields of a ResizeTask document this queue reads.
 interface TaskDoc {
@@ -64,12 +89,27 @@ export class MongoTaskQueue extends TaskQueue {
     return this.#getTiming();
   }
 
-  /** Startup check: the ResizeTask model must be registered. */
+  /**
+   * Startup check: the ResizeTask model must be registered, and its schema (when the model exposes
+   * one) must have every field this queue writes.
+   */
   verify(): void {
-    if (!this.#getModel()) {
+    const model = this.#getModel();
+    if (!model) {
       throw new ResizeSetupError(
         'resize: the ResizeTask model is not registered — scaffold src/models/ResizeTask.ts (or pass `model`)',
         { code: 'RESIZE_MONGO_MODEL_MISSING' },
+      );
+    }
+    const schema = model.schema;
+    if (typeof schema?.path !== 'function') {
+      return;
+    }
+    const missing = WRITTEN_PATHS.filter((path) => !schema.path(path));
+    if (missing.length > 0) {
+      throw new ResizeSetupError(
+        `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
+        { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
       );
     }
   }
@@ -110,6 +150,7 @@ export class MongoTaskQueue extends TaskQueue {
             previews: task.previews,
             status: 'pending',
             attempts: 0,
+            availableAt: new Date(),
           },
         },
         {
@@ -155,45 +196,50 @@ export class MongoTaskQueue extends TaskQueue {
   }
 
   // One findOneAndUpdate that returns at once (the core polls every idlePollMs), so it takes no
-  // abort signal.
+  // abort signal. The earliest due task wins: a waiting task whose availableAt has passed, or a
+  // leased one whose lease ended. A lease keeps availableAt at its end, so tasks in backoff and
+  // live leases lie outside the { queue, status, availableAt } index bounds and a claim reads
+  // about one document, with no in-memory sort. Rows written before availableAt existed have none:
+  // they are due once their leaseExpiresAt (a retry time or a lease end) has passed.
   async claim(queue: string, leaseMs: number): Promise<ClaimedTask | null> {
     const model = this.#model();
     if (!model) {
       return null;
     }
     const now = new Date();
+    const leaseEnd = new Date(now.getTime() + leaseMs);
     const doc = (await model.findOneAndUpdate(
       {
         queue: named(queue),
+        status: { $in: ['pending', 'processing'] },
+        availableAt: { $not: { $gt: now } }, // due, or no availableAt yet
+        // Rows written by a worker that keeps times in leaseExpiresAt (before availableAt existed,
+        // or an older worker in a rolling deploy) still wait for it: a waiting row's retry time,
+        // a leased row's lease. New waiting rows have leaseExpiresAt null.
         $or: [
-          {
-            status: 'pending',
-            $or: [
-              { leaseExpiresAt: { $exists: false } },
-              { leaseExpiresAt: null },
-              { leaseExpiresAt: { $lt: now } },
-            ],
-          },
-          { status: 'processing', leaseExpiresAt: { $lt: now } },
+          { status: 'pending', leaseExpiresAt: { $not: { $gt: now } } },
+          { leaseExpiresAt: { $lt: now } },
         ],
       },
       {
         $set: {
           status: 'processing',
-          leasedBy: `resizer-${process.pid}`,
+          leasedBy: LEASE_HOLDER,
           leaseToken: randomHex(),
-          leaseExpiresAt: new Date(now.getTime() + leaseMs),
+          leaseExpiresAt: leaseEnd,
+          availableAt: leaseEnd,
         },
         $inc: { attempts: 1 },
       },
-      { sort: { createdAt: 1 }, returnDocument: 'after' },
+      { sort: { availableAt: 1 }, returnDocument: 'after' },
     )) as TaskDoc | null;
     return doc ? toClaimedTask(doc) : null;
   }
 
   async renew(task: ClaimedTask, leaseMs: number): Promise<boolean> {
+    const leaseEnd = new Date(Date.now() + leaseMs);
     return this.#fenced(task, {
-      $set: { leaseExpiresAt: new Date(Date.now() + leaseMs) },
+      $set: { leaseExpiresAt: leaseEnd, availableAt: leaseEnd },
     });
   }
 
@@ -213,15 +259,28 @@ export class MongoTaskQueue extends TaskQueue {
       next === 'dead'
         ? { $set: { status: 'dead', deadAt: new Date(), error } }
         : {
-            // A future leaseExpiresAt keeps a pending task unclaimable until the retry time.
             $set: {
               status: 'pending',
               leaseToken: null,
-              leaseExpiresAt: next.retryAt,
+              leaseExpiresAt: null,
+              availableAt: next.retryAt,
               error,
             },
           },
     );
+  }
+
+  // Due at once, and the claim's attempt taken back.
+  async release(task: ClaimedTask): Promise<boolean> {
+    return this.#fenced(task, {
+      $set: {
+        status: 'pending',
+        leaseToken: null,
+        leaseExpiresAt: null,
+        availableAt: new Date(),
+      },
+      $inc: { attempts: -1 },
+    });
   }
 
   // Any queue: a task already waiting on another queue still covers the request.

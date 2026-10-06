@@ -1,6 +1,7 @@
 // The core queue logic, the same for every TaskQueue backend: the worker loop (claim, lease
-// heartbeat, task timeout), the retry policy (backoff, dead-lettering after maxAttempts, terminal
-// errors) and task events. Backends only implement the atomic TaskQueue operations.
+// heartbeat, task timeout, giving tasks back at shutdown), the retry policy (backoff,
+// dead-lettering after maxAttempts, terminal errors) and task events. Backends only implement the
+// atomic TaskQueue operations.
 import { defaultQueueOptions } from './config/resize.ts';
 import type {
   ClaimedTask,
@@ -9,7 +10,7 @@ import type {
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-import { ResizeError } from './errors.ts';
+import { ResizeConfigError, ResizeError } from './errors.ts';
 import { sleep } from './helpers/sleep.ts';
 import { validateQueueTiming } from './resizeConfig.ts';
 import type { QueueTimingOptions, ResizeLogger } from './types.d.ts';
@@ -23,15 +24,37 @@ const TIMING_KEYS = [
   'taskTimeoutMs',
 ] as const;
 
-const timings = new WeakMap<object, QueueTimingOptions>();
+/** Complete queue timing: every key set, the optional lock TTLs included. */
+export type QueueTiming = QueueTimingOptions & {
+  lockTtlMs: Required<QueueTimingOptions['lockTtlMs']>;
+};
+
+const timings = new WeakMap<object, QueueTiming>();
+
+/**
+ * Check the optional dead-letter cooldown `lockTtlMs.failed` (ms) when it is set. Throws
+ * ResizeConfigError.
+ */
+export function validateFailedLockTtl(failed: unknown): void {
+  if (
+    failed !== undefined &&
+    !(typeof failed === 'number' && Number.isSafeInteger(failed) && failed > 0)
+  ) {
+    throw new ResizeConfigError(
+      'resize queue options: lockTtlMs.failed must be a positive safe integer (ms)',
+      { code: 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' },
+    );
+  }
+}
 
 /**
  * Complete queue timing: the timing keys set in `own` over the defaults (other keys are ignored),
- * validated. Throws ResizeConfigError for invalid timing.
+ * validated. A `lockTtlMs` without `failed` gets the default cooldown. Throws ResizeConfigError for
+ * invalid timing.
  */
 export function fillTiming(
   own: Partial<QueueTimingOptions> | Record<string, unknown>,
-): QueueTimingOptions {
+): QueueTiming {
   const timing: Record<string, unknown> = { ...defaultQueueOptions };
   for (const key of TIMING_KEYS) {
     const value = (own as Record<string, unknown>)[key];
@@ -39,15 +62,24 @@ export function fillTiming(
       timing[key] = value;
     }
   }
+  const lockTtlMs = timing.lockTtlMs;
+  if (typeof lockTtlMs === 'object' && lockTtlMs !== null) {
+    const failed = (lockTtlMs as { failed?: unknown }).failed;
+    validateFailedLockTtl(failed);
+    timing.lockTtlMs = {
+      ...lockTtlMs,
+      failed: failed ?? defaultQueueOptions.lockTtlMs.failed,
+    };
+  }
   validateQueueTiming(timing);
-  return timing as unknown as QueueTimingOptions;
+  return timing as unknown as QueueTiming;
 }
 
 /**
  * A queue's timing: its getTiming() over the defaults, validated once per queue instance (a lazy
  * getTiming is read on first use). Throws ResizeConfigError for invalid timing.
  */
-export function timingOf(tasks: TaskQueue): QueueTimingOptions {
+export function timingOf(tasks: TaskQueue): QueueTiming {
   const cached = timings.get(tasks);
   if (cached) {
     return cached;
@@ -78,9 +110,28 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
   };
 }
 
+// Errors no retry can fix: the media row has no original, its source has no dimensions or is over
+// the pixel limits, or its SVG takes longer to render than allowed. Each retry would only download
+// and decode the original again. Errors cross module boundaries as plain objects, so match the
+// stable code, not the class.
+const TERMINAL_ERROR_CODES: ReadonlySet<unknown> = new Set([
+  'RESIZE_NO_ORIGINAL',
+  'RESIZE_SOURCE_METADATA_MISSING',
+  'RESIZE_SOURCE_TOO_LARGE',
+  'RESIZE_SVG_RENDER_TIMEOUT',
+]);
+
+const isTerminal = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'code' in error &&
+  TERMINAL_ERROR_CODES.has((error as { code?: unknown }).code);
+
 export interface ConsumeQueueOptions {
   queue: string;
-  signal: AbortSignal; // stops the loop: the current task finishes or aborts, then it returns
+  // Stops the loop: the current task finishes, or goes back to the queue unprocessed if the stop
+  // aborted it; then it returns.
+  signal: AbortSignal;
   handle: (
     task: LeasedTask,
     taskOpts: { signal: AbortSignal },
@@ -124,16 +175,7 @@ export async function consumeQueue(
     error: unknown,
     forceDead = false,
   ): Promise<void> => {
-    // A media row without an original is terminal: retrying cannot make it appear. Errors cross
-    // module boundaries as plain objects, so match the stable code, not the class.
-    const code =
-      typeof error === 'object' && error !== null && 'code' in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-    const dead =
-      forceDead ||
-      code === 'RESIZE_NO_ORIGINAL' ||
-      task.attempts >= maxAttempts;
+    const dead = forceDead || isTerminal(error) || task.attempts >= maxAttempts;
     try {
       const held = await tasks.fail(
         task,
@@ -149,6 +191,31 @@ export async function consumeQueue(
       }
     } catch (err) {
       logger.error(`resize worker: failing task ${task.taskId} failed`, err);
+    }
+  };
+  // The worker's shutdown stopped the task: it was not processed, so it goes back with no event,
+  // no backoff and, where the queue can release it, without counting the delivery. A queue without
+  // `release` retries it at once through `fail`; the delivery then counts, but it is never
+  // dead-lettered here.
+  const giveBack = async (task: ClaimedTask): Promise<void> => {
+    try {
+      const held = tasks.release
+        ? await tasks.release(task)
+        : await tasks.fail(
+            task,
+            { retryAt: new Date() },
+            `resize worker: task ${task.taskId} was stopped by a worker shutdown`,
+          );
+      if (held) {
+        logger.info(
+          `resize worker: shutdown — task ${task.taskId} is back in the queue`,
+        );
+      }
+    } catch (err) {
+      logger.error(
+        `resize worker: giving task ${task.taskId} back failed`,
+        err,
+      );
     }
   };
 
@@ -193,21 +260,25 @@ export async function consumeQueue(
       );
       continue;
     }
+    // The shutdown arrived while the claim ran (a claim that returns at once ignores the signal).
+    if (opts.signal.aborted) {
+      await giveBack(task);
+      break;
+    }
 
     // Per-task lease-loss signal; worker shutdown also aborts the current task, so it finishes
-    // its current variant, skips the rest, and the loop exits promptly.
+    // its current variant, skips the rest, goes back to the queue, and the loop exits promptly.
     const taskController = new AbortController();
     const onShutdown = () => taskController.abort();
     opts.signal.addEventListener('abort', onShutdown, { once: true });
-    if (opts.signal.aborted) {
-      taskController.abort();
-    }
     const claimed = task;
+    let leaseLost = false;
     const heartbeat = setInterval(() => {
       tasks
         .renew(claimed, leaseMs)
         .then((held) => {
           if (!held) {
+            leaseLost = true;
             taskController.abort();
           }
         })
@@ -271,6 +342,10 @@ export async function consumeQueue(
           err,
         );
       }
+    } else if (opts.signal.aborted && !leaseLost && !isTerminal(handlerError)) {
+      // Stopped by the shutdown, not by its own failure: not an attempt. A terminal error still
+      // dead-letters: the task proved it can never succeed before the shutdown stopped it.
+      await giveBack(task);
     } else {
       await finish(task, handlerError);
     }

@@ -16,6 +16,7 @@ import mongoose from 'mongoose';
 import sharp from 'sharp';
 import type { ResizeDatabase } from '../contracts/database.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
+import { ResizeSetupError } from '../errors.ts';
 import { resizeMediaSchemaFragment } from '../mediaFragment.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { fakeDb } from '../testHelpers/fakes.ts';
@@ -71,25 +72,47 @@ after(async () => {
   await server.stop();
 });
 
-function installApp() {
+const testQueue = {
+  leaseMs: 5000,
+  idlePollMs: 20,
+  lockTtlMs: { dispatch: 60000, worker: 5000 },
+};
+
+// A fake app over the real task and lock models. `configs` overrides config files by name;
+// `models` adds models (e.g. the media model) to ResizeTask and Lock.
+function installApp(
+  opts: {
+    configs?: Record<string, unknown>;
+    models?: Record<string, unknown>;
+  } = {},
+) {
   resetResizerForTests();
   resetAppInstance();
+  const models: Record<string, unknown> = {
+    ResizeTask: taskModel,
+    Lock: lockModel,
+    ...opts.models,
+  };
   setAppInstance({
-    getConfig: () =>
+    getConfig: (name: string) =>
+      opts.configs?.[name] ??
       makeResizeConfig({
         formats: ['webp'],
         worker: { enabled: true },
-        queue: {
-          leaseMs: 5000,
-          idlePollMs: 20,
-          lockTtlMs: { dispatch: 60000, worker: 5000 },
-        },
+        queue: testQueue,
       }),
-    getModel: (name: string) =>
-      name === 'ResizeTask' ? taskModel : name === 'Lock' ? lockModel : false,
+    getModel: (name: string) => models[name] ?? false,
     logger: { info() {}, warn() {}, error() {} },
   } as never);
 }
+
+// The host media model, built from the current fragment.
+const fileModel = () =>
+  connection.models.File ??
+  connection.model(
+    'File',
+    new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
+  );
 
 // In-memory storage: every download returns the test PNG; uploads are recorded.
 function memoryStorage(): { storage: ResizeStorage; uploads: string[] } {
@@ -243,20 +266,10 @@ test('a bulk-queue task waits for a bulk worker', async () => {
 test('a FrameworkResizer wired only by its config file runs through runResizeWorker', async () => {
   await taskModel.deleteMany({});
   const root = await mkdtemp(join(tmpdir(), 'resize-e2e-'));
-  const fileModel =
-    connection.models.File ??
-    connection.model(
-      'File',
-      new mongoose.Schema(
-        { ...resizeMediaSchemaFragment },
-        { minimize: false },
-      ),
-    );
-  resetResizerForTests();
-  resetAppInstance();
-  setAppInstance({
-    getConfig: () =>
-      makeResizeConfig({
+  const File = fileModel();
+  installApp({
+    configs: {
+      resize: makeResizeConfig({
         formats: ['webp'],
         worker: { enabled: true },
         storage: {
@@ -264,18 +277,11 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
           rootDir: join(root, 'public'),
           publicBaseUrl: '/media',
         },
-        queue: {
-          driver: 'database',
-          leaseMs: 5000,
-          idlePollMs: 20,
-          lockTtlMs: { dispatch: 60000, worker: 5000 },
-        },
+        queue: { driver: 'database', ...testQueue },
       }),
-    getModel: (name: string) =>
-      ({ ResizeTask: taskModel, Lock: lockModel, File: fileModel })[name] ??
-      false,
-    logger: { info() {}, warn() {}, error() {} },
-  } as never);
+    },
+    models: { File },
+  });
   try {
     const resizer = new FrameworkResizer(); // everything from the config file
     await resizer.verify();
@@ -283,7 +289,7 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
       body: png,
       visibility: 'private',
     });
-    const doc = await fileModel.create({ original, previews: [] });
+    const doc = await File.create({ original, previews: [] });
     const media = { id: String(doc._id), original, previews: [] };
     const result = await resizer.prewarm({ media, sizes });
     assert.equal(result.status, 'accepted');
@@ -292,7 +298,7 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
     try {
       const until = Date.now() + 20000;
       while (
-        ((await fileModel.findById(doc._id).lean())?.previews as unknown[])
+        ((await File.findById(doc._id).lean())?.previews as unknown[])
           ?.length !== 1
       ) {
         assert.ok(Date.now() < until, 'the worker did not store the preview');
@@ -302,7 +308,7 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
       process.emit('SIGTERM');
       await worker;
     }
-    const stored = await fileModel.findById(doc._id).lean();
+    const stored = await File.findById(doc._id).lean();
     const [preview] = (stored?.previews ?? []) as Preview[];
     assert.equal(preview.format, 'webp');
     assert.equal(
@@ -318,4 +324,160 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('two Resizers wired by their config files share one task queue: one task at a time, each with its own Resizer', async () => {
+  await taskModel.deleteMany({});
+  const File = fileModel();
+  const queue = { driver: 'database', ...testQueue };
+  installApp({
+    configs: {
+      resize: makeResizeConfig({ formats: ['webp'], queue }),
+      resizeListings: makeResizeConfig({ formats: ['webp'], queue }),
+    },
+    models: { File },
+  });
+  // Storage that records what it downloads and how many downloads overlap across both Resizers.
+  let running = 0;
+  let peak = 0;
+  const tracked = () => {
+    const downloads: string[] = [];
+    const storage: ResizeStorage = {
+      download: async (ref) => {
+        downloads.push((ref as { key: string }).key);
+        running += 1;
+        peak = Math.max(peak, running);
+        await new Promise((r) => setTimeout(r, 150));
+        running -= 1;
+        return png;
+      },
+      upload: async ({ key }) => ({ key }),
+      publicUrl: (ref) => `/m/${(ref as { key: string }).key}`,
+    };
+    return { downloads, storage };
+  };
+  const a = tracked();
+  const b = tracked();
+  const media = new FrameworkResizer({ storage: a.storage });
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+    storage: b.storage,
+  });
+  assert.equal(media.db === listings.db, false);
+
+  const ids: string[] = [];
+  for (const [resizer, prefix] of [
+    [media, 'media'],
+    [listings, 'listings'],
+  ] as const) {
+    for (const n of [1, 2]) {
+      const original = {
+        storageRef: { key: `${prefix}/${n}.png` },
+        format: 'png',
+      };
+      const doc = await File.create({ original, previews: [] });
+      ids.push(String(doc._id));
+      const result = await resizer.prewarm({
+        media: { id: String(doc._id), original, previews: [] },
+        sizes,
+      });
+      assert.equal(result.status, 'accepted');
+    }
+  }
+  await media.ready();
+  await listings.ready();
+  assert.equal(media.tasks, listings.tasks);
+
+  const stop = new AbortController();
+  const done = runWorker({ signal: stop.signal });
+  try {
+    const until = Date.now() + 20000;
+    while (
+      (await File.countDocuments({
+        _id: { $in: ids },
+        'previews.0': { $exists: true },
+      })) !== ids.length
+    ) {
+      assert.ok(Date.now() < until, 'the worker did not store every preview');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  } finally {
+    stop.abort();
+    await done;
+  }
+
+  assert.equal(peak, 1, 'one consume loop: tasks never overlap');
+  assert.deepEqual(a.downloads.sort(), ['media/1.png', 'media/2.png']);
+  assert.deepEqual(b.downloads.sort(), ['listings/1.png', 'listings/2.png']);
+  const rows = await taskModel.find({}).lean();
+  assert.equal(rows.length, 4);
+  assert.ok(rows.every((r) => r.status === 'completed'));
+});
+
+test("FrameworkDatabase keeps one preview row per identity in the app's media model", async () => {
+  const File = fileModel();
+  installApp({ models: { File } });
+  const db = new FrameworkDatabase();
+  db.verify();
+  const doc = await File.create({
+    original: { storageRef: { key: 'o.png' }, format: 'png' },
+    previews: [],
+  });
+  const preview = (key: string) =>
+    ({
+      storageRef: { key },
+      identity: 'default:default:16x16:webp:',
+      sizeKey: '16x16',
+      format: 'webp',
+      contentType: 'image/webp',
+    }) as Preview;
+  const results = await Promise.all([
+    db.appendPreviews(String(doc._id), [preview('one.webp')]),
+    db.appendPreviews(String(doc._id), [preview('two.webp')]),
+  ]);
+  assert.equal(results.flatMap((r) => r ?? []).length, 1);
+  const stored = await File.findById(doc._id).lean();
+  assert.equal(stored?.previews?.length, 1);
+  assert.equal(
+    (stored?.previews?.[0] as Preview | undefined)?.identity,
+    'default:default:16x16:webp:',
+  );
+});
+
+test('verify() rejects a media model registered without previews.identity', async () => {
+  const { identity: _identity, ...previewFields } =
+    resizeMediaSchemaFragment.previews[0];
+  const OldFile =
+    connection.models.OldFile ??
+    connection.model(
+      'OldFile',
+      new mongoose.Schema(
+        {
+          original: resizeMediaSchemaFragment.original,
+          previews: [previewFields],
+        },
+        { minimize: false },
+      ),
+    );
+  installApp({
+    configs: {
+      resize: makeResizeConfig({
+        mediaModelName: 'OldFile',
+        storage: {
+          driver: 'local',
+          rootDir: './var/media',
+          publicBaseUrl: '/m',
+        },
+      }),
+    },
+    models: { OldFile },
+  });
+  await assert.rejects(
+    () => new FrameworkResizer().verify(),
+    (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+      err.message.includes("'OldFile'"),
+  );
 });

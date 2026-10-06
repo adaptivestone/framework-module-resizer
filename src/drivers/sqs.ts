@@ -3,6 +3,7 @@
 //   claim    = ReceiveMessage (visibility timeout = lease; ApproximateReceiveCount = attempts)
 //   renew    = ChangeMessageVisibility        complete = DeleteMessage
 //   retry    = ChangeMessageVisibility(delay) dead     = send to deadLetterQueueUrl (if set), delete
+//   release  = ChangeMessageVisibility(0)
 // The SQS client is built from region/endpoint on first use unless the host passes `client`;
 // credentials come from the AWS provider chain. Subpath-only entry: the optional AWS SDK peer is
 // resolved only when this file is imported, so a missing SDK fails at the host's import line.
@@ -20,6 +21,7 @@ import {
   TaskQueue,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { validateFailedLockTtl } from '../queue.ts';
 import { validateLockTtlMs } from '../resizeConfig.ts';
 import type {
   MissingPreview,
@@ -79,6 +81,7 @@ export class SqsTaskQueue extends TaskQueue {
     }
     if (opts.timing?.lockTtlMs !== undefined) {
       validateLockTtlMs(opts.timing.lockTtlMs);
+      validateFailedLockTtl(opts.timing.lockTtlMs.failed);
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
@@ -262,6 +265,13 @@ export class SqsTaskQueue extends TaskQueue {
       }
       throw err;
     }
+  }
+
+  // Visible again at once. SQS cannot lower a message's receive count, so unlike the database
+  // queue this delivery still counts as an attempt: a task released on its last allowed delivery
+  // is dead-lettered by the next claim without running.
+  async release(task: ClaimedTask): Promise<boolean> {
+    return this.#setVisibility(task, 0);
   }
 
   async #setVisibility(

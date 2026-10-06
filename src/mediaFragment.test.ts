@@ -41,6 +41,7 @@ describe('resizeMediaSchemaFragment — shape', () => {
     const p = resizeMediaSchemaFragment.previews[0];
     for (const k of [
       'storageRef',
+      'identity',
       'resizer',
       'pipeline',
       'sizeKey',
@@ -63,6 +64,7 @@ describe('resizeMediaSchemaFragment — shape', () => {
     assert.equal(resizeMediaSchemaFragment.previews[0].fit.type, Boolean);
     assert.equal(resizeMediaSchemaFragment.previews[0].resizer.type, String);
     assert.equal(resizeMediaSchemaFragment.previews[0].pipeline.type, String);
+    assert.equal(resizeMediaSchemaFragment.previews[0].identity.type, String);
     // Mixed via the string alias (no mongoose import in the fragment source).
     assert.equal(resizeMediaSchemaFragment.previews[0].filters.type, 'Mixed');
   });
@@ -83,6 +85,8 @@ describe('resizeMediaSchemaFragment — host usage', () => {
     assert.ok(schema.path('original.width'));
     assert.ok(schema.path('original.storageRef'));
     assert.ok(schema.path('previews.storageRef'));
+    // The database checks this path at startup: strict mode would strip an unknown one.
+    assert.ok(schema.path('previews.identity'));
     assert.equal(schema.path('original.key'), undefined);
     assert.equal(schema.path('original.bucket'), undefined);
   });

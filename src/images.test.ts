@@ -1,17 +1,21 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { ResizeSetupError } from './errors.ts';
 import {
   calculateResizedDimensions,
+  canonicalizeFilterValue,
+  coverDimensions,
   DEFAULT_SCOPE,
   expandMissingPreviews,
   getFilterSig,
-  getImageContentType,
   getPreviewIdentity,
   getSizeKey,
   isCatalogCovered,
   parseSizeKey,
   previewScope,
+  toMissingPreview,
 } from './images.ts';
+import type { SizeInput } from './types.d.ts';
 
 describe('getSizeKey', () => {
   test('fit → "fit"', () => {
@@ -50,6 +54,66 @@ describe('getSizeKey', () => {
   test('a non-finite dimension does not count', () => {
     assert.throws(() => getSizeKey({ width: Number.NaN }));
     assert.throws(() => getSizeKey({ width: Number.POSITIVE_INFINITY }));
+  });
+
+  test('a positive dimension that rounds to 0 does not count', () => {
+    // A `0w` key would reach sharp as width 0, which it rejects.
+    assert.throws(
+      () => getSizeKey({ width: 0.4 }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_SIZE_INVALID',
+    );
+    assert.throws(() => getSizeKey({ height: 0.49 }));
+    assert.equal(getSizeKey({ width: 0.4, height: 100 }), '100h');
+    assert.equal(getSizeKey({ width: 0.5 }), '1w');
+  });
+});
+
+describe('toMissingPreview', () => {
+  const payload = (size: SizeInput, format = 'webp') =>
+    toMissingPreview(size, getSizeKey(size), format);
+
+  test('a fractional size carries the rounded dimensions of its key', () => {
+    assert.deepEqual(payload({ width: 300.5, height: 200 }), {
+      sizeKey: '301x200',
+      format: 'webp',
+      requestedWidth: 301,
+      requestedHeight: 200,
+    });
+    assert.deepEqual(payload({ width: 0.4, height: 99.6 }), {
+      sizeKey: '100h',
+      format: 'webp',
+      requestedHeight: 100,
+    });
+  });
+
+  test('a width-only or height-only size carries only that side', () => {
+    assert.deepEqual(payload({ width: 620 }), {
+      sizeKey: '620w',
+      format: 'webp',
+      requestedWidth: 620,
+    });
+    assert.deepEqual(payload({ height: 400 }), {
+      sizeKey: '400h',
+      format: 'webp',
+      requestedHeight: 400,
+    });
+  });
+
+  test('fit ignores width and height, so both spellings give one payload', () => {
+    const bare = payload({ fit: true });
+    assert.deepEqual(bare, { sizeKey: 'fit', format: 'webp', fit: true });
+    assert.deepEqual(payload({ fit: true, width: 2000, height: 1200 }), bare);
+  });
+
+  test('copies non-empty filters only', () => {
+    assert.deepEqual(payload({ width: 10, filters: { blur: 3 } }).filters, {
+      blur: 3,
+    });
+    assert.equal(
+      Object.hasOwn(payload({ width: 10, filters: {} }), 'filters'),
+      false,
+    );
   });
 });
 
@@ -163,6 +227,31 @@ describe('getFilterSig', () => {
       getFilterSig({ crop: { x: '1' } } as never),
     );
   });
+
+  test('an own "__proto__" key (from JSON.parse) is part of the signature', () => {
+    const red = JSON.parse('{"__proto__":"red"}');
+    const blue = JSON.parse('{"__proto__":"blue"}');
+    assert.notEqual(getFilterSig(red), getFilterSig(blue));
+    assert.equal(getFilterSig(red), '__proto__:"red"');
+    const nestedA = JSON.parse('{"crop":{"__proto__":{"x":1}}}');
+    const nestedB = JSON.parse('{"crop":{"__proto__":{"x":2}}}');
+    assert.notEqual(getFilterSig(nestedA), getFilterSig(nestedB));
+  });
+});
+
+describe('canonicalizeFilterValue', () => {
+  test('keeps an own "__proto__" key as data and never changes the prototype', () => {
+    const canonical = canonicalizeFilterValue(
+      JSON.parse('{"b":1,"__proto__":{"polluted":true}}'),
+    ) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(canonical), ['__proto__', 'b']);
+    assert.equal(Object.getPrototypeOf(canonical), Object.prototype);
+    assert.equal((canonical as { polluted?: unknown }).polluted, undefined);
+    assert.equal(
+      JSON.stringify(canonical),
+      '{"__proto__":{"polluted":true},"b":1}',
+    );
+  });
 });
 
 describe('getPreviewIdentity', () => {
@@ -267,18 +356,6 @@ describe('expandMissingPreviews with a scope', () => {
   });
 });
 
-describe('getImageContentType', () => {
-  test('maps each raster preview format', () => {
-    assert.equal(getImageContentType('jpeg'), 'image/jpeg');
-    assert.equal(getImageContentType('webp'), 'image/webp');
-    assert.equal(getImageContentType('avif'), 'image/avif');
-  });
-
-  test('undefined format → undefined', () => {
-    assert.equal(getImageContentType(undefined), undefined);
-  });
-});
-
 describe('calculateResizedDimensions', () => {
   test('cover passes both target dims through unchanged', () => {
     const r = calculateResizedDimensions(4000, 3000, 300, 300, false);
@@ -358,6 +435,67 @@ describe('calculateResizedDimensions', () => {
     );
     assert.equal(r.width, 1600);
     assert.equal(r.height, 1200);
+  });
+
+  test('fit keeps each side at least 1 on an extreme aspect ratio', () => {
+    assert.deepEqual(
+      calculateResizedDimensions(10000, 2, undefined, undefined, true),
+      { width: 2000, height: 1 },
+    );
+    assert.deepEqual(
+      calculateResizedDimensions(2, 10000, undefined, undefined, true),
+      { width: 1, height: 1200 },
+    );
+  });
+});
+
+describe('coverDimensions', () => {
+  test('both sides pass through, rounded and capped per side', () => {
+    assert.deepEqual(coverDimensions(4000, 3000, 300, 200, 5000), {
+      width: 300,
+      height: 200,
+    });
+    assert.deepEqual(coverDimensions(4000, 3000, 300.5, 199.6, 5000), {
+      width: 301,
+      height: 200,
+    });
+    assert.deepEqual(coverDimensions(64, 48, 9000, 50, 100), {
+      width: 100,
+      height: 50,
+    });
+  });
+
+  test('width-only keeps the aspect ratio while the derived height fits the cap', () => {
+    assert.deepEqual(coverDimensions(4000, 3000, 620, undefined, 5000), {
+      width: 620,
+      height: undefined,
+    });
+  });
+
+  test('width-only crops to the cap when the derived height would exceed it', () => {
+    // 1×100 source at width 1300 would be 1300×130000.
+    assert.deepEqual(coverDimensions(1, 100, 1300, undefined, 5000), {
+      width: 1300,
+      height: 5000,
+    });
+  });
+
+  test('height-only crops to the cap when the derived width would exceed it', () => {
+    assert.deepEqual(coverDimensions(100, 1, undefined, 1300, 5000), {
+      width: 5000,
+      height: 1300,
+    });
+    assert.deepEqual(coverDimensions(4000, 3000, undefined, 400, 5000), {
+      width: undefined,
+      height: 400,
+    });
+  });
+
+  test('the requested side is capped before the derived side is computed', () => {
+    assert.deepEqual(coverDimensions(1, 100, 9000, undefined, 200), {
+      width: 200,
+      height: 200,
+    });
   });
 });
 
