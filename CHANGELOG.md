@@ -23,6 +23,10 @@
   `RESIZE_SVG_RENDER_UNAVAILABLE`: the host must allow child processes (`--allow-child-process`
   under Node's permission model) and ship `svgRasterChild.js` next to `svgRaster.js` (bundles).
   Eager `generate()` throws all three.
+  SVG dimensions that cannot retain a pixel on each raster side within the renderer's side
+  limit (for example, `1×100000`) are rejected before storage with `ResizeOriginalError`
+  `RESIZE_SVG_DIMENSIONS_UNSUPPORTED`. Already stored sources fail with `ResizeMediaError`
+  carrying the same code and are dead-lettered on their first delivery.
 - The original is never served. `resolve()` no longer serves an original that fits the requested
   box: `decision.ready` holds stored previews only, every `ReadyEntry` has `preview` and
   `contentType`, and `isOriginal` is gone. For a pipeline without `variantSteps`, a raster

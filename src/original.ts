@@ -2,6 +2,7 @@ import sharp, { type Metadata } from 'sharp';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
+import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   Original,
@@ -87,6 +88,37 @@ async function prepareOriginal(
       `resize uploadOriginal: image ${metadata.width}x${frameHeight}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
       { code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' },
     );
+  }
+  if (format === 'svg') {
+    let density: number | undefined;
+    try {
+      const natural = await svgNaturalSize(
+        body,
+        metadata.width,
+        metadata.height,
+        config.limits.inputPixels,
+        config.limits.processingTimeoutSeconds,
+      );
+      density = await svgRasterDensity(body, natural.width, natural.height, {
+        pixelBudget: Math.min(
+          config.limits.sourcePixels,
+          config.limits.inputPixels,
+        ),
+        inputPixels: config.limits.inputPixels,
+        timeoutSeconds: config.limits.processingTimeoutSeconds,
+      });
+    } catch (cause) {
+      throw new ResizeOriginalError(
+        'resize uploadOriginal: SVG dimensions could not be inspected',
+        { code: 'RESIZE_ORIGINAL_INVALID', cause },
+      );
+    }
+    if (density === undefined) {
+      throw new ResizeOriginalError(
+        'resize uploadOriginal: SVG dimensions cannot be rasterized within the renderer limits',
+        { code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' },
+      );
+    }
   }
   return {
     format,

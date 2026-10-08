@@ -27,6 +27,7 @@ import {
 import { runBounded } from './helpers/concurrency.ts';
 import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
+import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
 import { rasterizeSvg } from './helpers/svgRaster.ts';
 import {
   calculateResizedDimensions,
@@ -55,9 +56,6 @@ import type {
 /** Normalize a driver download / beforeStep result to a Node Buffer for the next sharp(). */
 const asBuffer = (b: Buffer | Uint8Array): Buffer =>
   Buffer.isBuffer(b) ? b : Buffer.from(b);
-
-// librsvg refuses to render an SVG whose raster side is larger than this.
-const SVG_MAX_SIDE = 32767;
 
 /**
  * An unregistered pipeline must not render: its previews would be stored under that pipeline's
@@ -116,50 +114,6 @@ function withoutVisibleLoss(img: Sharp, format: string | undefined): Sharp {
     default:
       return img; // PNG and GIF are lossless at Sharp's defaults
   }
-}
-
-/**
- * An SVG's own size to a fraction of a pixel. Its 72 dpi size (roundedW × roundedH) and any
- * raster are rounded to whole pixels, so a side derived from them can be a pixel off (200×100
- * rendered at 619×310 gives 620×311 for a 620 width), and a 1000×0.6 SVG reads as 1000×1. This
- * is a header-only read (nothing is rendered) at the highest density whose size still fits
- * limitInputPixels, which Sharp checks on the header too; the +2 margins absorb its rounding.
- */
-async function svgNaturalSize(
-  svg: Buffer,
-  roundedW: number,
-  roundedH: number,
-  config: Resizer['config'],
-): Promise<{ width: number; height: number }> {
-  const density = Math.max(
-    72,
-    Math.min(
-      100_000,
-      Math.floor(
-        72 *
-          Math.sqrt(
-            config.limits.inputPixels / ((roundedW + 2) * (roundedH + 2)),
-          ),
-      ),
-    ),
-  );
-  const meta = await sharp(svg, {
-    density,
-    limitInputPixels: config.limits.inputPixels,
-  })
-    .timeout({ seconds: config.limits.processingTimeoutSeconds })
-    .metadata();
-  // Each side to within 1/scale of a pixel. A whole-number size inside that range is taken as
-  // exact: the read is coarse for a long strip (40000×300 allows only about 4.7×).
-  const scale = density / 72;
-  const side = (scaled: number | undefined, rounded: number) => {
-    const estimate = scaled === undefined ? rounded : scaled / scale;
-    return Math.abs(estimate - rounded) <= 1 / scale ? rounded : estimate;
-  };
-  return {
-    width: side(meta.width, roundedW),
-    height: side(meta.height, roundedH),
-  };
 }
 
 /** The identity a stored row answers for (rows written before previews carried one: derived). */
@@ -351,7 +305,13 @@ export async function generatePreviews(
   const fromSvg = origMeta.format === 'svg';
   let svgAspect: number | undefined;
   if (fromSvg) {
-    const natural = await svgNaturalSize(buf, dispW, dispH, config);
+    const natural = await svgNaturalSize(
+      buf,
+      dispW,
+      dispH,
+      config.limits.inputPixels,
+      config.limits.processingTimeoutSeconds,
+    );
     svgAspect = natural.width / natural.height;
     const largestScale = Math.max(
       1,
@@ -364,19 +324,20 @@ export async function generatePreviews(
           ),
         ),
     );
-    const scale = Math.min(
-      Math.max(
-        1,
-        Math.min(
-          largestScale,
-          Math.sqrt(pixelBudget / (natural.width * natural.height)),
-        ),
-      ),
-      // librsvg's side limit holds whatever the pixel budget allows (a 1×5000 strip).
-      SVG_MAX_SIDE / Math.max(natural.width, natural.height),
-    );
+    const density = await svgRasterDensity(buf, natural.width, natural.height, {
+      pixelBudget,
+      inputPixels: config.limits.inputPixels,
+      timeoutSeconds: config.limits.processingTimeoutSeconds,
+      largestScale,
+    });
+    if (density === undefined) {
+      throw new ResizeMediaError(
+        `resize: SVG dimensions cannot be rasterized within the renderer limits for media ${mediaId}`,
+        { mediaId, code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' },
+      );
+    }
     buf = await rasterizeSvg(buf, {
-      density: Math.max(1, Math.min(100_000, Math.floor(72 * scale))),
+      density,
       limitInputPixels: config.limits.inputPixels,
       timeoutMs: config.limits.processingTimeoutSeconds * 1000,
       signal,

@@ -171,7 +171,10 @@ const original = await getResizer().uploadOriginal({
 The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
 bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) as a private original. SVG
 sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
-is rejected. The module does not sanitize SVG markup. The worker renders an SVG once per task,
+is rejected. SVG dimensions that cannot retain a pixel on each side within the renderer's side
+limit are rejected before storage with `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` (for example,
+`1×100000`). Already stored sources with those dimensions are dead-lettered on their first
+delivery. The module does not sanitize SVG markup. The worker renders an SVG once per task,
 before any pipeline step, into a PNG, in a separate Node process, at the largest size the
 requested previews need; `beforeSteps` receive that PNG (never SVG markup), and every format is
 made from it. The render is killed after `limits.processingTimeoutSeconds`

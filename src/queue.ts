@@ -111,13 +111,14 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
 }
 
 // Errors no retry can fix: the media row has no original, its source has no dimensions or is over
-// the pixel limits, or its SVG takes longer to render than allowed. Each retry would only download
-// and decode the original again. Errors cross module boundaries as plain objects, so match the
-// stable code, not the class.
+// the pixel limits, or its SVG cannot fit the renderer or takes longer to render than allowed.
+// Each retry would only download and decode the original again. Errors cross module boundaries
+// as plain objects, so match the stable code, not the class.
 const TERMINAL_ERROR_CODES: ReadonlySet<unknown> = new Set([
   'RESIZE_NO_ORIGINAL',
   'RESIZE_SOURCE_METADATA_MISSING',
   'RESIZE_SOURCE_TOO_LARGE',
+  'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
   'RESIZE_SVG_RENDER_TIMEOUT',
 ]);
 
