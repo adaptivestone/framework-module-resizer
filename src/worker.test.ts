@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
+import { ResizeMediaError } from './errors.ts';
 import { consumeQueue } from './queue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
@@ -101,6 +102,87 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
   assert.equal(tasks.rows[0].status, 'dead');
   assert.equal(tasks.rows[0].attempts, 1);
   assert.equal(downloads, 1);
+});
+
+test('a stored SVG with unsupported dimensions is dead-lettered on its first delivery', async () => {
+  const svg = Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="100000"><rect width="1" height="100000" fill="red"/></svg>',
+  );
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+  });
+  let downloads = 0;
+  let uploads = 0;
+  const media: MediaLike = {
+    id: 'm1',
+    original: {
+      storageRef: { key: 'original.svg' },
+      format: 'svg',
+      width: 1,
+      height: 100000,
+    },
+    previews: [],
+  };
+  new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    storage: {
+      download: async () => {
+        downloads += 1;
+        return svg;
+      },
+      upload: async () => {
+        uploads += 1;
+        return { key: 'preview' };
+      },
+      publicUrl: () => '',
+    },
+    db: fakeDb({ load: async () => media }),
+    tasks,
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [
+      {
+        sizeKey: '10x10',
+        format: 'webp',
+        requestedWidth: 10,
+        requestedHeight: 10,
+      },
+    ],
+    requestKey: 'svg-geometry',
+  });
+  const events: { event: TaskEvent; error?: unknown }[] = [];
+  const stop = new AbortController();
+  const timeout = setTimeout(() => stop.abort(), 5000);
+  try {
+    await consumeQueue(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => processTask(task, opts, tasks),
+      onEvent: (event, _task, error) => {
+        events.push({ event, error });
+        stop.abort();
+      },
+      logger: silent,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+  assert.deepEqual(
+    events.map(({ event }) => event),
+    ['deadLettered'],
+  );
+  assert.ok(events[0].error instanceof ResizeMediaError);
+  assert.equal(events[0].error.code, 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED');
+  assert.equal(tasks.rows[0].status, 'dead');
+  assert.equal(tasks.rows[0].attempts, 1);
+  assert.equal(downloads, 1);
+  assert.equal(uploads, 0);
+  assert.deepEqual(media.previews, []);
 });
 
 describe('dead-letter cooldown', () => {

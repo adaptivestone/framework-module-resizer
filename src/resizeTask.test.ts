@@ -2290,6 +2290,46 @@ describe('EXIF orientation quality', () => {
 // ---------------------------------------------------------------------------
 
 describe('SVG raster size', () => {
+  test('an already stored unrasterizable SVG fails before spawning the renderer or running steps', async () => {
+    installApp();
+    const needleSvg = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="100000"><rect width="1" height="100000" fill="red"/></svg>',
+    );
+    const { storage, uploads } = makeStorage(needleSvg);
+    const { db } = makeDatabase(null);
+    let steps = 0;
+    const renders = countRenders();
+    const r = new FrameworkResizer({
+      storage,
+      db,
+      pipelines: {
+        default: {
+          beforeSteps: [
+            async (buf) => {
+              steps += 1;
+              return buf;
+            },
+          ],
+        },
+      },
+    });
+    await assert.rejects(
+      r.generate({
+        media: mediaDoc({
+          original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
+        }),
+        sizes: [{ fit: true }, { width: 300, height: 300 }],
+        formats: ['jpeg'],
+      }),
+      (err: unknown) =>
+        err instanceof ResizeMediaError &&
+        err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+    );
+    assert.equal(renders(), 0);
+    assert.equal(steps, 0);
+    assert.equal(uploads.length, 0);
+  });
+
   test('a 1×5000 SVG renders cover and fit variants', async () => {
     installApp();
     const { storage } = makeStorage(tallSvg);

@@ -285,6 +285,51 @@ describe('uploadOriginal — private SVG source', () => {
     assert.deepEqual(uploads[0].body, body);
   });
 
+  for (const [width, height] of [
+    [1, 100000],
+    [100000, 1],
+    [0.6, 40000],
+    [1, 65535],
+    [1, 2400000],
+  ]) {
+    test(`rejects an unrasterizable ${width}×${height} SVG before storage`, async () => {
+      installApp();
+      const { storage, uploads } = recordingStorage();
+      const r = new FrameworkResizer({ storage });
+      await assert.rejects(
+        r.uploadOriginal({
+          body: Buffer.from(
+            `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"/>`,
+          ),
+          visibility: 'private',
+        }),
+        (err: unknown) =>
+          err instanceof ResizeOriginalError &&
+          err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+      );
+      assert.equal(uploads.length, 0);
+    });
+  }
+
+  for (const [width, height] of [
+    [1, 40000],
+    [40000, 1],
+    [0.7, 40000],
+    [1, 65534],
+  ]) {
+    test(`accepts a supported ${width}×${height} SVG and preserves its bytes`, async () => {
+      installApp();
+      const { storage, uploads } = recordingStorage();
+      const r = new FrameworkResizer({ storage });
+      const body = Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"/>`,
+      );
+      const original = await r.uploadOriginal({ body, visibility: 'private' });
+      assert.equal(original.format, 'svg');
+      assert.deepEqual(uploads[0].body, body);
+    });
+  }
+
   test('rejects unreadable SVG and non-image XML before storage', async () => {
     installApp();
     const { storage, uploads } = recordingStorage();

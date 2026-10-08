@@ -226,6 +226,7 @@ describe('consumeQueue', () => {
   for (const code of [
     'RESIZE_SOURCE_TOO_LARGE',
     'RESIZE_SOURCE_METADATA_MISSING',
+    'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
     'RESIZE_SVG_RENDER_TIMEOUT', // rendering cannot get faster on a retry
   ]) {
     test(`an unusable source (${code}) is dead on the first failure`, async () => {
@@ -522,6 +523,7 @@ describe('consumeQueue shutdown', () => {
     'RESIZE_NO_ORIGINAL',
     'RESIZE_SOURCE_METADATA_MISSING',
     'RESIZE_SOURCE_TOO_LARGE',
+    'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
     'RESIZE_SVG_RENDER_TIMEOUT',
   ]) {
     test(`a terminal error (${code}) during shutdown is still dead-lettered, not given back`, async () => {

@@ -366,7 +366,9 @@ and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do 
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when no retry can help: the media has no original (`RESIZE_NO_ORIGINAL`), the source
     has no dimensions or exceeds the pixel limits (`RESIZE_SOURCE_METADATA_MISSING`,
-    `RESIZE_SOURCE_TOO_LARGE`), or an SVG render ran past `limits.processingTimeoutSeconds`
+    `RESIZE_SOURCE_TOO_LARGE`), an SVG has dimensions that cannot fit the renderer
+    (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected before storage by `uploadOriginal()`),
+    or an SVG render ran past `limits.processingTimeoutSeconds`
     (`RESIZE_SVG_RENDER_TIMEOUT`).
   - Completed rows expire after 24 h and dead rows after ~30 days (the `expireAfterSeconds` in
     the model).
