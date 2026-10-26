@@ -54,7 +54,7 @@
 | `src/helpers/log.ts` | Create | `logNeverThrow`: log on a never-throw path, with a console fallback for a throwing logger |
 | `src/hooks.ts` | Create | `HookBus`: guarded waterfalls and observers, mirrored to the event bus |
 | `src/pipelines.ts` | Create | `PipelineRegistry`: named pipelines, fixed at construction |
-| `src/registry.ts` | Create | Process registry: `registerResizer`, `getResizer`, `listResizers`, test reset hooks |
+| `src/registry.ts` | Create | Generic `Registry<T>` (`register`, `get`, `list`, `reset`, `onReset`); imports nothing from `resizer.ts`, which owns the typed `getResizer` / `listResizers` / reset functions |
 | `src/catalog.ts` | Create | `Catalog`: size × format expansion, identities, stored identities, configured formats |
 | `src/uploader.ts` | `git mv` from `original.ts` | `Uploader`: `uploadOriginal` |
 | `src/dispatcher.ts` | `git mv` from `enqueue.ts` | `Dispatcher`: the read path's enqueue and the prewarm confirmation |
@@ -514,16 +514,23 @@ export class PipelineRegistry {
   get(name: string): Pipeline; // unknown → one frozen empty pipeline
   has(name: string): boolean;  // 'default' always
 }
-// src/registry.ts
-export function registerResizer(resizer: Resizer): void; // duplicate name → ResizeSetupError RESIZE_DUPLICATE_RESIZER
-export function getResizer(name?: string): Resizer;       // default 'default'; missing → RESIZE_NO_RESIZER
-export function listResizers(): Resizer[];
-export function resetResizerForTests(): void;
-export function onResetResizerForTests(reset: () => void): void;
-// src/resizer.ts: ResizerOptions['hooks'] is HookTaps. The Resizer keeps hook() and hasPipeline(), and keeps runWaterfall(),
+// src/registry.ts — generic, imports nothing from resizer.ts
+export class Registry<T extends { readonly name: string }> {
+  register(item: T): void;        // duplicate name → ResizeSetupError RESIZE_DUPLICATE_RESIZER (today's message)
+  get(name?: string): T;          // default 'default'; missing → ResizeSetupError RESIZE_NO_RESIZER (today's message)
+  list(): T[];
+  reset(): void;                  // clears the items and runs every onReset hook
+  onReset(hook: () => void): void;
+}
+// src/resizer.ts owns the typed instance and the functions hosts and entry points use (moved, same names and behaviour):
+//   const registry = new Registry<Resizer>();
+//   export function getResizer(name?: string): Resizer; export function listResizers(): Resizer[];
+//   export function resetResizerForTests(): void; export function onResetResizerForTests(reset: () => void): void;
+// index.ts, worker.ts and framework/* import these from resizer.ts.
+// ResizerOptions['hooks'] is HookTaps. The Resizer keeps hook() and hasPipeline(), and keeps runWaterfall(),
 // runObservers() and getPipeline() as one-line delegates until Task 13. registerPipeline() is removed: pipelines are fixed at construction.
 ```
-**Decision (registry edge):** `registry.ts` keeps an `import type { Resizer }`, because the constructor calls `registerResizer(this)` and `getResizer()` must return the class type. This is the one edge back into `resizer.ts`, and it is type-only; Task 16 allows exactly this edge.
+**Decision (registry edge, controller ruling):** the spec (F5) removes the type cycles through `resizer.ts`, so `registry.ts` must not import `Resizer` even as a type. The registry is generic; `resizer.ts` instantiates it and exports the typed functions. Task 16's back-edge list is therefore empty.
 
 - [ ] **Step 1: Write the failing tests.** Move the describes `runWaterfall` (`resizer.test.ts:594-641`) and `runObservers` (`:643-720`) to `src/hooks.test.ts`. Each one builds `new HookBus({ logger, events })` instead of a Resizer, with unchanged assertions. Add:
 ```ts
@@ -537,12 +544,12 @@ test('a seeded pipeline is returned by get()', …)
 test('an unknown name returns one frozen empty pipeline', …) // deepEqual {}, Object.isFrozen, get('a') === get('b')
 test("has() is true for 'default' and seeded names only", …)
 ```
-In `resizer.test.ts`, the describe `Resizer registry` imports from `./registry.ts`; add:
+In `resizer.test.ts`, the describe `Resizer registry` keeps importing `getResizer` / `listResizers` / `resetResizerForTests` / `onResetResizerForTests` from `./resizer.ts`; add a `src/registry.test.ts` with `register` / `get` / `list` / `reset` / `onReset` on a `Registry<{ name: string }>` (duplicate → `RESIZE_DUPLICATE_RESIZER`, missing → `RESIZE_NO_RESIZER`), and in `resizer.test.ts` add:
 ```ts
 test('resetResizerForTests() runs every onResetResizerForTests hook', …) // a counter hook → 1 after one reset
 ```
 - [ ] **Step 2: Run the tests to verify they fail.** Run: `node --experimental-strip-types --test src/hooks.test.ts src/pipelines.test.ts src/resizer.test.ts`. Expected: FAIL with "Cannot find module './hooks.ts'".
-- [ ] **Step 3: Implement `HookBus`, `PipelineRegistry` and the registry functions.** The bodies move from `resizer.ts`. The constructor builds `#hooks = new HookBus({ logger, events, taps: opts.hooks })` and `#pipelines = new PipelineRegistry(opts.pipelines)`, and calls `registerResizer(this)` as its last statement. `resizer.ts` stops re-exporting contract types. `index.ts` takes the pipeline and hook types from `contracts/`, the option types from `types.d.ts`, and `getResizer` / `resetResizerForTests` from `registry.ts`. Update the `types.d.ts` header to name `contracts/` as the home of source-coupled types.
+- [ ] **Step 3: Implement `HookBus`, `PipelineRegistry` and the registry functions.** The bodies move from `resizer.ts`. The constructor builds `#hooks = new HookBus({ logger, events, taps: opts.hooks })` and `#pipelines = new PipelineRegistry(opts.pipelines)`, and calls `registry.register(this)` as its last statement (`registry` is the module-level `new Registry<Resizer>()` in `resizer.ts`). `resizer.ts` stops re-exporting contract types. `index.ts` takes the pipeline and hook types from `contracts/`, the option types from `types.d.ts`, and keeps taking `getResizer` / `resetResizerForTests` from `resizer.ts`. Update the `types.d.ts` header to name `contracts/` as the home of source-coupled types.
 - [ ] **Step 4: Run everything to verify it passes.** Run: `npm run types:check && npm run check && npm test`. Expected: PASS.
 - [ ] **Step 5: Commit.** `git add -A src && git commit -m "refactor: hook bus, pipeline registry and the Resizer registry get their own modules"`
 
@@ -885,14 +892,13 @@ Produces: (test-only) `walk(entry: string, opts?: { types: boolean }): { files: 
 
 - [ ] **Step 1: Write the tests.** In `src/importGraph.test.ts`:
 ```ts
-test('only index.ts, worker.ts, registry.ts and the framework adapter import resizer.ts', () => {
-  const allowed = (f: string) => ['index.ts', 'worker.ts', 'registry.ts'].includes(f) || f.startsWith('framework/');
+test('only index.ts, worker.ts and the framework adapter import resizer.ts', () => {
+  const allowed = (f: string) => ['index.ts', 'worker.ts'].includes(f) || f.startsWith('framework/');
   assert.deepEqual(sourceFiles().filter((f) => !allowed(f) && localImports(f, { types: true }).includes('resizer.ts')), []);
 });
-test('nothing resizer.ts reaches imports it back, except registry.ts with import type', () => {
+test('nothing resizer.ts reaches imports it back, not even as a type', () => {
   const back = [...walk('resizer.ts', { types: true }).files.keys()].filter((f) => f !== 'resizer.ts' && localImports(f, { types: true }).includes('resizer.ts'));
-  assert.deepEqual(back, ['registry.ts']);
-  assert.equal(localImports('registry.ts', { types: false }).includes('resizer.ts'), false);
+  assert.deepEqual(back, []);
 });
 test('the Dispatcher and its test need no Resizer, framework, storage or media port', () => {
   assert.deepEqual([...walk('dispatcher.test.ts', { types: true }).files.keys()].filter((f) => f === 'resizer.ts' || f.startsWith('framework/')), []);
@@ -948,7 +954,7 @@ Consumes: every exported name from Tasks 1–15: `MediaStore`, `LockStore`, `mon
 ## Definition of done (S1)
 
 - A Dispatcher unit test constructs only `memoryLocks()` and the in-memory `MemoryTaskQueue` (Task 11), and a guard pins it (Task 16).
-- No service file imports `resizer.ts`, and nothing `resizer.ts` reaches imports it back, except `registry.ts` with `import type` (Task 16).
+- No service file imports `resizer.ts`, and nothing `resizer.ts` reaches imports it back, not even as a type (Task 16).
 - `drivers/**` import only contracts, errors, helpers, types and other drivers (Task 2).
 - `src/drivers/mongo/frameworkFree.integration.test.ts` wires through `mongoParts` (Task 7).
 - `npm test`, `npm run types:check`, `npm run check`, `npm run build` and `npm run smoke` pass, and README, AGENTS.md, CHANGELOG and the docs-site page describe the ports (Task 17).
