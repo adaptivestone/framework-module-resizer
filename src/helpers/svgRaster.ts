@@ -151,7 +151,8 @@ export function rasterizeSvg(
         settle(
           new ResizeMediaError(
             `resize: SVG rendering${forMedia} exceeded limits.processingTimeoutSeconds (${timeoutMs / 1000}s) — the render process was killed`,
-            { mediaId, code: 'RESIZE_SVG_RENDER_TIMEOUT' },
+            // Rendering the same SVG cannot get faster on a retry.
+            { mediaId, code: 'RESIZE_SVG_RENDER_TIMEOUT', retryable: false },
           ),
         );
         return;

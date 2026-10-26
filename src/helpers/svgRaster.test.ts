@@ -152,7 +152,8 @@ describe('rasterizeSvg', () => {
       (err: unknown) =>
         err instanceof ResizeMediaError &&
         err.code === 'RESIZE_SVG_RENDER_TIMEOUT' &&
-        err.mediaId === 'm1',
+        err.mediaId === 'm1' &&
+        err.retryable === false,
     );
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 3000, `settled after ${elapsed} ms`);

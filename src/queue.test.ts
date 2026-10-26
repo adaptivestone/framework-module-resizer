@@ -1,6 +1,6 @@
 // The core queue loop (consumeQueue) against the in-memory TaskQueue: the same lifecycle every
-// backend gets — completion, retry with backoff, dead-lettering, terminal errors, crash loops,
-// timeouts, lost leases, graceful shutdown and resilient claiming.
+// backend gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash
+// loops, timeouts, lost leases, graceful shutdown and resilient claiming.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type {
@@ -223,33 +223,65 @@ describe('consumeQueue', () => {
     );
   });
 
-  for (const code of [
-    'RESIZE_SOURCE_TOO_LARGE',
-    'RESIZE_SOURCE_METADATA_MISSING',
-    'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-    'RESIZE_SVG_RENDER_TIMEOUT', // rendering cannot get faster on a retry
-  ]) {
-    test(`an unusable source (${code}) is dead on the first failure`, async () => {
-      const tasks = new MemoryTaskQueue({ timing: fastTiming });
-      await tasks.add(newTask());
-      const events = await runUntil(
-        tasks,
-        async () => {
-          throw new ResizeMediaError('resize: unusable source', {
-            mediaId: 'm1',
-            code,
-          });
-        },
-        () => tasks.rows[0].status === 'dead',
-      );
-      assert.equal(tasks.rows[0].attempts, 1);
-      assert.deepEqual(
-        events.map((e) => e.event),
-        ['deadLettered'],
-      );
-      assert.equal((events[0].error as { code?: string }).code, code);
+  test('an error with retryable: false is dead on the first failure', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeMediaError('resize: unusable source', {
+          mediaId: 'm1',
+          code: 'RESIZE_ANY',
+          retryable: false,
+        });
+      },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(tasks.rows[0].attempts, 1);
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+  });
+
+  test('a plain object with retryable: false is dead on the first failure', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    await runUntil(
+      tasks,
+      async () => {
+        // What an error looks like after crossing a process boundary: no class, only fields.
+        throw {
+          code: 'RESIZE_SOURCE_TOO_LARGE',
+          retryable: false,
+          message: 'crossed a process boundary',
+        };
+      },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(tasks.rows[0].status, 'dead');
+    assert.equal(tasks.rows[0].attempts, 1);
+  });
+
+  test('a formerly terminal code without retryable: false is retried', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 60_000, max: 60_000 } },
     });
-  }
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeMediaError('x', { code: 'RESIZE_SOURCE_TOO_LARGE' });
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+    );
+    assert.equal(tasks.rows[0].attempts, 1);
+    assert.equal(tasks.rows[0].status, 'pending');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+  });
 
   for (const code of ['RESIZE_WORKER_INCOMPLETE', 'RESIZE_PIPELINE_UNKNOWN']) {
     test(`${code} stays a retryable failure`, async () => {
@@ -519,43 +551,28 @@ describe('consumeQueue shutdown', () => {
     });
   }
 
-  for (const code of [
-    'RESIZE_NO_ORIGINAL',
-    'RESIZE_SOURCE_METADATA_MISSING',
-    'RESIZE_SOURCE_TOO_LARGE',
-    'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-    'RESIZE_SVG_RENDER_TIMEOUT',
-  ]) {
-    test(`a terminal error (${code}) during shutdown is still dead-lettered, not given back`, async () => {
-      const tasks = new ReleasingTaskQueue({ timing: fastTiming });
-      await tasks.add(newTask());
-      // The shutdown arrives while the handler inspects the source, which then proves unusable.
-      const events = await shutDownMidTask(
-        tasks,
-        (_task, { signal }) =>
-          new Promise<void>((_resolve, reject) => {
-            signal.addEventListener(
-              'abort',
-              () =>
-                reject(
-                  new ResizeMediaError('resize: unusable source', {
-                    mediaId: 'm1',
-                    code,
-                  }),
-                ),
-              { once: true },
-            );
-          }),
-      );
-      assert.deepEqual(
-        events.map((e) => e.event),
-        ['deadLettered'],
-      );
-      assert.equal((events[0].error as { code?: string }).code, code);
-      assert.equal(tasks.rows[0].status, 'dead');
-      assert.deepEqual(tasks.releaseCalls, []);
-    });
-  }
+  test('a non-retryable error during shutdown is still dead-lettered, not given back', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    // The shutdown arrives while the handler inspects the source, which then proves unusable.
+    const events = await shutDownMidTask(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => reject({ code: 'RESIZE_ANY', retryable: false }),
+            { once: true },
+          );
+        }),
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    assert.equal(tasks.rows[0].status, 'dead');
+    assert.deepEqual(tasks.releaseCalls, []);
+  });
 
   test('a queue without release retries the stopped task at once, with no event and never dead', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });

@@ -31,6 +31,7 @@ export type {
 export {
   ResizeConfigError,
   ResizeError,
+  type ResizeErrorOptions,
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,

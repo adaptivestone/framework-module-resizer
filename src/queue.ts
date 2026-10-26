@@ -1,7 +1,7 @@
 // The core queue logic, the same for every TaskQueue backend: the worker loop (claim, lease
 // heartbeat, task timeout, giving tasks back at shutdown), the retry policy (backoff,
-// dead-lettering after maxAttempts, terminal errors) and task events. Backends only implement the
-// atomic TaskQueue operations.
+// dead-lettering after maxAttempts, non-retryable errors) and task events. Backends only implement
+// the atomic TaskQueue operations.
 import { defaultQueueOptions } from './config/resize.ts';
 import type {
   ClaimedTask,
@@ -110,23 +110,16 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
   };
 }
 
-// Errors no retry can fix: the media row has no original, its source has no dimensions or is over
-// the pixel limits, or its SVG cannot fit the renderer or takes longer to render than allowed.
-// Each retry would only download and decode the original again. Errors cross module boundaries
-// as plain objects, so match the stable code, not the class.
-const TERMINAL_ERROR_CODES: ReadonlySet<unknown> = new Set([
-  'RESIZE_NO_ORIGINAL',
-  'RESIZE_SOURCE_METADATA_MISSING',
-  'RESIZE_SOURCE_TOO_LARGE',
-  'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-  'RESIZE_SVG_RENDER_TIMEOUT',
-]);
-
-const isTerminal = (error: unknown): boolean =>
-  typeof error === 'object' &&
-  error !== null &&
-  'code' in error &&
-  TERMINAL_ERROR_CODES.has((error as { code?: unknown }).code);
+// The thrower says when no retry can help (`retryable: false`), so the task is dead-lettered at
+// once instead of being downloaded and decoded again. Errors cross process boundaries as plain
+// objects, so read the field, never the class.
+function notRetryable(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { retryable?: unknown }).retryable === false
+  );
+}
 
 export interface ConsumeQueueOptions {
   queue: string;
@@ -176,7 +169,8 @@ export async function consumeQueue(
     error: unknown,
     forceDead = false,
   ): Promise<void> => {
-    const dead = forceDead || isTerminal(error) || task.attempts >= maxAttempts;
+    const dead =
+      forceDead || notRetryable(error) || task.attempts >= maxAttempts;
     try {
       const held = await tasks.fail(
         task,
@@ -343,9 +337,13 @@ export async function consumeQueue(
           err,
         );
       }
-    } else if (opts.signal.aborted && !leaseLost && !isTerminal(handlerError)) {
-      // Stopped by the shutdown, not by its own failure: not an attempt. A terminal error still
-      // dead-letters: the task proved it can never succeed before the shutdown stopped it.
+    } else if (
+      opts.signal.aborted &&
+      !leaseLost &&
+      !notRetryable(handlerError)
+    ) {
+      // Stopped by the shutdown, not by its own failure: not an attempt. A non-retryable error
+      // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
       await giveBack(task);
     } else {
       await finish(task, handlerError);

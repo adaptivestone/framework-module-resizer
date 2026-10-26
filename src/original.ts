@@ -116,7 +116,7 @@ async function prepareOriginal(
     if (density === undefined) {
       throw new ResizeOriginalError(
         'resize uploadOriginal: SVG dimensions cannot be rasterized within the renderer limits',
-        { code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' },
+        { code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED', retryable: false },
       );
     }
   }

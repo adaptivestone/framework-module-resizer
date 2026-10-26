@@ -1934,7 +1934,8 @@ describe('animated sources', () => {
         }),
       (err: unknown) =>
         err instanceof ResizeMediaError &&
-        err.code === 'RESIZE_SOURCE_TOO_LARGE',
+        err.code === 'RESIZE_SOURCE_TOO_LARGE' &&
+        err.retryable === false,
     );
     assert.equal(uploads.length, 0);
   });
@@ -2323,7 +2324,8 @@ describe('SVG raster size', () => {
       }),
       (err: unknown) =>
         err instanceof ResizeMediaError &&
-        err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+        err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' &&
+        err.retryable === false,
     );
     assert.equal(renders(), 0);
     assert.equal(steps, 0);
@@ -2595,7 +2597,8 @@ describe('SVG rendering', () => {
       (err: unknown) =>
         err instanceof ResizeMediaError &&
         err.code === 'RESIZE_SVG_RENDER_TIMEOUT' &&
-        err.mediaId === 'm1',
+        err.mediaId === 'm1' &&
+        err.retryable === false,
     );
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 3500, `settled after ${elapsed} ms`);
@@ -2623,7 +2626,8 @@ describe('SVG rendering', () => {
       () => processTask(task({ previews: [variant(), fitVariant] })),
       (err: unknown) =>
         err instanceof ResizeMediaError &&
-        err.code === 'RESIZE_SVG_RENDER_TIMEOUT',
+        err.code === 'RESIZE_SVG_RENDER_TIMEOUT' &&
+        err.retryable === false,
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);

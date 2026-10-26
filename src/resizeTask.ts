@@ -251,7 +251,7 @@ export async function generatePreviews(
   if (origMeta.width === undefined || origMeta.height === undefined) {
     throw new ResizeMediaError(
       `resize: source metadata missing width/height for media ${mediaId} — cannot size safely`,
-      { mediaId, code: 'RESIZE_SOURCE_METADATA_MISSING' },
+      { mediaId, code: 'RESIZE_SOURCE_METADATA_MISSING', retryable: false },
     );
   }
   const orientation = origMeta.orientation ?? 1;
@@ -264,7 +264,7 @@ export async function generatePreviews(
   if (origMeta.width * origMeta.height > config.limits.sourcePixels) {
     throw new ResizeMediaError(
       `resize: source ${origMeta.width}×${origMeta.height} exceeds limits.sourcePixels (${config.limits.sourcePixels}) for media ${mediaId}`,
-      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE' },
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
     );
   }
   const pixelBudget = Math.min(
@@ -333,7 +333,11 @@ export async function generatePreviews(
     if (density === undefined) {
       throw new ResizeMediaError(
         `resize: SVG dimensions cannot be rasterized within the renderer limits for media ${mediaId}`,
-        { mediaId, code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' },
+        {
+          mediaId,
+          code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+          retryable: false,
+        },
       );
     }
     buf = await rasterizeSvg(buf, {
@@ -404,7 +408,7 @@ export async function generatePreviews(
   if (procW * procH > pixelBudget) {
     throw new ResizeMediaError(
       `resize: processed source exceeds pixel limits for media ${mediaId}`,
-      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE' },
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
     );
   }
 

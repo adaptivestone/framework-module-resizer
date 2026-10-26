@@ -305,7 +305,8 @@ describe('uploadOriginal — private SVG source', () => {
         }),
         (err: unknown) =>
           err instanceof ResizeOriginalError &&
-          err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+          err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' &&
+          err.retryable === false,
       );
       assert.equal(uploads.length, 0);
     });

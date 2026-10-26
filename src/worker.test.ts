@@ -99,6 +99,7 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
     (events[0].error as { code?: string }).code,
     'RESIZE_SOURCE_TOO_LARGE',
   );
+  assert.equal((events[0].error as { retryable?: boolean }).retryable, false);
   assert.equal(tasks.rows[0].status, 'dead');
   assert.equal(tasks.rows[0].attempts, 1);
   assert.equal(downloads, 1);
@@ -178,6 +179,7 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
   );
   assert.ok(events[0].error instanceof ResizeMediaError);
   assert.equal(events[0].error.code, 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED');
+  assert.equal(events[0].error.retryable, false);
   assert.equal(tasks.rows[0].status, 'dead');
   assert.equal(tasks.rows[0].attempts, 1);
   assert.equal(downloads, 1);
