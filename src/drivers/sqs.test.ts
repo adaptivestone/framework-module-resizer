@@ -9,9 +9,10 @@ import type {
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
+import { consume } from '../testHelpers/consume.ts';
 import { fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
-import { consumeQueue, timingOf } from '../timing.ts';
+import { timingOf } from '../timing.ts';
 import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
 import { SqsTaskQueue } from './sqs.ts';
 
@@ -304,7 +305,7 @@ describe('SqsTaskQueue.claim', () => {
     const rec = makeEvents();
     let handlerCalls = 0;
     const ctrl = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -701,7 +702,7 @@ describe('SqsTaskQueue lease operations', () => {
   });
 });
 
-describe('consumeQueue with SqsTaskQueue', () => {
+describe('Consumer with SqsTaskQueue', () => {
   test('a resolving handler reports completed and deletes the receipt handle', async () => {
     const { client, deletes } = makeFakeSqsClient({
       message: message({ ReceiptHandle: 'rh-1' }),
@@ -711,7 +712,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     const seen: LeasedTask[] = [];
     const ctrl = new AbortController();
     let deletesAtEvent = 0;
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async (task) => {
@@ -748,7 +749,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     const rec = makeEvents();
     const boom = new Error('handler boom');
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -781,7 +782,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       timing: fastTiming,
     });
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {},
@@ -806,7 +807,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       ),
     );
   });
-  test('aborting opts.signal stops polling and resolves consumeQueue', async (t) => {
+  test('aborting the signal stops polling and resolves Consumer.run', async (t) => {
     const { client, receiveParams, receiveOptions } = makeFakeSqsClient();
     const tasks = new SqsTaskQueue({
       queueUrl: 'q',
@@ -814,7 +815,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       timing: fastTiming,
     });
     const ctrl = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {},
@@ -849,7 +850,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       release = resolve;
     });
     const ctrl = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -882,7 +883,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {},
@@ -907,7 +908,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     });
     let handlerCalls = 0;
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       logger,
@@ -937,7 +938,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     });
     const rec = makeEvents();
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: (_task, { signal }) =>
@@ -974,7 +975,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     const rec = makeEvents();
     const boom = new Error('handler boom');
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {

@@ -263,7 +263,7 @@ export class Processor {
   }
 
   /**
-   * One queued task: the core plus lock bookkeeping. The core queue loop (src/queue.ts) runs it
+   * One queued task: the core plus lock bookkeeping. The worker loop (src/consumer.ts) runs it
    * through the worker; it SUCCEEDS by returning and FAILS by throwing (which engages the queue's
    * retry → dead-letter). Worker locks last `workerLockTtlMs`, which fits the delivering queue's
    * lease. Without a lock store it rejects with RESIZE_LOCKS_REQUIRED before loading anything.

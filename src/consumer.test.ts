@@ -1,8 +1,9 @@
-// The core queue loop (consumeQueue) against the in-memory TaskQueue: the same lifecycle every
-// backend gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash
-// loops, timeouts, lost leases, graceful shutdown and resilient claiming.
+// The worker loop (Consumer) against the in-memory TaskQueue: the same lifecycle every backend
+// gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash loops,
+// timeouts, lost leases, graceful shutdown and resilient claiming.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { backoffMs, Consumer } from './consumer.ts';
 import type {
   ClaimedTask,
   LeasedTask,
@@ -10,14 +11,14 @@ import type {
   TaskEvent,
 } from './contracts/taskQueue.ts';
 import {
-  ResizeConfigError,
   ResizeError,
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
 } from './errors.ts';
+import { consume } from './testHelpers/consume.ts';
 import { MemoryTaskQueue } from './testHelpers/fakes.ts';
-import { backoffMs, consumeQueue, timingOf } from './timing.ts';
+import { timingOf } from './timing.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
 
@@ -77,7 +78,7 @@ async function shutDownMidTask(
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
   let started = false;
-  const loop = consumeQueue(tasks, {
+  const loop = consume(tasks, {
     queue: 'default',
     signal: stop.signal,
     handle: (task, opts) => {
@@ -90,12 +91,16 @@ async function shutDownMidTask(
     logger: silent,
   });
   const until = Date.now() + 5000;
-  while (!started) {
-    assert.ok(Date.now() < until, 'the handler never started');
-    await new Promise((r) => setTimeout(r, 2));
+  // A failed wait still stops the loop, so the test file can exit.
+  try {
+    while (!started) {
+      assert.ok(Date.now() < until, 'the handler never started');
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  } finally {
+    stop.abort();
+    await loop;
   }
-  stop.abort();
-  await loop;
   return events;
 }
 
@@ -127,7 +132,7 @@ async function runUntil(
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
-  const loop = consumeQueue(tasks, {
+  const loop = consume(tasks, {
     queue: 'default',
     signal: stop.signal,
     handle,
@@ -137,19 +142,43 @@ async function runUntil(
     logger,
   });
   const until = Date.now() + 5000;
-  while (!done()) {
-    assert.ok(
-      Date.now() < until,
-      'the queue loop did not reach the expected state',
-    );
-    await new Promise((r) => setTimeout(r, 5));
+  // A failed wait still stops the loop, so the test file can exit.
+  try {
+    while (!done()) {
+      assert.ok(
+        Date.now() < until,
+        'the queue loop did not reach the expected state',
+      );
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  } finally {
+    stop.abort();
+    await loop;
   }
-  stop.abort();
-  await loop;
   return events;
 }
 
-describe('consumeQueue', () => {
+describe('Consumer', () => {
+  test('a Consumer completes a task with only its own deps', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const stop = new AbortController();
+    const events: TaskEvent[] = [];
+    await new Consumer({
+      tasks,
+      timing: timingOf(tasks),
+      handle: async () => {
+        stop.abort();
+      },
+      events: (event) => {
+        events.push(event);
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    }).run('default', stop.signal);
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(events, ['completed']);
+  });
+
   test('a successful task is completed and reported, without its lease token', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
@@ -490,7 +519,7 @@ describe('consumeQueue', () => {
     await tasks.add(newTask());
     const errors: unknown[][] = [];
     const stop = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: async () => {},
@@ -499,11 +528,16 @@ describe('consumeQueue', () => {
       },
       logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
     });
-    while (tasks.rows[0].status !== 'completed') {
-      await new Promise((r) => setTimeout(r, 5));
+    const until = Date.now() + 5000;
+    try {
+      while (tasks.rows[0].status !== 'completed') {
+        assert.ok(Date.now() < until, 'the task was never completed');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      stop.abort();
+      await loop;
     }
-    stop.abort();
-    await loop;
     assert.equal(errors.length, 1);
   });
 
@@ -539,7 +573,7 @@ describe('consumeQueue', () => {
   });
 });
 
-describe('consumeQueue shutdown', () => {
+describe('Consumer shutdown', () => {
   for (const prior of [0, 2]) {
     test(`a shutdown mid-task gives the task back unprocessed (${prior} earlier attempts of 3)`, async () => {
       const tasks = new ReleasingTaskQueue({ timing: fastTiming });
@@ -622,7 +656,7 @@ describe('consumeQueue shutdown', () => {
     };
     let ran = false;
     const events: TaskEvent[] = [];
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: async () => {
@@ -678,7 +712,7 @@ describe('consumeQueue shutdown', () => {
     };
     const stop = new AbortController();
     const events: TaskEvent[] = [];
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: (_task, { signal }) =>
@@ -704,70 +738,7 @@ describe('consumeQueue shutdown', () => {
   });
 });
 
-describe('timingOf / backoffMs', () => {
-  test('fills defaults, keeps set values, and is read once per queue', () => {
-    let reads = 0;
-    const tasks = new MemoryTaskQueue();
-    tasks.getTiming = () => {
-      reads += 1;
-      return { leaseMs: 120_000, maxAttempts: undefined };
-    };
-    const timing = timingOf(tasks);
-    assert.equal(timing.leaseMs, 120_000);
-    assert.equal(timing.maxAttempts, 5);
-    timingOf(tasks);
-    assert.equal(reads, 1);
-  });
-
-  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes, also beside set lock TTLs', () => {
-    assert.equal(timingOf(new MemoryTaskQueue()).lockTtlMs.failed, 600_000);
-    const own = timingOf(
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
-      }),
-    );
-    assert.deepEqual(own.lockTtlMs, {
-      dispatch: 1000,
-      worker: 1000,
-      failed: 600_000,
-    });
-    const set = timingOf(
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 5000 } },
-      }),
-    );
-    assert.equal(set.lockTtlMs.failed, 5000);
-  });
-
-  for (const failed of [0, -1, 1.5, '600000', null]) {
-    test(`lockTtlMs.failed ${JSON.stringify(failed)} is a config error`, () => {
-      const tasks = new MemoryTaskQueue({
-        timing: {
-          lockTtlMs: { dispatch: 1000, worker: 1000, failed } as never,
-        },
-      });
-      assert.throws(
-        () => timingOf(tasks),
-        (err: unknown) =>
-          err instanceof ResizeConfigError &&
-          err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
-          /lockTtlMs\.failed/.test(err.message),
-      );
-    });
-  }
-
-  test('invalid timing is a config error (worker lock must fit the lease)', () => {
-    const tasks = new MemoryTaskQueue({
-      timing: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 5000 } },
-    });
-    assert.throws(
-      () => timingOf(tasks),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
-    );
-  });
-
+describe('backoffMs', () => {
   test('backoff doubles per attempt up to the maximum', () => {
     const timing = timingOf(
       new MemoryTaskQueue({

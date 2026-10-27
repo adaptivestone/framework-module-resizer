@@ -1,4 +1,4 @@
-// The worker's task handler (processTask) inside the core queue loop: a media error thrown while
+// The worker's task handler (processTask) inside the worker loop: a media error thrown while
 // reading the source reaches the retry policy unwrapped, so an unusable source is dead-lettered
 // on its first delivery instead of being downloaded and decoded again on every retry. After a
 // dead-letter the worker holds the variants' dispatch locks for a cooldown, so reads stop queueing
@@ -15,13 +15,13 @@ import {
   type ResizerOptions,
   resetResizerForTests,
 } from './resizer.ts';
+import { consume } from './testHelpers/consume.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
-import { consumeQueue } from './timing.ts';
 import type { MediaLike, QueueTimingOptions, SizeInput } from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
 
@@ -87,7 +87,7 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
   const timeout = setTimeout(() => stop.abort(), 5000);
-  await consumeQueue(tasks, {
+  await consume(tasks, {
     queue: 'default',
     signal: stop.signal,
     handle: (task, opts) => processTask(task, opts, tasks),
@@ -168,7 +168,7 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
   const stop = new AbortController();
   const timeout = setTimeout(() => stop.abort(), 5000);
   try {
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: (task, opts) => processTask(task, opts, tasks),

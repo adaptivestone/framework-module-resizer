@@ -1,12 +1,13 @@
 // The worker, framework-free. `runWorker()` serves every registered Resizer for ONE named queue: it
-// runs the core queue loop (src/queue.ts) once per distinct TaskQueue the Resizers use, after
-// verifying every Resizer. Each task runs with the Resizer named in it, and its events go to that
-// Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown. The
-// work itself is the Resizer's Processor (src/processor.ts).
+// runs one Consumer, the worker loop (src/consumer.ts), per distinct TaskQueue the Resizers use,
+// after verifying every Resizer. Each task runs with the Resizer named in it, and its events go to
+// that Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown.
+// The work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
 import { defaultQueueOptions } from './config/resize.ts';
+import { Consumer } from './consumer.ts';
 import type {
   LeasedTask,
   TaskEventHandler,
@@ -14,7 +15,7 @@ import type {
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
 import { getResizer, listResizers } from './resizer.ts';
-import { consumeQueue, timingOf } from './timing.ts';
+import { timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
 
 /**
@@ -30,8 +31,8 @@ export async function processTask(
   const resizer = getResizer(task.resizer);
   await resizer.ready();
   // The delivering queue, else the Resizer's own; with neither (an eager-only Resizer), the
-  // default TTL. Reading it before the Processor's lock check is safe: consumeQueue (and ready(),
-  // for the Resizer's own queue) validated this timing through timingOf, which caches it.
+  // default TTL. Reading it before the Processor's lock check is safe: runWorker (and ready(), for
+  // the Resizer's own queue) validated this timing through timingOf, which caches it.
   const queue = tasks ?? resizer.tasks;
   return resizer.processor.processTask(task, {
     signal: taskOpts?.signal,
@@ -119,8 +120,8 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       await owner.ready();
       const { processor } = owner;
       if (event === 'deadLettered') {
-        // Outside the cooldown's never-reject guard, which is safe: consumeQueue validated this
-        // queue's timing through timingOf before its first claim, and timingOf caches it.
+        // Outside the cooldown's never-reject guard, which is safe: this queue's timing was
+        // validated through timingOf when its Consumer was built, and timingOf caches it.
         const cooldown = processor.holdFailedCooldown(
           task,
           timingOf(tasks).lockTtlMs.failed,
@@ -149,13 +150,14 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     await Promise.allSettled(
       [...queues].map(async (tasks) => {
         try {
-          await consumeQueue(tasks, {
-            queue,
-            signal: stop.signal,
+          // timingOf validates the queue's timing here, so invalid timing fails this loop.
+          await new Consumer({
+            tasks,
+            timing: timingOf(tasks),
             handle: (task, taskOpts) => processTask(task, taskOpts, tasks),
-            onEvent: eventsOf(tasks),
+            events: eventsOf(tasks),
             logger,
-          });
+          }).run(queue, stop.signal);
         } catch (err) {
           firstFailure ??= { error: err };
           stop.abort();
