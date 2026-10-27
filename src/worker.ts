@@ -4,13 +4,12 @@
 // Resizers, so a task queue that filters claims never hands it another Resizer's task. Each task
 // runs with the Resizer named in it and that Resizer's coordination (the cooldown of a dead-letter,
 // and the lock store of the gate lock on a queue without gatesByTask), and its events go to that
-// Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown. The
-// host logger is called only through logNeverThrow, so a logger that throws never stops it.
+// Resizer's observers. The host logger is called only through logNeverThrow, so a logger that
+// throws never stops it.
 // The work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
-import { defaultQueueOptions } from './config/resize.ts';
 import { Consumer } from './consumer.ts';
 import type {
   LeasedTask,
@@ -39,33 +38,18 @@ import type { ResizeLogger } from './types.d.ts';
 export async function processTask(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
-  tasks?: TaskQueue, // the delivering queue; default: the Resizer's own
 ): Promise<void> {
-  return runTask(getResizer(task.resizer), task, taskOpts, tasks);
+  return runTask(getResizer(task.resizer), task, taskOpts);
 }
 
-/**
- * Run one task with `resizer`. Worker locks last the delivering queue's lockTtlMs.worker, so they
- * fit the lease it holds.
- */
+/** Run one task with `resizer`, once its parts and services are ready. */
 async function runTask(
   resizer: Resizer,
   task: LeasedTask,
   taskOpts: { signal: AbortSignal } | undefined,
-  tasks: TaskQueue | undefined,
 ): Promise<void> {
   await resizer.ready();
-  // The delivering queue, else the Resizer's own; with neither (an eager-only Resizer), the
-  // default TTL. Reading it before the Processor's lock check is safe: runWorker validated this
-  // timing through timingOf, which caches it, and outside runWorker invalid timing throws here, so
-  // the task fails before anything is loaded.
-  const queue = tasks ?? resizer.tasks;
-  return processorOf(resizer).processTask(task, {
-    signal: taskOpts?.signal,
-    workerLockTtlMs: queue
-      ? timingOf(queue).lockTtlMs.worker
-      : defaultQueueOptions.lockTtlMs.worker,
-  });
+  return processorOf(resizer).processTask(task, taskOpts);
 }
 
 /**
@@ -213,9 +197,6 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     await resizer.verify();
   }
 
-  // Dead-letter cooldowns run beside the loop, so they never delay it or the observers; the worker
-  // waits for the pending ones before it returns.
-  const cooldowns = new Set<Promise<void>>();
   // Tasks and events are routed by the task's Resizer name among the served Resizers. Any other
   // name, constructed in this process or not, is not served.
   const ownerOf = (task: LeasedTask) =>
@@ -247,34 +228,21 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   };
   // Events go to the observers of the task's Resizer. A task of a Resizer not served has events
   // only when a task queue hands it out and cannot give it back, so it fails: they are logged and
-  // dropped.
-  const eventsOf =
-    (tasks: TaskQueue): TaskEventHandler =>
-    async (event, task, error) => {
-      const owner = ownerOf(task);
-      if (!owner) {
-        logNeverThrow(
-          logger,
-          `resize worker: ${event} for task ${task.taskId} dropped — ${notServed(task)}`,
-        );
-        return;
-      }
-      // A served Resizer was readied at startup, so this resolves at once; it is kept so the
-      // Processor is never read before ready().
-      await owner.ready();
-      const processor = processorOf(owner);
-      if (event === 'deadLettered') {
-        // Outside the cooldown's never-reject guard, which is safe: this queue's timing was
-        // validated through timingOf when its Consumer was built, and timingOf caches it.
-        const cooldown = processor.holdFailedCooldown(
-          task,
-          timingOf(tasks).lockTtlMs.failed,
-        );
-        cooldowns.add(cooldown);
-        void cooldown.then(() => cooldowns.delete(cooldown));
-      }
-      await processor.notify(event, task, error);
-    };
+  // dropped. A dead-letter's cooldown is already set: the Consumer sets it before the event fires.
+  const events: TaskEventHandler = async (event, task, error) => {
+    const owner = ownerOf(task);
+    if (!owner) {
+      logNeverThrow(
+        logger,
+        `resize worker: ${event} for task ${task.taskId} dropped — ${notServed(task)}`,
+      );
+      return;
+    }
+    // A served Resizer was readied at startup, so this resolves at once; it is kept so the
+    // Processor is never read before ready().
+    await owner.ready();
+    await processorOf(owner).notify(event, task, error);
+  };
 
   // The Consumer of one task queue. A task of a Resizer not served is never run here. A task queue
   // that filters claims does not hand one out. One that does not, with `release`, gives it back for
@@ -319,9 +287,9 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
             code: 'RESIZE_NO_RESIZER',
           });
         }
-        return runTask(owner, task, taskOpts, tasks);
+        return runTask(owner, task, taskOpts);
       },
-      events: eventsOf(tasks),
+      events,
       logger,
     });
   };
@@ -357,7 +325,6 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   } finally {
     opts.signal.removeEventListener('abort', onAbort);
   }
-  await Promise.all(cooldowns);
   if (firstFailure) {
     throw firstFailure.error;
   }

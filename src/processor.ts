@@ -1,13 +1,14 @@
 // The resize core: ONE sharp pipeline shared by both generation modes, owned by `Processor`:
-//   - processTask() = the core + lock bookkeeping when the Resizer has a lock store (one queued
-//                     task, run by the worker)
-//   - generate()    = the core WITHOUT locks (eager `resizer.generate`)
+//   - processTask() = the core for one queued task, run by the worker
+//   - generate()    = the core for eager `resizer.generate`
 // The steps (download once → metadata guards → an SVG rendered once to a raster → beforeSteps
 // once, after an orientation normalize → decode once + bounded per-variant resize/encode/upload →
-// one appendPreviews) live in #generatePreviews(). The Processor also holds a dead-lettered task's
-// dispatch locks for the cooldown and fires the task observers. It takes its parts explicitly and
-// knows no Resizer. sharp is a hard dep; this is the only module that resizes or encodes (SVG
-// rendering runs in a child process: helpers/svgRaster.ts).
+// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers.
+// It takes no locks: the queue leases a task to one worker at a time, the lease token fences the
+// task's writes, and the media store keeps one row per preview identity when an expired lease lets
+// two workers render the same variant. It takes its parts explicitly and knows no Resizer. sharp
+// is a hard dep; this is the only module that resizes or encodes (SVG rendering runs in a child
+// process: helpers/svgRaster.ts).
 import sharp, {
   type FormatEnum,
   type Metadata,
@@ -16,7 +17,6 @@ import sharp, {
 } from 'sharp';
 import type { Catalog } from './catalog.ts';
 import type { ObserverName } from './contracts/hooks.ts';
-import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
@@ -38,11 +38,6 @@ import {
   coverDimensions,
   requireMediaId,
 } from './images.ts';
-import {
-  DISPATCH_LOCK_OWNER,
-  dispatchLockKey,
-  workerLockKey,
-} from './lockKeys.ts';
 import type { PipelineRegistry } from './pipelines.ts';
 import type {
   GenerateOpts,
@@ -122,23 +117,6 @@ function describeRefs(previews: Preview[]): string {
     .join(', ');
 }
 
-/**
- * Best-effort lock release; a failing release is logged, never thrown. A release that finds the
- * lock gone or held by another owner is not an error.
- */
-async function releaseLock(
-  locks: LockStore,
-  logger: ResizeLogger,
-  key: string,
-  owner: string,
-): Promise<void> {
-  try {
-    await locks.release(key, owner);
-  } catch (err) {
-    logger.error(`resize worker: failed to release lock ${key}`, err);
-  }
-}
-
 // The observer each task event fires.
 const OBSERVER: Record<TaskEvent, ObserverName> = {
   completed: 'afterTaskComplete',
@@ -148,9 +126,8 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 
 // ---------------------------------------------------------------------------
 // The shared core. Both modes expand their inputs into a `requested` MissingPreview[] and call
-// #generatePreviews. `locks` (queued mode only: the lock store) enables the two-tier locks
-// (dispatch release on skip-existing + best-effort worker lock); `persist` toggles the single
-// appendPreviews + onPreviewGenerated firing (eager `persist:false` returns raw).
+// #generatePreviews. `persist` toggles the single appendPreviews + onPreviewGenerated firing
+// (eager `persist:false` returns raw).
 // ---------------------------------------------------------------------------
 
 interface GenerateCoreArgs {
@@ -159,9 +136,6 @@ interface GenerateCoreArgs {
   requested: MissingPreview[];
   pipeline: string;
   ctx: Record<string, unknown>;
-  // Queued mode with a lock store: take locks in it, worker locks with this TTL. Eager mode, and a
-  // queued task of a Resizer without a lock store, pass none.
-  locks?: { store: LockStore; workerTtlMs: number };
   persist: boolean;
   signal?: AbortSignal;
 }
@@ -178,7 +152,6 @@ export interface ProcessorDeps {
   catalog: Catalog;
   media: MediaStore;
   storage: ResizeStorage;
-  locks: LockStore | undefined; // undefined: queued tasks render without worker locks
   pipelines: PipelineRegistry;
   hooks: HookBus;
   config: ResizeConfig;
@@ -187,8 +160,8 @@ export interface ProcessorDeps {
 }
 
 /**
- * Renders the previews of one Resizer: eagerly for a caller, or for one queued task. Also holds a
- * dead-lettered task's dispatch locks for the cooldown and fires the task observers.
+ * Renders the previews of one Resizer: eagerly for a caller, or for one queued task. Also fires
+ * the task observers.
  */
 export class Processor {
   readonly #deps: ProcessorDeps;
@@ -198,7 +171,7 @@ export class Processor {
   }
 
   /**
-   * Eager mode: the core with NO locks. The caller's real ctx reaches the resolveSizes waterfall
+   * Eager mode: the core for a caller. The caller's real ctx reaches the resolveSizes waterfall
    * and the pipeline steps (unlike a queued task's ctx === {}). `persist !== false` → one
    * appendPreviews (+ display-dim backfill), and the rows are appended onto `media.previews` too;
    * otherwise the previews are returned unstored.
@@ -265,18 +238,16 @@ export class Processor {
   }
 
   /**
-   * One queued task: the core plus lock bookkeeping. The worker loop (src/consumer.ts) runs it
-   * through the worker; it SUCCEEDS by returning and FAILS by throwing (which engages the queue's
-   * retry → dead-letter). Worker locks last `workerLockTtlMs`, which fits the delivering queue's
-   * lease. Without a lock store (a Resizer on a queue that gates by task needs none) it takes no
-   * locks and renders at once: the lease keeps the task to one worker at a time, and the media
-   * store keeps one row per preview identity.
+   * One queued task: the core, then a check that every requested identity is stored. The worker
+   * loop (src/consumer.ts) runs it through the worker; it SUCCEEDS by returning and FAILS by
+   * throwing (which engages the queue's retry → dead-letter). It takes no locks: the lease keeps
+   * the task to one worker at a time, and the media store keeps one row per preview identity.
    */
   async processTask(
     task: LeasedTask,
-    opts: { signal?: AbortSignal; workerLockTtlMs: number },
+    opts: { signal?: AbortSignal } = {},
   ): Promise<void> {
-    const { catalog, locks, logger, media: mediaStore, name } = this.#deps;
+    const { catalog, logger, media: mediaStore, name } = this.#deps;
     // ctx does NOT cross the queue — the worker's pipeline steps depend on media/metadata.
     const ctx: Record<string, unknown> = {};
 
@@ -310,17 +281,15 @@ export class Processor {
         requested,
         pipeline: task.pipeline,
         ctx,
-        locks: locks
-          ? { store: locks, workerTtlMs: opts.workerLockTtlMs }
-          : undefined,
         persist: true,
         signal: opts.signal,
       });
 
     // A queued task is complete only when every requested identity is now persisted. Re-read once
-    // so a worker-lock loser can observe a concurrent worker's write. Our own generated rows are
-    // included too: appendPreviews returned successfully before #generatePreviews returned, and so
-    // are the identities the media store reported as already stored by another worker.
+    // so the rows of a concurrent worker running the same task (after an expired lease) count: a
+    // variant that failed here may be stored there. Our own generated rows are included too:
+    // appendPreviews returned successfully before #generatePreviews returned, and so are the
+    // identities the media store reported as already stored by another worker.
     const refreshed = await mediaStore.loadMedia(task.mediaId);
     if (!refreshed) {
       logger.info(
@@ -360,50 +329,6 @@ export class Processor {
   }
 
   /**
-   * After a dead-letter, hold the dispatch lock of every variant in the task for `ttlMs` (the
-   * delivering queue's lockTtlMs.failed), so reads (resolve, prewarm) do not queue the same
-   * failing work again until it ends. Release first, then acquire: the read path's shorter
-   * dispatch lock may still be held. Both calls work across processes because every dispatch lock
-   * has the one owner DISPATCH_LOCK_OWNER. Best effort and never rejects: a failing lock call is
-   * logged, and a read that takes the lock between the two calls simply queues the work once more.
-   */
-  async holdFailedCooldown(task: LeasedTask, ttlMs: number): Promise<void> {
-    const { catalog, locks, logger, name } = this.#deps;
-    try {
-      if (!locks) {
-        // No lock store, so no lock-based cooldown to hold.
-        return;
-      }
-      const scope: PreviewScope = { resizer: name, pipeline: task.pipeline };
-      const keys = new Set(
-        catalog
-          .canonicalize(task.previews)
-          .map((variant) =>
-            dispatchLockKey(task.mediaId, catalog.identity(scope, variant)),
-          ),
-      );
-      await Promise.all(
-        [...keys].map(async (key) => {
-          try {
-            await locks.release(key, DISPATCH_LOCK_OWNER);
-            await locks.acquire(key, DISPATCH_LOCK_OWNER, ttlMs);
-          } catch (err) {
-            logger.error(
-              `resize worker: holding the dead-letter cooldown lock ${key} failed`,
-              err,
-            );
-          }
-        }),
-      );
-    } catch (err) {
-      logger.error(
-        `resize worker: the dead-letter cooldown of task ${task.taskId} failed`,
-        err,
-      );
-    }
-  }
-
-  /**
    * Fire the observer of a task event (afterTaskComplete, onTaskFailed, onTaskDeadLettered) with
    * ctx {}: ctx does not cross the queue. A completed task's observer gets no error.
    */
@@ -427,7 +352,6 @@ export class Processor {
       requested,
       pipeline: pipelineName,
       ctx,
-      locks,
       persist,
       signal,
     } = args;
@@ -469,19 +393,8 @@ export class Processor {
       catalog.identity(scope, v);
     const existing = catalog.storedIdentities(media, scope);
     const pending = requested.filter((v) => !existing.has(scopedIdentity(v)));
-    // Everything requested is already stored: no download. In queued mode drop the dispatch locks
-    // so a later read can re-enqueue a sibling promptly.
+    // Everything requested is already stored: no download.
     if (pending.length === 0) {
-      if (locks) {
-        for (const v of requested) {
-          await releaseLock(
-            locks.store,
-            logger,
-            dispatchLockKey(mediaId, scopedIdentity(v)),
-            DISPATCH_LOCK_OWNER,
-          );
-        }
-      }
       return { generated, failedCount, alreadyStored };
     }
 
@@ -683,60 +596,8 @@ export class Processor {
     const base = decode(1);
     const animatedBase = frames > 1 ? decode(frames) : undefined;
 
-    // Locks held for processed variants (key → owner); released once after the pool (success AND
-    // error), each with the owner that holds it.
-    const heldLocks = new Map<string, string>();
-
     const processVariant = async (v: MissingPreview): Promise<void> => {
       const identity = scopedIdentity(v);
-      const dispatchKey = dispatchLockKey(mediaId, identity);
-      const workerKey = workerLockKey(mediaId, identity);
-      // Queued mode: the worker lock's owner, fresh per acquire, so a late release after this lock
-      // expired and another worker took it over leaves the new holder's lock in place.
-      let workerOwner: string | undefined;
-
-      // Skip anything already generated; in queued mode drop its dispatch lock so a later read
-      // can re-enqueue a sibling promptly.
-      if (existing.has(identity)) {
-        if (locks) {
-          await releaseLock(
-            locks.store,
-            logger,
-            dispatchKey,
-            DISPATCH_LOCK_OWNER,
-          );
-        }
-        return;
-      }
-
-      // Best-effort worker lock (queued mode only) — dedup, not correctness. Not acquired →
-      // leave the variant MISSING (do NOT treat as done); the next read re-detects + re-enqueues.
-      // An acquire REJECTION behaves EXACTLY like "not acquired": log + skip; it must never reject
-      // the bounded pool (that would skip persist + the held-lock release) — a lock-infra hiccup is
-      // not a poison variant, so it does NOT count toward failedCount.
-      if (locks) {
-        workerOwner = randomHex();
-        let acquired: boolean;
-        try {
-          acquired = await locks.store.acquire(
-            workerKey,
-            workerOwner,
-            locks.workerTtlMs,
-          );
-        } catch (err) {
-          logger.error(
-            `resize worker: worker-lock acquire failed for ${identity} on media ${mediaId} — leaving variant missing`,
-            err,
-          );
-          return;
-        }
-        if (!acquired) {
-          return;
-        }
-        heldLocks.set(workerKey, workerOwner);
-        heldLocks.set(dispatchKey, DISPATCH_LOCK_OWNER);
-      }
-
       try {
         // A task payload can name any format; only configured encoders run (no sharp work here).
         const { dropped } = catalog.configuredFormats([v.format]);
@@ -907,105 +768,93 @@ export class Processor {
           err,
         );
         failedCount += 1;
-        if (locks && workerOwner !== undefined) {
-          heldLocks.delete(workerKey);
-          await releaseLock(locks.store, logger, workerKey, workerOwner);
-        }
       }
     };
 
-    // Bounded per-variant pool (NOT unbounded Promise.all); between variants stop launching new
-    // ones if the lease was lost (best-effort — correctness holds via the fencing token).
-    await runBounded(requested, config.concurrency, signal, processVariant);
+    // Bounded pool over the variants not stored yet (NOT unbounded Promise.all); between variants
+    // stop launching new ones if the lease was lost (best-effort — correctness holds via the
+    // fencing token).
+    await runBounded(pending, config.concurrency, signal, processVariant);
 
-    try {
-      // ONE atomic persist for everything generated (+ display-dim backfill when the original
-      // never carried dims), then fire onPreviewGenerated per pushed preview (ctx {}).
-      if (persist && generated.length > 0) {
-        const backfillDims =
-          original.width === undefined || original.height === undefined
-            ? { width: dispW, height: dispH }
-            : undefined;
-        // What the media store holds now, read once after a failed or partial write: the identities
-        // stored on the media, null when the media is gone, undefined when the reload failed too.
-        const recordedIdentities = async (): Promise<
-          Set<string> | null | undefined
-        > => {
-          try {
-            const reloaded = await mediaStore.loadMedia(mediaId);
-            return reloaded ? catalog.storedIdentities(reloaded, scope) : null;
-          } catch {
-            return undefined;
-          }
-        };
-        const stored = await mediaStore
-          .appendPreviews(mediaId, generated, backfillDims)
-          .catch(async (err: unknown) => {
-            // The write may have stopped part-way (a driver can store one row at a time). Name
-            // only the uploads no row points at, so an operator can find (or delete) them; a file
-            // a stored row references is never offered.
-            const recorded = await recordedIdentities();
-            const unrecorded = recorded
-              ? generated.filter((p) => !recorded.has(scopedIdentity(p)))
-              : generated;
-            logger.error(
-              `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${generated.length} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
-              err,
-            );
-            throw err;
-          });
-        // A store written to the old contract resolves with nothing. Read as the rows it stored,
-        // that would mean every preview was left out (reported as another worker's,
-        // `created: []`), so fail loudly instead, before any observer runs.
-        if (!Array.isArray(stored)) {
-          throw new ResizeSetupError(
-            `resize: MediaStore.appendPreviews must resolve with the previews it stored ([] when none were); for media ${mediaId} it resolved with ${String(stored)}`,
-            { code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID' },
-          );
+    // ONE atomic persist for everything generated (+ display-dim backfill when the original
+    // never carried dims), then fire onPreviewGenerated per pushed preview (ctx {}).
+    if (persist && generated.length > 0) {
+      const backfillDims =
+        original.width === undefined || original.height === undefined
+          ? { width: dispW, height: dispH }
+          : undefined;
+      // What the media store holds now, read once after a failed or partial write: the identities
+      // stored on the media, null when the media is gone, undefined when the reload failed too.
+      const recordedIdentities = async (): Promise<
+        Set<string> | null | undefined
+      > => {
+        try {
+          const reloaded = await mediaStore.loadMedia(mediaId);
+          return reloaded ? catalog.storedIdentities(reloaded, scope) : null;
+        } catch {
+          return undefined;
         }
-        // The media store keeps one row per identity and resolves with the rows it stored. The
-        // reload says why a row was left out: the media is gone, or another worker stored the same
-        // identity first (covered, not a failure).
-        const kept = catalog.storedIdentities({ previews: stored }, scope);
-        const leftOut = generated.filter((p) => !kept.has(scopedIdentity(p)));
-        if (leftOut.length > 0) {
-          generated = generated.filter((p) => kept.has(scopedIdentity(p)));
+      };
+      const stored = await mediaStore
+        .appendPreviews(mediaId, generated, backfillDims)
+        .catch(async (err: unknown) => {
+          // The write may have stopped part-way (a driver can store one row at a time). Name
+          // only the uploads no row points at, so an operator can find (or delete) them; a file
+          // a stored row references is never offered.
           const recorded = await recordedIdentities();
-          if (recorded === null) {
+          const unrecorded = recorded
+            ? generated.filter((p) => !recorded.has(scopedIdentity(p)))
+            : generated;
+          logger.error(
+            `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${generated.length} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
+            err,
+          );
+          throw err;
+        });
+      // A store written to the old contract resolves with nothing. Read as the rows it stored,
+      // that would mean every preview was left out (reported as another worker's,
+      // `created: []`), so fail loudly instead, before any observer runs.
+      if (!Array.isArray(stored)) {
+        throw new ResizeSetupError(
+          `resize: MediaStore.appendPreviews must resolve with the previews it stored ([] when none were); for media ${mediaId} it resolved with ${String(stored)}`,
+          { code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID' },
+        );
+      }
+      // The media store keeps one row per identity and resolves with the rows it stored. The
+      // reload says why a row was left out: the media is gone, or another worker stored the same
+      // identity first (covered, not a failure).
+      const kept = catalog.storedIdentities({ previews: stored }, scope);
+      const leftOut = generated.filter((p) => !kept.has(scopedIdentity(p)));
+      if (leftOut.length > 0) {
+        generated = generated.filter((p) => kept.has(scopedIdentity(p)));
+        const recorded = await recordedIdentities();
+        if (recorded === null) {
+          logger.warn(
+            `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
+          );
+        } else {
+          // A failed reload trusts the store's answer: the rows are another worker's.
+          const duplicates = recorded
+            ? leftOut.filter((p) => recorded.has(scopedIdentity(p)))
+            : leftOut;
+          const lost = recorded
+            ? leftOut.filter((p) => !recorded.has(scopedIdentity(p)))
+            : [];
+          if (duplicates.length > 0) {
             logger.warn(
-              `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
+              `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
             );
-          } else {
-            // A failed reload trusts the store's answer: the rows are another worker's.
-            const duplicates = recorded
-              ? leftOut.filter((p) => recorded.has(scopedIdentity(p)))
-              : leftOut;
-            const lost = recorded
-              ? leftOut.filter((p) => !recorded.has(scopedIdentity(p)))
-              : [];
-            if (duplicates.length > 0) {
-              logger.warn(
-                `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
-              );
-              alreadyStored.push(...duplicates.map(scopedIdentity));
-            }
-            if (lost.length > 0) {
-              logger.error(
-                `resize: the media store left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
-              );
-            }
+            alreadyStored.push(...duplicates.map(scopedIdentity));
           }
-        }
-        for (const preview of generated) {
-          await hooks.runObservers('onPreviewGenerated', preview, {});
+          if (lost.length > 0) {
+            logger.error(
+              `resize: the media store left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
+            );
+          }
         }
       }
-    } finally {
-      // Release every held dispatch + worker lock (success AND error paths).
-      if (locks) {
-        for (const [key, owner] of heldLocks) {
-          await releaseLock(locks.store, logger, key, owner);
-        }
+      for (const preview of generated) {
+        await hooks.runObservers('onPreviewGenerated', preview, {});
       }
     }
 

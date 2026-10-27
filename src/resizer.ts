@@ -372,7 +372,6 @@ export class Resizer {
           catalog,
           media,
           storage,
-          locks: this.#locks,
           pipelines: this.#pipelines,
           hooks: this.#hooks,
           config,
@@ -597,9 +596,9 @@ export function listResizers(): Resizer[] {
 }
 
 /**
- * The Processor of `resizer`, which renders previews: the worker's entry for one queued task, the
- * dead-letter cooldown and the task observers. Throws RESIZE_NOT_READY until ready() has built
- * the services. Internal: the main entry does not export it, and it may change in any release.
+ * The Processor of `resizer`, which renders previews: the worker's entry for one queued task and
+ * the task observers. Throws RESIZE_NOT_READY until ready() has built the services. Internal: the
+ * main entry does not export it, and it may change in any release.
  * @internal
  */
 export function processorOf(resizer: Resizer): Processor {

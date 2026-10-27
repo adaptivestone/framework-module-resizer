@@ -172,7 +172,7 @@ function validateRequiredResizeConfigFields(
 
 /**
  * Validate queue timing and lock TTLs (a task queue's timing, and the framework config file's
- * `queue` section). A worker lock must expire within the lease.
+ * `queue` section). lockTtlMs.worker may not exceed the lease.
  */
 export function validateQueueTiming(
   queue: unknown,
@@ -223,7 +223,7 @@ export function validateQueueTiming(
   }
   if ((workerTtlMs as number) > (leaseMs as number)) {
     invalid(
-      `resize queue options: lockTtlMs.worker (${workerTtlMs}) must be ≤ leaseMs (${leaseMs}) — a worker lock must expire within the lease`,
+      `resize queue options: lockTtlMs.worker (${workerTtlMs}) must be ≤ leaseMs (${leaseMs})`,
       'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
     );
   }

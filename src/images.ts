@@ -1,6 +1,6 @@
 // Pure identity, catalog + dimension helpers. ONE identity, built one way, used everywhere
-// (read map, dedup, dispatch lock, worker lock), and the one implementation of which stored rows
-// count and which formats have encoder settings. No external deps.
+// (read map, task dedup, one stored row per identity), and the one implementation of which stored
+// rows count and which formats have encoder settings. No external deps.
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import type {
@@ -83,7 +83,7 @@ export function parseSizeKey(key: string): ParsedSizeKey {
 
 // Escape the `|` (pair separator) and `:` (key/value separator) so a filter key/value that
 // contains them cannot forge a boundary — otherwise `{ a: '1|b:2' }` collides with
-// `{ a: 1, b: 2 }` (same identity → cache confusion + lock shadowing). Backslash is escaped
+// `{ a: 1, b: 2 }` (same identity → cache confusion + row shadowing). Backslash is escaped
 // FIRST so the escapes we then add for `|`/`:` are not themselves re-escaped. (03 · §7 review fix)
 function escapeFilterPart(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/:/g, '\\:');
@@ -186,7 +186,7 @@ export function previewScope(preview: {
 }
 
 /**
- * The one lookup and lock identity, used everywhere: which Resizer and pipeline rendered which
+ * The one lookup and storage identity, used everywhere: which Resizer and pipeline rendered which
  * size, format and filters (`resizer:pipeline:sizeKey:format:filterSig`). Names are
  * URI-encoded, so a ':' inside a name cannot shift the fields.
  */

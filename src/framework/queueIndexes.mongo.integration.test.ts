@@ -8,7 +8,7 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from '../contracts/storage.ts';
-import { DISPATCH_LOCK_OWNER } from '../lockKeys.ts';
+import { gateKey } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { FrameworkLockStore } from './locks.ts';
@@ -112,14 +112,8 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
     assert.equal(added.status, 'added');
     assert.ok(added.taskId);
     fixture.tasks.verify();
-    assert.equal(
-      await fixture.locks.acquire(
-        'resize_dispatch:test',
-        DISPATCH_LOCK_OWNER,
-        60_000,
-      ),
-      true,
-    );
+    const gate = gateKey('default', mediaId, 'default');
+    assert.equal(await fixture.locks.acquire(gate, 'g1', 60_000), true);
     const claimed = await fixture.tasks.claim('default', 60_000);
     assert.ok(claimed);
     assert.equal(await fixture.tasks.renew(claimed, 60_000), true);
@@ -134,10 +128,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
     const retried = await fixture.tasks.claim('default', 60_000);
     assert.ok(retried);
     assert.equal(await fixture.tasks.complete(retried), true);
-    assert.equal(
-      await fixture.locks.release('resize_dispatch:test', DISPATCH_LOCK_OWNER),
-      true,
-    );
+    assert.equal(await fixture.locks.release(gate, 'g1'), true);
 
     assert.deepEqual(
       (await fixture.taskModel.collection.listIndexes().toArray()).map(
