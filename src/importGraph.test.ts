@@ -137,37 +137,61 @@ test('the framework adapter is reachable from its own entry', () => {
 });
 
 test('only index.ts, worker.ts and the framework adapter import resizer.ts', () => {
+  assert.ok(
+    localImports('index.ts', { types: true }).includes('resizer.ts'),
+    'sanity check: the listing does see index.ts importing resizer.ts',
+  );
   const allowed = (f: string) =>
     ['index.ts', 'worker.ts'].includes(f) || f.startsWith('framework/');
   assert.deepEqual(
-    sourceFiles().filter(
-      (f) =>
-        !allowed(f) && localImports(f, { types: true }).includes('resizer.ts'),
-    ),
+    sourceFiles()
+      .filter(
+        (f) =>
+          !allowed(f) &&
+          localImports(f, { types: true }).includes('resizer.ts'),
+      )
+      .map((f) => `${f} → resizer.ts`),
     [],
   );
 });
 
 test('nothing resizer.ts reaches imports it back, not even as a type', () => {
-  const back = [...walk('resizer.ts', { types: true }).files.keys()].filter(
-    (f) =>
-      f !== 'resizer.ts' &&
-      localImports(f, { types: true }).includes('resizer.ts'),
+  const { files } = walk('resizer.ts', { types: true });
+  assert.ok(
+    files.has('catalog.ts'),
+    'sanity check: the walk does reach the services',
   );
+  const back = [...files.entries()]
+    .filter(
+      ([f]) =>
+        f !== 'resizer.ts' &&
+        localImports(f, { types: true }).includes('resizer.ts'),
+    )
+    .map(([, chain]) => [...chain, 'resizer.ts'].join(' → '));
   assert.deepEqual(back, []);
 });
 
 test('the Dispatcher and its test need no Resizer, framework, storage or media port', () => {
-  assert.deepEqual(
-    [...walk('dispatcher.test.ts', { types: true }).files.keys()].filter(
-      (f) => f === 'resizer.ts' || f.startsWith('framework/'),
-    ),
-    [],
+  const { files } = walk('dispatcher.test.ts', { types: true });
+  assert.ok(
+    files.has('dispatcher.ts'),
+    'sanity check: the walk does reach the Dispatcher',
   );
   assert.deepEqual(
-    localImports('dispatcher.ts', { types: true }).filter(
-      (t) => t === 'contracts/storage.ts' || t === 'contracts/media.ts',
-    ),
+    [...files.entries()]
+      .filter(([f]) => f === 'resizer.ts' || f.startsWith('framework/'))
+      .map(([, chain]) => chain.join(' → ')),
+    [],
+  );
+  const ports = localImports('dispatcher.ts', { types: true });
+  assert.ok(
+    ports.includes('contracts/taskQueue.ts'),
+    "sanity check: the listing does see the Dispatcher's ports",
+  );
+  assert.deepEqual(
+    ports
+      .filter((t) => t === 'contracts/storage.ts' || t === 'contracts/media.ts')
+      .map((t) => `dispatcher.ts → ${t}`),
     [],
   );
 });

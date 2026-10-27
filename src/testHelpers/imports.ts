@@ -1,6 +1,9 @@
 // Source-file and import listings for the guard tests that check who may import what. Paths are
-// relative to src/ and '/'-separated on every platform. The parser sees only static, single-quoted
-// `import … from` / `export … from` statements and side-effect imports, not dynamic `import()`.
+// relative to src/ and '/'-separated on every platform. The parser sees static, single-quoted
+// `import … from` / `export … from` statements and side-effect imports. `import('…')` specifiers
+// (type positions such as `import('./x.ts').X`, and dynamic imports) are collected only in
+// `types: true` mode; `types: false` leaves them out, so the runtime walks follow static imports
+// only. That pattern is matched anywhere in the text, comments and strings included.
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +29,8 @@ export function sourceFiles(): string[] {
  * The import/export specifiers of `source`, packages included. `types: false` skips whole
  * `import type` / `export type` statements, the only ones erased at runtime: under
  * verbatimModuleSyntax `import { type X } from './x.ts'` stays as `import {} from './x.ts'`, so
- * x.ts still loads. Side-effect imports always count.
+ * x.ts still loads. Side-effect imports always count. `types: true` also collects `import('…')`
+ * specifiers, after the statements.
  */
 export function importSpecifiers(
   source: string,
@@ -44,6 +48,12 @@ export function importSpecifiers(
   // Side-effect imports: `import './x.ts';`
   for (const match of source.matchAll(/(?:^|\n)\s*import\s+'([^']+)'/g)) {
     specifiers.push(match[1]);
+  }
+  // `import('./x.ts')`: a type position such as `import('./x.ts').X`, or a dynamic import.
+  if (opts.types) {
+    for (const match of source.matchAll(/import\(\s*'([^']+)'\s*\)/g)) {
+      specifiers.push(match[1]);
+    }
   }
   return specifiers;
 }

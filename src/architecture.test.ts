@@ -2,7 +2,8 @@
 // gets what it needs from its caller. Only the entry points (index.ts, worker.ts) and the
 // framework adapter import resizer.ts (pinned in importGraph.test.ts). Core is every top-level
 // src/ file except worker.ts (an entry point that looks Resizers up by name), registry.ts (the
-// process-wide registry itself), index.ts (the main entry) and types.d.ts (types only).
+// generic registry class; the process-wide instance lives in resizer.ts), index.ts (the main
+// entry) and types.d.ts (types only).
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';

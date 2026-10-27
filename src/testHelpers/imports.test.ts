@@ -32,6 +32,20 @@ test('with types, every statement counts', () => {
   ]);
 });
 
+// Built from pieces so this file's own text holds no `import('…')` for localImports below to see.
+const importTypeSource = [
+  ['export type G = import(', "'./g.ts'", ').G;'].join(''),
+  "import type { A } from './a.ts';",
+].join('\n');
+
+test('an `import()` type counts only with types, after the statements', () => {
+  assert.deepEqual(importSpecifiers(importTypeSource, { types: false }), []);
+  assert.deepEqual(importSpecifiers(importTypeSource, { types: true }), [
+    './a.ts',
+    './g.ts',
+  ]);
+});
+
 test('localImports resolves relative specifiers against src/ and leaves packages out', () => {
   // This file imports node builtins and ./imports.ts; the fixture lines above are strings.
   assert.deepEqual(
