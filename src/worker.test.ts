@@ -315,6 +315,53 @@ test('a listed Resizer whose ready() rejects makes runWorker reject at startup b
   assert.equal(claims, 0);
 });
 
+test('a Resizer whose task queue cannot be used makes runWorker reject at startup before any claim', async () => {
+  const cases: [
+    Pick<ResizerOptions, 'locks'>,
+    QueueTimingOptions | object,
+    string,
+  ][] = [
+    [{}, {}, 'RESIZE_LOCKS_REQUIRED'],
+    [
+      { locks: memoryLocks() },
+      { leaseMs: 0 },
+      'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    ],
+  ];
+  for (const [locks, timing, code] of cases) {
+    resetResizerForTests();
+    const tasks = new MemoryTaskQueue({ timing: timing as never });
+    let claims = 0;
+    tasks.claim = async () => {
+      claims += 1;
+      return null;
+    };
+    new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => png,
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia(),
+      ...locks,
+      tasks,
+    });
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await assert.rejects(
+        () => runWorker({ signal: stop.signal, logger: silent }),
+        (err: unknown) => (err as { code?: string }).code === code,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(claims, 0, code);
+  }
+});
+
 describe('dead-letter cooldown', () => {
   /**
    * Locks that expire, on a clock the test moves forward: `clock.ms` is added to real time. Owners

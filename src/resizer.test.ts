@@ -534,33 +534,7 @@ describe('ports', () => {
     );
   });
 
-  test('a task queue without locks: ready(), verify() and generate() reject; resolve() and prewarm() never throw', async () => {
-    const r = new Resizer({
-      logger: silent,
-      storage,
-      media: fakeMedia(),
-      tasks: new MemoryTaskQueue(),
-    });
-    await assert.rejects(() => r.ready(), locksRequired);
-    await assert.rejects(() => r.verify(), locksRequired);
-    await assert.rejects(
-      () => r.generate({ media: { id: 'm1' }, sizes: [] }),
-      locksRequired,
-    );
-    assert.deepEqual(
-      await r.resolve({ media: { id: 'm1' }, sizes: [{ width: 10 }] }),
-      { decision: { ready: [], missing: [] }, output: undefined },
-    );
-    const result = await r.prewarm({
-      media: { id: 'm1' },
-      sizes: [{ width: 10 }],
-    });
-    assert.equal(result.status, 'incomplete');
-    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
-    assert.equal(result.issues[0].retryable, false);
-  });
-
-  test('a lazy locks part that resolves to nothing beside a task queue is RESIZE_LOCKS_REQUIRED', async () => {
+  test('a lazy locks part that resolves to nothing beside a task queue: ready() resolves, verify() is RESIZE_LOCKS_REQUIRED', async () => {
     const r = new Resizer({
       logger: silent,
       storage,
@@ -568,36 +542,12 @@ describe('ports', () => {
       locks: () => undefined,
       tasks: new MemoryTaskQueue(),
     });
-    await assert.rejects(() => r.ready(), locksRequired);
+    await r.ready();
     assert.equal(r.locks, undefined);
+    await assert.rejects(() => r.verify(), locksRequired);
   });
 
-  test('ready() validates the task queue timing; resolve() still never throws', async () => {
-    const r = new Resizer({
-      logger: silent,
-      storage,
-      media: fakeMedia(),
-      locks: memoryLocks(),
-      tasks: new MemoryTaskQueue({ timing: { leaseMs: 0 } }),
-    });
-    const leaseInvalid = (e: unknown) =>
-      e instanceof ResizeConfigError &&
-      e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID';
-    await assert.rejects(() => r.ready(), leaseInvalid);
-    const media = { id: 'm1', original: { storageRef: { key: 'o' } } };
-    assert.deepEqual(await r.resolve({ media, sizes: [{ width: 10 }] }), {
-      decision: { ready: [], missing: [] },
-      output: undefined,
-    });
-    const result = await r.prewarm({ media, sizes: [{ width: 10 }] });
-    assert.equal(result.status, 'incomplete');
-    assert.deepEqual(result.requested, []);
-    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
-    assert.equal(result.issues[0].retryable, false);
-    await assert.rejects(() => r.verify(), leaseInvalid);
-  });
-
-  test('ready() checks the queue timing before the image config', async () => {
+  test('verify() checks the queue timing before the image config; ready() rejects only for the config', async () => {
     let configReads = 0;
     const r = new Resizer({
       logger: silent,
@@ -611,12 +561,19 @@ describe('ports', () => {
       },
     });
     await assert.rejects(
-      () => r.ready(),
+      () => r.verify(),
       (e: unknown) =>
         e instanceof ResizeConfigError &&
         e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
     assert.equal(configReads, 0);
+    await assert.rejects(
+      () => r.ready(),
+      (e: unknown) =>
+        e instanceof ResizeConfigError &&
+        /upload must be an object/.test(e.message),
+    );
+    assert.equal(configReads, 1);
   });
 
   test('an eager-only Resizer needs no locks, and has no db', async () => {
@@ -635,6 +592,184 @@ describe('ports', () => {
     assert.equal(r.media, media);
     assert.equal(r.locks, locks);
     assert.equal(r.tasks, tasks);
+  });
+});
+
+describe('a task queue the Resizer cannot use', () => {
+  const png = sharp({
+    create: { width: 40, height: 30, channels: 3, background: '#ff0000' },
+  })
+    .png()
+    .toBuffer();
+  // One stored preview (10x10 webp); 20x20 is missing.
+  const media = () => ({
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [
+      {
+        storageRef: { key: 'p10' },
+        sizeKey: '10x10',
+        format: 'webp',
+        contentType: 'image/webp',
+      },
+    ],
+  });
+  const sizes = [
+    { width: 10, height: 10 },
+    { width: 20, height: 20 },
+  ];
+
+  /**
+   * The read path serves what is stored and queues nothing, uploads and eager generate() work,
+   * prewarm() reports the failure, verify() rejects with it, and it is logged once, not per call.
+   */
+  async function assertDegraded(
+    parts: Pick<ResizerOptions, 'locks' | 'tasks'>,
+    tasks: MemoryTaskQueue,
+    failed: (e: unknown) => boolean,
+  ) {
+    const errors: unknown[][] = [];
+    const body = await png;
+    const r = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => {
+          errors.push(args);
+        },
+      },
+      storage: {
+        download: async () => body,
+        upload: async ({ key }) => ({ key }),
+        publicUrl: (ref) => `https://cdn/${(ref as { key: string }).key}`,
+      },
+      media: fakeMedia(),
+      ...parts,
+    });
+    await r.ready();
+    for (let read = 0; read < 2; read += 1) {
+      const { decision } = await r.resolve({ media: media(), sizes });
+      assert.deepEqual(
+        decision.ready.map((entry) => entry.url),
+        ['https://cdn/p10'],
+      );
+      assert.deepEqual(
+        decision.missing.map((variant) => variant.sizeKey),
+        ['20x20'],
+      );
+    }
+    assert.deepEqual(tasks.added, []);
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+    assert.equal(original.format, 'png');
+    const { created } = await r.generate({
+      media: media(),
+      sizes,
+      persist: false,
+    });
+    assert.deepEqual(
+      created.map((preview) => preview.sizeKey),
+      ['20x20'],
+    );
+    const result = await r.prewarm({ media: media(), sizes });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      result.requested.map((variant) => variant.sizeKey),
+      ['10x10', '20x20'],
+    );
+    assert.deepEqual(
+      result.ready.map((variant) => variant.sizeKey),
+      ['10x10'],
+    );
+    assert.deepEqual(
+      result.unconfirmed.map((variant) => variant.sizeKey),
+      ['20x20'],
+    );
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false);
+    assert.deepEqual(
+      result.issues[0].previews.map((variant) => variant.sizeKey),
+      ['20x20'],
+    );
+    assert.deepEqual(tasks.added, []);
+    await assert.rejects(() => r.verify(), failed);
+    await assert.rejects(() => r.verify(), failed);
+    assert.equal(errors.length, 1, 'logged once, when the Resizer started');
+    assert.match(String(errors[0][0]), /cannot use its task queue/);
+    assert.ok(failed(errors[0][1]));
+    return result;
+  }
+
+  test('invalid queue timing: reads serve stored previews, uploads and generate() work, prewarm() reports it, verify() rejects', async () => {
+    const tasks = new MemoryTaskQueue({ timing: { leaseMs: 0 } });
+    const result = await assertDegraded(
+      { tasks, locks: memoryLocks() },
+      tasks,
+      (e: unknown) =>
+        e instanceof ResizeConfigError &&
+        e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    );
+    assert.match(result.issues[0].message, /leaseMs/);
+  });
+
+  test('a task queue without locks: the same, and verify() is RESIZE_LOCKS_REQUIRED', async () => {
+    const tasks = new MemoryTaskQueue();
+    const result = await assertDegraded(
+      { tasks },
+      tasks,
+      (e: unknown) =>
+        e instanceof ResizeSetupError &&
+        e.code === 'RESIZE_LOCKS_REQUIRED' &&
+        /FrameworkResizer/.test(e.message) &&
+        /mongoParts/.test(e.message),
+    );
+    assert.match(result.issues[0].message, /no `locks`/);
+  });
+
+  test('a queue timing that becomes valid is used from the next call, and the failure is logged again only when it changes', async () => {
+    let timing: Record<string, unknown> = { leaseMs: 0 };
+    const tasks = new MemoryTaskQueue();
+    tasks.getTiming = () => timing as never;
+    const errors: unknown[][] = [];
+    const r = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => {
+          errors.push(args);
+        },
+      },
+      storage: {
+        download: async () => Buffer.alloc(0),
+        upload: async ({ key }) => ({ key }),
+        publicUrl: (ref) => `https://cdn/${(ref as { key: string }).key}`,
+      },
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks,
+    });
+    await r.ready();
+    await r.ready();
+    assert.equal(errors.length, 1);
+    timing = { maxAttempts: 0 };
+    await r.resolve({ media: media(), sizes });
+    await r.resolve({ media: media(), sizes });
+    assert.equal(errors.length, 2, 'a different failure is logged once more');
+    assert.deepEqual(tasks.added, []);
+    timing = {};
+    const { decision } = await r.resolve({ media: media(), sizes });
+    assert.deepEqual(
+      decision.missing.map((variant) => variant.sizeKey),
+      ['20x20'],
+    );
+    assert.deepEqual(
+      tasks.added.map((task) => task.previews.map((v) => v.sizeKey)),
+      [['20x20']],
+    );
+    await r.verify();
+    assert.equal(errors.length, 2);
   });
 });
 

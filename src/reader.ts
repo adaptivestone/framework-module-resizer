@@ -36,7 +36,11 @@ import type {
 
 export interface ReaderDeps {
   catalog: Catalog;
-  dispatcher: Dispatcher | undefined; // undefined: no task queue (eager only)
+  // undefined: no task queue (eager only), or one that cannot be used (see queueFailure)
+  dispatcher: Dispatcher | undefined;
+  // Why the Resizer's task queue cannot be used (no lock store, invalid timing), already logged
+  // once by the Resizer: reads queue nothing and prewarm reports it.
+  queueFailure?: { error: unknown };
   hooks: HookBus;
   pipelines: PipelineRegistry;
   storage: ResizeStorage;
@@ -181,6 +185,7 @@ export class Reader {
 
       // Enqueue the missing variants. Default follows construction: a task queue (so a
       // Dispatcher) means lazy mode (enqueue), none means eager-only (do not log-on-every-read).
+      // A task queue that cannot be used queues nothing; the Resizer logged why when it started.
       const enqueueMissing = opts.enqueueMissing ?? dispatcher !== undefined;
       if (enqueueMissing && decision.missing.length > 0) {
         if (media.original?.storageRef == null) {
@@ -188,9 +193,11 @@ export class Reader {
             `resize resolve: media ${mediaId} has no original storage ref — nothing enqueued`,
           );
         } else if (!dispatcher) {
-          logger.warn(
-            'resize resolve: missing previews but no task queue is configured — they stay placeholders (eager-only host? give the Resizer `tasks` for lazy mode)',
-          );
+          if (!this.#deps.queueFailure) {
+            logger.warn(
+              'resize resolve: missing previews but no task queue is configured — they stay placeholders (eager-only host? give the Resizer `tasks` for lazy mode)',
+            );
+          }
         } else {
           try {
             await dispatcher.enqueue({
@@ -372,6 +379,16 @@ export class Reader {
         });
       }
 
+      const { queueFailure } = this.#deps;
+      if (!dispatcher && queueFailure) {
+        // Nothing can be queued; the Resizer logged the failure when it started.
+        return finish({
+          ...prewarmFailure(queueFailure.error, required),
+          requested,
+          ready,
+          notRequired,
+        });
+      }
       const request: DispatchRequest = {
         mediaId,
         pipeline,
@@ -405,7 +422,9 @@ export class Reader {
 /**
  * Prewarm's result for an unexpected error: every variant `requested` so far is unconfirmed, with
  * one RESIZE_ENQUEUE_INTERNAL_ERROR issue. Retryable unless the media is unusable or the wiring or
- * config is wrong.
+ * config is wrong. This `retryable` is advice to the prewarm caller, so it differs from
+ * ResizeError.retryable on purpose: a ResizeSetupError will not improve on the caller's retry, yet
+ * a queued task that hits one is retried (a worker deployed with the fix can run it).
  */
 export function prewarmFailure(
   err: unknown,

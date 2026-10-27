@@ -75,13 +75,19 @@ const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
 type PartName = (typeof PART_NAMES)[number];
 
 // What the Resizer's methods run on, built once by ready() from the loaded parts and the
-// validated config. No service receives the Resizer.
+// validated config. No service receives the Resizer. The Reader alone uses the Dispatcher, so it
+// is built again when the Dispatcher's state changes.
 interface Services {
   catalog: Catalog;
   uploader: Uploader;
-  dispatcher: Dispatcher | undefined; // only with a task queue
   reader: Reader;
   processor: Processor;
+}
+
+// Why a Resizer with a task queue has no Dispatcher; `message` tells a new failure from the last.
+interface QueueFailure {
+  error: unknown;
+  message: string;
 }
 
 // How framework hosts get the parts below filled in from their app.
@@ -131,6 +137,11 @@ export class Resizer {
   readonly #pipelines: PipelineRegistry;
   readonly #hooks: HookBus;
   #builtServices: Services | undefined;
+  // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
+  #dispatcher: Dispatcher | undefined;
+  #queueFailure: QueueFailure | undefined;
+  // The Dispatcher was built or its failure changed after the Reader was built.
+  #readerStale = false;
 
   constructor(opts: ResizerOptions) {
     // Runtime validation of the required parts (`storage` here, `media` below): the type system
@@ -254,13 +265,27 @@ export class Resizer {
   /**
    * Load the parts given as functions, each once, then build the services. Every method of the
    * Resizer (and the worker) awaits it first, so hosts only need it before reading `storage`,
-   * `media`, `locks` or `tasks` directly. The checks run in this order, and the first failure
-   * rejects: the parts load; a task queue without a lock store is RESIZE_LOCKS_REQUIRED; the task
-   * queue's timing is validated; the image config is read and validated; the services are built.
-   * A part whose function fails is retried by the next call, and so is a timing or config that
-   * fails to load or validate; the parts that loaded are kept.
+   * `media`, `locks` or `tasks` directly. In this order: the parts load; a Resizer with a task
+   * queue builds its Dispatcher; the image config is read and validated; the services are built.
+   * A part or config failure rejects. A Dispatcher failure (a task queue without a lock store,
+   * RESIZE_LOCKS_REQUIRED, or invalid queue timing) does not: it is logged once, reads serve
+   * stored previews and queue nothing, uploads and generate() work, prewarm() reports it and
+   * verify() rejects with it. The next call retries what failed: a part that did not load, a
+   * config that did not validate, a Dispatcher that could not be built. The parts that loaded are
+   * kept.
    */
   async ready(): Promise<void> {
+    await this.#services();
+  }
+
+  /** The services, once the parts are loaded (see ready()). */
+  async #services(): Promise<Services> {
+    await this.#loadParts();
+    return this.#ensureServices();
+  }
+
+  /** Load the parts given as functions, each once; a failure rejects. */
+  async #loadParts(): Promise<void> {
     if (this.#loadedParts.size < PART_NAMES.length) {
       await Promise.all([
         this.#loadPart('storage', this.#sources.storage, (storage) => {
@@ -283,33 +308,22 @@ export class Resizer {
         }),
       ]);
     }
-    this.#ensureServices();
   }
 
   /**
-   * The services: built on the first call that succeeds, then the same object. A failed build
-   * leaves nothing behind. Called only after the parts are loaded.
+   * The services: built on the first call that succeeds, then the same object (a failed build
+   * leaves nothing behind). The Dispatcher comes first, in its own step, so its failure leaves the
+   * others usable. Called only after the parts are loaded.
    */
   #ensureServices(): Services {
+    this.#ensureDispatcher();
     if (!this.#builtServices) {
-      // The locks and the queue timing are checked before the config (the order ready() states).
-      const dispatcher = this.#buildDispatcher();
       const { config, storage, media } = this;
       const catalog = new Catalog({ config });
       this.#builtServices = {
         catalog,
         uploader: new Uploader({ storage, config }),
-        dispatcher,
-        reader: new Reader({
-          catalog,
-          dispatcher,
-          hooks: this.#hooks,
-          pipelines: this.#pipelines,
-          storage,
-          logger: this.logger,
-          name: this.name,
-          queue: this.queue,
-        }),
+        reader: this.#buildReader(catalog),
         processor: new Processor({
           catalog,
           media,
@@ -322,20 +336,64 @@ export class Resizer {
           name: this.name,
         }),
       };
+    } else if (this.#readerStale) {
+      this.#builtServices.reader = this.#buildReader(
+        this.#builtServices.catalog,
+      );
     }
+    this.#readerStale = false;
     return this.#builtServices;
   }
 
+  /** The Reader, on the Dispatcher as it is now, or on the reason there is none. */
+  #buildReader(catalog: Catalog): Reader {
+    return new Reader({
+      catalog,
+      dispatcher: this.#dispatcher,
+      queueFailure: this.#queueFailure,
+      hooks: this.#hooks,
+      pipelines: this.#pipelines,
+      storage: this.storage,
+      logger: this.logger,
+      name: this.name,
+      queue: this.queue,
+    });
+  }
+
   /**
-   * The Dispatcher of a Resizer with a task queue, on the queue's validated timing (undefined: eager
-   * only). Queued work locks every variant, so a task queue without a lock store rejects every call
-   * (resolve() and prewarm() turn that into their safe result).
+   * Build the Dispatcher of a Resizer with a task queue, unless it exists. A failure is kept for
+   * verify() and prewarm() and logged when it first happens or its message changes, never on every
+   * call; a later call that succeeds (e.g. a lazy getTiming() that is valid now) clears it.
    */
-  #buildDispatcher(): Dispatcher | undefined {
+  #ensureDispatcher(): void {
     const tasks = this.#tasks;
-    if (!tasks) {
-      return undefined;
+    if (this.#dispatcher || !tasks) {
+      return;
     }
+    try {
+      this.#dispatcher = this.#buildDispatcher(tasks);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.#queueFailure?.message !== message) {
+        this.#queueFailure = { error, message };
+        this.#readerStale = true;
+        logNeverThrow(
+          this.logger,
+          `resize: Resizer '${this.name}' cannot use its task queue — reads serve stored previews only and queue nothing, prewarm() reports it, verify() rejects`,
+          error,
+        );
+      }
+      return;
+    }
+    this.#queueFailure = undefined;
+    this.#readerStale = true;
+  }
+
+  /**
+   * The Dispatcher on the queue's validated timing. Queued work locks every variant, so a task
+   * queue without a lock store is RESIZE_LOCKS_REQUIRED.
+   */
+  #buildDispatcher(tasks: TaskQueue): Dispatcher {
     const locks = this.#locks;
     if (!locks) {
       throw locksRequired(this.name);
@@ -347,12 +405,6 @@ export class Resizer {
       name: this.name,
       logger: this.logger,
     });
-  }
-
-  /** The services, once ready() has loaded the parts and built them. */
-  async #services(): Promise<Services> {
-    await this.ready();
-    return this.#ensureServices();
   }
 
   /** Load one part given as a function; concurrent callers share its load while it runs. */
@@ -384,13 +436,19 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: load the drivers; resolve and validate the config and the task queue's
-   * timing; run the media store's and the lock store's verify(); check the task queue (its own
-   * verify(), and that it serves this Resizer's queue).
-   * Framework hosts call it after `Server.init()` to fail at boot instead of at the first upload or
-   * read. The worker runs it for every Resizer before leasing.
+   * Optional startup check: load the drivers; check that a task queue can be used (a lock store
+   * beside it, and its timing), then resolve and validate the config; run the media store's and
+   * the lock store's verify(); check the task queue (its own verify(), and that it serves this
+   * Resizer's queue). Framework hosts call it after `Server.init()` to fail at boot instead of at
+   * the first upload or read; it is the one call that rejects for a task queue that cannot be used
+   * (the read path degrades instead). The worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
+    await this.#loadParts();
+    this.#ensureDispatcher();
+    if (this.#queueFailure) {
+      throw this.#queueFailure.error;
+    }
     await this.ready();
     await this.media.verify?.();
     await this.locks?.verify?.();
@@ -456,7 +514,8 @@ export class Resizer {
   }
 
   /**
-   * Eager mode — synchronous generate at upload; no queue/worker/locks. Delegates to the
+   * Eager mode — generate at upload, within this call. It uses no task queue, worker or locks, so
+   * it also works on a Resizer whose task queue cannot be used. Delegates to the
    * Processor (src/processor.ts): resolveSizes waterfall with the caller's REAL ctx → expand
    * sizes × formats, skipping identities already in media.previews (idempotent) → download once →
    * beforeSteps once → per-variant resize/encode/upload (bounded by config.concurrency, NO locks).

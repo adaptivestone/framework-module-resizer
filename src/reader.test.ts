@@ -9,6 +9,7 @@ import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask } from './contracts/taskQueue.ts';
 import { Dispatcher } from './dispatcher.ts';
+import { ResizeConfigError } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
@@ -182,6 +183,63 @@ describe('Reader', () => {
     assert.equal(result.status, 'incomplete');
     assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_NO_QUEUE');
     assert.equal(result.issues[0].retryable, false);
+  });
+
+  test('a Reader whose task queue cannot be used serves stored previews, queues nothing, logs nothing and prewarm reports the failure', async () => {
+    const logged: unknown[][] = [];
+    const deps = readerDeps(undefined);
+    deps.logger = {
+      info: (...a: unknown[]) => logged.push(a),
+      warn: (...a: unknown[]) => logged.push(a),
+      error: (...a: unknown[]) => logged.push(a),
+    };
+    const failure = new ResizeConfigError('the lease is invalid', {
+      code: 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    });
+    deps.queueFailure = { error: failure };
+    const reader = new Reader(deps);
+    const sizes = [
+      { width: 10, height: 10 },
+      { width: 20, height: 20 },
+    ];
+    for (const enqueueMissing of [undefined, true]) {
+      const { decision } = await reader.resolve({
+        media,
+        sizes,
+        ...(enqueueMissing ? { enqueueMissing } : {}),
+      });
+      assert.deepEqual(
+        decision.ready.map((e) => e.url),
+        ['https://cdn/p'],
+      );
+      assert.deepEqual(
+        decision.missing.map((v) => v.sizeKey),
+        ['20x20'],
+      );
+    }
+    const result = await reader.prewarm({ media, sizes });
+    assert.deepEqual(logged, []);
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      result.requested.map((v) => v.sizeKey),
+      ['10x10', '20x20'],
+    );
+    assert.deepEqual(
+      result.ready.map((v) => v.sizeKey),
+      ['10x10'],
+    );
+    assert.deepEqual(
+      result.unconfirmed.map((v) => v.sizeKey),
+      ['20x20'],
+    );
+    assert.deepEqual(result.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
+        message: 'the lease is invalid',
+        retryable: false,
+        previews: result.unconfirmed,
+      },
+    ]);
   });
 
   test('a Reader never throws: an unexpected error is logged once and returns the safe result', async () => {

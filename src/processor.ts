@@ -275,8 +275,9 @@ export class Processor {
     const { catalog, locks, logger, media: mediaStore, name } = this.#deps;
     // ctx does NOT cross the queue — the worker's pipeline steps depend on media/metadata.
     const ctx: Record<string, unknown> = {};
-    // A queued task always takes locks. ready() requires a lock store beside a task queue, but a
-    // Resizer without one (eager only) can still be handed a task by another Resizer's queue.
+    // A queued task always takes locks. verify() (so worker start) requires a lock store beside a
+    // task queue, but a Resizer without one (eager only) can still be handed a task by another
+    // Resizer's queue.
     if (!locks) {
       throw new ResizeSetupError(
         `resize worker: Resizer '${name}' has no \`locks\`, so it cannot process queued tasks — give it a lock store (e.g. the parts of mongoParts(connection, { mediaModel }))`,

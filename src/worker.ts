@@ -44,8 +44,9 @@ async function runTask(
 ): Promise<void> {
   await resizer.ready();
   // The delivering queue, else the Resizer's own; with neither (an eager-only Resizer), the
-  // default TTL. Reading it before the Processor's lock check is safe: runWorker (and ready(), for
-  // the Resizer's own queue) validated this timing through timingOf, which caches it.
+  // default TTL. Reading it before the Processor's lock check is safe: runWorker validated this
+  // timing through timingOf, which caches it, and outside runWorker invalid timing throws here, so
+  // the task fails before anything is loaded.
   const queue = tasks ?? resizer.tasks;
   return resizer.processor.processTask(task, {
     signal: taskOpts?.signal,
