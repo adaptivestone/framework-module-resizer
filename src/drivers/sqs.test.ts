@@ -286,6 +286,29 @@ describe('SqsTaskQueue.add', () => {
     assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
     assert.equal(sent.length, 0);
   });
+  test('add sends gateOwner in the body and claim returns it; the dead-letter body leaves it out', async () => {
+    const { client, sent } = makeFakeSqsClient({ messageId: 'mid-g' });
+    const producer = new SqsTaskQueue({ queueUrl: 'q', client });
+    await producer.add(newTask({ gateOwner: 'g1' }));
+    const body = String(sent[0].input.MessageBody);
+    assert.equal(JSON.parse(body).gateOwner, 'g1');
+    // The worker receives the body that add sent.
+    const { client: received, sent: deadSent } = makeFakeSqsClient({
+      message: message({ Body: body }),
+    });
+    const consumer = new SqsTaskQueue({
+      queueUrl: 'q',
+      client: received,
+      deadLetterQueueUrl: DEAD_URL,
+    });
+    const claimed = await consumer.claim('default', 60_000);
+    assert.ok(claimed);
+    assert.equal(claimed.gateOwner, 'g1');
+    assert.equal(await consumer.fail(claimed, 'dead', 'x'), true);
+    assert.equal(deadSent[0].input.QueueUrl, DEAD_URL);
+    const deadBody = JSON.parse(String(deadSent[0].input.MessageBody));
+    assert.equal('gateOwner' in deadBody, false);
+  });
 });
 
 describe('SqsTaskQueue.claim', () => {
@@ -500,6 +523,50 @@ describe('SqsTaskQueue.claim', () => {
       });
       assert.deepEqual(deletes[0], { QueueUrl: 'q', ReceiptHandle: 'rh' });
     }
+  });
+  test('a body without gateOwner (queued before the gate) is claimed without one', async () => {
+    // A gateOwner that is not a string is not copied either.
+    for (const extra of [{}, { gateOwner: 42 }]) {
+      const { client } = makeFakeSqsClient({
+        message: message({
+          Body: JSON.stringify({
+            mediaId: 'm1',
+            pipeline: 'photo',
+            previews: [variant()],
+            ...extra,
+          }),
+        }),
+      });
+      const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+      const claimed = await tasks.claim('default', 60_000);
+      assert.ok(claimed);
+      assert.equal('gateOwner' in claimed, false);
+    }
+  });
+  test('claim ignores a resizers filter: SQS cannot filter by Resizer', async () => {
+    const { client } = makeFakeSqsClient({
+      message: message({
+        Body: JSON.stringify({
+          resizer: 'other',
+          mediaId: 'm1',
+          pipeline: 'photo',
+          previews: [variant()],
+        }),
+      }),
+    });
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const claimed = await tasks.claim('default', 60_000, undefined, {
+      resizers: ['default'],
+    });
+    assert.equal(claimed?.resizer, 'other');
+  });
+  test('SqsTaskQueue declares neither gatesByTask nor claimFilters', () => {
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client: makeFakeSqsClient().client,
+    });
+    assert.equal(tasks.gatesByTask, undefined);
+    assert.equal(tasks.claimFilters, undefined);
   });
 });
 
