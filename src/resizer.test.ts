@@ -549,33 +549,40 @@ describe('ports', () => {
     await assert.rejects(() => r.verify(), locksRequired);
   });
 
-  test('verify() checks the queue timing before the image config; ready() rejects only for the config', async () => {
+  test('ready() and verify() check the image config before the task queue, and log nothing about the queue', async () => {
     let configReads = 0;
+    let timingReads = 0;
+    const errors: unknown[][] = [];
+    const tasks = new MemoryTaskQueue();
+    tasks.getTiming = () => {
+      timingReads += 1;
+      return { leaseMs: 0 };
+    };
     const r = new Resizer({
-      logger: silent,
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => {
+          errors.push(args);
+        },
+      },
       storage,
       media: fakeMedia(),
       locks: memoryLocks(),
-      tasks: new MemoryTaskQueue({ timing: { leaseMs: 0 } }),
+      tasks,
       config: () => {
         configReads += 1;
         return { ...makeImageConfig(), upload: null } as never;
       },
     });
-    await assert.rejects(
-      () => r.verify(),
-      (e: unknown) =>
-        e instanceof ResizeConfigError &&
-        e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
-    );
-    assert.equal(configReads, 0);
-    await assert.rejects(
-      () => r.ready(),
-      (e: unknown) =>
-        e instanceof ResizeConfigError &&
-        /upload must be an object/.test(e.message),
-    );
-    assert.equal(configReads, 1);
+    const badConfig = (e: unknown) =>
+      e instanceof ResizeConfigError &&
+      /upload must be an object/.test(e.message);
+    await assert.rejects(() => r.ready(), badConfig);
+    await assert.rejects(() => r.verify(), badConfig);
+    assert.equal(configReads, 2);
+    assert.equal(timingReads, 0);
+    assert.deepEqual(errors, []);
   });
 
   test('an eager-only Resizer needs no locks, and has no db', async () => {

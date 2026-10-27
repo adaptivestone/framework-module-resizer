@@ -428,6 +428,33 @@ test("the config file's coordination reaches the Resizer, and the option wins", 
   assert.equal(taskCoordinationOf(explicit).cooldownMs, 77);
 });
 
+test('a broken config file fails as itself, before the task queue is set up: nothing is logged about the queue', async () => {
+  const { logger } = installApp({
+    resize: makeResizeConfig({
+      mediaModelName: '',
+      storage: localStorage,
+      queue: { driver: 'database' },
+    }),
+  });
+  const errors: unknown[][] = [];
+  logger.error = (...args: unknown[]) => {
+    errors.push(args);
+  };
+  const r = new FrameworkResizer({
+    storage,
+    tasks: new MemoryTaskQueue(),
+  });
+  const mediaModelMissing = (err: unknown) =>
+    err instanceof ResizeConfigError &&
+    err.code === 'RESIZE_CONFIG_MEDIA_MODEL_MISSING';
+  await assert.rejects(() => r.ready(), mediaModelMissing);
+  await assert.rejects(() => r.verify(), mediaModelMissing);
+  assert.deepEqual(
+    errors.filter((args) => /task queue/.test(String(args[0]))),
+    [],
+  );
+});
+
 test('a core MongoTaskQueue needs one model, and the core validates its timing', () => {
   for (const opts of [{}, { model: {}, getModel: () => ({}) }]) {
     assert.throws(

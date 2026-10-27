@@ -22,6 +22,9 @@ const KEYS = ['gateTtlMs', 'cooldownMs'] as const;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+const isPositiveSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
 // A value as a message shows it: strings quoted, so '600000' is told apart from 600000.
 const shown = (value: unknown): string =>
   typeof value === 'string' ? JSON.stringify(value) : String(value);
@@ -54,14 +57,12 @@ export function fillCoordination(
     if (value === undefined) {
       continue;
     }
-    if (
-      !(typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
-    ) {
-      invalid(
+    if (!isPositiveSafeInteger(value)) {
+      return invalid(
         `resize coordination: ${key} must be a positive safe integer (ms), got ${shown(value)}`,
       );
     }
-    coordination[key] = value as number;
+    coordination[key] = value;
   }
   // A gate lock must outlive the lease it guards: a shorter one could expire while a worker still
   // holds the task, and the next read would queue a second task for the same media and pipeline.
