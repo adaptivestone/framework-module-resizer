@@ -8,9 +8,10 @@ import type {
   TaskEventHandler,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { gateKey } from '../lockKeys.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { consume } from '../testHelpers/consume.ts';
-import { fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
+import { clockLocks, fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
 import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
@@ -1057,6 +1058,84 @@ describe('Consumer with SqsTaskQueue', () => {
     assert.equal(JSON.parse(String(sent[0].input.MessageBody)).attempts, 3);
     assert.equal(deletes.length, 1);
     assert.equal(changeVis.length, 0);
+  });
+  test('a retry holds the gate lock for the backoff plus one lease; completion releases it', async () => {
+    // The task's message, delivered twice: the first delivery fails, the retry completes.
+    const body = JSON.stringify({
+      mediaId: 'm1',
+      pipeline: 'photo',
+      previews: [variant()],
+      gateOwner: 'g1',
+    });
+    const { client, deletes } = makeFakeSqsClient({
+      outputs: {
+        ReceiveMessageCommand: [
+          { Messages: [message({ Body: body })] },
+          {
+            Messages: [
+              message({
+                Body: body,
+                ReceiptHandle: 'rh-2',
+                Attributes: { ApproximateReceiveCount: '2' },
+              }),
+            ],
+          },
+        ],
+      },
+    });
+    // The default lease (60 s) and a 1 s backoff.
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: fastTiming,
+    });
+    const { leaseMs, retryBackoffMs } = timingOf(tasks);
+    // The gate lock the Dispatcher took when it queued the task, under the owner the body carries.
+    const locks = clockLocks();
+    const key = gateKey('default', 'm1', 'photo');
+    assert.equal(await locks.acquire(key, 'g1', 600_000), true);
+    let deliveries = 0;
+    const seen: { event: string; left?: number }[] = [];
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2000);
+    try {
+      await consume(tasks, {
+        signal: ctrl.signal,
+        queue: 'default',
+        handle: async () => {
+          deliveries += 1;
+          if (deliveries === 1) {
+            throw new Error('handler boom');
+          }
+        },
+        coordinationOf: () => ({ cooldownMs: 600_000, locks }),
+        onEvent: (event) => {
+          const lock = locks.entry(key);
+          seen.push({
+            event,
+            ...(lock ? { left: lock.expiresAt - Date.now() } : {}),
+          });
+          if (event === 'completed') {
+            ctrl.abort();
+          }
+        },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(
+      seen.map(({ event }) => event),
+      ['failed', 'completed'],
+    );
+    const held = leaseMs + retryBackoffMs.base;
+    const left = seen[0].left ?? 0;
+    assert.ok(
+      left >= held - 100 && left <= held,
+      `held for ${left} ms after the failure (expected about ${held})`,
+    );
+    assert.equal(seen[1].left, undefined, 'released on completion');
+    assert.equal(locks.entry(key), undefined);
+    assert.deepEqual(deletes, [{ QueueUrl: 'q', ReceiptHandle: 'rh-2' }]);
   });
 });
 

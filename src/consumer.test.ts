@@ -1057,6 +1057,46 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     assert.ok(left >= 29_900 && left <= 30_000, `held for ${left} ms`);
   });
 
+  test('the cooldown hold is in place before the deadLettered event fires', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    // What the observer sees of the gate lock, read inside the event handler.
+    const seen: { event: TaskEvent; owner?: string; left: number }[] = [];
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async () => {
+          throw new ResizeMediaError('x', { retryable: false });
+        },
+        onEvent: (event) => {
+          const lock = locks.entry(key);
+          seen.push({
+            event,
+            owner: lock?.owner,
+            left: (lock?.expiresAt ?? 0) - Date.now(),
+          });
+          stop.abort();
+        },
+        coordinationOf: () => ({ cooldownMs: 30_000, locks }),
+        logger: silent,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(seen.length, 1);
+    const [{ event, owner, left }] = seen;
+    assert.equal(event, 'deadLettered');
+    assert.equal(owner, 'g1');
+    // The cooldown, not the 200 ms lease the task started with.
+    assert.ok(
+      left >= 29_900 && left <= 30_000,
+      `held for ${left} ms when the event fired`,
+    );
+  });
+
   test('a lock another request took over after it expired stays theirs', async () => {
     let t = 0;
     const locks = clockLocks(() => t);

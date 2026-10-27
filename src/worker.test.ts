@@ -738,6 +738,17 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
 
 test('on a task queue that filters claims, a worker starts beside unlisted Resizers and never claims their tasks', async () => {
   const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  // Every task the worker claims, recorded: `pending` with no attempts would also describe a task
+  // that was claimed and then given back, since a give-back does not count the delivery.
+  const claimed: string[] = [];
+  const claim = tasks.claim.bind(tasks);
+  tasks.claim = async (queue, leaseMs, signal, opts) => {
+    const task = await claim(queue, leaseMs, signal, opts);
+    if (task) {
+      claimed.push(task.taskId);
+    }
+    return task;
+  };
   const a = queuedResizer('a', tasks);
   queuedResizer('b', tasks);
   // b's task is the older one, so a queue that ignored the filter would hand it out first.
@@ -748,8 +759,11 @@ test('on a task queue that filters claims, a worker starts beside unlisted Resiz
     { logger: silent, resizers: [a] },
     () => aRow.status === 'completed',
   );
+  assert.deepEqual(claimed, [aRow.id]);
   assert.equal(bRow.status, 'pending');
   assert.equal(bRow.attempts, 0);
+  // Still first: a give-back would have moved it behind a's task.
+  assert.equal(tasks.rows[0], bRow);
 });
 
 test('a task queue that filters claims is not given accepts: a task of another Resizer it hands out anyway fails with RESIZE_NO_RESIZER', async () => {
@@ -877,6 +891,102 @@ test("on a queue without gatesByTask, the gate lock lives in the task's Resizer'
   assert.equal(held?.owner, 'g1');
   const left = (held?.expiresAt ?? 0) - Date.now();
   assert.ok(left >= 29_900 && left <= 30_000, `held for ${left} ms`);
+});
+
+test('on a queue without gatesByTask, the task of a Resizer the worker does not serve touches no lock, even with a gateOwner', async () => {
+  const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
+  // One lock store for both Resizers, recording every call the worker makes.
+  const store = clockLocks();
+  const calls: string[] = [];
+  const locks: LockStore = {
+    acquire: (key, owner, ttlMs) => {
+      calls.push(`acquire ${key}`);
+      return store.acquire(key, owner, ttlMs);
+    },
+    extend: (key, owner, ttlMs) => {
+      calls.push(`extend ${key}`);
+      return store.extend(key, owner, ttlMs);
+    },
+    release: (key, owner) => {
+      calls.push(`release ${key}`);
+      return store.release(key, owner);
+    },
+  };
+  const withLocks = (name: string) =>
+    new Resizer({
+      name,
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => png,
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia({
+        load: async (id) => ({
+          id,
+          original: { storageRef: { key: 'o' } },
+          previews: [],
+        }),
+      }),
+      locks,
+      tasks,
+    });
+  const a = withLocks('a');
+  const aKey = gateKey('a', 'm1', 'default');
+  const ghostKey = gateKey('ghost', 'm1', 'default');
+  // The gate locks their Dispatchers took, set in the store directly: `calls` lists the worker's.
+  assert.equal(await store.acquire(ghostKey, 'g-ghost', 60_000), true);
+  assert.equal(await store.acquire(aKey, 'g-a', 60_000), true);
+  const ghostLock = store.entry(ghostKey);
+  // The ghost's task is the older one, so it is claimed first.
+  await tasks.add({ ...taskOf('ghost'), gateOwner: 'g-ghost' });
+  await tasks.add({ ...taskOf('a'), gateOwner: 'g-a' });
+  const [ghostRow, aRow] = tasks.rows;
+  const stop = new AbortController();
+  const working = runWorker({
+    signal: stop.signal,
+    logger: silent,
+    resizers: [a],
+  });
+  // Constructed after the worker took its list, on the same lock store: it is not served.
+  withLocks('ghost');
+  const until = Date.now() + 5000;
+  try {
+    // a's task completed; the ghost's was claimed once and failed (PlainTaskQueue has no release).
+    while (
+      aRow.status !== 'completed' ||
+      ghostRow.attempts === 0 ||
+      ghostRow.status === 'processing'
+    ) {
+      assert.ok(Date.now() < until, 'the tasks were never settled');
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  } catch (err) {
+    // A failed wait still stops the worker, so the test file can exit; the assertion is the error.
+    stop.abort();
+    await working.catch(() => {});
+    throw err;
+  }
+  stop.abort();
+  await working;
+  assert.equal(ghostRow.status, 'pending');
+  assert.equal(ghostRow.attempts, 1);
+  assert.match(
+    ghostRow.error ?? '',
+    /Resizer 'ghost' is not served by this worker/,
+  );
+  assert.deepEqual(
+    calls.filter((call) => call.endsWith(ghostKey)),
+    [],
+    "the ghost's gate lock was never extended or released",
+  );
+  assert.deepEqual(store.entry(ghostKey), ghostLock);
+  // The same store holds the gate lock of a's task: extended while it ran, then released.
+  const aCalls = calls.filter((call) => call.endsWith(aKey));
+  assert.ok(aCalls.includes(`extend ${aKey}`), aCalls.join(', '));
+  assert.equal(aCalls.at(-1), `release ${aKey}`);
+  assert.equal(store.entry(aKey), undefined);
 });
 
 test('a listed Resizer whose ready() rejects makes runWorker reject at startup before any claim', async () => {

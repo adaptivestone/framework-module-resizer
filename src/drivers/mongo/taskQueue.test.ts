@@ -906,6 +906,63 @@ describe('MongoTaskQueue.findActive', () => {
   });
 });
 
+// The read path against the real gate index: Resizer.resolve() on this file's queue, no lock store.
+describe('the gate under concurrent reads (MongoDB)', () => {
+  const size = { width: 10, height: 10 };
+
+  /** A Resizer on this file's queue and a cold media (an original, no previews) to read. */
+  function reader() {
+    const resizer = new Resizer({
+      storage: fakeStorage,
+      config: makeImageConfig({ formats: ['webp'] }),
+      tasks,
+      media: fakeMedia(),
+      logger,
+    });
+    const fileId = fid();
+    const media = { id: fileId, original: { storageRef: { key: 'o' } } };
+    return {
+      fileId,
+      read: (sizes = [size]) => resizer.resolve({ media, sizes }),
+    };
+  }
+
+  test('1000 concurrent reads of a cold media create one task row', async () => {
+    const { errors } = configureQueue();
+    const { fileId, read } = reader();
+    const results = await Promise.all(
+      Array.from({ length: 1000 }, () => read()),
+    );
+    assert.equal(
+      results.filter(({ decision }) => decision.missing.length !== 1).length,
+      0,
+      'every read reports the one missing variant',
+    );
+    assert.equal(await M.countDocuments({ fileId }), 1);
+    // The other 999 adds met the gate index and were in flight, never a write error.
+    assert.deepEqual(errors, []);
+  });
+
+  test('a task in retry backoff blocks new tasks', async () => {
+    const { fileId, read } = reader();
+    await read();
+    const leased = await tasks.claim('default', 60_000);
+    assert.ok(leased);
+    assert.equal(
+      await tasks.fail(leased, { retryAt: new Date(Date.now() + 60_000) }, 'x'),
+      true,
+    );
+    // Ten reads, one of them of a new size: the gate is per media and pipeline.
+    await Promise.all([
+      ...Array.from({ length: 9 }, () => read()),
+      read([{ width: 20, height: 20 }]),
+    ]);
+    assert.equal(await M.countDocuments({ fileId }), 1);
+    const row = await M.findOne({ fileId }).lean();
+    assert.equal(row?.status, 'pending');
+  });
+});
+
 describe('MongoTaskQueue.claim', () => {
   test('claims the task that became due first; while leased it is due when the lease ends', async () => {
     // The later-due row is older and goes in first: _id, createdAt and due order disagree.

@@ -87,3 +87,36 @@ test('the worker loop logs only through logNeverThrow', () => {
   );
   assert.deepEqual(direct, []);
 });
+
+// One gate per Resizer, media and pipeline replaced the per-identity dispatch and worker locks:
+// the gate, the queue's lease and the media store's one row per identity deduplicate the work.
+test('per-identity locks are gone: no source builds a dispatch or worker lock', () =>
+  assert.deepEqual(
+    sourceFiles().filter((f) =>
+      /resize_dispatch|resize_worker|DISPATCH_LOCK_OWNER|dispatchLockKey|workerLockKey/.test(
+        read(f),
+      ),
+    ),
+    [],
+  ));
+
+// The core owns the lock settings: the Resizer validates its coordination (coordination.ts), and
+// the core's timing check rejects the removed lockTtlMs key. A driver never reads or checks them.
+test('lock settings are validated only in the core', () => {
+  assert.deepEqual(
+    sourceFiles().filter(
+      (f) => f.startsWith('drivers/') && /lockTtlMs|gateTtlMs/.test(read(f)),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    sourceFiles().filter(
+      (f) =>
+        f !== 'coordination.ts' &&
+        /RESIZE_CONFIG_(COORDINATION_INVALID|GATE_TTL_BELOW_LEASE)/.test(
+          read(f),
+        ),
+    ),
+    [],
+  );
+});
