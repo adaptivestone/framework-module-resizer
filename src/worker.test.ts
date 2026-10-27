@@ -2,13 +2,16 @@
 // reading the source reaches the retry policy unwrapped, so an unusable source is dead-lettered
 // on its first delivery instead of being downloaded and decoded again on every retry. After a
 // dead-letter the worker holds the variants' dispatch locks for a cooldown, so reads stop queueing
-// the same failing work.
+// the same failing work. runWorker serves only the Resizers it starts with.
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
-import type { MediaStore } from './contracts/media.ts';
-import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
+import type {
+  LeasedTask,
+  TaskEvent,
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import {
   Resizer,
@@ -193,6 +196,121 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
   assert.equal(downloads, 1);
   assert.equal(uploads, 0);
   assert.deepEqual(media.previews, []);
+});
+
+// A Resizer named `name` on `tasks`. Its default media store has no docs, so each of its tasks is a
+// no-op complete.
+function queuedResizer(
+  name: string,
+  tasks: TaskQueue,
+  media: ResizerOptions['media'] = fakeMedia(),
+): Resizer {
+  return new Resizer({
+    name,
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    storage: {
+      download: async () => png,
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media,
+    locks: memoryLocks(),
+    tasks,
+  });
+}
+
+const taskOf = (resizer: string) => ({
+  resizer,
+  queue: 'default',
+  mediaId: 'm1',
+  pipeline: 'default',
+  previews: [{ sizeKey: '10x10', format: 'webp' }],
+  requestKey: `${resizer}-request`,
+});
+
+test('runWorker({ resizers }) serves only the given Resizers', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  const a = queuedResizer('a', tasks);
+  queuedResizer('b', tasks);
+  // b's task is the older one, so it is claimed first.
+  await tasks.add(taskOf('b'));
+  await tasks.add(taskOf('a'));
+  const [bRow, aRow] = tasks.rows;
+  const stop = new AbortController();
+  const working = runWorker({
+    signal: stop.signal,
+    logger: silent,
+    resizers: [a],
+  });
+  const until = Date.now() + 5000;
+  try {
+    while (aRow.status !== 'completed') {
+      assert.ok(Date.now() < until, "a's task was never completed");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  } catch (err) {
+    // A failed wait still stops the worker, so the test file can exit; the assertion is the error.
+    stop.abort();
+    await working.catch(() => {});
+    throw err;
+  }
+  stop.abort();
+  await working;
+  assert.equal(bRow.status, 'pending');
+  assert.equal(bRow.attempts, 1);
+  assert.match(bRow.error ?? '', /no Resizer named 'b'/);
+});
+
+test('runWorker({ resizers: [] }) fails with RESIZE_NO_RESIZER', async () => {
+  queuedResizer('default', new MemoryTaskQueue());
+  await assert.rejects(
+    () =>
+      runWorker({ signal: AbortSignal.abort(), logger: silent, resizers: [] }),
+    (err: unknown) =>
+      err instanceof ResizeSetupError && err.code === 'RESIZE_NO_RESIZER',
+  );
+});
+
+test('runWorker serves a Resizer listed twice once', async () => {
+  const a = queuedResizer('default', new MemoryTaskQueue());
+  await runWorker({
+    signal: AbortSignal.abort(),
+    logger: silent,
+    resizers: [a, a],
+  });
+});
+
+test('a listed Resizer whose ready() rejects makes runWorker reject at startup before any claim', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  let claims = 0;
+  tasks.claim = async () => {
+    claims += 1;
+    return null;
+  };
+  const mediaDown = new ResizeSetupError('media store is down', {
+    code: 'MEDIA_DOWN',
+  });
+  const healthy = queuedResizer('default', tasks);
+  const broken = queuedResizer('broken', tasks, async () => {
+    throw mediaDown;
+  });
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), 5000);
+  try {
+    await assert.rejects(
+      () =>
+        runWorker({
+          signal: stop.signal,
+          logger: silent,
+          resizers: [healthy, broken],
+        }),
+      (err: unknown) => err === mediaDown,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(claims, 0);
 });
 
 describe('dead-letter cooldown', () => {
@@ -413,113 +531,53 @@ describe('dead-letter cooldown', () => {
     );
   });
 
-  // A Resizer named 'late', constructed after `runWorker` took its list of Resizers (so startup
-  // never readied or verified it). Tasks and events are routed by name, so it still gets its tasks.
-  function lateResizer(
-    media: () => Promise<MediaStore>,
-    locks: LockStore,
-    hooks: ResizerOptions['hooks'],
-  ): Resizer {
-    return new Resizer({
-      name: 'late',
-      config: makeImageConfig({ formats: ['webp'] }),
-      logger: silent,
-      storage: {
-        download: async () => png,
-        upload: async () => ({ key: 'k' }),
-        publicUrl: () => '',
-      },
-      media,
-      locks,
-      hooks,
-    });
-  }
-
-  const lateTask = {
-    resizer: 'late',
-    queue: 'default',
-    mediaId: 'm1',
-    pipeline: 'default',
-    previews: [{ sizeKey: '10x10', format: 'webp' }],
-    requestKey: 'late-request',
-  };
-
-  // Task 15 (an explicit `resizers` list for runWorker) will revisit this.
-  test('a Resizer constructed after the worker started still reaches its observers', async () => {
+  test('a Resizer constructed after the worker started is not served: its task fails with RESIZE_NO_RESIZER and its observers never fire', async () => {
     const t = setup(expiringLocks({ ms: 0 }));
     const working = t.work(); // runWorker has taken its list of Resizers
-    const failed: unknown[][] = [];
+    // The worker routes tasks and events only among the Resizers it started with.
     let loads = 0;
-    // Its media store is not up for the first task, so the task fails before the handler has
-    // readied the Resizer; the event handler readies it.
-    lateResizer(
-      async () => {
-        loads += 1;
-        if (loads === 1) {
-          throw new Error('media store not up yet');
-        }
-        return fakeMedia();
-      },
-      memoryLocks(),
-      {
-        onTaskFailed: (task, error) => {
-          failed.push([task.taskId, (error as Error).message]);
-          t.stop.abort();
-        },
-      },
-    );
-    const { taskId } = await t.tasks.add(lateTask);
-    await working;
-    assert.deepEqual(failed, [[taskId, 'media store not up yet']]);
-    assert.ok(
-      !t.errors.some((args) => /event handler failed/.test(String(args[0]))),
-    );
-  });
-
-  test('a Resizer that cannot start loses only its observers; its events are logged and no cooldown is held', {
-    timeout: 5000,
-  }, async () => {
-    const t = setup(expiringLocks({ ms: 0 }), {
-      maxAttempts: 2,
-      retryBackoffMs: { base: 1, max: 1 },
+    const late = queuedResizer('late', t.tasks, async () => {
+      loads += 1;
+      return fakeMedia();
     });
-    const working = t.work(); // runWorker has taken its list of Resizers
-    const lateLocks = expiringLocks({ ms: 0 });
     const observed: string[] = [];
-    lateResizer(
-      async () => {
-        throw new ResizeSetupError('media store is down', {
-          code: 'LATE_MEDIA_DOWN',
-        });
-      },
-      lateLocks,
-      {
-        onTaskFailed: () => {
-          observed.push('failed');
-        },
-        onTaskDeadLettered: () => {
-          observed.push('dead');
-        },
-      },
-    );
-    await t.tasks.add(lateTask);
-    while (t.tasks.rows[0].status !== 'dead') {
-      await new Promise((r) => setTimeout(r, 5));
+    late.hook('afterTaskComplete', () => {
+      observed.push('completed');
+    });
+    late.hook('onTaskFailed', () => {
+      observed.push('failed');
+    });
+    late.hook('onTaskDeadLettered', () => {
+      observed.push('dead');
+    });
+    const { taskId } = await t.tasks.add(taskOf('late'));
+    const [row] = t.tasks.rows;
+    const until = Date.now() + 5000;
+    try {
+      // Claimed once, then failed (back to 'pending') or completed.
+      while (row.attempts === 0 || row.status === 'processing') {
+        assert.ok(Date.now() < until, 'the task was never settled');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } catch (err) {
+      // A failed wait still stops the worker, so the test file can exit; the assertion is the error.
+      t.stop.abort();
+      await working.catch(() => {});
+      throw err;
     }
     t.stop.abort();
     await working;
-    // The task's retry and dead-letter bookkeeping ran; only the observers are lost.
-    assert.equal(t.tasks.rows[0].attempts, 2);
+    assert.equal(row.status, 'pending');
+    assert.equal(row.attempts, 1);
+    assert.match(row.error ?? '', /no Resizer named 'late'/);
     assert.deepEqual(observed, []);
-    assert.deepEqual(lateLocks.calls, []);
-    assert.deepEqual(
-      t.errors
-        .filter((args) => /event handler failed/.test(String(args[0])))
-        .map(([message, err]) => [message, (err as ResizeSetupError).code]),
-      [
-        ['resize worker: failed event handler failed', 'LATE_MEDIA_DOWN'],
-        ['resize worker: deadLettered event handler failed', 'LATE_MEDIA_DOWN'],
-      ],
+    assert.equal(loads, 0, 'the worker never readied it');
+    assert.ok(
+      t.errors.some((args) =>
+        String(args[0]).includes(
+          `failed for task ${taskId} of unknown Resizer 'late'`,
+        ),
+      ),
     );
   });
 });

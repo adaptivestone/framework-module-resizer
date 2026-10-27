@@ -1,7 +1,8 @@
-// The worker, framework-free. `runWorker()` serves every registered Resizer for ONE named queue: it
-// runs one Consumer, the worker loop (src/consumer.ts), per distinct TaskQueue the Resizers use,
-// after verifying every Resizer. Each task runs with the Resizer named in it, and its events go to
-// that Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown.
+// The worker, framework-free. `runWorker()` serves a list of Resizers (default: every registered
+// one) for ONE named queue: it runs one Consumer, the worker loop (src/consumer.ts), per distinct
+// TaskQueue those Resizers use, after verifying each of them. Each task runs with the Resizer named
+// in it, and its events go to that Resizer's observers. After a dead-letter it holds the task's
+// dispatch locks for a cooldown.
 // The work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
@@ -14,21 +15,34 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { getResizer, listResizers } from './resizer.ts';
+import { Registry } from './registry.ts';
+import { getResizer, listResizers, type Resizer } from './resizer.ts';
 import { timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
 
 /**
- * Run one task with the Resizer it names. An unknown name rejects with RESIZE_NO_RESIZER, so the
- * task retries and dead-letters instead of running with another Resizer's storage and config.
- * Worker locks last the delivering queue's lockTtlMs.worker, so they fit the lease it holds.
+ * Run one task with the Resizer it names in the process registry. An unknown name rejects with
+ * RESIZE_NO_RESIZER, so the task retries and dead-letters instead of running with another
+ * Resizer's storage and config.
  */
 export async function processTask(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
   tasks?: TaskQueue, // the delivering queue; default: the Resizer's own
 ): Promise<void> {
-  const resizer = getResizer(task.resizer);
+  return runTask(getResizer(task.resizer), task, taskOpts, tasks);
+}
+
+/**
+ * Run one task with `resizer`. Worker locks last the delivering queue's lockTtlMs.worker, so they
+ * fit the lease it holds.
+ */
+async function runTask(
+  resizer: Resizer,
+  task: LeasedTask,
+  taskOpts: { signal: AbortSignal } | undefined,
+  tasks: TaskQueue | undefined,
+): Promise<void> {
   await resizer.ready();
   // The delivering queue, else the Resizer's own; with neither (an eager-only Resizer), the
   // default TTL. Reading it before the Processor's lock check is safe: runWorker (and ready(), for
@@ -49,15 +63,27 @@ export interface RunWorkerOptions {
   // Process-wide Sharp tuning, applied once (keep Resizers' config.concurrency × concurrency ≈
   // CPU cores). Omitted: Sharp's settings are left as they are.
   sharp?: { concurrency: number; cache: boolean };
+  // The Resizers to serve; default: every Resizer registered when the worker starts. Tasks and
+  // events are routed by name among these only: a task of any other Resizer fails with
+  // RESIZE_NO_RESIZER (it retries, then dead-letters), and its events are logged and dropped.
+  resizers?: Resizer[];
 }
 
 export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   const queue = opts.queue ?? 'default';
   const logger = opts.logger ?? console;
-  const resizers = listResizers();
+  // The served Resizers by name, taken once now, so one constructed later is not served. The same
+  // Resizer listed twice counts once.
+  const served = new Registry<Resizer>();
+  for (const resizer of new Set(opts.resizers ?? listResizers())) {
+    served.register(resizer);
+  }
+  const resizers = served.list();
   if (resizers.length === 0) {
     throw new ResizeSetupError(
-      'resize worker: no Resizer constructed — construct your Resizers in the worker process before starting it',
+      opts.resizers
+        ? 'resize worker: the `resizers` list is empty — pass the Resizers this worker serves'
+        : 'resize worker: no Resizer constructed — construct your Resizers in the worker process before starting it',
       { code: 'RESIZE_NO_RESIZER' },
     );
   }
@@ -100,23 +126,20 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   // Dead-letter cooldowns run beside the loop, so they never delay it or the observers; the worker
   // waits for the pending ones before it returns.
   const cooldowns = new Set<Promise<void>>();
-  // Events are routed by the task's Resizer name, looked up when the event arrives.
+  // Events are routed by the task's Resizer name among the served Resizers.
   const eventsOf =
     (tasks: TaskQueue): TaskEventHandler =>
     async (event, task, error) => {
-      const owner = listResizers().find((r) => r.name === task.resizer);
+      const owner = resizers.find((r) => r.name === task.resizer);
       if (!owner) {
         logger.error(
           `resize worker: ${event} for task ${task.taskId} of unknown Resizer '${task.resizer}'`,
         );
         return;
       }
-      // The Processor exists once the Resizer is ready. The task's own handler readied it, unless
-      // the task failed before that (e.g. a part that failed to load once) or never reached it
-      // (dead-lettered for too many deliveries). A Resizer that cannot start is caught by startup
-      // verification; one that slips past it (constructed after the worker started) only loses its
-      // observers: this rejects, the consume loop logs it, and the task's retry and dead-letter
-      // bookkeeping is already done.
+      // The Processor exists once the Resizer is ready. A served Resizer was readied and verified
+      // at startup, so this returns at once; it stays for the registry-routed processTask entry,
+      // whose Resizers no startup readied.
       await owner.ready();
       const { processor } = owner;
       if (event === 'deadLettered') {
@@ -154,7 +177,9 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
           await new Consumer({
             tasks,
             timing: timingOf(tasks),
-            handle: (task, taskOpts) => processTask(task, taskOpts, tasks),
+            // An unknown name throws getResizer's RESIZE_NO_RESIZER.
+            handle: async (task, taskOpts) =>
+              runTask(served.get(task.resizer), task, taskOpts, tasks),
             events: eventsOf(tasks),
             logger,
           }).run(queue, stop.signal);
