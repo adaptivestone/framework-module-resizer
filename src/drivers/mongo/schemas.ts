@@ -94,9 +94,10 @@ export const resizeTaskIndexes: readonly IndexSpec[] = [
   ],
 ];
 
-/** ResizeLock fields: the lock key is the document id. */
+/** ResizeLock fields: the lock key is the document id; `owner` is who holds the lock. */
 export const resizeLockFields = {
   _id: { type: String, required: true },
+  owner: { type: String },
   expiredAt: { type: Date, required: true },
 } as const;
 

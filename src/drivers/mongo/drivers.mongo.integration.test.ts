@@ -1,4 +1,4 @@
-// The framework-free Mongo database against a real MongoDB: models and indexes, locks, media,
+// The framework-free Mongo drivers against a real MongoDB: models and indexes, locks, media,
 // and factory wiring.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
@@ -9,8 +9,10 @@ import type { Preview } from '../../types.d.ts';
 import {
   createResizeModels,
   MongoDatabase,
+  MongoLockStore,
   MongoTaskQueue,
   mongoDatabase,
+  resizeLockFields,
 } from './index.ts';
 
 let server: MongoMemoryServer;
@@ -108,6 +110,103 @@ describe('MongoDatabase locks', () => {
     assert.equal(await db.acquireLock('k2', 1000), true);
     await db.releaseLock('k2');
     assert.equal(calls, 2);
+  });
+});
+
+describe('MongoLockStore', () => {
+  let ResizeLock: ReturnType<typeof createResizeModels>['ResizeLock'];
+  let store: MongoLockStore;
+  before(() => {
+    ({ ResizeLock } = createResizeModels(connection));
+    store = new MongoLockStore({ model: ResizeLock });
+  });
+  const expire = (key: string) =>
+    ResizeLock.updateOne(
+      { _id: key },
+      { $set: { expiredAt: new Date(Date.now() - 1000) } },
+    );
+
+  test("one owner at a time; the owner's release frees the lock", async () => {
+    assert.equal(await store.acquire('l1', 'A', 60_000), true);
+    assert.equal(await store.acquire('l1', 'B', 60_000), false);
+    assert.equal(await store.release('l1', 'A'), true);
+    assert.equal(await store.acquire('l1', 'B', 60_000), true);
+  });
+
+  test('another owner can neither release nor extend the lock', async () => {
+    assert.equal(await store.acquire('l2', 'A', 60_000), true);
+    assert.equal(await store.release('l2', 'B'), false);
+    assert.equal(await store.extend('l2', 'B', 60_000), false);
+    assert.equal(await store.acquire('l2', 'C', 60_000), false);
+  });
+
+  test("extend moves a live lock's expiry; an expired lock cannot be extended", async () => {
+    assert.equal(await store.acquire('l3', 'A', 1000), true);
+    assert.equal(await store.extend('l3', 'A', 120_000), true);
+    const lock = await ResizeLock.findById('l3').lean();
+    assert.ok(lock.expiredAt.getTime() - Date.now() > 100_000);
+    await expire('l3');
+    assert.equal(await store.extend('l3', 'A', 1000), false);
+  });
+
+  test("an expired lock goes to one caller, and the old owner's late release leaves it", async () => {
+    assert.equal(await store.acquire('l4', 'A', 60_000), true);
+    await expire('l4');
+    const owners = ['B0', 'B1', 'B2', 'B3', 'B4'];
+    const results = await Promise.all(
+      owners.map((owner) => store.acquire('l4', owner, 60_000)),
+    );
+    assert.equal(results.filter(Boolean).length, 1, 'one caller takes it over');
+    assert.equal(await store.release('l4', 'A'), false);
+    assert.equal(
+      (await ResizeLock.findById('l4').lean()).owner,
+      owners[results.indexOf(true)],
+    );
+  });
+
+  test('the owner releases its own expired lock while nobody took it over', async () => {
+    assert.equal(await store.acquire('l5', 'A', 60_000), true);
+    await expire('l5');
+    assert.equal(await store.release('l5', 'A'), true);
+    assert.equal(await ResizeLock.findById('l5').lean(), null);
+  });
+
+  test('getModel is resolved on use; an unresolved model fails verify()', async () => {
+    let calls = 0;
+    const lazy = new MongoLockStore({
+      getModel: () => {
+        calls++;
+        return ResizeLock;
+      },
+    });
+    assert.equal(calls, 0);
+    assert.equal(await lazy.acquire('l6', 'A', 1000), true);
+    assert.equal(await lazy.release('l6', 'A'), true);
+    assert.equal(calls, 2);
+    assert.throws(
+      () => new MongoLockStore({ getModel: () => null }).verify(),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_MONGO_MODEL_MISSING' &&
+        /lock model/.test(err.message),
+    );
+  });
+
+  test('needs exactly one of model or getModel', () => {
+    assert.throws(
+      () => new MongoLockStore({}),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_MONGO_MODEL_REQUIRED',
+    );
+    assert.throws(
+      () =>
+        new MongoLockStore({ model: ResizeLock, getModel: () => ResizeLock }),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_MONGO_MODEL_REQUIRED',
+    );
+  });
+
+  test('the ResizeLock schema stores the owner', () => {
+    assert.deepEqual(resizeLockFields.owner, { type: String });
   });
 });
 

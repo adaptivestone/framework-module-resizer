@@ -1,10 +1,12 @@
 // Lock contract: a key-value store whose entries expire after a TTL and carry an owner. Locks only
 // prevent duplicate work (two requests or workers generating the same variant at once). The owner
 // is what makes `release` a compare-and-delete: a caller whose lock expired and was taken over by
-// someone else cannot delete (or extend) the new holder's lock. Keep the owner with the lock, not
-// in process memory: one process may release a lock that another took under the same owner. Extend
-// this class (or pass any object of the same shape — the core never checks `instanceof`, so
-// duplicate package copies still work).
+// someone else cannot delete (or extend) the new holder's lock. An expired lock is not extended,
+// even for its owner, but its owner can still release it until another owner takes it over. Keep
+// the owner with the lock, not in process memory: one process may release a lock that another took
+// under the same owner. The store closes over its own client and receives no `app`. Extend this
+// class (or pass any object of the same shape — the core never checks `instanceof`, so duplicate
+// package copies still work).
 
 export abstract class LockStore {
   /**
@@ -15,12 +17,15 @@ export abstract class LockStore {
    */
   abstract acquire(key: string, owner: string, ttlMs: number): Promise<boolean>;
 
-  /** Move the expiry of `owner`'s live lock to `ttlMs` from now. `false`: `owner` does not hold it. */
+  /**
+   * Move the expiry of `owner`'s live lock to `ttlMs` from now. `false`: `owner` holds no live lock
+   * on `key`.
+   */
   abstract extend(key: string, owner: string, ttlMs: number): Promise<boolean>;
 
   /**
-   * Delete the lock only if `owner` holds it. `false`: `owner` does not (the lock is gone, or
-   * another owner took it over and keeps it); that is not an error.
+   * Delete the lock only if `owner` holds it, expired or not. `false`: `owner` does not (the lock
+   * is gone, or another owner took it over); that is not an error.
    */
   abstract release(key: string, owner: string): Promise<boolean>;
 
