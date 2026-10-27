@@ -91,16 +91,19 @@ async function shutDownMidTask(
     logger: silent,
   });
   const until = Date.now() + 5000;
-  // A failed wait still stops the loop, so the test file can exit.
   try {
     while (!started) {
       assert.ok(Date.now() < until, 'the handler never started');
       await new Promise((r) => setTimeout(r, 2));
     }
-  } finally {
+  } catch (err) {
+    // A failed wait still stops the loop, so the test file can exit; the assertion is the error.
     stop.abort();
-    await loop;
+    await loop.catch(() => {});
+    throw err;
   }
+  stop.abort();
+  await loop;
   return events;
 }
 
@@ -142,7 +145,6 @@ async function runUntil(
     logger,
   });
   const until = Date.now() + 5000;
-  // A failed wait still stops the loop, so the test file can exit.
   try {
     while (!done()) {
       assert.ok(
@@ -151,15 +153,21 @@ async function runUntil(
       );
       await new Promise((r) => setTimeout(r, 5));
     }
-  } finally {
+  } catch (err) {
+    // A failed wait still stops the loop, so the test file can exit; the assertion is the error.
     stop.abort();
-    await loop;
+    await loop.catch(() => {});
+    throw err;
   }
+  stop.abort();
+  await loop;
   return events;
 }
 
 describe('Consumer', () => {
-  test('a Consumer completes a task with only its own deps', async () => {
+  test('a Consumer completes a task with only its own deps', {
+    timeout: 5000,
+  }, async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
     const stop = new AbortController();
@@ -479,12 +487,13 @@ describe('Consumer', () => {
   });
 
   test('an empty claim that already waited (a long poll) is retried at once; a quick one waits idlePollMs', async () => {
+    const idlePollMs = 60;
     for (const [claimWaitMs, expectGap] of [
       [80, 'none'],
       [0, 'idle'],
     ] as const) {
       const tasks = new MemoryTaskQueue({
-        timing: { ...fastTiming, idlePollMs: 60 },
+        timing: { ...fastTiming, idlePollMs },
       });
       const starts: number[] = [];
       const ends: number[] = [];
@@ -499,16 +508,19 @@ describe('Consumer', () => {
         async () => {},
         () => starts.length >= 3,
       );
-      const gap = starts[1] - ends[0];
       if (expectGap === 'none') {
+        const gap = starts[1] - ends[0];
         assert.ok(
           gap < 30,
           `a long poll is not followed by a sleep (${gap} ms)`,
         );
       } else {
+        // The loop waits until idlePollMs has passed since the claim STARTED, so measure from
+        // there (3 ms covers the clock tick between the loop's claimStarted and starts[0]).
+        const idleGap = starts[1] - starts[0];
         assert.ok(
-          gap >= 55,
-          `a quick empty claim waits idlePollMs (${gap} ms)`,
+          idleGap >= idlePollMs - 3,
+          `a quick empty claim waits idlePollMs (${idleGap} ms)`,
         );
       }
     }
@@ -534,10 +546,13 @@ describe('Consumer', () => {
         assert.ok(Date.now() < until, 'the task was never completed');
         await new Promise((r) => setTimeout(r, 5));
       }
-    } finally {
+    } catch (err) {
       stop.abort();
-      await loop;
+      await loop.catch(() => {});
+      throw err;
     }
+    stop.abort();
+    await loop;
     assert.equal(errors.length, 1);
   });
 

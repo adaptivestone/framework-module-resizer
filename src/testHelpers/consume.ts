@@ -1,5 +1,5 @@
-// Test-only: run a Consumer with the options the loop took before it became a class, so tests
-// keep one call per loop. The timing is the queue's own, and the logger defaults to console.
+// Test-only: the loop tests' one-call form of a Consumer. It runs `queue` on `tasks` with the
+// queue's own timing, events from `onEvent`, and console unless a logger is given.
 import { Consumer, type ConsumerDeps } from '../consumer.ts';
 import type { TaskEventHandler, TaskQueue } from '../contracts/taskQueue.ts';
 import { timingOf } from '../timing.ts';
