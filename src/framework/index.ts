@@ -17,6 +17,11 @@ export {
   FrameworkDatabase,
   type FrameworkDatabaseOptions,
 } from './database.ts';
+export { FrameworkLockStore } from './locks.ts';
+export {
+  FrameworkMediaStore,
+  type FrameworkMediaStoreOptions,
+} from './media.ts';
 export type { TResizeTask } from './ResizeTaskModel.ts';
 export { default as ResizeTaskModel } from './ResizeTaskModel.ts';
 export { default as ResizeWorker } from './ResizeWorkerCommand.ts';
