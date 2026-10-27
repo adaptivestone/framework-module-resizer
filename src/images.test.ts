@@ -4,6 +4,8 @@ import { ResizeSetupError } from './errors.ts';
 import {
   calculateResizedDimensions,
   canonicalizeFilterValue,
+  canonicalizeVariants,
+  configuredFormats,
   coverDimensions,
   DEFAULT_SCOPE,
   expandMissingPreviews,
@@ -13,9 +15,12 @@ import {
   isCatalogCovered,
   parseSizeKey,
   previewScope,
+  splitConfigured,
+  storedIdentities,
+  storedPreviews,
   toMissingPreview,
 } from './images.ts';
-import type { SizeInput } from './types.d.ts';
+import type { MissingPreview, SizeInput } from './types.d.ts';
 
 describe('getSizeKey', () => {
   test('fit → "fit"', () => {
@@ -353,6 +358,86 @@ describe('expandMissingPreviews with a scope', () => {
       }),
       false,
     );
+  });
+});
+
+describe('stored rows', () => {
+  const row = (fields: {
+    resizer?: string;
+    pipeline?: string;
+    key: string;
+  }) => ({
+    storageRef: { key: fields.key },
+    ...(fields.resizer ? { resizer: fields.resizer } : {}),
+    ...(fields.pipeline ? { pipeline: fields.pipeline } : {}),
+    sizeKey: '10x10',
+    format: 'webp',
+    contentType: 'image/webp',
+  });
+
+  test("a row's identity comes from its fields, not a stored identity string", () => {
+    const media = {
+      previews: [
+        { ...row({ key: 'a' }), identity: 'listings:wm:1x1:png:none' },
+      ],
+    };
+    assert.deepEqual(
+      storedIdentities(media, DEFAULT_SCOPE),
+      new Set(['default:default:10x10:webp:none']),
+    );
+  });
+
+  test('another Resizer or pipeline keeps its own rows', () => {
+    const media = {
+      previews: [
+        row({ key: 'a' }),
+        row({ resizer: 'listings', key: 'b' }),
+        row({ resizer: 'listings', pipeline: 'wm', key: 'c' }),
+      ],
+    };
+    const listings = storedPreviews(media, {
+      resizer: 'listings',
+      pipeline: 'default',
+    });
+    assert.deepEqual(
+      [...listings.values()].map((p) => (p.storageRef as { key: string }).key),
+      ['b'],
+    );
+    assert.equal(storedIdentities({}, DEFAULT_SCOPE).size, 0);
+  });
+});
+
+describe('configured formats', () => {
+  test('only own keys of the encoder settings count', () => {
+    const encoders = Object.assign(Object.create({ jpg: {} }), { jpeg: {} });
+    assert.deepEqual(
+      configuredFormats(encoders, ['jpeg', 'jpg', 'toString', 'jpeg']),
+      { formats: ['jpeg', 'jpeg'], dropped: ['jpg', 'toString'] },
+    );
+  });
+
+  test('splitConfigured keeps the order and drops a non-string format', () => {
+    const encoders = { jpeg: {}, webp: {} };
+    const webp: MissingPreview = { sizeKey: '1x1', format: 'webp' };
+    const jpeg: MissingPreview = { sizeKey: '2x2', format: 'jpeg' };
+    const numeric = { sizeKey: '3x3', format: 5 } as never;
+    assert.deepEqual(splitConfigured(encoders, [webp, numeric, jpeg]), {
+      configured: [webp, jpeg],
+      unconfigured: [numeric],
+    });
+  });
+});
+
+describe('canonicalizeVariants', () => {
+  test('drops empty filters and keeps one copy of each payload', () => {
+    const variant: MissingPreview = {
+      sizeKey: '1x1',
+      format: 'webp',
+      filters: {},
+    };
+    assert.deepEqual(canonicalizeVariants([variant, variant]), [
+      { sizeKey: '1x1', format: 'webp' },
+    ]);
   });
 });
 

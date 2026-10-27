@@ -7,8 +7,9 @@ import {
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
-import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
+import { buildRequestKey, enqueue } from './enqueue.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
+import { canonicalizeVariants } from './images.ts';
 import { resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,

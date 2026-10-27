@@ -16,13 +16,14 @@ import type {
   NewTask,
   TaskEventHandler,
 } from '../../contracts/taskQueue.ts';
-import { buildRequestKey, canonicalizeVariants } from '../../enqueue.ts';
+import { buildRequestKey } from '../../enqueue.ts';
 import {
   ResizeGenerateError,
   ResizeNoOriginalError,
   ResizeSetupError,
 } from '../../errors.ts';
 import ResizeTaskModel from '../../framework/ResizeTaskModel.ts';
+import { canonicalizeVariants } from '../../images.ts';
 import { consumeQueue, timingOf } from '../../queue.ts';
 import { Resizer, resetResizerForTests } from '../../resizer.ts';
 import { fakeMedia } from '../../testHelpers/fakes.ts';

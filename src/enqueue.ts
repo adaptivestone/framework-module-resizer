@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import type { LockStore } from './contracts/locks.ts';
 import type { NewTask } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
+import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
 import { timingOf } from './queue.ts';
 import type { Resizer } from './resizer.ts';
@@ -18,54 +18,6 @@ import type {
   MissingPreview,
   PreviewScope,
 } from './types.d.ts';
-
-function normalizeVariant(variant: MissingPreview): MissingPreview {
-  const normalized: MissingPreview = {
-    sizeKey: variant.sizeKey,
-    format: variant.format,
-  };
-  if (variant.filters && Object.keys(variant.filters).length > 0) {
-    normalized.filters = canonicalizeFilterValue(
-      variant.filters,
-    ) as MissingPreview['filters'];
-  }
-  if (variant.requestedWidth !== undefined) {
-    normalized.requestedWidth = variant.requestedWidth;
-  }
-  if (variant.requestedHeight !== undefined) {
-    normalized.requestedHeight = variant.requestedHeight;
-  }
-  if (variant.fit !== undefined) {
-    normalized.fit = variant.fit;
-  }
-  return normalized;
-}
-
-/**
- * Canonicalize a complete queue payload: normalize nested filter keys, remove exact
- * duplicate variants, and sort the result by the canonical representation. The
- * stable result goes into the request key, so a list permutation cannot create another
- * durable task in a queue that deduplicates by it.
- */
-export function canonicalizeVariants(
-  variants: readonly MissingPreview[],
-): MissingPreview[] {
-  const byKey = new Map<string, MissingPreview>();
-  for (const variant of variants) {
-    const normalized = normalizeVariant(variant);
-    const key = JSON.stringify(normalized);
-    if (!byKey.has(key)) {
-      byKey.set(key, normalized);
-    }
-  }
-  return (
-    [...byKey.entries()]
-      // Do not use localeCompare: durable identity ordering must be independent of
-      // the host process locale.
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([, variant]) => variant)
-  );
-}
 
 /**
  * Build a bounded request identity a task queue can deduplicate by (e.g. the Mongo queue's

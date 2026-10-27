@@ -1,8 +1,10 @@
 // Core modules receive their Resizer as an argument. Only entry points (the Resizer's
 // constructor defaults, worker.ts) and framework drivers may import process-wide lookups.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { sourceFiles } from './testHelpers/imports.ts';
 
 const CORE_FILES = [
   'engine.ts',
@@ -49,3 +51,15 @@ for (const file of CORE_FILES) {
     );
   });
 }
+
+// Which stored rows count is one rule: callers use storedPreviews / storedIdentities.
+test('only images.ts decides which stored rows count', () => {
+  const users = sourceFiles().filter(
+    (f) =>
+      f !== 'images.ts' &&
+      readFileSync(new URL(`./${f}`, import.meta.url), 'utf8').includes(
+        'isUsablePreview(',
+      ),
+  );
+  assert.deepEqual(users, []);
+});

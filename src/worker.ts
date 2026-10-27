@@ -12,9 +12,8 @@ import type {
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-import { canonicalizeVariants } from './enqueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { getPreviewIdentity } from './images.ts';
+import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
 import { consumeQueue, timingOf } from './queue.ts';
 import { getResizer, listResizers, type Resizer } from './resizer.ts';

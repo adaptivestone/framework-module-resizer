@@ -17,7 +17,6 @@ import sharp, {
 import { defaultQueueOptions } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { LeasedTask, TaskQueue } from './contracts/taskQueue.ts';
-import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
@@ -32,12 +31,13 @@ import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
 import { rasterizeSvg } from './helpers/svgRaster.ts';
 import {
   calculateResizedDimensions,
+  canonicalizeVariants,
+  configuredFormats,
   coverDimensions,
   expandMissingPreviews,
   getPreviewIdentity,
-  isUsablePreview,
-  previewScope,
   requireMediaId,
+  storedIdentities,
 } from './images.ts';
 import {
   DISPATCH_LOCK_OWNER,
@@ -74,20 +74,6 @@ function requirePipeline(resizer: Resizer, name: string): void {
   }
 }
 
-/**
- * Formats that are not an own key of `encode.formats`: an alias such as 'jpg' would skip the
- * JPEG options and the flatten step, and an arbitrary Sharp id such as 'raw' would publish a
- * pixel dump.
- */
-function unconfiguredFormats(
-  encoders: Record<string, unknown>,
-  formats: readonly string[],
-): string[] {
-  return [...new Set(formats)].filter(
-    (format) => !Object.hasOwn(encoders, format),
-  );
-}
-
 /** A per-call argument names an unconfigured format: a wiring error at the call site. */
 function formatNotConfiguredError(formats: string[]): ResizeSetupError {
   return new ResizeSetupError(
@@ -117,19 +103,6 @@ function withoutVisibleLoss(img: Sharp, format: string | undefined): Sharp {
     default:
       return img; // PNG and GIF are lossless at Sharp's defaults
   }
-}
-
-/** The identity a stored row answers for (rows written before previews carried one: derived). */
-function identityOf(preview: Preview): string {
-  return (
-    preview.identity ??
-    getPreviewIdentity(
-      previewScope(preview),
-      preview.sizeKey,
-      preview.format,
-      preview.filters,
-    )
-  );
 }
 
 /** Uploaded locators for a log line; an opaque ref that JSON cannot encode is still named. */
@@ -208,21 +181,14 @@ export async function generatePreviews(
     return { generated, failedCount, alreadyStored };
   }
 
-  // Existing-preview set (the DB check that makes re-runs idempotent — 07 step 6). Stored
-  // previews keep their own scope, so another pipeline's rendering never counts as done here.
+  // Existing-preview set (the DB check that makes re-runs idempotent). Stored previews keep
+  // their own scope, so another pipeline's rendering never counts as done here.
   const scope: PreviewScope = { resizer: resizer.name, pipeline: pipelineName };
-  const existing = new Set<string>();
-  for (const p of media.previews ?? []) {
-    if (isUsablePreview(p)) {
-      existing.add(
-        getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
-      );
-    }
-  }
-  const pending = requested.filter(
-    (v) =>
-      !existing.has(getPreviewIdentity(scope, v.sizeKey, v.format, v.filters)),
-  );
+  // The identity of a requested variant or a generated row (both belong to `scope`).
+  const scopedIdentity = (v: MissingPreview | Preview): string =>
+    getPreviewIdentity(scope, v.sizeKey, v.format, v.filters);
+  const existing = storedIdentities(media, scope);
+  const pending = requested.filter((v) => !existing.has(scopedIdentity(v)));
   // Everything requested is already stored: no download. In queued mode drop the dispatch locks
   // so a later read can re-enqueue a sibling promptly.
   if (pending.length === 0) {
@@ -231,10 +197,7 @@ export async function generatePreviews(
         await releaseLock(
           resizer,
           locks.store,
-          dispatchLockKey(
-            mediaId,
-            getPreviewIdentity(scope, v.sizeKey, v.format, v.filters),
-          ),
+          dispatchLockKey(mediaId, scopedIdentity(v)),
           DISPATCH_LOCK_OWNER,
         );
       }
@@ -436,7 +399,7 @@ export async function generatePreviews(
   const heldLocks = new Map<string, string>();
 
   const processVariant = async (v: MissingPreview): Promise<void> => {
-    const identity = getPreviewIdentity(scope, v.sizeKey, v.format, v.filters);
+    const identity = scopedIdentity(v);
     const dispatchKey = dispatchLockKey(mediaId, identity);
     const workerKey = workerLockKey(mediaId, identity);
     // A fresh owner per acquire: a late release after this lock expired and another worker took
@@ -486,8 +449,9 @@ export async function generatePreviews(
 
     try {
       // A task payload can name any format; only configured encoders run (no sharp work here).
-      if (!Object.hasOwn(config.encode.formats, v.format)) {
-        throw formatNotConfiguredError([v.format]);
+      const { dropped } = configuredFormats(config.encode.formats, [v.format]);
+      if (dropped.length > 0) {
+        throw formatNotConfiguredError(dropped);
       }
       // Fit: capped to config.maxSize by calculateResizedDimensions. Cover: requested sides
       // rounded and capped to limits.resultDimension, a derived side included. For an SVG the
@@ -674,18 +638,12 @@ export async function generatePreviews(
       const mediaStore = resizer.media;
       // What the media store holds now, read once after a failed or partial write: the identities
       // stored on the media, null when the media is gone, undefined when the reload failed too.
-      const storedIdentities = async (): Promise<
+      const recordedIdentities = async (): Promise<
         Set<string> | null | undefined
       > => {
         try {
           const reloaded = await mediaStore.loadMedia(mediaId);
-          return reloaded
-            ? new Set(
-                (reloaded.previews ?? [])
-                  .filter(isUsablePreview)
-                  .map(identityOf),
-              )
-            : null;
+          return reloaded ? storedIdentities(reloaded, scope) : null;
         } catch {
           return undefined;
         }
@@ -696,9 +654,9 @@ export async function generatePreviews(
           // The write may have stopped part-way (a driver can store one row at a time). Name
           // only the uploads no row points at, so an operator can find (or delete) them; a file
           // a stored row references is never offered.
-          const recorded = await storedIdentities();
+          const recorded = await recordedIdentities();
           const unrecorded = recorded
-            ? generated.filter((p) => !recorded.has(identityOf(p)))
+            ? generated.filter((p) => !recorded.has(scopedIdentity(p)))
             : generated;
           logger.error(
             `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${generated.length} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
@@ -718,11 +676,11 @@ export async function generatePreviews(
       // The media store keeps one row per identity and resolves with the rows it stored. The
       // reload says why a row was left out: the media is gone, or another worker stored the same
       // identity first (covered, not a failure).
-      const kept = new Set(stored.map(identityOf));
-      const leftOut = generated.filter((p) => !kept.has(identityOf(p)));
+      const kept = storedIdentities({ previews: stored }, scope);
+      const leftOut = generated.filter((p) => !kept.has(scopedIdentity(p)));
       if (leftOut.length > 0) {
-        generated = generated.filter((p) => kept.has(identityOf(p)));
-        const recorded = await storedIdentities();
+        generated = generated.filter((p) => kept.has(scopedIdentity(p)));
+        const recorded = await recordedIdentities();
         if (recorded === null) {
           logger.warn(
             `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
@@ -730,16 +688,16 @@ export async function generatePreviews(
         } else {
           // A failed reload trusts the store's answer: the rows are another worker's.
           const duplicates = recorded
-            ? leftOut.filter((p) => recorded.has(identityOf(p)))
+            ? leftOut.filter((p) => recorded.has(scopedIdentity(p)))
             : leftOut;
           const lost = recorded
-            ? leftOut.filter((p) => !recorded.has(identityOf(p)))
+            ? leftOut.filter((p) => !recorded.has(scopedIdentity(p)))
             : [];
           if (duplicates.length > 0) {
             logger.warn(
               `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
             );
-            alreadyStored.push(...duplicates.map(identityOf));
+            alreadyStored.push(...duplicates.map(scopedIdentity));
           }
           if (lost.length > 0) {
             logger.error(
@@ -868,23 +826,19 @@ export async function processTaskWith(
     );
     return;
   }
-  const covered = new Set<string>(alreadyStored);
-  for (const preview of [
-    ...(media.previews ?? []),
-    ...(refreshed.previews ?? []),
-    ...generated,
-  ]) {
-    if (isUsablePreview(preview)) {
-      covered.add(
-        getPreviewIdentity(
-          previewScope(preview),
-          preview.sizeKey,
-          preview.format,
-          preview.filters,
-        ),
-      );
-    }
-  }
+  const covered = new Set<string>([
+    ...alreadyStored,
+    ...storedIdentities(
+      {
+        previews: [
+          ...(media.previews ?? []),
+          ...(refreshed.previews ?? []),
+          ...generated,
+        ],
+      },
+      scope,
+    ),
+  ]);
   const missing = requested.filter(
     (preview) =>
       !covered.has(
@@ -940,9 +894,9 @@ export async function generateImpl(
   // Caller bugs fail before any host hook, download or decode.
   requirePipeline(resizer, pipeline);
   const formats = opts.formats ?? config.formats;
-  const unconfigured = unconfiguredFormats(config.encode.formats, formats);
-  if (unconfigured.length > 0) {
-    throw formatNotConfiguredError(unconfigured);
+  const { dropped } = configuredFormats(config.encode.formats, formats);
+  if (dropped.length > 0) {
+    throw formatNotConfiguredError(dropped);
   }
 
   // Host size magic (real ctx in eager mode).

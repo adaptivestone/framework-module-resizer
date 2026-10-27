@@ -5,26 +5,27 @@
 // smaller than the box still gets a preview, made by the worker at the original's own size.
 // Every URL comes from the PURE, I/O-free storage.publicUrl of a stored preview. Imports the
 // Resizer TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
-import { canonicalizeVariants, enqueue, enqueueConfirmed } from './enqueue.ts';
+import { enqueue, enqueueConfirmed } from './enqueue.ts';
 import {
   ResizeConfigError,
   ResizeMediaError,
   ResizeSetupError,
 } from './errors.ts';
 import {
+  canonicalizeVariants,
+  configuredFormats,
   expandPreviewRequests,
   getPreviewIdentity,
   getSizeKey,
-  isUsablePreview,
-  previewScope,
   requireMediaId,
+  splitConfigured,
+  storedIdentities,
+  storedPreviews,
   toMissingPreview,
 } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
   MissingPreview,
-  Preview,
-  PreviewFormat,
   PrewarmOpts,
   PrewarmResult,
   ReadDecision,
@@ -73,25 +74,16 @@ export async function resolveImpl(
       ctx,
     )) as SizeInput[];
 
-    const { formats } = configuredFormats(
-      resizer,
-      opts.formats,
-      'resize resolve',
+    const { formats, dropped } = configuredFormats(
+      resizer.config.encode.formats,
+      opts.formats ?? resizer.config.formats,
     );
+    logUnconfiguredFormats(resizer, 'resize resolve', dropped, '');
 
-    // 5. previewMap keyed by identity — only complete entries (both key + contentType). Stored
-    // previews keep the scope they were rendered in, so another pipeline or Resizer never
-    // matches them.
+    // 5. The usable stored previews of this scope, by identity. Stored previews keep the scope
+    // they were rendered in, so another pipeline or Resizer never matches them.
     const scope = { resizer: resizer.name, pipeline };
-    const previewMap = new Map<string, Preview>();
-    for (const p of media.previews ?? []) {
-      if (isUsablePreview(p)) {
-        previewMap.set(
-          getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
-          p,
-        );
-      }
-    }
+    const previewMap = storedPreviews(media, scope);
 
     const missing: MissingPreview[] = [];
     const missingSeen = new Set<string>();
@@ -157,17 +149,18 @@ export async function resolveImpl(
     // formatPublicUrls all see exactly what was enqueued. An unknown pipeline skips the hook, so
     // a tap cannot add variants that would be queued for it; a variant the tap added or rewrote
     // to an unconfigured format is dropped.
-    decision.missing = knownPipeline
-      ? splitConfiguredVariants(
-          resizer,
-          (await resizer.runWaterfall(
-            'beforeEnqueue',
-            missing,
-            ctx,
-          )) as MissingPreview[],
-          'resize resolve',
-        ).configured
-      : [];
+    if (knownPipeline) {
+      const { configured, unconfigured } = splitConfigured(
+        resizer.config.encode.formats,
+        (await resizer.runWaterfall(
+          'beforeEnqueue',
+          missing,
+          ctx,
+        )) as MissingPreview[],
+      );
+      logUnconfiguredTapFormats(resizer, 'resize resolve', unconfigured);
+      decision.missing = configured;
+    }
 
     // 9. Enqueue the missing variants. Default follows construction: a task queue means
     // lazy mode (enqueue), none means eager-only (do not log-on-every-read).
@@ -292,10 +285,10 @@ async function prewarmStrict(
   )) as SizeInput[];
   const scope = { resizer: resizer.name, pipeline };
   const { formats, dropped } = configuredFormats(
-    resizer,
-    opts.formats,
-    'resize prewarm',
+    resizer.config.encode.formats,
+    opts.formats ?? resizer.config.formats,
   );
+  logUnconfiguredFormats(resizer, 'resize prewarm', dropped, '');
   // Requested in formats that have no encoder settings: reported, never queued.
   const unconfigured = expandPreviewRequests(sizes, dropped, scope);
   const finish = (result: PrewarmResult): PrewarmResult =>
@@ -339,19 +332,7 @@ async function prewarmStrict(
     return finish(empty());
   }
 
-  const readyIdentities = new Set<string>();
-  for (const preview of media.previews ?? []) {
-    if (isUsablePreview(preview)) {
-      readyIdentities.add(
-        getPreviewIdentity(
-          previewScope(preview),
-          preview.sizeKey,
-          preview.format,
-          preview.filters,
-        ),
-      );
-    }
-  }
+  const readyIdentities = storedIdentities(media, scope);
   const ready = requestedBeforePolicy.filter((preview) =>
     readyIdentities.has(
       getPreviewIdentity(
@@ -392,8 +373,11 @@ async function prewarmStrict(
   );
   // A tap may add or rewrite variants: one in an unconfigured format is reported like a per-call
   // one (once per identity), never queued.
-  const { configured: required, unconfigured: fromPolicy } =
-    splitConfiguredVariants(resizer, afterPolicy, 'resize prewarm');
+  const { configured: required, unconfigured: fromPolicy } = splitConfigured(
+    resizer.config.encode.formats,
+    afterPolicy,
+  );
+  logUnconfiguredTapFormats(resizer, 'resize prewarm', fromPolicy);
   const unconfiguredIdentities = new Set(
     unconfigured.map((preview) =>
       getPreviewIdentity(
@@ -524,69 +508,10 @@ function withUnconfiguredFormats(
 }
 
 /**
- * The requested formats (default: config.formats) that have an own `encode.formats` entry. Per-call
- * formats are open strings, so an alias such as 'jpg' or an arbitrary id would otherwise be queued
- * and encoded without the configured options. The others are dropped and named in one logged error.
+ * Name the requested formats without an `encode.formats` entry in one logged error. Per-call
+ * formats are open strings, so an alias such as 'jpg' or an arbitrary id is dropped, never
+ * queued or encoded without the configured options.
  */
-function configuredFormats(
-  resizer: Resizer,
-  requested: readonly PreviewFormat[] | undefined,
-  label: string,
-): { formats: PreviewFormat[]; dropped: PreviewFormat[] } {
-  const formats: PreviewFormat[] = [];
-  const dropped = new Set<PreviewFormat>();
-  for (const format of requested ?? resizer.config.formats) {
-    if (isConfiguredFormat(resizer, format)) {
-      formats.push(format);
-    } else {
-      dropped.add(format);
-    }
-  }
-  logUnconfiguredFormats(resizer, label, [...dropped], '');
-  return { formats, dropped: [...dropped] };
-}
-
-/**
- * Split what a `beforeEnqueue` tap returned by the same rule as configuredFormats: a tap may add
- * or rewrite a variant to a format with no encoder settings, which a worker could never produce
- * (it would fail, dead-letter, and be queued again by the next read). The unconfigured ones are
- * named in one logged error.
- */
-function splitConfiguredVariants(
-  resizer: Resizer,
-  variants: readonly MissingPreview[],
-  label: string,
-): { configured: MissingPreview[]; unconfigured: MissingPreview[] } {
-  const configured: MissingPreview[] = [];
-  const unconfigured: MissingPreview[] = [];
-  for (const variant of variants) {
-    // `?.`: a tap's malformed entry is dropped like an unknown format, not thrown on.
-    if (isConfiguredFormat(resizer, variant?.format)) {
-      configured.push(variant);
-    } else {
-      unconfigured.push(variant);
-    }
-  }
-  logUnconfiguredFormats(
-    resizer,
-    label,
-    [...new Set(unconfigured.map((variant) => variant?.format))],
-    ' from a beforeEnqueue tap',
-  );
-  return { configured, unconfigured };
-}
-
-/** True when `format` is an own key of `encode.formats` (format ids are open strings). */
-function isConfiguredFormat(
-  resizer: Resizer,
-  format: unknown,
-): format is PreviewFormat {
-  return (
-    typeof format === 'string' &&
-    Object.hasOwn(resizer.config.encode.formats, format)
-  );
-}
-
 function logUnconfiguredFormats(
   resizer: Resizer,
   label: string,
@@ -598,6 +523,24 @@ function logUnconfiguredFormats(
       `${label}: formats ${JSON.stringify(formats)}${origin} have no encode.formats entry — skipped (use a configured Sharp format id, e.g. 'jpeg', not 'jpg')`,
     );
   }
+}
+
+/**
+ * Name the formats of the variants a `beforeEnqueue` tap returned without encoder settings (a
+ * worker could never produce them: they would fail, dead-letter, and be queued again by the
+ * next read). A malformed entry counts too.
+ */
+function logUnconfiguredTapFormats(
+  resizer: Resizer,
+  label: string,
+  unconfigured: readonly MissingPreview[],
+): void {
+  logUnconfiguredFormats(
+    resizer,
+    label,
+    [...new Set(unconfigured.map((variant) => variant?.format))],
+    ' from a beforeEnqueue tap',
+  );
 }
 
 /** Log a never-throw catch; a throwing host logger falls back to the console. */
