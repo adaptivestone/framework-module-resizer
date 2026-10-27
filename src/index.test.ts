@@ -27,6 +27,8 @@ const EXPECTED_VALUE_EXPORTS = [
   'getResizer',
   'getSizeKey',
   'isCatalogCovered',
+  'LockStore',
+  'MediaStore',
   'ResizeStorage',
   'parseSizeKey',
   'resetResizerForTests',
@@ -68,6 +70,8 @@ describe('public API surface (src/index.ts)', () => {
       'Resizer',
       'ResizeStorage',
       'ResizeDatabase',
+      'MediaStore',
+      'LockStore',
       'TaskQueue',
     ]) {
       const v = asRecord[name];

@@ -10,6 +10,8 @@
 
 // --- driver contracts: abstract classes a custom driver extends (or any object of the same shape) ---
 export { ResizeDatabase } from './contracts/database.ts';
+export { LockStore } from './contracts/locks.ts';
+export { MediaStore } from './contracts/media.ts';
 export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
 export {
   type ClaimedTask,
