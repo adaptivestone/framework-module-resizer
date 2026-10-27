@@ -11,9 +11,10 @@ import type {
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-import { canonicalizeVariants, dispatchLockKey } from './enqueue.ts';
+import { canonicalizeVariants } from './enqueue.ts';
 import { ResizeSetupError } from './errors.ts';
 import { getPreviewIdentity } from './images.ts';
+import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
 import { consumeQueue, timingOf } from './queue.ts';
 import {
   getResizer,
@@ -48,8 +49,9 @@ export async function processTask(
  * After a dead-letter, hold the dispatch lock of every variant in the task for the delivering
  * queue's lockTtlMs.failed, so reads (resolve, prewarm) do not queue the same failing work again
  * until it ends. Release first, then acquire: the read path's shorter dispatch lock may still be
- * held. Best effort and never rejects: a failing lock call is logged, and a read that takes the
- * lock between the two calls simply queues the work once more.
+ * held. Both calls work across processes because every dispatch lock has the one owner
+ * DISPATCH_LOCK_OWNER. Best effort and never rejects: a failing lock call is logged, and a read
+ * that takes the lock between the two calls simply queues the work once more.
  */
 async function holdFailedCooldown(
   resizer: Resizer,
@@ -58,6 +60,11 @@ async function holdFailedCooldown(
   logger: ResizeLogger,
 ): Promise<void> {
   try {
+    const { locks } = resizer;
+    if (!locks) {
+      // An eager-only Resizer: its tasks fail with RESIZE_LOCKS_REQUIRED; there is nothing to hold.
+      return;
+    }
     const ttlMs = timingOf(tasks).lockTtlMs.failed;
     const scope = { resizer: resizer.name, pipeline: task.pipeline };
     const keys = new Set(
@@ -76,8 +83,8 @@ async function holdFailedCooldown(
     await Promise.all(
       [...keys].map(async (key) => {
         try {
-          await resizer.db.releaseLock(key);
-          await resizer.db.acquireLock(key, ttlMs);
+          await locks.release(key, DISPATCH_LOCK_OWNER);
+          await locks.acquire(key, DISPATCH_LOCK_OWNER, ttlMs);
         } catch (err) {
           logger.error(
             `resize worker: holding the dead-letter cooldown lock ${key} failed`,
@@ -143,7 +150,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       { code: 'RESIZE_QUEUE_NOT_SERVED' },
     );
   }
-  // Fail before claiming anything: a bad config, queue or database (e.g. a wrong mediaModelName)
+  // Fail before claiming anything: a bad config, queue or store (e.g. a wrong mediaModelName)
   // would otherwise surface only as per-task errors.
   for (const resizer of resizers) {
     await resizer.verify();

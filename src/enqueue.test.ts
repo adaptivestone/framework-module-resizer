@@ -4,14 +4,15 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import type { LockStore } from './contracts/locks.ts';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { buildRequestKey, canonicalizeVariants, enqueue } from './enqueue.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { type ResizeStorage, resetResizerForTests } from './resizer.ts';
 import {
-  type FakeLocks,
-  fakeDb,
+  fakeMedia,
   MemoryTaskQueue,
+  memoryLocks,
 } from './testHelpers/fakes.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
 import type { MissingPreview, StorageRef } from './types.d.ts';
@@ -52,26 +53,30 @@ function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
   return { tasks, calls };
 }
 
+// A recording lock store: every acquire and release with its key and owner.
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
-  const acquired: { key: string; ttl: number }[] = [];
-  const released: string[] = [];
-  const locks: FakeLocks = {
-    acquire: async (key, ttl) => {
-      acquired.push({ key, ttl });
+  const acquired: { key: string; owner: string; ttl: number }[] = [];
+  const released: { key: string; owner: string }[] = [];
+  const locks: LockStore = {
+    acquire: async (key, owner, ttl) => {
+      acquired.push({ key, owner, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
-    release: async (key) => {
-      released.push(key);
+    extend: async () => true,
+    release: async (key, owner) => {
+      released.push({ key, owner });
+      return true;
     },
   };
   return { locks, acquired, released };
 }
 
-function makeResizer(opts: { tasks?: TaskQueue; locks?: FakeLocks }) {
+function makeResizer(opts: { tasks?: TaskQueue; locks?: LockStore }) {
   const { tasks, locks } = opts;
   return new FrameworkResizer({
     storage,
-    db: fakeDb({ locks }),
+    media: fakeMedia(),
+    locks: locks ?? memoryLocks(),
     tasks,
   });
 }
@@ -242,7 +247,7 @@ describe('enqueue', () => {
   test('a rejecting dispatch-lock acquire skips that variant; earlier survivors still enqueue', async () => {
     const { errors } = installFakeApp();
     const { tasks, calls } = makeTasks();
-    const locks: FakeLocks = {
+    const locks: LockStore = {
       // jpeg acquires fine; the webp acquire REJECTS — that variant is not a survivor (log +
       // continue), and the earlier jpeg survivor still reaches the task queue (1.2b).
       acquire: async (key) => {
@@ -251,7 +256,8 @@ describe('enqueue', () => {
         }
         return true;
       },
-      release: async () => {},
+      extend: async () => true,
+      release: async () => true,
     };
     const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(
@@ -275,7 +281,7 @@ describe('enqueue', () => {
     const { tasks, calls } = makeTasks();
     let inFlight = 0;
     let maxInFlight = 0;
-    const locks: FakeLocks = {
+    const locks: LockStore = {
       acquire: async (key) => {
         inFlight += 1;
         maxInFlight = Math.max(maxInFlight, inFlight);
@@ -286,7 +292,8 @@ describe('enqueue', () => {
         }
         return !key.endsWith(':webp:none'); // webp is held by a concurrent read
       },
-      release: async () => {},
+      extend: async () => true,
+      release: async () => true,
     };
     const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(
@@ -339,11 +346,26 @@ describe('enqueue', () => {
     const { locks, released } = makeLocks(true);
     const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
-    ]);
+    assert.deepEqual(
+      released.map(({ key }) => key),
+      ['resize_dispatch:m1:default:default:300x300:jpeg:none'],
+    );
     assert.ok(errors.length >= 1);
     assert.equal(enqueued, 0); // a throw released the locks → nothing durably queued
+  });
+
+  test('dispatch locks are taken and released with the fixed owner resize:dispatch', async () => {
+    installFakeApp();
+    const { tasks } = makeTasks(() => {
+      throw new Error('down');
+    });
+    const { locks, acquired, released } = makeLocks(true);
+    const r = makeResizer({ tasks, locks });
+    await enqueue(r, 'm1', 'default', [variant()], 'default');
+    assert.equal(acquired[0].owner, 'resize:dispatch');
+    assert.deepEqual(released, [
+      { key: acquired[0].key, owner: 'resize:dispatch' },
+    ]);
   });
 
   test('releases survivor locks when taskId is null (soft failure)', async () => {
@@ -352,9 +374,10 @@ describe('enqueue', () => {
     const { locks, released } = makeLocks(true);
     const r = makeResizer({ tasks, locks });
     const enqueued = await enqueue(r, 'm1', 'default', [variant()], 'default');
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
-    ]);
+    assert.deepEqual(
+      released.map(({ key }) => key),
+      ['resize_dispatch:m1:default:default:300x300:jpeg:none'],
+    );
     assert.ok(errors.length >= 1);
     assert.equal(enqueued, 0); // null taskId → soft failure → not counted
   });
@@ -380,7 +403,8 @@ describe('enqueue', () => {
     const resizer = new FrameworkResizer({
       storage,
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       name: 'listings',
     });
     await enqueue(

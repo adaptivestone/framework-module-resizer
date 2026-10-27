@@ -4,6 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import type { LockStore } from './contracts/locks.ts';
 import type { NewTask } from './contracts/taskQueue.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import {
@@ -11,11 +12,7 @@ import {
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
-import {
-  type FakeLocks,
-  fakeDb,
-  MemoryTaskQueue,
-} from './testHelpers/fakes.ts';
+import { fakeMedia, MemoryTaskQueue } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -72,13 +69,15 @@ function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const locks: FakeLocks = {
-    acquire: async (key, ttl) => {
+  const locks: LockStore = {
+    acquire: async (key, _owner, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
+    extend: async () => true,
     release: async (key) => {
       released.push(key);
+      return true;
     },
   };
   return { locks, acquired, released };
@@ -169,7 +168,8 @@ describe('resolve — partitioning', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         formatPublicUrls: (decision) =>
           decision.ready.map((entry) => entry.url),
@@ -225,7 +225,8 @@ describe('resolve — partitioning', () => {
         },
       }),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: {
@@ -429,7 +430,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       pipelines: { photo: {} },
     });
     const media: MediaLike = {
@@ -467,7 +469,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       name: 'listings',
       queue: 'interactive',
     });
@@ -502,7 +505,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -531,7 +535,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     await r.resolve({
       media: {
@@ -557,7 +562,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -577,7 +583,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -596,7 +603,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -616,7 +624,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
@@ -638,7 +647,8 @@ describe('prewarm — missing original key', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -698,7 +708,8 @@ describe('resolve — SVG raster previews', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -817,7 +828,8 @@ describe('resolve — the original is never served', () => {
         canServeOriginalPublicly: () => true,
       } as Partial<ResizeStorage>),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: smallOriginal(),
@@ -952,7 +964,8 @@ describe('resolve — never throws', () => {
     const r = new FrameworkResizer({
       storage: throwingStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         formatPublicUrls: (decision) =>
           decision.ready.map((entry) => entry.url),
@@ -1039,7 +1052,8 @@ describe('resolve — unknown pipeline', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         beforeEnqueue: (missing) => {
           beforeEnqueueCalls += 1;
@@ -1112,7 +1126,8 @@ describe('resolve — per-call formats', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -1146,7 +1161,8 @@ describe('resolve — per-call formats', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         beforeEnqueue: (missing) => [
           ...missing,
@@ -1227,17 +1243,17 @@ describe('several Resizers in one process', () => {
       },
     });
     // Core Resizers with explicit parts: no framework app is installed in this test.
-    const db = fakeDb();
+    const mediaStore = fakeMedia();
     const a = new Resizer({
       storage: makeStorage(),
-      db,
+      media: mediaStore,
       config: makeImageConfig({ formats: ['webp'] }),
       logger: logger(errorsA),
     });
     const b = new Resizer({
       name: 'listings',
       storage: makeStorage(),
-      db,
+      media: mediaStore,
       config: makeImageConfig({ formats: ['jpeg'] }),
       logger: logger(errorsB),
     });

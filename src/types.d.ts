@@ -2,7 +2,7 @@
 // This file is copied verbatim into dist by postBuild.ts (tsc does not emit it),
 // so it MUST stay dependency-free: no imports of source (.ts) modules and no
 // runtime imports. Source-coupled types (Pipeline, BeforeStep, VariantStep,
-// ResizeStorage, ResizeDatabase, TaskQueue, HookName, HookFn)
+// ResizeStorage, MediaStore, LockStore, TaskQueue, HookName, HookFn)
 // live next to their code.
 
 // Recursive partial for environment-specific config overrides. Arrays stay whole because
@@ -67,7 +67,7 @@ export interface PreviewScope {
 
 export interface Preview {
   storageRef: StorageRef;
-  // The full preview identity (resizer:pipeline:sizeKey:format:filters). The database stores one
+  // The full preview identity (resizer:pipeline:sizeKey:format:filters). The media store keeps one
   // row per identity; absent on rows written before previews carried it.
   identity?: string;
   resizer?: string; // Resizer that generated it; absent → 'default'
@@ -266,7 +266,7 @@ export type FrameworkStorageConfig =
 // timing (any QueueTimingOptions key; the rest default).
 export interface FrameworkDatabaseQueueConfig
   extends Partial<QueueTimingOptions> {
-  driver?: 'database'; // the database's own queue: the ResizeTask model (default driver)
+  driver?: 'database'; // the app's queue over its ResizeTask model (default driver)
 }
 export interface FrameworkSqsQueueConfig extends Partial<QueueTimingOptions> {
   driver: 'sqs'; // SqsTaskQueue (needs @aws-sdk/client-sqs)

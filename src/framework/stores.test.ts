@@ -11,8 +11,9 @@ import type { Preview } from '../types.d.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
 
-// One stateless media store drives the whole file (option-less constructor; every method reaches
-// the model and the config through getApp() when it runs).
+// The framework stores over a fake app. One stateless media store drives the media tests
+// (option-less constructor; every method reaches the model and the config through getApp() when
+// it runs); the lock store tests build their own stores.
 const mediaStore = new FrameworkMediaStore();
 
 // Install a fake ambient app whose getConfig('resize') carries mediaModelName and whose

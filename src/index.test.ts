@@ -14,7 +14,6 @@ const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 const EXPECTED_VALUE_EXPORTS = [
   'Resizer',
   'ResizeConfigError',
-  'ResizeDatabase',
   'ResizeError',
   'ResizeGenerateError',
   'ResizeMediaError',
@@ -44,9 +43,9 @@ const DRIVER_NAMES = [
   'SqsTaskQueue',
   'S3Storage',
   'LocalFsStorage',
-  'FrameworkDatabase',
-  'MongoDatabase',
-  'mongoDatabase',
+  'FrameworkMediaStore',
+  'MongoMediaStore',
+  'mongoParts',
   'createResizeModels',
   // The framework adapter lives at …/framework.js, never on the framework-free main entry.
   'ResizeTaskModel',
@@ -69,7 +68,6 @@ describe('public API surface (src/index.ts)', () => {
     for (const name of [
       'Resizer',
       'ResizeStorage',
-      'ResizeDatabase',
       'MediaStore',
       'LockStore',
       'TaskQueue',

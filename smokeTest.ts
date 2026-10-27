@@ -55,7 +55,8 @@ const expected = [
   'ResizeOriginalError',
   'getResizer',
   'Resizer',
-  'ResizeDatabase',
+  'LockStore',
+  'MediaStore',
   'ResizeStorage',
   'TaskQueue',
   'resetResizerForTests',
@@ -72,13 +73,15 @@ assert.equal(
 );
 assert.deepEqual([...actual].sort(), [...expected].sort(), 'main entry export surface drift');
 for (const driver of [
-  'MongoDatabase',
+  'MongoMediaStore',
+  'MongoLockStore',
   'MongoTaskQueue',
-  'mongoDatabase',
+  'mongoParts',
   'SqsTaskQueue',
   'S3Storage',
   'LocalFsStorage',
-  'FrameworkDatabase',
+  'FrameworkMediaStore',
+  'FrameworkLockStore',
   'createResizeModels',
   'ResizeTaskModel',
   'ResizeWorker',
@@ -118,12 +121,14 @@ for (const [sub, sdk] of optional) {
 
 // (c) always-safe subpaths import successfully.
 const safe = [
-  ['/drivers/mongo.js', 'mongoDatabase'],
-  ['/drivers/mongo.js', 'MongoDatabase'],
+  ['/drivers/mongo.js', 'mongoParts'],
+  ['/drivers/mongo.js', 'MongoMediaStore'],
+  ['/drivers/mongo.js', 'MongoLockStore'],
   ['/drivers/mongo.js', 'MongoTaskQueue'],
   ['/drivers/mongo.js', 'createResizeModels'],
   ['/drivers/fs.js', 'LocalFsStorage'],
-  ['/framework.js', 'FrameworkDatabase'],
+  ['/framework.js', 'FrameworkMediaStore'],
+  ['/framework.js', 'FrameworkLockStore'],
   ['/framework.js', 'ResizeTaskModel'],
   ['/framework/ResizeTaskModel.js', 'default'],
   ['/framework.js', 'ResizeWorker'],
@@ -138,7 +143,8 @@ for (const [sub, exp] of safe) {
 const taskModel = await import(PKG + '/framework/ResizeTaskModel.js');
 const framework = await import(PKG + '/framework.js');
 const expectedFramework = [
-  'FrameworkDatabase',
+  'FrameworkLockStore',
+  'FrameworkMediaStore',
   'FrameworkResizer',
   'ResizeTaskModel',
   'ResizeWorker',
@@ -150,15 +156,19 @@ assert.deepEqual(
   'framework entry export surface drift',
 );
 assert.strictEqual(taskModel.default, framework.ResizeTaskModel);
-const { MongoTaskQueue, MongoDatabase } = await import(PKG + '/drivers/mongo.js');
-for (const Driver of [MongoTaskQueue, MongoDatabase]) {
+const { MongoTaskQueue, MongoMediaStore, MongoLockStore } = await import(
+  PKG + '/drivers/mongo.js'
+);
+for (const Driver of [MongoTaskQueue, MongoMediaStore, MongoLockStore]) {
   assert.equal(
     'prepare' in Driver.prototype,
     false,
     Driver.name + '.prototype.prepare must not exist at runtime',
   );
 }
-console.log('  ok  MongoTaskQueue + MongoDatabase have no runtime preparation methods');
+console.log(
+  '  ok  MongoTaskQueue, MongoMediaStore and MongoLockStore have no runtime preparation methods',
+);
 `;
 
 // Runs in a consumer installed WITHOUT peer dependencies (no @adaptivestone/framework, no
@@ -174,31 +184,43 @@ const resizer = new mod.Resizer({
   logger: { info() {}, warn() {}, error() {} },
   storage: { download: async () => Buffer.alloc(0), upload: async () => ({}), publicUrl: () => '' },
   // A plain object of the contract's shape works as well as a subclass.
-  db: {
+  media: {
     loadMedia: async () => null,
-    appendPreviews: async () => {},
-    acquireLock: async () => true,
-    releaseLock: async () => {},
+    appendPreviews: async (_id, previews) => previews,
   },
 });
 assert.equal(resizer.name, 'default');
+await resizer.ready();
 const mongo = await import(PKG + '/drivers/mongo.js');
 const fs = await import(PKG + '/drivers/fs.js');
-class MemoryDatabase extends mod.ResizeDatabase {
+class MemoryMedia extends mod.MediaStore {
   async loadMedia() { return null; }
-  async appendPreviews() {}
-  async acquireLock() { return true; }
-  async releaseLock() {}
+  async appendPreviews(_id, previews) { return previews; }
 }
-new mod.Resizer({
+class MemoryLocks extends mod.LockStore {
+  async acquire() { return true; }
+  async extend() { return true; }
+  async release() { return true; }
+}
+const custom = new mod.Resizer({
   name: 'drivers',
   config: defaultResizeConfig,
   logger: { info() {}, warn() {}, error() {} },
   storage: new fs.LocalFsStorage({ rootDir: './var/media', publicBaseUrl: '/media' }),
-  db: new MemoryDatabase(),
+  media: new MemoryMedia(),
+  locks: new MemoryLocks(),
 });
-new mongo.MongoDatabase({ mediaModel: { findById: async () => null, findByIdAndUpdate: async () => null } });
-console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; a custom driver extends ResizeDatabase');
+await custom.ready();
+new mongo.MongoMediaStore({ model: { findById: async () => null, findOneAndUpdate: async () => null } });
+new mongo.MongoLockStore({
+  model: {
+    create: async () => ({}),
+    updateOne: async () => ({ matchedCount: 0 }),
+    deleteOne: async () => ({ deletedCount: 0 }),
+  },
+});
+assert.equal(typeof mongo.mongoParts, 'function');
+console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; custom drivers extend MediaStore and LockStore');
 let frameworkErr = null;
 try {
   await import(PKG + '/framework.js');
@@ -224,11 +246,14 @@ console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classe
 // installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
 const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
 import {
-  ResizeDatabase,
+  LockStore,
+  MediaStore,
+  type Preview,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
-  FrameworkDatabase,
+  FrameworkLockStore,
+  FrameworkMediaStore,
   FrameworkResizer,
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
@@ -255,32 +280,65 @@ const productionConfig = {
 // The scaffolded construction site (never called here: it would register a Resizer).
 const construct = () => new FrameworkResizer({ pipelines: { default: {} } });
 void [hostConfig, productionConfig, construct];
-import { MongoTaskQueue } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
+import {
+  MongoLockStore,
+  MongoMediaStore,
+  MongoTaskQueue,
+  mongoParts,
+} from '@adaptivestone/framework-module-resize/drivers/mongo.js';
 
-class MemoryDatabase extends ResizeDatabase {
+class MemoryMedia extends MediaStore {
   async loadMedia(): Promise<null> { return null; }
-  async appendPreviews(): Promise<void> {}
-  async acquireLock(): Promise<boolean> { return true; }
-  async releaseLock(): Promise<void> {}
+  async appendPreviews(_id: string, previews: Preview[]): Promise<Preview[]> { return previews; }
 }
-const db: ResizeDatabase = new MemoryDatabase();
-void [db, FrameworkDatabase, MongoTaskQueue];
+class MemoryLocks extends LockStore {
+  async acquire(): Promise<boolean> { return true; }
+  async extend(): Promise<boolean> { return true; }
+  async release(): Promise<boolean> { return true; }
+}
+const media: MediaStore = new MemoryMedia();
+const locks: LockStore = new MemoryLocks();
+// A plain object of the contract's shape type-checks as the contract.
+const plainMedia: MediaStore = {
+  loadMedia: async () => null,
+  appendPreviews: async (_id, previews) => previews,
+};
+// A core construction site (never called here: it would register a Resizer).
+const core = () =>
+  new Resizer({
+    storage: { download: async () => Buffer.alloc(0), upload: async () => ({}), publicUrl: () => '' },
+    media: plainMedia,
+    locks,
+  });
+void [
+  media,
+  core,
+  FrameworkMediaStore,
+  FrameworkLockStore,
+  MongoMediaStore,
+  MongoLockStore,
+  MongoTaskQueue,
+  mongoParts,
+];
 
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends
   (<T>() => T extends B ? 1 : 2) ? true : false;
 type ResizerHasPrepareQueue = 'prepareQueue' extends keyof Resizer ? true : false;
 type QueueHasPrepare = 'prepare' extends keyof TaskQueue ? true : false;
-type LockHasPrepare = 'prepare' extends keyof ResizeDatabase ? true : false;
+type LockHasPrepare = 'prepare' extends keyof LockStore ? true : false;
+type MediaHasPrepare = 'prepare' extends keyof MediaStore ? true : false;
 
 const resizerHasPrepareQueue: Equal<ResizerHasPrepareQueue, false> = true;
 const queueHasPrepare: Equal<QueueHasPrepare, false> = true;
 const lockHasPrepare: Equal<LockHasPrepare, false> = true;
+const mediaHasPrepare: Equal<MediaHasPrepare, false> = true;
 
 void [
   resizerHasPrepareQueue,
   queueHasPrepare,
   lockHasPrepare,
+  mediaHasPrepare,
 ];
 `;
 

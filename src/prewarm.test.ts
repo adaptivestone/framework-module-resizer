@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
+import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
-import type { FakeLocks } from './testHelpers/fakes.ts';
-import { fakeDb, MemoryTaskQueue, memoryLocks } from './testHelpers/fakes.ts';
+import {
+  fakeMedia,
+  MemoryTaskQueue,
+  memoryLocks,
+} from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
@@ -71,25 +75,26 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const base = memoryLocks();
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const dbLocks: FakeLocks = {
-    acquire: async (key, ttl) => {
+  const lockStore: LockStore = {
+    acquire: async (key, owner, ttl) => {
       acquired.push({ key, ttl });
       const allowed = typeof acquire === 'function' ? acquire(key) : acquire;
-      return allowed ? base.acquire(key) : false;
+      return allowed ? base.acquire(key, owner, ttl) : false;
     },
-    release: async (key) => {
+    extend: (key, owner, ttl) => base.extend(key, owner, ttl),
+    release: async (key, owner) => {
       released.push(key);
-      await base.release(key);
+      return base.release(key, owner);
     },
   };
-  return { dbLocks, acquired, released };
+  return { lockStore, acquired, released };
 }
 
 function makeResizer(
   options: {
     storage?: ResizeStorage;
     tasks?: TaskQueue;
-    dbLocks?: FakeLocks;
+    lockStore?: LockStore;
     name?: string;
     queue?: string;
     hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
@@ -98,7 +103,8 @@ function makeResizer(
 ) {
   return new Resizer({
     storage: options.storage ?? makeStorage(),
-    db: fakeDb({ locks: options.dbLocks }),
+    media: fakeMedia(),
+    locks: options.lockStore ?? memoryLocks(),
     tasks: options.tasks,
     config: makeImageConfig(),
     logger: currentLogger,
@@ -122,11 +128,11 @@ describe('prewarm — happy path', () => {
   test('expands N sizes × M formats, adds one task with the surviving variants', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       pipelines: { photo: {} },
     });
     const { accepted } = await r.prewarm({
@@ -152,11 +158,11 @@ describe('prewarm — happy path', () => {
   test('carries requestedWidth/Height/filters/fit onto the task variants', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -183,11 +189,11 @@ describe('prewarm — queue', () => {
   test('without queue sends resizer.queue; with queue sends that queue', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       name: 'listings',
       queue: 'interactive',
     });
@@ -215,11 +221,11 @@ describe('prewarm — queue', () => {
   test('a Resizer without a queue option sends "default"', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -235,11 +241,11 @@ describe('prewarm — skip existing & dedup', () => {
   test('identities already in media.previews are not added to the task queue', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -268,11 +274,11 @@ describe('prewarm — skip existing & dedup', () => {
   test('duplicate sizes within the request are deduped to one identity', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -289,11 +295,11 @@ describe('prewarm — skip existing & dedup', () => {
   test('a getSizeKey-throwing size is skipped; the others are added', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -309,11 +315,11 @@ describe('prewarm — SVG original uses the normal queue', () => {
   test('private SVG adds publication work to the task queue', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks, acquired } = makeLocks(true);
+    const { lockStore, acquired } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: {
@@ -334,11 +340,11 @@ describe('prewarm — SVG original uses the normal queue', () => {
   test('SVG detected via original.format === "svg" is added to the task queue too', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: {
@@ -357,11 +363,11 @@ describe('prewarm — size and task hooks', () => {
   test('resolveSizes tap expands the set fed to the expansion', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       hooks: {
         resolveSizes: () => [
           { width: 100, height: 100 },
@@ -384,11 +390,11 @@ describe('prewarm — size and task hooks', () => {
   test('beforeEnqueue tap filters the remainder (assign-back semantics)', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       hooks: {
         // drop everything but the jpeg 300x300 variant
         beforeEnqueue: (missing: MissingPreview[]) =>
@@ -413,11 +419,11 @@ describe('prewarm — size and task hooks', () => {
   test('a beforeEnqueue tap that empties the set → nothing accepted, no task queue call', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       hooks: { beforeEnqueue: () => [] },
     });
     const { accepted } = await r.prewarm({
@@ -454,11 +460,11 @@ describe('prewarm — dispatch-lock winners only', () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
     // Only the jpeg dispatch lock is won; the webp one is already in flight elsewhere.
-    const { dbLocks } = makeLocks((key) => key.endsWith(':jpeg:none'));
+    const { lockStore } = makeLocks((key) => key.endsWith(':jpeg:none'));
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -475,11 +481,11 @@ describe('prewarm — dispatch-lock winners only', () => {
   test('no lock survives → nothing accepted and the task queue is not called', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(false);
+    const { lockStore } = makeLocks(false);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -497,11 +503,11 @@ describe('prewarm — queue and lock failures never throw', () => {
     const { tasks } = makeTaskQueue(() => {
       throw new Error('task queue down');
     });
-    const { dbLocks, released } = makeLocks(true);
+    const { lockStore, released } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -514,19 +520,20 @@ describe('prewarm — queue and lock failures never throw', () => {
     ]);
   });
 
-  test('an internal error (db.acquireLock throws) is caught → nothing accepted, logged', async () => {
+  test('an internal error (locks.acquire throws) is caught → nothing accepted, logged', async () => {
     const { errors } = installFakeApp();
     const { tasks } = makeTaskQueue();
-    const dbLocks: FakeLocks = {
+    const lockStore: LockStore = {
       acquire: async () => {
         throw new Error('lock backend down');
       },
-      release: async () => {},
+      extend: async () => true,
+      release: async () => true,
     };
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -540,11 +547,11 @@ describe('prewarm — queue and lock failures never throw', () => {
   test('a throwing resolveSizes tap does not reject; prewarm proceeds on the prior value', async () => {
     const { errors } = installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       hooks: {
         resolveSizes: () => {
           throw new Error('boom');
@@ -564,11 +571,11 @@ describe('prewarm — queue and lock failures never throw', () => {
   test('media with no id/_id → incomplete with a non-retryable INTERNAL_ERROR, never a throw', async () => {
     const { errors } = installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const result = await r.prewarm({
       media: { original: { storageRef: { key: 'orig.jpg' } } },
@@ -588,11 +595,11 @@ describe('prewarm — a small original', () => {
   test('a box larger than the original is queued like any other size', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -622,11 +629,11 @@ describe('prewarm — pipelines are part of identity', () => {
   test('a default pipeline preview does not satisfy a watermark pipeline prewarm', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
-      dbLocks,
+      lockStore,
       pipelines: { watermark: {} },
     });
     const media = {
@@ -665,8 +672,8 @@ describe('prewarm — unknown pipeline', () => {
   test('every requested variant is unconfirmed with one non-retryable RESIZE_PIPELINE_UNKNOWN issue', async () => {
     const { errors } = installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks, acquired } = makeLocks(true);
-    const r = makeResizer({ tasks, dbLocks });
+    const { lockStore, acquired } = makeLocks(true);
+    const r = makeResizer({ tasks, lockStore });
     const result = await r.prewarm({
       media: {
         id: 'm1',
@@ -711,8 +718,8 @@ describe('prewarm — per-call formats', () => {
   test('formats without an encode.formats entry are unconfirmed with a non-retryable issue; the rest queue', async () => {
     const { errors } = installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
-    const r = makeResizer({ tasks, dbLocks });
+    const { lockStore } = makeLocks(true);
+    const r = makeResizer({ tasks, lockStore });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -745,8 +752,8 @@ describe('prewarm — per-call formats', () => {
   test('only unconfigured formats: nothing queued, incomplete rather than an empty request', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
-    const r = makeResizer({ tasks, dbLocks });
+    const { lockStore } = makeLocks(true);
+    const r = makeResizer({ tasks, lockStore });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -771,10 +778,10 @@ describe('prewarm — formats from a beforeEnqueue tap', () => {
   test('an unconfigured format a tap adds is unconfirmed with a non-retryable issue; the rest queue', async () => {
     const { errors } = installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks, acquired } = makeLocks(true);
+    const { lockStore, acquired } = makeLocks(true);
     const r = makeResizer({
       tasks,
-      dbLocks,
+      lockStore,
       hooks: { beforeEnqueue: (missing) => [...missing, jpg300] },
     });
     const result = await r.prewarm({
@@ -807,10 +814,10 @@ describe('prewarm — formats from a beforeEnqueue tap', () => {
   test('a tap that rewrites every variant to an unconfigured format queues nothing; a per-call duplicate is reported once', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    const { dbLocks } = makeLocks(true);
+    const { lockStore } = makeLocks(true);
     const r = makeResizer({
       tasks,
-      dbLocks,
+      lockStore,
       hooks: {
         beforeEnqueue: (missing) =>
           missing.map((m) => ({ ...m, format: 'jpg' })),

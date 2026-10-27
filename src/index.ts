@@ -4,12 +4,11 @@
 // host's own import line:
 //   …/drivers/fs.js     LocalFsStorage
 //   …/drivers/s3.js     S3Storage                      (optional peers: AWS S3 SDK)
-//   …/drivers/mongo.js  mongoDatabase, MongoDatabase, MongoTaskQueue, createResizeModels
+//   …/drivers/mongo.js  mongoParts, MongoMediaStore, MongoLockStore, MongoTaskQueue, …
 //   …/drivers/sqs.js    SqsTaskQueue                   (optional peer: AWS SQS SDK)
-//   …/framework.js      the framework adapter: FrameworkResizer, FrameworkDatabase, …
+//   …/framework.js      the framework adapter: FrameworkResizer, FrameworkMediaStore, …
 
 // --- driver contracts: abstract classes a custom driver extends (or any object of the same shape) ---
-export { ResizeDatabase } from './contracts/database.ts';
 export { LockStore } from './contracts/locks.ts';
 export { MediaStore } from './contracts/media.ts';
 export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';

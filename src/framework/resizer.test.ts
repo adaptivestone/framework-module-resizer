@@ -12,10 +12,16 @@ import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
 import { timingOf } from '../queue.ts';
 import { resetResizerForTests } from '../resizer.ts';
-import { fakeDb, MemoryTaskQueue } from '../testHelpers/fakes.ts';
+import {
+  fakeMedia,
+  MemoryTaskQueue,
+  memoryLocks,
+} from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { runWorker } from '../worker.ts';
-import { FrameworkDatabase } from './database.ts';
+import { FrameworkLockStore } from './locks.ts';
+import { FrameworkMediaStore } from './media.ts';
+import { appTaskQueue } from './queue.ts';
 import { FrameworkResizer } from './resizer.ts';
 import { runResizeWorker } from './worker.ts';
 
@@ -56,7 +62,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-test('fills config, logger, events and the database from the app', async () => {
+test('fills config, logger, events and the media and lock stores from the app', async () => {
   const { asked, logger, events } = installApp();
   const seen: unknown[] = [];
   const emitted: unknown[][] = [];
@@ -70,10 +76,11 @@ test('fills config, logger, events and the database from the app', async () => {
   r.logger.info('hello');
   assert.deepEqual(seen, ['hello']); // the app logger, resolved at call time
   assert.deepEqual(r.config.formats, ['jpeg', 'webp', 'avif']);
-  assert.ok(r.db instanceof FrameworkDatabase);
+  assert.ok(r.media instanceof FrameworkMediaStore);
+  assert.ok(r.locks instanceof FrameworkLockStore);
   await r.ready();
   assert.equal(r.tasks, undefined); // no `queue` section: eager only
-  await r.db.loadMedia('m1');
+  await r.media.loadMedia('m1');
   assert.deepEqual(asked, ['File']);
   await r.runObservers('onPreviewGenerated', 'preview', {});
   assert.deepEqual(emitted, [['resize:onPreviewGenerated', 'preview', {}]]);
@@ -173,7 +180,7 @@ test('a missing storage section is a config error at verify(), and resolve() sti
   );
 });
 
-test("queue { driver: 'database' } uses the database's own queue and the framework Lock model", async () => {
+test("queue { driver: 'database' } uses the app's ResizeTask queue and the framework Lock model", async () => {
   const calls: unknown[][] = [];
   setAppInstance({
     getConfig: () =>
@@ -184,30 +191,33 @@ test("queue { driver: 'database' } uses the database's own queue and the framewo
     getModel: (name: string) => {
       assert.equal(name, 'Lock');
       return {
-        acquireLock: async (key: string, seconds: number) => {
-          calls.push(['acquire', key, seconds]);
-          return true;
-        },
-        releaseLock: async (key: string) => {
-          calls.push(['release', key]);
+        collection: {
+          insertOne: async (doc: { _id: string; owner: string }) => {
+            calls.push(['insert', doc._id, doc.owner]);
+          },
+          updateOne: async () => ({ matchedCount: 0 }),
+          deleteOne: async (filter: object) => {
+            calls.push(['delete', filter]);
+            return { deletedCount: 1 };
+          },
         },
       };
     },
   } as never);
   const r = new FrameworkResizer();
   await r.ready();
-  assert.ok(r.db instanceof FrameworkDatabase);
+  assert.ok(r.locks instanceof FrameworkLockStore);
   assert.ok(r.tasks instanceof MongoTaskQueue);
-  assert.equal(r.tasks, r.db.tasks);
-  assert.equal(await r.db.acquireLock('variant', 1001), true);
-  await r.db.releaseLock('variant');
+  assert.equal(r.tasks, appTaskQueue());
+  assert.equal(await r.locks.acquire('variant', 'A', 1001), true);
+  assert.equal(await r.locks.release('variant', 'A'), true);
   assert.deepEqual(calls, [
-    ['acquire', 'variant', 2],
-    ['release', 'variant'],
+    ['insert', 'variant', 'A'],
+    ['delete', { _id: 'variant', owner: 'A' }],
   ]);
 });
 
-test("a queue section without a driver is the database's queue; its timing fills the defaults", async () => {
+test("a queue section without a driver is the app's ResizeTask queue; its timing fills the defaults", async () => {
   installApp({
     resizeListings: makeResizeConfig({
       storage: localStorage,
@@ -244,7 +254,7 @@ test("queue { driver: 'sqs' } builds an SqsTaskQueue with the config's URLs and 
   assert.equal(r.tasks.servesQueue('bulk'), true);
   assert.equal(r.tasks.servesQueue('other'), false);
   assert.equal(timingOf(r.tasks).maxAttempts, 3);
-  assert.notEqual(r.tasks, r.db.tasks); // media and locks stay in the database
+  assert.ok(r.locks instanceof FrameworkLockStore); // locks stay in the framework Lock model
 });
 
 test('invalid storage or queue sections are config errors', async () => {
@@ -282,8 +292,8 @@ test('configName selects the config file, including its media model', async () =
   const media = new FrameworkResizer({ storage });
   assert.deepEqual(listings.config.formats, ['webp']);
   assert.deepEqual(media.config.formats, ['jpeg', 'webp', 'avif']);
-  await listings.db.loadMedia('m1');
-  await media.db.loadMedia('m2');
+  await listings.media.loadMedia('m1');
+  await media.media.loadMedia('m2');
   assert.deepEqual(asked, ['Photo', 'File']);
 });
 
@@ -296,7 +306,8 @@ test('explicit options win over the config file', async () => {
   });
   const logger = { info() {}, warn() {}, error() {} };
   const events = { emit() {} };
-  const db = fakeDb();
+  const media = fakeMedia();
+  const locks = memoryLocks();
   const tasks = new MemoryTaskQueue();
   const config = makeResizeConfig({ formats: ['avif'] });
   const r = new FrameworkResizer({
@@ -305,12 +316,14 @@ test('explicit options win over the config file', async () => {
     config,
     logger,
     events,
-    db,
+    media,
+    locks,
   });
   assert.deepEqual(r.config.formats, ['avif']);
   assert.equal(r.config.encode, config.encode);
   assert.equal(r.logger, logger);
-  assert.equal(r.db, db);
+  assert.equal(r.media, media);
+  assert.equal(r.locks, locks);
   assert.equal(r.storage, storage);
   assert.equal(r.tasks, tasks);
 });
@@ -338,28 +351,6 @@ test('an explicit config also feeds the database queue timing', async () => {
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
   assert.equal(timingOf(r.tasks).leaseMs, 4000);
-});
-
-test("the 'database' queue needs a database with its own queue", async () => {
-  installApp({
-    resize: makeResizeConfig({
-      storage: localStorage,
-      queue: { driver: 'database' },
-    }),
-  });
-  const r = new FrameworkResizer({ db: fakeDb() });
-  await assert.rejects(
-    () => r.ready(),
-    (err: unknown) =>
-      err instanceof ResizeConfigError &&
-      err.code === 'RESIZE_CONFIG_INVALID' &&
-      /has no task queue/.test(err.message),
-  );
-  const tasks = new MemoryTaskQueue();
-  resetResizerForTests();
-  const own = new FrameworkResizer({ db: fakeDb({ tasks }) });
-  await own.ready();
-  assert.equal(own.tasks, tasks);
 });
 
 test('a core MongoTaskQueue needs one model, and the core validates its timing', () => {
@@ -483,7 +474,7 @@ const conflictBetween =
     keys.every((key) => err.message.includes(key)) &&
     same.every((key) => !err.message.includes(key));
 
-test('Resizers and databases with default wiring share one database task queue', async () => {
+test('Resizers with default wiring share one database task queue', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
@@ -500,13 +491,10 @@ test('Resizers and databases with default wiring share one database task queue',
     name: 'listings',
     configName: 'resizeListings',
   });
-  const direct = new FrameworkDatabase({ configName: 'resizeListings' });
   await Promise.all([media.ready(), listings.ready()]);
   assert.ok(media.tasks instanceof MongoTaskQueue);
-  assert.notEqual(media.db, listings.db); // each Resizer keeps its own media model and config
+  assert.notEqual(media.media, listings.media); // each Resizer keeps its own media model and config
   assert.equal(listings.tasks, media.tasks);
-  assert.equal(media.db.tasks, media.tasks);
-  assert.equal(direct.tasks, media.tasks);
 });
 
 test('config files sharing a task queue with different timing conflict on first use, in verify() and at worker start', async () => {
@@ -559,26 +547,6 @@ test('config files sharing a task queue with different timing conflict on first 
     () => runWorker({ signal: AbortSignal.abort() }),
     conflict,
   );
-});
-
-test('a host-built FrameworkDatabase is checked against the Resizers that share its queue', async () => {
-  installApp({
-    resize: makeResizeConfig({
-      storage: localStorage,
-      queue: { maxAttempts: 3 },
-    }),
-    resizeHost: makeResizeConfig({ queue: { maxAttempts: 4 } }),
-  });
-  const media = new FrameworkResizer();
-  const db = new FrameworkDatabase({ configName: 'resizeHost' });
-  const conflict = conflictBetween(
-    ['src/config/resize.ts', 'src/config/resizeHost.ts'],
-    ['maxAttempts'],
-  );
-  await assert.rejects(() => media.verify(), conflict);
-  assert.throws(() => db.verify(), conflict);
-  assert.ok(db.tasks);
-  assert.throws(() => timingOf(db.tasks as MongoTaskQueue), conflict);
 });
 
 test('two config files with the same timing share the queue and its timing', async () => {

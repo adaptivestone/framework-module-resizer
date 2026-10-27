@@ -4,18 +4,25 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import type { MediaStore } from './contracts/media.ts';
 import { ResizeConfigError, ResizeSetupError } from './errors.ts';
-import { FrameworkDatabase } from './framework/database.ts';
+import { FrameworkLockStore } from './framework/locks.ts';
+import { FrameworkMediaStore } from './framework/media.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import {
   getResizer,
   listResizers,
   type Pipeline,
   Resizer,
+  type ResizerOptions,
   type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
-import { fakeDb, MemoryTaskQueue } from './testHelpers/fakes.ts';
+import {
+  fakeMedia,
+  MemoryTaskQueue,
+  memoryLocks,
+} from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -85,30 +92,33 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('FrameworkResizer fills the database; locks stay on the database', () => {
+  test('FrameworkResizer fills the media and lock stores', () => {
     const eager = new FrameworkResizer(baseOpts());
-    assert.ok(eager.db instanceof FrameworkDatabase);
+    assert.ok(eager.media instanceof FrameworkMediaStore);
+    assert.ok(eager.locks instanceof FrameworkLockStore);
     resetResizerForTests();
     const tasks = new MemoryTaskQueue();
     const queued = new FrameworkResizer({ ...baseOpts(), tasks });
-    assert.ok(queued.db instanceof FrameworkDatabase);
+    assert.ok(queued.media instanceof FrameworkMediaStore);
+    assert.ok(queued.locks instanceof FrameworkLockStore);
     assert.equal(queued.tasks, tasks);
-    // the passed queue is used, not the database's own
-    assert.notEqual(queued.tasks, queued.db.tasks);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
     const storage = fakeStorage();
     const tasks = new MemoryTaskQueue();
-    const db = fakeDb();
+    const media = fakeMedia();
+    const locks = memoryLocks();
     const r = new FrameworkResizer({
       storage,
       tasks,
-      db,
+      media,
+      locks,
     });
     assert.equal(r.storage, storage);
     assert.equal(r.tasks, tasks);
-    assert.equal(r.db, db);
+    assert.equal(r.media, media);
+    assert.equal(r.locks, locks);
   });
 
   test('task queue is undefined when the config has no queue (eager-only host)', async () => {
@@ -116,7 +126,7 @@ describe('Resizer constructor — driver wiring', () => {
     await r.ready();
     assert.equal(r.tasks, undefined);
     assert.equal(
-      new Resizer({ ...baseOpts(), name: 'core', db: fakeDb() }).tasks,
+      new Resizer({ ...baseOpts(), name: 'core', media: fakeMedia() }).tasks,
       undefined,
     );
   });
@@ -125,7 +135,7 @@ describe('Resizer constructor — driver wiring', () => {
     // A JS host could omit the required `storage` — fail loudly at construction with a NAMED
     // error, not a downstream TypeError (02 · §6 review fix).
     assert.throws(
-      () => new Resizer({ db: fakeDb() } as never),
+      () => new Resizer({ media: fakeMedia() } as never),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_STORAGE_REQUIRED' &&
@@ -142,7 +152,7 @@ describe('Resizer constructor — driver wiring', () => {
       () =>
         new Resizer({
           storage: fakeStorage(),
-          db: fakeDb(),
+          media: fakeMedia(),
           config: { ...makeImageConfig(), upload: null } as never,
         }),
       /upload must be an object/,
@@ -173,7 +183,7 @@ describe('Resizer constructor — driver wiring', () => {
     assert.deepEqual(r.config.formats, ['webp']);
   });
 
-  test('the default database loads from the Resizer’s own media model', async () => {
+  test('the default media store loads from the Resizer’s own media model', async () => {
     const asked: string[] = [];
     resetAppInstance();
     setAppInstance({
@@ -190,8 +200,8 @@ describe('Resizer constructor — driver wiring', () => {
       config: makeResizeConfig({ mediaModelName: 'Photo' }),
     });
     const files = new FrameworkResizer(baseOpts());
-    await photos.db.loadMedia('m1');
-    await files.db.loadMedia('m2');
+    await photos.media.loadMedia('m1');
+    await files.media.loadMedia('m2');
     assert.deepEqual(asked, ['Photo', 'File']);
   });
 
@@ -231,7 +241,8 @@ describe('drivers given as functions', () => {
 
   test('are called once, on first use, sync or async — even under concurrent calls', async () => {
     const storage = fakeStorage();
-    const db = fakeDb();
+    const media = fakeMedia();
+    const locks = memoryLocks();
     const tasks = new MemoryTaskQueue();
     const calls: string[] = [];
     const r = new Resizer({
@@ -240,9 +251,13 @@ describe('drivers given as functions', () => {
         calls.push('storage');
         return storage;
       },
-      db: async () => {
-        calls.push('db');
-        return db;
+      media: async () => {
+        calls.push('media');
+        return media;
+      },
+      locks: () => {
+        calls.push('locks');
+        return locks;
       },
       tasks: async () => {
         calls.push('tasks');
@@ -250,7 +265,7 @@ describe('drivers given as functions', () => {
       },
     });
     assert.deepEqual(calls, []);
-    for (const part of ['storage', 'db', 'tasks'] as const) {
+    for (const part of ['storage', 'media', 'locks', 'tasks'] as const) {
       assert.throws(
         () => r[part],
         (err: unknown) =>
@@ -260,23 +275,25 @@ describe('drivers given as functions', () => {
       );
     }
     await Promise.all([r.ready(), r.ready(), r.verify()]);
-    assert.deepEqual(calls.sort(), ['db', 'storage', 'tasks']);
+    assert.deepEqual(calls.sort(), ['locks', 'media', 'storage', 'tasks']);
     assert.equal(r.storage, storage);
-    assert.equal(r.db, db);
+    assert.equal(r.media, media);
+    assert.equal(r.locks, locks);
     assert.equal(r.tasks, tasks);
     await r.ready();
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
   });
 
   test('a part given as an object is usable while another is still loading', () => {
-    const db = fakeDb();
+    const media = fakeMedia();
     const r = new Resizer({
       logger: silent,
       storage: async () => fakeStorage(),
-      db,
+      media,
     });
-    assert.equal(r.db, db);
-    assert.equal(r.tasks, undefined); // not given: eager only, nothing to wait for
+    assert.equal(r.media, media);
+    assert.equal(r.locks, undefined); // not given: eager only, nothing to wait for
+    assert.equal(r.tasks, undefined);
     assert.throws(() => r.storage, /has not loaded `storage`/);
   });
 
@@ -285,7 +302,7 @@ describe('drivers given as functions', () => {
     const storage = fakeStorage();
     const r = new Resizer({
       logger: silent,
-      db: fakeDb(),
+      media: fakeMedia(),
       storage: async () => {
         attempts += 1;
         if (attempts === 1) {
@@ -302,21 +319,21 @@ describe('drivers given as functions', () => {
 
   test('a part that loaded is kept when a sibling fails; only the failed part is retried', async () => {
     let storageCalls = 0;
-    let dbCalls = 0;
+    let mediaCalls = 0;
     const storage = fakeStorage();
-    const db = fakeDb();
+    const media = fakeMedia();
     const r = new Resizer({
       logger: silent,
       storage: async () => {
         storageCalls += 1;
         return storage;
       },
-      db: async () => {
-        dbCalls += 1;
-        if (dbCalls === 1) {
+      media: async () => {
+        mediaCalls += 1;
+        if (mediaCalls === 1) {
           throw new Error('db not up');
         }
-        return db;
+        return media;
       },
     });
     await assert.rejects(() => r.ready(), /db not up/);
@@ -324,9 +341,9 @@ describe('drivers given as functions', () => {
     await Promise.all([r.ready(), r.ready()]);
     await r.ready();
     assert.equal(storageCalls, 1);
-    assert.equal(dbCalls, 2);
+    assert.equal(mediaCalls, 2);
     assert.equal(r.storage, storage);
-    assert.equal(r.db, db);
+    assert.equal(r.media, media);
   });
 
   test('a failed lazy task queue stays not ready until it loads', async () => {
@@ -335,7 +352,8 @@ describe('drivers given as functions', () => {
     const r = new Resizer({
       logger: silent,
       storage: fakeStorage(),
-      db: fakeDb(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
       tasks: async () => {
         taskCalls += 1;
         if (taskCalls === 1) {
@@ -360,7 +378,7 @@ describe('drivers given as functions', () => {
       name: 'a',
       logger: silent,
       storage: () => undefined as never,
-      db: fakeDb(),
+      media: fakeMedia(),
     });
     await assert.rejects(
       () => noStorage.ready(),
@@ -368,17 +386,16 @@ describe('drivers given as functions', () => {
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_STORAGE_REQUIRED',
     );
-    const noDb = new Resizer({
+    const noMedia = new Resizer({
       name: 'b',
       logger: silent,
       storage: fakeStorage(),
-      db: async () => null as never,
+      media: async () => null as never,
     });
     await assert.rejects(
-      () => noDb.ready(),
+      () => noMedia.ready(),
       (err: unknown) =>
-        err instanceof ResizeSetupError &&
-        err.code === 'RESIZE_DATABASE_REQUIRED',
+        err instanceof ResizeSetupError && err.code === 'RESIZE_MEDIA_REQUIRED',
     );
   });
 
@@ -386,7 +403,7 @@ describe('drivers given as functions', () => {
     const errors: unknown[][] = [];
     const r = new Resizer({
       logger: { ...silent, error: (...args: unknown[]) => errors.push(args) },
-      db: fakeDb(),
+      media: fakeMedia(),
       storage: async () => {
         throw new ResizeConfigError('no storage configured', {
           code: 'TEST_NO_STORAGE',
@@ -407,6 +424,92 @@ describe('drivers given as functions', () => {
       (err: unknown) =>
         err instanceof ResizeConfigError && err.code === 'TEST_NO_STORAGE',
     );
+  });
+});
+
+describe('ports', () => {
+  const silent = { info() {}, warn() {}, error() {} };
+  const storage = fakeStorage();
+  const locksRequired = (e: unknown) =>
+    e instanceof ResizeSetupError && e.code === 'RESIZE_LOCKS_REQUIRED';
+
+  test('a missing media store is RESIZE_MEDIA_REQUIRED at construction', () =>
+    assert.throws(
+      () => new Resizer({ storage } as unknown as ResizerOptions),
+      (e: unknown) =>
+        e instanceof ResizeSetupError &&
+        e.code === 'RESIZE_MEDIA_REQUIRED' &&
+        /FrameworkResizer/.test(e.message) &&
+        /mongoParts/.test(e.message),
+    ));
+
+  test('a lazy media store that returns nothing is RESIZE_MEDIA_REQUIRED at ready()', async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage,
+      media: () => undefined as unknown as MediaStore,
+    });
+    await assert.rejects(
+      () => r.ready(),
+      (e: unknown) =>
+        e instanceof ResizeSetupError && e.code === 'RESIZE_MEDIA_REQUIRED',
+    );
+  });
+
+  test('a task queue without locks: ready(), verify() and generate() reject; resolve() and prewarm() never throw', async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage,
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+    });
+    await assert.rejects(() => r.ready(), locksRequired);
+    await assert.rejects(() => r.verify(), locksRequired);
+    await assert.rejects(
+      () => r.generate({ media: { id: 'm1' }, sizes: [] }),
+      locksRequired,
+    );
+    assert.deepEqual(
+      await r.resolve({ media: { id: 'm1' }, sizes: [{ width: 10 }] }),
+      { decision: { ready: [], missing: [] }, output: undefined },
+    );
+    const result = await r.prewarm({
+      media: { id: 'm1' },
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false);
+  });
+
+  test('a lazy locks part that resolves to nothing beside a task queue is RESIZE_LOCKS_REQUIRED', async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage,
+      media: fakeMedia(),
+      locks: () => undefined,
+      tasks: new MemoryTaskQueue(),
+    });
+    await assert.rejects(() => r.ready(), locksRequired);
+    assert.equal(r.locks, undefined);
+  });
+
+  test('an eager-only Resizer needs no locks, and has no db', async () => {
+    const r = new Resizer({ storage, media: fakeMedia() });
+    await r.ready();
+    assert.equal(r.locks, undefined);
+    assert.equal(r.tasks, undefined);
+    assert.equal('db' in r, false);
+  });
+
+  test('media, locks and tasks given as objects are exposed as given', () => {
+    const media = fakeMedia();
+    const locks = memoryLocks();
+    const tasks = new MemoryTaskQueue();
+    const r = new Resizer({ storage, media, locks, tasks });
+    assert.equal(r.media, media);
+    assert.equal(r.locks, locks);
+    assert.equal(r.tasks, tasks);
   });
 });
 
@@ -519,27 +622,27 @@ describe('Resizer registry', () => {
 
   test('explicit config, logger and drivers need no framework app', () => {
     resetAppInstance();
-    const db = fakeDb();
+    const media = fakeMedia();
     const r = new Resizer({
       storage: fakeStorage(),
-      db,
+      media,
       config: makeImageConfig(),
       logger: { info() {}, warn() {}, error() {} },
     });
     assert.equal(r.name, 'default');
-    assert.equal(r.db, db);
+    assert.equal(r.media, media);
     assert.equal(getResizer(), r);
   });
 
-  test('a core Resizer requires a database but not a task queue; config defaults', () => {
+  test('a core Resizer requires a media store but not a task queue; config defaults', () => {
     resetAppInstance();
-    const core = { storage: fakeStorage(), db: fakeDb() };
+    const core = { storage: fakeStorage(), media: fakeMedia() };
     const rejects = (opts: unknown, code: string) =>
       assert.throws(
         () => new Resizer(opts as never),
         (err: unknown) => err instanceof ResizeSetupError && err.code === code,
       );
-    rejects({ ...core, db: undefined }, 'RESIZE_DATABASE_REQUIRED');
+    rejects({ storage: core.storage }, 'RESIZE_MEDIA_REQUIRED');
     // None of the rejected constructions claimed the name; config defaults to the package's.
     const r = new Resizer(core);
     assert.equal(r.logger, console);

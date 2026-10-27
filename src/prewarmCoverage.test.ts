@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
+import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
-import type { FakeLocks } from './testHelpers/fakes.ts';
-import { fakeDb, MemoryTaskQueue } from './testHelpers/fakes.ts';
+import {
+  fakeMedia,
+  MemoryTaskQueue,
+  memoryLocks,
+} from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
   EnqueueReceipt,
@@ -51,21 +55,23 @@ function locks(
   acquire: boolean | ((key: string) => boolean | Promise<boolean>) = true,
 ) {
   const released: string[] = [];
-  const dbLocks: FakeLocks = {
+  const lockStore: LockStore = {
     acquire: async (key) =>
       typeof acquire === 'function' ? acquire(key) : acquire,
+    extend: async () => true,
     release: async (key) => {
       released.push(key);
+      return true;
     },
   };
-  return { dbLocks, released };
+  return { lockStore, released };
 }
 
 function makeResizer(
   options: {
     storage?: ResizeStorage;
     tasks?: TaskQueue;
-    dbLocks?: FakeLocks;
+    lockStore?: LockStore;
     name?: string;
     queue?: string;
     hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
@@ -74,7 +80,8 @@ function makeResizer(
 ) {
   return new Resizer({
     storage: options.storage ?? storage,
-    db: fakeDb({ locks: options.dbLocks }),
+    media: fakeMedia(),
+    locks: options.lockStore ?? memoryLocks(),
     tasks: options.tasks,
     config: makeImageConfig(),
     logger,
@@ -110,7 +117,7 @@ describe('prewarm — explicit coverage', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'original.jpg' } } },
@@ -141,7 +148,7 @@ describe('prewarm — explicit coverage', () => {
       storage,
       // The jpeg lock is won for add; the webp lock is lost and checked via findActive.
       tasks,
-      dbLocks: locks((key) => key.endsWith(':jpeg:none')).dbLocks,
+      lockStore: locks((key) => key.endsWith(':jpeg:none')).lockStore,
       name: 'listings',
       queue: 'interactive',
     });
@@ -177,7 +184,7 @@ describe('prewarm — explicit coverage', () => {
     const ready = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
     });
     const readyResult = await ready.prewarm({
       media: {
@@ -202,7 +209,7 @@ describe('prewarm — explicit coverage', () => {
     const svg = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
     });
     const svgResult = await svg.prewarm({
       media: {
@@ -263,7 +270,7 @@ describe('prewarm — explicit coverage', () => {
     const noOriginal = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
     });
     const missingOriginal = await noOriginal.prewarm({
       media: { id: 'm2' },
@@ -291,7 +298,7 @@ describe('prewarm — explicit coverage', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -315,7 +322,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks(false).dbLocks,
+      lockStore: locks(false).lockStore,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -338,7 +345,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks(false).dbLocks,
+      lockStore: locks(false).lockStore,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -364,7 +371,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks(false).dbLocks,
+      lockStore: locks(false).lockStore,
     });
 
     const result = await r.prewarm({
@@ -390,7 +397,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
       hooks: {
         beforeEnqueue: (missing) => {
           const first = missing[0];
@@ -429,7 +436,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
       const r = makeResizer({
         storage,
         tasks,
-        dbLocks: locks().dbLocks,
+        lockStore: locks().lockStore,
         hooks: {
           beforeEnqueue: (missing) =>
             missing[0] ? [...missing, { ...missing[0], ...override }] : missing,
@@ -461,7 +468,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
       hooks: {
         beforeEnqueue: (missing) =>
           missing[0] ? [...missing, missing[0]] : missing,
@@ -487,7 +494,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
       hooks: {
         beforeEnqueue: (missing) =>
           missing[0]
@@ -521,7 +528,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks(false).dbLocks,
+      lockStore: locks(false).lockStore,
     });
 
     const result = await r.prewarm({
@@ -554,7 +561,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks(false).dbLocks,
+      lockStore: locks(false).lockStore,
     });
 
     const result = await r.prewarm({
@@ -584,11 +591,11 @@ describe('prewarm — dispatch-lock races and retries', () => {
         return { taskId: 'task-2' };
       },
     });
-    const { dbLocks, released } = locks(true);
+    const { lockStore, released } = locks(true);
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks,
+      lockStore,
     });
     const opts: Parameters<Resizer['prewarm']>[0] = {
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -611,7 +618,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks((key) => key.includes(':jpeg:')).dbLocks,
+      lockStore: locks((key) => key.includes(':jpeg:')).lockStore,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -638,7 +645,7 @@ describe('prewarm — pipeline scope is part of preview identity', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
       pipelines: { watermark: {} },
     });
     const media = {
@@ -685,7 +692,7 @@ describe('prewarm — issues describe only what stays unconfirmed', () => {
           { taskId: 'active-1', previews: [taskPreview('jpeg')] },
         ],
       });
-      const r = makeResizer({ storage, tasks, dbLocks: locks().dbLocks });
+      const r = makeResizer({ storage, tasks, lockStore: locks().lockStore });
       const result = await r.prewarm({
         media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
         sizes: [{ width: 300, height: 300 }],
@@ -709,7 +716,7 @@ describe('prewarm — issues describe only what stays unconfirmed', () => {
         { taskId: 'active-1', previews: [taskPreview('jpeg')] },
       ],
     });
-    const r = makeResizer({ storage, tasks, dbLocks: locks().dbLocks });
+    const r = makeResizer({ storage, tasks, lockStore: locks().lockStore });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -735,7 +742,7 @@ describe('prewarm — an internal error after expansion', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks().dbLocks,
+      lockStore: locks().lockStore,
       // A host bug: the tap returns nothing, which the policy step cannot read.
       hooks: { beforeEnqueue: (() => undefined) as never },
     });
@@ -762,7 +769,7 @@ describe('prewarm — an internal error after expansion', () => {
   test('a config error before expansion still reports an empty request', async () => {
     const r = new Resizer({
       storage,
-      db: fakeDb(),
+      media: fakeMedia(),
       logger,
       config: () => ({ ...makeImageConfig(), upload: null }) as never,
     });
@@ -789,7 +796,7 @@ describe('prewarm — dispatch locks', () => {
     const r = makeResizer({
       storage,
       tasks,
-      dbLocks: locks(async (key) => {
+      lockStore: locks(async (key) => {
         inFlight += 1;
         maxInFlight = Math.max(maxInFlight, inFlight);
         await new Promise((resolve) => setImmediate(resolve));
@@ -798,7 +805,7 @@ describe('prewarm — dispatch locks', () => {
           throw new Error('lock backend down');
         }
         return !key.includes(':webp:');
-      }).dbLocks,
+      }).lockStore,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },

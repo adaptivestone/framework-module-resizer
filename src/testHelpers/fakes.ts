@@ -1,7 +1,8 @@
-// Test-only fakes for the driver contracts: a ResizeDatabase built from parts, in-memory locks, and
-// a complete in-memory TaskQueue (the reference for the contract's semantics: request
-// de-duplication, oldest-first claims, fenced leases, retry times and dead tasks).
-import type { ResizeDatabase } from '../contracts/database.ts';
+// Test-only fakes for the driver contracts: a MediaStore built from parts, in-memory locks that
+// honour owners, and a complete in-memory TaskQueue (the reference for the contract's semantics:
+// request de-duplication, oldest-first claims, fenced leases, retry times and dead tasks).
+import type { LockStore } from '../contracts/locks.ts';
+import type { MediaStore } from '../contracts/media.ts';
 import {
   type ClaimedTask,
   type NewTask,
@@ -14,45 +15,42 @@ import type {
   QueueTimingOptions,
 } from '../types.d.ts';
 
-export interface FakeLocks {
-  acquire(key: string, ttlMs: number): Promise<boolean>;
-  release(key: string): Promise<void>;
-}
-
-/** In-memory locks (no expiry). */
-export function memoryLocks(): FakeLocks {
-  const held = new Set<string>();
+/** In-memory locks (no expiry). Owners are honoured: only the holder extends or releases a lock. */
+export function memoryLocks(): LockStore {
+  const held = new Map<string, string>(); // key → owner
   return {
-    acquire: async (key) => {
+    acquire: async (key, owner) => {
       if (held.has(key)) {
         return false;
       }
-      held.add(key);
+      held.set(key, owner);
       return true;
     },
-    release: async (key) => {
+    extend: async (key, owner) => held.get(key) === owner,
+    release: async (key, owner) => {
+      if (held.get(key) !== owner) {
+        return false;
+      }
       held.delete(key);
+      return true;
     },
   };
 }
 
 /**
- * A ResizeDatabase from optional parts; missing parts are harmless in-memory stand-ins. The default
- * appendPreviews follows the database contract: it keeps one row per preview identity in
- * `previews` (per media id; pass a map to seed or inspect it) and resolves with the previews it
- * stored. A preview without an identity is always stored.
+ * A MediaStore from optional parts; missing parts are harmless in-memory stand-ins. The default
+ * appendPreviews follows the media contract: it keeps one row per preview identity in `previews`
+ * (per media id; pass a map to seed or inspect it) and resolves with the previews it stored. A
+ * preview without an identity is always stored.
  */
-export function fakeDb(
+export function fakeMedia(
   parts: {
     load?: (mediaId: string) => Promise<MediaLike | null>;
-    appendPreviews?: ResizeDatabase['appendPreviews'];
+    appendPreviews?: MediaStore['appendPreviews'];
     previews?: Map<string, Preview[]>;
-    locks?: FakeLocks;
-    tasks?: TaskQueue;
     verify?: () => void | Promise<void>;
   } = {},
-): ResizeDatabase {
-  const locks = parts.locks ?? memoryLocks();
+): MediaStore {
   const rows = parts.previews ?? new Map<string, Preview[]>();
   const appendPreviews = async (mediaId: string, previews: Preview[]) => {
     const media = rows.get(mediaId) ?? [];
@@ -73,9 +71,6 @@ export function fakeDb(
   return {
     loadMedia: parts.load ?? (async () => null),
     appendPreviews: parts.appendPreviews ?? appendPreviews,
-    acquireLock: (key, ttlMs) => locks.acquire(key, ttlMs),
-    releaseLock: (key) => locks.release(key),
-    ...(parts.tasks ? { tasks: parts.tasks } : {}),
     ...(parts.verify ? { verify: parts.verify } : {}),
   };
 }

@@ -6,14 +6,15 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
+import type { LockStore } from './contracts/locks.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
 import { ResizeMediaError } from './errors.ts';
 import { consumeQueue } from './queue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
-  type FakeLocks,
-  fakeDb,
+  fakeMedia,
   MemoryTaskQueue,
+  memoryLocks,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type { MediaLike, QueueTimingOptions, SizeInput } from './types.d.ts';
@@ -53,13 +54,14 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
       upload: async () => ({ key: 'k' }),
       publicUrl: () => '',
     },
-    db: fakeDb({
+    media: fakeMedia({
       load: async () => ({
         id: 'm1',
         original: { storageRef: { key: 'o' } },
         previews: [],
       }),
     }),
+    locks: memoryLocks(),
     tasks,
   });
   await tasks.add({
@@ -138,7 +140,8 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
       },
       publicUrl: () => '',
     },
-    db: fakeDb({ load: async () => media }),
+    media: fakeMedia({ load: async () => media }),
+    locks: memoryLocks(),
     tasks,
   });
   await tasks.add({
@@ -188,24 +191,41 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
 });
 
 describe('dead-letter cooldown', () => {
-  /** Locks that expire, on a clock the test moves forward: `clock.ms` is added to real time. */
+  /**
+   * Locks that expire, on a clock the test moves forward: `clock.ms` is added to real time. Owners
+   * are checked like a real store: an expired lock is taken over by any owner, and `release` or
+   * `extend` by another owner returns false and keeps the lock.
+   */
   function expiringLocks(clock: { ms: number }) {
-    const expiry = new Map<string, number>();
+    const held = new Map<string, { owner: string; expiresAt: number }>();
     const calls: string[] = [];
-    const locks: FakeLocks & { calls: string[] } = {
+    const locks: LockStore & { calls: string[] } = {
       calls,
-      acquire: async (key, ttlMs) => {
+      acquire: async (key, owner, ttlMs) => {
         calls.push(`acquire ${key} ${ttlMs}`);
         const now = Date.now() + clock.ms;
-        if ((expiry.get(key) ?? 0) > now) {
+        if ((held.get(key)?.expiresAt ?? 0) > now) {
           return false;
         }
-        expiry.set(key, now + ttlMs);
+        held.set(key, { owner, expiresAt: now + ttlMs });
         return true;
       },
-      release: async (key) => {
+      extend: async (key, owner, ttlMs) => {
+        const now = Date.now() + clock.ms;
+        const lock = held.get(key);
+        if (!lock || lock.owner !== owner || lock.expiresAt <= now) {
+          return false;
+        }
+        lock.expiresAt = now + ttlMs;
+        return true;
+      },
+      release: async (key, owner) => {
         calls.push(`release ${key}`);
-        expiry.delete(key);
+        if (held.get(key)?.owner !== owner) {
+          return false;
+        }
+        held.delete(key);
+        return true;
       },
     };
     return locks;
@@ -215,7 +235,7 @@ describe('dead-letter cooldown', () => {
 
   // A Resizer whose sources are all over limits.sourcePixels, so every task is dead-lettered on
   // its first delivery. Dispatch locks last 1 s, the cooldown 10 s.
-  function setup(locks: FakeLocks, timing: Partial<QueueTimingOptions> = {}) {
+  function setup(locks: LockStore, timing: Partial<QueueTimingOptions> = {}) {
     const tasks = new MemoryTaskQueue({
       timing: {
         idlePollMs: 5,
@@ -235,7 +255,8 @@ describe('dead-letter cooldown', () => {
         upload: async () => ({ key: 'k' }),
         publicUrl: () => '',
       },
-      db: fakeDb({ load: async (id) => docs.get(id) ?? null, locks }),
+      media: fakeMedia({ load: async (id) => docs.get(id) ?? null }),
+      locks,
       tasks,
     });
     const errors: unknown[][] = [];
@@ -327,10 +348,10 @@ describe('dead-letter cooldown', () => {
     });
     let released = false;
     const release = locks.release;
-    locks.release = async (key) => {
+    locks.release = async (key, owner) => {
       await gate;
       released = true;
-      await release(key);
+      return release(key, owner);
     };
     let returned = false;
     const working = t.work().then(() => {

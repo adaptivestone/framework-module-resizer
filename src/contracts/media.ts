@@ -12,8 +12,10 @@ export abstract class MediaStore {
    * Append generated previews, and optionally backfill the original's dimensions. The store keeps
    * one row per `identity`: a preview whose identity is already stored on the media is skipped, so
    * two workers that rendered the same variant leave one row. Resolve with the previews that were
-   * stored (`[]` when none were, e.g. the media is gone): the core treats every preview left out as
-   * not recorded, so resolving with nothing is never a way to say "all of them".
+   * stored (`[]` when none were, e.g. the media is gone). Of the previews left out, the core counts
+   * one whose identity is already stored as covered, and any other as not recorded. Resolving with
+   * nothing is never a way to say "all of them": the core rejects it with
+   * RESIZE_MEDIA_APPEND_RESULT_INVALID.
    */
   abstract appendPreviews(
     mediaId: string,

@@ -5,8 +5,11 @@
 // Takes the Resizer type-only (the resizer.ts → engine.ts → enqueue.ts value chain never
 // closes back on this module at runtime — 05 · design delta).
 import { createHash } from 'node:crypto';
+import type { LockStore } from './contracts/locks.ts';
 import type { NewTask } from './contracts/taskQueue.ts';
+import { ResizeSetupError } from './errors.ts';
 import { canonicalizeFilterValue, getPreviewIdentity } from './images.ts';
+import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
 import { timingOf } from './queue.ts';
 import type { Resizer } from './resizer.ts';
 import type {
@@ -112,10 +115,10 @@ export async function enqueue(
   missing: MissingPreview[],
   queue: string,
 ): Promise<number> {
-  // Defensive: resolve guarantees a task queue before calling us (§17 step 9), but never
-  // assume — bail before grabbing any lock we could not use.
-  const { tasks } = resizer;
-  if (!tasks) {
+  // Defensive: resolve guarantees a task queue before calling us (§17 step 9), and ready() a lock
+  // store beside it, but never assume — bail before grabbing any lock we could not use.
+  const { tasks, locks } = resizer;
+  if (!tasks || !locks) {
     return 0;
   }
 
@@ -137,12 +140,12 @@ export async function enqueue(
   }
 
   // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
-  // in flight from a concurrent read). TTL in ms — the framework driver converts to s.
+  // in flight from a concurrent read). Every dispatch lock has the one owner DISPATCH_LOCK_OWNER.
   const dispatchTtlMs = timingOf(tasks).lockTtlMs.dispatch;
   const survivors: MissingPreview[] = [];
   const survivorLockKeys: string[] = [];
   const attempts = await acquireDispatchLocks(
-    resizer,
+    locks,
     mediaId,
     byIdentity,
     dispatchTtlMs,
@@ -176,7 +179,7 @@ export async function enqueue(
       resizer.logger.error(
         `resize enqueue: the task queue returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       );
-      await releaseAll(resizer, survivorLockKeys);
+      await releaseAll(resizer, locks, survivorLockKeys);
       return 0;
     }
     // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
@@ -186,7 +189,7 @@ export async function enqueue(
       `resize enqueue: adding the task threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       err,
     );
-    await releaseAll(resizer, survivorLockKeys);
+    await releaseAll(resizer, locks, survivorLockKeys);
     return 0;
   }
 }
@@ -272,6 +275,14 @@ export async function enqueueConfirmed(
       ],
     };
   }
+  // ready() rejects a task queue without a lock store, so prewarm never gets here without one.
+  const { locks } = resizer;
+  if (!locks) {
+    throw new ResizeSetupError(
+      `resize prewarm: Resizer '${resizer.name}' has a task queue but no \`locks\``,
+      { code: 'RESIZE_LOCKS_REQUIRED' },
+    );
+  }
 
   // Receipts from findActive belong to the same Resizer and pipeline (the task queue filters by
   // both), so one scope covers every identity built here.
@@ -297,7 +308,7 @@ export async function enqueueConfirmed(
   const dispatchTtlMs = timingOf(taskQueue).lockTtlMs.dispatch;
 
   const attempts = await acquireDispatchLocks(
-    resizer,
+    locks,
     mediaId,
     byIdentity,
     dispatchTtlMs,
@@ -332,7 +343,7 @@ export async function enqueueConfirmed(
           retryable: true,
           previews: winners,
         });
-        await releaseAll(resizer, winnerKeys);
+        await releaseAll(resizer, locks, winnerKeys);
       } else {
         const receipt = { taskId, previews: winners };
         tasks.push(receipt);
@@ -358,7 +369,7 @@ export async function enqueueConfirmed(
         retryable: true,
         previews: winners,
       });
-      await releaseAll(resizer, winnerKeys);
+      await releaseAll(resizer, locks, winnerKeys);
     }
   }
 
@@ -496,20 +507,12 @@ interface LockAttempt {
 }
 
 /**
- * The dispatch lock of one preview identity of a media: while it is held, reads do not queue that
- * variant. The worker holds it for a cooldown after the variant's task is dead-lettered.
- */
-export function dispatchLockKey(mediaId: string, identity: string): string {
-  return `resize_dispatch:${mediaId}:${identity}`;
-}
-
-/**
  * Acquire one dispatch lock per identity, all at once: a read with many missing variants waits
  * for the slowest acquire, not for one database round trip after another. Never rejects; the
  * results keep the input order, and the caller decides how to report a held or failed lock.
  */
 async function acquireDispatchLocks(
-  resizer: Resizer,
+  locks: LockStore,
   mediaId: string,
   byIdentity: Map<string, MissingPreview>,
   ttlMs: number,
@@ -518,7 +521,9 @@ async function acquireDispatchLocks(
     [...byIdentity].map(async ([identity, preview]): Promise<LockAttempt> => {
       const lockKey = dispatchLockKey(mediaId, identity);
       try {
-        const acquired = Boolean(await resizer.db.acquireLock(lockKey, ttlMs));
+        const acquired = Boolean(
+          await locks.acquire(lockKey, DISPATCH_LOCK_OWNER, ttlMs),
+        );
         return { preview, lockKey, acquired, failed: false };
       } catch (error) {
         return { preview, lockKey, acquired: false, failed: true, error };
@@ -527,11 +532,15 @@ async function acquireDispatchLocks(
   );
 }
 
-/** Best-effort release of every given lock key; a failing release is logged, not thrown. */
-async function releaseAll(resizer: Resizer, lockKeys: string[]): Promise<void> {
+/** Best-effort release of every given dispatch lock; a failing release is logged, not thrown. */
+async function releaseAll(
+  resizer: Resizer,
+  locks: LockStore,
+  lockKeys: string[],
+): Promise<void> {
   for (const key of lockKeys) {
     try {
-      await resizer.db.releaseLock(key);
+      await locks.release(key, DISPATCH_LOCK_OWNER);
     } catch (err) {
       resizer.logger.error(
         `resize enqueue: failed to release dispatch lock ${key}`,

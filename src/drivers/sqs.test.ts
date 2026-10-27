@@ -10,7 +10,7 @@ import type {
 import { ResizeSetupError } from '../errors.ts';
 import { consumeQueue, timingOf } from '../queue.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
-import { fakeDb } from '../testHelpers/fakes.ts';
+import { fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
 import { SqsTaskQueue } from './sqs.ts';
@@ -247,7 +247,8 @@ describe('SqsTaskQueue.add', () => {
         upload: async ({ key }) => ({ key }),
         publicUrl: () => '',
       },
-      db: fakeDb(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
       tasks,
     });
     const result = await resizer.prewarm({
@@ -268,9 +269,12 @@ describe('SqsTaskQueue.add', () => {
         upload: async ({ key }) => ({ key }),
         publicUrl: () => '',
       },
-      db: fakeDb({
-        locks: { acquire: async () => false, release: async () => {} },
-      }),
+      media: fakeMedia(),
+      locks: {
+        acquire: async () => false,
+        extend: async () => false,
+        release: async () => false,
+      },
       tasks,
     });
     const result = await resizer.prewarm({

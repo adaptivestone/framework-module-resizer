@@ -3,8 +3,10 @@
 // this store writes the same documents (`_id`, `expiredAt`, plus `owner`) through the model's
 // native collection, which strict mode does not filter. The owner then lives in the database: the
 // worker extends and releases locks the API process took, the framework's TTL index still removes
-// expired locks, and the framework's own `acquireLock` still sees them. Nothing is read from the
-// app until first use.
+// expired locks, and the framework's own `acquireLock` still sees them. Its takeover of an expired
+// lock (`$set: { expiredAt }`) leaves the stale `owner` field in place, so module locks and locks
+// taken through the framework's statics must not share keys. Nothing is read from the app until
+// first use.
 import { type MongoLockModel, MongoLockStore } from '../drivers/mongo/locks.ts';
 import { ResizeSetupError } from '../errors.ts';
 import { getApp } from './app.ts';

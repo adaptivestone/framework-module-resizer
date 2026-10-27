@@ -1,14 +1,7 @@
 // @adaptivestone/framework-module-resize/drivers/mongo.js — MongoDB for the module's records:
 // MongoMediaStore (the host's media), MongoLockStore (locks), MongoTaskQueue (the task queue),
-// mongoParts() that builds all three on one connection, the models they use, and MongoDatabase
-// (media, locks and its queue in one object). Framework-free; mongoose is used only through the
-// models and connection you pass in.
-export {
-  MongoDatabase,
-  type MongoDatabaseFactoryOptions,
-  type MongoDatabaseOptions,
-  mongoDatabase,
-} from './database.ts';
+// mongoParts() that builds all three on one connection, and the models they use. Framework-free;
+// mongoose is used only through the models and connection you pass in.
 export {
   type MongoLockModel,
   MongoLockStore,

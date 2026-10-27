@@ -14,16 +14,18 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
-import type { ResizeDatabase } from '../contracts/database.ts';
+import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
+import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
 import { resizeMediaSchemaFragment } from '../mediaFragment.ts';
 import { resetResizerForTests } from '../resizer.ts';
-import { fakeDb } from '../testHelpers/fakes.ts';
+import { fakeMedia } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import { runWorker } from '../worker.ts';
-import { FrameworkDatabase } from './database.ts';
+import { FrameworkLockStore } from './locks.ts';
+import { FrameworkMediaStore } from './media.ts';
 import ResizeTaskModel from './ResizeTaskModel.ts';
 import { FrameworkResizer } from './resizer.ts';
 import { runResizeWorker } from './worker.ts';
@@ -128,22 +130,20 @@ function memoryStorage(): { storage: ResizeStorage; uploads: string[] } {
   return { storage, uploads };
 }
 
-// In-memory media with the shared database's real Mongo locks.
-function memoryDatabase(
-  media: MediaLike,
-  shared: ResizeDatabase,
-): ResizeDatabase {
-  return fakeDb({
+// In-memory media; the Resizers beside it keep their locks in the real framework Lock model.
+function memoryMedia(media: MediaLike): MediaStore {
+  return fakeMedia({
     load: async (id) => (id === media.id ? media : null),
     appendPreviews: async (_id, previews: Preview[]) => {
       media.previews = [...(media.previews ?? []), ...previews];
-    },
-    locks: {
-      acquire: (key, ttlMs) => shared.acquireLock(key, ttlMs),
-      release: (key) => shared.releaseLock(key),
+      return previews;
     },
   });
 }
+
+// One task queue over the real ResizeTask model, with the test timing.
+const sharedQueue = () =>
+  new MongoTaskQueue({ model: taskModel, timing: testQueue });
 
 function newMedia(): MediaLike {
   return {
@@ -168,9 +168,7 @@ const sizes = [{ width: 16, height: 16 }];
 test('one worker serves two Resizers that share a task queue', async () => {
   installApp();
   await taskModel.deleteMany({});
-  const shared = new FrameworkDatabase();
-  assert.ok(shared.tasks);
-  const tasks = shared.tasks;
+  const tasks = sharedQueue();
   const stop = new AbortController();
   const mediaA = newMedia();
   const mediaB = newMedia();
@@ -179,14 +177,15 @@ test('one worker serves two Resizers that share a task queue', async () => {
   const media = new FrameworkResizer({
     storage: a.storage,
     tasks,
-    db: memoryDatabase(mediaA, shared),
+    media: memoryMedia(mediaA),
   });
   const listings = new FrameworkResizer({
     name: 'listings',
     storage: b.storage,
     tasks,
-    db: memoryDatabase(mediaB, shared),
+    media: memoryMedia(mediaB),
   });
+  assert.ok(media.locks instanceof FrameworkLockStore);
 
   assert.equal(
     (await media.prewarm({ media: mediaA, sizes })).accepted.length,
@@ -222,15 +221,13 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   await taskModel.deleteMany({});
   const media = newMedia();
   const memory = memoryStorage();
-  const shared = new FrameworkDatabase();
-  assert.ok(shared.tasks);
-  const tasks = shared.tasks;
+  const tasks = sharedQueue();
 
   const first = new AbortController();
   const resizer = new FrameworkResizer({
     storage: memory.storage,
     tasks,
-    db: memoryDatabase(media, shared),
+    media: memoryMedia(media),
   });
   assert.equal(
     (await resizer.prewarm({ media, sizes, queue: 'bulk' })).accepted.length,
@@ -364,7 +361,7 @@ test('two Resizers wired by their config files share one task queue: one task at
     configName: 'resizeListings',
     storage: b.storage,
   });
-  assert.equal(media.db === listings.db, false);
+  assert.equal(media.media === listings.media, false);
 
   const ids: string[] = [];
   for (const [resizer, prefix] of [
@@ -415,11 +412,11 @@ test('two Resizers wired by their config files share one task queue: one task at
   assert.ok(rows.every((r) => r.status === 'completed'));
 });
 
-test("FrameworkDatabase keeps one preview row per identity in the app's media model", async () => {
+test("FrameworkMediaStore keeps one preview row per identity in the app's media model", async () => {
   const File = fileModel();
   installApp({ models: { File } });
-  const db = new FrameworkDatabase();
-  db.verify();
+  const store = new FrameworkMediaStore();
+  store.verify();
   const doc = await File.create({
     original: { storageRef: { key: 'o.png' }, format: 'png' },
     previews: [],
@@ -433,10 +430,10 @@ test("FrameworkDatabase keeps one preview row per identity in the app's media mo
       contentType: 'image/webp',
     }) as Preview;
   const results = await Promise.all([
-    db.appendPreviews(String(doc._id), [preview('one.webp')]),
-    db.appendPreviews(String(doc._id), [preview('two.webp')]),
+    store.appendPreviews(String(doc._id), [preview('one.webp')]),
+    store.appendPreviews(String(doc._id), [preview('two.webp')]),
   ]);
-  assert.equal(results.flatMap((r) => r ?? []).length, 1);
+  assert.equal(results.flat().length, 1);
   const stored = await File.findById(doc._id).lean();
   assert.equal(stored?.previews?.length, 1);
   assert.equal(

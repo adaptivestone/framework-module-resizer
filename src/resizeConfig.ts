@@ -25,7 +25,7 @@ const REMOVED_KEYS: Record<string, string> = {
   // Moved out of the image config: queue timing is a task-queue option, and `worker.concurrency`
   // is the top-level `concurrency`.
   queue:
-    'the task queue timing (e.g. new MongoTaskQueue({ model, timing: { leaseMs } }) or mongoDatabase(connection, { mediaModel, timing })); framework hosts keep `queue` in the config file',
+    'the task queue timing (e.g. new MongoTaskQueue({ model, timing: { leaseMs } }) or mongoParts(connection, { mediaModel, timing })); framework hosts keep `queue` in the config file',
   worker:
     '`concurrency`, and runWorker({ sharp }) for Sharp tuning; framework hosts keep `worker` in the config file',
 };

@@ -25,7 +25,7 @@ import {
 import ResizeTaskModel from '../../framework/ResizeTaskModel.ts';
 import { consumeQueue, timingOf } from '../../queue.ts';
 import { Resizer, resetResizerForTests } from '../../resizer.ts';
-import { fakeDb } from '../../testHelpers/fakes.ts';
+import { fakeMedia } from '../../testHelpers/fakes.ts';
 import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
 import type {
   MissingPreview,
@@ -733,12 +733,12 @@ describe('MongoTaskQueue.add', () => {
       storage: fakeStorage,
       config: makeImageConfig(),
       tasks,
-      db: fakeDb({
-        locks: {
-          acquire: async () => false,
-          release: async () => {},
-        },
-      }),
+      media: fakeMedia(),
+      locks: {
+        acquire: async () => false,
+        extend: async () => false,
+        release: async () => false,
+      },
       logger,
     });
     const result = await resizer.prewarm({

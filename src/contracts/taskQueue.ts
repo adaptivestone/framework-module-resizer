@@ -1,4 +1,4 @@
-// Task queue contract: where queued tasks wait. A database can hold them (MongoDatabase.tasks) or a
+// Task queue contract: where queued tasks wait. A database can hold them (MongoTaskQueue) or a
 // message broker can (SqsTaskQueue). Every method is ONE atomic operation; the core owns everything
 // else — the worker loop, lease heartbeat, task timeout, retry with backoff, dead-lettering, giving
 // tasks back at shutdown, request de-duplication keys and task events — so every backend behaves

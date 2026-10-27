@@ -13,10 +13,6 @@ export type {
   FrameworkSqsQueueConfig,
   FrameworkStorageConfig,
 } from '../types.d.ts';
-export {
-  FrameworkDatabase,
-  type FrameworkDatabaseOptions,
-} from './database.ts';
 export { FrameworkLockStore } from './locks.ts';
 export {
   FrameworkMediaStore,
