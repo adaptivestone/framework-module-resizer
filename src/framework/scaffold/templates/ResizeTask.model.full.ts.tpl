@@ -33,7 +33,7 @@ export default class ResizeTask extends BaseModel {
       // queue it waits in. Rows written before tasks recorded them read as 'default'.
       resizer: { type: String, default: 'default' },
       queue: { type: String, default: 'default' },
-      // True while the task is the gate of its media and pipeline.
+      // True while the task is the gate of its Resizer, media and pipeline.
       active: { type: Boolean, default: false },
       // A dead task keeps the gate until then.
       cooldownUntil: { type: Date },
