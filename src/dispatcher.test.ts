@@ -340,6 +340,35 @@ describe('a task queue without gatesByTask', () => {
     assert.equal(errors.length, 1);
   });
 
+  test('an added result with an unusable task id keeps the gate lock: the queue says it stored the task', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'added', taskId: '' }) as never;
+    const locks = clockLocks();
+    const d = makeDispatcher({ tasks, locks });
+    assert.equal(await d.enqueue(requestFor([v300])), 0);
+    const gate = locks.entry(GATE);
+    assert.ok(gate, 'the gate lock is kept');
+    assert.match(gate.owner, /^[0-9a-f]{32}$/);
+
+    const other = clockLocks();
+    const confirmed = await makeDispatcher({
+      tasks,
+      locks: other,
+    }).enqueueConfirmed(requestFor([v300]));
+    assert.ok(other.entry(GATE), 'the gate lock is kept');
+    assert.deepEqual(confirmed.accepted, []);
+    assert.deepEqual(
+      confirmed.issues.map(({ code, retryable }) => ({ code, retryable })),
+      [{ code: 'RESIZE_ENQUEUE_UNCONFIRMED', retryable: false }],
+    );
+    assert.match(confirmed.issues[0].message, /TaskAddResult/);
+    // Logged once per Dispatcher, naming the contract.
+    assert.equal(
+      errors.filter((e) => /TaskAddResult/.test(String(e[0]))).length,
+      2,
+    );
+  });
+
   test('gate keys are separate per Resizer and per pipeline', async () => {
     const tasks = new PlainTaskQueue();
     const { locks, calls } = recordingLocks();

@@ -663,18 +663,18 @@ describe('MongoTaskQueue.add: one active task per Resizer, media and pipeline', 
     assert.ok(leased);
     const before = Date.now();
     assert.equal(
-      await tasks.fail(leased, 'dead', 'boom', { cooldownMs: 200 }),
+      await tasks.fail(leased, 'dead', 'boom', { cooldownMs: 1000 }),
       true,
     );
     const cooldownUntil = (await M.findById(dead).lean())
       ?.cooldownUntil as Date;
-    assert.ok(cooldownUntil.getTime() >= before + 200);
-    assert.ok(cooldownUntil.getTime() <= Date.now() + 200);
+    assert.ok(cooldownUntil.getTime() >= before + 1000);
+    assert.ok(cooldownUntil.getTime() <= Date.now() + 1000);
     assert.deepEqual(await tasks.add(request({ mediaId })), {
       status: 'in-flight',
       taskId: dead,
     });
-    await sleep(250);
+    await sleep(1050);
     const results = await Promise.all(
       Array.from({ length: 20 }, () => tasks.add(request({ mediaId }))),
     );

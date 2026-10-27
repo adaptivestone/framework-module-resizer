@@ -77,7 +77,9 @@ type DispatchOutcome =
   | { status: 'add-failed'; error: unknown } // `add` threw
   | { status: 'gate-held' } // another request holds the gate lock
   | { status: 'gate-failed'; error: unknown } // the gate lock could not be acquired
-  | { status: 'invalid' }; // `add` resolved something that is not a TaskAddResult
+  // `add` resolved something that is not a TaskAddResult; `stored`: its status still says
+  // 'added' (e.g. with an empty task id), so the queue may hold the task.
+  | { status: 'invalid'; stored: boolean };
 
 const TASK_ADD_RESULT =
   "TaskAddResult ({ status: 'added', taskId } | { status: 'in-flight', taskId? } | { status: 'unconfirmed' })";
@@ -248,7 +250,8 @@ export class Dispatcher {
    * One dispatch of `variants` (canonical, one per identity) for the request's media and pipeline.
    * On a queue with gatesByTask it is one `add`. Without it: acquire the gate lock with a fresh
    * owner for gateTtlMs, then `add` the task carrying that owner, and release the lock unless the
-   * task was added. Never rejects.
+   * queue says it stored the task: an `added` result, even one with an unusable task id, keeps the
+   * lock (at worst it expires after gateTtlMs), so no second task can be queued. Never rejects.
    */
   async #dispatch(
     req: DispatchRequest,
@@ -283,7 +286,10 @@ export class Dispatcher {
       return { status: 'gate-failed', error };
     }
     const outcome = await this.#add({ ...task, gateOwner: owner });
-    if (outcome.status !== 'added') {
+    const stored =
+      outcome.status === 'added' ||
+      (outcome.status === 'invalid' && outcome.stored);
+    if (!stored) {
       // No task holds the gate: open it now instead of when the lock expires.
       try {
         await locks.release(key, owner);
@@ -315,7 +321,12 @@ export class Dispatcher {
         result,
       );
     }
-    return { status: 'invalid' };
+    const stored =
+      typeof result === 'object' &&
+      result !== null &&
+      'status' in result &&
+      result.status === 'added';
+    return { status: 'invalid', stored };
   }
 
   /**
