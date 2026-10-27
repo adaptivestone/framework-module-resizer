@@ -104,7 +104,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
   const fixture = await createFixture('no_effects');
   try {
     const mediaId = new mongoose.Types.ObjectId().toString();
-    const { taskId } = await fixture.tasks.add({
+    const added = await fixture.tasks.add({
       resizer: 'default',
       queue: 'default',
       mediaId,
@@ -112,7 +112,8 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
       previews: [{ sizeKey: '640x480', format: 'webp' }],
       requestKey: 'index-side-effect-test',
     });
-    assert.ok(taskId);
+    assert.equal(added.status, 'added');
+    assert.ok(added.taskId);
     fixture.tasks.verify();
     assert.equal(
       await fixture.locks.acquire(
@@ -208,7 +209,10 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
         fixture.tasks.add({ ...request, requestKey: buildRequestKey(request) }),
       ),
     );
-    const taskIds = receipts.map(({ taskId }) => taskId);
+    const taskIds = receipts.map((receipt) => {
+      assert.equal(receipt.status, 'added');
+      return receipt.taskId;
+    });
     assert.ok(taskIds.every((taskId) => typeof taskId === 'string' && taskId));
     assert.equal(new Set(taskIds).size, 1);
     assert.equal(

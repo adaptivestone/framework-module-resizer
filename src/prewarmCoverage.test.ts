@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
+import type {
+  NewTask,
+  TaskAddResult,
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
@@ -26,7 +30,7 @@ const storage: ResizeStorage = {
 
 function makeTaskQueue(
   overrides: {
-    add?: (task: NewTask) => Promise<{ taskId: string | null }>;
+    add?: (task: NewTask) => Promise<TaskAddResult>;
     findActive?: (query: {
       resizer: string;
       mediaId: string;
@@ -111,7 +115,7 @@ describe('prewarm — explicit coverage', () => {
     const { tasks } = makeTaskQueue({
       add: async ({ previews }) => {
         calls.push(previews);
-        return { taskId: 'task-1' };
+        return { status: 'added', taskId: 'task-1' };
       },
     });
     const r = makeResizer({
@@ -137,7 +141,7 @@ describe('prewarm — explicit coverage', () => {
     const { tasks } = makeTaskQueue({
       add: async ({ resizer, queue }) => {
         added.push({ resizer, queue });
-        return { taskId: 'task-1' };
+        return { status: 'added', taskId: 'task-1' };
       },
       findActive: async ({ resizer, mediaId, pipeline }) => {
         looked.push({ resizer, mediaId, pipeline });
@@ -179,7 +183,7 @@ describe('prewarm — explicit coverage', () => {
 
   test('distinguishes already ready, SVG, empty, and policy-filtered requests', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'unexpected' }),
+      add: async () => ({ status: 'added', taskId: 'unexpected' }),
     });
     const ready = makeResizer({
       storage,
@@ -253,7 +257,7 @@ describe('prewarm — explicit coverage', () => {
     assert.equal(filteredResult.notRequired.length, 1);
   });
 
-  test('reports no task queue, no original, and null taskId as incomplete', async () => {
+  test('reports no task queue, no original, and an unconfirmed add as incomplete', async () => {
     const noQueue = makeResizer({ storage });
     const missingQueue = await noQueue.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -265,7 +269,7 @@ describe('prewarm — explicit coverage', () => {
 
     resetResizerForTests();
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: null }),
+      add: async () => ({ status: 'unconfirmed' }),
     });
     const noOriginal = makeResizer({
       storage,
@@ -293,7 +297,7 @@ describe('prewarm — explicit coverage', () => {
 
   test('does not accept an empty task ID', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: '' }),
+      add: async () => ({ status: 'added', taskId: '' }),
     });
     const r = makeResizer({
       storage,
@@ -316,7 +320,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const { tasks } = makeTaskQueue({
       add: async () => {
         addCalls++;
-        return { taskId: 'unexpected' };
+        return { status: 'added', taskId: 'unexpected' };
       },
     });
     const r = makeResizer({
@@ -337,7 +341,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
 
   test('findActive may prove coverage by an existing active task', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'unexpected' }),
+      add: async () => ({ status: 'added', taskId: 'unexpected' }),
       findActive: async () => [
         { taskId: 'active-1', previews: [taskPreview()] },
       ],
@@ -360,7 +364,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
 
   test('does not accept a findActive task with a matching identity but different payload', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'unexpected' }),
+      add: async () => ({ status: 'added', taskId: 'unexpected' }),
       findActive: async () => [
         {
           taskId: 'other-payload',
@@ -391,7 +395,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const { tasks } = makeTaskQueue({
       add: async () => {
         addCalls++;
-        return { taskId: 'unexpected' };
+        return { status: 'added', taskId: 'unexpected' };
       },
     });
     const r = makeResizer({
@@ -430,7 +434,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
       const { tasks } = makeTaskQueue({
         add: async () => {
           addCalls++;
-          return { taskId: 'unexpected' };
+          return { status: 'added', taskId: 'unexpected' };
         },
       });
       const r = makeResizer({
@@ -462,7 +466,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const { tasks } = makeTaskQueue({
       add: async ({ previews }) => {
         calls.push(previews);
-        return { taskId: 'same-payload' };
+        return { status: 'added', taskId: 'same-payload' };
       },
     });
     const r = makeResizer({
@@ -489,7 +493,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
 
   test('keeps different filter payloads as separate identities', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'filtered' }),
+      add: async () => ({ status: 'added', taskId: 'filtered' }),
     });
     const r = makeResizer({
       storage,
@@ -517,7 +521,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
   test('does not confirm a requested payload from a conflicting findActive receipt', async () => {
     const requested = taskPreview('webp');
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'unexpected' }),
+      add: async () => ({ status: 'added', taskId: 'unexpected' }),
       findActive: async () => [
         {
           taskId: 'active-conflict',
@@ -549,7 +553,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const jpeg = taskPreview('jpeg');
     const webp = taskPreview('webp');
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'unexpected' }),
+      add: async () => ({ status: 'added', taskId: 'unexpected' }),
       findActive: async () => [
         {
           taskId: 'active-conflict',
@@ -588,7 +592,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
         if (calls === 1) {
           throw new Error('connection dropped after lock');
         }
-        return { taskId: 'task-2' };
+        return { status: 'added', taskId: 'task-2' };
       },
     });
     const { lockStore, released } = locks(true);
@@ -613,7 +617,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
 
   test('partial lock coverage reports accepted and unconfirmed variants separately', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'jpeg-task' }),
+      add: async () => ({ status: 'added', taskId: 'jpeg-task' }),
     });
     const r = makeResizer({
       storage,
@@ -640,7 +644,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
 describe('prewarm — pipeline scope is part of preview identity', () => {
   test('a default pipeline preview does not make a watermark pipeline request ready', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ taskId: 'task-1' }),
+      add: async () => ({ status: 'added', taskId: 'task-1' }),
     });
     const r = makeResizer({
       storage,
@@ -676,7 +680,16 @@ describe('prewarm — pipeline scope is part of preview identity', () => {
 
 describe('prewarm — issues describe only what stays unconfirmed', () => {
   for (const [label, add, code] of [
-    ['a null taskId', async () => ({ taskId: null }), 'UNCONFIRMED'],
+    [
+      'an unconfirmed add',
+      async (): Promise<TaskAddResult> => ({ status: 'unconfirmed' }),
+      'UNCONFIRMED',
+    ],
+    [
+      'an in-flight add',
+      async (): Promise<TaskAddResult> => ({ status: 'in-flight' }),
+      'UNCONFIRMED',
+    ],
     [
       'a throwing add',
       async () => {
@@ -788,7 +801,7 @@ describe('prewarm — an internal error after expansion', () => {
 describe('prewarm — dispatch locks', () => {
   test('are acquired in parallel; contended and failed locks are still reported', async () => {
     const { tasks, added } = makeTaskQueue({
-      add: async () => ({ taskId: 'task-1' }),
+      add: async () => ({ status: 'added', taskId: 'task-1' }),
       findActive: async () => [],
     });
     let inFlight = 0;

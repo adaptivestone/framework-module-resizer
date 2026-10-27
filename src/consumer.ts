@@ -23,7 +23,7 @@ export function backoffMs(
   return Math.min(max, base * 2 ** (Math.max(1, attempts) - 1));
 }
 
-/** The task as observers and handlers see it: without the lease token and attempt count. */
+/** The task as observers and handlers see it: with its delivery count, without the lease token. */
 export function toLeasedTask(task: ClaimedTask): LeasedTask {
   return {
     taskId: task.taskId,
@@ -32,6 +32,7 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
     mediaId: task.mediaId,
     pipeline: task.pipeline,
     previews: task.previews,
+    attempts: task.attempts,
   };
 }
 

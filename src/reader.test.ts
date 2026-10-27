@@ -7,7 +7,7 @@ import {
 import { Catalog } from './catalog.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type { NewTask } from './contracts/taskQueue.ts';
+import type { NewTask, TaskAddResult } from './contracts/taskQueue.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { ResizeConfigError } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
@@ -64,12 +64,12 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   };
 }
 
-function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
+function makeTasks(behavior?: (task: NewTask) => TaskAddResult) {
   const calls: NewTask[] = [];
   const tasks = new MemoryTaskQueue();
   tasks.add = async (task) => {
     calls.push(task);
-    return behavior ? behavior(task) : { taskId: 't1' };
+    return behavior ? behavior(task) : { status: 'added', taskId: 't1' };
   };
   return { tasks, calls };
 }
@@ -760,9 +760,9 @@ describe('resolve — enqueue wiring', () => {
     ]);
   });
 
-  test('resolve does not throw when task queue returns taskId null; locks released', async () => {
+  test('resolve does not throw when the task queue cannot confirm the add; locks released', async () => {
     installFakeApp();
-    const { tasks } = makeTasks(() => ({ taskId: null }));
+    const { tasks } = makeTasks(() => ({ status: 'unconfirmed' }));
     const { locks, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),

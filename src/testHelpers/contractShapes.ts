@@ -13,7 +13,7 @@ export const storage: ResizeStorage = {
 };
 
 export const tasks: TaskQueue = {
-  add: async () => ({ taskId: null }),
+  add: async () => ({ status: 'unconfirmed' }),
   claim: async () => null,
   renew: async () => true,
   complete: async () => true,
@@ -22,7 +22,7 @@ export const tasks: TaskQueue = {
 
 // The optional members stay optional on plain objects too.
 export const fullTasks: TaskQueue = {
-  add: async () => ({ taskId: null }),
+  add: async () => ({ status: 'added', taskId: 't' }),
   claim: async () => null,
   renew: async () => true,
   complete: async () => true,
@@ -57,3 +57,33 @@ export const voidAppendMedia: MediaStore = {
 };
 // @ts-expect-error — a media store is not a lock store.
 export const locklessMedia: LockStore = media;
+
+// The gate flags and the fourth parameters of claim and fail. The four-parameter forms do not
+// type-check against three-parameter signatures, so they pin the new parameters.
+export const gatingTasks: TaskQueue = {
+  gatesByTask: true,
+  claimFilters: true,
+  add: async () => ({ status: 'in-flight' }),
+  claim: async (_queue, _leaseMs, _signal, opts) =>
+    opts?.resizers?.length === 0 ? null : null,
+  renew: async () => true,
+  complete: async () => true,
+  fail: async (_task, _next, _error, opts) => opts?.cooldownMs !== undefined,
+};
+export const oldAddTasks: TaskQueue = {
+  // @ts-expect-error — add resolves with a status; a bare taskId is the older contract.
+  add: async () => ({ taskId: 'x' }),
+  claim: async () => null,
+  renew: async () => true,
+  complete: async () => true,
+  fail: async () => true,
+};
+export const falseGate: TaskQueue = {
+  // @ts-expect-error — gatesByTask is `true` or absent.
+  gatesByTask: false,
+  add: async () => ({ status: 'unconfirmed' }),
+  claim: async () => null,
+  renew: async () => true,
+  complete: async () => true,
+  fail: async () => true,
+};

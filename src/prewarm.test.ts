@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
+import type {
+  NewTask,
+  TaskAddResult,
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
@@ -51,9 +55,7 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   };
 }
 
-function makeTaskQueue(
-  behavior?: (task: NewTask) => { taskId: string | null },
-) {
+function makeTaskQueue(behavior?: (task: NewTask) => TaskAddResult) {
   const memory = new MemoryTaskQueue();
   const calls: NewTask[] = [];
   const tasks: TaskQueue = {

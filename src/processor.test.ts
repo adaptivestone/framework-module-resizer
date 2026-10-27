@@ -354,6 +354,7 @@ const task = (over: Partial<LeasedTask> = {}): LeasedTask => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [],
+  attempts: 1,
   ...over,
 });
 
@@ -3574,7 +3575,7 @@ function observedQueue(onIdle: () => void = () => process.emit('SIGTERM')) {
 }
 
 async function addTask(tasks: MemoryTaskQueue, over: Partial<NewTask> = {}) {
-  const { taskId: _taskId, ...payload } = task();
+  const { taskId: _taskId, attempts: _attempts, ...payload } = task();
   await tasks.add({ ...payload, requestKey: JSON.stringify(over), ...over });
 }
 

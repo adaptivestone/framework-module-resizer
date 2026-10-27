@@ -2,7 +2,8 @@
 // message broker can (SqsTaskQueue). Every method is ONE atomic operation; the core owns everything
 // else — the worker loop, lease heartbeat, task timeout, retry with backoff, dead-lettering, giving
 // tasks back at shutdown, request de-duplication keys and task events — so every backend behaves
-// the same. Extend this class, or pass any object of the same shape (the core never checks
+// the same. A queue that gates by task keeps at most one active task per Resizer, media and
+// pipeline. Extend this class, or pass any object of the same shape (the core never checks
 // `instanceof`).
 import type {
   EnqueueReceipt,
@@ -10,7 +11,10 @@ import type {
   QueueTimingOptions,
 } from '../types.d.ts';
 
-/** A task to store. `requestKey` identifies the whole request, for de-duplicating active tasks. */
+/**
+ * A task to store. `requestKey` identifies the whole request, for de-duplicating active tasks.
+ * `gateOwner`, when set, is stored with the task and handed back by `claim()`.
+ */
 export interface NewTask {
   resizer: string;
   queue: string;
@@ -18,9 +22,13 @@ export interface NewTask {
   pipeline: string;
   previews: MissingPreview[];
   requestKey: string;
+  gateOwner?: string;
 }
 
-/** A stored task, as observers see it. Tasks stored without resizer/queue read as 'default'. */
+/**
+ * A stored task, as observers and handlers see it: `attempts` counts its deliveries, this one
+ * included. Tasks stored without resizer/queue read as 'default'.
+ */
 export interface LeasedTask {
   taskId: string;
   resizer: string;
@@ -28,12 +36,40 @@ export interface LeasedTask {
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
+  attempts: number;
 }
 
-/** A task held by this worker: `token` fences every later write; `attempts` counts deliveries. */
+/**
+ * A task held by this worker: `token` fences every later write. `gateOwner` is what `add()`
+ * received with the task, handed back unchanged.
+ */
 export interface ClaimedTask extends LeasedTask {
   token: string;
-  attempts: number;
+  gateOwner?: string;
+}
+
+/**
+ * What `add()` did with a task:
+ * - `added`: the task is stored under `taskId`;
+ * - `in-flight`: a queue that gates by task already holds an active task of this Resizer, media
+ *   and pipeline (`taskId`, when the queue knows it), so it stored nothing;
+ * - `unconfirmed`: the queue could not confirm the write.
+ */
+export type TaskAddResult =
+  | { status: 'added'; taskId: string }
+  | { status: 'in-flight'; taskId?: string }
+  | { status: 'unconfirmed' };
+
+/** Options for `claim()`. */
+export interface ClaimOptions {
+  /** The Resizers this worker serves: a queue with `claimFilters` claims only their tasks. */
+  resizers?: readonly string[];
+}
+
+/** Options for `fail()`. */
+export interface FailOptions {
+  /** With `'dead'`: how long a queue that gates by task keeps the dead task as the gate. */
+  cooldownMs?: number;
 }
 
 export type TaskEvent = 'completed' | 'failed' | 'deadLettered';
@@ -45,11 +81,24 @@ export type TaskEventHandler = (
 ) => void | Promise<void>;
 
 export abstract class TaskQueue {
+  // The two flags are declared only, never emitted as class fields: a field here would put an
+  // own `undefined` on every instance and hide a subclass that sets the flag with a getter.
+
   /**
-   * Store a task. An active task with the same `requestKey` (if the backend can find one) is
-   * returned instead of a new one. `taskId: null` means the backend could not confirm the write.
+   * Optional: `add()` keeps at most one active task per Resizer, media and pipeline, and reports
+   * `in-flight` while one exists. Absent: every `add()` stores a task.
    */
-  abstract add(task: NewTask): Promise<{ taskId: string | null }>;
+  declare readonly gatesByTask?: true;
+
+  /** Optional: `claim()` honours `ClaimOptions.resizers`. Absent: it may hand out any task. */
+  declare readonly claimFilters?: true;
+
+  /**
+   * Store a task: the result says whether it was added, another task is in flight, or the write
+   * is unconfirmed (see TaskAddResult). An active task with the same `requestKey` (if the backend
+   * can find one) is reported as `added` under its own `taskId` instead of storing a new one.
+   */
+  abstract add(task: NewTask): Promise<TaskAddResult>;
 
   /**
    * Atomically claim the oldest due task of `queue` for `leaseMs`: a waiting task whose retry time
@@ -64,11 +113,14 @@ export abstract class TaskQueue {
    *   heartbeat for it;
    * - treat a notification as a hint to try the atomic claim, not as ownership: several workers
    *   may wake for one task, and only one claim wins.
+   *
+   * A queue with `claimFilters` claims only tasks of the Resizers in `opts.resizers`, when given.
    */
   abstract claim(
     queue: string,
     leaseMs: number,
     signal?: AbortSignal,
+    opts?: ClaimOptions,
   ): Promise<ClaimedTask | null>;
 
   /** Extend the lease (the heartbeat). `false` means the lease was lost to another worker. */
@@ -78,13 +130,15 @@ export abstract class TaskQueue {
   abstract complete(task: ClaimedTask): Promise<boolean>;
 
   /**
-   * Retry later (`{ retryAt }`) or give up (`'dead'`, keeping `error` for inspection). `false`
-   * means the lease was lost.
+   * Retry later (`{ retryAt }`) or give up (`'dead'`, keeping `error` for inspection). With
+   * `'dead'`, a queue that gates by task keeps the dead task as the gate for `opts.cooldownMs`.
+   * `false` means the lease was lost.
    */
   abstract fail(
     task: ClaimedTask,
     next: { retryAt: Date } | 'dead',
     error: string,
+    opts?: FailOptions,
   ): Promise<boolean>;
 
   /**
@@ -98,8 +152,9 @@ export abstract class TaskQueue {
   release?(task: ClaimedTask): Promise<boolean>;
 
   /**
-   * Optional: active tasks of this Resizer + media + pipeline on any queue, so prewarm can confirm
-   * work another request already queued. Omit when tasks can't be queried (e.g. SQS).
+   * Optional: the one active task (pending or processing) of this Resizer, media and pipeline, or
+   * `[]`; the Dispatcher reads it after an `in-flight` add. Omit when tasks can't be queried (e.g.
+   * SQS).
    */
   findActive?(query: {
     resizer: string;

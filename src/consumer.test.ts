@@ -177,10 +177,35 @@ describe('Consumer', () => {
     );
     assert.equal(handled.length, 1);
     assert.equal('token' in handled[0], false);
-    assert.equal('attempts' in handled[0], false);
+    assert.equal(handled[0].attempts, 1);
     assert.deepEqual(
       events.map((e) => e.event),
       ['completed'],
+    );
+  });
+
+  test('task events carry the delivery count', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 1, max: 1 } },
+    });
+    await tasks.add(newTask());
+    let calls = 0;
+    const events = await runUntil(
+      tasks,
+      async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error('once');
+        }
+      },
+      () => tasks.rows[0].status === 'completed',
+    );
+    assert.deepEqual(
+      events.map((e) => [e.event, e.task.attempts]),
+      [
+        ['failed', 1],
+        ['completed', 2],
+      ],
     );
   });
 

@@ -23,8 +23,8 @@ export type HookName = WaterfallName | ObserverName;
 // Per-hook tap signatures. The public `hook(name, fn)` + the `hooks:` constructor option infer
 // `fn`'s exact shape from `name`, so a typo'd tap body or a wrong return shape is a COMPILE error
 // instead of silent `any`. Waterfalls thread + return their value; observers are fire-and-forget
-// (return ignored). `task` is always the backend-agnostic LeasedTask, and the worker observers
-// receive `ctx === {}`.
+// (return ignored). `task` is always the backend-agnostic LeasedTask; its `attempts` counts the
+// task's deliveries, this one included (1 on the first). The worker observers receive `ctx === {}`.
 export interface HookSignatures {
   resolveSizes: (
     sizes: SizeInput[],

@@ -17,6 +17,7 @@ import {
   ResizeMediaError,
   ResizeSecurityError,
   ResizeSetupError,
+  ResizeStorageError,
 } from './errors.ts';
 import {
   Resizer,
@@ -521,6 +522,68 @@ test('runWorker accepts a Resizer listed twice', async () => {
   });
 });
 
+test('task observers and their resize:<hook> events carry attempts', async () => {
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+  });
+  const emitted: { name: string; args: unknown[] }[] = [];
+  let downloads = 0;
+  const resizer = new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    events: {
+      emit: (name, ...args) => {
+        emitted.push({ name, args });
+      },
+    },
+    storage: {
+      download: async () => {
+        downloads += 1;
+        if (downloads === 1) {
+          throw new ResizeStorageError('resize: the bucket did not answer');
+        }
+        return png;
+      },
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({
+      load: async () => ({
+        id: 'm1',
+        original: { storageRef: { key: 'o' } },
+        previews: [],
+      }),
+    }),
+    locks: memoryLocks(),
+    tasks,
+  });
+  const failed: number[] = [];
+  const completed: number[] = [];
+  resizer.hook('onTaskFailed', (task) => {
+    failed.push(task.attempts);
+  });
+  resizer.hook('afterTaskComplete', (task) => {
+    completed.push(task.attempts);
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [webp10],
+    requestKey: 'attempts',
+  });
+  await workUntil(
+    { logger: silent, resizers: [resizer] },
+    () => completed.length === 1,
+  );
+  assert.deepEqual(failed, [1]);
+  assert.deepEqual(completed, [2]);
+  const onFailed = emitted.find(({ name }) => name === 'resize:onTaskFailed');
+  assert.ok(onFailed, 'the failure is mirrored on the event bus');
+  assert.equal((onFailed.args[0] as LeasedTask).attempts, 1);
+});
+
 test('two different Resizers listed under one name are RESIZE_DUPLICATE_RESIZER', async () => {
   const tasks = new MemoryTaskQueue();
   const first = queuedResizer('x', tasks);
@@ -982,7 +1045,8 @@ describe('dead-letter cooldown', () => {
     late.hook('onTaskDeadLettered', () => {
       observed.push('dead');
     });
-    const { taskId } = await t.tasks.add(taskOf('late'));
+    const added = await t.tasks.add(taskOf('late'));
+    assert.equal(added.status, 'added');
     const [row] = t.tasks.rows;
     const until = Date.now() + 5000;
     try {
@@ -1010,7 +1074,7 @@ describe('dead-letter cooldown', () => {
     assert.ok(
       t.errors.some((args) =>
         String(args[0]).includes(
-          `failed for task ${taskId} dropped — Resizer 'late' is not served by this worker`,
+          `failed for task ${added.taskId} dropped — Resizer 'late' is not served by this worker`,
         ),
       ),
     );

@@ -155,6 +155,14 @@ function request(over: Partial<Omit<NewTask, 'requestKey'>> = {}): NewTask {
   });
 }
 
+// Add a task the queue must report as `added` (stored, or an active copy of the same request), and
+// return its task ID.
+async function addedTaskId(task: NewTask): Promise<string> {
+  const result = await tasks.add(task);
+  assert.equal(result.status, 'added');
+  return result.taskId;
+}
+
 interface Rec {
   completed: [LeasedTask, unknown?][];
   failed: [LeasedTask, unknown?][];
@@ -330,7 +338,7 @@ describe('MongoTaskQueue setup', () => {
       token: 'token',
       attempts: 1,
     };
-    assert.deepEqual(await tasks.add(request()), { taskId: null });
+    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(await tasks.claim('default', 300), null);
     assert.equal(await tasks.renew(claimed, 300), false);
     assert.equal(await tasks.complete(claimed), false);
@@ -404,7 +412,7 @@ describe('MongoTaskQueue.add', () => {
   test('maps mediaId to fileId, stores pipeline and previews, returns the taskId', async () => {
     const payload = request({ pipeline: 'photo' });
     const before = Date.now();
-    const { taskId } = await tasks.add(payload);
+    const taskId = await addedTaskId(payload);
     assert.ok(taskId);
     const doc = await M.findById(taskId).lean();
     assert.ok(doc, 'added task doc should exist');
@@ -444,7 +452,7 @@ describe('MongoTaskQueue.add', () => {
             previews: [preview as MissingPreview],
           }),
         );
-        assert.deepEqual(result, { taskId: null });
+        assert.deepEqual(result, { status: 'unconfirmed' });
         assert.equal(await M.countDocuments({}), 0);
         assert.equal(errors.length, 1);
         const error = errors[0][1];
@@ -463,7 +471,7 @@ describe('MongoTaskQueue.add', () => {
       requestedWidth: 300,
     };
     const second = { sizeKey: 'fit', format: 'webp', fit: true };
-    const a = await tasks.add(
+    const a = await addedTaskId(
       request({
         mediaId,
         pipeline: 'photo',
@@ -474,7 +482,7 @@ describe('MongoTaskQueue.add', () => {
         ],
       }),
     );
-    const b = await tasks.add(
+    const b = await addedTaskId(
       request({
         mediaId,
         pipeline: 'photo',
@@ -484,8 +492,8 @@ describe('MongoTaskQueue.add', () => {
         ],
       }),
     );
-    assert.ok(a.taskId);
-    assert.equal(b.taskId, a.taskId);
+    assert.ok(a);
+    assert.equal(b, a);
     assert.equal(
       await M.countDocuments({
         fileId: mediaId,
@@ -500,11 +508,11 @@ describe('MongoTaskQueue.add', () => {
     const payload = request({
       previews: [{ sizeKey: '640w', format: 'avif' }],
     });
-    const results = await Promise.all(
-      Array.from({ length: 12 }, () => tasks.add(payload)),
+    const taskIds = await Promise.all(
+      Array.from({ length: 12 }, () => addedTaskId(payload)),
     );
-    assert.equal(new Set(results.map((result) => result.taskId)).size, 1);
-    assert.ok(results[0].taskId);
+    assert.equal(new Set(taskIds).size, 1);
+    assert.ok(taskIds[0]);
     assert.equal(
       await M.countDocuments({
         fileId: payload.mediaId,
@@ -535,8 +543,7 @@ describe('MongoTaskQueue.add', () => {
         return readCalls === 1 ? null : winner;
       },
     }));
-    const result = await tasks.add(request());
-    assert.equal(String(result.taskId), String(winner._id));
+    assert.equal(await addedTaskId(request()), String(winner._id));
     assert.equal(readCalls, 2, 'each duplicate race rereads the active winner');
   });
 
@@ -553,7 +560,7 @@ describe('MongoTaskQueue.add', () => {
         return null;
       },
     }));
-    assert.deepEqual(await tasks.add(request()), { taskId: null });
+    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(upserts, 3);
     assert.equal(reads, 3);
     assert.match(String(errors[0][0]), /contended/);
@@ -569,7 +576,7 @@ describe('MongoTaskQueue.add', () => {
         throw failure;
       },
     }));
-    assert.deepEqual(await tasks.add(request()), { taskId: null });
+    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(errors.length, 1);
     assert.equal(errors[0][1], failure);
   });
@@ -581,33 +588,33 @@ describe('MongoTaskQueue.add', () => {
         throw failure;
       },
     }));
-    assert.deepEqual(await tasks.add(request()), { taskId: null });
+    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(errors.length, 1);
     assert.equal(errors[0][1], failure);
   });
 
   test('different variants and pipelines remain separate requests', async () => {
     const mediaId = new mongoose.Types.ObjectId().toString();
-    const a = await tasks.add(request({ mediaId }));
-    const b = await tasks.add(
+    const a = await addedTaskId(request({ mediaId }));
+    const b = await addedTaskId(
       request({
         mediaId,
         previews: [{ sizeKey: '600x600', format: 'jpeg' }],
       }),
     );
-    const c = await tasks.add(request({ mediaId, pipeline: 'photo' }));
-    assert.notEqual(a.taskId, b.taskId);
-    assert.notEqual(a.taskId, c.taskId);
-    assert.notEqual(b.taskId, c.taskId);
+    const c = await addedTaskId(request({ mediaId, pipeline: 'photo' }));
+    assert.notEqual(a, b);
+    assert.notEqual(a, c);
+    assert.notEqual(b, c);
     assert.equal(await M.countDocuments({ fileId: mediaId }), 3);
   });
 
   test('processing request is returned unchanged, including attempts and payload', async () => {
     const payload = request();
-    const original = await tasks.add(payload);
+    const original = await addedTaskId(payload);
     assert.ok(await tasks.claim('default', 300));
-    assert.equal((await tasks.add(payload)).taskId, original.taskId);
-    const doc = await M.findById(original.taskId).lean();
+    assert.equal(await addedTaskId(payload), original);
+    const doc = await M.findById(original).lean();
     assert.ok(doc);
     assert.equal(doc.status, 'processing');
     assert.equal(doc.attempts, 1);
@@ -616,46 +623,43 @@ describe('MongoTaskQueue.add', () => {
 
   test('retry reuses the active row, while completed and dead rows permit a new request', async () => {
     const payload = request();
-    const first = await tasks.add(payload);
+    const first = await addedTaskId(payload);
     const leased = await tasks.claim('default', 300);
     assert.ok(leased);
     assert.equal(
       await tasks.fail(leased, { retryAt: new Date(Date.now() + 50) }, 'retry'),
       true,
     );
-    assert.equal((await tasks.add(payload)).taskId, first.taskId);
-    assert.equal((await M.findById(first.taskId).lean())?.attempts, 1);
-    await M.updateOne({ _id: first.taskId }, { $set: { status: 'completed' } });
-    const afterCompleted = await tasks.add(payload);
-    assert.notEqual(afterCompleted.taskId, first.taskId);
-    await M.updateOne(
-      { _id: afterCompleted.taskId },
-      { $set: { status: 'dead' } },
-    );
-    const afterDead = await tasks.add(payload);
-    assert.notEqual(afterDead.taskId, afterCompleted.taskId);
+    assert.equal(await addedTaskId(payload), first);
+    assert.equal((await M.findById(first).lean())?.attempts, 1);
+    await M.updateOne({ _id: first }, { $set: { status: 'completed' } });
+    const afterCompleted = await addedTaskId(payload);
+    assert.notEqual(afterCompleted, first);
+    await M.updateOne({ _id: afterCompleted }, { $set: { status: 'dead' } });
+    const afterDead = await addedTaskId(payload);
+    assert.notEqual(afterDead, afterCompleted);
   });
 
   test('legacy row without requestKey remains compatible', async () => {
     const legacy = await insert();
-    const created = await tasks.add(
+    const created = await addedTaskId(
       request({ mediaId: String(legacy.fileId) }),
     );
-    assert.ok(created.taskId);
-    assert.notEqual(created.taskId, String(legacy._id));
+    assert.ok(created);
+    assert.notEqual(created, String(legacy._id));
     assert.equal(await M.countDocuments({ fileId: legacy.fileId }), 2);
   });
 
-  test('returns taskId null and logs when getModel is falsy', async () => {
+  test('reports unconfirmed and logs when getModel is falsy', async () => {
     const { errors } = configureQueue(() => false);
     const result = await tasks.add(request({ pipeline: 'p', previews: [] }));
-    assert.equal(result.taskId, null);
+    assert.deepEqual(result, { status: 'unconfirmed' });
     assert.ok(errors.length >= 1);
   });
 
   test('findActive returns persisted payloads that can prove strict-enqueue coverage', async () => {
     const payload = request({ pipeline: 'photo' });
-    const added = await tasks.add(payload);
+    const added = await addedTaskId(payload);
     const active = await tasks.findActive({
       resizer: 'default',
       mediaId: payload.mediaId,
@@ -666,7 +670,7 @@ describe('MongoTaskQueue.add', () => {
         taskId,
         previews: canonicalizeVariants(previews),
       })),
-      [{ taskId: added.taskId, previews: payload.previews }],
+      [{ taskId: added, previews: payload.previews }],
     );
   });
 
@@ -674,7 +678,7 @@ describe('MongoTaskQueue.add', () => {
     const mediaId = new mongoose.Types.ObjectId().toString();
     const payload = request({ mediaId, pipeline: 'photo' });
     await tasks.add(request({ ...payload, resizer: 'listings' }));
-    const bulk = await tasks.add(request({ ...payload, queue: 'bulk' }));
+    const bulk = await addedTaskId(request({ ...payload, queue: 'bulk' }));
     const active = await tasks.findActive({
       resizer: 'default',
       mediaId,
@@ -685,7 +689,7 @@ describe('MongoTaskQueue.add', () => {
         taskId,
         previews: canonicalizeVariants(previews),
       })),
-      [{ taskId: bulk.taskId, previews: payload.previews }],
+      [{ taskId: bulk, previews: payload.previews }],
     );
   });
 
@@ -707,7 +711,7 @@ describe('MongoTaskQueue.add', () => {
 
   test('findActive excludes completed, dead, different-media, and different-pipeline tasks', async () => {
     const payload = request();
-    const own = await tasks.add(payload);
+    const own = await addedTaskId(payload);
     await insert({ fileId: payload.mediaId, status: 'completed' });
     await insert({ fileId: payload.mediaId, status: 'dead' });
     await insert({ fileId: payload.mediaId, pipeline: 'other' });
@@ -715,7 +719,7 @@ describe('MongoTaskQueue.add', () => {
     const active = await tasks.findActive(payload);
     assert.deepEqual(
       active.map(({ taskId }) => taskId),
-      [own.taskId],
+      [own],
     );
   });
 
@@ -730,7 +734,7 @@ describe('MongoTaskQueue.add', () => {
         },
       ],
     });
-    const existing = await tasks.add(payload);
+    const existing = await addedTaskId(payload);
     const resizer = new Resizer({
       storage: fakeStorage,
       config: makeImageConfig(),
@@ -752,7 +756,7 @@ describe('MongoTaskQueue.add', () => {
       formats: ['jpeg'],
     });
     assert.equal(result.status, 'accepted');
-    assert.equal(result.tasks[0].taskId, existing.taskId);
+    assert.equal(result.tasks[0].taskId, existing);
   });
 });
 
@@ -1030,12 +1034,12 @@ describe('MongoTaskQueue named queues and task events', () => {
       resizer: 'listings',
       previews: [{ sizeKey: '300x300', format: 'webp' }],
     });
-    const a = await tasks.add(payload);
-    const b = await tasks.add(request({ ...payload, queue: 'bulk' }));
-    const again = await tasks.add(payload);
-    assert.notEqual(a.taskId, b.taskId);
-    assert.equal(again.taskId, a.taskId);
-    const row = await M.findById(b.taskId).lean();
+    const a = await addedTaskId(payload);
+    const b = await addedTaskId(request({ ...payload, queue: 'bulk' }));
+    const again = await addedTaskId(payload);
+    assert.notEqual(a, b);
+    assert.equal(again, a);
+    const row = await M.findById(b).lean();
     assert.equal(row?.resizer, 'listings');
     assert.equal(row?.queue, 'bulk');
   });
@@ -1131,7 +1135,7 @@ describe('MongoTaskQueue.complete fencing', () => {
     assert.equal('fileId' in task, false);
     assert.equal('leaseToken' in task, false);
     assert.equal('token' in task, false);
-    assert.equal('attempts' in task, false);
+    assert.equal(task.attempts, 1);
   });
 
   test('a lapsed but unreclaimed lease can still complete because the token fences writes', async () => {
@@ -1452,14 +1456,12 @@ describe('Consumer with exhausted Mongo leases', () => {
 describe('Consumer with MongoTaskQueue', () => {
   test('add, claim, handle, and complete report the completed task', async () => {
     const payload = request({ pipeline: 'photo' });
-    const { taskId } = await tasks.add(payload);
+    const taskId = await addedTaskId(payload);
     const seen: { mediaId: string; taskId: string }[] = [];
     const rec = await consumeOne(async (task) => {
       seen.push({ mediaId: task.mediaId, taskId: task.taskId });
     });
-    assert.deepEqual(seen, [
-      { mediaId: payload.mediaId, taskId: String(taskId) },
-    ]);
+    assert.deepEqual(seen, [{ mediaId: payload.mediaId, taskId }]);
     assert.equal((await M.findById(taskId).lean())?.status, 'completed');
     assert.equal(rec.completed.length, 1);
   });
@@ -1467,7 +1469,7 @@ describe('Consumer with MongoTaskQueue', () => {
   test('graceful stop waits for an in-flight handler to finish', {
     timeout: 10_000,
   }, async () => {
-    const { taskId } = await tasks.add(
+    const taskId = await addedTaskId(
       request({
         previews: [{ sizeKey: '1x1', format: 'jpeg' }],
       }),
@@ -1494,7 +1496,7 @@ describe('Consumer with MongoTaskQueue', () => {
     timeout: 10_000,
   }, async () => {
     configureQueue(undefined, { taskTimeoutMs: 40 });
-    const { taskId } = await tasks.add(
+    const taskId = await addedTaskId(
       request({
         previews: [{ sizeKey: '1x1', format: 'jpeg' }],
       }),
@@ -1534,7 +1536,7 @@ describe('Consumer with MongoTaskQueue', () => {
       }
       return realClaim(queue, leaseMs);
     };
-    const { taskId } = await tasks.add(request());
+    const taskId = await addedTaskId(request());
     const rec = await consumeOne(async () => {});
     assert.ok(claimCalls >= 2);
     assert.ok(errors.length >= 1);
@@ -1625,7 +1627,7 @@ describe('Consumer with MongoTaskQueue', () => {
       leaseMs: 100,
       lockTtlMs: { dispatch: 60_000, worker: 100 },
     });
-    const { taskId } = await tasks.add(request());
+    const taskId = await addedTaskId(request());
     const rec = makeEvents();
     const { gate, releaseGate } = makeGate();
     let started = false;
@@ -1661,7 +1663,7 @@ describe('Consumer with MongoTaskQueue', () => {
       leaseMs: 100,
       lockTtlMs: { dispatch: 60_000, worker: 100 },
     });
-    const { taskId } = await tasks.add(request());
+    const taskId = await addedTaskId(request());
     let capturedSignal: AbortSignal | undefined;
     const { gate, releaseGate } = makeGate();
     const rec = makeEvents();

@@ -91,6 +91,7 @@ test('fills config, logger, events and the media and lock stores from the app', 
     mediaId: 'm1',
     pipeline: 'default',
     previews: [],
+    attempts: 1,
   };
   await processorOf(r).notify('completed', done);
   assert.deepEqual(emitted, [['resize:afterTaskComplete', done, {}]]);

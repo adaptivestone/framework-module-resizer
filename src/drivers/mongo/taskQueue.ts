@@ -5,6 +5,7 @@ import { hostname } from 'node:os';
 import {
   type ClaimedTask,
   type NewTask,
+  type TaskAddResult,
   TaskQueue,
 } from '../../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../../errors.ts';
@@ -123,10 +124,10 @@ export class MongoTaskQueue extends TaskQueue {
     return model;
   }
 
-  async add(task: NewTask): Promise<{ taskId: string | null }> {
+  async add(task: NewTask): Promise<TaskAddResult> {
     const model = this.#model();
     if (!model) {
-      return { taskId: null };
+      return { status: 'unconfirmed' };
     }
     const filter = activeRequestFilter(
       task.mediaId,
@@ -162,33 +163,35 @@ export class MongoTaskQueue extends TaskQueue {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const doc = await upsert();
-        return { taskId: doc ? String(doc._id) : null };
+        return doc
+          ? { status: 'added', taskId: String(doc._id) }
+          : { status: 'unconfirmed' };
       } catch (err) {
         if (!isDuplicateKeyError(err)) {
           this.#logger.error(
             `resize mongo queue: adding a task failed for media ${task.mediaId}`,
             err,
           );
-          return { taskId: null };
+          return { status: 'unconfirmed' };
         }
         try {
           const existing = await model.findOne(filter);
           if (existing) {
-            return { taskId: String(existing._id) };
+            return { status: 'added', taskId: String(existing._id) };
           }
         } catch (rereadError) {
           this.#logger.error(
             `resize mongo queue: rereading a duplicate task failed for media ${task.mediaId}`,
             rereadError,
           );
-          return { taskId: null };
+          return { status: 'unconfirmed' };
         }
       }
     }
     this.#logger.error(
       `resize mongo queue: adding a task stayed contended for media ${task.mediaId}`,
     );
-    return { taskId: null };
+    return { status: 'unconfirmed' };
   }
 
   // One findOneAndUpdate that returns at once (the core polls every idlePollMs), so it takes no

@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { beforeEach, describe, test } from 'node:test';
 import type { LockStore } from './contracts/locks.ts';
-import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
+import type {
+  NewTask,
+  TaskAddResult,
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import {
   buildRequestKey,
   Dispatcher,
@@ -34,12 +38,12 @@ beforeEach(() => {
   errors = [];
 });
 
-function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
+function makeTasks(behavior?: (task: NewTask) => TaskAddResult) {
   const calls: NewTask[] = [];
   const tasks = new MemoryTaskQueue();
   tasks.add = async (task) => {
     calls.push(task);
-    return behavior ? behavior(task) : { taskId: 't1' };
+    return behavior ? behavior(task) : { status: 'added', taskId: 't1' };
   };
   return { tasks, calls };
 }
@@ -336,7 +340,7 @@ describe('enqueue', () => {
     assert.equal(enqueued, 0); // no survivor → nothing handed over
   });
 
-  test('on success (non-null taskId) the survivor locks are NOT released', async () => {
+  test('on success (an added task) the survivor locks are NOT released', async () => {
     const { tasks } = makeTasks();
     const { locks, released } = makeLocks(true);
     const d = makeDispatcher({ tasks, locks });
@@ -373,18 +377,23 @@ describe('enqueue', () => {
     ]);
   });
 
-  test('releases survivor locks when taskId is null (soft failure)', async () => {
-    const { tasks } = makeTasks(() => ({ taskId: null }));
-    const { locks, released } = makeLocks(true);
-    const d = makeDispatcher({ tasks, locks });
-    const enqueued = await d.enqueue(requestFor([variant()]));
-    assert.deepEqual(
-      released.map(({ key }) => key),
-      ['resize_dispatch:m1:default:default:300x300:jpeg:none'],
-    );
-    assert.ok(errors.length >= 1);
-    assert.equal(enqueued, 0); // null taskId → soft failure → not counted
-  });
+  for (const result of [
+    { status: 'unconfirmed' },
+    { status: 'in-flight', taskId: 'other' },
+  ] as const) {
+    test(`releases survivor locks when the add is ${result.status} (soft failure)`, async () => {
+      const { tasks } = makeTasks(() => result);
+      const { locks, released } = makeLocks(true);
+      const d = makeDispatcher({ tasks, locks });
+      const enqueued = await d.enqueue(requestFor([variant()]));
+      assert.deepEqual(
+        released.map(({ key }) => key),
+        ['resize_dispatch:m1:default:default:300x300:jpeg:none'],
+      );
+      assert.ok(errors.length >= 1);
+      assert.equal(enqueued, 0); // not added → soft failure → not counted
+    });
+  }
 
   test('passes mediaId + pipeline + survivors through to the task queue', async () => {
     const { tasks, calls } = makeTasks();

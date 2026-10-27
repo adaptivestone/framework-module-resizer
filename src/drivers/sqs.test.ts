@@ -198,7 +198,7 @@ describe('SqsTaskQueue.add', () => {
       client,
     });
     const res = await tasks.add(newTask());
-    assert.equal(res.taskId, 'mid-1');
+    assert.deepEqual(res, { status: 'added', taskId: 'mid-1' });
     assert.equal(sent[0].input.QueueUrl, 'https://q/url');
     assert.deepEqual(JSON.parse(String(sent[0].input.MessageBody)), {
       resizer: 'default',
@@ -233,10 +233,10 @@ describe('SqsTaskQueue.add', () => {
     );
     assert.equal(sent.length, 0);
   });
-  test('returns a null taskId when the send response has no MessageId', async () => {
+  test('reports unconfirmed when the send response has no MessageId', async () => {
     const { client } = makeFakeSqsClient();
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
-    assert.equal((await tasks.add(newTask())).taskId, null);
+    assert.deepEqual(await tasks.add(newTask()), { status: 'unconfirmed' });
   });
   test('prewarm accepts a successful SQS MessageId receipt', async () => {
     const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
@@ -735,6 +735,7 @@ describe('Consumer with SqsTaskQueue', () => {
       mediaId: 'm1',
       pipeline: 'photo',
       previews: [variant()],
+      attempts: 1,
     });
   });
   test('a throwing handler reports failed with the original error and schedules redelivery without deletion', async () => {

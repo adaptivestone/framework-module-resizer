@@ -18,6 +18,7 @@ import {
 import {
   type ClaimedTask,
   type NewTask,
+  type TaskAddResult,
   TaskQueue,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
@@ -122,7 +123,7 @@ export class SqsTaskQueue extends TaskQueue {
     return this.#opts.timing ?? {};
   }
 
-  async add(task: NewTask): Promise<{ taskId: string | null }> {
+  async add(task: NewTask): Promise<TaskAddResult> {
     const body: TaskBody = {
       resizer: task.resizer,
       queue: task.queue,
@@ -136,7 +137,9 @@ export class SqsTaskQueue extends TaskQueue {
         MessageBody: JSON.stringify(body),
       }),
     );
-    return { taskId: out.MessageId ?? null };
+    return typeof out.MessageId === 'string'
+      ? { status: 'added', taskId: out.MessageId }
+      : { status: 'unconfirmed' };
   }
 
   async claim(

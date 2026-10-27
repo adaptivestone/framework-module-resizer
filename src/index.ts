@@ -28,8 +28,11 @@ export type {
 export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
 export {
   type ClaimedTask,
+  type ClaimOptions,
+  type FailOptions,
   type LeasedTask,
   type NewTask,
+  type TaskAddResult,
   type TaskEvent,
   type TaskEventHandler,
   TaskQueue,

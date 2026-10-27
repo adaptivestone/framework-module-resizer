@@ -166,20 +166,21 @@ export class Dispatcher {
       return 0;
     }
 
-    // 5/6. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
-    // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
+    // 5/6. Enqueue; on a throw OR any result but `added` (a soft failure) log + release the
+    // survivors' locks so a later read retries instead of waiting out the TTL. NEVER throw to
+    // caller.
     try {
-      const { taskId } = await tasks.add(
+      const added = await tasks.add(
         newTask(name, queue, mediaId, pipeline, survivors),
       );
-      if (taskId === null) {
+      if (added.status !== 'added') {
         logger.error(
-          `resize enqueue: the task queue returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
+          `resize enqueue: the task queue did not add the task for media ${mediaId} (status ${added.status}) — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
         );
         await releaseAll(logger, locks, survivorLockKeys);
         return 0;
       }
-      // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
+      // `added` = success: the dispatch locks are intentionally held to their TTL.
       return survivors.length;
     } catch (err) {
       logger.error(
@@ -193,8 +194,8 @@ export class Dispatcher {
 
   /**
    * Strict counterpart to enqueue(), for prewarm. A dispatch lock is only an optimization:
-   * losing it is never reported as accepted. Coverage is accepted only from a non-null enqueue
-   * receipt or from an optional TaskQueue.findActive() proof.
+   * losing it is never reported as accepted. Coverage is accepted only from an `added` enqueue
+   * result or from an optional TaskQueue.findActive() proof.
    */
   async enqueueConfirmed(
     req: DispatchRequest,
@@ -252,19 +253,24 @@ export class Dispatcher {
     const activeReceiptConflicts = new Map<string, MissingPreview>();
     if (winners.length > 0) {
       try {
-        const { taskId } = await taskQueue.add(
+        const added = await taskQueue.add(
           newTask(name, queue, mediaId, pipeline, winners),
         );
-        if (typeof taskId !== 'string' || taskId.length === 0) {
+        // Only `added` with a task ID is a receipt; any other result is unconfirmed.
+        if (
+          added.status !== 'added' ||
+          typeof added.taskId !== 'string' ||
+          added.taskId.length === 0
+        ) {
           issues.push({
             code: 'RESIZE_ENQUEUE_UNCONFIRMED',
-            message: 'the task queue returned a null taskId',
+            message: 'the task queue did not confirm the task',
             retryable: true,
             previews: winners,
           });
           await releaseAll(logger, locks, winnerKeys);
         } else {
-          const receipt = { taskId, previews: winners };
+          const receipt = { taskId: added.taskId, previews: winners };
           tasks.push(receipt);
           for (const preview of winners) {
             const identity = getPreviewIdentity(

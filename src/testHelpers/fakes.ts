@@ -7,6 +7,7 @@ import type { MediaStore } from '../contracts/media.ts';
 import {
   type ClaimedTask,
   type NewTask,
+  type TaskAddResult,
   TaskQueue,
 } from '../contracts/taskQueue.ts';
 import type {
@@ -107,7 +108,7 @@ export class MemoryTaskQueue extends TaskQueue {
     return row.status === 'pending' || row.status === 'processing';
   }
 
-  async add(task: NewTask): Promise<{ taskId: string | null }> {
+  async add(task: NewTask): Promise<TaskAddResult> {
     this.added.push(task);
     const existing = this.rows.find(
       (row) =>
@@ -117,7 +118,7 @@ export class MemoryTaskQueue extends TaskQueue {
         row.task.requestKey === task.requestKey,
     );
     if (existing) {
-      return { taskId: existing.id };
+      return { status: 'added', taskId: existing.id };
     }
     this.#seq += 1;
     const row: Row = {
@@ -130,7 +131,7 @@ export class MemoryTaskQueue extends TaskQueue {
       availableAt: 0,
     };
     this.rows.push(row);
-    return { taskId: row.id };
+    return { status: 'added', taskId: row.id };
   }
 
   async claim(queue: string, leaseMs: number): Promise<ClaimedTask | null> {
