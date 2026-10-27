@@ -5,13 +5,16 @@ import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
+import { timingOf } from '../../queue.ts';
 import type { Preview } from '../../types.d.ts';
 import {
   createResizeModels,
   MongoDatabase,
   MongoLockStore,
+  MongoMediaStore,
   MongoTaskQueue,
   mongoDatabase,
+  mongoParts,
   resizeLockFields,
 } from './index.ts';
 
@@ -19,7 +22,14 @@ let server: MongoMemoryServer;
 let connection: mongoose.Connection;
 
 before(async () => {
-  server = await MongoMemoryServer.create({ instance: { ip: '127.0.0.1' } });
+  // The TTL monitor is off: its sweep (every 60 s) could delete a lock a test has just expired
+  // before the test reads it. The index tests only check that the TTL index exists.
+  server = await MongoMemoryServer.create({
+    instance: {
+      ip: '127.0.0.1',
+      args: ['--setParameter', 'ttlMonitorEnabled=false'],
+    },
+  });
   connection = await mongoose
     .createConnection(server.getUri(), {
       dbName: `resize_mongo_drivers_${process.pid}`,
@@ -133,6 +143,11 @@ describe('MongoLockStore', () => {
     assert.equal(await store.acquire('l1', 'B', 60_000), true);
   });
 
+  test('a live lock blocks even its own owner', async () => {
+    assert.equal(await store.acquire('l7', 'A', 60_000), true);
+    assert.equal(await store.acquire('l7', 'A', 60_000), false);
+  });
+
   test('another owner can neither release nor extend the lock', async () => {
     assert.equal(await store.acquire('l2', 'A', 60_000), true);
     assert.equal(await store.release('l2', 'B'), false);
@@ -203,6 +218,26 @@ describe('MongoLockStore', () => {
       (err: Error & { code?: string }) =>
         err.code === 'RESIZE_MONGO_MODEL_REQUIRED',
     );
+  });
+
+  test('a create error other than a duplicate key is rethrown', async () => {
+    const failure = { code: 1 };
+    const updates: object[] = [];
+    const failing = new MongoLockStore({
+      model: {
+        create: () => Promise.reject(failure),
+        updateOne: async (filter) => {
+          updates.push(filter);
+          return { matchedCount: 1 };
+        },
+        deleteOne: async () => ({ deletedCount: 0 }),
+      },
+    });
+    await assert.rejects(
+      () => failing.acquire('l8', 'A', 1000),
+      (err: unknown) => err === failure,
+    );
+    assert.deepEqual(updates, [], 'no takeover is tried');
   });
 
   test('the ResizeLock schema stores the owner', () => {
@@ -324,5 +359,33 @@ describe('mongoDatabase', () => {
     });
     assert.ok(receipt.taskId);
     assert.equal(await ResizeTask.countDocuments({ _id: receipt.taskId }), 1);
+  });
+});
+
+describe('mongoParts', () => {
+  test('returns exactly the Resizer options media, locks and tasks, on the package models', async () => {
+    const parts = mongoParts(connection, {
+      mediaModel: Media(),
+      timing: { maxAttempts: 2 },
+    });
+    assert.deepEqual(Object.keys(parts).sort(), ['locks', 'media', 'tasks']);
+    assert.ok(
+      parts.media instanceof MongoMediaStore &&
+        parts.locks instanceof MongoLockStore &&
+        parts.tasks instanceof MongoTaskQueue,
+    );
+    assert.equal(timingOf(parts.tasks).maxAttempts, 2);
+    assert.equal(await parts.locks.acquire('p1', 'A', 1000), true);
+    assert.equal(
+      (await connection.models.ResizeLock.findById('p1').lean())?.owner,
+      'A',
+    );
+  });
+
+  test('each call makes its own task queue (call it once per process)', () => {
+    assert.notEqual(
+      mongoParts(connection, { mediaModel: Media() }).tasks,
+      mongoParts(connection, { mediaModel: Media() }).tasks,
+    );
   });
 });

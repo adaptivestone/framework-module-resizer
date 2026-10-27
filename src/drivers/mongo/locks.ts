@@ -3,7 +3,7 @@
 // several callers racing for a key only one matches. A TTL index removes expired locks, and one
 // that is still present is taken over by the next acquire.
 import { LockStore } from '../../contracts/locks.ts';
-import { ResizeSetupError } from '../../errors.ts';
+import { resolveModelOption } from './modelOption.ts';
 
 /** The lock model methods the store calls (any Mongoose model has them). */
 export interface MongoLockModel {
@@ -28,29 +28,19 @@ export interface MongoLockStoreOptions {
 const DUPLICATE_KEY = 11000;
 
 export class MongoLockStore extends LockStore {
-  readonly #getModel: () => MongoLockModel | null | undefined;
+  readonly #model: () => MongoLockModel;
 
   constructor(opts: MongoLockStoreOptions) {
     super();
-    if (!opts || (opts.model === undefined) === (opts.getModel === undefined)) {
-      throw new ResizeSetupError(
-        'resize: MongoLockStore needs exactly one of `model` or `getModel`',
-        { code: 'RESIZE_MONGO_MODEL_REQUIRED' },
-      );
-    }
-    const { model, getModel } = opts;
-    this.#getModel = getModel ?? (() => model);
+    this.#model = resolveModelOption(opts, {
+      driver: 'MongoLockStore',
+      missing:
+        'resize: MongoLockStore has no lock model — pass `model` (createResizeModels gives ResizeLock)',
+    });
   }
 
   protected lockModel(): MongoLockModel {
-    const model = this.#getModel();
-    if (!model) {
-      throw new ResizeSetupError(
-        'resize: MongoLockStore has no lock model — pass `model` (createResizeModels gives ResizeLock)',
-        { code: 'RESIZE_MONGO_MODEL_MISSING' },
-      );
-    }
-    return model;
+    return this.#model();
   }
 
   /** Startup check: the lock model must resolve, or every variant would fail at run time. */
