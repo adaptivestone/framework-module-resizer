@@ -991,32 +991,33 @@ describe('consumeQueue with SqsTaskQueue', () => {
 });
 
 describe('SqsTaskQueue options', () => {
-  test('rejects invalid lock TTLs at construction', () => {
-    assert.throws(
-      () =>
-        new SqsTaskQueue({
-          queueUrl: 'q',
-          timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
-        }),
-      (err: Error & { code?: string }) =>
-        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
-    );
-    assert.throws(
-      () =>
-        new SqsTaskQueue({
-          queueUrl: 'q',
-          timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
-        }),
-      (err: Error & { code?: string }) =>
-        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
-        /lockTtlMs\.failed/.test(err.message),
-    );
-    // Optional: the default cooldown applies.
-    const tasks = new SqsTaskQueue({
+  test('accepts any timing at construction; the core rejects bad lock TTLs when it reads the timing', () => {
+    const ttl = (err: Error & { code?: string }) =>
+      err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID';
+    // Built outside assert.throws, so a constructor that still checks the TTLs fails the test.
+    const badTtls = new SqsTaskQueue({
       queueUrl: 'q',
-      timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
+      timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
     });
-    assert.equal(timingOf(tasks).lockTtlMs.failed, 600_000);
+    const badCooldown = new SqsTaskQueue({
+      queueUrl: 'q',
+      timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
+    });
+    assert.throws(() => timingOf(badTtls), ttl);
+    assert.throws(
+      () => timingOf(badCooldown),
+      (err: Error & { code?: string }) =>
+        ttl(err) && /lockTtlMs\.failed/.test(err.message),
+    );
+    assert.equal(
+      timingOf(
+        new SqsTaskQueue({
+          queueUrl: 'q',
+          timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
+        }),
+      ).lockTtlMs.failed,
+      600_000,
+    );
   });
   test('requires queueUrl at construction', () => {
     assert.throws(

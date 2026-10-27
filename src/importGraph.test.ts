@@ -1,11 +1,13 @@
 // Guard: the package's main entry runs without @adaptivestone/framework. Walk every runtime
 // (value) import reachable from src/index.ts and fail if it reaches the framework, the framework
-// adapter, the ResizeTask model or the CLI command.
+// adapter, the ResizeTask model or the CLI command. Drivers import only contracts, errors, helpers,
+// types and other drivers, never core code.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { localImports, sourceFiles } from './testHelpers/imports.ts';
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 
@@ -119,6 +121,23 @@ for (const entry of [
     );
   });
 }
+
+test('drivers import only contracts, errors, helpers, types and other drivers', () => {
+  const allowed = (t: string) =>
+    t.startsWith('contracts/') ||
+    t === 'errors.ts' ||
+    t.startsWith('helpers/') ||
+    t === 'types.d.ts' ||
+    t.startsWith('drivers/');
+  const offending = sourceFiles()
+    .filter((f) => f.startsWith('drivers/'))
+    .flatMap((f) =>
+      localImports(f, { types: true })
+        .filter((t) => !allowed(t))
+        .map((t) => `${f} → ${t}`),
+    );
+  assert.deepEqual(offending, []);
+});
 
 test('the framework adapter is reachable from its own entry', () => {
   const { bare } = walk('framework/index.ts');

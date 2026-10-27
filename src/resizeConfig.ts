@@ -170,22 +170,6 @@ function validateRequiredResizeConfigFields(
   }
 }
 
-/** Validate lock TTLs: `{ dispatch, worker }` in positive safe-integer ms. */
-export function validateLockTtlMs(
-  lockTtlMs: unknown,
-): asserts lockTtlMs is { dispatch: number; worker: number } {
-  if (
-    !isRecord(lockTtlMs) ||
-    !isPositiveSafeInteger(lockTtlMs.dispatch) ||
-    !isPositiveSafeInteger(lockTtlMs.worker)
-  ) {
-    invalid(
-      'resize queue options: lockTtlMs needs dispatch and worker as positive safe integers (ms)',
-      'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
-    );
-  }
-}
-
 /**
  * Validate queue timing and lock TTLs (a task queue's timing, and the framework config file's
  * `queue` section). A worker lock must expire within the lease.

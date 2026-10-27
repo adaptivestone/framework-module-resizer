@@ -21,8 +21,6 @@ import {
   TaskQueue,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { validateFailedLockTtl } from '../queue.ts';
-import { validateLockTtlMs } from '../resizeConfig.ts';
 import type {
   MissingPreview,
   QueueTimingOptions,
@@ -35,7 +33,8 @@ export interface SqsTaskQueueOptions {
   // Where dead tasks go (their body plus the error), before they are deleted. Without it a dead
   // task is logged and deleted.
   deadLetterQueueUrl?: string;
-  timing?: Partial<QueueTimingOptions>; // missing values use defaultQueueOptions
+  // Missing values use defaultQueueOptions. The core checks the timing on first use, not here.
+  timing?: Partial<QueueTimingOptions>;
   waitTimeSeconds?: number; // long poll per claim, 0–20; default 10
   logger?: ResizeLogger; // default: console
   region?: string;
@@ -78,10 +77,6 @@ export class SqsTaskQueue extends TaskQueue {
       throw new ResizeSetupError('resize sqs: `queueUrl` is required', {
         code: 'RESIZE_SQS_QUEUE_URL_REQUIRED',
       });
-    }
-    if (opts.timing?.lockTtlMs !== undefined) {
-      validateLockTtlMs(opts.timing.lockTtlMs);
-      validateFailedLockTtl(opts.timing.lockTtlMs.failed);
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;

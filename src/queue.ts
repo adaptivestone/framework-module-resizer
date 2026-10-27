@@ -35,7 +35,7 @@ const timings = new WeakMap<object, QueueTiming>();
  * Check the optional dead-letter cooldown `lockTtlMs.failed` (ms) when it is set. Throws
  * ResizeConfigError.
  */
-export function validateFailedLockTtl(failed: unknown): void {
+function validateFailedLockTtl(failed: unknown): void {
   if (
     failed !== undefined &&
     !(typeof failed === 'number' && Number.isSafeInteger(failed) && failed > 0)
