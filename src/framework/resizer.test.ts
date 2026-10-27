@@ -11,7 +11,7 @@ import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { S3Storage } from '../drivers/s3.ts';
 import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
-import { resetResizerForTests } from '../resizer.ts';
+import { processorOf, resetResizerForTests } from '../resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
@@ -92,7 +92,7 @@ test('fills config, logger, events and the media and lock stores from the app', 
     pipeline: 'default',
     previews: [],
   };
-  await r.processor.notify('completed', done);
+  await processorOf(r).notify('completed', done);
   assert.deepEqual(emitted, [['resize:afterTaskComplete', done, {}]]);
 });
 

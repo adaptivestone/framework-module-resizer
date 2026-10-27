@@ -15,7 +15,12 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { getResizer, listResizers, type Resizer } from './resizer.ts';
+import {
+  getResizer,
+  listResizers,
+  processorOf,
+  type Resizer,
+} from './resizer.ts';
 import { timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
 
@@ -48,7 +53,7 @@ async function runTask(
   // timing through timingOf, which caches it, and outside runWorker invalid timing throws here, so
   // the task fails before anything is loaded.
   const queue = tasks ?? resizer.tasks;
-  return resizer.processor.processTask(task, {
+  return processorOf(resizer).processTask(task, {
     signal: taskOpts?.signal,
     workerLockTtlMs: queue
       ? timingOf(queue).lockTtlMs.worker
@@ -152,7 +157,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       // A served Resizer was readied at startup, so this resolves at once; it is kept so the
       // Processor is never read before ready().
       await owner.ready();
-      const { processor } = owner;
+      const processor = processorOf(owner);
       if (event === 'deadLettered') {
         // Outside the cooldown's never-reject guard, which is safe: this queue's timing was
         // validated through timingOf when its Consumer was built, and timingOf caches it.

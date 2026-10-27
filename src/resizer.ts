@@ -71,6 +71,9 @@ export interface ResizerOptions {
 // Constructed Resizers by name (see src/registry.ts).
 const registry = new Registry<Resizer>();
 
+// Set by the Resizer class, which alone can read its private services (see processorOf()).
+let readProcessor: (resizer: Resizer) => Processor;
+
 const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
 type PartName = (typeof PART_NAMES)[number];
 
@@ -142,6 +145,12 @@ export class Resizer {
   #queueFailure: QueueFailure | undefined;
   // The Dispatcher was built or its failure changed after the Reader was built.
   #readerStale = false;
+
+  static {
+    // processorOf() (below) reads the Processor through this; the services stay private.
+    readProcessor = (resizer) =>
+      resizer.#builtServices?.processor ?? resizer.#notReady('processor');
+  }
 
   constructor(opts: ResizerOptions) {
     // Runtime validation of the required parts (`storage` here, `media` below): the type system
@@ -245,14 +254,6 @@ export class Resizer {
       this.#notReady('tasks');
     }
     return this.#tasks;
-  }
-
-  /**
-   * Renders previews: the worker's entry for one queued task, the dead-letter cooldown and the task
-   * observers. Available once ready() has built the services.
-   */
-  get processor(): Processor {
-    return this.#builtServices?.processor ?? this.#notReady('processor');
   }
 
   #notReady(part: string): never {
@@ -540,6 +541,16 @@ export function getResizer(name?: string): Resizer {
 /** Every registered Resizer, in construction order (the worker serves all of them). */
 export function listResizers(): Resizer[] {
   return registry.list();
+}
+
+/**
+ * The Processor of `resizer`, which renders previews: the worker's entry for one queued task, the
+ * dead-letter cooldown and the task observers. Throws RESIZE_NOT_READY until ready() has built
+ * the services. Internal: the main entry does not export it, and it may change in any release.
+ * @internal
+ */
+export function processorOf(resizer: Resizer): Processor {
+  return readProcessor(resizer);
 }
 
 /**

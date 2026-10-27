@@ -34,7 +34,7 @@ import { HookBus } from './hooks.ts';
 import { getSizeKey, toMissingPreview } from './images.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { Processor, type ProcessorDeps } from './processor.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
@@ -524,22 +524,23 @@ describe('Processor', () => {
     );
   });
 
-  test("the Resizer's processor is RESIZE_NOT_READY until ready()", async () => {
+  test('processorOf() is RESIZE_NOT_READY until ready(); the Resizer has no public processor', async () => {
     const r = new Resizer({
       logger: silent,
       storage: makeStorage(redPng).storage,
       media: fakeMedia(),
     });
     assert.throws(
-      () => r.processor,
+      () => processorOf(r),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_NOT_READY' &&
         err.message.includes('processor'),
     );
     await r.ready();
-    assert.ok(r.processor instanceof Processor);
-    assert.equal(r.processor, r.processor);
+    assert.ok(processorOf(r) instanceof Processor);
+    assert.equal(processorOf(r), processorOf(r));
+    assert.equal('processor' in r, false);
   });
 });
 
