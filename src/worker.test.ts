@@ -466,7 +466,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
     /queue 'default'/.test(err.message) &&
     names.test(err.message);
 
-  test('is refused at start, naming the queue and the Resizers left out, before any claim', async () => {
+  test('is refused at start, naming the queue and the unlisted Resizers, before any claim', async () => {
     const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
     let claims = 0;
     tasks.claim = async () => {
@@ -504,12 +504,76 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
     );
   });
 
-  test('a Resizer whose parts cannot load is left out of the comparison', async () => {
+  // An unserved Resizer whose storage fails to load, and whose task queue part is `tasks`.
+  const storageDown = (name: string, tasks: ResizerOptions['tasks']) =>
+    new Resizer({
+      name,
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: async () => {
+        throw new Error('storage not up');
+      },
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks,
+    });
+
+  test('a Resizer whose other parts fail to load is still compared by its task queue', async () => {
     const tasks = new MemoryTaskQueue();
     const a = queuedResizer('a', tasks);
-    queuedResizer('broken', async () => {
-      throw new Error('queue not up');
+    // The storage fails first, while the task queue is still loading.
+    storageDown('half', async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      return tasks;
     });
+    await assert.rejects(
+      () =>
+        runWorker({
+          signal: AbortSignal.abort(),
+          logger: silent,
+          resizers: [a],
+        }),
+      (err: unknown) => unlisted(err, /'half'/),
+    );
+  });
+
+  test('a Resizer whose task queue cannot be loaded fails startup: it may share one', async () => {
+    const tasks = new MemoryTaskQueue();
+    let claims = 0;
+    tasks.claim = async () => {
+      claims += 1;
+      return null;
+    };
+    const a = queuedResizer('a', tasks);
+    const queueDown = new Error('queue not up');
+    queuedResizer('broken', async () => {
+      throw queueDown;
+    });
+    // Its storage fails too: the task queue alone decides.
+    storageDown('worse', async () => {
+      throw queueDown;
+    });
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await assert.rejects(
+        () => runWorker({ signal: stop.signal, logger: silent, resizers: [a] }),
+        (err: unknown) =>
+          unlisted(err, /'broken', 'worse'/) &&
+          /could not be determined/.test((err as Error).message) &&
+          (err as Error).cause === queueDown,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(claims, 0);
+  });
+
+  test('an unserved Resizer on its own task queue, or eager-only, lets the worker start', async () => {
+    const tasks = new MemoryTaskQueue();
+    const a = queuedResizer('a', tasks);
+    storageDown('own', async () => new MemoryTaskQueue());
+    storageDown('eager', undefined);
     await runWorker({
       signal: AbortSignal.abort(),
       logger: silent,

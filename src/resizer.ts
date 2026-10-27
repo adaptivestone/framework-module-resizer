@@ -71,8 +71,10 @@ export interface ResizerOptions {
 // Constructed Resizers by name (see src/registry.ts).
 const registry = new Registry<Resizer>();
 
-// Set by the Resizer class, which alone can read its private services (see processorOf()).
+// Set by the Resizer class, which alone can read its private services and parts (see
+// processorOf() and tasksPartOf()).
 let readProcessor: (resizer: Resizer) => Processor;
+let loadTasksPart: (resizer: Resizer) => Promise<TaskQueue | undefined>;
 
 const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
 type PartName = (typeof PART_NAMES)[number];
@@ -147,9 +149,13 @@ export class Resizer {
   #readerStale = false;
 
   static {
-    // processorOf() (below) reads the Processor through this; the services stay private.
+    // processorOf() and tasksPartOf() (below) read through these; the services stay private.
     readProcessor = (resizer) =>
       resizer.#builtServices?.processor ?? resizer.#notReady('processor');
+    loadTasksPart = async (resizer) => {
+      await resizer.#loadTasks();
+      return resizer.#tasks;
+    };
   }
 
   constructor(opts: ResizerOptions) {
@@ -304,11 +310,16 @@ export class Resizer {
         this.#loadPart('locks', this.#sources.locks, (locks) => {
           this.#locks = locks ?? undefined;
         }),
-        this.#loadPart('tasks', this.#sources.tasks, (tasks) => {
-          this.#tasks = tasks ?? undefined;
-        }),
+        this.#loadTasks(),
       ]);
     }
+  }
+
+  /** Load the task queue part alone, once (ready() loads it with the others). */
+  #loadTasks(): Promise<void> {
+    return this.#loadPart('tasks', this.#sources.tasks, (tasks) => {
+      this.#tasks = tasks ?? undefined;
+    });
   }
 
   /**
@@ -551,6 +562,17 @@ export function listResizers(): Resizer[] {
  */
 export function processorOf(resizer: Resizer): Processor {
   return readProcessor(resizer);
+}
+
+/**
+ * The task queue of `resizer` (undefined: eager only), loading only that part when it is a
+ * function that has not run, so a failure of another part cannot hide it. Rejects when the task
+ * queue itself cannot be loaded. The worker uses it to see which task queue a Resizer it does not
+ * serve uses. Internal: the main entry does not export it, and it may change in any release.
+ * @internal
+ */
+export function tasksPartOf(resizer: Resizer): Promise<TaskQueue | undefined> {
+  return loadTasksPart(resizer);
 }
 
 /**

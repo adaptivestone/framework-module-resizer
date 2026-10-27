@@ -20,6 +20,7 @@ import {
   listResizers,
   processorOf,
   type Resizer,
+  tasksPartOf,
 } from './resizer.ts';
 import { timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
@@ -63,10 +64,11 @@ async function runTask(
 
 /**
  * Refuse to start when a Resizer of this process that the worker does not serve uses one of the
- * task queues it consumes: the worker would claim that Resizer's tasks and fail them
- * (RESIZE_NO_RESIZER) into the dead-letter queue, with their events dropped. A Resizer whose task
- * queue is a function that has not run yet is loaded first; one whose parts cannot load is left
- * out (it cannot be compared). Resizers constructed in other processes cannot be seen here.
+ * task queues it consumes: the worker would claim that Resizer's tasks without running them. This
+ * is an early error only; the loop never runs such a task either (see runWorker). Only the task
+ * queue part of each such Resizer is loaded, so a failure of its other parts cannot hide it. A
+ * task queue that cannot be loaded fails startup too, since it may be one of these. Resizers
+ * constructed in other processes cannot be seen here.
  */
 async function refuseUnservedSharers(
   queue: string,
@@ -74,36 +76,38 @@ async function refuseUnservedSharers(
   unserved: Resizer[],
 ): Promise<void> {
   const sharing: string[] = [];
+  const unknown: string[] = [];
+  let loadError: unknown;
   for (const resizer of unserved) {
-    const tasks = await taskQueueOf(resizer);
+    let tasks: TaskQueue | undefined;
+    try {
+      tasks = await tasksPartOf(resizer);
+    } catch (err) {
+      unknown.push(`'${resizer.name}'`);
+      loadError ??= err;
+      continue;
+    }
     if (tasks && consumed.has(tasks)) {
       sharing.push(`'${resizer.name}'`);
     }
   }
+  const problems: string[] = [];
   if (sharing.length > 0) {
-    throw new ResizeSetupError(
-      `resize worker: Resizer(s) ${sharing.join(', ')} share a task queue this worker consumes for queue '${queue}' but are not in the \`resizers\` list — the worker would claim their tasks and dead-letter them; list them too, or give them their own task queue`,
-      { code: 'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED' },
+    problems.push(
+      `Resizer(s) ${sharing.join(', ')} share a task queue this worker consumes for queue '${queue}' but are not in the \`resizers\` list — the worker would claim their tasks without running them; list them too, or give them their own task queue`,
     );
   }
-}
-
-/** The task queue of `resizer`, loading its parts when they have not loaded; undefined if none. */
-async function taskQueueOf(resizer: Resizer): Promise<TaskQueue | undefined> {
-  const loaded = (): { tasks: TaskQueue | undefined } | undefined => {
-    try {
-      return { tasks: resizer.tasks };
-    } catch {
-      return undefined; // RESIZE_NOT_READY: its task queue is a function that has not run
-    }
-  };
-  const now = loaded();
-  if (now) {
-    return now.tasks;
+  if (unknown.length > 0) {
+    problems.push(
+      `the task queue of Resizer(s) ${unknown.join(', ')} failed to load, so whether it is one this worker consumes for queue '${queue}' could not be determined — fix that task queue (the load error is the cause)`,
+    );
   }
-  // Not a Resizer this worker serves, so its own failure is not the worker's.
-  await resizer.ready().catch(() => undefined);
-  return loaded()?.tasks;
+  if (problems.length > 0) {
+    throw new ResizeSetupError(`resize worker: ${problems.join('; ')}`, {
+      code: 'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED',
+      cause: loadError,
+    });
+  }
 }
 
 export interface RunWorkerOptions {

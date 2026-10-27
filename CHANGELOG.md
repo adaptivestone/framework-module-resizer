@@ -149,7 +149,8 @@
   events are logged and dropped. A listed Resizer that cannot start (its `ready()` or `verify()`
   rejects) makes `runWorker` reject before it claims anything. The list must include every
   Resizer of the process that uses a task queue the worker consumes (otherwise the worker would
-  claim their tasks and dead-letter them: `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`), and two listed
+  claim their tasks and dead-letter them: `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`, also when an
+  unlisted Resizer's task queue cannot be loaded, so it cannot be compared), and two listed
   Resizers need two names (`RESIZE_DUPLICATE_RESIZER`). `runWorker({ logger })` takes the
   worker loop's messages; failed lock calls (releases, the dead-letter cooldown) are logged through
   the owning Resizer's `logger`.

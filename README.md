@@ -165,8 +165,10 @@ verifies every listed Resizer, so one that cannot start, or whose task queue can
 lock store, invalid timing), rejects `runWorker`. A list must name each Resizer once (two
 Resizers under one name: `RESIZE_DUPLICATE_RESIZER`), and it must include every Resizer of the
 process that uses a task queue the worker consumes: otherwise the worker would claim their tasks
-and dead-letter them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. Resizers built
-only in other processes cannot be checked: construct every Resizer in the worker process too.
+and dead-letter them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. Of a Resizer it
+does not serve it loads only the task queue, and it rejects the same way when that task queue
+cannot be loaded, since it may be a shared one. Resizers built only in other processes cannot be
+checked: construct every Resizer in the worker process too.
 `logger` receives the worker loop's own messages; a failed lock call (a release, the dead-letter
 cooldown) is logged through the owning Resizer's `logger`. Framework hosts run
 `npm run cli ResizeWorker`, which serves the Resizers that `src/resizer.ts` constructs.
