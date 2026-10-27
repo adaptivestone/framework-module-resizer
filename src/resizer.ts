@@ -25,7 +25,7 @@ import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { timingOf } from './queue.ts';
-import { prewarmFailure, prewarmImpl, resolveImpl } from './reader.ts';
+import { prewarmFailure, Reader } from './reader.ts';
 import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
@@ -85,6 +85,7 @@ interface Services {
   catalog: Catalog;
   uploader: Uploader;
   dispatcher: Dispatcher | undefined; // only with a task queue
+  reader: Reader;
 }
 
 // How framework hosts get the parts below filled in from their app.
@@ -290,11 +291,22 @@ export class Resizer {
     if (!this.#builtServices) {
       // The locks and the queue timing are checked before the config (the order ready() states).
       const dispatcher = this.#buildDispatcher();
-      const { config } = this;
+      const { config, storage } = this;
+      const catalog = new Catalog({ config });
       this.#builtServices = {
-        catalog: new Catalog({ config }),
-        uploader: new Uploader({ storage: this.storage, config }),
+        catalog,
+        uploader: new Uploader({ storage, config }),
         dispatcher,
+        reader: new Reader({
+          catalog,
+          dispatcher,
+          hooks: this.#hooks,
+          pipelines: this.#pipelines,
+          storage,
+          logger: this.logger,
+          name: this.name,
+          queue: this.queue,
+        }),
       };
     }
     return this.#builtServices;
@@ -405,16 +417,17 @@ export class Resizer {
   }
 
   /**
-   * Read path (06 · §17) — the host calls this from its DTO builders. Delegates to the
-   * engine (src/engine.ts), which partitions ready vs missing, enqueues the missing set,
-   * and never throws into the caller's read.
+   * Read path — the host calls this from its DTO builders. Delegates to the Reader
+   * (src/reader.ts), which partitions ready vs missing, enqueues the missing set, and never
+   * throws into the caller's read.
    */
   async resolve(
     opts: ResolveOpts,
   ): Promise<{ decision: ReadDecision; output: unknown }> {
     let services: Services;
     try {
-      services = await this.#services(); // inside the never-throw guard
+      // The Reader guards the rest, but it does not exist until ready() succeeds.
+      services = await this.#services();
     } catch (err) {
       logNeverThrow(
         this.logger,
@@ -423,7 +436,7 @@ export class Resizer {
       );
       return { decision: { ready: [], missing: [] }, output: undefined };
     }
-    return resolveImpl(this, services.dispatcher, opts);
+    return services.reader.resolve(opts);
   }
 
   /**
@@ -435,7 +448,8 @@ export class Resizer {
   async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
     let services: Services;
     try {
-      services = await this.#services(); // inside the never-throw guard
+      // The Reader guards the rest, but it does not exist until ready() succeeds.
+      services = await this.#services();
     } catch (err) {
       logNeverThrow(
         this.logger,
@@ -444,7 +458,7 @@ export class Resizer {
       );
       return prewarmFailure(err, []);
     }
-    return prewarmImpl(this, services.dispatcher, opts);
+    return services.reader.prewarm(opts);
   }
 
   /**

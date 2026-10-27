@@ -780,7 +780,7 @@ describe('typed hooks', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolve/generate stubs', () => {
-  test('resolve delegates to the engine (no longer a stub)', async () => {
+  test('resolve delegates to the Reader (no longer a stub)', async () => {
     installFakeApp();
     const r = new FrameworkResizer(baseOpts());
     const { decision, output } = await r.resolve({
