@@ -1185,6 +1185,61 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     assert.deepEqual(tasks.releaseCalls, ['task-1']);
     assert.deepEqual(calls, [`extend ${key}`]);
   });
+
+  test('a slow lock store gets one heartbeat extend at a time, and the release follows the task', async () => {
+    const latencyMs = 150; // each extend takes longer than a heartbeat (50 ms)
+    const handlerMs = 400;
+    const base = clockLocks();
+    const calls: { op: 'extend' | 'release'; at: number }[] = [];
+    const slow: LockStore = {
+      acquire: base.acquire,
+      extend: async (lockKey, owner, ttlMs) => {
+        calls.push({ op: 'extend', at: Date.now() });
+        const held = await base.extend(lockKey, owner, ttlMs);
+        await sleepMs(latencyMs);
+        return held;
+      },
+      release: async (lockKey, owner) => {
+        calls.push({ op: 'release', at: Date.now() });
+        return base.release(lockKey, owner);
+      },
+    };
+    const tasks = new PlainTaskQueue({
+      timing: {
+        ...fastTiming,
+        leaseMs: 100,
+        lockTtlMs: { dispatch: 1000, worker: 100 },
+      },
+    });
+    assert.equal(await slow.acquire(key, 'g1', 1000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    let handlerEnded = 0;
+    await runUntil(
+      tasks,
+      async () => {
+        await sleepMs(handlerMs);
+        handlerEnded = Date.now();
+      },
+      () => tasks.rows[0].status === 'completed',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks: slow }) },
+    );
+    const extendCalls = calls.filter((call) => call.op === 'extend');
+    // The extends run one after another and each takes latencyMs, so while the handler runs at
+    // most handlerMs / latencyMs of them start after the start extend, and at most one more is
+    // pending when it ends: 1 + 400 / 150 + 1 ≈ 4.7, so never more than 5. One extend per
+    // heartbeat would make about 1 + 400 / 50 = 9.
+    assert.ok(
+      extendCalls.length >= 2 && extendCalls.length <= 5,
+      `${extendCalls.length} extends`,
+    );
+    const release = calls.find((call) => call.op === 'release');
+    assert.ok(release, 'the gate lock is released');
+    // The release waits for at most the one pending extend (latencyMs; 350 leaves room for slow
+    // timers). A backlog of one extend per heartbeat would delay it by about a second.
+    const gapMs = release.at - handlerEnded;
+    assert.ok(gapMs < 350, `released ${gapMs} ms after the handler ended`);
+    assert.equal(base.entry(key), undefined);
+  });
 });
 
 describe('the dead-letter cooldown on a task queue with gatesByTask', () => {

@@ -196,9 +196,12 @@ export class Consumer {
     let leaseLost = false;
     // The gate lock gets one lease when the task starts: the task may have waited in the queue for
     // most of the lock's time. Each heartbeat that renewed the lease extends it again, until the
-    // task ends. Gate calls run one after another, so the one made after the task lands last.
+    // task ends. Gate calls run one after another, so the one made after the task lands last. A
+    // heartbeat skips its extend while an earlier one is still pending, which serves as well: a
+    // slow lock store gets no backlog, and the task's end waits for at most that one call.
     const gate = this.#gate(task, coordination);
     let ended = false;
+    let extendPending = false;
     let gateCalls = this.#holdGate(task, gate, leaseMs);
     const heartbeat = setInterval(() => {
       tasks.renew(task, leaseMs).then(
@@ -206,10 +209,13 @@ export class Consumer {
           if (!held) {
             leaseLost = true;
             taskController.abort();
-          } else if (gate && !ended) {
-            gateCalls = gateCalls.then(() =>
-              this.#holdGate(task, gate, leaseMs),
-            );
+          } else if (gate && !ended && !extendPending) {
+            extendPending = true;
+            gateCalls = gateCalls
+              .then(() => this.#holdGate(task, gate, leaseMs))
+              .finally(() => {
+                extendPending = false;
+              });
           }
         },
         (err) => {
