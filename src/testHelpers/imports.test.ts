@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { importSpecifiers, localImports } from './imports.ts';
+import { importSpecifiers, localImports, resolveLocal } from './imports.ts';
 
 const source = [
   "import type { A } from './a.ts';",
@@ -44,6 +44,20 @@ test('an `import()` type counts only with types, after the statements', () => {
     './a.ts',
     './g.ts',
   ]);
+});
+
+test('a `.js` specifier names its `.ts` source (or its `.d.ts`), so it cannot slip past a rule', () => {
+  assert.deepEqual(
+    importSpecifiers("import { Resizer } from './resizer.js';", {
+      types: false,
+    }),
+    ['./resizer.js'],
+  );
+  assert.equal(resolveLocal('worker.ts', './resizer.js'), 'resizer.ts');
+  assert.equal(resolveLocal('worker.ts', './resizer.ts'), 'resizer.ts');
+  assert.equal(resolveLocal('framework/app.ts', '../index.js'), 'index.ts');
+  assert.equal(resolveLocal('helpers/log.ts', '../types.js'), 'types.d.ts');
+  assert.equal(resolveLocal('helpers/log.ts', '../types.d.ts'), 'types.d.ts');
 });
 
 test('localImports resolves relative specifiers against src/ and leaves packages out', () => {

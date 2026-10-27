@@ -3,8 +3,10 @@
 //   reachable from src/index.ts and fail if it reaches the framework, the framework adapter, the
 //   ResizeTask model or the CLI command;
 // - drivers import only contracts, errors, helpers, types and other drivers, never core code;
+// - helpers and contracts are leaves: they import only each other, errors and types;
 // - resizer.ts is the composition root: only the entry points (index.ts, worker.ts) and the
-//   framework adapter import it, and nothing it reaches imports it back, not even as a type.
+//   framework adapter import it, and nothing it reaches imports it back, not even as a type;
+//   nor does any other file import the main entry, which re-exports the Resizer.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -126,6 +128,28 @@ test('drivers import only contracts, errors, helpers, types and other drivers', 
   assert.deepEqual(offending, []);
 });
 
+test('helpers and contracts import only helpers, contracts, errors and types', () => {
+  const allowed = (t: string) =>
+    t.startsWith('helpers/') ||
+    t.startsWith('contracts/') ||
+    t === 'errors.ts' ||
+    t === 'types.d.ts';
+  const leaves = sourceFiles().filter(
+    (f) => f.startsWith('helpers/') || f.startsWith('contracts/'),
+  );
+  assert.ok(
+    leaves.includes('helpers/svgRaster.ts') &&
+      leaves.includes('contracts/taskQueue.ts'),
+    'sanity check: the listing does see the helpers and the contracts',
+  );
+  const offending = leaves.flatMap((f) =>
+    localImports(f, { types: true })
+      .filter((t) => !allowed(t))
+      .map((t) => `${f} → ${t}`),
+  );
+  assert.deepEqual(offending, []);
+});
+
 test('the framework adapter is reachable from its own entry', () => {
   const { bare } = walk('framework/index.ts');
   assert.ok(
@@ -151,6 +175,23 @@ test('only index.ts, worker.ts and the framework adapter import resizer.ts', () 
           localImports(f, { types: true }).includes('resizer.ts'),
       )
       .map((f) => `${f} → resizer.ts`),
+    [],
+  );
+});
+
+test('only tests and the framework adapter import the main entry (it re-exports the Resizer)', () => {
+  assert.ok(
+    localImports('index.test.ts', { types: true }).includes('index.ts'),
+    'sanity check: the listing does see a file importing index.ts',
+  );
+  assert.deepEqual(
+    sourceFiles()
+      .filter(
+        (f) =>
+          !f.startsWith('framework/') &&
+          localImports(f, { types: true }).includes('index.ts'),
+      )
+      .map((f) => `${f} → index.ts`),
     [],
   );
 });
