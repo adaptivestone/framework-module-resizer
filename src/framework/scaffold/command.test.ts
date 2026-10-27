@@ -205,16 +205,6 @@ describe('runScaffold — --eject', () => {
     assert.match(model, /@adaptivestone\/framework\/modules\/BaseModel\.js/);
     assert.match(
       model,
-      /requestKey:\s*\{\s*type:\s*String\s*\}/,
-      'the ejected schema accepts the transport request identity',
-    );
-    assert.match(
-      model,
-      /\{ fileId: 1, pipeline: 1, requestKey: 1 \}/,
-      'the ejected schema carries the active-request dedupe index',
-    );
-    assert.match(
-      model,
       /resizer:\s*\{\s*type:\s*String,\s*default:\s*'default'\s*\}/,
       'the ejected schema records the Resizer of each task',
     );
@@ -237,6 +227,45 @@ describe('runScaffold — --eject', () => {
     // Still the full set of files.
     assert.equal(await exists(COMMAND), true);
     assert.equal(await exists(CONFIG), true);
+  });
+
+  test('the ejected schema carries active, cooldownUntil and the gate index, and no requestKey', async () => {
+    await run(['--eject']);
+    const model = await read(MODEL);
+    assert.match(
+      model,
+      /active:\s*\{\s*type:\s*Boolean/,
+      'the ejected schema marks the task that holds the gate',
+    );
+    assert.match(
+      model,
+      /cooldownUntil:\s*\{\s*type:\s*Date/,
+      'the ejected schema records how long a dead task keeps the gate',
+    );
+    assert.match(
+      model,
+      /\{ resizer: 1, fileId: 1, pipeline: 1 \}/,
+      'the ejected schema carries the gate index',
+    );
+    assert.match(
+      model,
+      /partialFilterExpression:\s*\{\s*active:\s*true\s*\}/,
+      'the gate index covers active tasks only',
+    );
+    assert.doesNotMatch(model, /requestKey/);
+  });
+
+  test('an ejected model that still declares requestKey is not drift', async () => {
+    await run(['--eject']);
+    const model = (await read(MODEL)).replace(
+      /^ {6}queue: \{[^\n]+\n/m,
+      (line) => `${line}      requestKey: { type: String },\n`,
+    );
+    assert.match(model, /requestKey: \{ type: String \}/);
+    await writeFile(join(root, MODEL), model);
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 0, out);
+    assert.doesNotMatch(out, /drift/);
   });
 
   test('honors skip-if-exists without --force', async () => {
@@ -338,9 +367,10 @@ describe('runScaffold — --check', () => {
   for (const fields of [
     ['resizer'],
     ['queue'],
-    ['requestKey'],
     ['availableAt'],
-    ['resizer', 'queue', 'requestKey', 'availableAt'],
+    ['active'],
+    ['cooldownUntil'],
+    ['resizer', 'queue', 'availableAt', 'active', 'cooldownUntil'],
   ]) {
     test(`an ejected model missing ${fields.join(', ')} is drift even with its indexes intact`, async () => {
       await run(['--eject']);
@@ -357,7 +387,7 @@ describe('runScaffold — --check', () => {
       assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
       assert.match(
         out,
-        /port the resizer, queue, requestKey and availableAt fields/,
+        /port the resizer, queue, availableAt, active and cooldownUntil fields \(and the gate index\)/,
       );
       assert.match(out, /delete the file and re-run resize-scaffold --eject/);
       assert.doesNotMatch(out, /--force/);

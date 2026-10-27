@@ -33,9 +33,10 @@ export default class ResizeTask extends BaseModel {
       // queue it waits in. Rows written before tasks recorded them read as 'default'.
       resizer: { type: String, default: 'default' },
       queue: { type: String, default: 'default' },
-      // SHA-256 identity of the complete enqueue request. Keep this optional so
-      // rows created by older module versions remain readable during upgrades.
-      requestKey: { type: String },
+      // True while the task is the gate of its media and pipeline.
+      active: { type: Boolean, default: false },
+      // A dead task keeps the gate until then.
+      cooldownUntil: { type: Date },
       // The REQUESTED variants to generate (NOT the full stored Preview — the worker computes
       // key/dims/contentType and $pushes those to the media doc).
       previews: [
@@ -97,17 +98,12 @@ export default class ResizeTask extends BaseModel {
     );
     // Per-media task lookup, newest first.
     schema.index({ fileId: 1, createdAt: -1 });
-    // One active row per exact canonical request. Completed/dead and old rows
-    // without requestKey do not block a later explicit enqueue.
+    // The gate: at most one active task per Resizer, media and pipeline. add() inserts an active
+    // row, so a duplicate key on this index means another task is in flight; rows that are not
+    // active (finished, taken over, or written before the gate) never block a new task.
     schema.index(
-      { fileId: 1, pipeline: 1, requestKey: 1 },
-      {
-        unique: true,
-        partialFilterExpression: {
-          status: { $in: ['pending', 'processing'] },
-          requestKey: { $exists: true },
-        },
-      },
+      { resizer: 1, fileId: 1, pipeline: 1 },
+      { unique: true, partialFilterExpression: { active: true } },
     );
     // 👉 Add your custom indexes here.
   }
