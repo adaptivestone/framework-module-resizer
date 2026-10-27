@@ -1,10 +1,12 @@
-// Direct unit coverage for the four INTERNAL generic helpers. Behavior these express is also
+// Direct unit coverage for the five INTERNAL generic helpers. Behavior these express is also
 // exercised through images/uploader/processor/consumer/mongo tests; we pin the utilities themselves
-// (guards edge cases, hex shape, abortable sleep, bounded pool + abort) directly.
+// (guards edge cases, hex shape, abortable sleep, bounded pool + abort, never-throwing logging)
+// directly.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { runBounded } from './concurrency.ts';
 import { isPositiveFinite } from './guards.ts';
+import { logNeverThrow } from './log.ts';
 import { randomHex } from './random.ts';
 import { sleep } from './sleep.ts';
 
@@ -125,5 +127,42 @@ describe('runBounded', () => {
       processed.push(n);
     });
     assert.equal(processed.length, 0);
+  });
+});
+
+describe('logNeverThrow', () => {
+  test('logs at the given level, error by default', () => {
+    const calls: unknown[][] = [];
+    const logger = {
+      info: (...a: unknown[]) => calls.push(['info', ...a]),
+      warn: (...a: unknown[]) => calls.push(['warn', ...a]),
+      error: (...a: unknown[]) => calls.push(['error', ...a]),
+    };
+    const err = new Error('x');
+    logNeverThrow(logger, 'a', err);
+    logNeverThrow(logger, 'b', undefined, 'info');
+    logNeverThrow(logger, 'c', err, 'warn');
+    assert.deepEqual(calls, [
+      ['error', 'a', err],
+      ['info', 'b'],
+      ['warn', 'c', err],
+    ]);
+  });
+
+  test('a throwing logger falls back to the console method of the same level', (t) => {
+    const fallback = t.mock.method(console, 'info', () => {});
+    const throws = () => {
+      throw new Error('log sink down');
+    };
+    logNeverThrow(
+      { info: throws, warn: throws, error: throws },
+      'stopped',
+      undefined,
+      'info',
+    );
+    assert.deepEqual(
+      fallback.mock.calls.map((call) => call.arguments),
+      [['stopped']],
+    );
   });
 });

@@ -1,11 +1,15 @@
 // The worker loop (Consumer) against the in-memory TaskQueue: the same lifecycle every backend
 // gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash loops,
-// timeouts, lost leases, graceful shutdown and resilient claiming.
+// timeouts, lost leases, graceful shutdown and resilient claiming — plus the gate lock it holds on
+// a queue without gatesByTask, the dead-letter cooldown it passes to a queue with it, and a host
+// logger that throws.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { backoffMs, Consumer } from './consumer.ts';
+import type { LockStore } from './contracts/locks.ts';
 import type {
   ClaimedTask,
+  ClaimOptions,
   LeasedTask,
   NewTask,
   TaskEvent,
@@ -16,8 +20,10 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
 } from './errors.ts';
+import { gateKey } from './lockKeys.ts';
 import { consume } from './testHelpers/consume.ts';
 import {
+  clockLocks,
   MemoryTaskQueue,
   PlainTaskQueue,
   ReleasingTaskQueue,
@@ -106,12 +112,17 @@ const fastTiming = {
   maxAttempts: 3,
 };
 
-/** Run the loop until `done()` (or 5 s), then stop it and wait for it to return. */
+type ConsumeOptions = Parameters<typeof consume>[1];
+
+/**
+ * Run the loop until `done()` (or 5 s), then stop it and wait for it to return. `opts` go to the
+ * Consumer (default logger: silent).
+ */
 async function runUntil(
-  tasks: MemoryTaskQueue,
+  tasks: MemoryTaskQueue | PlainTaskQueue,
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>,
   done: () => boolean,
-  logger: { info(): void; warn(): void; error(...a: unknown[]): void } = silent,
+  opts: Pick<ConsumeOptions, 'logger' | 'resizers' | 'coordinationOf'> = {},
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -122,7 +133,8 @@ async function runUntil(
     onEvent: (event, task, error) => {
       events.push({ event, task, error });
     },
-    logger,
+    logger: silent,
+    ...opts,
   });
   const until = Date.now() + 5000;
   try {
@@ -491,7 +503,7 @@ describe('Consumer', () => {
       tasks,
       async () => {},
       () => tasks.rows[0].status === 'completed',
-      { ...silent, error: (...a: unknown[]) => errors.push(a) },
+      { logger: { ...silent, error: (...a: unknown[]) => errors.push(a) } },
     );
     assert.equal(errors.length, 2);
   });
@@ -518,7 +530,12 @@ describe('Consumer', () => {
       tasks,
       async () => {},
       () => starts.length >= script.length + 1,
-      { ...silent, error: (msg: unknown) => errors.push(String(msg)) },
+      {
+        logger: {
+          ...silent,
+          error: (msg: unknown) => errors.push(String(msg)),
+        },
+      },
     );
     // The delays the loop chose: 10, 20, 40, 80, then capped at 10 × idlePollMs = 100 (uncapped it
     // would be 160), and 10 again after the successful (empty) claim. The cap and the reset are read
@@ -940,6 +957,337 @@ describe('a task the Consumer does not accept', () => {
     assert.equal(tasks.rows[0].status, 'completed');
     assert.deepEqual(tasks.releaseCalls, []);
   });
+});
+
+/** A LockStore that records every call and holds nothing. */
+function recordingLocks() {
+  const calls: string[] = [];
+  const locks: LockStore = {
+    acquire: async (key) => {
+      calls.push(`acquire ${key}`);
+      return true;
+    },
+    extend: async (key) => {
+      calls.push(`extend ${key}`);
+      return true;
+    },
+    release: async (key) => {
+      calls.push(`release ${key}`);
+      return true;
+    },
+  };
+  return { locks, calls };
+}
+
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe('the gate lock on a task queue without gatesByTask', () => {
+  const gateTiming = {
+    ...fastTiming,
+    leaseMs: 200,
+    idlePollMs: 5,
+    retryBackoffMs: { base: 60_000, max: 60_000 },
+  };
+  const key = gateKey('default', 'm1', 'default');
+
+  /** A PlainTaskQueue with one task of owner 'g1', whose gate lock is held for 50 ms. */
+  async function gatedTask(locks: LockStore) {
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    assert.equal(await locks.acquire(key, 'g1', 50), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    return tasks;
+  }
+
+  test('is extended when the task starts and on every heartbeat, and released on completion', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    const left: number[] = [];
+    const remaining = () => (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    const events = await runUntil(
+      tasks,
+      async () => {
+        left.push(remaining());
+        await sleepMs(250); // past the first lease: only heartbeats keep it
+        left.push(remaining());
+      },
+      () => tasks.rows[0].status === 'completed',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.ok(left[0] > 100, `held for ${left[0]} ms when the task started`);
+    assert.ok(left[1] > 0, `held for ${left[1]} ms after 250 ms`);
+    assert.equal(locks.entry(key), undefined, 'released on completion');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+  });
+
+  test('a retry holds it for the backoff plus one lease', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new Error('once');
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+    const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    assert.ok(left >= 60_100 && left <= 60_200, `held for ${left} ms`);
+  });
+
+  test("a dead-letter holds it for the Resizer's cooldownMs", async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeMediaError('x', { retryable: false });
+      },
+      () => tasks.rows[0].status === 'dead',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    assert.ok(left >= 29_900 && left <= 30_000, `held for ${left} ms`);
+  });
+
+  test('a lock another request took over after it expired stays theirs', async () => {
+    let t = 0;
+    const locks = clockLocks(() => t);
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    assert.equal(await locks.acquire(key, 'g1', 10), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    t = 100; // g1's lock expired, and a new request took the gate
+    assert.equal(await locks.acquire(key, 'g2', 10_000), true);
+    const events = await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    assert.deepEqual(locks.entry(key), { owner: 'g2', expiresAt: 10_100 });
+  });
+
+  test('a rejecting lock store is logged and never changes the outcome', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    locks.extend = async () => {
+      throw new Error('lock store down');
+    };
+    locks.release = async () => {
+      throw new Error('lock store down');
+    };
+    const errors: unknown[][] = [];
+    const events = await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({ cooldownMs: 30_000, locks }),
+        logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
+      },
+    );
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    assert.ok(errors.length > 0, 'the failures are logged');
+    for (const [message, err] of errors) {
+      assert.match(String(message), /gate/);
+      assert.match(String(err), /lock store down/);
+    }
+  });
+
+  test('a task without gateOwner touches no lock', async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    await tasks.add(newTask());
+    await tasks.add(newTask({ mediaId: 'm2' }));
+    const events = await runUntil(
+      tasks,
+      async (task) => {
+        if (task.mediaId === 'm2') {
+          throw new ResizeMediaError('x', { retryable: false });
+        }
+        await sleepMs(150); // past a heartbeat
+      },
+      () => tasks.rows[1].status === 'dead',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed', 'deadLettered'],
+    );
+    assert.deepEqual(calls, []);
+  });
+
+  test('a task whose lease was lost leaves it to the new holder after the start', async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    // Another worker took the task over: no heartbeat extends the lock, and fail() is fenced.
+    tasks.renew = async () => {
+      tasks.rows[0].token = 'another-worker';
+      return false;
+    };
+    let aborted = false;
+    const events = await runUntil(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(new Error('lease lost'));
+            },
+            { once: true },
+          );
+        }),
+      () => aborted,
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.deepEqual(events, []);
+    assert.deepEqual(calls, [`extend ${key}`]);
+  });
+
+  test('a task given back at shutdown leaves it alone after the start', async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new ReleasingTaskQueue({ timing: gateTiming });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const stop = new AbortController();
+    await consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => {
+        const stopped = stoppedByShutdown(task, opts);
+        stop.abort();
+        return stopped;
+      },
+      logger: silent,
+      coordinationOf: () => ({ cooldownMs: 30_000, locks }),
+    });
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    assert.deepEqual(calls, [`extend ${key}`]);
+  });
+});
+
+describe('the dead-letter cooldown on a task queue with gatesByTask', () => {
+  const deadOnce = async () => {
+    throw new ResizeMediaError('x', { retryable: false });
+  };
+
+  test("fail('dead') receives the Resizer's cooldownMs, and no lock is touched", async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new MemoryTaskQueue({ timing: fastTiming, now: () => 1_000 });
+    // Even with a gateOwner: the task row is the gate here.
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const events = await runUntil(
+      tasks,
+      deadOnce,
+      () => tasks.rows[0].status === 'dead',
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    assert.equal(tasks.rows[0].cooldownUntil, 31_000);
+    assert.deepEqual(calls, []);
+  });
+
+  for (const [label, opts] of [
+    ['coordinationOf gives none', { coordinationOf: () => undefined }],
+    ['the Consumer has no coordinationOf', {}],
+  ] as const) {
+    test(`without coordination for the task, a dead-letter gets the default cooldown (${label})`, async () => {
+      const tasks = new MemoryTaskQueue({
+        timing: fastTiming,
+        now: () => 1_000,
+      });
+      await tasks.add(newTask());
+      await runUntil(
+        tasks,
+        deadOnce,
+        () => tasks.rows[0].status === 'dead',
+        opts,
+      );
+      assert.equal((tasks.rows[0].cooldownUntil ?? 0) - 1_000, 600_000);
+    });
+  }
+});
+
+test('claim receives the served Resizer names', async () => {
+  const tasks = new MemoryTaskQueue({ timing: fastTiming });
+  const seen: (ClaimOptions | undefined)[] = [];
+  const stop = new AbortController();
+  tasks.claim = async (_queue, _leaseMs, _signal, opts) => {
+    seen.push(opts);
+    stop.abort();
+    return null;
+  };
+  await new Consumer({
+    tasks,
+    timing: timingOf(tasks),
+    resizers: ['a', 'b'],
+    handle: async () => {},
+    logger: silent,
+  }).run('default', stop.signal);
+  assert.deepEqual(seen, [{ resizers: ['a', 'b'] }]);
+});
+
+test('a throwing logger never stops the loop or fails a task', async (t) => {
+  // The fallback writes to the console: keep the test output clean, and count the lines.
+  const fallback = t.mock.method(console, 'error', () => {});
+  const tasks = new MemoryTaskQueue({ timing: fastTiming });
+  await tasks.add(newTask());
+  const realClaim = tasks.claim.bind(tasks);
+  let claims = 0;
+  tasks.claim = async (...args: Parameters<MemoryTaskQueue['claim']>) => {
+    claims += 1;
+    if (claims === 1) {
+      throw new Error('db blip');
+    }
+    return realClaim(...args);
+  };
+  const logSinkDown = () => {
+    throw new Error('log sink down');
+  };
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), 5000);
+  try {
+    await new Consumer({
+      tasks,
+      timing: timingOf(tasks),
+      handle: async () => {
+        stop.abort();
+      },
+      events: () => {
+        throw new Error('observer bug');
+      },
+      logger: { info: logSinkDown, warn: logSinkDown, error: logSinkDown },
+    }).run('default', stop.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(tasks.rows[0].status, 'completed');
+  // The claim failure and the observer failure, each written to the console instead.
+  assert.equal(fallback.mock.callCount(), 2);
 });
 
 describe('backoffMs', () => {

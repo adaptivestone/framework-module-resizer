@@ -1,6 +1,8 @@
 // Lock keys and owners. A dispatch lock is held per preview identity of a media while that variant
 // is queued, so concurrent reads queue it once; the worker also holds it for a cooldown after the
-// variant's task is dead-lettered. A worker lock is held while one worker renders the variant.
+// variant's task is dead-lettered. A worker lock is held while one worker renders the variant. On a
+// task queue without gatesByTask, the gate lock of a Resizer, media and pipeline is held while its
+// task is queued, in flight, waiting for a retry, and for the cooldown after a dead-letter.
 
 /**
  * The owner of every dispatch lock. The worker releases dispatch locks that a read took, possibly
@@ -20,4 +22,16 @@ export function dispatchLockKey(mediaId: string, identity: string): string {
 /** The worker lock of one preview identity of a media: one worker renders it at a time. */
 export function workerLockKey(mediaId: string, identity: string): string {
   return `resize_worker:${mediaId}:${identity}`;
+}
+
+/**
+ * The gate lock of one Resizer, media and pipeline on a task queue without gatesByTask: while it
+ * is held, no other task is queued for them. Its owner travels with the task as `gateOwner`.
+ */
+export function gateKey(
+  resizer: string,
+  mediaId: string,
+  pipeline: string,
+): string {
+  return `resize_gate:${resizer}:${mediaId}:${pipeline}`;
 }

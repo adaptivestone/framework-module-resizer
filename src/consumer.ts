@@ -1,16 +1,24 @@
-// The worker loop, the same for every TaskQueue backend: claiming, the lease heartbeat, the task
-// timeout, giving tasks back (at shutdown, and tasks the worker does not accept), the retry policy
-// (backoff, dead-lettering after maxAttempts, non-retryable errors) and task events. Backends only
-// implement the atomic TaskQueue operations.
+// The worker loop, the same for every TaskQueue backend: claiming (the served Resizers' tasks only,
+// on a queue that filters claims), the lease heartbeat, the task timeout, giving tasks back (at
+// shutdown, and tasks the worker does not accept), the retry policy (backoff, dead-lettering after
+// maxAttempts, non-retryable errors), the dead-letter cooldown, the gate lock of a queue without
+// gatesByTask, and task events. Backends only implement the atomic TaskQueue operations. The host
+// logger is called only through logNeverThrow, so a logger that throws never stops the loop.
+import { defaultCoordination } from './config/resize.ts';
+import type { LockStore } from './contracts/locks.ts';
 import type {
   ClaimedTask,
+  ClaimOptions,
   LeasedTask,
   TaskEvent,
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+import type { TaskCoordination } from './coordination.ts';
 import { ResizeError } from './errors.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import { sleep } from './helpers/sleep.ts';
+import { gateKey } from './lockKeys.ts';
 import type { QueueTiming } from './timing.ts';
 import type { QueueTimingOptions, ResizeLogger } from './types.d.ts';
 
@@ -57,6 +65,28 @@ export interface ConsumerDeps {
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>;
   events?: TaskEventHandler;
   logger: ResizeLogger;
+  // Optional: the Resizers this worker serves, passed to every claim, so a queue that filters
+  // claims hands out only their tasks.
+  resizers?: readonly string[];
+  // Optional, must not throw: the coordination of the task's Resizer, read once for each task the
+  // worker accepts: the cooldown its dead-letter gets, and the lock store that holds its gate lock
+  // on a queue without gatesByTask. Undefined, or absent: the default cooldown and no gate lock.
+  coordinationOf?: (task: LeasedTask) => TaskCoordination | undefined;
+}
+
+// The gate lock of a task on a queue without gatesByTask. Such a queue cannot tell that a task of
+// the same Resizer, media and pipeline is already active, so the Dispatcher takes a lock in the
+// Resizer's LockStore when it queues one, under an owner that travels with the task (`gateOwner`).
+// The Consumer keeps that lock for as long as the task can still run: one lease when the task
+// starts and on every heartbeat, the backoff plus one lease after a retry, the cooldown after a
+// dead-letter; it releases the lock once the task is completed. A task given back, or one whose
+// lease was lost, leaves the lock to the task's next holder. Every call is best effort: `false`
+// (the lock expired, or another request took it over) is ignored, a failure is logged, and neither
+// changes the task's outcome or its events.
+interface GateLock {
+  locks: LockStore;
+  key: string;
+  owner: string;
 }
 
 // Consecutive claim failures wait idlePollMs × 2^(n-1), up to this many idlePollMs, so a down
@@ -78,14 +108,18 @@ export class Consumer {
    * growing delay that resets after the next successful claim.
    */
   async run(queue: string, signal: AbortSignal): Promise<void> {
-    const { tasks, timing, accepts, logger } = this.#deps;
+    const { tasks, timing, accepts, resizers, coordinationOf, logger } =
+      this.#deps;
     const { leaseMs, idlePollMs, maxAttempts } = timing;
+    const claimOptions: ClaimOptions | undefined = resizers
+      ? { resizers }
+      : undefined;
     let claimFailures = 0;
     while (!signal.aborted) {
       let task: ClaimedTask | null;
       const claimStarted = Date.now();
       try {
-        task = await tasks.claim(queue, leaseMs, signal);
+        task = await tasks.claim(queue, leaseMs, signal, claimOptions);
       } catch (err) {
         if (signal.aborted) {
           break;
@@ -94,7 +128,8 @@ export class Consumer {
         const waitMs =
           idlePollMs *
           Math.min(2 ** (claimFailures - 1), MAX_CLAIM_ERROR_BACKOFF);
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize worker: claiming a task failed (${claimFailures} in a row) — retrying in ${waitMs} ms`,
           err,
         );
@@ -118,10 +153,12 @@ export class Consumer {
         await sleep(idlePollMs, signal);
         continue;
       }
+      const coordination = coordinationOf?.(toLeasedTask(task));
       // Delivered more often than allowed (its workers kept crashing mid-task): dead, not retried.
       if (task.attempts > maxAttempts) {
         await this.#finish(
           task,
+          coordination,
           new ResizeError(
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
             { code: 'RESIZE_TASK_MAX_ATTEMPTS' },
@@ -135,12 +172,19 @@ export class Consumer {
         await this.#giveBackAtShutdown(task);
         break;
       }
-      await this.#runTask(task, signal);
+      await this.#runTask(task, coordination, signal);
     }
   }
 
-  /** Run one claimed task under its lease, then complete, fail or give it back. */
-  async #runTask(task: ClaimedTask, signal: AbortSignal): Promise<void> {
+  /**
+   * Run one claimed task under its lease, holding its gate lock (when it has one), then complete,
+   * fail or give it back.
+   */
+  async #runTask(
+    task: ClaimedTask,
+    coordination: TaskCoordination | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
     const { tasks, timing, handle, logger } = this.#deps;
     const { leaseMs, taskTimeoutMs } = timing;
     const heartbeatMs = Math.max(1, Math.floor(leaseMs / 2));
@@ -150,18 +194,28 @@ export class Consumer {
     const onShutdown = () => taskController.abort();
     signal.addEventListener('abort', onShutdown, { once: true });
     let leaseLost = false;
+    // The gate lock gets one lease when the task starts: the task may have waited in the queue for
+    // most of the lock's time. Each heartbeat that renewed the lease extends it again, until the
+    // task ends. Gate calls run one after another, so the one made after the task lands last.
+    const gate = this.#gate(task, coordination);
+    let ended = false;
+    let gateCalls = this.#holdGate(task, gate, leaseMs);
     const heartbeat = setInterval(() => {
-      tasks
-        .renew(task, leaseMs)
-        .then((held) => {
+      tasks.renew(task, leaseMs).then(
+        (held) => {
           if (!held) {
             leaseLost = true;
             taskController.abort();
+          } else if (gate && !ended) {
+            gateCalls = gateCalls.then(() =>
+              this.#holdGate(task, gate, leaseMs),
+            );
           }
-        })
-        .catch((err) => {
-          logger.error('resize worker: lease renewal failed', err);
-        });
+        },
+        (err) => {
+          logNeverThrow(logger, 'resize worker: lease renewal failed', err);
+        },
+      );
     }, heartbeatMs);
 
     // Race the handler against taskTimeoutMs: one hung I/O call must not wedge the worker (the
@@ -196,6 +250,8 @@ export class Consumer {
       clearInterval(heartbeat);
       signal.removeEventListener('abort', onShutdown);
     }
+    ended = true;
+    await gateCalls;
 
     if (timedOut) {
       // The detached handler is harmless: later writes are token-fenced, and previews it pushes
@@ -203,6 +259,7 @@ export class Consumer {
       taskController.abort();
       await this.#finish(
         task,
+        coordination,
         new ResizeError(
           `resize worker: task ${task.taskId} exceeded taskTimeoutMs (${taskTimeoutMs}ms)`,
           { code: 'RESIZE_TASK_TIMEOUT' },
@@ -211,10 +268,12 @@ export class Consumer {
     } else if (ok) {
       try {
         if (await tasks.complete(task)) {
+          await this.#releaseGate(task, gate);
           await this.#report('completed', task);
         }
       } catch (err) {
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize worker: completing task ${task.taskId} failed`,
           err,
         );
@@ -224,7 +283,7 @@ export class Consumer {
       // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
       await this.#giveBackAtShutdown(task);
     } else {
-      await this.#finish(task, handlerError);
+      await this.#finish(task, coordination, handlerError);
     }
   }
 
@@ -237,37 +296,114 @@ export class Consumer {
       await this.#deps.events?.(event, toLeasedTask(task), error);
     } catch (err) {
       // A throwing observer must not undo the task's state or stop the loop.
-      this.#deps.logger.error(
+      logNeverThrow(
+        this.#deps.logger,
         `resize worker: ${event} event handler failed`,
         err,
       );
     }
   }
 
-  /** Retry the task after its backoff, or dead-letter it (forced, not retryable, last attempt). */
+  /**
+   * Retry the task after its backoff, or dead-letter it (forced, not retryable, last attempt) with
+   * its Resizer's cooldown. Its gate lock is then held until the retry is due plus one lease, or
+   * for the cooldown.
+   */
   async #finish(
     task: ClaimedTask,
+    coordination: TaskCoordination | undefined,
     error: unknown,
     forceDead = false,
   ): Promise<void> {
     const { tasks, timing, logger } = this.#deps;
     const dead =
       forceDead || notRetryable(error) || task.attempts >= timing.maxAttempts;
+    const message = String(error).slice(0, 1000);
+    const gate = this.#gate(task, coordination);
     try {
-      const held = await tasks.fail(
-        task,
-        dead
-          ? 'dead'
-          : {
-              retryAt: new Date(Date.now() + backoffMs(task.attempts, timing)),
-            },
-        String(error).slice(0, 1000),
-      );
-      if (held) {
-        await this.#report(dead ? 'deadLettered' : 'failed', task, error);
+      if (dead) {
+        const cooldownMs =
+          coordination?.cooldownMs ?? defaultCoordination.cooldownMs;
+        if (await tasks.fail(task, 'dead', message, { cooldownMs })) {
+          await this.#holdGate(task, gate, cooldownMs);
+          await this.#report('deadLettered', task, error);
+        }
+        return;
+      }
+      const retryAt = new Date(Date.now() + backoffMs(task.attempts, timing));
+      if (await tasks.fail(task, { retryAt }, message)) {
+        await this.#holdGate(
+          task,
+          gate,
+          Math.max(0, retryAt.getTime() - Date.now()) + timing.leaseMs,
+        );
+        await this.#report('failed', task, error);
       }
     } catch (err) {
-      logger.error(`resize worker: failing task ${task.taskId} failed`, err);
+      logNeverThrow(
+        logger,
+        `resize worker: failing task ${task.taskId} failed`,
+        err,
+      );
+    }
+  }
+
+  /** The gate lock `task` holds (see GateLock), or undefined when it holds none. */
+  #gate(
+    task: ClaimedTask,
+    coordination: TaskCoordination | undefined,
+  ): GateLock | undefined {
+    const locks = coordination?.locks;
+    if (
+      this.#deps.tasks.gatesByTask ||
+      task.gateOwner === undefined ||
+      !locks
+    ) {
+      return undefined;
+    }
+    return {
+      locks,
+      key: gateKey(task.resizer, task.mediaId, task.pipeline),
+      owner: task.gateOwner,
+    };
+  }
+
+  /** Move the gate lock's expiry to `ttlMs` from now, when there is one. Never rejects. */
+  async #holdGate(
+    task: ClaimedTask,
+    gate: GateLock | undefined,
+    ttlMs: number,
+  ): Promise<void> {
+    if (!gate) {
+      return;
+    }
+    try {
+      await gate.locks.extend(gate.key, gate.owner, ttlMs);
+    } catch (err) {
+      logNeverThrow(
+        this.#deps.logger,
+        `resize worker: extending the gate lock of task ${task.taskId} failed`,
+        err,
+      );
+    }
+  }
+
+  /** Release the gate lock, when there is one. Never rejects. */
+  async #releaseGate(
+    task: ClaimedTask,
+    gate: GateLock | undefined,
+  ): Promise<void> {
+    if (!gate) {
+      return;
+    }
+    try {
+      await gate.locks.release(gate.key, gate.owner);
+    } catch (err) {
+      logNeverThrow(
+        this.#deps.logger,
+        `resize worker: releasing the gate lock of task ${task.taskId} failed`,
+        err,
+      );
     }
   }
 
@@ -283,7 +419,7 @@ export class Consumer {
   // The task was not processed, so it goes back with no event, no backoff and, where the queue
   // can release it, without counting the delivery. A queue without `release` retries it at once
   // through `fail`, which records `reason`; the delivery then counts, but it is never dead-lettered
-  // here. `done`, when given, is logged once the task is back.
+  // here. `done`, when given, is logged at info once the task is back.
   async #giveBack(
     task: ClaimedTask,
     reason: string,
@@ -295,10 +431,11 @@ export class Consumer {
         ? await tasks.release(task)
         : await tasks.fail(task, { retryAt: new Date() }, reason);
       if (held && done) {
-        logger.info(done);
+        logNeverThrow(logger, done, undefined, 'info');
       }
     } catch (err) {
-      logger.error(
+      logNeverThrow(
+        logger,
         `resize worker: giving task ${task.taskId} back failed`,
         err,
       );

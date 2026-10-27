@@ -3824,29 +3824,24 @@ describe('one worker serves every Resizer', () => {
         );
       });
     register(sibling);
-    // A failing claim is retried, but the loop logs it first, and the worker's logger is host
-    // code: one that throws fails this loop while it runs. This relies on that claim-error log line
-    // in Consumer.run being unguarded; if it is ever wrapped (e.g. in logNeverThrow), this test
-    // needs a new trigger, or it only times out.
+    // The loop guards its queue calls, observers and logging (a throwing logger falls back to the
+    // console), so this one fails on what it cannot guard: a claimed task that cannot be read.
+    const unreadable = new Error('unreadable task');
     const failing = new MemoryTaskQueue();
-    failing.claim = async () => {
-      throw new Error('queue unreachable');
-    };
+    failing.claim = async () =>
+      ({
+        get taskId(): string {
+          throw unreadable;
+        },
+      }) as unknown as Awaited<ReturnType<MemoryTaskQueue['claim']>>;
     register(failing, 'listings');
-    const logSinkDown = new Error('log sink down');
     await assert.rejects(
       () =>
         runWorker({
           signal: new AbortController().signal,
-          logger: {
-            info() {},
-            warn() {},
-            error() {
-              throw logSinkDown;
-            },
-          },
+          logger: { info() {}, warn() {}, error() {} },
         }),
-      (err: unknown) => err === logSinkDown,
+      (err: unknown) => err === unreadable,
     );
     assert.equal(siblingAborted, true);
   });

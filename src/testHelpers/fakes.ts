@@ -146,7 +146,8 @@ interface Row {
 
 /**
  * The rows and the lease logic of the in-memory task queues: oldest-first claims, fenced leases,
- * retry times and dead tasks. `rows` and `added` are open for assertions.
+ * retry times and dead tasks. A claimed task carries the `gateOwner` it was added with, when it has
+ * one. `rows` and `added` are open for assertions.
  */
 abstract class RowQueue extends TaskQueue {
   readonly rows: Row[] = [];
@@ -222,6 +223,9 @@ abstract class RowQueue extends TaskQueue {
       previews: row.task.previews,
       token: row.token,
       attempts: row.attempts,
+      ...(row.task.gateOwner === undefined
+        ? {}
+        : { gateOwner: row.task.gateOwner }),
     };
   }
 
