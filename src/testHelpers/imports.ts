@@ -1,5 +1,6 @@
 // Source-file and import listings for the guard tests that check who may import what. Paths are
-// relative to src/ and '/'-separated on every platform.
+// relative to src/ and '/'-separated on every platform. The parser sees only static, single-quoted
+// `import … from` / `export … from` statements and side-effect imports, not dynamic `import()`.
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,41 +23,37 @@ export function sourceFiles(): string[] {
 }
 
 /**
- * The files that `file`'s relative import/export specifiers point at. `types: false` skips
- * `import type` / `export type` statements and braces that name only `type X` specifiers, since
- * those are erased at runtime; side-effect imports always count. Package specifiers are left out.
+ * The import/export specifiers of `source`, packages included. `types: false` skips whole
+ * `import type` / `export type` statements, the only ones erased at runtime: under
+ * verbatimModuleSyntax `import { type X } from './x.ts'` stays as `import {} from './x.ts'`, so
+ * x.ts still loads. Side-effect imports always count.
  */
-export function localImports(file: string, opts: { types: boolean }): string[] {
-  const source = readFileSync(resolve(SRC, file), 'utf8');
+export function importSpecifiers(
+  source: string,
+  opts: { types: boolean },
+): string[] {
   const specifiers: string[] = [];
   const re =
-    /(?:^|\n)\s*(import|export)\s+(type\s+)?([^;'"]*?)\s+from\s+'([^']+)'/g;
+    /(?:^|\n)\s*(import|export)\s+(type\s+)?[^;'"]*?\s+from\s+'([^']+)'/g;
   for (const match of source.matchAll(re)) {
-    if (!opts.types && (match[2] || onlyTypes(match[3]))) {
+    if (!opts.types && match[2]) {
       continue;
     }
-    specifiers.push(match[4]);
+    specifiers.push(match[3]);
   }
   // Side-effect imports: `import './x.ts';`
   for (const match of source.matchAll(/(?:^|\n)\s*import\s+'([^']+)'/g)) {
     specifiers.push(match[1]);
   }
-  return specifiers
+  return specifiers;
+}
+
+/** The src/ files that `file`'s relative specifiers point at (see importSpecifiers). */
+export function localImports(file: string, opts: { types: boolean }): string[] {
+  const source = readFileSync(resolve(SRC, file), 'utf8');
+  return importSpecifiers(source, opts)
     .filter((spec) => spec.startsWith('.'))
     .map((spec) =>
       toSrcPath(relative(SRC, resolve(dirname(resolve(SRC, file)), spec))),
     );
-}
-
-// `{ type A, type B }`: every named specifier is a type.
-function onlyTypes(clause: string): boolean {
-  const braced = clause.trim().match(/^\{([\s\S]*)\}$/);
-  if (!braced) {
-    return false;
-  }
-  const names = braced[1]
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean);
-  return names.length > 0 && names.every((name) => name.startsWith('type '));
 }

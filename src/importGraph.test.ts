@@ -129,13 +129,16 @@ test('drivers import only contracts, errors, helpers, types and other drivers', 
     t.startsWith('helpers/') ||
     t === 'types.d.ts' ||
     t.startsWith('drivers/');
-  const offending = sourceFiles()
-    .filter((f) => f.startsWith('drivers/'))
-    .flatMap((f) =>
-      localImports(f, { types: true })
-        .filter((t) => !allowed(t))
-        .map((t) => `${f} → ${t}`),
-    );
+  const drivers = sourceFiles().filter((f) => f.startsWith('drivers/'));
+  assert.ok(
+    drivers.includes('drivers/sqs.ts'),
+    'sanity check: the listing does see the drivers',
+  );
+  const offending = drivers.flatMap((f) =>
+    localImports(f, { types: true })
+      .filter((t) => !allowed(t))
+      .map((t) => `${f} → ${t}`),
+  );
   assert.deepEqual(offending, []);
 });
 
