@@ -58,8 +58,11 @@ describe('createResizeModels', () => {
     await ResizeTask.createIndexes();
     await ResizeLock.createIndexes();
     const taskIndexes = await ResizeTask.collection.indexes();
-    const dedupe = taskIndexes.find((i) => i.key.requestKey === 1);
-    assert.equal(dedupe?.unique, true);
+    const gate = taskIndexes.find(
+      (i) => i.key.resizer === 1 && i.key.fileId === 1 && i.key.pipeline === 1,
+    );
+    assert.equal(gate?.unique, true);
+    assert.deepEqual(gate?.partialFilterExpression, { active: true });
     assert.ok(
       taskIndexes.some((i) => i.key.queue === 1 && i.key.status === 1),
       'the lease index exists',

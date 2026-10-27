@@ -54,10 +54,14 @@ describe('ResizeTaskModel.modelSchema — spec/08 §12 fields', () => {
     assert.equal(queue.default, 'default');
   });
 
-  test('requestKey is an optional String for active-request dedupe', () => {
-    const requestKey = ResizeTaskModel.modelSchema.requestKey;
-    assert.equal(requestKey.type, String);
-    assert.equal('required' in requestKey, false);
+  test('active is a Boolean defaulting to false; cooldownUntil is a Date; there is no requestKey', () => {
+    const s = ResizeTaskModel.modelSchema;
+    // A row is the gate only once add() sets it: rows from before the gate never are.
+    assert.equal(s.active.type, Boolean);
+    assert.equal(s.active.default, false);
+    assert.equal(s.cooldownUntil.type, Date);
+    assert.equal('default' in s.cooldownUntil, false);
+    assert.equal('requestKey' in s, false);
   });
 
   test('status is the four-state enum defaulting to "pending"', () => {
@@ -176,20 +180,21 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     assert.deepEqual(idx[1], {});
   });
 
-  test('{ fileId:1, pipeline:1, requestKey:1 } dedupes active rows only', () => {
+  test('{ resizer:1, fileId:1, pipeline:1 } is unique among active rows', () => {
     const idx = byFields(buildIndexes(), {
+      resizer: 1,
       fileId: 1,
       pipeline: 1,
-      requestKey: 1,
     });
     assert.ok(idx);
     assert.deepEqual(idx[1], {
       unique: true,
-      partialFilterExpression: {
-        status: { $in: ['pending', 'processing'] },
-        requestKey: { $exists: true },
-      },
+      partialFilterExpression: { active: true },
     });
+    assert.equal(
+      byFields(buildIndexes(), { fileId: 1, pipeline: 1, requestKey: 1 }),
+      undefined,
+    );
   });
 });
 

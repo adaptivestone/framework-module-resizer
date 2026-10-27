@@ -4,7 +4,6 @@
 // survivors' locks so a later read can retry. Prewarm's strict counterpart reports exactly what
 // was queued instead. A Dispatcher needs only the task queue, the lock store, the queue's timing,
 // its Resizer's name and a logger.
-import { createHash } from 'node:crypto';
 import type { LockStore } from './contracts/locks.ts';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
@@ -17,35 +16,6 @@ import type {
   PreviewScope,
   ResizeLogger,
 } from './types.d.ts';
-
-/**
- * Build a bounded request identity a task queue can deduplicate by (e.g. the Mongo queue's
- * unique index). The complete
- * file + resizer + queue + pipeline identity is included before hashing; the hash keeps the
- * indexed value small even when filters or the variant catalog are large. The queue is part
- * of the key, so the same request on another queue is a separate task: an interactive
- * request never waits behind a bulk backfill that happens to hold the same payload.
- */
-export function buildRequestKey(task: {
-  mediaId: string;
-  resizer: string;
-  queue: string;
-  pipeline: string;
-  previews: readonly MissingPreview[];
-}): string {
-  const canonical = canonicalizeVariants(task.previews);
-  // FNV-style string hashing would be shorter but collision-prone for a durable
-  // correctness key. Web Crypto is not guaranteed in every supported Node runtime,
-  // so use the built-in SHA-256 implementation.
-  const json = JSON.stringify({
-    fileId: task.mediaId,
-    resizer: task.resizer,
-    queue: task.queue,
-    pipeline: task.pipeline,
-    variants: canonical,
-  });
-  return `v2:${createHash('sha256').update(json).digest('hex')}`;
-}
 
 export interface DispatcherDeps {
   tasks: TaskQueue;
@@ -117,8 +87,7 @@ export class Dispatcher {
 
     // 1. Canonicalize first so equivalent nested filter objects and list permutations
     // reach the task queue in a stable form. The dispatch lock remains per preview
-    // identity (not per whole catalog) by design; a deduplicating task queue handles the
-    // complete request key.
+    // identity (not per whole catalog) by design.
     const canonical = canonicalizeVariants(missing);
 
     // 2. Dedup by identity — the one lookup/lock key, built one way. The scope keeps another
@@ -524,7 +493,7 @@ async function releaseAll(
   }
 }
 
-/** A task for the queue: canonical variants plus the key that de-duplicates identical requests. */
+/** A task for the queue, with its variants in canonical form. */
 function newTask(
   resizer: string,
   queue: string,
@@ -532,19 +501,11 @@ function newTask(
   pipeline: string,
   variants: MissingPreview[],
 ): NewTask {
-  const previews = canonicalizeVariants(variants);
   return {
     resizer,
     queue,
     mediaId,
     pipeline,
-    previews,
-    requestKey: buildRequestKey({
-      mediaId,
-      resizer,
-      queue,
-      pipeline,
-      previews,
-    }),
+    previews: canonicalizeVariants(variants),
   };
 }

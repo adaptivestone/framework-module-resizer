@@ -112,7 +112,6 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
   mediaId: 'm1',
   pipeline: 'photo',
   previews: [variant()],
-  requestKey: 'request-key',
   ...over,
 });
 const message = (over: Partial<FakeMessage> = {}): FakeMessage => ({

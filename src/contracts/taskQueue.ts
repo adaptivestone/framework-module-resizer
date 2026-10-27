@@ -1,10 +1,9 @@
 // Task queue contract: where queued tasks wait. A database can hold them (MongoTaskQueue) or a
 // message broker can (SqsTaskQueue). Every method is ONE atomic operation; the core owns everything
 // else — the worker loop, lease heartbeat, task timeout, retry with backoff, dead-lettering, giving
-// tasks back at shutdown, request de-duplication keys and task events — so every backend behaves
-// the same. A queue that gates by task keeps at most one active task per Resizer, media and
-// pipeline. Extend this class, or pass any object of the same shape (the core never checks
-// `instanceof`).
+// tasks back at shutdown and task events — so every backend behaves the same. A queue that gates
+// by task keeps at most one active task per Resizer, media and pipeline. Extend this class, or
+// pass any object of the same shape (the core never checks `instanceof`).
 import type {
   EnqueueReceipt,
   MissingPreview,
@@ -12,8 +11,9 @@ import type {
 } from '../types.d.ts';
 
 /**
- * A task to store. `requestKey` identifies the whole request, for de-duplicating active tasks.
- * `gateOwner`, when set, is stored with the task and handed back by `claim()`.
+ * A task to store: variants of one media and pipeline, for one Resizer. `gateOwner` is set only
+ * for a queue without `gatesByTask`; such a queue stores it with the task and hands it back from
+ * `claim()`.
  */
 export interface NewTask {
   resizer: string;
@@ -21,7 +21,6 @@ export interface NewTask {
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
-  requestKey: string;
   gateOwner?: string;
 }
 
@@ -95,8 +94,10 @@ export abstract class TaskQueue {
 
   /**
    * Store a task: the result says whether it was added, another task is in flight, or the write
-   * is unconfirmed (see TaskAddResult). An active task with the same `requestKey` (if the backend
-   * can find one) is reported as `added` under its own `taskId` instead of storing a new one.
+   * is unconfirmed (see TaskAddResult). A queue with `gatesByTask` stores nothing while an active
+   * task of the same Resizer, media and pipeline exists, whatever variants either asks for, and
+   * reports `in-flight` (with that task's id when it knows it). A queue without it stores every
+   * task it is given.
    */
   abstract add(task: NewTask): Promise<TaskAddResult>;
 

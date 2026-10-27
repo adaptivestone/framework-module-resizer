@@ -14,9 +14,9 @@ import type {
   ClaimedTask,
   LeasedTask,
   NewTask,
+  TaskAddResult,
   TaskEventHandler,
 } from '../../contracts/taskQueue.ts';
-import { buildRequestKey } from '../../dispatcher.ts';
 import {
   ResizeGenerateError,
   ResizeNoOriginalError,
@@ -134,33 +134,55 @@ function configureQueue(
   return { errors };
 }
 
-// Request canonicalization belongs to the core now. Driver callers supply its requestKey.
-function newTask(task: Omit<NewTask, 'requestKey'>): NewTask {
-  const previews = canonicalizeVariants(task.previews);
-  return {
-    ...task,
-    previews,
-    requestKey: buildRequestKey({ ...task, previews }),
-  };
-}
+const fid = () => new mongoose.Types.ObjectId().toString();
 
-function request(over: Partial<Omit<NewTask, 'requestKey'>> = {}): NewTask {
-  return newTask({
+function request(over: Partial<NewTask> = {}): NewTask {
+  return {
     resizer: 'default',
     queue: 'default',
-    mediaId: new mongoose.Types.ObjectId().toString(),
+    mediaId: fid(),
     pipeline: 'default',
     previews: [{ sizeKey: '300x300', format: 'jpeg' }],
     ...over,
-  });
+  };
 }
 
-// Add a task the queue must report as `added` (stored, or an active copy of the same request), and
-// return its task ID.
+// Add a task the queue must store, and return its task ID.
 async function addedTaskId(task: NewTask): Promise<string> {
   const result = await tasks.add(task);
   assert.equal(result.status, 'added');
   return result.taskId;
+}
+
+// The task IDs of the adds that stored a task.
+function addedIds(results: TaskAddResult[]): string[] {
+  return results.flatMap((result) =>
+    result.status === 'added' ? [result.taskId] : [],
+  );
+}
+
+function duplicateKey() {
+  return Object.assign(new Error('E11000 duplicate key error'), {
+    code: 11000,
+  });
+}
+
+// A row written past the schema (so no defaults apply), as an older API or worker left it.
+async function insertRaw(
+  mediaId: string,
+  row: Record<string, unknown>,
+): Promise<string> {
+  const { insertedId } = await M.collection.insertOne({
+    fileId: new mongoose.Types.ObjectId(mediaId),
+    resizer: 'default',
+    queue: 'default',
+    pipeline: 'default',
+    previews: [],
+    attempts: 1,
+    availableAt: past(),
+    ...row,
+  });
+  return String(insertedId);
 }
 
 interface Rec {
@@ -350,12 +372,13 @@ describe('MongoTaskQueue setup', () => {
 
   test('verify rejects a model without the fields the queue writes (an ejected 0.2 model)', () => {
     // Strict mode would silently drop these from every insert: each task would then read as
-    // Resizer 'default' on queue 'default'.
+    // Resizer 'default' on queue 'default', and no task would hold the gate.
     const {
       resizer: _resizer,
       queue: _queue,
-      requestKey: _requestKey,
       availableAt: _availableAt,
+      active: _active,
+      cooldownUntil: _cooldownUntil,
       ...oldFields
     } = resizeTaskFields('File');
     const Old =
@@ -370,7 +393,9 @@ describe('MongoTaskQueue setup', () => {
       (error: unknown) =>
         error instanceof ResizeSetupError &&
         error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
-        /resizer, queue, requestKey, availableAt/.test(error.message) &&
+        /no resizer, queue, availableAt, active, cooldownUntil field/.test(
+          error.message,
+        ) &&
         /delete src\/models\/ResizeTask\.ts and re-run resize-scaffold/.test(
           error.message,
         ) &&
@@ -399,6 +424,33 @@ describe('MongoTaskQueue setup', () => {
     );
   });
 
+  test('verify rejects a model without active or cooldownUntil, naming the field', () => {
+    // Without active every add would succeed: the gate is off. Without cooldownUntil a dead
+    // task would give up the gate at once, whatever its cooldown.
+    const { active: _active, ...withoutActive } = resizeTaskFields('File');
+    const { cooldownUntil: _cooldownUntil, ...withoutCooldown } =
+      resizeTaskFields('File');
+    for (const [field, fields] of [
+      ['active', withoutActive],
+      ['cooldownUntil', withoutCooldown],
+    ] as const) {
+      const name = `ResizeTaskWithout_${field}`;
+      const Old =
+        connection.models[name] ??
+        connection.model(
+          name,
+          new mongoose.Schema(fields, { timestamps: true, autoIndex: false }),
+        );
+      assert.throws(
+        () => new MongoTaskQueue({ model: Old }).verify(),
+        (error: unknown) =>
+          error instanceof ResizeSetupError &&
+          error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
+          error.message.includes(`has no ${field} field`),
+      );
+    }
+  });
+
   test('verify accepts the package model and a model-shaped object without a schema', () => {
     assert.doesNotThrow(() => tasks.verify());
     const schemaless = new MongoTaskQueue({
@@ -409,7 +461,7 @@ describe('MongoTaskQueue setup', () => {
 });
 
 describe('MongoTaskQueue.add', () => {
-  test('maps mediaId to fileId, stores pipeline and previews, returns the taskId', async () => {
+  test('maps mediaId to fileId, stores the active task with pipeline and previews, returns the taskId', async () => {
     const payload = request({ pipeline: 'photo' });
     const before = Date.now();
     const taskId = await addedTaskId(payload);
@@ -421,7 +473,9 @@ describe('MongoTaskQueue.add', () => {
     assert.equal(doc.status, 'pending');
     assert.equal(doc.attempts, 0);
     assert.equal((doc.previews as unknown[]).length, 1);
-    assert.equal(doc.requestKey, payload.requestKey);
+    assert.equal(doc.active, true);
+    assert.equal(doc.cooldownUntil, undefined);
+    assert.equal('requestKey' in doc, false);
     // Due at once.
     const availableAt = (doc.availableAt as Date).getTime();
     assert.ok(availableAt >= before && availableAt <= Date.now());
@@ -462,115 +516,53 @@ describe('MongoTaskQueue.add', () => {
     );
   }
 
-  test('identical requests with reordered variants and filter keys return one active task', async () => {
-    const mediaId = new mongoose.Types.ObjectId().toString();
-    const first = {
-      sizeKey: '300x300',
-      format: 'jpeg',
-      filters: { tone: { z: 2, a: 1 } } as never,
-      requestedWidth: 300,
-    };
-    const second = { sizeKey: 'fit', format: 'webp', fit: true };
-    const a = await addedTaskId(
-      request({
-        mediaId,
-        pipeline: 'photo',
-        previews: [
-          first,
-          second,
-          { ...first, filters: { tone: { a: 1, z: 2 } } as never },
-        ],
-      }),
-    );
-    const b = await addedTaskId(
-      request({
-        mediaId,
-        pipeline: 'photo',
-        previews: [
-          second,
-          { ...first, filters: { tone: { a: 1, z: 2 } } as never },
-        ],
-      }),
-    );
-    assert.ok(a);
-    assert.equal(b, a);
-    assert.equal(
-      await M.countDocuments({
-        fileId: mediaId,
-        pipeline: 'photo',
-        status: 'pending',
-      }),
-      1,
-    );
-  });
-
-  test('concurrent identical add calls create one active row', async () => {
-    const payload = request({
-      previews: [{ sizeKey: '640w', format: 'avif' }],
-    });
-    const taskIds = await Promise.all(
-      Array.from({ length: 12 }, () => addedTaskId(payload)),
-    );
-    assert.equal(new Set(taskIds).size, 1);
-    assert.ok(taskIds[0]);
-    assert.equal(
-      await M.countDocuments({
-        fileId: payload.mediaId,
-        pipeline: 'default',
-        status: 'pending',
-      }),
-      1,
-    );
-  });
-
-  test('rereads the winner when a second duplicate-key race follows completion', async () => {
-    const winner = { _id: new mongoose.Types.ObjectId() };
-    let upsertCalls = 0;
-    let readCalls = 0;
-    const duplicate = Object.assign(new Error('E11000 duplicate key'), {
-      code: 11000,
-    });
-    configureQueue(() => ({
-      findOneAndUpdate: async () => {
-        upsertCalls += 1;
-        if (upsertCalls <= 2) {
-          throw duplicate;
-        }
-        return winner;
-      },
-      findOne: async () => {
-        readCalls += 1;
-        return readCalls === 1 ? null : winner;
-      },
-    }));
-    assert.equal(await addedTaskId(request()), String(winner._id));
-    assert.equal(readCalls, 2, 'each duplicate race rereads the active winner');
-  });
-
-  test('bounds duplicate-key contention to three attempts', async () => {
-    let upserts = 0;
+  test('a gate that opens between the insert and the read gives the task a second round', async () => {
+    const stored = { _id: new mongoose.Types.ObjectId() };
+    let creates = 0;
     let reads = 0;
-    const { errors } = configureQueue(() => ({
-      findOneAndUpdate: async () => {
-        upserts += 1;
-        throw Object.assign(new Error('E11000 duplicate key'), { code: 11000 });
+    configureQueue(() => ({
+      create: async () => {
+        creates += 1;
+        if (creates === 1) {
+          throw duplicateKey();
+        }
+        return [stored];
       },
       findOne: async () => {
         reads += 1;
         return null;
       },
     }));
-    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
-    assert.equal(upserts, 3);
-    assert.equal(reads, 3);
-    assert.match(String(errors[0][0]), /contended/);
+    assert.deepEqual(await tasks.add(request()), {
+      status: 'added',
+      taskId: String(stored._id),
+    });
+    assert.deepEqual([creates, reads], [2, 1]);
   });
 
-  test('reread failure after a duplicate key is logged and unconfirmed', async () => {
-    const failure = new Error('reread failed');
+  test('two rounds at most: a gate that keeps changing hands is reported in-flight', async () => {
+    let creates = 0;
+    let reads = 0;
     const { errors } = configureQueue(() => ({
-      findOneAndUpdate: async () => {
-        throw Object.assign(new Error('duplicate key'), { code: 11000 });
+      create: async () => {
+        creates += 1;
+        throw duplicateKey();
+      },
+      findOne: async () => {
+        reads += 1;
+        return null;
+      },
+    }));
+    assert.deepEqual(await tasks.add(request()), { status: 'in-flight' });
+    assert.deepEqual([creates, reads], [2, 2]);
+    assert.equal(errors.length, 0, 'another add holds the gate: not an error');
+  });
+
+  test('a failed read after a duplicate key is logged and unconfirmed', async () => {
+    const failure = new Error('read failed');
+    const { errors } = configureQueue(() => ({
+      create: async () => {
+        throw duplicateKey();
       },
       findOne: async () => {
         throw failure;
@@ -580,104 +572,236 @@ describe('MongoTaskQueue.add', () => {
     assert.equal(errors.length, 1);
     assert.equal(errors[0][1], failure);
   });
+});
 
-  test('non-duplicate write failure is logged and unconfirmed', async () => {
+describe('MongoTaskQueue.add: one active task per Resizer, media and pipeline', () => {
+  test('a second add is in-flight with the active task id; another pipeline, Resizer or media is a new task', async () => {
+    const mediaId = fid();
+    const first = await addedTaskId(request({ mediaId }));
+    // Whatever it asks for, and on whichever queue, a request for the same media and pipeline
+    // waits for the active task.
+    for (const over of [
+      { previews: [{ sizeKey: '600x600', format: 'webp' }] },
+      { queue: 'bulk' },
+    ]) {
+      assert.deepEqual(await tasks.add(request({ mediaId, ...over })), {
+        status: 'in-flight',
+        taskId: first,
+      });
+    }
+    const others = [
+      await addedTaskId(request({ mediaId, pipeline: 'photo' })),
+      await addedTaskId(request({ mediaId, resizer: 'listings' })),
+      await addedTaskId(request()),
+    ];
+    assert.equal(new Set([first, ...others]).size, 4);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 3);
+  });
+
+  test('fifty concurrent adds store one active row; the others are in-flight with its id', async () => {
+    const mediaId = fid();
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () => tasks.add(request({ mediaId }))),
+    );
+    const winners = addedIds(results);
+    assert.equal(winners.length, 1);
+    assert.deepEqual(
+      results.filter((result) => result.status !== 'added'),
+      Array.from({ length: 49 }, () => ({
+        status: 'in-flight',
+        taskId: winners[0],
+      })),
+    );
+    assert.equal(await M.countDocuments({ fileId: mediaId, active: true }), 1);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 1);
+  });
+
+  test('a task in retry backoff, or given back, keeps the gate', async (t) => {
+    const mediaId = fid();
+    const taskId = await addedTaskId(request({ mediaId }));
+    const inFlight = { status: 'in-flight', taskId };
+    const leased = await tasks.claim('default', 60_000);
+    assert.equal(leased?.taskId, taskId);
+    assert.ok(leased);
+    assert.deepEqual(await tasks.add(request({ mediaId })), inFlight);
+    assert.equal(
+      await tasks.fail(leased, { retryAt: new Date(Date.now() + 60_000) }, 'x'),
+      true,
+    );
+    assert.deepEqual(await tasks.add(request({ mediaId })), inFlight);
+    // The backoff passes, and the next delivery is given back (a worker shutting down).
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() + 61_000 });
+    const again = await tasks.claim('default', 60_000);
+    assert.equal(again?.taskId, taskId);
+    assert.ok(again);
+    assert.equal(await tasks.release(again), true);
+    assert.deepEqual(await tasks.add(request({ mediaId })), inFlight);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 1);
+  });
+
+  test('complete opens the gate: the next add is a new task', async () => {
+    const mediaId = fid();
+    const first = await addedTaskId(request({ mediaId }));
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    assert.equal(await tasks.complete(leased), true);
+    const row = await M.findById(first).lean();
+    assert.equal(row?.status, 'completed');
+    assert.equal(row?.active, false);
+    const next = await addedTaskId(request({ mediaId }));
+    assert.notEqual(next, first);
+    assert.equal(await M.countDocuments({ fileId: mediaId, active: true }), 1);
+  });
+
+  test('a dead task holds the gate for cooldownMs; then one of twenty adds takes it over and the dead row keeps its error', async () => {
+    const mediaId = fid();
+    const dead = await addedTaskId(request({ mediaId }));
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    const before = Date.now();
+    assert.equal(
+      await tasks.fail(leased, 'dead', 'boom', { cooldownMs: 200 }),
+      true,
+    );
+    const cooldownUntil = (await M.findById(dead).lean())
+      ?.cooldownUntil as Date;
+    assert.ok(cooldownUntil.getTime() >= before + 200);
+    assert.ok(cooldownUntil.getTime() <= Date.now() + 200);
+    assert.deepEqual(await tasks.add(request({ mediaId })), {
+      status: 'in-flight',
+      taskId: dead,
+    });
+    await sleep(250);
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => tasks.add(request({ mediaId }))),
+    );
+    const winners = addedIds(results);
+    assert.equal(winners.length, 1);
+    assert.notEqual(winners[0], dead);
+    assert.deepEqual(
+      results.filter((result) => result.status !== 'added'),
+      Array.from({ length: 19 }, () => ({
+        status: 'in-flight',
+        taskId: winners[0],
+      })),
+    );
+    const row = await M.findById(dead).lean();
+    assert.equal(row?.status, 'dead');
+    assert.equal(row?.active, false);
+    assert.equal(row?.error, 'boom');
+    assert.equal(await M.countDocuments({ fileId: mediaId, active: true }), 1);
+  });
+
+  test('a dead-letter without cooldownMs opens the gate at once', async () => {
+    const mediaId = fid();
+    const dead = await addedTaskId(request({ mediaId }));
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    assert.equal(await tasks.fail(leased, 'dead', 'boom'), true);
+    assert.notEqual(await addedTaskId(request({ mediaId })), dead);
+  });
+
+  test('a row completed or dead-lettered by a worker from before the gate does not hold it', async () => {
+    for (const status of ['completed', 'dead']) {
+      const mediaId = fid();
+      // The new API inserted it as the gate; an older worker finished it without touching
+      // `active`, and a dead one got no cooldownUntil.
+      const old = await insertRaw(mediaId, { status, active: true });
+      const added = await addedTaskId(request({ mediaId }));
+      assert.notEqual(added, old);
+      const row = await M.findById(old).lean();
+      assert.equal(row?.status, status);
+      assert.equal(row?.active, false);
+      assert.equal(
+        await M.countDocuments({ fileId: mediaId, active: true }),
+        1,
+      );
+    }
+  });
+
+  test('a row written before the gate, without active, does not hold it', async () => {
+    const mediaId = fid();
+    const old = await insertRaw(mediaId, { status: 'pending', attempts: 0 });
+    const added = await addedTaskId(request({ mediaId }));
+    assert.notEqual(added, old);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 2);
+  });
+
+  test('a write error other than a duplicate key is logged and unconfirmed; a missing model is unconfirmed', async () => {
     const failure = new Error('MongoDB offline');
     const { errors } = configureQueue(() => ({
-      findOneAndUpdate: async () => {
+      create: async () => {
         throw failure;
       },
     }));
     assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(errors.length, 1);
     assert.equal(errors[0][1], failure);
+    for (const missing of [null, false]) {
+      const logged = configureQueue(() => missing);
+      assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
+      assert.equal(logged.errors.length, 1);
+    }
   });
+});
 
-  test('different variants and pipelines remain separate requests', async () => {
-    const mediaId = new mongoose.Types.ObjectId().toString();
-    const a = await addedTaskId(request({ mediaId }));
-    const b = await addedTaskId(
-      request({
-        mediaId,
-        previews: [{ sizeKey: '600x600', format: 'jpeg' }],
-      }),
-    );
-    const c = await addedTaskId(request({ mediaId, pipeline: 'photo' }));
-    assert.notEqual(a, b);
-    assert.notEqual(a, c);
-    assert.notEqual(b, c);
-    assert.equal(await M.countDocuments({ fileId: mediaId }), 3);
-  });
-
-  test('processing request is returned unchanged, including attempts and payload', async () => {
-    const payload = request();
-    const original = await addedTaskId(payload);
-    assert.ok(await tasks.claim('default', 300));
-    assert.equal(await addedTaskId(payload), original);
-    const doc = await M.findById(original).lean();
-    assert.ok(doc);
-    assert.equal(doc.status, 'processing');
-    assert.equal(doc.attempts, 1);
-    assert.equal((doc.previews as unknown[]).length, 1);
-  });
-
-  test('retry reuses the active row, while completed and dead rows permit a new request', async () => {
-    const payload = request();
-    const first = await addedTaskId(payload);
-    const leased = await tasks.claim('default', 300);
-    assert.ok(leased);
-    assert.equal(
-      await tasks.fail(leased, { retryAt: new Date(Date.now() + 50) }, 'retry'),
-      true,
-    );
-    assert.equal(await addedTaskId(payload), first);
-    assert.equal((await M.findById(first).lean())?.attempts, 1);
-    await M.updateOne({ _id: first }, { $set: { status: 'completed' } });
-    const afterCompleted = await addedTaskId(payload);
-    assert.notEqual(afterCompleted, first);
-    await M.updateOne({ _id: afterCompleted }, { $set: { status: 'dead' } });
-    const afterDead = await addedTaskId(payload);
-    assert.notEqual(afterDead, afterCompleted);
-  });
-
-  test('legacy row without requestKey remains compatible', async () => {
-    const legacy = await insert();
-    const created = await addedTaskId(
-      request({ mediaId: String(legacy.fileId) }),
-    );
-    assert.ok(created);
-    assert.notEqual(created, String(legacy._id));
-    assert.equal(await M.countDocuments({ fileId: legacy.fileId }), 2);
-  });
-
-  test('reports unconfirmed and logs when getModel is falsy', async () => {
-    const { errors } = configureQueue(() => false);
-    const result = await tasks.add(request({ pipeline: 'p', previews: [] }));
-    assert.deepEqual(result, { status: 'unconfirmed' });
-    assert.ok(errors.length >= 1);
-  });
-
-  test('findActive returns persisted payloads that can prove strict-enqueue coverage', async () => {
+describe('MongoTaskQueue.findActive', () => {
+  test('returns the one pending or processing task, and [] for a dead row that still holds the gate', async () => {
     const payload = request({ pipeline: 'photo' });
-    const added = await addedTaskId(payload);
-    const active = await tasks.findActive({
+    const taskId = await addedTaskId(payload);
+    const query = {
       resizer: 'default',
       mediaId: payload.mediaId,
       pipeline: 'photo',
-    });
-    assert.deepEqual(
-      active.map(({ taskId, previews }) => ({
+    };
+    const receipt = [
+      { taskId, previews: canonicalizeVariants(payload.previews) },
+    ];
+    const active = async () =>
+      (await tasks.findActive(query)).map(({ taskId, previews }) => ({
         taskId,
         previews: canonicalizeVariants(previews),
-      })),
-      [{ taskId: added, previews: payload.previews }],
+      }));
+    assert.deepEqual(await active(), receipt);
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    assert.deepEqual(await active(), receipt);
+    for (const other of [
+      { ...query, pipeline: 'default' },
+      { ...query, mediaId: fid() },
+    ]) {
+      assert.deepEqual(await tasks.findActive(other), []);
+    }
+    assert.equal(
+      await tasks.fail(leased, 'dead', 'boom', { cooldownMs: 60_000 }),
+      true,
+    );
+    assert.deepEqual(await tasks.findActive(query), []);
+    // The dead row is still the gate: nothing will run, and nothing is reported.
+    assert.deepEqual(await tasks.add(payload), {
+      status: 'in-flight',
+      taskId,
+    });
+  });
+
+  test('reports neither a row left active by a worker from before the gate nor a row written before it', async () => {
+    const mediaId = fid();
+    await insertRaw(mediaId, { status: 'completed', active: true });
+    await insertRaw(mediaId, { status: 'pending', attempts: 0 });
+    assert.deepEqual(
+      await tasks.findActive({
+        resizer: 'default',
+        mediaId,
+        pipeline: 'default',
+      }),
+      [],
     );
   });
 
-  test('findActive only returns tasks of the asking Resizer, on any queue', async () => {
-    const mediaId = new mongoose.Types.ObjectId().toString();
+  test('only returns the task of the asking Resizer, on any queue', async () => {
+    const mediaId = fid();
     const payload = request({ mediaId, pipeline: 'photo' });
-    await tasks.add(request({ ...payload, resizer: 'listings' }));
+    await addedTaskId(request({ ...payload, resizer: 'listings' }));
     const bulk = await addedTaskId(request({ ...payload, queue: 'bulk' }));
     const active = await tasks.findActive({
       resizer: 'default',
@@ -689,37 +813,7 @@ describe('MongoTaskQueue.add', () => {
         taskId,
         previews: canonicalizeVariants(previews),
       })),
-      [{ taskId: bulk, previews: payload.previews }],
-    );
-  });
-
-  test('findActive treats a row without a resizer as the default Resizer', async () => {
-    const legacy = await insert({ pipeline: 'photo' });
-    await M.collection.updateOne(
-      { _id: legacy._id },
-      { $unset: { queue: '', resizer: '' } },
-    );
-    const query = { mediaId: String(legacy.fileId), pipeline: 'photo' };
-    const own = await tasks.findActive({ ...query, resizer: 'default' });
-    assert.equal(own.length, 1);
-    assert.equal(own[0].taskId, String(legacy._id));
-    assert.deepEqual(
-      await tasks.findActive({ ...query, resizer: 'listings' }),
-      [],
-    );
-  });
-
-  test('findActive excludes completed, dead, different-media, and different-pipeline tasks', async () => {
-    const payload = request();
-    const own = await addedTaskId(payload);
-    await insert({ fileId: payload.mediaId, status: 'completed' });
-    await insert({ fileId: payload.mediaId, status: 'dead' });
-    await insert({ fileId: payload.mediaId, pipeline: 'other' });
-    await insert();
-    const active = await tasks.findActive(payload);
-    assert.deepEqual(
-      active.map(({ taskId }) => taskId),
-      [own],
+      [{ taskId: bulk, previews: canonicalizeVariants(payload.previews) }],
     );
   });
 
@@ -909,6 +1003,30 @@ describe('MongoTaskQueue.claim', () => {
     assert.equal((a === null) !== (b === null), true);
   });
 
+  test('claim with resizers takes only their tasks; a row without a resizer belongs to default', async () => {
+    const own = await addedTaskId(request());
+    const listings = await addedTaskId(request({ resizer: 'listings' }));
+    // Written before tasks recorded their Resizer (and before the gate).
+    const { insertedId } = await M.collection.insertOne({
+      fileId: new mongoose.Types.ObjectId(),
+      queue: 'default',
+      pipeline: 'default',
+      previews: [],
+      status: 'pending',
+      attempts: 0,
+      availableAt: past(),
+    });
+    const claimFor = async (resizers: string[]) =>
+      (await tasks.claim('default', 300, undefined, { resizers }))?.taskId;
+    assert.equal(await claimFor(['listings']), listings);
+    assert.equal(await claimFor(['listings']), undefined);
+    assert.deepEqual(
+      [await claimFor(['default']), await claimFor(['default'])].sort(),
+      [own, String(insertedId)].sort(),
+    );
+    assert.equal(await claimFor(['default']), undefined);
+  });
+
   // The claim's own filter and sort, explained against thousands of tasks that are not due: tasks
   // in backoff and live leases must stay outside the index bounds, so after an outage a claim
   // still reads about one document, with no in-memory sort.
@@ -1029,17 +1147,21 @@ describe('MongoTaskQueue named queues and task events', () => {
     assert.equal(await tasks.claim('default', 300), null);
   });
 
-  test('add stores resizer and queue, and one request on two queues is two tasks', async () => {
+  test('add stores resizer and queue; the same request on another queue waits for that task', async () => {
     const payload = request({
       resizer: 'listings',
+      queue: 'bulk',
       previews: [{ sizeKey: '300x300', format: 'webp' }],
     });
-    const a = await addedTaskId(payload);
-    const b = await addedTaskId(request({ ...payload, queue: 'bulk' }));
-    const again = await addedTaskId(payload);
-    assert.notEqual(a, b);
-    assert.equal(again, a);
-    const row = await M.findById(b).lean();
+    const taskId = await addedTaskId(payload);
+    assert.deepEqual(
+      await tasks.add(request({ ...payload, queue: 'default' })),
+      {
+        status: 'in-flight',
+        taskId,
+      },
+    );
+    const row = await M.findById(taskId).lean();
     assert.equal(row?.resizer, 'listings');
     assert.equal(row?.queue, 'bulk');
   });

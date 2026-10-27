@@ -8,7 +8,6 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from '../contracts/storage.ts';
-import { buildRequestKey } from '../dispatcher.ts';
 import { DEFAULT_SCOPE, getPreviewIdentity } from '../images.ts';
 import { DISPATCH_LOCK_OWNER } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
@@ -110,7 +109,6 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' }],
-      requestKey: 'index-side-effect-test',
     });
     assert.equal(added.status, 'added');
     assert.ok(added.taskId);
@@ -159,7 +157,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
   }
 });
 
-test('prepared indexes preserve concurrent enqueue deduplication', async () => {
+test('prepared indexes enforce the gate: concurrent adds create one active row', async () => {
   const fixture = await createFixture('prepared');
   try {
     await Promise.all([
@@ -170,10 +168,17 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
     const taskIndexes = await fixture.taskModel.collection
       .listIndexes()
       .toArray();
-    const dedupe = taskIndexes.find(({ key }) =>
-      hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
+    const gate = taskIndexes.find(({ key }) =>
+      hasExactKey(key, { resizer: 1, fileId: 1, pipeline: 1 }),
     );
-    assert.ok(dedupe, 'fixture should create the active-request dedupe index');
+    assert.ok(gate, 'fixture should create the gate index');
+    assert.equal(
+      taskIndexes.some(({ key }) =>
+        hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
+      ),
+      false,
+      'the request-key index is gone',
+    );
     assert.ok(
       taskIndexes.some(({ key }) =>
         hasExactKey(key, { queue: 1, status: 1, availableAt: 1 }),
@@ -190,11 +195,8 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
         `the old lease index ${JSON.stringify(old)} is gone`,
       );
     }
-    assert.equal(dedupe.unique, true);
-    assert.deepEqual(dedupe.partialFilterExpression, {
-      status: { $in: ['pending', 'processing'] },
-      requestKey: { $exists: true },
-    });
+    assert.equal(gate.unique, true);
+    assert.deepEqual(gate.partialFilterExpression, { active: true });
 
     const mediaId = new mongoose.Types.ObjectId().toString();
     const request = {
@@ -204,22 +206,26 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' as const }],
     };
-    const receipts = await Promise.all(
-      Array.from({ length: 20 }, () =>
-        fixture.tasks.add({ ...request, requestKey: buildRequestKey(request) }),
-      ),
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => fixture.tasks.add(request)),
     );
-    const taskIds = receipts.map((receipt) => {
-      assert.equal(receipt.status, 'added');
-      return receipt.taskId;
-    });
-    assert.ok(taskIds.every((taskId) => typeof taskId === 'string' && taskId));
-    assert.equal(new Set(taskIds).size, 1);
+    const added = results.flatMap((result) =>
+      result.status === 'added' ? [result.taskId] : [],
+    );
+    assert.equal(added.length, 1);
+    assert.deepEqual(
+      results.filter((result) => result.status !== 'added'),
+      Array.from({ length: 19 }, () => ({
+        status: 'in-flight',
+        taskId: added[0],
+      })),
+    );
     assert.equal(
-      await fixture.taskModel.countDocuments({
-        fileId: mediaId,
-        status: { $in: ['pending', 'processing'] },
-      }),
+      await fixture.taskModel.countDocuments({ fileId: mediaId, active: true }),
+      1,
+    );
+    assert.equal(
+      await fixture.taskModel.countDocuments({ fileId: mediaId }),
       1,
     );
   } finally {
@@ -235,10 +241,11 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       { sizeKey: '30w', format: 'webp' as const, requestedWidth: 20 },
       { sizeKey: '30w', format: 'webp' as const, requestedWidth: 30 },
     ];
+    // The active task of this media holds two payloads for one preview identity.
     await fixture.taskModel.create({
       fileId: mediaId,
       pipeline: 'default',
-      requestKey: 'legacy-conflicting-payload',
+      active: true,
       status: 'pending',
       previews: conflictingPreviews,
     });

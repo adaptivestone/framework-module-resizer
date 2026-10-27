@@ -3584,7 +3584,7 @@ async function addTask(
   over: Partial<NewTask> = {},
 ) {
   const { taskId: _taskId, attempts: _attempts, ...payload } = task();
-  await tasks.add({ ...payload, requestKey: JSON.stringify(over), ...over });
+  await tasks.add({ ...payload, ...over });
 }
 
 describe('runResizeWorker', () => {

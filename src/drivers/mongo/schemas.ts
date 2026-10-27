@@ -17,9 +17,12 @@ export function resizeTaskFields(mediaModelName: string) {
     // The Resizer that queued the task and the named queue it waits in.
     resizer: { type: String, default: 'default' },
     queue: { type: String, default: 'default' },
-    // SHA-256 identity of the whole request (media + resizer + queue + pipeline + variants).
-    // Optional, so rows written before deduplication stay valid.
-    requestKey: { type: String },
+    // True while the task is the gate of its Resizer, media and pipeline: from add() until it
+    // completes, or until the next add() takes over a dead task whose cooldown has passed. Only
+    // add() sets it, so rows written before the gate never hold it.
+    active: { type: Boolean, default: false },
+    // A dead task keeps the gate until then.
+    cooldownUntil: { type: Date },
     // The requested variants (MissingPreview shape); the worker computes the stored Preview rows.
     previews: [
       {
@@ -80,17 +83,12 @@ export const resizeTaskIndexes: readonly IndexSpec[] = [
   ],
   // Per-media task lookup, newest first.
   [{ fileId: 1, createdAt: -1 }],
-  // Durable dedupe of identical active requests. Rows without requestKey are excluded, and
-  // completed/dead rows never block a fresh request.
+  // The gate: at most one active task per Resizer, media and pipeline. add() inserts an active
+  // row, so a duplicate key means another task is in flight; rows that are not active (finished,
+  // taken over, or written before the gate) never block a new task.
   [
-    { fileId: 1, pipeline: 1, requestKey: 1 },
-    {
-      unique: true,
-      partialFilterExpression: {
-        status: { $in: ['pending', 'processing'] },
-        requestKey: { $exists: true },
-      },
-    },
+    { resizer: 1, fileId: 1, pipeline: 1 },
+    { unique: true, partialFilterExpression: { active: true } },
   ],
 ];
 

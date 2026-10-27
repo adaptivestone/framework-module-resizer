@@ -94,7 +94,6 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [{ sizeKey: '10x10', format: 'webp' }],
-  requestKey: 'k1',
   ...over,
 });
 
@@ -631,8 +630,8 @@ describe('Consumer', () => {
 
   test('only tasks of the consumed queue are claimed', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
-    await tasks.add(newTask({ queue: 'bulk', requestKey: 'b' }));
-    await tasks.add(newTask({ mediaId: 'm2', requestKey: 'd' }));
+    await tasks.add(newTask({ queue: 'bulk' }));
+    await tasks.add(newTask({ mediaId: 'm2' }));
     const seen: string[] = [];
     await runUntil(
       tasks,

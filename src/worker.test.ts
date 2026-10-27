@@ -98,7 +98,6 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
         requestedHeight: 10,
       },
     ],
-    requestKey: 'k1',
   });
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -178,7 +177,6 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
         requestedHeight: 10,
       },
     ],
-    requestKey: 'svg-geometry',
   });
   const events: { event: TaskEvent; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -272,7 +270,6 @@ test('a storage.download security refusal is dead-lettered on its first delivery
     mediaId: 'm1',
     pipeline: 'default',
     previews: [webp10],
-    requestKey: 'security',
   });
   const events = await firstEvent(tasks);
   assert.deepEqual(
@@ -340,7 +337,6 @@ test('a variant error with retryable: false fails only its variant; the task fai
         requestedHeight: 20,
       },
     ],
-    requestKey: 'variant-refused',
   });
   const events = await firstEvent(tasks);
   assert.deepEqual(
@@ -387,7 +383,6 @@ const taskOf = (resizer: string) => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [{ sizeKey: '10x10', format: 'webp' }],
-  requestKey: `${resizer}-request`,
 });
 
 /** Run the worker until `done()` (or 5 s), then stop it and wait for it to return. */
@@ -439,8 +434,8 @@ test('a task of a Resizer the worker does not serve is given back, never run or 
     return fakeMedia();
   });
   // Two tasks of 'b', older than a's, so they are claimed first.
-  await tasks.add({ ...taskOf('b'), mediaId: 'b1', requestKey: 'b1' });
-  await tasks.add({ ...taskOf('b'), mediaId: 'b2', requestKey: 'b2' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b2' });
   await tasks.add(taskOf('a'));
   const [b1, b2, aRow] = tasks.rows;
   const errors: unknown[][] = [];
@@ -476,8 +471,8 @@ test('runWorker({ resizers }) serves only the given Resizers; on a task queue wi
   queuedResizer('c', new MemoryTaskQueue());
   // Two tasks of Resizer 'b', which only another process constructs. They are the older ones, so
   // they are claimed first.
-  await tasks.add({ ...taskOf('b'), mediaId: 'b1', requestKey: 'b1' });
-  await tasks.add({ ...taskOf('b'), mediaId: 'b2', requestKey: 'b2' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b2' });
   await tasks.add(taskOf('a'));
   const [b1, b2, aRow] = tasks.rows;
   const errors: unknown[][] = [];
@@ -572,7 +567,6 @@ test('task observers and their resize:<hook> events carry attempts', async () =>
     mediaId: 'm1',
     pipeline: 'default',
     previews: [webp10],
-    requestKey: 'attempts',
   });
   await workUntil(
     { logger: silent, resizers: [resizer] },
@@ -1016,7 +1010,6 @@ describe('dead-letter cooldown', () => {
       mediaId: 'm1',
       pipeline: 'default',
       previews: [{ sizeKey: '10x10', format: 'webp' }],
-      requestKey: 'ghost-request',
     });
     const working = t.work();
     while (t.tasks.rows[0].status !== 'dead') {

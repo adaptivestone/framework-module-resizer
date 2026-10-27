@@ -28,7 +28,6 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [{ sizeKey: '10x10', format: 'webp' }],
-  requestKey: 'k1',
   ...over,
 });
 
@@ -89,7 +88,6 @@ test('MemoryTaskQueue gates by task: one active task per Resizer, media and pipe
     await tasks.add(
       newTask({
         previews: [{ sizeKey: '20x20', format: 'webp' }],
-        requestKey: 'k2',
       }),
     ),
     { status: 'in-flight', taskId: 'task-1' },

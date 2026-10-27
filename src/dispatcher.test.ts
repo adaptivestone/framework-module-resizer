@@ -7,7 +7,6 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import {
-  buildRequestKey,
   Dispatcher,
   type DispatchRequest,
   noQueueResult,
@@ -169,21 +168,13 @@ describe('enqueue', () => {
       filters: { nested: { a: 1, z: 2 } },
       requestedWidth: 300,
     });
-    const request = {
-      mediaId: 'm1',
-      resizer: 'default',
-      queue: 'default',
-      pipeline: 'default',
-    };
-    assert.equal(
-      buildRequestKey({ ...request, previews: [first, second] }),
-      buildRequestKey({
-        ...request,
-        previews: [
-          second,
-          { ...first, filters: { nested: { a: 1, z: 2 } } as never },
-        ],
-      }),
+    // A permutation of the same request reaches the task queue as the same payload.
+    assert.deepEqual(
+      canonicalizeVariants([
+        second,
+        { ...first, filters: { nested: { a: 1, z: 2 } } as never },
+      ]),
+      canonical,
     );
   });
 
@@ -404,7 +395,7 @@ describe('enqueue', () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].mediaId, 'm1');
     assert.equal(calls[0].pipeline, 'photo');
-    assert.equal(calls[0].requestKey, buildRequestKey(calls[0]));
+    assert.equal('requestKey' in calls[0], false);
     assert.deepEqual(calls[0].previews, [v]);
   });
 
@@ -419,28 +410,6 @@ describe('enqueue', () => {
       { resizer: calls[0].resizer, queue: calls[0].queue },
       { resizer: 'listings', queue: 'bulk' },
     );
-  });
-});
-
-describe('buildRequestKey', () => {
-  const previews: MissingPreview[] = [{ sizeKey: '300x300', format: 'webp' }];
-  const base = {
-    mediaId: 'm1',
-    resizer: 'default',
-    queue: 'default',
-    pipeline: 'default',
-    previews,
-  };
-
-  test('is stable and versioned', () => {
-    assert.match(buildRequestKey(base), /^v2:[0-9a-f]{64}$/);
-    assert.equal(buildRequestKey(base), buildRequestKey({ ...base }));
-  });
-
-  test('differs by resizer and by queue', () => {
-    const key = buildRequestKey(base);
-    assert.notEqual(buildRequestKey({ ...base, resizer: 'listings' }), key);
-    assert.notEqual(buildRequestKey({ ...base, queue: 'bulk' }), key);
   });
 });
 
