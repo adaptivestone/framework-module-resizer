@@ -148,11 +148,12 @@ export const resizer = new Resizer({
 await runWorker({ signal, queue: 'default', sharp: { concurrency: 1, cache: false } });
 ```
 
-An eager-only Resizer needs only `storage` and `media` (`media: parts.media`); `locks` is required
-beside `tasks` (`RESIZE_LOCKS_REQUIRED`). Create the indexes of both models through your migration
-process (for example `await mongoose.connection.models.ResizeTask.createIndexes()`, and the same
-for `ResizeLock`); the module never creates them at runtime (`createResizeModels` sets
-`autoIndex: false`).
+An eager-only Resizer needs only `storage` and `media`: pass `media: new MongoMediaStore({ model:
+File })` (also from `…/drivers/mongo.js`) instead of the parts, which also register the task and
+lock models. `locks` is required beside `tasks` (`RESIZE_LOCKS_REQUIRED`). With the parts, create
+the indexes of both models through your migration process (for example
+`await mongoose.connection.models.ResizeTask.createIndexes()`, and the same for `ResizeLock`); the
+module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
 
 **The worker.** `runWorker({ signal, queue?, resizers?, logger?, sharp? })` serves the Resizers in
 `resizers`, by default every Resizer constructed in the process when it starts (an empty list
@@ -289,8 +290,9 @@ the owner in the `ResizeLock` row, and `FrameworkLockStore` in the framework `Lo
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
   - `appendPreviews` stores a preview only when its `identity` is not stored on the media yet, and
-    must resolve with the previews it stored (`[]` when none); any other result (e.g. `undefined`)
-    fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`. Of the previews left out,
+    must resolve with the previews it stored (`[]` when none); resolving with something other than
+    an array (e.g. `undefined`) fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.
+    Of the previews left out,
     one whose identity is already stored counts as covered: another worker stored it first, so the
     core logs it as a warning with its storage ref, does not count it as created and sends no
     `onPreviewGenerated` event. Any other is not recorded.
@@ -407,9 +409,14 @@ and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do 
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), or an SVG render ran past
-    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`). The worker reads the field,
-    not the class: any error object that fails a task with `retryable: false`, for example from a
-    custom driver or a `beforeSteps` step, dead-letters it at once.
+    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`). The worker reads
+    `retryable` on the error that fails the task, on any thrown object, not only a `ResizeError`:
+    an error from `loadMedia`, `storage.download`, the source and SVG checks, the SVG render,
+    `beforeSteps` or `appendPreviews` with `retryable: false` dead-letters the task at once. An
+    error inside one variant (`variantSteps`, encoding, `storage.upload`) or from the lock store
+    fails only that variant: it is logged, and the task fails with the retryable
+    `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only, then dead-lettered after
+    `maxAttempts`).
   - Completed rows expire after 24 h and dead rows after ~30 days (the `expireAfterSeconds` in
     the model).
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that

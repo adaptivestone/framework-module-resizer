@@ -76,8 +76,9 @@
   - `ResizeStorage` (files): `upload`, `download`, `publicUrl`, optional `signedUrl`.
   - `MediaStore` (media documents): `loadMedia`, `appendPreviews` and an optional `verify()`.
     `appendPreviews` stores a preview only when its `identity` is not stored yet and must resolve
-    with the previews it stored (`[]` when none); any other result, such as the pre-release
-    "nothing = all", fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.
+    with the previews it stored (`[]` when none); resolving with something other than an array,
+    such as the pre-release "nothing = all" `undefined`, fails with `ResizeSetupError`
+    `RESIZE_MEDIA_APPEND_RESULT_INVALID`.
   - `LockStore` (locks with owners): `acquire(key, owner, ttlMs)`, `extend(key, owner, ttlMs)`,
     `release(key, owner)` and an optional `verify()`. `release` is a compare-and-delete: a holder
     whose lock expired and was taken over cannot remove the new holder's lock. Worker locks get a
@@ -218,11 +219,15 @@
   (`RESIZE_FORMAT_NOT_CONFIGURED`) before any hook runs.
 - `ResizeError.retryable` (default `true`) decides dead-lettering instead of a list of codes: a
   task whose error has `retryable: false` is dead-lettered on its first failure. It is `false` by
-  default on `ResizeNoOriginalError` and `ResizeSecurityError` (a security refusal is no longer
-  retried), and `RESIZE_SOURCE_TOO_LARGE`, `RESIZE_SOURCE_METADATA_MISSING`,
-  `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` and `RESIZE_SVG_RENDER_TIMEOUT` set it. The worker reads the
-  field, not the class: any thrown object with `retryable: false`, such as an error from a custom
-  driver or a `beforeSteps` step, dead-letters its task at once.
+  default on `ResizeNoOriginalError` and `ResizeSecurityError` (a security refusal while reading
+  the original is no longer retried), and `RESIZE_SOURCE_TOO_LARGE`,
+  `RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` and
+  `RESIZE_SVG_RENDER_TIMEOUT` set it. The worker reads `retryable` on the error that fails the
+  task, on any thrown object, not only a `ResizeError`: errors from `loadMedia`,
+  `storage.download`, the source and SVG checks, the SVG render, `beforeSteps` and
+  `appendPreviews`. An error inside one variant (`variantSteps`, encoding, `storage.upload`) or
+  from the lock store fails only that variant, and the task fails with the retryable
+  `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only).
 - New error codes: `RESIZE_MEDIA_REQUIRED` (no `media`), `RESIZE_LOCKS_REQUIRED` (a task queue
   without `locks`) and `RESIZE_MEDIA_APPEND_RESULT_INVALID` (`appendPreviews` resolved with
   something other than an array). The pre-release `RESIZE_DATABASE_REQUIRED` is gone.

@@ -21,8 +21,8 @@ export interface MongoParts {
 /**
  * The `media`, `locks` and `tasks` options of a Resizer on `connection`. The package's ResizeTask
  * and ResizeLock models are registered with autoIndex off: create their indexes through your
- * migration process. Each call makes its own task queue, so call it once per process and pass the
- * same `tasks` to every Resizer.
+ * migration process. Call it once per process and spread the same parts into every Resizer (each
+ * call makes its own task queue).
  */
 export function mongoParts(
   // biome-ignore lint/suspicious/noExplicitAny: a Mongoose connection (types only, no import)

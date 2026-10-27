@@ -254,10 +254,12 @@ is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this re
 nothing or queued coverage is incomplete),
 `ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
 Every instance carries a stable `err.code` and `err.retryable` (default `true`; `false`: no retry
-can help, so the worker dead-letters the task at once — it reads the field on any thrown object,
-not the class). Use `ResizeError.isResizeError(err)` rather than `instanceof` when the error may
-cross a package boundary — duplicate copies of the package break `instanceof` but not the symbol
-brand.
+can help). The worker reads `retryable` on the error that fails the task (any thrown object, not
+only `ResizeError`) and dead-letters it at once when it is `false`; an error inside one variant
+(`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with the
+retryable `RESIZE_WORKER_INCOMPLETE`. Use `ResizeError.isResizeError(err)` rather than
+`instanceof` when the error may cross a package boundary — duplicate copies of the package break
+`instanceof` but not the symbol brand.
 
 ```ts
 import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
@@ -290,9 +292,10 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
 - Construct each Resizer ONCE, at one construction site, with `new FrameworkResizer`. Most
   hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
-  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves every Resizer constructed in its process before it starts
-  for one queue (`--queue`, default `'default'`), with one consume loop per task queue (Resizers
-  on the same backend share one), one task at a time, each processed with its own Resizer.
+  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves one queue
+  (`--queue`, default `'default'`) for every Resizer constructed in its process before the worker
+  starts, with one consume loop per task queue (Resizers on the same backend share one), one task
+  at a time, each processed with its own Resizer.
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
