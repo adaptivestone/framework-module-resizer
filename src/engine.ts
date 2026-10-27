@@ -22,34 +22,16 @@ import {
 } from './images.ts';
 import type { Resizer } from './resizer.ts';
 import type {
-  MediaLike,
   MissingPreview,
   Preview,
   PreviewFormat,
+  PrewarmOpts,
   PrewarmResult,
   ReadDecision,
   ReadyEntry,
+  ResolveOpts,
   SizeInput,
 } from './types.d.ts';
-
-export interface ResolveOpts {
-  media: MediaLike;
-  sizes: SizeInput[];
-  pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = config.formats
-  ctx?: Record<string, unknown>; // threaded to the read-path hooks
-  enqueueMissing?: boolean; // default true when a task queue is set, false otherwise
-  queue?: string; // queue for missing variants; default resizer.queue
-}
-
-export interface PrewarmOpts {
-  media: MediaLike;
-  sizes: SizeInput[];
-  pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = config.formats
-  ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
-  queue?: string; // queue for missing variants; default resizer.queue
-}
 
 /**
  * §17 steps 1–11. See the module header for the shape. The ENTIRE body runs inside a

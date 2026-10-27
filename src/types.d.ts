@@ -1,9 +1,10 @@
 // Hand-authored public types for @adaptivestone/framework-module-resize.
 // This file is copied verbatim into dist by postBuild.ts (tsc does not emit it),
 // so it MUST stay dependency-free: no imports of source (.ts) modules and no
-// runtime imports. Source-coupled types (Pipeline, BeforeStep, VariantStep,
-// ResizeStorage, MediaStore, LockStore, TaskQueue, HookName, HookFn)
-// live next to their code.
+// runtime imports. Source-coupled types live in src/contracts/: the driver contracts
+// (ResizeStorage, MediaStore, LockStore, TaskQueue) and the pipeline and hook types that
+// reference them or sharp (Pipeline, BeforeStep, VariantStep, HookName, HookSignatures,
+// HookTaps, HookFn). ResizerOptions stays beside the Resizer in resizer.ts.
 
 // Recursive partial for environment-specific config overrides. Arrays stay whole because
 // the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts.
@@ -176,6 +177,53 @@ export interface PictureUrls {
       [format: string]: { url: string; contentType?: string };
     };
   };
+}
+
+// ---------------------------------------------------------------------------
+// Options of the Resizer's methods, named so hosts can annotate their call sites
+// ---------------------------------------------------------------------------
+
+/**
+ * A part given as a function: called once, on first use, sync or async. It lets a Resizer be
+ * constructed at import time and build a driver later, e.g. from config that is not loaded yet or
+ * from an optional peer imported only when selected.
+ */
+export type LazyPart<T> = () => T | Promise<T>;
+
+export interface ResolveOpts {
+  media: MediaLike;
+  sizes: SizeInput[];
+  pipeline?: string; // selects a registered pipeline; default 'default'
+  formats?: PreviewFormat[]; // default = config.formats
+  ctx?: Record<string, unknown>; // threaded to the read-path hooks
+  enqueueMissing?: boolean; // default true when a task queue is set, false otherwise
+  queue?: string; // queue for missing variants; default resizer.queue
+}
+
+export interface PrewarmOpts {
+  media: MediaLike;
+  sizes: SizeInput[];
+  pipeline?: string; // selects a registered pipeline; default 'default'
+  formats?: PreviewFormat[]; // default = config.formats
+  ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
+  queue?: string; // queue for missing variants; default resizer.queue
+}
+
+// Options for eager `generate`.
+export interface GenerateOpts {
+  media: MediaLike;
+  sizes: SizeInput[];
+  pipeline?: string; // selects a registered pipeline; default 'default'
+  formats?: PreviewFormat[]; // default = config.formats
+  ctx?: Record<string, unknown>; // real ctx reaches pipeline steps (eager mode)
+  persist?: boolean; // default true → $push previews + backfill dims
+}
+
+// `created` is only the rows THIS call produced. Empty + `failed === 0` is success
+// (already stored or an empty catalog). Total failure throws.
+export interface GenerateResult {
+  created: Preview[];
+  failed: number;
 }
 
 // ---------------------------------------------------------------------------

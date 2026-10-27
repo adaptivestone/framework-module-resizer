@@ -5,6 +5,7 @@
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
+import type { ObserverName } from './contracts/hooks.ts';
 import type {
   LeasedTask,
   TaskEvent,
@@ -16,12 +17,7 @@ import { ResizeSetupError } from './errors.ts';
 import { getPreviewIdentity } from './images.ts';
 import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
 import { consumeQueue, timingOf } from './queue.ts';
-import {
-  getResizer,
-  listResizers,
-  type ObserverName,
-  type Resizer,
-} from './resizer.ts';
+import { getResizer, listResizers, type Resizer } from './resizer.ts';
 import { processTaskWith } from './resizeTask.ts';
 import type { ResizeLogger } from './types.d.ts';
 

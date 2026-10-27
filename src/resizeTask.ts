@@ -16,7 +16,7 @@ import sharp, {
 } from 'sharp';
 import { defaultQueueOptions } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
-import type { TaskQueue } from './contracts/taskQueue.ts';
+import type { LeasedTask, TaskQueue } from './contracts/taskQueue.ts';
 import { canonicalizeVariants } from './enqueue.ts';
 import {
   ResizeGenerateError,
@@ -45,13 +45,10 @@ import {
   workerLockKey,
 } from './lockKeys.ts';
 import { timingOf } from './queue.ts';
+import type { Resizer } from './resizer.ts';
 import type {
   GenerateOpts,
   GenerateResult,
-  LeasedTask,
-  Resizer,
-} from './resizer.ts';
-import type {
   MediaLike,
   MissingPreview,
   Preview,

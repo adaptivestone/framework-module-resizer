@@ -8,10 +8,10 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import type { ResizeStorage } from './contracts/storage.ts';
 import { LocalFsStorage } from './drivers/fs.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
-import type { ResizeStorage } from './resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { MemoryTaskQueue } from './testHelpers/fakes.ts';
 import { makeResizeConfig } from './testHelpers/resizeConfig.ts';

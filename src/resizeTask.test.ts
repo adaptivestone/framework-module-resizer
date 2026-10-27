@@ -16,6 +16,8 @@ import {
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
+import type { Pipeline } from './contracts/pipeline.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
 import {
   ResizeConfigError,
@@ -28,12 +30,7 @@ import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
 import { getSizeKey, toMissingPreview } from './images.ts';
-import {
-  type Pipeline,
-  Resizer,
-  type ResizeStorage,
-  resetResizerForTests,
-} from './resizer.ts';
+import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,

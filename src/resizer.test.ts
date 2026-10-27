@@ -5,6 +5,8 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import type { MediaStore } from './contracts/media.ts';
+import type { Pipeline } from './contracts/pipeline.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
 import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { FrameworkLockStore } from './framework/locks.ts';
 import { FrameworkMediaStore } from './framework/media.ts';
@@ -12,10 +14,9 @@ import { FrameworkResizer } from './framework/resizer.ts';
 import {
   getResizer,
   listResizers,
-  type Pipeline,
+  onResetResizerForTests,
   Resizer,
   type ResizerOptions,
-  type ResizeStorage,
   resetResizerForTests,
 } from './resizer.ts';
 import {
@@ -32,7 +33,7 @@ import type { MissingPreview, SizeInput } from './types.d.ts';
 // ---------------------------------------------------------------------------
 // Fakes. The Resizer stores passed driver references verbatim (identity checks);
 // FrameworkResizer fills omitted parts with framework-driver instances (instanceof
-// checks) and takes the logger/events from the recording fake app installed here.
+// checks) and takes the logger from the fake app installed here.
 // ---------------------------------------------------------------------------
 
 const fakeStorage = (): ResizeStorage => ({
@@ -41,38 +42,15 @@ const fakeStorage = (): ResizeStorage => ({
   publicUrl: () => '',
 });
 
-// A recording fake app: logger.error pushes to `errors`; events.emit (when present)
-// pushes to `emitted` (or throws when emitThrows). The Resizer reads the app when it is
+// A fake app with a silent logger and no event bus. The Resizer reads the app when it is
 // constructed, so install this before constructing the Resizer.
-function installFakeApp(
-  opts: { withEvents?: boolean; emitThrows?: boolean } = {},
-): { errors: unknown[][]; emitted: unknown[][] } {
+function installFakeApp(): void {
   resetAppInstance();
-  const errors: unknown[][] = [];
-  const emitted: unknown[][] = [];
-  const events = opts.withEvents
-    ? {
-        emit(name: string, ...args: unknown[]) {
-          if (opts.emitThrows) {
-            throw new Error('emit boom');
-          }
-          emitted.push([name, ...args]);
-        },
-      }
-    : undefined;
   setAppInstance({
     getConfig: () => makeResizeConfig(),
     getModel: () => ({}),
-    logger: {
-      info() {},
-      warn() {},
-      error(...args: unknown[]) {
-        errors.push(args);
-      },
-    },
-    events,
+    logger: { info() {}, warn() {}, error() {} },
   } as never);
-  return { errors, emitted };
 }
 
 // The minimal valid options: only `storage` is required.
@@ -659,160 +637,14 @@ describe('Resizer registry', () => {
     assert.equal(getResizer(), second);
     assert.throws(() => getResizer('listings'), /no Resizer named 'listings'/);
   });
-});
 
-// ---------------------------------------------------------------------------
-// Named pipelines (04 · §8) — ported from registry.test.ts
-// ---------------------------------------------------------------------------
-
-describe('named pipelines', () => {
-  test('a registered pipeline is retrievable', () => {
-    const r = new FrameworkResizer(baseOpts());
-    const p: Pipeline = { beforeSteps: [] };
-    r.registerPipeline('photo', p);
-    assert.equal(r.getPipeline('photo'), p);
-  });
-
-  test('re-registering a name replaces it (last-wins)', () => {
-    const r = new FrameworkResizer(baseOpts());
-    const p1: Pipeline = { beforeSteps: [] };
-    const p2: Pipeline = { variantSteps: [] };
-    r.registerPipeline('photo', p1);
-    r.registerPipeline('photo', p2);
-    assert.equal(r.getPipeline('photo'), p2);
-  });
-
-  test('unknown name → structurally empty pipeline {}, and frozen', () => {
-    const r = new FrameworkResizer(baseOpts());
-    const empty = r.getPipeline('nope');
-    assert.deepEqual(empty, {});
-    assert.equal(Object.isFrozen(empty), true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Hook bus — waterfall (04 · §9) — ported from hooks.test.ts
-// ---------------------------------------------------------------------------
-
-describe('runWaterfall', () => {
-  test('threads the value through taps in registration order', async () => {
-    installFakeApp();
-    const r = new FrameworkResizer(baseOpts());
-    r.hook('resolveSizes', (v: number) => v + 1);
-    r.hook('resolveSizes', async (v: number) => v * 2);
-    const out = await r.runWaterfall('resolveSizes', 1, {});
-    assert.equal(out, 4); // (1 + 1) * 2
-  });
-
-  test('threads ctx to each tap', async () => {
-    installFakeApp();
-    const r = new FrameworkResizer(baseOpts());
-    const ctx = { entity: 'event' };
-    let seen: unknown;
-    r.hook('beforeEnqueue', (v: unknown, c: unknown) => {
-      seen = c;
-      return v;
+  test('resetResizerForTests() runs every onResetResizerForTests hook', () => {
+    let resets = 0;
+    onResetResizerForTests(() => {
+      resets += 1;
     });
-    await r.runWaterfall('beforeEnqueue', [], ctx);
-    assert.equal(seen, ctx);
-  });
-
-  test('a throwing tap is logged and skipped (prior value kept); later taps still run', async () => {
-    const { errors } = installFakeApp();
-    const r = new FrameworkResizer(baseOpts());
-    r.hook('resolveSizes', (v: number) => v + 1);
-    r.hook('resolveSizes', () => {
-      throw new Error('boom');
-    });
-    r.hook('resolveSizes', (v: number) => v + 10);
-    const out = await r.runWaterfall('resolveSizes', 0, {});
-    assert.equal(out, 11); // 0+1 → (throw → keep 1) → 1+10
-    assert.equal(errors.length, 1);
-    assert.match(String(errors[0][0]), /resolveSizes/);
-  });
-
-  test('with no taps returns the input unchanged', async () => {
-    installFakeApp();
-    const r = new FrameworkResizer(baseOpts());
-    const value = { a: 1 };
-    assert.equal(await r.runWaterfall('formatPublicUrls', value, {}), value);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Hook bus — observers (04 · §9) — ported from hooks.test.ts
-// ---------------------------------------------------------------------------
-
-describe('runObservers', () => {
-  test('awaits every tap in registration order', async () => {
-    installFakeApp();
-    const r = new FrameworkResizer(baseOpts());
-    const order: number[] = [];
-    r.hook('afterTaskComplete', async () => {
-      await Promise.resolve();
-      order.push(1);
-    });
-    r.hook('afterTaskComplete', () => {
-      order.push(2);
-    });
-    await r.runObservers('afterTaskComplete', {}, {});
-    assert.deepEqual(order, [1, 2]);
-  });
-
-  test('a throwing tap is logged and does not stop later taps', async () => {
-    const { errors } = installFakeApp();
-    const r = new FrameworkResizer(baseOpts());
-    const seen: string[] = [];
-    r.hook('onTaskFailed', () => {
-      throw new Error('boom');
-    });
-    r.hook('onTaskFailed', () => {
-      seen.push('second');
-    });
-    await r.runObservers('onTaskFailed', {}, new Error('x'), {});
-    assert.deepEqual(seen, ['second']);
-    assert.equal(errors.length, 1);
-    assert.match(String(errors[0][0]), /onTaskFailed/);
-  });
-
-  test('mirrors onto app.events as resize:<name> BEFORE the taps run', async () => {
-    const { emitted } = installFakeApp({ withEvents: true });
-    const r = new FrameworkResizer(baseOpts());
-    let emittedLenWhenTapRan = -1;
-    r.hook('onPreviewGenerated', () => {
-      emittedLenWhenTapRan = emitted.length;
-    });
-    await r.runObservers('onPreviewGenerated', 'preview-arg', {});
-    assert.equal(emittedLenWhenTapRan, 1); // the emit already happened before the tap
-    assert.deepEqual(emitted[0], [
-      'resize:onPreviewGenerated',
-      'preview-arg',
-      {},
-    ]);
-  });
-
-  test('a missing app.events is fine — taps still run', async () => {
-    installFakeApp(); // no events
-    const r = new FrameworkResizer(baseOpts());
-    const seen: string[] = [];
-    r.hook('afterTaskComplete', () => {
-      seen.push('ran');
-    });
-    await r.runObservers('afterTaskComplete', {}, {});
-    assert.deepEqual(seen, ['ran']);
-  });
-
-  test('a THROWING app.events.emit is caught (logged) and taps still run', async () => {
-    const { errors } = installFakeApp({ withEvents: true, emitThrows: true });
-    const r = new FrameworkResizer(baseOpts());
-    const seen: string[] = [];
-    r.hook('onTaskDeadLettered', () => {
-      seen.push('ran');
-    });
-    await r.runObservers('onTaskDeadLettered', {}, new Error('x'), {});
-    assert.deepEqual(seen, ['ran']);
-    assert.equal(errors.length, 1);
-    assert.match(String(errors[0][0]), /onTaskDeadLettered/);
+    resetResizerForTests();
+    assert.equal(resets, 1);
   });
 });
 

@@ -8,9 +8,23 @@
 //   …/drivers/sqs.js    SqsTaskQueue                   (optional peer: AWS SQS SDK)
 //   …/framework.js      the framework adapter: FrameworkResizer, FrameworkMediaStore, …
 
-// --- driver contracts: abstract classes a custom driver extends (or any object of the same shape) ---
+// --- contracts: the abstract classes a custom driver extends (or any object of the same shape),
+// and the pipeline and hook types for pipeline and hook authors (type-only; erased at runtime) ---
+export type {
+  HookFn,
+  HookName,
+  HookSignatures,
+  HookTaps,
+  ObserverName,
+  WaterfallName,
+} from './contracts/hooks.ts';
 export { LockStore } from './contracts/locks.ts';
 export { MediaStore } from './contracts/media.ts';
+export type {
+  BeforeStep,
+  Pipeline,
+  VariantStep,
+} from './contracts/pipeline.ts';
 export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
 export {
   type ClaimedTask,
@@ -20,11 +34,6 @@ export {
   type TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-// --- read-path / eager option types (type-only) — hosts annotate their call sites ---
-export type {
-  PrewarmOpts,
-  ResolveOpts,
-} from './engine.ts';
 // --- error hierarchy: every module throw is a `ResizeError`; the subclass says what to DO ---
 // Hosts catch `ResizeError` to separate "this module rejected it" from a sharp/S3/mongo failure,
 // then branch on the subclass (or the stable `err.code`). `ResizeError.isResizeError(err)` is the
@@ -53,29 +62,15 @@ export {
   resizeMediaPaths,
   resizeMediaSchemaFragment,
 } from './mediaFragment.ts';
-// --- contract types for custom-driver / pipeline / hook authors (type-only; erased at runtime) ---
-export type {
-  BeforeStep,
-  GenerateOpts,
-  GenerateResult,
-  HookFn,
-  HookName,
-  HookSignatures,
-  LazyPart,
-  ObserverName,
-  Pipeline,
-  ResizerOptions,
-  VariantStep,
-  WaterfallName,
-} from './resizer.ts';
 // --- core: the Resizer + named lookup (constructor-wired; one per name) ---
 // `resetResizerForTests` is a TEST-ONLY escape hatch for host test suites.
+export type { ResizerOptions } from './resizer.ts';
 export {
   getResizer,
   Resizer,
   resetResizerForTests,
 } from './resizer.ts';
-// --- data shapes (types.d.ts) ---
+// --- data shapes and method options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts, …) ---
 export type * from './types.d.ts';
 // --- the framework-free worker (framework hosts run `runResizeWorker` from …/framework.js) ---
 export type { RunWorkerOptions } from './worker.ts';

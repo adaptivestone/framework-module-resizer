@@ -1,143 +1,46 @@
 // The constructor-wired public surface (02 · §6, design delta #12): every driver is
 // injected in ONE visible options literal at construction and fixed for the process
-// lifetime — no register-call sequence, no hidden global registries. The class also
-// carries the named-pipeline set (04 · §8) and the cross-cutting hook bus (04 · §9).
+// lifetime — no register-call sequence. The Resizer holds its named pipelines (src/pipelines.ts)
+// and its hook bus (src/hooks.ts), and registers itself by name in the process registry below.
 // Each Resizer owns its config, logger and event bus, all passed in explicitly: the core never
 // reads a framework app. Framework hosts use FrameworkResizer (src/framework/resizer.ts), which
 // builds every part from the app's config file.
-import type { Metadata, Sharp } from 'sharp';
 import defaultResizeConfig from './config/resize.ts';
-// The driver contracts live in src/contracts/ so drivers import them without this module. They
-// are re-exported here (types only) for the core files that import them from resizer.ts.
+import type {
+  HookName,
+  HookSignatures,
+  HookTaps,
+  ObserverName,
+  WaterfallName,
+} from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
+import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type {
-  ClaimedTask,
-  LeasedTask,
-  NewTask,
-  TaskEvent,
-  TaskEventHandler,
-  TaskQueue,
-} from './contracts/taskQueue.ts';
-import {
-  type PrewarmOpts,
-  prewarmImpl,
-  type ResolveOpts,
-  resolveImpl,
-} from './engine.ts';
+import type { TaskQueue } from './contracts/taskQueue.ts';
+import { prewarmImpl, resolveImpl } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
+import { HookBus } from './hooks.ts';
 import { uploadOriginalImpl } from './original.ts';
+import { PipelineRegistry } from './pipelines.ts';
 import { timingOf } from './queue.ts';
+import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { generateImpl } from './resizeTask.ts';
 import type {
-  MediaLike,
-  MissingPreview,
+  GenerateOpts,
+  GenerateResult,
+  LazyPart,
   Original,
-  Preview,
-  PreviewFormat,
+  PrewarmOpts,
   PrewarmResult,
   ReadDecision,
   ResizeConfig,
   ResizeEventBus,
   ResizeLogger,
-  SizeInput,
+  ResolveOpts,
   UploadOriginalOpts,
 } from './types.d.ts';
-
-export type {
-  ClaimedTask,
-  LeasedTask,
-  LockStore,
-  MediaStore,
-  NewTask,
-  ResizeStorage,
-  TaskEvent,
-  TaskEventHandler,
-  TaskQueue,
-};
-
-// ---------------------------------------------------------------------------
-// Named pipeline types (04 · §8) — the per-media-type pixel work. sharp is a hard dep;
-// these reference its types (erased at runtime, so this module stays pure logic).
-// ---------------------------------------------------------------------------
-
-export type BeforeStep = (
-  buffer: Buffer,
-  meta: { media: MediaLike; metadata: Metadata; ctx: Record<string, unknown> },
-) => Buffer | Promise<Buffer>;
-
-export type VariantStep = (
-  img: Sharp,
-  meta: { variant: MissingPreview; ctx: Record<string, unknown> }, // variant carries `filters`, `fit`
-) => Sharp | Promise<Sharp>;
-
-export interface Pipeline {
-  beforeSteps?: BeforeStep[]; // async; run ONCE on the original buffer, before any resize
-  variantSteps?: VariantStep[]; // run PER variant, after resize, before encode
-}
-
-// ---------------------------------------------------------------------------
-// Hook names (04 · §9). Waterfall hooks thread a value through their taps (default =
-// identity); observer hooks are fire-and-forget side effects (return ignored; errors
-// logged). NOT pipelines (those are per-media-type pixel work, above).
-// ---------------------------------------------------------------------------
-
-export type WaterfallName =
-  | 'resolveSizes'
-  | 'beforeEnqueue'
-  | 'formatPublicUrls';
-export type ObserverName =
-  | 'onPreviewGenerated'
-  | 'afterTaskComplete'
-  | 'onTaskFailed'
-  | 'onTaskDeadLettered';
-export type HookName = WaterfallName | ObserverName;
-
-// Per-hook tap signatures (04 · §9 review fix). The public `hook(name, fn)` + the `hooks:`
-// constructor option infer `fn`'s exact shape from `name`, so a typo'd tap body or a wrong
-// return shape is a COMPILE error instead of silent `any`. Waterfalls thread + return their
-// value; observers are fire-and-forget (return ignored). `task` is always the backend-agnostic
-// LeasedTask, and the worker observers receive `ctx === {}`.
-export interface HookSignatures {
-  resolveSizes: (
-    sizes: SizeInput[],
-    ctx: Record<string, unknown>,
-  ) => SizeInput[] | Promise<SizeInput[]>;
-  beforeEnqueue: (
-    missing: MissingPreview[],
-    ctx: Record<string, unknown>,
-  ) => MissingPreview[] | Promise<MissingPreview[]>;
-  formatPublicUrls: (
-    decision: ReadDecision,
-    ctx: Record<string, unknown>,
-  ) => unknown | Promise<unknown>;
-  onPreviewGenerated: (
-    preview: Preview,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-  afterTaskComplete: (
-    task: LeasedTask,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-  onTaskFailed: (
-    task: LeasedTask,
-    error: unknown,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-  onTaskDeadLettered: (
-    task: LeasedTask,
-    error: unknown,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-}
-
-// Deliberately loose: the bus stores heterogeneous taps uniformly. The PUBLIC surface
-// (`hook<N>`, `ResizerOptions.hooks`) is typed via HookSignatures above; internal storage +
-// runWaterfall/runObservers keep this loose type with contained casts.
-// biome-ignore lint/suspicious/noExplicitAny: heterogeneous tap signatures; typed at Resizer.hook
-export type HookFn = (...args: any[]) => unknown;
 
 // ---------------------------------------------------------------------------
 // Constructor options (02 · §6). `storage` and `media` are required — both modes need them
@@ -145,13 +48,6 @@ export type HookFn = (...args: any[]) => unknown;
 // degradation. `tasks` is optional (eager-only hosts omit it — 11 · Modes), and `locks` is
 // required beside it: reads and the worker lock every variant they queue or render.
 // ---------------------------------------------------------------------------
-
-/**
- * A part given as a function: called once, on first use, sync or async. It lets a Resizer be
- * constructed at import time and build a driver later, e.g. from config that is not loaded yet or
- * from an optional peer imported only when selected.
- */
-export type LazyPart<T> = () => T | Promise<T>;
 
 export interface ResizerOptions {
   name?: string; // registry key; default 'default'
@@ -169,36 +65,14 @@ export interface ResizerOptions {
   // an SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
   tasks?: TaskQueue | LazyPart<TaskQueue | undefined>;
   queue?: string; // default queue name for this Resizer's tasks; default 'default'
-  pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
-  // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
-  hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
+  pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
+  // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
+  hooks?: HookTaps;
 }
-
-// Options for eager `generate` (11 · Modes §11.1) — a NAMED type so hosts can annotate their
-// call sites and the method signature stays DRY (ResolveOpts / PrewarmOpts live in engine.ts).
-export interface GenerateOpts {
-  media: MediaLike;
-  sizes: SizeInput[];
-  pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = config.formats
-  ctx?: Record<string, unknown>; // real ctx reaches pipeline steps (eager mode, 04 · §8)
-  persist?: boolean; // default true → $push previews + backfill dims
-}
-
-// `created` is only the rows THIS call produced. Empty + `failed === 0` is success
-// (already stored or an empty catalog). Total failure throws.
-export interface GenerateResult {
-  created: Preview[];
-  failed: number;
-}
-
-// Unknown pipeline name → the shared, frozen empty pipeline (no steps). One frozen
-// constant avoids per-call allocation + accidental mutation of a "default" (04 · §8).
-const EMPTY_PIPELINE: Pipeline = Object.freeze({});
 
 // Constructed Resizers by name. Entry points (the worker, host code) look them up here;
 // core code always receives its Resizer as an argument.
-const resizers = new Map<string, Resizer>();
+const registry = new Registry<Resizer>();
 
 type PartName = 'storage' | 'media' | 'locks' | 'tasks';
 const PART_COUNT = 4;
@@ -237,7 +111,6 @@ export class Resizer {
   readonly #config: () => ResizeConfig;
   #resolvedConfig: ResizeConfig | undefined;
   readonly logger: ResizeLogger;
-  readonly #events: ResizeEventBus | undefined;
   // The drivers. A part given as a function stays unset until ready() has loaded it.
   readonly #sources: Pick<ResizerOptions, PartName>;
   #storage: ResizeStorage | undefined;
@@ -248,10 +121,8 @@ export class Resizer {
   // flight. A part whose function failed is retried alone; the parts that loaded are kept.
   readonly #loadedParts = new Set<PartName>();
   readonly #loadingParts = new Map<PartName, Promise<void>>();
-  // Named pipelines: last-wins per name (04 · §8).
-  readonly #pipelines: Map<string, Pipeline>;
-  // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
-  readonly #hooks: Map<HookName, HookFn[]>;
+  readonly #pipelines: PipelineRegistry;
+  readonly #hooks: HookBus;
 
   constructor(opts: ResizerOptions) {
     // Runtime storage validation (02 · §6 review fix): `storage` is the ONE required option —
@@ -266,12 +137,6 @@ export class Resizer {
       throw new ResizeSetupError('resize: `name` must be a non-empty string', {
         code: 'RESIZE_NAME_INVALID',
       });
-    }
-    if (resizers.has(name)) {
-      throw new ResizeSetupError(
-        `resize: a Resizer named '${name}' already exists in this process — construct each name once and use getResizer('${name}') elsewhere`,
-        { code: 'RESIZE_DUPLICATE_RESIZER' },
-      );
     }
     const queue = opts.queue ?? 'default';
     if (typeof queue !== 'string' || queue.trim().length === 0) {
@@ -293,7 +158,6 @@ export class Resizer {
       this.#config = () => config;
     }
     this.logger = opts.logger ?? console;
-    this.#events = opts.events;
     this.name = name;
     this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
@@ -320,28 +184,23 @@ export class Resizer {
       this.#tasks = opts.tasks;
       this.#loadedParts.add('tasks');
     }
-    this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
-    // A seeded hooks value may be a single fn or an array — normalize to arrays and
-    // COPY them, so a caller mutating its own array later cannot bypass hook().
-    this.#hooks = new Map();
-    for (const [hookName, fns] of Object.entries(opts.hooks ?? {})) {
-      const arr = (Array.isArray(fns) ? [...fns] : [fns]) as HookFn[];
-      this.#hooks.set(hookName as HookName, arr);
-    }
-    resizers.set(name, this);
+    this.#pipelines = new PipelineRegistry(opts.pipelines);
+    this.#hooks = new HookBus({
+      logger: this.logger,
+      events: opts.events,
+      taps: opts.hooks,
+    });
+    // Last, so a rejected construction never claims the name; a taken name throws
+    // RESIZE_DUPLICATE_RESIZER.
+    registry.register(this);
   }
 
   /**
-   * Register a tap — `fn` is inferred from `name` via HookSignatures (04 · §9). Multiple taps per
-   * name are allowed; registration order is preserved. (Internal storage stays loosely typed.)
+   * Register a tap — `fn` is inferred from `name` via HookSignatures. Multiple taps per name are
+   * allowed; registration order is preserved.
    */
   hook<N extends HookName>(name: N, fn: HookSignatures[N]): void {
-    const taps = this.#hooks.get(name);
-    if (taps) {
-      taps.push(fn as HookFn);
-    } else {
-      this.#hooks.set(name, [fn as HookFn]);
-    }
+    this.#hooks.add(name, fn);
   }
 
   /** Files: originals and previews. Available once the parts are loaded (see `ready()`). */
@@ -465,72 +324,29 @@ export class Resizer {
     }
   }
 
-  /** Register a named pipeline — last-wins per name (04 · §8). */
-  registerPipeline(name: string, p: Pipeline): void {
-    this.#pipelines.set(name, p);
-  }
-
   /** Look up a pipeline; an unknown name → the shared frozen empty pipeline (no steps). */
   getPipeline(name: string): Pipeline {
-    return this.#pipelines.get(name) ?? EMPTY_PIPELINE;
+    return this.#pipelines.get(name);
   }
 
   /** True when `name` is registered. `default` always exists: unregistered, it has no steps. */
   hasPipeline(name: string): boolean {
-    return name === 'default' || this.#pipelines.has(name);
+    return this.#pipelines.has(name);
   }
 
-  /**
-   * Thread `value` through the name's taps in order, awaiting each. Taps are HOST code
-   * on the read path, so each is GUARDED: on throw, log and keep the prior value (treat
-   * the tap as identity). No taps → returns the input unchanged. (04 · §9)
-   */
-  async runWaterfall(
+  /** Thread `value` through the name's guarded taps (see HookBus.runWaterfall). */
+  runWaterfall(
     name: WaterfallName,
     value: unknown,
     ctx: Record<string, unknown>,
-    // `optional` (0.2 formatPublicUrls): no taps / every tap throws → `undefined`
-    // instead of leaking the raw decision as a DTO. Other waterfalls stay `identity`.
-    mode: 'identity' | 'optional' = 'identity',
+    mode?: 'identity' | 'optional',
   ): Promise<unknown> {
-    const taps = this.#hooks.get(name) ?? [];
-    if (mode === 'optional' && taps.length === 0) {
-      return undefined;
-    }
-    let succeeded = false;
-    for (const fn of taps) {
-      try {
-        value = await fn(value, ctx);
-        succeeded = true;
-      } catch (e) {
-        this.logger.error(`resize waterfall ${name} tap failed (skipped)`, e);
-      }
-    }
-    if (mode === 'optional' && !succeeded) {
-      return undefined;
-    }
-    return value;
+    return this.#hooks.runWaterfall(name, value, ctx, mode);
   }
 
-  /**
-   * Fire an observer. First a fire-and-forget mirror onto the framework event bus as
-   * `resize:<name>` (its own try/catch) so ecosystem subscribers see it BEFORE the taps;
-   * then await each registered tap sequentially, error-isolated (log + continue). Return
-   * values are ignored. (04 · §9)
-   */
-  async runObservers(name: ObserverName, ...args: unknown[]): Promise<void> {
-    try {
-      this.#events?.emit(`resize:${name}`, ...args);
-    } catch (e) {
-      this.logger.error(`resize event ${name} listener failed`, e);
-    }
-    for (const fn of this.#hooks.get(name) ?? []) {
-      try {
-        await fn(...args);
-      } catch (e) {
-        this.logger.error(`resize hook ${name} failed`, e);
-      }
-    }
+  /** Fire an observer: the event bus first, then every tap (see HookBus.runObservers). */
+  runObservers(name: ObserverName, ...args: unknown[]): Promise<void> {
+    return this.#hooks.runObservers(name, ...args);
   }
 
   /**
@@ -574,36 +390,25 @@ export class Resizer {
   }
 }
 
-/** The Resizer registered under `name` (worker entry, host code, late taps). */
-export function getResizer(name = 'default'): Resizer {
-  const resizer = resizers.get(name);
-  if (!resizer) {
-    throw new ResizeSetupError(
-      `resize: no Resizer named '${name}' — construct it in bootstrap code that runs in every process that uses it`,
-      { code: 'RESIZE_NO_RESIZER' },
-    );
-  }
-  return resizer;
+/** The Resizer registered under `name`, default 'default' (worker entry, host code, late taps). */
+export function getResizer(name?: string): Resizer {
+  return registry.get(name);
 }
 
 /** Every registered Resizer, in construction order (the worker serves all of them). */
 export function listResizers(): Resizer[] {
-  return [...resizers.values()];
+  return registry.list();
 }
 
-// Per-process state an adapter keeps beside the registry (the framework adapter's shared task
-// queues), cleared with it.
-const resetHooks = new Set<() => void>();
-
-/** Run `reset` on every resetResizerForTests() (for an adapter's per-process state). */
+/**
+ * Run `reset` on every resetResizerForTests(): for per-process state an adapter keeps beside the
+ * registry (the framework adapter's shared task queues).
+ */
 export function onResetResizerForTests(reset: () => void): void {
-  resetHooks.add(reset);
+  registry.onReset(reset);
 }
 
 /** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */
 export function resetResizerForTests(): void {
-  resizers.clear();
-  for (const reset of resetHooks) {
-    reset();
-  }
+  registry.reset();
 }

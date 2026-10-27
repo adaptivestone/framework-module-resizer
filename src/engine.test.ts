@@ -5,13 +5,10 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import type { LockStore } from './contracts/locks.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask } from './contracts/taskQueue.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
-import {
-  Resizer,
-  type ResizeStorage,
-  resetResizerForTests,
-} from './resizer.ts';
+import { Resizer, resetResizerForTests } from './resizer.ts';
 import { fakeMedia, MemoryTaskQueue } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
