@@ -8,9 +8,9 @@ import { sourceFiles } from './testHelpers/imports.ts';
 
 const CORE_FILES = [
   'dispatcher.ts',
-  'engine.ts',
   'formatPictureUrls.ts',
   'images.ts',
+  'reader.ts',
   'resizeTask.ts',
   'uploader.ts',
 ];
