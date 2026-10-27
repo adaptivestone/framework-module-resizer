@@ -7,10 +7,15 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
+import type { MediaStore } from './contracts/media.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
-import { ResizeMediaError } from './errors.ts';
+import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { consumeQueue } from './queue.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import {
+  Resizer,
+  type ResizerOptions,
+  resetResizerForTests,
+} from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
@@ -405,6 +410,116 @@ describe('dead-letter cooldown', () => {
     assert.deepEqual(locks.calls, []);
     assert.ok(
       t.errors.some((args) => /unknown Resizer 'ghost'/.test(String(args[0]))),
+    );
+  });
+
+  // A Resizer named 'late', constructed after `runWorker` took its list of Resizers (so startup
+  // never readied or verified it). Tasks and events are routed by name, so it still gets its tasks.
+  function lateResizer(
+    media: () => Promise<MediaStore>,
+    locks: LockStore,
+    hooks: ResizerOptions['hooks'],
+  ): Resizer {
+    return new Resizer({
+      name: 'late',
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => png,
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media,
+      locks,
+      hooks,
+    });
+  }
+
+  const lateTask = {
+    resizer: 'late',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [{ sizeKey: '10x10', format: 'webp' }],
+    requestKey: 'late-request',
+  };
+
+  // Task 15 (an explicit `resizers` list for runWorker) will revisit this.
+  test('a Resizer constructed after the worker started still reaches its observers', async () => {
+    const t = setup(expiringLocks({ ms: 0 }));
+    const working = t.work(); // runWorker has taken its list of Resizers
+    const failed: unknown[][] = [];
+    let loads = 0;
+    // Its media store is not up for the first task, so the task fails before the handler has
+    // readied the Resizer; the event handler readies it.
+    lateResizer(
+      async () => {
+        loads += 1;
+        if (loads === 1) {
+          throw new Error('media store not up yet');
+        }
+        return fakeMedia();
+      },
+      memoryLocks(),
+      {
+        onTaskFailed: (task, error) => {
+          failed.push([task.taskId, (error as Error).message]);
+          t.stop.abort();
+        },
+      },
+    );
+    const { taskId } = await t.tasks.add(lateTask);
+    await working;
+    assert.deepEqual(failed, [[taskId, 'media store not up yet']]);
+    assert.ok(
+      !t.errors.some((args) => /event handler failed/.test(String(args[0]))),
+    );
+  });
+
+  test('a Resizer that cannot start loses only its observers; its events are logged and no cooldown is held', {
+    timeout: 5000,
+  }, async () => {
+    const t = setup(expiringLocks({ ms: 0 }), {
+      maxAttempts: 2,
+      retryBackoffMs: { base: 1, max: 1 },
+    });
+    const working = t.work(); // runWorker has taken its list of Resizers
+    const lateLocks = expiringLocks({ ms: 0 });
+    const observed: string[] = [];
+    lateResizer(
+      async () => {
+        throw new ResizeSetupError('media store is down', {
+          code: 'LATE_MEDIA_DOWN',
+        });
+      },
+      lateLocks,
+      {
+        onTaskFailed: () => {
+          observed.push('failed');
+        },
+        onTaskDeadLettered: () => {
+          observed.push('dead');
+        },
+      },
+    );
+    await t.tasks.add(lateTask);
+    while (t.tasks.rows[0].status !== 'dead') {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    t.stop.abort();
+    await working;
+    // The task's retry and dead-letter bookkeeping ran; only the observers are lost.
+    assert.equal(t.tasks.rows[0].attempts, 2);
+    assert.deepEqual(observed, []);
+    assert.deepEqual(lateLocks.calls, []);
+    assert.deepEqual(
+      t.errors
+        .filter((args) => /event handler failed/.test(String(args[0])))
+        .map(([message, err]) => [message, (err as ResizeSetupError).code]),
+      [
+        ['resize worker: failed event handler failed', 'LATE_MEDIA_DOWN'],
+        ['resize worker: deadLettered event handler failed', 'LATE_MEDIA_DOWN'],
+      ],
     );
   });
 });

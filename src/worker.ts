@@ -30,7 +30,8 @@ export async function processTask(
   const resizer = getResizer(task.resizer);
   await resizer.ready();
   // The delivering queue, else the Resizer's own; with neither (an eager-only Resizer), the
-  // default TTL.
+  // default TTL. Reading it before the Processor's lock check is safe: consumeQueue (and ready(),
+  // for the Resizer's own queue) validated this timing through timingOf, which caches it.
   const queue = tasks ?? resizer.tasks;
   return resizer.processor.processTask(task, {
     signal: taskOpts?.signal,
@@ -109,11 +110,17 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
         );
         return;
       }
-      // The Processor exists once the Resizer is ready (the task's own handler readied it, unless
-      // the task never reached it, e.g. one dead-lettered for too many deliveries).
+      // The Processor exists once the Resizer is ready. The task's own handler readied it, unless
+      // the task failed before that (e.g. a part that failed to load once) or never reached it
+      // (dead-lettered for too many deliveries). A Resizer that cannot start is caught by startup
+      // verification; one that slips past it (constructed after the worker started) only loses its
+      // observers: this rejects, the consume loop logs it, and the task's retry and dead-letter
+      // bookkeeping is already done.
       await owner.ready();
       const { processor } = owner;
       if (event === 'deadLettered') {
+        // Outside the cooldown's never-reject guard, which is safe: consumeQueue validated this
+        // queue's timing through timingOf before its first claim, and timingOf caches it.
         const cooldown = processor.holdFailedCooldown(
           task,
           timingOf(tasks).lockTtlMs.failed,

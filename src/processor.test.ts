@@ -3789,7 +3789,9 @@ describe('one worker serves every Resizer', () => {
       });
     register(sibling);
     // A failing claim is retried, but the loop logs it first, and the worker's logger is host
-    // code: one that throws fails this loop while it runs.
+    // code: one that throws fails this loop while it runs. This relies on that claim-error log line
+    // in consumeQueue being unguarded; if it is ever wrapped (e.g. in logNeverThrow), this test
+    // needs a new trigger, or it only times out.
     const failing = new MemoryTaskQueue();
     failing.claim = async () => {
       throw new Error('queue unreachable');
