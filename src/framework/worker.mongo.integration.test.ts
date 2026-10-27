@@ -142,7 +142,7 @@ function memoryMedia(media: MediaLike): MediaStore {
 }
 
 // One task queue over the real ResizeTask model, with the test timing.
-const sharedQueue = () =>
+const realTaskQueue = () =>
   new MongoTaskQueue({ model: taskModel, timing: testQueue });
 
 function newMedia(): MediaLike {
@@ -168,7 +168,7 @@ const sizes = [{ width: 16, height: 16 }];
 test('one worker serves two Resizers that share a task queue', async () => {
   installApp();
   await taskModel.deleteMany({});
-  const tasks = sharedQueue();
+  const tasks = realTaskQueue();
   const stop = new AbortController();
   const mediaA = newMedia();
   const mediaB = newMedia();
@@ -221,7 +221,7 @@ test('a bulk-queue task waits for a bulk worker', async () => {
   await taskModel.deleteMany({});
   const media = newMedia();
   const memory = memoryStorage();
-  const tasks = sharedQueue();
+  const tasks = realTaskQueue();
 
   const first = new AbortController();
   const resizer = new FrameworkResizer({

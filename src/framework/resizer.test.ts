@@ -372,7 +372,8 @@ test('a core MongoTaskQueue needs one model, and the core validates its timing',
         err.code === 'RESIZE_MONGO_MODEL_REQUIRED',
     );
   }
-  // Locks come from the database; queue timing is validated by the core on first use.
+  // Locks live in the framework Lock collection; queue timing, lock TTLs included, is validated by
+  // the core on first use.
   assert.throws(
     () =>
       timingOf(

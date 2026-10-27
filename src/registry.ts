@@ -1,5 +1,5 @@
-// The process registry: constructed items by name, one per name. Entry points look them up here;
-// core code always receives its Resizer as an argument. Generic, so it needs nothing from the
+// The process registry: constructed items by name, one per name. Entry points look Resizers up
+// here; the services receive their ports, never a Resizer. Generic, so it needs nothing from the
 // Resizer: resizer.ts keeps the one instance and the typed lookups hosts use.
 import { ResizeSetupError } from './errors.ts';
 

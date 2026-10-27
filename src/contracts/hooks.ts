@@ -66,5 +66,5 @@ export type HookTaps = {
 // Deliberately loose: the bus stores heterogeneous taps uniformly. The PUBLIC surface
 // (`hook<N>`, `HookTaps`) is typed via HookSignatures above; the bus keeps this loose type
 // internally with contained casts.
-// biome-ignore lint/suspicious/noExplicitAny: heterogeneous tap signatures; typed at Resizer.hook
+// biome-ignore lint/suspicious/noExplicitAny: heterogeneous tap signatures; typed at Resizer.hook, HookBus.add and HookTaps
 export type HookFn = (...args: any[]) => unknown;

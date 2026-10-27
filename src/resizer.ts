@@ -1,7 +1,8 @@
-// The constructor-wired public surface (02 · §6, design delta #12): every driver is
-// injected in ONE visible options literal at construction and fixed for the process
-// lifetime — no register-call sequence. The Resizer holds its named pipelines (src/pipelines.ts)
-// and its hook bus (src/hooks.ts), and registers itself by name in the process registry below.
+// The constructor-wired public surface: every driver is injected in ONE visible options literal
+// at construction and fixed for the process lifetime — no register-call sequence. The Resizer
+// holds its named pipelines (src/pipelines.ts) and its hook bus (src/hooks.ts), and registers
+// itself by name in the process registry below. It is the composition root: ready() builds the
+// services from the parts, and no service receives the Resizer.
 // Each Resizer owns its config, logger and event bus, all passed in explicitly: the core never
 // reads a framework app. Framework hosts use FrameworkResizer (src/framework/resizer.ts), which
 // builds every part from the app's config file.
@@ -40,10 +41,10 @@ import type {
 import { Uploader } from './uploader.ts';
 
 // ---------------------------------------------------------------------------
-// Constructor options (02 · §6). `storage` and `media` are required — both modes need them
-// (05 · §10.4), so a missing driver is a boot-time type/throw error, not a runtime
-// degradation. `tasks` is optional (eager-only hosts omit it — 11 · Modes), and `locks` is
-// required beside it: reads and the worker lock every variant they queue or render.
+// Constructor options. `storage` and `media` are required — both modes need them, so a missing
+// driver is a boot-time type/throw error, not a runtime degradation. `tasks` is optional
+// (eager-only hosts omit it), and `locks` is required beside it: reads and the worker lock every
+// variant they queue or render.
 // ---------------------------------------------------------------------------
 
 export interface ResizerOptions {
@@ -132,10 +133,9 @@ export class Resizer {
   #builtServices: Services | undefined;
 
   constructor(opts: ResizerOptions) {
-    // Runtime storage validation (02 · §6 review fix): `storage` is the ONE required option —
-    // both modes need it (05 · §10.4). The type system enforces it for TS hosts, but a JS host or
-    // a half-filled scaffold would otherwise fail with a downstream TypeError at the first
-    // publicUrl/download — throw a NAMED error at construction instead.
+    // Runtime validation of the required parts (`storage` here, `media` below): the type system
+    // enforces them for TS hosts, but a JS host or a half-filled scaffold would otherwise fail with
+    // a downstream TypeError at the first publicUrl/download — throw a NAMED error at construction.
     if (!opts?.storage) {
       throw storageRequired();
     }
