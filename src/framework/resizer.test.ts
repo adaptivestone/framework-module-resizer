@@ -355,6 +355,32 @@ test('tasks: false is eager only, even when the config has a queue', async () =>
   assert.equal(r.tasks, undefined);
 });
 
+test('tasks: false builds no lock store, so verify() needs no framework Lock model', async () => {
+  const asked: string[] = [];
+  setAppInstance({
+    getConfig: () =>
+      makeResizeConfig({
+        storage: localStorage,
+        queue: { driver: 'database' },
+      }),
+    getModel: (name: string) => {
+      asked.push(name);
+      return name === 'Lock' ? undefined : { findById: async () => null };
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  } as never);
+  const r = new FrameworkResizer({ tasks: false });
+  await r.verify();
+  assert.equal(r.locks, undefined);
+  assert.deepEqual(asked, ['File']);
+  // A lock store given in code is kept.
+  const locks = memoryLocks();
+  assert.equal(
+    new FrameworkResizer({ name: 'b', tasks: false, locks }).locks,
+    locks,
+  );
+});
+
 test('an explicit config also feeds the database queue timing', async () => {
   installApp();
   const r = new FrameworkResizer({

@@ -7,11 +7,7 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
-import type {
-  LeasedTask,
-  TaskEvent,
-  TaskQueue,
-} from './contracts/taskQueue.ts';
+import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
@@ -360,7 +356,7 @@ test('a variant error with retryable: false fails only its variant; the task fai
 // no-op complete.
 function queuedResizer(
   name: string,
-  tasks: TaskQueue,
+  tasks: ResizerOptions['tasks'],
   media: ResizerOptions['media'] = fakeMedia(),
 ): Resizer {
   return new Resizer({
@@ -390,8 +386,10 @@ const taskOf = (resizer: string) => ({
 test('runWorker({ resizers }) serves only the given Resizers', async () => {
   const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
   const a = queuedResizer('a', tasks);
-  queuedResizer('b', tasks);
-  // b's task is the older one, so it is claimed first.
+  // Not listed, on its own task queue: it does not share a's queue, so the worker may start.
+  queuedResizer('c', new MemoryTaskQueue());
+  // A task of Resizer 'b', which only another process constructs. It is the older one, so it is
+  // claimed first.
   await tasks.add(taskOf('b'));
   await tasks.add(taskOf('a'));
   const [bRow, aRow] = tasks.rows;
@@ -438,6 +436,85 @@ test('runWorker accepts a Resizer listed twice', async () => {
     signal: AbortSignal.abort(),
     logger: silent,
     resizers: [a, a],
+  });
+});
+
+test('two different Resizers listed under one name are RESIZE_DUPLICATE_RESIZER', async () => {
+  const tasks = new MemoryTaskQueue();
+  const first = queuedResizer('x', tasks);
+  // The registry holds one Resizer per name; a list can hold two that were never registered together.
+  resetResizerForTests();
+  const second = queuedResizer('x', tasks);
+  await assert.rejects(
+    () =>
+      runWorker({
+        signal: AbortSignal.abort(),
+        logger: silent,
+        resizers: [first, second],
+      }),
+    (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_DUPLICATE_RESIZER' &&
+      /the `resizers` list names 'x' twice/.test(err.message),
+  );
+});
+
+describe('a worker that serves only some of the Resizers on a task queue', () => {
+  const unlisted = (err: unknown, names: RegExp) =>
+    err instanceof ResizeSetupError &&
+    err.code === 'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED' &&
+    /queue 'default'/.test(err.message) &&
+    names.test(err.message);
+
+  test('is refused at start, naming the queue and the Resizers left out, before any claim', async () => {
+    const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+    let claims = 0;
+    tasks.claim = async () => {
+      claims += 1;
+      return null;
+    };
+    const a = queuedResizer('a', tasks);
+    queuedResizer('b', tasks);
+    queuedResizer('c', tasks);
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await assert.rejects(
+        () => runWorker({ signal: stop.signal, logger: silent, resizers: [a] }),
+        (err: unknown) => unlisted(err, /'b', 'c'/),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(claims, 0);
+  });
+
+  test('a Resizer whose task queue is a function that has not run yet is loaded and compared', async () => {
+    const tasks = new MemoryTaskQueue();
+    const a = queuedResizer('a', tasks);
+    queuedResizer('lazy', async () => tasks);
+    await assert.rejects(
+      () =>
+        runWorker({
+          signal: AbortSignal.abort(),
+          logger: silent,
+          resizers: [a],
+        }),
+      (err: unknown) => unlisted(err, /'lazy'/),
+    );
+  });
+
+  test('a Resizer whose parts cannot load is left out of the comparison', async () => {
+    const tasks = new MemoryTaskQueue();
+    const a = queuedResizer('a', tasks);
+    queuedResizer('broken', async () => {
+      throw new Error('queue not up');
+    });
+    await runWorker({
+      signal: AbortSignal.abort(),
+      logger: silent,
+      resizers: [a],
+    });
   });
 });
 

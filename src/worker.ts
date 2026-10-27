@@ -61,6 +61,51 @@ async function runTask(
   });
 }
 
+/**
+ * Refuse to start when a Resizer of this process that the worker does not serve uses one of the
+ * task queues it consumes: the worker would claim that Resizer's tasks and fail them
+ * (RESIZE_NO_RESIZER) into the dead-letter queue, with their events dropped. A Resizer whose task
+ * queue is a function that has not run yet is loaded first; one whose parts cannot load is left
+ * out (it cannot be compared). Resizers constructed in other processes cannot be seen here.
+ */
+async function refuseUnservedSharers(
+  queue: string,
+  consumed: Set<TaskQueue>,
+  unserved: Resizer[],
+): Promise<void> {
+  const sharing: string[] = [];
+  for (const resizer of unserved) {
+    const tasks = await taskQueueOf(resizer);
+    if (tasks && consumed.has(tasks)) {
+      sharing.push(`'${resizer.name}'`);
+    }
+  }
+  if (sharing.length > 0) {
+    throw new ResizeSetupError(
+      `resize worker: Resizer(s) ${sharing.join(', ')} share a task queue this worker consumes for queue '${queue}' but are not in the \`resizers\` list — the worker would claim their tasks and dead-letter them; list them too, or give them their own task queue`,
+      { code: 'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED' },
+    );
+  }
+}
+
+/** The task queue of `resizer`, loading its parts when they have not loaded; undefined if none. */
+async function taskQueueOf(resizer: Resizer): Promise<TaskQueue | undefined> {
+  const loaded = (): { tasks: TaskQueue | undefined } | undefined => {
+    try {
+      return { tasks: resizer.tasks };
+    } catch {
+      return undefined; // RESIZE_NOT_READY: its task queue is a function that has not run
+    }
+  };
+  const now = loaded();
+  if (now) {
+    return now.tasks;
+  }
+  // Not a Resizer this worker serves, so its own failure is not the worker's.
+  await resizer.ready().catch(() => undefined);
+  return loaded()?.tasks;
+}
+
 export interface RunWorkerOptions {
   queue?: string; // queue to consume; default 'default'
   signal: AbortSignal; // stops the worker: finish in-flight tasks, then return
@@ -70,15 +115,19 @@ export interface RunWorkerOptions {
   sharp?: { concurrency: number; cache: boolean };
   // The Resizers to serve; default: every Resizer registered when the worker starts. Tasks and
   // events are routed by name among these only: a task of any other Resizer fails with
-  // RESIZE_NO_RESIZER (it retries, then dead-letters), and its events are logged and dropped.
+  // RESIZE_NO_RESIZER (it retries, then dead-letters), and its events are logged and dropped. A
+  // Resizer registered at start that shares a consumed task queue must be listed too
+  // (RESIZE_QUEUE_SHARED_RESIZER_UNLISTED), and two listed Resizers need two names.
   resizers?: Resizer[];
 }
 
 export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   const queue = opts.queue ?? 'default';
   const logger = opts.logger ?? console;
-  // The served Resizers, taken once now, so one constructed later is not served.
-  const resizers = [...(opts.resizers ?? listResizers())];
+  // The served Resizers, taken once now, so one constructed later is not served (and neither is
+  // it compared below); a Resizer listed twice is served once.
+  const registered = listResizers();
+  const resizers = [...new Set(opts.resizers ?? registered)];
   if (resizers.length === 0) {
     throw new ResizeSetupError(
       opts.resizers
@@ -86,6 +135,17 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
         : 'resize worker: no Resizer constructed — construct your Resizers in the worker process before starting it',
       { code: 'RESIZE_NO_RESIZER' },
     );
+  }
+  // Tasks are routed by name, so of two Resizers listed under one name the second would never run.
+  const names = new Set<string>();
+  for (const { name } of resizers) {
+    if (names.has(name)) {
+      throw new ResizeSetupError(
+        `resize worker: the \`resizers\` list names '${name}' twice — list each Resizer once`,
+        { code: 'RESIZE_DUPLICATE_RESIZER' },
+      );
+    }
+    names.add(name);
   }
   // Drivers given as functions load now, so each Resizer's task queue is known.
   await Promise.all(resizers.map((resizer) => resizer.ready()));
@@ -117,6 +177,11 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       { code: 'RESIZE_QUEUE_NOT_SERVED' },
     );
   }
+  await refuseUnservedSharers(
+    queue,
+    queues,
+    registered.filter((resizer) => !resizers.includes(resizer)),
+  );
   // Fail before claiming anything: a bad config, queue or store (e.g. a wrong mediaModelName)
   // would otherwise surface only as per-task errors.
   for (const resizer of resizers) {

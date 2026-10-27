@@ -3,7 +3,7 @@
 // holds only behaviour (pipelines, hooks):
 // - config: the file's image settings;
 // - media: FrameworkMediaStore (the app's media model, `mediaModelName` in the file);
-// - locks: FrameworkLockStore (the framework's own Lock model);
+// - locks: FrameworkLockStore (the framework's own Lock model), unless `tasks: false`;
 // - storage: the file's `storage` section ('local' or 's3');
 // - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
 // - logger and events: the app's.
@@ -51,7 +51,7 @@ export interface FrameworkResizerOptions
   config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
   storage?: ResizeStorage; // default: built from the config's `storage`
   media?: MediaStore; // default: FrameworkMediaStore over the config's `mediaModelName`
-  locks?: LockStore; // default: FrameworkLockStore (the framework's Lock model)
+  locks?: LockStore; // default: FrameworkLockStore (the framework's Lock model), none if no tasks
   // default: built from the config's `queue`; `false` = eager only, whatever the config says
   tasks?: TaskQueue | false;
   logger?: ResizeLogger; // default: the app logger
@@ -100,7 +100,8 @@ export class FrameworkResizer extends Resizer {
             ? { config: explicitConfig, configName }
             : { configName },
         ),
-      locks: locks ?? new FrameworkLockStore(),
+      // An eager-only Resizer (`tasks: false`) takes no locks, so its verify() needs no Lock model.
+      locks: locks ?? (tasks === false ? undefined : new FrameworkLockStore()),
       ...(tasks === false
         ? {}
         : { tasks: tasks ?? (() => buildQueue(read(), file)) }),
