@@ -262,7 +262,7 @@
   there invalid timing is still a config error on first use.)
 - Locks carry an owner, and a release deletes only the owner's lock. `ResizeLock` and framework
   `Lock` rows written by an older version have no owner, so this version cannot release them
-  early: they expire by their TTL (at most 60 s for dispatch and worker locks, 10 min for a
+  early: they expire by their TTL (by default 60 s for dispatch and worker locks, 10 min for a
   dead-letter cooldown), and an expired one is taken over as usual. In a mixed-version rolling
   deploy an older process still deletes any lock by its key, this version's too. Locks only
   prevent duplicate work, so the cost is a variant that waits or is queued twice; deploy the API

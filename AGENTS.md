@@ -101,12 +101,13 @@ full box its steps were written for. To hand the private original to its owner, 
 
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
    on a bad config, call `await getResizer().verify()` after `Server.init()`; otherwise a config
-   error appears at the first call. A task queue that cannot be used (no lock store, invalid
-   timing) does not fail calls: it is logged once, reads serve stored previews and queue nothing,
-   uploads and `generate()` work, and only `verify()`, `prewarm()` and worker start report it. The
-   worker process imports it from the scaffolded `src/commands/ResizeWorker.ts`
-   (`import '../resizer.ts'` plus a re-export of the module's command); keep that import if you
-   edit the command.
+   error appears at the first call. A task queue passed in code that cannot be used (no lock store,
+   invalid `timing`) does not fail calls: it is logged once, reads serve stored previews and queue
+   nothing, uploads and `generate()` work, and only `verify()`, `prewarm()` and worker start report
+   it. For a `FrameworkResizer`, invalid timing in the config file's `queue` section is still a
+   config error at the first call, like the rest of the file. The worker process imports it from the
+   scaffolded `src/commands/ResizeWorker.ts` (`import '../resizer.ts'` plus a re-export of the
+   module's command); keep that import if you edit the command.
 
 5. The scaffolded `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
    `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
