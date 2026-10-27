@@ -202,8 +202,13 @@ test("queue { driver: 'database' } uses the app's ResizeTask queue and the frame
       assert.equal(name, 'Lock');
       return {
         collection: {
-          insertOne: async (doc: { _id: string; owner: string }) => {
-            calls.push(['insert', doc._id, doc.owner]);
+          findOneAndUpdate: async (
+            filter: { _id: string },
+            update: { $set: { owner: string } },
+            options: { upsert: boolean },
+          ) => {
+            calls.push(['upsert', filter._id, update.$set.owner, options]);
+            return null;
           },
           updateOne: async () => ({ matchedCount: 0 }),
           deleteOne: async (filter: object) => {
@@ -222,7 +227,7 @@ test("queue { driver: 'database' } uses the app's ResizeTask queue and the frame
   assert.equal(await r.locks.acquire('variant', 'A', 1001), true);
   assert.equal(await r.locks.release('variant', 'A'), true);
   assert.deepEqual(calls, [
-    ['insert', 'variant', 'A'],
+    ['upsert', 'variant', 'A', { upsert: true }],
     ['delete', { _id: 'variant', owner: 'A' }],
   ]);
 });

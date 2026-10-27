@@ -72,3 +72,19 @@ test('the owner is stored despite the strict schema, and the framework statics s
   assert.equal(stored?.owner, 'A');
   assert.equal(await LockModel.acquireLock('k3', 30), false);
 });
+
+test('a lock without an expiry, or an expired one, is taken over; a live one blocks', async () => {
+  const a = new FrameworkLockStore();
+  await LockModel.collection.insertOne({ _id: 'k4' });
+  assert.equal(await a.acquire('k4', 'A', 60_000), true);
+  assert.equal(await a.acquire('k4', 'B', 60_000), false);
+  await LockModel.collection.updateOne(
+    { _id: 'k4' },
+    { $set: { expiredAt: new Date(Date.now() - 1000) } },
+  );
+  assert.equal(await a.acquire('k4', 'B', 60_000), true);
+  assert.equal((await LockModel.collection.findOne({ _id: 'k4' }))?.owner, 'B');
+  // The framework model's strict schema has no owner; the store writes around it, so verify()
+  // checks only that the model is registered.
+  new FrameworkLockStore().verify();
+});

@@ -3,15 +3,20 @@
 // several callers racing for a key only one matches. A TTL index removes expired locks, and one
 // that is still present is taken over by the next acquire.
 import { LockStore } from '../../contracts/locks.ts';
+import { ResizeSetupError } from '../../errors.ts';
 import { resolveModelOption } from './modelOption.ts';
 
-/** The lock model methods the store calls (any Mongoose model has them). */
+/**
+ * The lock model methods the store calls (any Mongoose model has them). When the model also
+ * exposes its `schema`, verify() checks it keeps the `owner` field.
+ */
 export interface MongoLockModel {
-  create(doc: {
-    _id: string;
-    owner: string;
-    expiredAt: Date;
-  }): PromiseLike<unknown>;
+  modelName?: string;
+  findOneAndUpdate(
+    filter: object,
+    update: object,
+    options: { upsert: true },
+  ): PromiseLike<unknown>;
   updateOne(
     filter: object,
     update: object,
@@ -23,6 +28,12 @@ export interface MongoLockStoreOptions {
   // The ResizeLock model, or a getter called on each use (for a model registered later).
   model?: MongoLockModel;
   getModel?: () => MongoLockModel | null | undefined;
+}
+
+// The part of a Mongoose schema verify() reads (types only: no mongoose import).
+interface SchemaLike {
+  path(path: string): unknown;
+  options: { strict?: unknown };
 }
 
 const DUPLICATE_KEY = 11000;
@@ -43,30 +54,48 @@ export class MongoLockStore extends LockStore {
     return this.#model();
   }
 
-  /** Startup check: the lock model must resolve, or every variant would fail at run time. */
+  /**
+   * Startup check: the lock model must resolve, or every variant would fail at run time, and a
+   * strict schema must declare `owner`. Mongoose strict mode drops an undeclared field, so no
+   * release or extend would ever match its lock (e.g. a ResizeLock model registered on the
+   * connection before this package version, which createResizeModels returns as it is).
+   */
   verify(): void {
-    this.lockModel();
+    const model = this.lockModel();
+    const schema = (model as { schema?: Partial<SchemaLike> }).schema;
+    if (
+      typeof schema?.path === 'function' &&
+      schema.options?.strict !== false &&
+      !schema.path('owner')
+    ) {
+      throw new ResizeSetupError(
+        `resize: the lock model ${model.modelName ? `'${model.modelName}' ` : ''}has no owner field, so Mongoose would drop it and no lock could be released before it expires — add owner: { type: String } to its schema (see resizeLockFields)`,
+        { code: 'RESIZE_MONGO_LOCK_MODEL_OUTDATED' },
+      );
+    }
   }
 
-  // A free key is created; a taken key is taken over only once its lock has expired (of racing
-  // callers, one matches `$lte: now`: its write moves the expiry past now).
+  // One write: a free key is inserted, and a taken key matches only once its lock has expired (or
+  // has no expiry), so of racing callers one wins. A live lock does not match, so the upsert tries
+  // to insert the same _id, which fails with a duplicate key: not acquired.
   async acquire(key: string, owner: string, ttlMs: number): Promise<boolean> {
-    const model = this.lockModel();
     const now = new Date();
-    const expiredAt = new Date(now.getTime() + ttlMs);
     try {
-      await model.create({ _id: key, owner, expiredAt });
-      return true;
+      await this.lockModel().findOneAndUpdate(
+        {
+          _id: key,
+          $or: [{ expiredAt: { $lte: now } }, { expiredAt: null }],
+        },
+        { $set: { owner, expiredAt: new Date(now.getTime() + ttlMs) } },
+        { upsert: true },
+      );
     } catch (err) {
-      if ((err as { code?: number }).code !== DUPLICATE_KEY) {
-        throw err;
+      if ((err as { code?: number }).code === DUPLICATE_KEY) {
+        return false;
       }
+      throw err;
     }
-    const result = await model.updateOne(
-      { _id: key, expiredAt: { $lte: now } },
-      { $set: { owner, expiredAt } },
-    );
-    return result.matchedCount === 1;
+    return true;
   }
 
   // Only the owner's live lock: an expired one may already belong to the next acquire.

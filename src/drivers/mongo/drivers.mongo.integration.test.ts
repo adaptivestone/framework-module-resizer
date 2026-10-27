@@ -173,14 +173,17 @@ describe('MongoLockStore', () => {
     );
   });
 
-  test('a create error other than a duplicate key is rethrown', async () => {
+  test('acquire is one write; an error other than a duplicate key is rethrown', async () => {
     const failure = { code: 1 };
-    const updates: object[] = [];
+    const calls: string[] = [];
     const failing = new MongoLockStore({
       model: {
-        create: () => Promise.reject(failure),
-        updateOne: async (filter) => {
-          updates.push(filter);
+        findOneAndUpdate: () => {
+          calls.push('findOneAndUpdate');
+          return Promise.reject(failure);
+        },
+        updateOne: async () => {
+          calls.push('updateOne');
           return { matchedCount: 1 };
         },
         deleteOne: async () => ({ deletedCount: 0 }),
@@ -190,11 +193,45 @@ describe('MongoLockStore', () => {
       () => failing.acquire('l8', 'A', 1000),
       (err: unknown) => err === failure,
     );
-    assert.deepEqual(updates, [], 'no takeover is tried');
+    assert.deepEqual(calls, ['findOneAndUpdate']);
+  });
+
+  test('a lock row without an expiry is taken over', async () => {
+    await ResizeLock.collection.insertOne({ _id: 'l9', owner: 'A' } as never);
+    assert.equal(await store.acquire('l9', 'B', 60_000), true);
+    const lock = await ResizeLock.findById('l9').lean();
+    assert.equal(lock.owner, 'B');
+    assert.ok(lock.expiredAt.getTime() > Date.now());
   });
 
   test('the ResizeLock schema stores the owner', () => {
     assert.deepEqual(resizeLockFields.owner, { type: String });
+  });
+
+  test('verify() rejects a strict lock model without `owner`; the package model passes', async () => {
+    const OldLock = connection.model(
+      'OldResizeLock',
+      new mongoose.Schema({ _id: String, expiredAt: Date }),
+    );
+    assert.throws(
+      () => new MongoLockStore({ model: OldLock }).verify(),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_MONGO_LOCK_MODEL_OUTDATED' &&
+        /'OldResizeLock'/.test(err.message) &&
+        /owner/.test(err.message),
+    );
+    // What the check prevents: Mongoose drops the undeclared owner, so no release would match.
+    await new MongoLockStore({ model: OldLock }).acquire('old1', 'A', 60_000);
+    assert.equal(
+      (await OldLock.collection.findOne({ _id: 'old1' as never }))?.owner,
+      undefined,
+    );
+    new MongoLockStore({ model: ResizeLock }).verify();
+    const Loose = connection.model(
+      'LooseResizeLock',
+      new mongoose.Schema({ _id: String, expiredAt: Date }, { strict: false }),
+    );
+    new MongoLockStore({ model: Loose }).verify();
   });
 });
 

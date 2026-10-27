@@ -6,14 +6,18 @@
 // expired locks, and the framework's own `acquireLock` still sees them. Its takeover of an expired
 // lock (`$set: { expiredAt }`) leaves the stale `owner` field in place, so module locks and locks
 // taken through the framework's statics must not share keys. Nothing is read from the app until
-// first use.
+// first use; verify() (inherited) checks that the `Lock` model is registered.
 import { type MongoLockModel, MongoLockStore } from '../drivers/mongo/locks.ts';
 import { ResizeSetupError } from '../errors.ts';
 import { getApp } from './app.ts';
 
 // The native collection methods the store calls (the MongoDB driver's Collection has them).
 interface LockCollection {
-  insertOne(doc: object): PromiseLike<unknown>;
+  findOneAndUpdate(
+    filter: object,
+    update: object,
+    options: { upsert: true },
+  ): PromiseLike<unknown>;
   updateOne(
     filter: object,
     update: object,
@@ -32,7 +36,8 @@ function frameworkLockModel(): MongoLockModel {
   }
   const collection: LockCollection = Lock.collection;
   return {
-    create: (doc) => collection.insertOne(doc),
+    findOneAndUpdate: (filter, update, options) =>
+      collection.findOneAndUpdate(filter, update, options),
     updateOne: (filter, update) => collection.updateOne(filter, update),
     deleteOne: (filter) => collection.deleteOne(filter),
   };
@@ -41,10 +46,5 @@ function frameworkLockModel(): MongoLockModel {
 export class FrameworkLockStore extends MongoLockStore {
   constructor() {
     super({ getModel: frameworkLockModel });
-  }
-
-  /** Startup check: the framework's `Lock` model must be registered. */
-  verify(): void {
-    frameworkLockModel();
   }
 }
