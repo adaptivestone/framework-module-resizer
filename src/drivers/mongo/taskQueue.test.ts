@@ -34,7 +34,7 @@ import type {
   QueueTimingOptions,
   ResizeLogger,
 } from '../../types.d.ts';
-import { resizeTaskFields } from './schemas.ts';
+import { resizeTaskFields, resizeTaskIndexes } from './schemas.ts';
 import { MongoTaskQueue } from './taskQueue.ts';
 
 // Real MongoDB atomic semantics, using the same schema and indexes as framework hosts.
@@ -161,9 +161,12 @@ function addedIds(results: TaskAddResult[]): string[] {
   );
 }
 
+// A duplicate key on the gate index, shaped as the server reports it (the key order is the
+// server's; the queue compares the key set).
 function duplicateKey() {
   return Object.assign(new Error('E11000 duplicate key error'), {
     code: 11000,
+    keyPattern: { pipeline: 1, resizer: 1, fileId: 1 },
   });
 }
 
@@ -741,6 +744,59 @@ describe('MongoTaskQueue.add: one active task per Resizer, media and pipeline', 
       const logged = configureQueue(() => missing);
       assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
       assert.equal(logged.errors.length, 1);
+    }
+  });
+
+  test('a duplicate key on another unique index is logged and unconfirmed, not in-flight', async () => {
+    // A host model with one more unique index. Every task gets the same `tenant`, so the second
+    // add collides on it, for another media: the gate index is not involved.
+    const schema = new mongoose.Schema(
+      {
+        ...resizeTaskFields('File'),
+        tenant: { type: String, default: 'acme' },
+      },
+      { timestamps: true, minimize: false, autoIndex: false },
+    );
+    for (const [keys, options] of resizeTaskIndexes) {
+      schema.index(keys, options);
+    }
+    schema.index({ tenant: 1 }, { unique: true });
+    const Host =
+      connection.models.ResizeTaskWithTenant ??
+      connection.model('ResizeTaskWithTenant', schema);
+    await Host.createIndexes();
+    await Host.deleteMany({});
+    const { errors } = configureQueue(() => Host);
+    assert.equal((await tasks.add(request())).status, 'added');
+    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
+    assert.equal(errors.length, 1);
+    assert.equal((errors[0][1] as { code?: unknown }).code, 11000);
+    assert.equal(await Host.countDocuments({ active: true }), 1);
+  });
+
+  test('a duplicate key that does not name exactly the gate index keys is a write error', async () => {
+    const message =
+      'E11000 duplicate key error index: resizer_1_fileId_1_pipeline_1';
+    for (const failure of [
+      Object.assign(new Error(message), { code: 11000 }), // no keyPattern
+      Object.assign(new Error(message), {
+        code: 11000,
+        keyPattern: { resizer: 1, fileId: 1 },
+      }),
+      Object.assign(new Error(message), {
+        code: 11000,
+        keyPattern: { resizer: 1, fileId: 1, pipeline: 1, queue: 1 },
+      }),
+      new Error(message), // only the message says so
+    ]) {
+      const { errors } = configureQueue(() => ({
+        create: async () => {
+          throw failure;
+        },
+      }));
+      assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0][1], failure);
     }
   });
 });

@@ -27,6 +27,7 @@ import type {
   ResizeLogger,
 } from '../../types.d.ts';
 import { modelGetter } from './modelOption.ts';
+import { gateIndexKeys } from './schemas.ts';
 
 // biome-ignore lint/suspicious/noExplicitAny: a host-registered mongoose model
 type TaskModel = any;
@@ -343,7 +344,7 @@ export class MongoTaskQueue extends TaskQueue {
 }
 
 // Insert the task as the active row of its gate. Resolves with its id, or null when another
-// active row holds the gate; any other write error rejects.
+// active row holds the gate; any other write error rejects, a duplicate key on another index too.
 async function insertActive(
   model: TaskModel,
   task: NewTask,
@@ -367,7 +368,7 @@ async function insertActive(
     );
     return String(doc._id);
   } catch (err) {
-    if (isDuplicateKeyError(err)) {
+    if (isGateConflict(err)) {
       return null;
     }
     throw err;
@@ -419,14 +420,25 @@ function namedAll(values: readonly string[]): (string | null)[] {
   return values.includes('default') ? [...values, null] : [...values];
 }
 
-function isDuplicateKeyError(error: unknown): boolean {
+const GATE_KEYS = Object.keys(gateIndexKeys).sort();
+
+// A duplicate key on the gate index: another task is in flight. A duplicate key on any other
+// unique index (one a host added to its model), or one that does not say which index, is a write
+// error: treating it as the gate would report every add in flight while storing nothing.
+function isGateConflict(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) {
     return false;
   }
+  const { code, keyPattern } = error as {
+    code?: unknown;
+    keyPattern?: unknown;
+  };
+  if (code !== 11000 || typeof keyPattern !== 'object' || keyPattern === null) {
+    return false;
+  }
+  const keys = Object.keys(keyPattern).sort();
   return (
-    (error as { code?: unknown }).code === 11000 ||
-    /duplicate key/i.test(
-      String((error as { message?: unknown }).message ?? error),
-    )
+    keys.length === GATE_KEYS.length &&
+    keys.every((key, i) => key === GATE_KEYS[i])
   );
 }
