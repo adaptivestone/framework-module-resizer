@@ -8,13 +8,17 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
-import type { ResizeStorage } from './contracts/storage.ts';
+import type { ResizeStorage, StorageUploadArgs } from './contracts/storage.ts';
 import { LocalFsStorage } from './drivers/fs.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { MemoryTaskQueue } from './testHelpers/fakes.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import {
+  makeImageConfig,
+  makeResizeConfig,
+} from './testHelpers/resizeConfig.ts';
+import { Uploader } from './uploader.ts';
 
 const png = await sharp({
   create: {
@@ -22,6 +26,17 @@ const png = await sharp({
     height: 24,
     channels: 4,
     background: { r: 12, g: 34, b: 56, alpha: 0.5 },
+  },
+})
+  .png()
+  .toBuffer();
+
+const png64x48 = await sharp({
+  create: {
+    width: 64,
+    height: 48,
+    channels: 3,
+    background: { r: 200, g: 100, b: 50 },
   },
 })
   .png()
@@ -87,6 +102,32 @@ function recordingStorage() {
 afterEach(() => {
   resetResizerForTests();
   resetAppInstance();
+});
+
+test('an Uploader stores an original with only storage and config', async () => {
+  const uploads: StorageUploadArgs[] = [];
+  const storage: ResizeStorage = {
+    download: async () => Buffer.alloc(0),
+    upload: async (args) => {
+      uploads.push(args);
+      return { key: args.key };
+    },
+    publicUrl: () => '',
+  };
+  const original = await new Uploader({
+    storage,
+    config: makeImageConfig(),
+  }).upload({ body: png64x48, visibility: 'private' });
+  assert.match(uploads[0].key, /^originals\/[0-9a-f]{32}\.png$/);
+  assert.deepEqual(
+    {
+      format: original.format,
+      contentType: original.contentType,
+      width: original.width,
+      height: original.height,
+    },
+    { format: 'png', contentType: 'image/png', width: 64, height: 48 },
+  );
 });
 
 describe('uploadOriginal — raster bytes and metadata', () => {

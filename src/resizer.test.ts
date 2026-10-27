@@ -324,6 +324,28 @@ describe('drivers given as functions', () => {
     assert.equal(r.media, media);
   });
 
+  test('ready() validates a lazy config, and reads it again after a failure', async () => {
+    let reads = 0;
+    const r = new Resizer({
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      config: () => {
+        reads += 1;
+        return reads === 1
+          ? ({ ...makeImageConfig(), upload: null } as never)
+          : makeImageConfig();
+      },
+    });
+    await assert.rejects(
+      () => r.ready(),
+      (err: unknown) => err instanceof ResizeConfigError,
+    );
+    await r.ready();
+    await r.ready();
+    assert.equal(reads, 2);
+  });
+
   test('a failed lazy task queue stays not ready until it loads', async () => {
     let taskCalls = 0;
     const tasks = new MemoryTaskQueue();

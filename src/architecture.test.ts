@@ -11,8 +11,8 @@ const CORE_FILES = [
   'enqueue.ts',
   'formatPictureUrls.ts',
   'images.ts',
-  'original.ts',
   'resizeTask.ts',
+  'uploader.ts',
 ];
 const GLOBAL_LOOKUPS = new Set(['getApp', 'getResizeConfig', 'getResizer']);
 

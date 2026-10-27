@@ -5,6 +5,7 @@
 // Each Resizer owns its config, logger and event bus, all passed in explicitly: the core never
 // reads a framework app. Framework hosts use FrameworkResizer (src/framework/resizer.ts), which
 // builds every part from the app's config file.
+import { Catalog } from './catalog.ts';
 import defaultResizeConfig from './config/resize.ts';
 import type {
   HookName,
@@ -21,7 +22,6 @@ import type { TaskQueue } from './contracts/taskQueue.ts';
 import { prewarmImpl, resolveImpl } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
 import { HookBus } from './hooks.ts';
-import { uploadOriginalImpl } from './original.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { timingOf } from './queue.ts';
 import { Registry } from './registry.ts';
@@ -41,6 +41,7 @@ import type {
   ResolveOpts,
   UploadOriginalOpts,
 } from './types.d.ts';
+import { Uploader } from './uploader.ts';
 
 // ---------------------------------------------------------------------------
 // Constructor options (02 · §6). `storage` and `media` are required — both modes need them
@@ -70,12 +71,18 @@ export interface ResizerOptions {
   hooks?: HookTaps;
 }
 
-// Constructed Resizers by name. Entry points (the worker, host code) look them up here;
-// core code always receives its Resizer as an argument.
+// Constructed Resizers by name (see src/registry.ts).
 const registry = new Registry<Resizer>();
 
-type PartName = 'storage' | 'media' | 'locks' | 'tasks';
-const PART_COUNT = 4;
+const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
+type PartName = (typeof PART_NAMES)[number];
+
+// What the Resizer's methods run on, built once by ready() from the loaded parts and the
+// validated config. No service receives the Resizer.
+interface Services {
+  catalog: Catalog;
+  uploader: Uploader;
+}
 
 // How framework hosts get the parts below filled in from their app.
 const FRAMEWORK_HINT =
@@ -123,6 +130,7 @@ export class Resizer {
   readonly #loadingParts = new Map<PartName, Promise<void>>();
   readonly #pipelines: PipelineRegistry;
   readonly #hooks: HookBus;
+  #builtServices: Services | undefined;
 
   constructor(opts: ResizerOptions) {
     // Runtime storage validation (02 · §6 review fix): `storage` is the ONE required option —
@@ -237,13 +245,15 @@ export class Resizer {
   }
 
   /**
-   * Load the parts given as functions, each once. Every method of the Resizer (and the worker)
-   * awaits it first, so hosts only need it before reading `storage`, `media`, `locks` or `tasks`
-   * directly. A part whose function fails is retried by the next call; the parts that loaded are
-   * kept. Rejects with RESIZE_LOCKS_REQUIRED when a task queue has no lock store beside it.
+   * Load the parts given as functions, each once, then build the services from the validated
+   * config. Every method of the Resizer (and the worker) awaits it first, so hosts only need it
+   * before reading `storage`, `media`, `locks` or `tasks` directly. A part whose function fails is
+   * retried by the next call, and so is a config that fails to load or validate; the parts that
+   * loaded are kept. Rejects with RESIZE_LOCKS_REQUIRED when a task queue has no lock store beside
+   * it.
    */
   async ready(): Promise<void> {
-    if (this.#loadedParts.size < PART_COUNT) {
+    if (this.#loadedParts.size < PART_NAMES.length) {
       await Promise.all([
         this.#loadPart('storage', this.#sources.storage, (storage) => {
           if (!storage) {
@@ -270,6 +280,25 @@ export class Resizer {
     if (this.#tasks && !this.#locks) {
       throw locksRequired(this.name);
     }
+    this.#buildServices();
+  }
+
+  /** The services, built on the first call that succeeds; a failed build leaves nothing behind. */
+  #buildServices(): Services {
+    if (!this.#builtServices) {
+      const { config } = this;
+      this.#builtServices = {
+        catalog: new Catalog({ config }),
+        uploader: new Uploader({ storage: this.storage, config }),
+      };
+    }
+    return this.#builtServices;
+  }
+
+  /** The services, once ready() has loaded the parts and built them. */
+  async #services(): Promise<Services> {
+    await this.ready();
+    return this.#buildServices();
   }
 
   /** Load one part given as a function; concurrent callers share its load while it runs. */
@@ -309,7 +338,6 @@ export class Resizer {
    */
   async verify(): Promise<void> {
     await this.ready();
-    void this.config;
     await this.media.verify?.();
     await this.locks?.verify?.();
     if (this.tasks) {
@@ -385,8 +413,7 @@ export class Resizer {
 
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
   async uploadOriginal(opts: UploadOriginalOpts): Promise<Original> {
-    await this.ready();
-    return uploadOriginalImpl(this, opts);
+    return (await this.#services()).uploader.upload(opts);
   }
 }
 
