@@ -244,12 +244,20 @@ describe('dead-letter cooldown', () => {
       },
     });
     const docs = new Map<string, MediaLike>();
+    // The Resizer's own errors (its Processor logs the cooldown's lock calls).
+    const resizerErrors: unknown[][] = [];
     const resizer = new Resizer({
       config: makeImageConfig({
         formats: ['webp'],
         limits: { sourcePixels: 100 },
       }),
-      logger: silent,
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => {
+          resizerErrors.push(args);
+        },
+      },
       storage: {
         download: async () => png,
         upload: async () => ({ key: 'k' }),
@@ -270,6 +278,7 @@ describe('dead-letter cooldown', () => {
       tasks,
       resizer,
       errors,
+      resizerErrors,
       deadLettered,
       stop,
       media(id: string): MediaLike {
@@ -333,8 +342,8 @@ describe('dead-letter cooldown', () => {
     await t.work();
     assert.equal(t.deadLettered.length, 1);
     assert.ok(
-      t.errors.some((args) => /cooldown/.test(String(args[0]))),
-      'the failed cooldown is logged',
+      t.resizerErrors.some((args) => /cooldown/.test(String(args[0]))),
+      "the failed cooldown is logged by the Resizer's logger",
     );
   });
 

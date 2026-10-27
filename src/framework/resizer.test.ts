@@ -5,6 +5,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import type { ResizeStorage } from '../contracts/storage.ts';
+import type { LeasedTask } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { S3Storage } from '../drivers/s3.ts';
@@ -82,8 +83,17 @@ test('fills config, logger, events and the media and lock stores from the app', 
   assert.equal(r.tasks, undefined); // no `queue` section: eager only
   await r.media.loadMedia('m1');
   assert.deepEqual(asked, ['File']);
-  await r.runObservers('onPreviewGenerated', 'preview', {});
-  assert.deepEqual(emitted, [['resize:onPreviewGenerated', 'preview', {}]]);
+  // Observers reach the app's event bus.
+  const done: LeasedTask = {
+    taskId: 't1',
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [],
+  };
+  await r.processor.notify('completed', done);
+  assert.deepEqual(emitted, [['resize:afterTaskComplete', done, {}]]);
 });
 
 test('storage comes from the config file: local', async () => {

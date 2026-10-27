@@ -7,13 +7,7 @@
 // builds every part from the app's config file.
 import { Catalog } from './catalog.ts';
 import defaultResizeConfig from './config/resize.ts';
-import type {
-  HookName,
-  HookSignatures,
-  HookTaps,
-  ObserverName,
-  WaterfallName,
-} from './contracts/hooks.ts';
+import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
@@ -24,7 +18,7 @@ import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
-import { generateImpl } from './processor.ts';
+import { Processor } from './processor.ts';
 import { timingOf } from './queue.ts';
 import { prewarmFailure, Reader } from './reader.ts';
 import { Registry } from './registry.ts';
@@ -86,6 +80,7 @@ interface Services {
   uploader: Uploader;
   dispatcher: Dispatcher | undefined; // only with a task queue
   reader: Reader;
+  processor: Processor;
 }
 
 // How framework hosts get the parts below filled in from their app.
@@ -241,6 +236,14 @@ export class Resizer {
     return this.#tasks;
   }
 
+  /**
+   * Renders previews: the worker's entry for one queued task, the dead-letter cooldown and the task
+   * observers. Available once ready() has built the services.
+   */
+  get processor(): Processor {
+    return this.#builtServices?.processor ?? this.#notReady('processor');
+  }
+
   #notReady(part: string): never {
     throw new ResizeSetupError(
       `resize: Resizer '${this.name}' has not loaded \`${part}\` yet — await resizer.ready() before reading it (the Resizer's own methods do this)`,
@@ -291,7 +294,7 @@ export class Resizer {
     if (!this.#builtServices) {
       // The locks and the queue timing are checked before the config (the order ready() states).
       const dispatcher = this.#buildDispatcher();
-      const { config, storage } = this;
+      const { config, storage, media } = this;
       const catalog = new Catalog({ config });
       this.#builtServices = {
         catalog,
@@ -306,6 +309,17 @@ export class Resizer {
           logger: this.logger,
           name: this.name,
           queue: this.queue,
+        }),
+        processor: new Processor({
+          catalog,
+          media,
+          storage,
+          locks: this.#locks,
+          pipelines: this.#pipelines,
+          hooks: this.#hooks,
+          config,
+          logger: this.logger,
+          name: this.name,
         }),
       };
     }
@@ -391,29 +405,9 @@ export class Resizer {
     }
   }
 
-  /** Look up a pipeline; an unknown name → the shared frozen empty pipeline (no steps). */
-  getPipeline(name: string): Pipeline {
-    return this.#pipelines.get(name);
-  }
-
   /** True when `name` is registered. `default` always exists: unregistered, it has no steps. */
   hasPipeline(name: string): boolean {
     return this.#pipelines.has(name);
-  }
-
-  /** Thread `value` through the name's guarded taps (see HookBus.runWaterfall). */
-  runWaterfall(
-    name: WaterfallName,
-    value: unknown,
-    ctx: Record<string, unknown>,
-    mode?: 'identity' | 'optional',
-  ): Promise<unknown> {
-    return this.#hooks.runWaterfall(name, value, ctx, mode);
-  }
-
-  /** Fire an observer: the event bus first, then every tap (see HookBus.runObservers). */
-  runObservers(name: ObserverName, ...args: unknown[]): Promise<void> {
-    return this.#hooks.runObservers(name, ...args);
   }
 
   /**
@@ -462,16 +456,15 @@ export class Resizer {
   }
 
   /**
-   * Eager mode (11 · Modes §11.1) — synchronous generate at upload; no queue/worker/locks.
-   * Delegates to the SHARED resize core (src/resizeTask.ts): resolveSizes waterfall with the
-   * caller's REAL ctx → expand sizes × formats, skipping identities already in media.previews
-   * (idempotent) → download once → beforeSteps once → per-variant resize/encode/upload
-   * (bounded by config.concurrency, NO locks). `persist !== false` → one
-   * media.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
+   * Eager mode — synchronous generate at upload; no queue/worker/locks. Delegates to the
+   * Processor (src/processor.ts): resolveSizes waterfall with the caller's REAL ctx → expand
+   * sizes × formats, skipping identities already in media.previews (idempotent) → download once →
+   * beforeSteps once → per-variant resize/encode/upload (bounded by config.concurrency, NO locks).
+   * `persist !== false` → one media.appendPreviews (+ display-dim backfill); else the previews are
+   * returned unstored.
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
-    await this.ready();
-    return generateImpl(this, opts);
+    return (await this.#services()).processor.generate(opts);
   }
 
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */

@@ -1,5 +1,5 @@
-// Worker core tests (07 · Worker + 11 · Modes). Real sharp on tiny in-memory fixtures
-// generated with sharp itself; fakes for storage, database and task queues.
+// Processor tests: queued tasks, eager generate and the worker that runs them. Real sharp on tiny
+// in-memory fixtures generated with sharp itself; fakes for storage, media, locks and task queues.
 // Fresh Resizer + fake ambient app per test (node:test = per-file process isolation).
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
@@ -14,6 +14,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import { Catalog } from './catalog.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
@@ -29,19 +30,26 @@ import {
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
+import { HookBus } from './hooks.ts';
 import { getSizeKey, toMissingPreview } from './images.ts';
+import { PipelineRegistry } from './pipelines.ts';
+import { Processor, type ProcessorDeps } from './processor.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
 } from './testHelpers/fakes.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import {
+  makeImageConfig,
+  makeResizeConfig,
+} from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
   MissingPreview,
   Original,
   Preview,
+  ResizeLogger,
 } from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
 
@@ -376,6 +384,166 @@ function countRenders(): () => number {
 }
 
 // ---------------------------------------------------------------------------
+// A Processor built from its parts: no Resizer, no framework app.
+// ---------------------------------------------------------------------------
+
+const silent: ResizeLogger = { info() {}, warn() {}, error() {} };
+
+/** A Processor on a jpeg-only config whose media store loads mediaDoc(); no `locks`: eager only. */
+function processorDeps(locks: LockStore | undefined): ProcessorDeps {
+  const config = makeImageConfig({ formats: ['jpeg'] });
+  return {
+    catalog: new Catalog({ config }),
+    media: fakeMedia({ load: async () => mediaDoc() }),
+    storage: makeStorage(redPng).storage,
+    locks,
+    pipelines: new PipelineRegistry(),
+    hooks: new HookBus({ logger: silent }),
+    config,
+    logger: silent,
+    name: 'default',
+  };
+}
+
+describe('Processor', () => {
+  test('a Processor renders a task with only its ports (no Resizer)', async () => {
+    const locks = memoryLocks();
+    const { storage, uploads } = makeStorage(redPng);
+    const deps = processorDeps(locks);
+    deps.storage = storage;
+    const processor = new Processor(deps);
+    await processor.processTask(task({ previews: [variant()] }), {
+      workerLockTtlMs: 1000,
+    });
+    assert.equal(uploads.length, 1);
+    // Released: another owner takes it at once.
+    assert.equal(
+      await locks.acquire(
+        'resize_worker:m1:default:default:20x20:jpeg:none',
+        'other',
+        1000,
+      ),
+      true,
+    );
+  });
+
+  test('processTask without a lock store is RESIZE_LOCKS_REQUIRED', async () => {
+    let loads = 0;
+    const deps = processorDeps(undefined);
+    deps.media = fakeMedia({
+      load: async () => {
+        loads++;
+        return mediaDoc();
+      },
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).processTask(task({ previews: [variant()] }), {
+          workerLockTtlMs: 1000,
+        }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
+    );
+    assert.equal(loads, 0);
+  });
+
+  test('notify maps task events to their observers with ctx {}', async () => {
+    const deps = processorDeps(memoryLocks());
+    const seen: unknown[][] = [];
+    deps.hooks.add('afterTaskComplete', (...args) => {
+      seen.push(['afterTaskComplete', ...args]);
+    });
+    deps.hooks.add('onTaskFailed', (...args) => {
+      seen.push(['onTaskFailed', ...args]);
+    });
+    deps.hooks.add('onTaskDeadLettered', (...args) => {
+      seen.push(['onTaskDeadLettered', ...args]);
+    });
+    const processor = new Processor(deps);
+    const err = new Error('boom');
+    await processor.notify('completed', task());
+    await processor.notify('failed', task(), err);
+    await processor.notify('deadLettered', task(), err);
+    assert.deepEqual(seen, [
+      ['afterTaskComplete', task(), {}],
+      ['onTaskFailed', task(), err, {}],
+      ['onTaskDeadLettered', task(), err, {}],
+    ]);
+  });
+
+  test('holdFailedCooldown re-takes every dispatch lock of the task for ttlMs and never rejects', async () => {
+    const calls: unknown[][] = [];
+    const recorder: LockStore = {
+      acquire: async (key, owner, ttlMs) => {
+        calls.push(['acquire', key, owner, ttlMs]);
+        return true;
+      },
+      extend: async () => true,
+      release: async (key, owner) => {
+        calls.push(['release', key, owner]);
+        return true;
+      },
+    };
+    // Two copies of one variant: one lock.
+    const dead = task({ previews: [variant(), variant()] });
+    await new Processor(processorDeps(recorder)).holdFailedCooldown(
+      dead,
+      600_000,
+    );
+    const key = 'resize_dispatch:m1:default:default:20x20:jpeg:none';
+    assert.deepEqual(calls, [
+      ['release', key, 'resize:dispatch'],
+      ['acquire', key, 'resize:dispatch', 600_000],
+    ]);
+
+    const errors: unknown[][] = [];
+    const deps = processorDeps({
+      acquire: async () => true,
+      extend: async () => true,
+      release: () => {
+        throw new Error('lock store down');
+      },
+    });
+    deps.logger = {
+      info() {},
+      warn() {},
+      error(...a: unknown[]) {
+        errors.push(a);
+      },
+    };
+    const processor = new Processor(deps);
+    await processor.holdFailedCooldown(dead, 600_000);
+    // A malformed task payload is logged too.
+    await processor.holdFailedCooldown(task({ previews: null as never }), 1);
+    assert.deepEqual(
+      errors.map((a) => String(a[0])),
+      [
+        `resize worker: holding the dead-letter cooldown lock ${key} failed`,
+        'resize worker: the dead-letter cooldown of task t1 failed',
+      ],
+    );
+  });
+
+  test("the Resizer's processor is RESIZE_NOT_READY until ready()", async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage: makeStorage(redPng).storage,
+      media: fakeMedia(),
+    });
+    assert.throws(
+      () => r.processor,
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_NOT_READY' &&
+        err.message.includes('processor'),
+    );
+    await r.ready();
+    assert.ok(r.processor instanceof Processor);
+    assert.equal(r.processor, r.processor);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // processTask — download / metadata / beforeSteps
 // ---------------------------------------------------------------------------
 
@@ -495,7 +663,7 @@ describe('processTask — source handling', () => {
   test('inputPixels < source → rejected consistently at the guarded decode (orientation-6 source)', async () => {
     // inputPixels below the source pixel count, but sourcePixels stays huge (default) so the
     // sourcePixels guard does NOT catch it — every worker sharp() call must carry
-    // limitInputPixels (01 · §16), so the guarded metadata/normalize decode rejects it.
+    // limitInputPixels, so the guarded metadata/normalize decode rejects it.
     installApp({ limits: { inputPixels: 100 } }); // orientedJpeg 64×48 = 3072 px > 100
     const { storage, uploads } = makeStorage(orientedJpeg);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
@@ -587,9 +755,39 @@ describe('processTask — variants', () => {
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
-    assert.deepEqual(keysOf(released), [
-      'resize_dispatch:m1:default:default:20x20:jpeg:none',
+    assert.deepEqual(released, [
+      {
+        key: 'resize_dispatch:m1:default:default:20x20:jpeg:none',
+        owner: 'resize:dispatch',
+      },
     ]);
+  });
+
+  test('renders the rest of a task and releases the dispatch lock of its one stored preview', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const existing = {
+      sizeKey: '20x20',
+      format: 'jpeg',
+      storageRef: { key: 'e' },
+      contentType: 'image/jpeg',
+    } as unknown as Preview;
+    const { mediaStore } = makeMediaStore(mediaDoc({ previews: [existing] }));
+    const { locks, acquired, released } = makeLocks(true);
+    new FrameworkResizer({ storage, media: mediaStore, locks });
+    await processTask(
+      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].contentType, 'image/webp');
+    const stored = 'default:default:20x20:jpeg:none';
+    assert.ok(
+      !acquired.some(({ key }) => key === `resize_worker:m1:${stored}`),
+    );
+    assert.deepEqual(
+      released.filter(({ key }) => key.endsWith(stored)),
+      [{ key: `resize_dispatch:m1:${stored}`, owner: 'resize:dispatch' }],
+    );
   });
 
   test('worker lock not acquired → variant skipped, still missing, not persisted', async () => {
@@ -645,7 +843,7 @@ describe('processTask — variants', () => {
     const locks: LockStore = {
       // The webp worker-lock acquire REJECTS — treated exactly like a not-acquired lock: skip the
       // variant (leave it missing), never reject the pool or skip persist/finally. The jpeg variant
-      // is unaffected: generated, persisted, and its locks released (1.2a).
+      // is unaffected: generated, persisted, and its locks released.
       acquire: async (key: string) => {
         if (key === 'resize_worker:m1:default:default:20x20:webp:none') {
           throw new Error('lock backend down');
@@ -1289,7 +1487,7 @@ describe('processTask — persistence & failure handling', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Eager mode — resizer.generate (11 · §11.1)
+// Eager mode — resizer.generate
 // ---------------------------------------------------------------------------
 
 describe('generate (eager)', () => {
@@ -3329,7 +3527,7 @@ describe('a source smaller than the box', () => {
 });
 
 // ---------------------------------------------------------------------------
-// runResizeWorker (07 · §11)
+// runResizeWorker
 // ---------------------------------------------------------------------------
 
 // Stop idle test queues deterministically after their queued work has been handled.
@@ -3590,20 +3788,27 @@ describe('one worker serves every Resizer', () => {
         );
       });
     register(sibling);
-    // Invalid timing (the worker lock outlives the lease), with ready() and verify() bypassed
-    // (both validate the timing), so the failure surfaces inside the running loop rather than at
-    // startup.
-    const broken = new MemoryTaskQueue({
-      timing: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 2000 } },
-    });
-    const r = register(broken, 'listings');
-    r.ready = async () => {};
-    r.verify = async () => {};
+    // A failing claim is retried, but the loop logs it first, and the worker's logger is host
+    // code: one that throws fails this loop while it runs.
+    const failing = new MemoryTaskQueue();
+    failing.claim = async () => {
+      throw new Error('queue unreachable');
+    };
+    register(failing, 'listings');
+    const logSinkDown = new Error('log sink down');
     await assert.rejects(
-      () => runWorker({ signal: new AbortController().signal }),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+      () =>
+        runWorker({
+          signal: new AbortController().signal,
+          logger: {
+            info() {},
+            warn() {},
+            error() {
+              throw logSinkDown;
+            },
+          },
+        }),
+      (err: unknown) => err === logSinkDown,
     );
     assert.equal(siblingAborted, true);
   });

@@ -4,6 +4,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import sharp from 'sharp';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
@@ -183,19 +184,64 @@ describe('Resizer constructor — driver wiring', () => {
     assert.deepEqual(asked, ['Photo', 'File']);
   });
 
-  test('seeds pipelines from options', () => {
-    const photo: Pipeline = { beforeSteps: [] };
-    const r = new FrameworkResizer({ ...baseOpts(), pipelines: { photo } });
-    assert.equal(r.getPipeline('photo'), photo);
+  test('seeds pipelines from options', async () => {
+    const png = await sharp({
+      create: { width: 8, height: 8, channels: 3, background: '#ff0000' },
+    })
+      .png()
+      .toBuffer();
+    const ran: string[] = [];
+    const photo: Pipeline = {
+      variantSteps: [
+        async (img) => {
+          ran.push('photo');
+          return img;
+        },
+      ],
+    };
+    const r = new FrameworkResizer({
+      storage: {
+        download: async () => png,
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      pipelines: { photo },
+    });
+    assert.equal(r.hasPipeline('photo'), true);
+    const { created } = await r.generate({
+      media: { id: 'm1', original: { storageRef: { key: 'o' } }, previews: [] },
+      sizes: [{ width: 4, height: 4 }],
+      formats: ['jpeg'],
+      pipeline: 'photo',
+      persist: false,
+    });
+    assert.equal(created.length, 1);
+    assert.deepEqual(ran, ['photo']);
   });
 
-  test('seeds hooks from options — single fn form threads through runWaterfall', async () => {
+  // The media has no previews, so every size the taps return is missing.
+  const unrendered = { id: 'm1', previews: [] };
+
+  test('seeds hooks from options — single fn form threads through resolve', async () => {
     installFakeApp();
     const r = new FrameworkResizer({
       ...baseOpts(),
-      hooks: { resolveSizes: (v: number) => v + 1 },
+      hooks: {
+        resolveSizes: (sizes: SizeInput[]) => [
+          ...sizes,
+          { width: 10, height: 10 },
+        ],
+      },
     });
-    assert.equal(await r.runWaterfall('resolveSizes', 1, {}), 2);
+    const { decision } = await r.resolve({
+      media: unrendered,
+      sizes: [],
+      formats: ['jpeg'],
+    });
+    assert.deepEqual(
+      decision.missing.map((v) => v.sizeKey),
+      ['10x10'],
+    );
   });
 
   test('seeds hooks from options — array form runs every tap in order', async () => {
@@ -203,10 +249,26 @@ describe('Resizer constructor — driver wiring', () => {
     const r = new FrameworkResizer({
       ...baseOpts(),
       hooks: {
-        resolveSizes: [(v: number) => v + 1, async (v: number) => v * 2],
+        resolveSizes: [
+          (sizes: SizeInput[]) => [...sizes, { width: 10, height: 10 }],
+          async (sizes: SizeInput[]) =>
+            sizes.map((s) => ({
+              width: (s.width ?? 0) * 2,
+              height: (s.height ?? 0) * 2,
+            })),
+        ],
       },
     });
-    assert.equal(await r.runWaterfall('resolveSizes', 1, {}), 4); // (1+1)*2
+    const { decision } = await r.resolve({
+      media: unrendered,
+      sizes: [],
+      formats: ['jpeg'],
+    });
+    // Added, then doubled.
+    assert.deepEqual(
+      decision.missing.map((v) => v.sizeKey),
+      ['20x20'],
+    );
   });
 });
 
@@ -764,14 +826,21 @@ describe('typed hooks', () => {
       seenMissing = missing;
       return missing;
     });
-    const sizes = (await r.runWaterfall('resolveSizes', [], {})) as SizeInput[];
-    assert.deepEqual(sizes, [injected]);
-    await r.runWaterfall(
-      'beforeEnqueue',
-      [{ sizeKey: 'fit', format: 'webp' }],
-      {},
-    );
-    assert.deepEqual(seenMissing, [{ sizeKey: 'fit', format: 'webp' }]);
+    const { decision } = await r.resolve({
+      media: { id: 'm1', previews: [] },
+      sizes: [],
+      formats: ['webp'],
+    });
+    const expected: MissingPreview[] = [
+      {
+        sizeKey: '10x10',
+        format: 'webp',
+        requestedWidth: 10,
+        requestedHeight: 10,
+      },
+    ];
+    assert.deepEqual(seenMissing, expected);
+    assert.deepEqual(decision.missing, expected);
   });
 });
 

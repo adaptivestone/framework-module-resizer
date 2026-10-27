@@ -1,34 +1,26 @@
 // The worker, framework-free. `runWorker()` serves every registered Resizer for ONE named queue: it
 // runs the core queue loop (src/queue.ts) once per distinct TaskQueue the Resizers use, after
 // verifying every Resizer. Each task runs with the Resizer named in it, and its events go to that
-// Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown.
+// Resizer's observers. After a dead-letter it holds the task's dispatch locks for a cooldown. The
+// work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
-import type { ObserverName } from './contracts/hooks.ts';
+import { defaultQueueOptions } from './config/resize.ts';
 import type {
   LeasedTask,
-  TaskEvent,
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
-import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
-import { processTaskWith } from './processor.ts';
 import { consumeQueue, timingOf } from './queue.ts';
-import { getResizer, listResizers, type Resizer } from './resizer.ts';
+import { getResizer, listResizers } from './resizer.ts';
 import type { ResizeLogger } from './types.d.ts';
-
-const OBSERVER: Record<TaskEvent, ObserverName> = {
-  completed: 'afterTaskComplete',
-  failed: 'onTaskFailed',
-  deadLettered: 'onTaskDeadLettered',
-};
 
 /**
  * Run one task with the Resizer it names. An unknown name rejects with RESIZE_NO_RESIZER, so the
  * task retries and dead-letters instead of running with another Resizer's storage and config.
+ * Worker locks last the delivering queue's lockTtlMs.worker, so they fit the lease it holds.
  */
 export async function processTask(
   task: LeasedTask,
@@ -37,63 +29,15 @@ export async function processTask(
 ): Promise<void> {
   const resizer = getResizer(task.resizer);
   await resizer.ready();
-  return processTaskWith(resizer, task, taskOpts, tasks ?? resizer.tasks);
-}
-
-/**
- * After a dead-letter, hold the dispatch lock of every variant in the task for the delivering
- * queue's lockTtlMs.failed, so reads (resolve, prewarm) do not queue the same failing work again
- * until it ends. Release first, then acquire: the read path's shorter dispatch lock may still be
- * held. Both calls work across processes because every dispatch lock has the one owner
- * DISPATCH_LOCK_OWNER. Best effort and never rejects: a failing lock call is logged, and a read
- * that takes the lock between the two calls simply queues the work once more.
- */
-async function holdFailedCooldown(
-  resizer: Resizer,
-  task: LeasedTask,
-  tasks: TaskQueue,
-  logger: ResizeLogger,
-): Promise<void> {
-  try {
-    const { locks } = resizer;
-    if (!locks) {
-      // An eager-only Resizer: its tasks fail with RESIZE_LOCKS_REQUIRED; there is nothing to hold.
-      return;
-    }
-    const ttlMs = timingOf(tasks).lockTtlMs.failed;
-    const scope = { resizer: resizer.name, pipeline: task.pipeline };
-    const keys = new Set(
-      canonicalizeVariants(task.previews).map((variant) =>
-        dispatchLockKey(
-          task.mediaId,
-          getPreviewIdentity(
-            scope,
-            variant.sizeKey,
-            variant.format,
-            variant.filters,
-          ),
-        ),
-      ),
-    );
-    await Promise.all(
-      [...keys].map(async (key) => {
-        try {
-          await locks.release(key, DISPATCH_LOCK_OWNER);
-          await locks.acquire(key, DISPATCH_LOCK_OWNER, ttlMs);
-        } catch (err) {
-          logger.error(
-            `resize worker: holding the dead-letter cooldown lock ${key} failed`,
-            err,
-          );
-        }
-      }),
-    );
-  } catch (err) {
-    logger.error(
-      `resize worker: the dead-letter cooldown of task ${task.taskId} failed`,
-      err,
-    );
-  }
+  // The delivering queue, else the Resizer's own; with neither (an eager-only Resizer), the
+  // default TTL.
+  const queue = tasks ?? resizer.tasks;
+  return resizer.processor.processTask(task, {
+    signal: taskOpts?.signal,
+    workerLockTtlMs: queue
+      ? timingOf(queue).lockTtlMs.worker
+      : defaultQueueOptions.lockTtlMs.worker,
+  });
 }
 
 export interface RunWorkerOptions {
@@ -165,16 +109,19 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
         );
         return;
       }
+      // The Processor exists once the Resizer is ready (the task's own handler readied it, unless
+      // the task never reached it, e.g. one dead-lettered for too many deliveries).
+      await owner.ready();
+      const { processor } = owner;
       if (event === 'deadLettered') {
-        const cooldown = holdFailedCooldown(owner, task, tasks, logger);
+        const cooldown = processor.holdFailedCooldown(
+          task,
+          timingOf(tasks).lockTtlMs.failed,
+        );
         cooldowns.add(cooldown);
         void cooldown.then(() => cooldowns.delete(cooldown));
       }
-      if (event === 'completed') {
-        await owner.runObservers(OBSERVER[event], task, {});
-      } else {
-        await owner.runObservers(OBSERVER[event], task, error, {});
-      }
+      await processor.notify(event, task, error);
     };
 
   if (opts.sharp) {
