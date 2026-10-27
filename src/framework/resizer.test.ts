@@ -11,7 +11,6 @@ import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { S3Storage } from '../drivers/s3.ts';
 import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
-import { timingOf } from '../queue.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import {
   fakeMedia,
@@ -19,6 +18,7 @@ import {
   memoryLocks,
 } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
+import { timingOf } from '../timing.ts';
 import { runWorker } from '../worker.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';

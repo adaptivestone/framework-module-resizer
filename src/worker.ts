@@ -13,8 +13,8 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { consumeQueue, timingOf } from './queue.ts';
 import { getResizer, listResizers } from './resizer.ts';
+import { consumeQueue, timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
 
 /**

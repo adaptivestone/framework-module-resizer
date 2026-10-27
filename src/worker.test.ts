@@ -10,7 +10,6 @@ import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
-import { consumeQueue } from './queue.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -22,6 +21,7 @@ import {
   memoryLocks,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
+import { consumeQueue } from './timing.ts';
 import type { MediaLike, QueueTimingOptions, SizeInput } from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
 

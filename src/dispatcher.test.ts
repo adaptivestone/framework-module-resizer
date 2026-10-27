@@ -9,8 +9,8 @@ import {
   noQueueResult,
 } from './dispatcher.ts';
 import { canonicalizeVariants } from './images.ts';
-import { timingOf } from './queue.ts';
 import { MemoryTaskQueue, memoryLocks } from './testHelpers/fakes.ts';
+import { timingOf } from './timing.ts';
 import type { MissingPreview, ResizeLogger } from './types.d.ts';
 
 // ---------------------------------------------------------------------------

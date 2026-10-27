@@ -5,8 +5,8 @@
 // command).
 import { defaultWorkerOptions } from '../config/resize.ts';
 import { ResizeConfigError } from '../errors.ts';
-import { fillTiming } from '../queue.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
+import { fillTiming } from '../timing.ts';
 import type {
   FrameworkQueueConfig,
   FrameworkResizeConfig,

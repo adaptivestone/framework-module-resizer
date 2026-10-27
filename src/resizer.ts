@@ -19,10 +19,10 @@ import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { Processor } from './processor.ts';
-import { timingOf } from './queue.ts';
 import { prewarmFailure, Reader } from './reader.ts';
 import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
+import { timingOf } from './timing.ts';
 import type {
   GenerateOpts,
   GenerateResult,

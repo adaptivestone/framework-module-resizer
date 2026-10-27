@@ -9,7 +9,7 @@ import type { LockStore } from './contracts/locks.ts';
 import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
-import type { QueueTiming } from './queue.ts';
+import type { QueueTiming } from './timing.ts';
 import type {
   EnqueueIssue,
   EnqueueReceipt,

@@ -24,10 +24,10 @@ import {
 } from '../../errors.ts';
 import ResizeTaskModel from '../../framework/ResizeTaskModel.ts';
 import { canonicalizeVariants } from '../../images.ts';
-import { consumeQueue, timingOf } from '../../queue.ts';
 import { Resizer, resetResizerForTests } from '../../resizer.ts';
 import { fakeMedia } from '../../testHelpers/fakes.ts';
 import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
+import { consumeQueue, timingOf } from '../../timing.ts';
 import type {
   MissingPreview,
   QueueTimingOptions,

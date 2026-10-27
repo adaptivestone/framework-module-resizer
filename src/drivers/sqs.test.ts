@@ -8,10 +8,10 @@ import type {
   TaskEventHandler,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { consumeQueue, timingOf } from '../queue.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
+import { consumeQueue, timingOf } from '../timing.ts';
 import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
 import { SqsTaskQueue } from './sqs.ts';
 

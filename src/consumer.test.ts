@@ -16,8 +16,8 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
 } from './errors.ts';
-import { backoffMs, consumeQueue, timingOf } from './queue.ts';
 import { MemoryTaskQueue } from './testHelpers/fakes.ts';
+import { backoffMs, consumeQueue, timingOf } from './timing.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
 

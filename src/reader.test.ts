@@ -12,7 +12,6 @@ import { Dispatcher } from './dispatcher.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
-import { timingOf } from './queue.ts';
 import { Reader, type ReaderDeps } from './reader.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
@@ -24,6 +23,7 @@ import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
+import { timingOf } from './timing.ts';
 import type { MediaLike, ResizeLogger, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------

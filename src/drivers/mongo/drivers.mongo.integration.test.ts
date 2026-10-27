@@ -5,7 +5,7 @@ import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
-import { timingOf } from '../../queue.ts';
+import { timingOf } from '../../timing.ts';
 import {
   createResizeModels,
   MongoLockStore,
