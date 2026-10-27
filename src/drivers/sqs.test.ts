@@ -358,10 +358,7 @@ describe('SqsTaskQueue.claim', () => {
     const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       client,
-      timing: {
-        leaseMs: 30_000,
-        lockTtlMs: { dispatch: 60_000, worker: 30_000 },
-      },
+      timing: { leaseMs: 30_000 },
     });
     await tasks.claim('default', timingOf(tasks).leaseMs);
     assert.equal(receiveParams[0].VisibilityTimeout, 30);
@@ -911,11 +908,7 @@ describe('Consumer with SqsTaskQueue', () => {
     const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       client,
-      timing: {
-        ...fastTiming,
-        leaseMs: 20,
-        lockTtlMs: { dispatch: 20, worker: 20 },
-      },
+      timing: { ...fastTiming, leaseMs: 20 },
     });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -1068,32 +1061,27 @@ describe('Consumer with SqsTaskQueue', () => {
 });
 
 describe('SqsTaskQueue options', () => {
-  test('accepts any timing at construction; the core rejects bad lock TTLs when it reads the timing', () => {
-    const ttl = (err: Error & { code?: string }) =>
-      err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID';
-    // Built outside assert.throws, so a constructor that still checks the TTLs fails the test.
-    const badTtls = new SqsTaskQueue({
+  test('accepts any timing at construction; the core validates it when it reads the timing', () => {
+    // Built outside assert.throws, so a constructor that checks the timing fails the test.
+    const badLease = new SqsTaskQueue({
       queueUrl: 'q',
-      timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
+      timing: { leaseMs: 0 },
     });
-    const badCooldown = new SqsTaskQueue({
+    const removed = new SqsTaskQueue({
       queueUrl: 'q',
-      timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
+      timing: { lockTtlMs: { dispatch: 60_000, worker: 30_000 } } as never,
     });
-    assert.throws(() => timingOf(badTtls), ttl);
     assert.throws(
-      () => timingOf(badCooldown),
+      () => timingOf(badLease),
       (err: Error & { code?: string }) =>
-        ttl(err) && /lockTtlMs\.failed/.test(err.message),
+        err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
-    assert.equal(
-      timingOf(
-        new SqsTaskQueue({
-          queueUrl: 'q',
-          timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
-        }),
-      ).lockTtlMs.failed,
-      600_000,
+    // A plain-Node host that still passes lock TTLs is told where they went.
+    assert.throws(
+      () => timingOf(removed),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+        /coordination/.test(err.message),
     );
   });
   test('requires queueUrl at construction', () => {

@@ -37,9 +37,8 @@ const defaultResizeConfig: ResizeConfig = {
   concurrency: 4,
 };
 
-/** Queue timing and lock TTL defaults (a task queue's missing timing values). */
+/** Queue timing defaults (a task queue's missing timing values). */
 export const defaultQueueOptions = {
-  lockTtlMs: { dispatch: 60_000, worker: 60_000, failed: 600_000 },
   leaseMs: 60_000,
   retryBackoffMs: { base: 5_000, max: 300_000 },
   maxAttempts: 5,

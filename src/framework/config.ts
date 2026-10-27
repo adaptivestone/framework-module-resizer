@@ -6,7 +6,7 @@
 import { defaultWorkerOptions } from '../config/resize.ts';
 import { ResizeConfigError } from '../errors.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
-import { fillTiming } from '../timing.ts';
+import { fillTiming, LOCK_TTL_MOVES } from '../timing.ts';
 import type {
   CoordinationOptions,
   FrameworkQueueConfig,
@@ -113,6 +113,13 @@ export function resolveFrameworkConfig(
     throw new ResizeConfigError(
       `resize config: \`queue.queueUrl\` in ${file} is required for the 'sqs' driver`,
       { code: 'RESIZE_CONFIG_INVALID' },
+    );
+  }
+  // Checked before fillTiming, which rejects it too, but without naming the file.
+  if (isRecord(queue) && Object.hasOwn(queue, 'lockTtlMs')) {
+    throw new ResizeConfigError(
+      `resize config: \`queue.lockTtlMs\` in ${file} is no longer supported — set coordination in the same file instead: { gateTtlMs, cooldownMs } (${LOCK_TTL_MOVES})`,
+      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
     );
   }
   const timing = fillTiming(isRecord(queue) ? queue : {});

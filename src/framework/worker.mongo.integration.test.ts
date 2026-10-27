@@ -76,7 +76,6 @@ after(async () => {
 const testQueue = {
   leaseMs: 5000,
   idlePollMs: 20,
-  lockTtlMs: { dispatch: 60000, worker: 5000 },
 };
 
 // A fake app over the real task and lock models. `configs` overrides config files by name;

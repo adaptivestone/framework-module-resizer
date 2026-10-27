@@ -8,7 +8,6 @@ import { validateQueueTiming } from './resizeConfig.ts';
 import type { QueueTimingOptions } from './types.d.ts';
 
 const TIMING_KEYS = [
-  'lockTtlMs',
   'leaseMs',
   'retryBackoffMs',
   'maxAttempts',
@@ -16,37 +15,32 @@ const TIMING_KEYS = [
   'taskTimeoutMs',
 ] as const;
 
-/** Complete queue timing: every key set, the optional lock TTLs included. */
-export type QueueTiming = QueueTimingOptions & {
-  lockTtlMs: Required<QueueTimingOptions['lockTtlMs']>;
-};
+/**
+ * Where each old lock TTL went: the Resizer's coordination. The framework adapter repeats it in its
+ * own message for a config file.
+ */
+export const LOCK_TTL_MOVES =
+  'lockTtlMs.failed → cooldownMs, lockTtlMs.dispatch → gateTtlMs; drop lockTtlMs.worker';
+
+/** Complete queue timing: every key set. */
+export type QueueTiming = QueueTimingOptions;
 
 const timings = new WeakMap<object, QueueTiming>();
 
 /**
- * Check the optional dead-letter cooldown `lockTtlMs.failed` (ms) when it is set. Throws
- * ResizeConfigError.
- */
-function validateFailedLockTtl(failed: unknown): void {
-  if (
-    failed !== undefined &&
-    !(typeof failed === 'number' && Number.isSafeInteger(failed) && failed > 0)
-  ) {
-    throw new ResizeConfigError(
-      'resize queue options: lockTtlMs.failed must be a positive safe integer (ms)',
-      { code: 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' },
-    );
-  }
-}
-
-/**
  * Complete queue timing: the timing keys set in `own` over the defaults (other keys are ignored),
- * validated. A `lockTtlMs` without `failed` gets the default cooldown. Throws ResizeConfigError for
- * invalid timing.
+ * validated. Throws ResizeConfigError for invalid timing, and for `lockTtlMs`, which moved to the
+ * Resizer's coordination: ignoring it would drop a host's cooldown without a word.
  */
 export function fillTiming(
   own: Partial<QueueTimingOptions> | Record<string, unknown>,
 ): QueueTiming {
+  if (Object.hasOwn(own, 'lockTtlMs')) {
+    throw new ResizeConfigError(
+      `resize queue options: \`lockTtlMs\` is no longer supported — pass coordination: { gateTtlMs, cooldownMs } to the Resizer (${LOCK_TTL_MOVES})`,
+      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+    );
+  }
   const timing: Record<string, unknown> = { ...defaultQueueOptions };
   for (const key of TIMING_KEYS) {
     const value = (own as Record<string, unknown>)[key];
@@ -54,17 +48,8 @@ export function fillTiming(
       timing[key] = value;
     }
   }
-  const lockTtlMs = timing.lockTtlMs;
-  if (typeof lockTtlMs === 'object' && lockTtlMs !== null) {
-    const failed = (lockTtlMs as { failed?: unknown }).failed;
-    validateFailedLockTtl(failed);
-    timing.lockTtlMs = {
-      ...lockTtlMs,
-      failed: failed ?? defaultQueueOptions.lockTtlMs.failed,
-    };
-  }
   validateQueueTiming(timing);
-  return timing as unknown as QueueTiming;
+  return timing;
 }
 
 /**

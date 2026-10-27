@@ -36,7 +36,7 @@ export interface MongoTaskQueueOptions {
   // The ResizeTask model, or a getter called on each use (for a model registered later).
   model?: TaskModel;
   getModel?: () => TaskModel;
-  // Queue timing (lease, retries, lock TTLs); missing values use defaultQueueOptions.
+  // Queue timing (lease, retries, polling, task timeout); missing values use defaultQueueOptions.
   timing?: Partial<QueueTimingOptions>;
   // The same, read on first use (the framework adapter reads it from its config file).
   getTiming?: () => Partial<QueueTimingOptions>;

@@ -105,7 +105,6 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
 
 const fastTiming = {
   leaseMs: 200,
-  lockTtlMs: { dispatch: 1000, worker: 200 },
   idlePollMs: 5,
   taskTimeoutMs: 2000,
   retryBackoffMs: { base: 10, max: 40 },
@@ -466,7 +465,6 @@ describe('Consumer', () => {
       timing: {
         ...fastTiming,
         leaseMs: 20,
-        lockTtlMs: { dispatch: 1000, worker: 20 },
       },
     });
     await tasks.add(newTask());
@@ -809,7 +807,6 @@ describe('Consumer shutdown', () => {
       timing: {
         ...fastTiming,
         leaseMs: 20,
-        lockTtlMs: { dispatch: 1000, worker: 20 },
       },
     });
     await tasks.add(newTask());
@@ -1208,7 +1205,6 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       timing: {
         ...fastTiming,
         leaseMs: 100,
-        lockTtlMs: { dispatch: 1000, worker: 100 },
       },
     });
     assert.equal(await slow.acquire(key, 'g1', 1000), true);

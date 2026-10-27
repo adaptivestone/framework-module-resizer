@@ -126,7 +126,6 @@ function configureQueue(
       idlePollMs: 20,
       maxAttempts: 3,
       retryBackoffMs: { base: 50, max: 200 },
-      lockTtlMs: { dispatch: 60_000, worker: 300 },
       ...override,
     },
     logger,
@@ -350,7 +349,7 @@ describe('MongoTaskQueue setup', () => {
     });
     assert.equal(reads, 0);
     assert.equal(timingOf(queue).leaseMs, 123_000);
-    assert.equal(timingOf(queue).lockTtlMs.worker, 60_000);
+    assert.equal(timingOf(queue).maxAttempts, 5); // a default
     assert.equal(timingOf(queue).leaseMs, 123_000);
     assert.equal(reads, 1);
   });
@@ -1798,10 +1797,7 @@ describe('Consumer with MongoTaskQueue', () => {
   test('heartbeat renews a real Mongo lease and prevents another claimant taking it', {
     timeout: 10_000,
   }, async () => {
-    configureQueue(undefined, {
-      leaseMs: 100,
-      lockTtlMs: { dispatch: 60_000, worker: 100 },
-    });
+    configureQueue(undefined, { leaseMs: 100 });
     const taskId = await addedTaskId(request());
     const rec = makeEvents();
     const { gate, releaseGate } = makeGate();
@@ -1834,10 +1830,7 @@ describe('Consumer with MongoTaskQueue', () => {
   test('heartbeat lease loss aborts the handler and fences its completion event', {
     timeout: 10_000,
   }, async () => {
-    configureQueue(undefined, {
-      leaseMs: 100,
-      lockTtlMs: { dispatch: 60_000, worker: 100 },
-    });
+    configureQueue(undefined, { leaseMs: 100 });
     const taskId = await addedTaskId(request());
     let capturedSignal: AbortSignal | undefined;
     const { gate, releaseGate } = makeGate();

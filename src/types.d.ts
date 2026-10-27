@@ -268,14 +268,10 @@ export interface ResizeConfig {
   concurrency: number;
 }
 
-// Queue timing and lock TTLs: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the
-// framework config file's `queue` section feeds the framework's queue).
+// Queue timing: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the framework
+// config file's `queue` section feeds the framework's queue). How long locks last is not timing:
+// that is the Resizer's `coordination` (CoordinationOptions).
 export interface QueueTimingOptions {
-  // dispatch: default 60000 — one read's enqueue holds each variant this long;
-  // worker: default 60000, must be ≤ leaseMs;
-  // failed: default 600000 — after a task is dead-lettered, reads do not queue its variants again
-  // for this long.
-  lockTtlMs: { dispatch: number; worker: number; failed?: number };
   leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
   retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
   maxAttempts: number; // default 5 — deliveries before dead-letter (every lease counts, incl. reclaims)

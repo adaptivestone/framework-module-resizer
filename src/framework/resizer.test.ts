@@ -321,15 +321,14 @@ test("a queue section without a driver is the app's ResizeTask queue; its timing
   installApp({
     resizeListings: makeResizeConfig({
       storage: localStorage,
-      queue: { leaseMs: 1234, lockTtlMs: { dispatch: 60000, worker: 1000 } },
+      queue: { leaseMs: 1234, idlePollMs: 50 },
     }),
   });
   const r = new FrameworkResizer({ configName: 'resizeListings' });
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
   assert.equal(timingOf(r.tasks).leaseMs, 1234);
-  assert.equal(timingOf(r.tasks).lockTtlMs.dispatch, 60000);
-  assert.equal(timingOf(r.tasks).lockTtlMs.worker, 1000);
+  assert.equal(timingOf(r.tasks).idlePollMs, 50);
   assert.equal(timingOf(r.tasks).maxAttempts, 5);
 });
 
@@ -471,7 +470,7 @@ test('an explicit config also feeds the database queue timing', async () => {
   const r = new FrameworkResizer({
     config: makeResizeConfig({
       storage: localStorage,
-      queue: { leaseMs: 4000, lockTtlMs: { dispatch: 60000, worker: 4000 } },
+      queue: { leaseMs: 4000 },
     }),
   });
   await r.ready();
@@ -544,27 +543,16 @@ test('a core MongoTaskQueue needs one model, and the core validates its timing',
         err.code === 'RESIZE_MONGO_MODEL_REQUIRED',
     );
   }
-  // Locks live in the framework Lock collection; queue timing, lock TTLs included, is validated by
-  // the core on first use.
+  // Queue timing is validated by the core on first use, not at construction.
   assert.throws(
-    () =>
-      timingOf(
-        new MongoTaskQueue({
-          model: {},
-          timing: {
-            leaseMs: 1000,
-            lockTtlMs: { dispatch: 60000, worker: 2000 },
-          },
-        }),
-      ),
+    () => timingOf(new MongoTaskQueue({ model: {}, timing: { leaseMs: 0 } })),
     (err: unknown) =>
       err instanceof ResizeConfigError &&
-      err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+      err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
   );
   const t = new MongoTaskQueue({ model: {} });
   assert.equal(timingOf(t).leaseMs, 60_000);
-  assert.equal(timingOf(t).lockTtlMs.dispatch, 60_000);
-  assert.equal(timingOf(t).lockTtlMs.worker, 60_000);
+  assert.equal(timingOf(t).maxAttempts, 5);
 });
 
 test('nothing is read from the app until first use', async () => {
@@ -573,7 +561,7 @@ test('nothing is read from the app until first use', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { leaseMs: 4321, lockTtlMs: { dispatch: 60000, worker: 1000 } },
+      queue: { leaseMs: 4321 },
     }),
   });
   await r.ready();
@@ -695,7 +683,7 @@ test('config files sharing a task queue with different timing conflict on first 
       queue: {
         maxAttempts: 3,
         idlePollMs: 50,
-        lockTtlMs: { dispatch: 60000, worker: 5000 },
+        retryBackoffMs: { base: 50, max: 500 },
       },
     }),
     resizeListings: makeResizeConfig({
@@ -705,7 +693,7 @@ test('config files sharing a task queue with different timing conflict on first 
         driver: 'database',
         maxAttempts: 7,
         idlePollMs: 50,
-        lockTtlMs: { worker: 5000, dispatch: 60000 }, // same values, other key order
+        retryBackoffMs: { max: 500, base: 50 }, // same values, other key order
         taskTimeoutMs: 1000,
       },
     }),
@@ -713,7 +701,7 @@ test('config files sharing a task queue with different timing conflict on first 
   const conflict = conflictBetween(
     ['src/config/resize.ts', 'src/config/resizeListings.ts'],
     ['maxAttempts', 'taskTimeoutMs'],
-    ['idlePollMs', 'lockTtlMs'],
+    ['idlePollMs', 'retryBackoffMs'],
   );
   await assert.rejects(() => media.verify(), conflict);
   await assert.rejects(() => listings.verify(), conflict);
@@ -735,7 +723,6 @@ test('config files sharing a task queue with different timing conflict on first 
 test('two config files with the same timing share the queue and its timing', async () => {
   const queue = {
     maxAttempts: 3,
-    lockTtlMs: { dispatch: 60000, worker: 5000 },
     leaseMs: 5000,
   };
   installApp({
