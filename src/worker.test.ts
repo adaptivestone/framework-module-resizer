@@ -2,7 +2,8 @@
 // reading the source reaches the retry policy unwrapped, so an unusable source is dead-lettered
 // on its first delivery instead of being downloaded and decoded again on every retry. After a
 // dead-letter the worker holds the variants' dispatch locks for a cooldown, so reads stop queueing
-// the same failing work. runWorker serves only the Resizers it starts with.
+// the same failing work. runWorker serves only the Resizers it starts with, claims only their tasks
+// on a task queue that filters claims, and runs each task with its own Resizer's coordination.
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
@@ -19,6 +20,7 @@ import {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
+import { gateKey } from './lockKeys.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -26,6 +28,7 @@ import {
 } from './resizer.ts';
 import { consume } from './testHelpers/consume.ts';
 import {
+  clockLocks,
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
@@ -392,9 +395,17 @@ async function workUntil(
 ): Promise<void> {
   const stop = new AbortController();
   const working = runWorker({ ...opts, signal: stop.signal });
+  // A worker that fails before the wait ends (refused at start, say) fails the test with its error.
+  let failed: { error: unknown } | undefined;
+  working.catch((error: unknown) => {
+    failed = { error };
+  });
   const until = Date.now() + 5000;
   try {
     while (!done()) {
+      if (failed) {
+        throw failed.error;
+      }
       assert.ok(
         Date.now() < until,
         'the worker never reached the expected state',
@@ -599,6 +610,8 @@ test('two different Resizers listed under one name are RESIZE_DUPLICATE_RESIZER'
   );
 });
 
+// On a task queue that does not filter claims (PlainTaskQueue, the SQS shape), the worker would
+// claim the unlisted Resizers' tasks.
 describe('a worker that serves only some of the Resizers on a task queue', () => {
   const unlisted = (err: unknown, names: RegExp) =>
     err instanceof ResizeSetupError &&
@@ -607,7 +620,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
     names.test(err.message);
 
   test('is refused at start, naming the queue and the unlisted Resizers, before any claim', async () => {
-    const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+    const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
     let claims = 0;
     tasks.claim = async () => {
       claims += 1;
@@ -630,7 +643,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
   });
 
   test('a Resizer whose task queue is a function that has not run yet is loaded and compared', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     const a = queuedResizer('a', tasks);
     queuedResizer('lazy', async () => tasks);
     await assert.rejects(
@@ -659,7 +672,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
     });
 
   test('a Resizer whose other parts fail to load is still compared by its task queue', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     const a = queuedResizer('a', tasks);
     // The storage fails first, while the task queue is still loading.
     storageDown('half', async () => {
@@ -678,7 +691,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
   });
 
   test('a Resizer whose task queue cannot be loaded fails startup: it may share one', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     let claims = 0;
     tasks.claim = async () => {
       claims += 1;
@@ -710,9 +723,9 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
   });
 
   test('an unserved Resizer on its own task queue, or eager-only, lets the worker start', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     const a = queuedResizer('a', tasks);
-    storageDown('own', async () => new MemoryTaskQueue());
+    storageDown('own', async () => new PlainTaskQueue());
     storageDown('eager', undefined);
     await runWorker({
       signal: AbortSignal.abort(),
@@ -720,6 +733,149 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
       resizers: [a],
     });
   });
+});
+
+test('on a task queue that filters claims, a worker starts beside unlisted Resizers and never claims their tasks', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  const a = queuedResizer('a', tasks);
+  queuedResizer('b', tasks);
+  // b's task is the older one, so a queue that ignored the filter would hand it out first.
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add(taskOf('a'));
+  const [bRow, aRow] = tasks.rows;
+  await workUntil(
+    { logger: silent, resizers: [a] },
+    () => aRow.status === 'completed',
+  );
+  assert.equal(bRow.status, 'pending');
+  assert.equal(bRow.attempts, 0);
+});
+
+test('a task queue that filters claims is not given accepts: a task of another Resizer it hands out anyway fails with RESIZE_NO_RESIZER', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  // A broken queue that ignores the filter.
+  const claim = tasks.claim.bind(tasks);
+  tasks.claim = (queue, leaseMs, signal) => claim(queue, leaseMs, signal);
+  const a = queuedResizer('a', tasks);
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add(taskOf('a'));
+  const [bRow, aRow] = tasks.rows;
+  const errors: unknown[][] = [];
+  await workUntil(
+    {
+      logger: { ...silent, error: (...args) => errors.push(args) },
+      resizers: [a],
+    },
+    // Failed, not given back: a release would leave its attempts at 0.
+    () =>
+      aRow.status === 'completed' &&
+      bRow.status === 'pending' &&
+      bRow.attempts === 1,
+  );
+  assert.match(bRow.error ?? '', /Resizer 'b' is not served by this worker/);
+  assert.ok(
+    errors.some((args) =>
+      /although it filters claims, so its tasks fail with RESIZE_NO_RESIZER/.test(
+        String(args[0]),
+      ),
+    ),
+  );
+});
+
+test('when every consumed task queue filters claims, an unserved Resizer whose task queue cannot be loaded does not stop the start', async () => {
+  const tasks = new MemoryTaskQueue();
+  const a = queuedResizer('a', tasks);
+  queuedResizer('broken', async () => {
+    throw new Error('queue not up');
+  });
+  await runWorker({
+    signal: AbortSignal.abort(),
+    logger: silent,
+    resizers: [a],
+  });
+});
+
+// A Resizer whose every source is over limits.sourcePixels, so each of its tasks is dead-lettered
+// on its first delivery.
+function tooLargeResizer(
+  name: string,
+  tasks: ResizerOptions['tasks'],
+  over: Pick<ResizerOptions, 'coordination' | 'locks'>,
+): Resizer {
+  return new Resizer({
+    name,
+    config: makeImageConfig({
+      formats: ['webp'],
+      limits: { sourcePixels: 100 },
+    }),
+    coordination: over.coordination,
+    logger: silent,
+    storage: {
+      download: async () => png,
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({
+      load: async (id) => ({
+        id,
+        original: { storageRef: { key: `o-${id}` } },
+        previews: [],
+      }),
+    }),
+    locks: over.locks ?? memoryLocks(),
+    tasks,
+  });
+}
+
+test("each dead-letter gets the cooldown of the task's own Resizer", async () => {
+  const tasks = new MemoryTaskQueue({
+    now: () => 0,
+    timing: { idlePollMs: 5 },
+  });
+  const a = tooLargeResizer('a', tasks, {
+    coordination: { cooldownMs: 30_000 },
+  });
+  const b = tooLargeResizer('b', tasks, {
+    coordination: { cooldownMs: 90_000 },
+  });
+  await tasks.add({ ...taskOf('a'), previews: [webp10] });
+  await tasks.add({ ...taskOf('b'), previews: [webp10] });
+  const [aRow, bRow] = tasks.rows;
+  await workUntil(
+    { logger: silent, resizers: [a, b] },
+    () => aRow.status === 'dead' && bRow.status === 'dead',
+  );
+  assert.equal(aRow.cooldownUntil, 30_000);
+  assert.equal(bRow.cooldownUntil, 90_000);
+});
+
+test("on a queue without gatesByTask, the gate lock lives in the task's Resizer's lock store", async () => {
+  const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
+  const locks = clockLocks();
+  const resizer = tooLargeResizer('default', tasks, {
+    coordination: { cooldownMs: 30_000 },
+    locks,
+  });
+  const deadLettered: LeasedTask[] = [];
+  resizer.hook('onTaskDeadLettered', (task) => {
+    deadLettered.push(task);
+  });
+  // The lock the Dispatcher takes when it queues the task, under the owner the task carries.
+  const key = gateKey('default', 'm1', 'default');
+  assert.equal(await locks.acquire(key, 'g1', 60_000), true);
+  await tasks.add({
+    ...taskOf('default'),
+    previews: [webp10],
+    gateOwner: 'g1',
+  });
+  await workUntil(
+    { logger: silent, resizers: [resizer] },
+    () => deadLettered.length === 1,
+  );
+  const held = locks.entry(key);
+  assert.equal(held?.owner, 'g1');
+  const left = (held?.expiresAt ?? 0) - Date.now();
+  assert.ok(left >= 29_900 && left <= 30_000, `held for ${left} ms`);
 });
 
 test('a listed Resizer whose ready() rejects makes runWorker reject at startup before any claim', async () => {

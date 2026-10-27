@@ -3806,44 +3806,58 @@ describe('one worker serves every Resizer', () => {
     );
   });
 
-  test('a loop that fails stops the other loops, and its error rejects the worker', {
+  test('a throwing logger does not stop the loop', {
     timeout: 5000,
   }, async () => {
     installApp();
-    let siblingAborted = false;
-    const sibling = new MemoryTaskQueue();
-    sibling.claim = (_queue, _leaseMs, signal) =>
-      new Promise((_resolve, reject) => {
-        signal?.addEventListener(
-          'abort',
-          () => {
-            siblingAborted = true;
-            reject(new Error('aborted'));
-          },
-          { once: true },
-        );
-      });
-    register(sibling);
-    // The loop guards its queue calls, observers and logging (a throwing logger falls back to the
-    // console), so this one fails on what it cannot guard: a claimed task that cannot be read.
-    const unreadable = new Error('unreadable task');
-    const failing = new MemoryTaskQueue();
-    failing.claim = async () =>
-      ({
-        get taskId(): string {
-          throw unreadable;
-        },
-      }) as unknown as Awaited<ReturnType<MemoryTaskQueue['claim']>>;
-    register(failing, 'listings');
-    await assert.rejects(
-      () =>
-        runWorker({
-          signal: new AbortController().signal,
-          logger: { info() {}, warn() {}, error() {} },
-        }),
-      (err: unknown) => err === unreadable,
+    // Each message the worker's logger refuses falls back to the console, muted here.
+    const consoleError = mock.method(console, 'error', () => {});
+    const consoleInfo = mock.method(console, 'info', () => {});
+    const failing = new MemoryTaskQueue({ timing: { idlePollMs: 1 } });
+    const claim = failing.claim.bind(failing);
+    let claims = 0;
+    failing.claim = async (...args: Parameters<MemoryTaskQueue['claim']>) => {
+      claims += 1;
+      if (claims === 1) {
+        throw new Error('queue unreachable');
+      }
+      return claim(...args);
+    };
+    const sibling = new MemoryTaskQueue({ timing: { idlePollMs: 1 } });
+    register(failing);
+    register(sibling, 'listings');
+    await addTask(failing);
+    await addTask(sibling, { resizer: 'listings' });
+    const rows = [...failing.rows, ...sibling.rows];
+    const sinkDown = () => {
+      throw new Error('log sink down');
+    };
+    const controller = new AbortController();
+    const outcome = runWorker({
+      signal: controller.signal,
+      logger: { info: sinkDown, warn: sinkDown, error: sinkDown },
+    }).then(
+      () => 'resolved',
+      (err: unknown) => err,
     );
-    assert.equal(siblingAborted, true);
+    const until = Date.now() + 4000;
+    try {
+      while (!rows.every((row) => row.status === 'completed')) {
+        assert.ok(Date.now() < until, 'both tasks were completed');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      controller.abort();
+    }
+    assert.equal(await outcome, 'resolved');
+    const said = (calls: typeof consoleError.mock.calls) =>
+      calls.map((call) => String(call.arguments[0]));
+    assert.ok(
+      said(consoleError.mock.calls).some((m) =>
+        m.includes('claiming a task failed'),
+      ),
+    );
+    assert.ok(said(consoleInfo.mock.calls).includes('resize worker stopped'));
   });
 
   test('a sibling claim aborted during shutdown does not reject the worker', async () => {

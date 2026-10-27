@@ -22,6 +22,10 @@ const GLOBAL_LOOKUPS = new Set([
   'listResizers',
 ]);
 
+/** The source of `f`, a path relative to src/. */
+const read = (f: string): string =>
+  readFileSync(new URL(`./${f}`, import.meta.url), 'utf8');
+
 /** Names imported as runtime values (`import type` and `type X` specifiers are erased). */
 function valueImports(source: string): string[] {
   const names: string[] = [];
@@ -70,11 +74,16 @@ for (const file of CORE_FILES) {
 // export come back.
 test('only images.ts decides which stored rows count', () => {
   const users = sourceFiles().filter(
-    (f) =>
-      f !== 'images.ts' &&
-      readFileSync(new URL(`./${f}`, import.meta.url), 'utf8').includes(
-        'isUsablePreview(',
-      ),
+    (f) => f !== 'images.ts' && read(f).includes('isUsablePreview('),
   );
   assert.deepEqual(users, []);
+});
+
+// The host's logger is host code and may throw; the worker loop must survive that, so it logs only
+// through logNeverThrow, which falls back to the console.
+test('the worker loop logs only through logNeverThrow', () => {
+  const direct = ['consumer.ts', 'worker.ts'].filter((f) =>
+    /\blogger\.(info|warn|error)\(/.test(read(f)),
+  );
+  assert.deepEqual(direct, []);
 });
