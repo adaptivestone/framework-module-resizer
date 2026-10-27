@@ -150,8 +150,9 @@ await runWorker({ signal, queue: 'default', sharp: { concurrency: 1, cache: fals
 
 An eager-only Resizer needs only `storage` and `media`: pass `media: new MongoMediaStore({ model:
 File })` (also from `…/drivers/mongo.js`) instead of the parts, which also register the task and
-lock models. `locks` is required beside `tasks` (`RESIZE_LOCKS_REQUIRED`). With the parts, create
-the indexes of both models through your migration process (for example
+lock models. `locks` is required beside `tasks`: without it `verify()` and the worker reject with
+`RESIZE_LOCKS_REQUIRED`, and reads serve stored previews only (see [Drivers](#drivers)). With the
+parts, create the indexes of both models through your migration process (for example
 `await mongoose.connection.models.ResizeTask.createIndexes()`, and the same for `ResizeLock`); the
 module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
 
@@ -160,10 +161,15 @@ module never creates them at runtime (`createResizeModels` sets `autoIndex: fals
 rejects with `RESIZE_NO_RESIZER`). The list is resolved once, at start: a Resizer constructed
 later is not served, so its tasks fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) and
 its task events are logged and dropped. Before it claims anything, the worker readies and
-verifies every listed Resizer, so one that cannot start rejects `runWorker`. `logger` receives the
-worker loop's own messages; a failed lock call (a release, the dead-letter cooldown) is logged
-through the owning Resizer's `logger`. Framework hosts run `npm run cli ResizeWorker`, which
-serves the Resizers that `src/resizer.ts` constructs.
+verifies every listed Resizer, so one that cannot start, or whose task queue cannot be used (no
+lock store, invalid timing), rejects `runWorker`. A list must name each Resizer once (two
+Resizers under one name: `RESIZE_DUPLICATE_RESIZER`), and it must include every Resizer of the
+process that uses a task queue the worker consumes: otherwise the worker would claim their tasks
+and dead-letter them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. Resizers built
+only in other processes cannot be checked: construct every Resizer in the worker process too.
+`logger` receives the worker loop's own messages; a failed lock call (a release, the dead-letter
+cooldown) is logged through the owning Resizer's `logger`. Framework hosts run
+`npm run cli ResizeWorker`, which serves the Resizers that `src/resizer.ts` constructs.
 
 ## Package exports
 
@@ -184,8 +190,8 @@ A `Resizer` takes four parts:
 - `storage` (required, a `ResizeStorage`): files;
 - `media` (required, a `MediaStore`; `RESIZE_MEDIA_REQUIRED` without it): media documents and
   their previews;
-- `locks` (a `LockStore`; required when `tasks` is set, `RESIZE_LOCKS_REQUIRED`): locks for queued
-  work;
+- `locks` (a `LockStore`; required when `tasks` is set, `RESIZE_LOCKS_REQUIRED` from `verify()`):
+  locks for queued work;
 - `tasks` (queued workflows, a `TaskQueue`): where tasks wait — `mongoParts(…).tasks`, or an
   `SqsTaskQueue`.
 
@@ -196,11 +202,19 @@ implement atomic operations. Drivers receive no `app` argument; each one uses it
 (the framework's own `Lock` model), and uses the scaffolded `ResizeTask` model as its queue. Any
 part may also be a function (sync or async), called once on first use: `new Resizer({ storage:
 async () => …, media, locks, tasks })`. `await resizer.ready()` loads them; the Resizer's own
-methods and the worker do it for you. After loading, `ready()` checks that a Resizer with a task
-queue has a lock store, validates the queue timing, then the image config (a config given as a
-function is read here), and builds the Resizer's services; the first failure rejects. The next
-call retries the step that failed (a part that did not load, a timing or config that did not
-validate) and keeps the parts that loaded.
+methods and the worker do it for you. After loading, `ready()` sets up the task queue (a Resizer
+with one needs a lock store and valid queue timing), then validates the image config (a config
+given as a function is read here) and builds the Resizer's services. A part that does not load
+or an invalid config rejects. A task queue that cannot be used does not: the error is logged once,
+`resolve()` serves the stored previews and queues nothing, `uploadOriginal()` and `generate()`
+work, `prewarm()` returns `incomplete` with a non-retryable `RESIZE_ENQUEUE_INTERNAL_ERROR` issue
+carrying the error, and `verify()` and the worker reject with it (`RESIZE_LOCKS_REQUIRED`,
+`RESIZE_CONFIG_QUEUE_*`, `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`). Call `verify()` at boot so such a
+misconfiguration stops the deploy instead of degrading reads. (`FrameworkResizer` validates the
+config file's `queue` section with the rest of the file, so there invalid timing is a config
+error on first use.) The next call retries what failed
+(a part that did not load, a config that did not validate, a task queue that could not be set up)
+and keeps the parts that loaded.
 
 **`LocalFsStorage`**
 
@@ -243,9 +257,11 @@ needs `findById` and `findOneAndUpdate`. Previews and the backfilled dimensions 
 `findOneAndUpdate` middleware runs for each; the document it receives has only `_id`, and is
 `null` when the preview was already stored or the media is gone. `MongoMediaStore.verify()` fails
 with `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as
-sub-documents without `identity` (a mixed or plain `previews` array passes), and
-`MongoTaskQueue.verify()` with `RESIZE_MONGO_MODEL_OUTDATED` when the `ResizeTask` schema lacks a
-field the queue writes.
+sub-documents without `identity` (a mixed or plain `previews` array passes),
+`MongoLockStore.verify()` with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock schema has no
+`owner` field (for example a `ResizeLock` model registered on the connection before this
+version), and `MongoTaskQueue.verify()` with `RESIZE_MONGO_MODEL_OUTDATED` when the `ResizeTask`
+schema lacks a field the queue writes.
 
 **`SqsTaskQueue`**
 
@@ -263,8 +279,9 @@ Credentials come from the AWS provider chain. Retries and dead-lettering are the
 as for Mongo (attempts = `ApproximateReceiveCount`), and `onTaskDeadLettered` fires for SQS too. Use
 it with any media and lock store: media and locks stay in your database. Its timing is its own
 `timing` option (the framework config's `queue` section passes its timing); the core validates it,
-lock TTLs included, on first use (`ready()`, `verify()` or worker start), not when the queue is
-constructed. A redrive policy on the SQS queue is optional; if you keep one, set its
+lock TTLs included, when the Resizer starts, not when the queue is constructed (invalid timing
+makes `verify()` and the worker reject; see `ready()` above). A redrive policy on the SQS queue is
+optional; if you keep one, set its
 `maxReceiveCount` above `maxAttempts`, so the module dead-letters a task first. SQS fences less
 strictly than Mongo: it accepts a delete with an outdated receipt, so a task whose lease ran out
 can report `completed` and still run again (the worker skips previews that exist), and a dead
@@ -300,10 +317,13 @@ the owner in the `ResizeLock` row, and `FrameworkLockStore` in the framework `Lo
   `false` while a live lock holds it, even one with the same owner), `extend(key, owner, ttlMs)`
   (only the owner's live lock), `release(key, owner)` (only while `owner` holds it, expired or
   not), and optionally `verify()`, awaited at startup. Keep the owner with the lock, not in process
-  memory: one process may release a lock that another took.
+  memory: one process may release a lock that another took. The core does not call `extend` in
+  this release; implement it now, for the next one.
 - `TaskQueue` — each method one atomic operation:
-  - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews, requestKey }`; an active task
-    with the same `requestKey` may be returned instead.
+  - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews }`. `task.requestKey`
+    identifies the whole request: a queue that can find an active task with the same key may
+    return it instead of storing a copy. `MongoTaskQueue` stores the key for that; `SqsTaskQueue`
+    does not (its messages and dead-letter bodies carry no `requestKey` in this release).
   - `claim(queue, leaseMs, signal?)` takes the task that became due first (a waiting one whose
     retry time has passed, or one whose lease expired), increments `attempts` and returns a
     fencing `token`. It is how a worker receives tasks: it may return `null` at once (the core
@@ -317,9 +337,10 @@ the owner in the `ResizeLock` row, and `FrameworkLockStore` in the framework `Lo
     becomes claimable at once, and the delivery should not count as an attempt; a backend that
     cannot take a delivery back may still count it (`MongoTaskQueue` takes the attempt back;
     `SqsTaskQueue` cannot, since SQS counts receives). The worker calls it at shutdown for a task
-    it stopped, with no `onTaskFailed` / `onTaskDeadLettered` event and no backoff; an error with
-    `retryable: false` (see [Operations](#operations)) is still dead-lettered with its event.
-    Without `release`, the core retries the task at once through `fail`, which counts.
+    it stopped, with no `onTaskFailed` / `onTaskDeadLettered` event and no backoff; a
+    `ResizeError` with `retryable: false` (see [Operations](#operations)) is still dead-lettered
+    with its event. Without `release`, the core retries the task at once through `fail`, which
+    counts.
   - Optionally `findActive({ resizer, mediaId, pipeline })` (lets `prewarm()` confirm work queued by
     another request), `servesQueue(queue)`, `getTiming()` and `verify()`.
 
@@ -354,7 +375,10 @@ do Resizers whose config selects SQS with the same settings; config files
 that share a queue must set the same timing (and SQS `waitTimeSeconds`, where unset counts as the
 default 10), or first use, `verify()`
 and worker start fail with `ResizeConfigError` `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`, naming both
-files and the keys. The core validates timing on first use or in `verify()`. Their defaults are
+files and the keys. A config file's timing is validated with the file, on first use. The core
+validates a task queue's own `timing` when the Resizer starts: invalid timing makes `verify()` and
+the worker reject, while reads serve stored previews and queue nothing and `prewarm()` reports it
+(see `ready()` under [Drivers](#drivers)). Their defaults are
 `defaultQueueOptions` in `…/config/resize.js`:
 
 | Option | Default | Notes |
@@ -410,9 +434,11 @@ and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do 
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), or an SVG render ran past
     `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`). The worker reads
-    `retryable` on the error that fails the task, on any thrown object, not only a `ResizeError`:
-    an error from `loadMedia`, `storage.download`, the source and SVG checks, the SVG render,
-    `beforeSteps` or `appendPreviews` with `retryable: false` dead-letters the task at once. An
+    `retryable` on the error that fails the task, when it is a `ResizeError` — including one from
+    a duplicate copy of the package (it checks the `isResizeError` brand, not the class); errors
+    from other libraries are retried, whatever fields they carry. A `ResizeError` from
+    `loadMedia`, `storage.download`, the source and SVG checks, the SVG render, `beforeSteps` or
+    `appendPreviews` with `retryable: false` dead-letters the task at once. An
     error inside one variant (`variantSteps`, encoding, `storage.upload`) or from the lock store
     fails only that variant: it is logged, and the task fails with the retryable
     `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only, then dead-lettered after
