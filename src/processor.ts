@@ -1,5 +1,6 @@
 // The resize core: ONE sharp pipeline shared by both generation modes, owned by `Processor`:
-//   - processTask() = the core + lock bookkeeping (one queued task, run by the worker)
+//   - processTask() = the core + lock bookkeeping when the Resizer has a lock store (one queued
+//                     task, run by the worker)
 //   - generate()    = the core WITHOUT locks (eager `resizer.generate`)
 // The steps (download once → metadata guards → an SVG rendered once to a raster → beforeSteps
 // once, after an orientation normalize → decode once + bounded per-variant resize/encode/upload →
@@ -158,7 +159,8 @@ interface GenerateCoreArgs {
   requested: MissingPreview[];
   pipeline: string;
   ctx: Record<string, unknown>;
-  // Queued mode: take locks in this store, worker locks with this TTL. Eager mode passes none.
+  // Queued mode with a lock store: take locks in it, worker locks with this TTL. Eager mode, and a
+  // queued task of a Resizer without a lock store, pass none.
   locks?: { store: LockStore; workerTtlMs: number };
   persist: boolean;
   signal?: AbortSignal;
@@ -176,7 +178,7 @@ export interface ProcessorDeps {
   catalog: Catalog;
   media: MediaStore;
   storage: ResizeStorage;
-  locks: LockStore | undefined; // undefined: eager only, queued tasks are refused
+  locks: LockStore | undefined; // undefined: queued tasks render without worker locks
   pipelines: PipelineRegistry;
   hooks: HookBus;
   config: ResizeConfig;
@@ -266,7 +268,9 @@ export class Processor {
    * One queued task: the core plus lock bookkeeping. The worker loop (src/consumer.ts) runs it
    * through the worker; it SUCCEEDS by returning and FAILS by throwing (which engages the queue's
    * retry → dead-letter). Worker locks last `workerLockTtlMs`, which fits the delivering queue's
-   * lease. Without a lock store it rejects with RESIZE_LOCKS_REQUIRED before loading anything.
+   * lease. Without a lock store (a Resizer on a queue that gates by task needs none) it takes no
+   * locks and renders at once: the lease keeps the task to one worker at a time, and the media
+   * store keeps one row per preview identity.
    */
   async processTask(
     task: LeasedTask,
@@ -275,15 +279,6 @@ export class Processor {
     const { catalog, locks, logger, media: mediaStore, name } = this.#deps;
     // ctx does NOT cross the queue — the worker's pipeline steps depend on media/metadata.
     const ctx: Record<string, unknown> = {};
-    // A queued task always takes locks. verify() (so worker start) requires a lock store beside a
-    // task queue, but a Resizer without one (eager only) can still be handed a task by another
-    // Resizer's queue.
-    if (!locks) {
-      throw new ResizeSetupError(
-        `resize worker: Resizer '${name}' has no \`locks\`, so it cannot process queued tasks — give it a lock store (e.g. the parts of mongoParts(connection, { mediaModel }))`,
-        { code: 'RESIZE_LOCKS_REQUIRED' },
-      );
-    }
 
     // Load the media doc. A deleted media row is a logged no-op success (the queue completes it),
     // but a live row whose persisted original is absent/malformed is a terminal media error. In
@@ -315,7 +310,9 @@ export class Processor {
         requested,
         pipeline: task.pipeline,
         ctx,
-        locks: { store: locks, workerTtlMs: opts.workerLockTtlMs },
+        locks: locks
+          ? { store: locks, workerTtlMs: opts.workerLockTtlMs }
+          : undefined,
         persist: true,
         signal: opts.signal,
       });
@@ -374,7 +371,7 @@ export class Processor {
     const { catalog, locks, logger, name } = this.#deps;
     try {
       if (!locks) {
-        // An eager-only Resizer: its tasks fail with RESIZE_LOCKS_REQUIRED; nothing to hold.
+        // No lock store, so no lock-based cooldown to hold.
         return;
       }
       const scope: PreviewScope = { resizer: name, pipeline: task.pipeline };

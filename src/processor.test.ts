@@ -429,24 +429,14 @@ describe('Processor', () => {
     );
   });
 
-  test('processTask without a lock store is RESIZE_LOCKS_REQUIRED', async () => {
-    let loads = 0;
+  test('a Processor renders a queued task with no lock store', async () => {
+    const { storage, uploads } = makeStorage(redPng);
     const deps = processorDeps(undefined);
-    deps.media = fakeMedia({
-      load: async () => {
-        loads++;
-        return mediaDoc();
-      },
+    deps.storage = storage;
+    await new Processor(deps).processTask(task({ previews: [variant()] }), {
+      workerLockTtlMs: 1000,
     });
-    await assert.rejects(
-      () =>
-        new Processor(deps).processTask(task({ previews: [variant()] }), {
-          workerLockTtlMs: 1000,
-        }),
-      (err: unknown) =>
-        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
-    );
-    assert.equal(loads, 0);
+    assert.equal(uploads.length, 1);
   });
 
   test('notify maps task events to their observers with ctx {}', async () => {
@@ -4062,29 +4052,6 @@ describe('one worker serves every Resizer', () => {
       tasks.rows[0].error ?? '',
       /Resizer 'ghost' is not served by this worker/,
     );
-  });
-
-  test('a Resizer without a lock store cannot process a queued task', async () => {
-    installApp();
-    const { storage, uploads } = makeStorage(redPng);
-    let loads = 0;
-    // Eager only (no task queue, no locks), yet another Resizer's queue hands it a task.
-    new Resizer({
-      storage,
-      media: fakeMedia({
-        load: async () => {
-          loads++;
-          return mediaDoc();
-        },
-      }),
-    });
-    await assert.rejects(
-      () => processTask(task({ previews: [variant()] })),
-      (err: unknown) =>
-        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
-    );
-    assert.equal(loads, 0);
-    assert.equal(uploads.length, 0);
   });
 
   test('a task for an unregistered Resizer fails with RESIZE_NO_RESIZER', async () => {
