@@ -29,6 +29,7 @@ import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  PlainTaskQueue,
   ReleasingTaskQueue,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
@@ -469,7 +470,7 @@ test('a task of a Resizer the worker does not serve is given back, never run or 
 });
 
 test('runWorker({ resizers }) serves only the given Resizers; on a task queue without release, a task of another fails with RESIZE_NO_RESIZER', async () => {
-  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
   const a = queuedResizer('a', tasks);
   // Not listed, on its own task queue: it does not share a's queue, so the worker may start.
   queuedResizer('c', new MemoryTaskQueue());
@@ -850,9 +851,14 @@ describe('dead-letter cooldown', () => {
   const size: SizeInput = { width: 10, height: 10 };
 
   // A Resizer whose sources are all over limits.sourcePixels, so every task is dead-lettered on
-  // its first delivery. Dispatch locks last 1 s, the cooldown 10 s.
-  function setup(locks: LockStore, timing: Partial<QueueTimingOptions> = {}) {
-    const tasks = new MemoryTaskQueue({
+  // its first delivery. Dispatch locks last 1 s, the cooldown 10 s. A test whose unserved task must
+  // fail, not be given back, passes PlainTaskQueue (a queue without release).
+  function setup(
+    locks: LockStore,
+    timing: Partial<QueueTimingOptions> = {},
+    Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
+  ) {
+    const tasks = new Queue({
       timing: {
         idlePollMs: 5,
         lockTtlMs: { dispatch: 1000, worker: 1000, failed: 10_000 },
@@ -1003,7 +1009,7 @@ describe('dead-letter cooldown', () => {
 
   test('a dead task of a Resizer unknown in this process takes no lock', async () => {
     const locks = expiringLocks({ ms: 0 });
-    const t = setup(locks, { maxAttempts: 1 });
+    const t = setup(locks, { maxAttempts: 1 }, PlainTaskQueue);
     await t.tasks.add({
       resizer: 'ghost',
       queue: 'default',
@@ -1027,7 +1033,7 @@ describe('dead-letter cooldown', () => {
   });
 
   test('a Resizer constructed after the worker started is not served: its task fails with RESIZE_NO_RESIZER and its observers never fire', async () => {
-    const t = setup(expiringLocks({ ms: 0 }));
+    const t = setup(expiringLocks({ ms: 0 }), {}, PlainTaskQueue);
     const working = t.work(); // runWorker has taken its list of Resizers
     // The worker routes tasks and events only among the Resizers it started with.
     let loads = 0;

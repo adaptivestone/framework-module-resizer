@@ -3,8 +3,8 @@
 // queues that share one row store (oldest-first claims, fenced leases, retry times and dead tasks).
 // MemoryTaskQueue behaves like the database queue: it gates by task (one active task per Resizer,
 // media and pipeline, and a dead task holds the gate until its cooldown ends), filters claims by
-// Resizer and answers findActive. PlainTaskQueue has the SQS shape and stores every task;
-// ReleasingTaskQueue adds `release` to it.
+// Resizer, gives tasks back with `release` and answers findActive. PlainTaskQueue has the SQS
+// shape and stores every task; ReleasingTaskQueue adds `release` to it.
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
@@ -235,6 +235,25 @@ abstract class RowQueue extends TaskQueue {
     );
   }
 
+  /**
+   * The body of `release` for the queues that have it: a held task is due again at once, behind
+   * the tasks already due (like the database queue, which claims the task that became due first),
+   * and the delivery is not counted. `active` is unchanged. `false` when the task is not held.
+   */
+  protected giveBack(task: ClaimedTask): boolean {
+    const row = this.held(task);
+    if (!row) {
+      return false;
+    }
+    this.rows.splice(this.rows.indexOf(row), 1);
+    row.status = 'pending';
+    row.token = null;
+    row.availableAt = 0;
+    row.attempts -= 1;
+    this.rows.push(row);
+    return true;
+  }
+
   async renew(task: ClaimedTask, leaseMs: number): Promise<boolean> {
     const row = this.held(task);
     if (!row) {
@@ -285,9 +304,9 @@ export interface MemoryTaskQueueOptions {
 
 /**
  * The in-memory database queue. It keeps one active task per Resizer, media and pipeline: `add`
- * reports any other active task as `in-flight`, through its retries, until `complete`. A dead task
- * holds the gate for the `cooldownMs` given to `fail`; after that the next `add` takes it over.
- * `claim` honours `resizers`.
+ * reports any other active task as `in-flight`, through its retries and a `release`, until
+ * `complete`. A dead task holds the gate for the `cooldownMs` given to `fail`; after that the next
+ * `add` takes it over. `claim` honours `resizers`.
  */
 export class MemoryTaskQueue extends RowQueue {
   readonly gatesByTask = true;
@@ -360,7 +379,12 @@ export class MemoryTaskQueue extends RowQueue {
     return true;
   }
 
-  /** The gate, while it is pending or processing; a dead task in its cooldown is not reported. */
+  /** Give a held task back; it keeps the gate. */
+  async release(task: ClaimedTask): Promise<boolean> {
+    return this.giveBack(task);
+  }
+
+  /** The gate, while it is pending or processing; a dead task is never reported. */
   async findActive(query: {
     resizer: string;
     mediaId: string;
@@ -381,30 +405,15 @@ export class MemoryTaskQueue extends RowQueue {
 export class PlainTaskQueue extends RowQueue {}
 
 /**
- * PlainTaskQueue with `release`: the task is due again at once, behind the tasks already due
- * (like the database queue, which claims the task that became due first), and the delivery is not
- * counted. `releaseCalls` lists the task ids passed to `release`.
+ * PlainTaskQueue with `release`, which gives a held task back as MemoryTaskQueue's does: due again
+ * at once, behind the tasks already due, and the delivery is not counted. `releaseCalls` lists the
+ * task ids passed to `release`.
  */
 export class ReleasingTaskQueue extends PlainTaskQueue {
   readonly releaseCalls: string[] = [];
 
   async release(task: ClaimedTask): Promise<boolean> {
     this.releaseCalls.push(task.taskId);
-    const index = this.rows.findIndex(
-      (r) =>
-        r.id === task.taskId &&
-        r.status === 'processing' &&
-        r.token === task.token,
-    );
-    if (index === -1) {
-      return false;
-    }
-    const [row] = this.rows.splice(index, 1);
-    row.status = 'pending';
-    row.token = null;
-    row.availableAt = 0;
-    row.attempts -= 1;
-    this.rows.push(row);
-    return true;
+    return this.giveBack(task);
   }
 }

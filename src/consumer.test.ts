@@ -19,7 +19,7 @@ import {
 import { consume } from './testHelpers/consume.ts';
 import {
   MemoryTaskQueue,
-  type PlainTaskQueue,
+  PlainTaskQueue,
   ReleasingTaskQueue,
 } from './testHelpers/fakes.ts';
 import { timingOf } from './timing.ts';
@@ -711,7 +711,7 @@ describe('Consumer shutdown', () => {
   });
 
   test('a queue without release retries the stopped task at once, with no event and never dead', async () => {
-    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    const tasks = new PlainTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
     tasks.rows[0].attempts = 2; // this delivery is the last one allowed
     const events = await shutDownMidTask(tasks);
@@ -911,7 +911,7 @@ describe('a task the Consumer does not accept', () => {
   });
 
   test('on a queue without release it is retried at once through fail: the delivery counts', async () => {
-    const tasks = new MemoryTaskQueue({
+    const tasks = new PlainTaskQueue({
       timing: { ...fastTiming, idlePollMs },
     });
     await tasks.add(newTask());

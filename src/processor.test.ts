@@ -39,6 +39,7 @@ import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
@@ -3558,9 +3559,13 @@ describe('a source smaller than the box', () => {
 // runResizeWorker
 // ---------------------------------------------------------------------------
 
-// Stop idle test queues deterministically after their queued work has been handled.
-function observedQueue(onIdle: () => void = () => process.emit('SIGTERM')) {
-  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 1 } });
+// Stop idle test queues deterministically after their queued work has been handled. A test whose
+// unserved task must fail, not be given back, passes PlainTaskQueue (a queue without release).
+function observedQueue(
+  onIdle: () => void = () => process.emit('SIGTERM'),
+  Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
+) {
+  const tasks = new Queue({ timing: { idlePollMs: 1 } });
   const claimedQueues: string[] = [];
   const claim = tasks.claim.bind(tasks);
   tasks.claim = async (queue, leaseMs) => {
@@ -3574,7 +3579,10 @@ function observedQueue(onIdle: () => void = () => process.emit('SIGTERM')) {
   return { tasks, claimedQueues };
 }
 
-async function addTask(tasks: MemoryTaskQueue, over: Partial<NewTask> = {}) {
+async function addTask(
+  tasks: MemoryTaskQueue | PlainTaskQueue,
+  over: Partial<NewTask> = {},
+) {
   const { taskId: _taskId, attempts: _attempts, ...payload } = task();
   await tasks.add({ ...payload, requestKey: JSON.stringify(over), ...over });
 }
@@ -3696,7 +3704,7 @@ describe('runResizeWorker', () => {
 
 describe('one worker serves every Resizer', () => {
   function register(
-    tasks: MemoryTaskQueue,
+    tasks: MemoryTaskQueue | PlainTaskQueue,
     name = 'default',
     media = fakeMedia(),
   ) {
@@ -4031,7 +4039,7 @@ describe('one worker serves every Resizer', () => {
 
   test('an event for an unknown Resizer is logged, not thrown', async () => {
     const { logs } = installApp({ worker: { enabled: true } });
-    const { tasks } = observedQueue();
+    const { tasks } = observedQueue(undefined, PlainTaskQueue);
     register(tasks);
     await addTask(tasks, { resizer: 'ghost' });
     await runResizeWorker();

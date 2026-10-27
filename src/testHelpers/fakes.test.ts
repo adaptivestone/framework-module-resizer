@@ -12,7 +12,6 @@ import {
   MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
-  ReleasingTaskQueue,
 } from './fakes.ts';
 
 const preview = (identity: string | undefined, path: string): Preview =>
@@ -126,22 +125,26 @@ test('retry backoff and release keep the gate; complete opens it', async (t) => 
   assert.equal(retry.taskId, 'task-1');
   assert.equal(retry.attempts, 2);
   assert.equal((await tasks.add(newTask())).status, 'in-flight');
-  assert.equal(await tasks.complete(retry), true);
+
+  // A task given back keeps the gate.
+  assert.equal(await tasks.release(retry), true);
+  assert.deepEqual(await tasks.add(newTask()), {
+    status: 'in-flight',
+    taskId: 'task-1',
+  });
+  assert.equal(tasks.rows.length, 1);
+  assert.equal(tasks.rows[0].status, 'pending');
+  assert.equal(tasks.rows[0].active, true);
+
+  const last = await tasks.claim('default', 1000);
+  assert.ok(last);
+  assert.equal(last.taskId, 'task-1');
+  assert.equal(await tasks.complete(last), true);
   assert.equal(tasks.rows[0].active, false);
   const next = await tasks.add(newTask());
   assert.equal(next.status, 'added');
   assert.equal(tasks.rows.length, 2);
   assert.equal(tasks.rows[1].active, true);
-
-  // `release` lives on the queues without the gate: it gives the task back and leaves the row
-  // active.
-  const releasing = new ReleasingTaskQueue();
-  await releasing.add(newTask());
-  const claimed = await releasing.claim('default', 1000);
-  assert.ok(claimed);
-  assert.equal(await releasing.release(claimed), true);
-  assert.equal(releasing.rows[0].status, 'pending');
-  assert.equal(releasing.rows[0].active, true);
 });
 
 test('a dead task holds the gate until its cooldown ends; then one add takes it over', async () => {
