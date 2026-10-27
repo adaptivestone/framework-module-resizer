@@ -233,6 +233,32 @@ describe('MongoLockStore', () => {
     );
     new MongoLockStore({ model: Loose }).verify();
   });
+
+  test('owner stays in the filters of a non-strict lock model with strictQuery on', async () => {
+    // verify() passes this schema (it is not strict), but strictQuery would drop the undeclared
+    // owner from a query's filter, so another owner's release or extend would match the lock.
+    const StrictQueryLock = connection.model(
+      'StrictQueryResizeLock',
+      new mongoose.Schema(
+        { _id: String, expiredAt: Date },
+        { strict: false, strictQuery: true },
+      ),
+    );
+    const store = new MongoLockStore({ model: StrictQueryLock });
+    store.verify();
+    assert.equal(await store.acquire('sq1', 'A', 60_000), true);
+    assert.equal(await store.release('sq1', 'B'), false);
+    assert.equal(
+      (await StrictQueryLock.collection.findOne({ _id: 'sq1' as never }))
+        ?.owner,
+      'A',
+      'the lock survives a release by another owner',
+    );
+    assert.equal(await store.extend('sq1', 'B', 120_000), false);
+    assert.equal(await store.acquire('sq1', 'B', 60_000), false);
+    assert.equal(await store.extend('sq1', 'A', 120_000), true);
+    assert.equal(await store.release('sq1', 'A'), true);
+  });
 });
 
 describe('mongoParts', () => {

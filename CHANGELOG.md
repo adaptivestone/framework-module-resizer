@@ -120,8 +120,9 @@
     `ResizeLock` rows carry the lock's `owner`. `MongoLockStore` (and `FrameworkLockStore`)
     acquires a lock in one `findOneAndUpdate` upsert, the framework `Lock` model's pattern: an
     expired lock, or one without an expiry, is taken over. A `MongoLockModel` needs
-    `findOneAndUpdate`, `updateOne` and `deleteOne` (no longer `create`), and
-    `MongoLockStore.verify()` fails with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock
+    `findOneAndUpdate`, `updateOne` and `deleteOne` (no longer `create`); each call passes
+    `strictQuery: false`, so `owner` stays in the filter of a non-strict schema that does not
+    declare it. `MongoLockStore.verify()` fails with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock
     schema has no `owner` field (a `ResizeLock` model registered before this version, which
     `createResizeModels` returns as it is).
   - `SqsTaskQueue` uses plain SQS calls (ReceiveMessage, ChangeMessageVisibility, DeleteMessage,

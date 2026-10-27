@@ -8,20 +8,27 @@ import { resolveModelOption } from './modelOption.ts';
 
 /**
  * The lock model methods the store calls (any Mongoose model has them). When the model also
- * exposes its `schema`, verify() checks it keeps the `owner` field.
+ * exposes its `schema`, verify() checks it keeps the `owner` field. Every call passes
+ * `strictQuery: false`, a Mongoose query option that other implementations may ignore: a
+ * schema that does not declare `owner` with `strictQuery: true` would otherwise drop `owner` from
+ * the filter, so a release or extend would match another owner's lock.
  */
 export interface MongoLockModel {
   modelName?: string;
   findOneAndUpdate(
     filter: object,
     update: object,
-    options: { upsert: true },
+    options: { upsert: true; strictQuery: false },
   ): PromiseLike<unknown>;
   updateOne(
     filter: object,
     update: object,
+    options?: { strictQuery: false },
   ): PromiseLike<{ matchedCount: number }>;
-  deleteOne(filter: object): PromiseLike<{ deletedCount?: number }>;
+  deleteOne(
+    filter: object,
+    options?: { strictQuery: false },
+  ): PromiseLike<{ deletedCount?: number }>;
 }
 
 export interface MongoLockStoreOptions {
@@ -37,6 +44,9 @@ interface SchemaLike {
 }
 
 const DUPLICATE_KEY = 11000;
+
+// The filters always keep `owner` and `expiredAt`, whatever the schema's strictQuery says.
+const KEEP_FILTER = { strictQuery: false } as const;
 
 export class MongoLockStore extends LockStore {
   readonly #model: () => MongoLockModel;
@@ -87,7 +97,7 @@ export class MongoLockStore extends LockStore {
           $or: [{ expiredAt: { $lte: now } }, { expiredAt: null }],
         },
         { $set: { owner, expiredAt: new Date(now.getTime() + ttlMs) } },
-        { upsert: true },
+        { upsert: true, ...KEEP_FILTER },
       );
     } catch (err) {
       if ((err as { code?: number }).code === DUPLICATE_KEY) {
@@ -104,13 +114,17 @@ export class MongoLockStore extends LockStore {
     const result = await this.lockModel().updateOne(
       { _id: key, owner, expiredAt: { $gt: now } },
       { $set: { expiredAt: new Date(now.getTime() + ttlMs) } },
+      KEEP_FILTER,
     );
     return result.matchedCount === 1;
   }
 
   // Compare-and-delete: deletes the owner's lock, expired or not, never another owner's.
   async release(key: string, owner: string): Promise<boolean> {
-    const result = await this.lockModel().deleteOne({ _id: key, owner });
+    const result = await this.lockModel().deleteOne(
+      { _id: key, owner },
+      KEEP_FILTER,
+    );
     return result.deletedCount === 1;
   }
 }

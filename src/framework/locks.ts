@@ -35,9 +35,10 @@ function frameworkLockModel(): MongoLockModel {
     );
   }
   const collection: LockCollection = Lock.collection;
+  // The store's strictQuery option is for Mongoose; the native collection filters nothing.
   return {
-    findOneAndUpdate: (filter, update, options) =>
-      collection.findOneAndUpdate(filter, update, options),
+    findOneAndUpdate: (filter, update, { upsert }) =>
+      collection.findOneAndUpdate(filter, update, { upsert }),
     updateOne: (filter, update) => collection.updateOne(filter, update),
     deleteOne: (filter) => collection.deleteOne(filter),
   };
