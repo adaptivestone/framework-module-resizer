@@ -100,14 +100,15 @@ export class Dispatcher {
 
   /**
    * Dedup `missing` by identity, acquire a per-variant dispatch lock, enqueue the
-   * lock-winners as one task, and release those locks only on failure (a throw OR a
-   * `taskId === null` soft failure). On success the locks are deliberately left to expire
+   * lock-winners as one task, and release those locks only on failure (a throw OR any add
+   * result but `added`, a soft failure). On success the locks are deliberately left to expire
    * — they collapse concurrent read fan-out into this single task.
    *
    * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead). Returns the
    * number of variants HANDED TO the task queue — the lock-winners on a successful enqueue.
-   * Every non-success path returns 0: no surviving lock, a throw, or a `taskId === null` soft
-   * failure (the released locks let a later read retry, so nothing durable was queued).
+   * Every non-success path returns 0: no surviving lock, a throw, or any add result but `added`
+   * (a soft failure: the variant stays unconfirmed, nothing throws, and the released locks let a
+   * later read retry).
    * resolve() ignores the count. Never throws.
    */
   async enqueue(req: DispatchRequest): Promise<number> {

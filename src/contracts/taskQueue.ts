@@ -86,7 +86,7 @@ export abstract class TaskQueue {
 
   /**
    * Optional: `add()` keeps at most one active task per Resizer, media and pipeline, and reports
-   * `in-flight` while one exists. Absent: every `add()` stores a task.
+   * `in-flight` while one exists. Absent: `add()` never reports `in-flight`.
    */
   declare readonly gatesByTask?: true;
 
@@ -152,9 +152,11 @@ export abstract class TaskQueue {
   release?(task: ClaimedTask): Promise<boolean>;
 
   /**
-   * Optional: the one active task (pending or processing) of this Resizer, media and pipeline, or
-   * `[]`; the Dispatcher reads it after an `in-flight` add. Omit when tasks can't be queried (e.g.
-   * SQS).
+   * Optional: the active tasks (pending or processing) of this Resizer, media and pipeline on any
+   * queue, each with the previews it covers; `[]` when there are none. A queue with `gatesByTask`
+   * returns at most one. The Dispatcher reads it for every variant still without a confirmed task
+   * (after a dispatch lock it could not take, an unconfirmed or in-flight add, or an add that
+   * threw). Omit when tasks can't be queried (e.g. SQS).
    */
   findActive?(query: {
     resizer: string;
