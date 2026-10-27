@@ -282,6 +282,20 @@ export interface QueueTimingOptions {
   taskTimeoutMs: number; // default 600000 — a task running longer is failed
 }
 
+// How a Resizer with a task queue coordinates its queued work, in ms
+// (`new Resizer({ coordination })`, or the framework config file's `coordination` section). Missing
+// values take the defaults (defaultCoordination); only the core validates them, when the Resizer
+// sets up its task queue. An eager-only Resizer never reads them.
+export interface CoordinationOptions {
+  // default 600000 — how long the gate lock of a queued task holds its media and pipeline until a
+  // worker extends it (on a task queue without its own gate, e.g. SQS); must be ≥ the task queue's
+  // leaseMs.
+  gateTtlMs?: number;
+  // default 600000 — after a task is dead-lettered, no new task for that media and pipeline is
+  // queued for this long.
+  cooldownMs?: number;
+}
+
 // The framework worker command's settings (the config file's `worker` section).
 export interface FrameworkWorkerConfig {
   enabled: boolean; // default false — permits `npm run cli ResizeWorker` to run
@@ -337,5 +351,6 @@ export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   storage?: FrameworkStorageConfig; // required unless the code passes `storage`
   queue?: FrameworkQueueConfig | false; // missing or false: eager only (no task queue)
+  coordination?: CoordinationOptions; // default: defaultCoordination; read only beside a queue
   worker?: FrameworkWorkerConfig; // default: defaultWorkerOptions
 }

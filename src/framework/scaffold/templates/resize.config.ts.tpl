@@ -18,6 +18,7 @@ export default {
   // the framework Lock model's) through your migration process; the module never creates them.
   // Or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs); false = eager only.
   queue: { driver: 'database' },
+  // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }, // the defaults; see README "Coordination"
   // Allow the worker command, then run `npm run cli ResizeWorker` as its own process.
   // worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
 } satisfies FrameworkResizeConfig;

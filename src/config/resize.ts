@@ -1,4 +1,5 @@
 import type {
+  CoordinationOptions,
   FrameworkResizeConfig,
   FrameworkWorkerConfig,
   QueueTimingOptions,
@@ -7,8 +8,8 @@ import type {
 
 // Canonical defaults, pure data. The default export is the core image config (what
 // `new Resizer({ config })` takes). Framework hosts spread `defaultFrameworkResizeConfig`, which adds
-// the `worker` section, and set `mediaModelName`, `storage` and `queue` themselves; the framework
-// applies resize.<NODE_ENV>.ts overrides.
+// the `coordination` and `worker` sections, and set `mediaModelName`, `storage` and `queue`
+// themselves; the framework applies resize.<NODE_ENV>.ts overrides.
 const defaultResizeConfig: ResizeConfig = {
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
@@ -46,6 +47,12 @@ export const defaultQueueOptions = {
   taskTimeoutMs: 600_000,
 } satisfies QueueTimingOptions;
 
+/** Coordination defaults (a Resizer's missing coordination values). */
+export const defaultCoordination = {
+  gateTtlMs: 600_000,
+  cooldownMs: 600_000,
+} satisfies Required<CoordinationOptions>;
+
 /** Framework worker command defaults. */
 export const defaultWorkerOptions: FrameworkWorkerConfig = {
   enabled: false,
@@ -55,15 +62,19 @@ export const defaultWorkerOptions: FrameworkWorkerConfig = {
 
 /**
  * What a framework host's config file spreads; it adds `mediaModelName`, `storage` and (for
- * background generation) `queue`. `worker` is typed as present, so
+ * background generation) `queue`. `coordination` and `worker` are typed as present, so
  * `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` stays a complete section
  * under strict TypeScript.
  */
 export const defaultFrameworkResizeConfig: Omit<
   FrameworkResizeConfig,
-  'mediaModelName' | 'worker'
-> & { worker: FrameworkWorkerConfig } = {
+  'mediaModelName' | 'worker' | 'coordination'
+> & {
+  worker: FrameworkWorkerConfig;
+  coordination: Required<CoordinationOptions>;
+} = {
   ...defaultResizeConfig,
+  coordination: defaultCoordination,
   worker: defaultWorkerOptions,
 };
 

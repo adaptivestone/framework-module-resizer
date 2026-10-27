@@ -5,13 +5,17 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
-import { getResizeConfig } from '../framework/config.ts';
+import {
+  getResizeConfig,
+  resolveFrameworkConfig,
+} from '../framework/config.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
 } from '../testHelpers/resizeConfig.ts';
 import defaultResizeConfig, {
+  defaultCoordination,
   defaultFrameworkResizeConfig,
   defaultQueueOptions,
   defaultWorkerOptions,
@@ -291,6 +295,31 @@ describe('config split: core validation vs framework loading', () => {
       (err: unknown) =>
         err instanceof ResizeConfigError &&
         err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
+    );
+  });
+
+  test('defaultFrameworkResizeConfig carries the coordination defaults', () => {
+    assert.deepEqual(
+      defaultFrameworkResizeConfig.coordination,
+      defaultCoordination,
+    );
+    assert.deepEqual(defaultCoordination, {
+      gateTtlMs: 600_000,
+      cooldownMs: 600_000,
+    });
+  });
+
+  test("a config file's coordination is passed on unvalidated, outside the image config", () => {
+    const resolved = resolveFrameworkConfig({
+      ...makeResizeConfig(),
+      coordination: { gateTtlMs: 0 },
+    });
+    assert.deepEqual(resolved.coordination, { gateTtlMs: 0 });
+    assert.equal('coordination' in resolved.image, false);
+    const { coordination: _omit, ...withoutSection } = makeResizeConfig();
+    assert.equal(
+      resolveFrameworkConfig(withoutSection).coordination,
+      undefined,
     );
   });
 

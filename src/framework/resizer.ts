@@ -6,6 +6,7 @@
 // - locks: FrameworkLockStore (the framework's own Lock model), unless `tasks: false`;
 // - storage: the file's `storage` section ('local' or 's3');
 // - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
+// - coordination: the file's `coordination` section, which the core validates;
 // - logger and events: the app's.
 // Options win over the config file. Nothing is read from the app until first use, and the AWS
 // drivers (optional peers) are imported only when the config selects them. The task queues this
@@ -19,6 +20,7 @@ import { LocalFsStorage } from '../drivers/fs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
 import { Resizer, type ResizerOptions } from '../resizer.ts';
 import type {
+  CoordinationOptions,
   FrameworkResizeConfig,
   ResizeEventBus,
   ResizeLogger,
@@ -45,7 +47,14 @@ import {
 export interface FrameworkResizerOptions
   extends Omit<
     ResizerOptions,
-    'config' | 'storage' | 'media' | 'locks' | 'tasks' | 'logger' | 'events'
+    | 'config'
+    | 'storage'
+    | 'media'
+    | 'locks'
+    | 'tasks'
+    | 'coordination'
+    | 'logger'
+    | 'events'
   > {
   configName?: string; // the config file this Resizer reads; default 'resize'
   config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
@@ -54,6 +63,7 @@ export interface FrameworkResizerOptions
   locks?: LockStore; // default: FrameworkLockStore (the framework's Lock model), none if no tasks
   // default: built from the config's `queue`; `false` = eager only, whatever the config says
   tasks?: TaskQueue | false;
+  coordination?: CoordinationOptions; // default: the config's `coordination`
   logger?: ResizeLogger; // default: the app logger
   events?: ResizeEventBus; // default: the app event bus
 }
@@ -76,6 +86,7 @@ export class FrameworkResizer extends Resizer {
       media,
       locks,
       tasks,
+      coordination,
       logger,
       events,
       ...rest
@@ -105,6 +116,11 @@ export class FrameworkResizer extends Resizer {
       ...(tasks === false
         ? {}
         : { tasks: tasks ?? (() => buildQueue(read(), file)) }),
+      // Read only beside a task queue, when the core sets it up; the core validates it (a file
+      // without the section gives {}: the defaults).
+      coordination:
+        coordination ??
+        (explicit ? explicit.coordination : () => read().coordination ?? {}),
     });
     // Registered once constructed (a rejected name or config registers nothing).
     if (tasks === undefined) {

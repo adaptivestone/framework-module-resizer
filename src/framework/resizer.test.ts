@@ -11,7 +11,11 @@ import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { S3Storage } from '../drivers/s3.ts';
 import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
-import { processorOf, resetResizerForTests } from '../resizer.ts';
+import {
+  processorOf,
+  resetResizerForTests,
+  taskCoordinationOf,
+} from '../resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
@@ -393,6 +397,35 @@ test('an explicit config also feeds the database queue timing', async () => {
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
   assert.equal(timingOf(r.tasks).leaseMs, 4000);
+});
+
+test("the config file's coordination reaches the Resizer, and the option wins", async () => {
+  const file = makeResizeConfig({
+    storage: localStorage,
+    queue: { driver: 'database' },
+    coordination: { cooldownMs: 1234 },
+  });
+  installApp({ resize: file });
+  const fromFile = new FrameworkResizer();
+  await fromFile.ready();
+  assert.equal(taskCoordinationOf(fromFile).cooldownMs, 1234);
+  const fromOption = new FrameworkResizer({
+    name: 'option',
+    coordination: { cooldownMs: 99 },
+  });
+  await fromOption.ready();
+  assert.equal(taskCoordinationOf(fromOption).cooldownMs, 99);
+  // An explicit config carries its own section.
+  const explicit = new FrameworkResizer({
+    name: 'explicit',
+    config: makeResizeConfig({
+      storage: localStorage,
+      queue: { driver: 'database' },
+      coordination: { cooldownMs: 77 },
+    }),
+  });
+  await explicit.ready();
+  assert.equal(taskCoordinationOf(explicit).cooldownMs, 77);
 });
 
 test('a core MongoTaskQueue needs one model, and the core validates its timing', () => {

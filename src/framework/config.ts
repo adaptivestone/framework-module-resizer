@@ -2,12 +2,13 @@
 // (`configName`, default 'resize'); the framework has already merged resize.<NODE_ENV>.ts over it.
 // The file holds the image settings (passed to the Resizer) plus what only this adapter reads:
 // `mediaModelName`, `storage`, `queue` (the task queue and its timing) and `worker` (the worker
-// command).
+// command). Its `coordination` section goes to the Resizer as it is: the core validates it.
 import { defaultWorkerOptions } from '../config/resize.ts';
 import { ResizeConfigError } from '../errors.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import { fillTiming } from '../timing.ts';
 import type {
+  CoordinationOptions,
   FrameworkQueueConfig,
   FrameworkResizeConfig,
   FrameworkStorageConfig,
@@ -24,6 +25,8 @@ export interface ResolvedFrameworkConfig {
   storage: FrameworkStorageConfig | undefined; // the file's `storage`, if any
   queue: FrameworkQueueConfig | false; // the file's `queue`; false when missing (eager only)
   timing: QueueTimingOptions; // the queue's timing, with the defaults filled in
+  // The file's `coordination`, unvalidated: the Resizer validates it against its task queue.
+  coordination: CoordinationOptions | undefined;
   worker: FrameworkWorkerConfig; // the file's `worker`, or the defaults
 }
 
@@ -70,7 +73,9 @@ export function resolveFrameworkConfig(
       { code: 'RESIZE_CONFIG_INVALID' },
     );
   }
-  const { mediaModelName, storage, queue, worker, ...image } = raw;
+  // `coordination` is taken out before the image config is validated, and passed on as it is.
+  const { mediaModelName, storage, queue, worker, coordination, ...image } =
+    raw;
   if (
     typeof mediaModelName !== 'string' ||
     mediaModelName.trim().length === 0
@@ -137,6 +142,7 @@ export function resolveFrameworkConfig(
     storage: storage as FrameworkStorageConfig | undefined,
     queue: isRecord(queue) ? (queue as unknown as FrameworkQueueConfig) : false,
     timing,
+    coordination: coordination as CoordinationOptions | undefined,
     worker: workerOptions as unknown as FrameworkWorkerConfig,
   };
   resolved.set(raw, { result, values: new Map(Object.entries(raw)) });
