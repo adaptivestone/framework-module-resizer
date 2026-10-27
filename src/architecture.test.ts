@@ -10,8 +10,8 @@ const CORE_FILES = [
   'dispatcher.ts',
   'formatPictureUrls.ts',
   'images.ts',
+  'processor.ts',
   'reader.ts',
-  'resizeTask.ts',
   'uploader.ts',
 ];
 const GLOBAL_LOOKUPS = new Set(['getApp', 'getResizeConfig', 'getResizer']);

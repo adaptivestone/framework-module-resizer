@@ -15,9 +15,9 @@ import type {
 import { ResizeSetupError } from './errors.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
+import { processTaskWith } from './processor.ts';
 import { consumeQueue, timingOf } from './queue.ts';
 import { getResizer, listResizers, type Resizer } from './resizer.ts';
-import { processTaskWith } from './resizeTask.ts';
 import type { ResizeLogger } from './types.d.ts';
 
 const OBSERVER: Record<TaskEvent, ObserverName> = {

@@ -24,11 +24,11 @@ import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
+import { generateImpl } from './processor.ts';
 import { timingOf } from './queue.ts';
 import { prewarmFailure, Reader } from './reader.ts';
 import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
-import { generateImpl } from './resizeTask.ts';
 import type {
   GenerateOpts,
   GenerateResult,
