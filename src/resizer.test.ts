@@ -535,6 +535,28 @@ describe('ports', () => {
     await assert.rejects(() => r.verify(), leaseInvalid);
   });
 
+  test('ready() checks the queue timing before the image config', async () => {
+    let configReads = 0;
+    const r = new Resizer({
+      logger: silent,
+      storage,
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks: new MemoryTaskQueue({ timing: { leaseMs: 0 } }),
+      config: () => {
+        configReads += 1;
+        return { ...makeImageConfig(), upload: null } as never;
+      },
+    });
+    await assert.rejects(
+      () => r.ready(),
+      (e: unknown) =>
+        e instanceof ResizeConfigError &&
+        e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    );
+    assert.equal(configReads, 0);
+  });
+
   test('an eager-only Resizer needs no locks, and has no db', async () => {
     const r = new Resizer({ storage, media: fakeMedia() });
     await r.ready();

@@ -248,12 +248,13 @@ export class Resizer {
   }
 
   /**
-   * Load the parts given as functions, each once, then build the services from the validated
-   * config and the task queue's validated timing. Every method of the Resizer (and the worker)
-   * awaits it first, so hosts only need it before reading `storage`, `media`, `locks` or `tasks`
-   * directly. A part whose function fails is retried by the next call, and so is a config or a
-   * timing that fails to load or validate; the parts that loaded are kept. Rejects with
-   * RESIZE_LOCKS_REQUIRED when a task queue has no lock store beside it.
+   * Load the parts given as functions, each once, then build the services. Every method of the
+   * Resizer (and the worker) awaits it first, so hosts only need it before reading `storage`,
+   * `media`, `locks` or `tasks` directly. The checks run in this order, and the first failure
+   * rejects: the parts load; a task queue without a lock store is RESIZE_LOCKS_REQUIRED; the task
+   * queue's timing is validated; the image config is read and validated; the services are built.
+   * A part whose function fails is retried by the next call, and so is a timing or config that
+   * fails to load or validate; the parts that loaded are kept.
    */
   async ready(): Promise<void> {
     if (this.#loadedParts.size < PART_NAMES.length) {
@@ -287,6 +288,7 @@ export class Resizer {
    */
   #ensureServices(): Services {
     if (!this.#builtServices) {
+      // The locks and the queue timing are checked before the config (the order ready() states).
       const dispatcher = this.#buildDispatcher();
       const { config } = this;
       this.#builtServices = {
@@ -416,7 +418,7 @@ export class Resizer {
     } catch (err) {
       logNeverThrow(
         this.logger,
-        'resize resolve: the Resizer is not ready — returning the safe empty decision',
+        'resize resolve: the Resizer could not start — returning the safe empty decision',
         err,
       );
       return { decision: { ready: [], missing: [] }, output: undefined };
@@ -437,7 +439,7 @@ export class Resizer {
     } catch (err) {
       logNeverThrow(
         this.logger,
-        'resize prewarm: the Resizer is not ready — nothing confirmed',
+        'resize prewarm: the Resizer could not start — nothing confirmed',
         err,
       );
       return prewarmFailure(err, []);

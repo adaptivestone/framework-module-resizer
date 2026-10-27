@@ -63,7 +63,34 @@ export interface DispatchRequest {
   queue: string;
 }
 
-/** Queues missing variants for one Resizer: it binds its deps to the two algorithms below. */
+export interface ConfirmedEnqueueResult {
+  accepted: MissingPreview[];
+  unconfirmed: MissingPreview[];
+  tasks: EnqueueReceipt[];
+  issues: EnqueueIssue[];
+}
+
+/** Prewarm without a task queue (an eager-only Resizer): nothing is queued, and no retry helps. */
+export function noQueueResult(
+  previews: MissingPreview[],
+): ConfirmedEnqueueResult {
+  const canonical = canonicalizeVariants(previews);
+  return {
+    accepted: [],
+    unconfirmed: canonical,
+    tasks: [],
+    issues: [
+      {
+        code: 'RESIZE_ENQUEUE_NO_QUEUE',
+        message: 'no task queue is configured',
+        retryable: false,
+        previews: canonical,
+      },
+    ],
+  };
+}
+
+/** Queues missing variants for one Resizer. */
 export class Dispatcher {
   readonly #deps: DispatcherDeps;
 
@@ -71,113 +98,326 @@ export class Dispatcher {
     this.#deps = deps;
   }
 
-  /** The read path's best-effort enqueue (see dispatch()). Never throws. */
-  enqueue(req: DispatchRequest): Promise<number> {
-    return dispatch(this.#deps, req);
-  }
+  /**
+   * Dedup `missing` by identity, acquire a per-variant dispatch lock, enqueue the
+   * lock-winners as one task, and release those locks only on failure (a throw OR a
+   * `taskId === null` soft failure). On success the locks are deliberately left to expire
+   * — they collapse concurrent read fan-out into this single task.
+   *
+   * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead). Returns the
+   * number of variants HANDED TO the task queue — the lock-winners on a successful enqueue.
+   * Every non-success path returns 0: no surviving lock, a throw, or a `taskId === null` soft
+   * failure (the released locks let a later read retry, so nothing durable was queued).
+   * resolve() ignores the count. Never throws.
+   */
+  async enqueue(req: DispatchRequest): Promise<number> {
+    const { tasks, locks, timing, name, logger } = this.#deps;
+    const { mediaId, pipeline, previews: missing, queue } = req;
 
-  /** Prewarm's enqueue: accepted only with a task receipt (see dispatchConfirmed()). */
-  enqueueConfirmed(req: DispatchRequest): Promise<ConfirmedEnqueueResult> {
-    return dispatchConfirmed(this.#deps, req);
-  }
-}
+    // 1. Canonicalize first so equivalent nested filter objects and list permutations
+    // reach the task queue in a stable form. The dispatch lock remains per preview
+    // identity (not per whole catalog) by design; a deduplicating task queue handles the
+    // complete request key.
+    const canonical = canonicalizeVariants(missing);
 
-/**
- * Dedup `missing` by identity, acquire a per-variant dispatch lock, enqueue the
- * lock-winners as one task, and release those locks only on failure (a throw OR a
- * `taskId === null` soft failure). On success the locks are deliberately left to expire
- * — they collapse concurrent read fan-out into this single task.
- *
- * The read path's best-effort enqueue (prewarm uses dispatchConfirmed instead). Returns the
- * number of variants HANDED TO the task queue — the lock-winners on a successful enqueue. Every
- * non-success path returns 0: no surviving lock, a throw, or a `taskId === null` soft failure
- * (the released locks let a later read retry, so nothing durable was queued).
- * resolve() ignores the count.
- */
-async function dispatch(
-  deps: DispatcherDeps,
-  req: DispatchRequest,
-): Promise<number> {
-  const { tasks, locks, timing, name, logger } = deps;
-  const { mediaId, pipeline, previews: missing, queue } = req;
-
-  // 1. Canonicalize first so equivalent nested filter objects and list permutations
-  // reach the task queue in a stable form. The dispatch lock remains per preview
-  // identity (not per whole catalog) by design; a deduplicating task queue handles the
-  // complete request key.
-  const canonical = canonicalizeVariants(missing);
-
-  // 2. Dedup by identity — the one lookup/lock key, built one way. The scope keeps another
-  // pipeline's (or Resizer's) dispatch lock from suppressing this request.
-  const scope: PreviewScope = { resizer: name, pipeline };
-  const byIdentity = new Map<string, MissingPreview>();
-  for (const m of canonical) {
-    const identity = getPreviewIdentity(scope, m.sizeKey, m.format, m.filters);
-    if (!byIdentity.has(identity)) {
-      byIdentity.set(identity, m);
-    }
-  }
-
-  // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
-  // in flight from a concurrent read). Every dispatch lock has the one owner DISPATCH_LOCK_OWNER.
-  const dispatchTtlMs = timing.lockTtlMs.dispatch;
-  const survivors: MissingPreview[] = [];
-  const survivorLockKeys: string[] = [];
-  const attempts = await acquireDispatchLocks(
-    locks,
-    mediaId,
-    byIdentity,
-    dispatchTtlMs,
-  );
-  for (const attempt of attempts) {
-    // A rejecting acquire = this variant is NOT a survivor (log + continue); the other survivors
-    // are unaffected and still reach the task queue. enqueue must never throw into the read.
-    if (attempt.failed) {
-      logger.error(
-        `resize enqueue: dispatch-lock acquire failed for ${attempt.lockKey} on media ${mediaId} — skipping this variant`,
-        attempt.error,
+    // 2. Dedup by identity — the one lookup/lock key, built one way. The scope keeps another
+    // pipeline's (or Resizer's) dispatch lock from suppressing this request.
+    const scope: PreviewScope = { resizer: name, pipeline };
+    const byIdentity = new Map<string, MissingPreview>();
+    for (const m of canonical) {
+      const identity = getPreviewIdentity(
+        scope,
+        m.sizeKey,
+        m.format,
+        m.filters,
       );
-    } else if (attempt.acquired) {
-      survivors.push(attempt.preview);
-      survivorLockKeys.push(attempt.lockKey);
+      if (!byIdentity.has(identity)) {
+        byIdentity.set(identity, m);
+      }
     }
-  }
 
-  // 4. None survive → nothing to dispatch.
-  if (survivors.length === 0) {
-    return 0;
-  }
-
-  // 5/6. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
-  // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
-  try {
-    const { taskId } = await tasks.add(
-      newTask(name, queue, mediaId, pipeline, survivors),
+    // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
+    // in flight from a concurrent read). Every dispatch lock has the one owner DISPATCH_LOCK_OWNER.
+    const dispatchTtlMs = timing.lockTtlMs.dispatch;
+    const survivors: MissingPreview[] = [];
+    const survivorLockKeys: string[] = [];
+    const attempts = await acquireDispatchLocks(
+      locks,
+      mediaId,
+      byIdentity,
+      dispatchTtlMs,
     );
-    if (taskId === null) {
+    for (const attempt of attempts) {
+      // A rejecting acquire = this variant is NOT a survivor (log + continue); the other survivors
+      // are unaffected and still reach the task queue. enqueue must never throw into the read.
+      if (attempt.failed) {
+        logger.error(
+          `resize enqueue: dispatch-lock acquire failed for ${attempt.lockKey} on media ${mediaId} — skipping this variant`,
+          attempt.error,
+        );
+      } else if (attempt.acquired) {
+        survivors.push(attempt.preview);
+        survivorLockKeys.push(attempt.lockKey);
+      }
+    }
+
+    // 4. None survive → nothing to dispatch.
+    if (survivors.length === 0) {
+      return 0;
+    }
+
+    // 5/6. Enqueue; on a throw OR a null taskId (soft failure) log + release the survivors'
+    // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
+    try {
+      const { taskId } = await tasks.add(
+        newTask(name, queue, mediaId, pipeline, survivors),
+      );
+      if (taskId === null) {
+        logger.error(
+          `resize enqueue: the task queue returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
+        );
+        await releaseAll(logger, locks, survivorLockKeys);
+        return 0;
+      }
+      // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
+      return survivors.length;
+    } catch (err) {
       logger.error(
-        `resize enqueue: the task queue returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
+        `resize enqueue: adding the task threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
+        err,
       );
       await releaseAll(logger, locks, survivorLockKeys);
       return 0;
     }
-    // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
-    return survivors.length;
-  } catch (err) {
-    logger.error(
-      `resize enqueue: adding the task threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
-      err,
-    );
-    await releaseAll(logger, locks, survivorLockKeys);
-    return 0;
   }
-}
 
-export interface ConfirmedEnqueueResult {
-  accepted: MissingPreview[];
-  unconfirmed: MissingPreview[];
-  tasks: EnqueueReceipt[];
-  issues: EnqueueIssue[];
+  /**
+   * Strict counterpart to enqueue(), for prewarm. A dispatch lock is only an optimization:
+   * losing it is never reported as accepted. Coverage is accepted only from a non-null enqueue
+   * receipt or from an optional TaskQueue.findActive() proof.
+   */
+  async enqueueConfirmed(
+    req: DispatchRequest,
+  ): Promise<ConfirmedEnqueueResult> {
+    const { tasks: taskQueue, locks, timing, name, logger } = this.#deps;
+    const { mediaId, pipeline, previews: missing, queue } = req;
+    const canonical = canonicalizeVariants(missing);
+
+    // Receipts from findActive belong to the same Resizer and pipeline (the task queue filters by
+    // both), so one scope covers every identity built here.
+    const scope: PreviewScope = { resizer: name, pipeline };
+    const requestedGroups = groupVariants(canonical, scope);
+    const byIdentity = requestedGroups.unique;
+    const conflicts = [...requestedGroups.conflicts.values()].flat();
+    const winners: MissingPreview[] = [];
+    const winnerKeys: string[] = [];
+    const unresolved = new Map(byIdentity);
+    const issues: EnqueueIssue[] = [];
+    if (conflicts.length > 0) {
+      issues.push({
+        code: 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
+        message:
+          'multiple variant payloads share one preview identity; none can be confirmed safely',
+        retryable: false,
+        previews: conflicts,
+      });
+    }
+    const lockContended: MissingPreview[] = [];
+    const lockFailed: MissingPreview[] = [];
+    const dispatchTtlMs = timing.lockTtlMs.dispatch;
+
+    const attempts = await acquireDispatchLocks(
+      locks,
+      mediaId,
+      byIdentity,
+      dispatchTtlMs,
+    );
+    for (const attempt of attempts) {
+      if (attempt.failed) {
+        logger.error(
+          `resize prewarm: dispatch-lock acquire failed for ${attempt.lockKey}`,
+          attempt.error,
+        );
+        lockFailed.push(attempt.preview);
+      } else if (attempt.acquired) {
+        winners.push(attempt.preview);
+        winnerKeys.push(attempt.lockKey);
+      } else {
+        lockContended.push(attempt.preview);
+      }
+    }
+
+    const accepted = new Map<string, MissingPreview>();
+    const tasks: EnqueueReceipt[] = [];
+    const activeReceiptConflicts = new Map<string, MissingPreview>();
+    if (winners.length > 0) {
+      try {
+        const { taskId } = await taskQueue.add(
+          newTask(name, queue, mediaId, pipeline, winners),
+        );
+        if (typeof taskId !== 'string' || taskId.length === 0) {
+          issues.push({
+            code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+            message: 'the task queue returned a null taskId',
+            retryable: true,
+            previews: winners,
+          });
+          await releaseAll(logger, locks, winnerKeys);
+        } else {
+          const receipt = { taskId, previews: winners };
+          tasks.push(receipt);
+          for (const preview of winners) {
+            const identity = getPreviewIdentity(
+              scope,
+              preview.sizeKey,
+              preview.format,
+              preview.filters,
+            );
+            accepted.set(identity, preview);
+            unresolved.delete(identity);
+          }
+        }
+      } catch (error) {
+        logger.error(
+          `resize prewarm: adding the task threw for media ${mediaId}`,
+          error,
+        );
+        issues.push({
+          code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+          message: 'adding the task failed; outcome is unconfirmed',
+          retryable: true,
+          previews: winners,
+        });
+        await releaseAll(logger, locks, winnerKeys);
+      }
+    }
+
+    if (unresolved.size > 0 && taskQueue.findActive) {
+      try {
+        const confirmations = (
+          await taskQueue.findActive({ resizer: name, mediaId, pipeline })
+        ).map((receipt) => ({
+          taskId: receipt.taskId,
+          previews: canonicalizeVariants(receipt.previews ?? []),
+        }));
+        const unresolvedByPayload = new Map(
+          [...unresolved.entries()].map(([identity, preview]) => [
+            variantPayloadKey(preview),
+            { identity, preview },
+          ]),
+        );
+        for (const receipt of confirmations) {
+          if (
+            typeof receipt.taskId !== 'string' ||
+            receipt.taskId.trim().length === 0
+          ) {
+            continue;
+          }
+          // Inspect the complete receipt before matching any requested payload. Filtering to
+          // the requested payload first would hide a second payload that makes the identity
+          // ambiguous in the active task.
+          const receiptGroups = groupVariants(receipt.previews, scope);
+          for (const identity of receiptGroups.conflicts.keys()) {
+            const requested = unresolved.get(identity);
+            if (requested && !activeReceiptConflicts.has(identity)) {
+              activeReceiptConflicts.set(identity, requested);
+            }
+          }
+          const covered: MissingPreview[] = [];
+          for (const preview of receiptGroups.unique.values()) {
+            const requested = unresolvedByPayload.get(
+              variantPayloadKey(preview),
+            );
+            if (requested) {
+              accepted.set(requested.identity, requested.preview);
+              unresolved.delete(requested.identity);
+              unresolvedByPayload.delete(variantPayloadKey(preview));
+              covered.push(requested.preview);
+            }
+          }
+          if (covered.length > 0) {
+            tasks.push({ taskId: receipt.taskId, previews: covered });
+          }
+        }
+      } catch (error) {
+        logger.error(
+          `resize prewarm: active-task confirmation failed for media ${mediaId}`,
+          error,
+        );
+        issues.push({
+          code: 'RESIZE_ENQUEUE_CONFIRM_FAILED',
+          message: 'the task queue could not confirm active task coverage',
+          retryable: true,
+          previews: [...unresolved.values()],
+        });
+      }
+    }
+
+    const unconfirmed = [...unresolved.values(), ...conflicts];
+    const receiptConflictPreviews = [...activeReceiptConflicts.entries()]
+      .filter(([identity]) => unresolved.has(identity))
+      .map(([, preview]) => preview);
+    if (receiptConflictPreviews.length > 0) {
+      issues.push({
+        code: 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
+        message:
+          'multiple active-task payloads share one preview identity; none can be confirmed safely',
+        retryable: false,
+        previews: receiptConflictPreviews,
+      });
+    }
+    if (lockContended.length > 0) {
+      issues.push({
+        code: 'RESIZE_ENQUEUE_LOCK_CONTENDED',
+        message:
+          'dispatch lock is held but no active task coverage was confirmed',
+        retryable: true,
+        previews: lockContended,
+      });
+    }
+    if (lockFailed.length > 0) {
+      issues.push({
+        code: 'RESIZE_ENQUEUE_LOCK_FAILED',
+        message: 'dispatch lock could not be acquired or confirmed',
+        retryable: true,
+        previews: lockFailed,
+      });
+    }
+
+    // An issue explains only what stayed unconfirmed: a preview that findActive later confirmed
+    // drops out of it, and an issue left with none is removed, so an accepted request carries
+    // no retryable issue.
+    const unresolvedIdentities = new Set(
+      unconfirmed.map((preview) =>
+        getPreviewIdentity(
+          scope,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
+      ),
+    );
+    const remainingIssues = issues.flatMap((issue) => {
+      const previews = issue.previews.filter((preview) =>
+        unresolvedIdentities.has(
+          getPreviewIdentity(
+            scope,
+            preview.sizeKey,
+            preview.format,
+            preview.filters,
+          ),
+        ),
+      );
+      return previews.length > 0 ? [{ ...issue, previews }] : [];
+    });
+
+    return {
+      accepted: [...accepted.values()],
+      unconfirmed,
+      tasks,
+      issues: remainingIssues,
+    };
+  }
 }
 
 function variantPayloadKey(variant: MissingPreview): string {
@@ -223,253 +463,6 @@ function groupVariants(
     }
   }
   return { unique, conflicts };
-}
-
-/** Prewarm without a task queue (an eager-only Resizer): nothing is queued, and no retry helps. */
-export function noQueueResult(
-  previews: MissingPreview[],
-): ConfirmedEnqueueResult {
-  const canonical = canonicalizeVariants(previews);
-  return {
-    accepted: [],
-    unconfirmed: canonical,
-    tasks: [],
-    issues: [
-      {
-        code: 'RESIZE_ENQUEUE_NO_QUEUE',
-        message: 'no task queue is configured',
-        retryable: false,
-        previews: canonical,
-      },
-    ],
-  };
-}
-
-/**
- * Strict counterpart to dispatch(). A dispatch lock is only an optimization: losing it is
- * never reported as accepted. Coverage is accepted only from a non-null enqueue receipt or
- * from an optional TaskQueue.findActive() proof.
- */
-async function dispatchConfirmed(
-  deps: DispatcherDeps,
-  req: DispatchRequest,
-): Promise<ConfirmedEnqueueResult> {
-  const { tasks: taskQueue, locks, timing, name, logger } = deps;
-  const { mediaId, pipeline, previews: missing, queue } = req;
-  const canonical = canonicalizeVariants(missing);
-
-  // Receipts from findActive belong to the same Resizer and pipeline (the task queue filters by
-  // both), so one scope covers every identity built here.
-  const scope: PreviewScope = { resizer: name, pipeline };
-  const requestedGroups = groupVariants(canonical, scope);
-  const byIdentity = requestedGroups.unique;
-  const conflicts = [...requestedGroups.conflicts.values()].flat();
-  const winners: MissingPreview[] = [];
-  const winnerKeys: string[] = [];
-  const unresolved = new Map(byIdentity);
-  const issues: EnqueueIssue[] = [];
-  if (conflicts.length > 0) {
-    issues.push({
-      code: 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
-      message:
-        'multiple variant payloads share one preview identity; none can be confirmed safely',
-      retryable: false,
-      previews: conflicts,
-    });
-  }
-  const lockContended: MissingPreview[] = [];
-  const lockFailed: MissingPreview[] = [];
-  const dispatchTtlMs = timing.lockTtlMs.dispatch;
-
-  const attempts = await acquireDispatchLocks(
-    locks,
-    mediaId,
-    byIdentity,
-    dispatchTtlMs,
-  );
-  for (const attempt of attempts) {
-    if (attempt.failed) {
-      logger.error(
-        `resize prewarm: dispatch-lock acquire failed for ${attempt.lockKey}`,
-        attempt.error,
-      );
-      lockFailed.push(attempt.preview);
-    } else if (attempt.acquired) {
-      winners.push(attempt.preview);
-      winnerKeys.push(attempt.lockKey);
-    } else {
-      lockContended.push(attempt.preview);
-    }
-  }
-
-  const accepted = new Map<string, MissingPreview>();
-  const tasks: EnqueueReceipt[] = [];
-  const activeReceiptConflicts = new Map<string, MissingPreview>();
-  if (winners.length > 0) {
-    try {
-      const { taskId } = await taskQueue.add(
-        newTask(name, queue, mediaId, pipeline, winners),
-      );
-      if (typeof taskId !== 'string' || taskId.length === 0) {
-        issues.push({
-          code: 'RESIZE_ENQUEUE_UNCONFIRMED',
-          message: 'the task queue returned a null taskId',
-          retryable: true,
-          previews: winners,
-        });
-        await releaseAll(logger, locks, winnerKeys);
-      } else {
-        const receipt = { taskId, previews: winners };
-        tasks.push(receipt);
-        for (const preview of winners) {
-          const identity = getPreviewIdentity(
-            scope,
-            preview.sizeKey,
-            preview.format,
-            preview.filters,
-          );
-          accepted.set(identity, preview);
-          unresolved.delete(identity);
-        }
-      }
-    } catch (error) {
-      logger.error(
-        `resize prewarm: adding the task threw for media ${mediaId}`,
-        error,
-      );
-      issues.push({
-        code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
-        message: 'adding the task failed; outcome is unconfirmed',
-        retryable: true,
-        previews: winners,
-      });
-      await releaseAll(logger, locks, winnerKeys);
-    }
-  }
-
-  if (unresolved.size > 0 && taskQueue.findActive) {
-    try {
-      const confirmations = (
-        await taskQueue.findActive({ resizer: name, mediaId, pipeline })
-      ).map((receipt) => ({
-        taskId: receipt.taskId,
-        previews: canonicalizeVariants(receipt.previews ?? []),
-      }));
-      const unresolvedByPayload = new Map(
-        [...unresolved.entries()].map(([identity, preview]) => [
-          variantPayloadKey(preview),
-          { identity, preview },
-        ]),
-      );
-      for (const receipt of confirmations) {
-        if (
-          typeof receipt.taskId !== 'string' ||
-          receipt.taskId.trim().length === 0
-        ) {
-          continue;
-        }
-        // Inspect the complete receipt before matching any requested payload. Filtering to
-        // the requested payload first would hide a second payload that makes the identity
-        // ambiguous in the active task.
-        const receiptGroups = groupVariants(receipt.previews, scope);
-        for (const identity of receiptGroups.conflicts.keys()) {
-          const requested = unresolved.get(identity);
-          if (requested && !activeReceiptConflicts.has(identity)) {
-            activeReceiptConflicts.set(identity, requested);
-          }
-        }
-        const covered: MissingPreview[] = [];
-        for (const preview of receiptGroups.unique.values()) {
-          const requested = unresolvedByPayload.get(variantPayloadKey(preview));
-          if (requested) {
-            accepted.set(requested.identity, requested.preview);
-            unresolved.delete(requested.identity);
-            unresolvedByPayload.delete(variantPayloadKey(preview));
-            covered.push(requested.preview);
-          }
-        }
-        if (covered.length > 0) {
-          tasks.push({ taskId: receipt.taskId, previews: covered });
-        }
-      }
-    } catch (error) {
-      logger.error(
-        `resize prewarm: active-task confirmation failed for media ${mediaId}`,
-        error,
-      );
-      issues.push({
-        code: 'RESIZE_ENQUEUE_CONFIRM_FAILED',
-        message: 'the task queue could not confirm active task coverage',
-        retryable: true,
-        previews: [...unresolved.values()],
-      });
-    }
-  }
-
-  const unconfirmed = [...unresolved.values(), ...conflicts];
-  const receiptConflictPreviews = [...activeReceiptConflicts.entries()]
-    .filter(([identity]) => unresolved.has(identity))
-    .map(([, preview]) => preview);
-  if (receiptConflictPreviews.length > 0) {
-    issues.push({
-      code: 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
-      message:
-        'multiple active-task payloads share one preview identity; none can be confirmed safely',
-      retryable: false,
-      previews: receiptConflictPreviews,
-    });
-  }
-  if (lockContended.length > 0) {
-    issues.push({
-      code: 'RESIZE_ENQUEUE_LOCK_CONTENDED',
-      message:
-        'dispatch lock is held but no active task coverage was confirmed',
-      retryable: true,
-      previews: lockContended,
-    });
-  }
-  if (lockFailed.length > 0) {
-    issues.push({
-      code: 'RESIZE_ENQUEUE_LOCK_FAILED',
-      message: 'dispatch lock could not be acquired or confirmed',
-      retryable: true,
-      previews: lockFailed,
-    });
-  }
-
-  // An issue explains only what stayed unconfirmed: a preview that findActive later confirmed
-  // drops out of it, and an issue left with none is removed, so an accepted request carries
-  // no retryable issue.
-  const unresolvedIdentities = new Set(
-    unconfirmed.map((preview) =>
-      getPreviewIdentity(
-        scope,
-        preview.sizeKey,
-        preview.format,
-        preview.filters,
-      ),
-    ),
-  );
-  const remainingIssues = issues.flatMap((issue) => {
-    const previews = issue.previews.filter((preview) =>
-      unresolvedIdentities.has(
-        getPreviewIdentity(
-          scope,
-          preview.sizeKey,
-          preview.format,
-          preview.filters,
-        ),
-      ),
-    );
-    return previews.length > 0 ? [{ ...issue, previews }] : [];
-  });
-
-  return {
-    accepted: [...accepted.values()],
-    unconfirmed,
-    tasks,
-    issues: remainingIssues,
-  };
 }
 
 interface LockAttempt {
