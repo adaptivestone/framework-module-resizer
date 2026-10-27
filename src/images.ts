@@ -333,7 +333,7 @@ export function isCatalogCovered(
 }
 
 /** A row that can be served: it has a storage ref and a raster content type (never SVG). */
-export function isUsablePreview(preview: Preview): boolean {
+function isUsablePreview(preview: Preview): boolean {
   return Boolean(
     preview.storageRef != null &&
       preview.contentType &&

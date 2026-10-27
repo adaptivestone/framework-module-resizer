@@ -1,46 +1,32 @@
-// Guard: the package's main entry runs without @adaptivestone/framework. Walk every runtime
-// (value) import reachable from src/index.ts and fail if it reaches the framework, the framework
-// adapter, the ResizeTask model or the CLI command. Drivers import only contracts, errors, helpers,
-// types and other drivers, never core code.
+// Guards on the import graph:
+// - the package's main entry runs without @adaptivestone/framework: walk every runtime import
+//   reachable from src/index.ts and fail if it reaches the framework, the framework adapter, the
+//   ResizeTask model or the CLI command;
+// - drivers import only contracts, errors, helpers, types and other drivers, never core code;
+// - resizer.ts is the composition root: only the entry points (index.ts, worker.ts) and the
+//   framework adapter import it, and nothing it reaches imports it back, not even as a type.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { localImports, sourceFiles } from './testHelpers/imports.ts';
+import {
+  importSpecifiers,
+  localImports,
+  sourceFiles,
+} from './testHelpers/imports.ts';
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 
-/** Runtime import specifiers of a module (type-only imports and specifiers are skipped). */
-function valueImports(source: string): string[] {
-  const specifiers: string[] = [];
-  const re =
-    /(?:^|\n)\s*(import|export)\s+(type\s+)?([^;'"]*?)\s+from\s+'([^']+)'/g;
-  for (const match of source.matchAll(re)) {
-    if (match[2]) {
-      continue; // `import type …` / `export type …`
-    }
-    const clause = match[3].trim();
-    const braced = clause.match(/^\{([\s\S]*)\}$/);
-    if (braced) {
-      const names = braced[1]
-        .split(',')
-        .map((part) => part.trim())
-        .filter(Boolean);
-      if (names.length > 0 && names.every((n) => n.startsWith('type '))) {
-        continue; // every specifier is `type X`
-      }
-    }
-    specifiers.push(match[4]);
-  }
-  // Side-effect imports: `import './x.ts';`
-  for (const match of source.matchAll(/(?:^|\n)\s*import\s+'([^']+)'/g)) {
-    specifiers.push(match[1]);
-  }
-  return specifiers;
-}
-
-function walk(entry: string): {
+/**
+ * Every src/ file and package that `entry` reaches, each with the chain of files that first
+ * reached it. By default only runtime imports are followed (whole `import type` / `export type`
+ * statements are skipped); `types: true` follows those too.
+ */
+function walk(
+  entry: string,
+  opts: { types: boolean } = { types: false },
+): {
   files: Map<string, string[]>;
   bare: Map<string, string[]>;
 } {
@@ -55,14 +41,12 @@ function walk(entry: string): {
       continue;
     }
     files.set(file, chain);
+    for (const next of localImports(file, opts)) {
+      queue.push({ file: next, chain: [...chain, next] });
+    }
     const source = readFileSync(resolve(SRC, file), 'utf8');
-    for (const spec of valueImports(source)) {
-      if (spec.startsWith('.')) {
-        const next = resolve(dirname(resolve(SRC, file)), spec)
-          .slice(SRC.length + 1)
-          .replaceAll('\\', '/');
-        queue.push({ file: next, chain: [...chain, next] });
-      } else if (!bare.has(spec)) {
+    for (const spec of importSpecifiers(source, opts)) {
+      if (!spec.startsWith('.') && !bare.has(spec)) {
         bare.set(spec, [...chain, spec]);
       }
     }
@@ -149,5 +133,41 @@ test('the framework adapter is reachable from its own entry', () => {
       spec.startsWith('@adaptivestone/framework/'),
     ),
     'sanity check: the walker does see framework imports',
+  );
+});
+
+test('only index.ts, worker.ts and the framework adapter import resizer.ts', () => {
+  const allowed = (f: string) =>
+    ['index.ts', 'worker.ts'].includes(f) || f.startsWith('framework/');
+  assert.deepEqual(
+    sourceFiles().filter(
+      (f) =>
+        !allowed(f) && localImports(f, { types: true }).includes('resizer.ts'),
+    ),
+    [],
+  );
+});
+
+test('nothing resizer.ts reaches imports it back, not even as a type', () => {
+  const back = [...walk('resizer.ts', { types: true }).files.keys()].filter(
+    (f) =>
+      f !== 'resizer.ts' &&
+      localImports(f, { types: true }).includes('resizer.ts'),
+  );
+  assert.deepEqual(back, []);
+});
+
+test('the Dispatcher and its test need no Resizer, framework, storage or media port', () => {
+  assert.deepEqual(
+    [...walk('dispatcher.test.ts', { types: true }).files.keys()].filter(
+      (f) => f === 'resizer.ts' || f.startsWith('framework/'),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    localImports('dispatcher.ts', { types: true }).filter(
+      (t) => t === 'contracts/storage.ts' || t === 'contracts/media.ts',
+    ),
+    [],
   );
 });

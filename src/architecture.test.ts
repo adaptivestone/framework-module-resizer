@@ -1,20 +1,25 @@
-// Core modules receive their Resizer as an argument. Only entry points (the Resizer's
-// constructor defaults, worker.ts) and framework drivers may import process-wide lookups.
+// Core files read nothing process-wide (getApp, getResizeConfig, getResizer, listResizers): each
+// gets what it needs from its caller. Only the entry points (index.ts, worker.ts) and the
+// framework adapter import resizer.ts (pinned in importGraph.test.ts). Core is every top-level
+// src/ file except worker.ts (an entry point that looks Resizers up by name), registry.ts (the
+// process-wide registry itself), index.ts (the main entry) and types.d.ts (types only).
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { sourceFiles } from './testHelpers/imports.ts';
 
-const CORE_FILES = [
-  'dispatcher.ts',
-  'formatPictureUrls.ts',
-  'images.ts',
-  'processor.ts',
-  'reader.ts',
-  'uploader.ts',
-];
-const GLOBAL_LOOKUPS = new Set(['getApp', 'getResizeConfig', 'getResizer']);
+const CORE_FILES = sourceFiles().filter(
+  (f) =>
+    !f.includes('/') &&
+    !['worker.ts', 'registry.ts', 'index.ts', 'types.d.ts'].includes(f),
+);
+const GLOBAL_LOOKUPS = new Set([
+  'getApp',
+  'getResizeConfig',
+  'getResizer',
+  'listResizers',
+]);
 
 /** Names imported as runtime values (`import type` and `type X` specifiers are erased). */
 function valueImports(source: string): string[] {
@@ -35,6 +40,13 @@ function valueImports(source: string): string[] {
   return names;
 }
 
+test('the core list sees the services', () => {
+  assert.ok(
+    CORE_FILES.includes('processor.ts') && CORE_FILES.includes('resizer.ts'),
+    'sanity check: the listing does see the top-level files',
+  );
+});
+
 for (const file of CORE_FILES) {
   test(`${file} imports no process-wide lookup`, async () => {
     const source = await readFile(
@@ -47,12 +59,14 @@ for (const file of CORE_FILES) {
     assert.deepEqual(
       found,
       [],
-      `${file} must read its context from the Resizer argument`,
+      `${file} must take what it needs from its caller; only entry points look up process-wide state`,
     );
   });
 }
 
-// Which stored rows count is one rule: callers use storedPreviews / storedIdentities.
+// Which stored rows count is one rule, kept in images.ts: callers use storedPreviews /
+// storedIdentities. isUsablePreview is not exported; this text check is a second net should the
+// export come back.
 test('only images.ts decides which stored rows count', () => {
   const users = sourceFiles().filter(
     (f) =>

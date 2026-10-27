@@ -1,5 +1,5 @@
 // Direct unit coverage for the four INTERNAL generic helpers. Behavior these express is also
-// exercised through images/reader/processor/mongo tests; here we pin the utilities themselves
+// exercised through images/uploader/processor/consumer/mongo tests; we pin the utilities themselves
 // (guards edge cases, hex shape, abortable sleep, bounded pool + abort) at their new location.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
