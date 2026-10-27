@@ -201,6 +201,14 @@ describe('ResizeError.retryable', () => {
     assert.equal(new ResizeNoOriginalError('m1').retryable, false);
   });
 
+  test('a security refusal is never retryable by default', () => {
+    assert.equal(new ResizeSecurityError('m').retryable, false);
+    assert.equal(
+      new ResizeSecurityError('m', { retryable: true }).retryable,
+      true,
+    );
+  });
+
   test('survives JSON serialization (structured logs)', () => {
     assert.equal(
       JSON.parse(

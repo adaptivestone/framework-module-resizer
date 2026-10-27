@@ -3,7 +3,7 @@
 // EVERY error this module throws extends `ResizeError`, so ONE check separates "the resize
 // module rejected this" from "sharp blew up" / "S3 timed out" / "mongo went away". The subclass
 // then answers the only question a catch block actually has — what do I DO about it:
-//   ResizeSetupError    — the wiring is wrong; no retry helps, fix the bootstrap code
+//   ResizeSetupError    — the wiring is wrong; fix the bootstrap code
 //   ResizeConfigError   — host config is invalid; crash at boot
 //   ResizeMediaError    — this record is unusable; skip it, do not retry
 //   ResizeGenerateError — the operation produced nothing
@@ -11,9 +11,10 @@
 //   ResizeStorageError  — transient I/O; a retry may help
 //   ResizeSecurityError — a refusal (traversal, cross-bucket); never retry, log loudly
 //
-// `retryable` is a separate, per-throw answer for the task queue: `false` means another delivery
-// of the same task cannot succeed, so the consumer dead-letters it at once. It is a plain field,
-// not the class, because errors reach the consumer as plain objects across process boundaries.
+// The subclass guides a host's catch block; the task queue retries every error unless it carries
+// `retryable: false`. That per-throw field means another delivery of the same task cannot
+// succeed, so the consumer dead-letters it at once. It is a plain field, not the class, because
+// errors reach the consumer as plain objects across process boundaries.
 
 /**
  * Brand for cross-copy identification. `instanceof` silently returns FALSE when two copies of
@@ -59,7 +60,10 @@ export class ResizeError extends Error {
   }
 }
 
-/** Bootstrap/wiring is wrong — a programmer error. Retrying will never help. */
+/**
+ * Bootstrap/wiring is wrong — a programmer error; fix the code. A queued task still retries: a
+ * worker deployed with the fix (e.g. a newly registered pipeline) can run it.
+ */
 export class ResizeSetupError extends ResizeError {
   constructor(message: string, opts?: ResizeErrorOptions) {
     super(message, { ...opts, code: opts?.code ?? 'RESIZE_SETUP' });
@@ -80,10 +84,17 @@ export class ResizeStorageError extends ResizeError {
   }
 }
 
-/** A deliberate refusal (path traversal, cross-bucket access). NEVER retry; log loudly. */
+/**
+ * A deliberate refusal (path traversal, cross-bucket access). NEVER retry (`retryable` defaults
+ * to `false`); log loudly.
+ */
 export class ResizeSecurityError extends ResizeError {
   constructor(message: string, opts?: ResizeErrorOptions) {
-    super(message, { ...opts, code: opts?.code ?? 'RESIZE_SECURITY' });
+    super(message, {
+      ...opts,
+      code: opts?.code ?? 'RESIZE_SECURITY',
+      retryable: opts?.retryable ?? false,
+    });
   }
 }
 

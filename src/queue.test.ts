@@ -247,12 +247,12 @@ describe('consumeQueue', () => {
   test('a plain object with retryable: false is dead on the first failure', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
-    await runUntil(
+    const events = await runUntil(
       tasks,
       async () => {
         // What an error looks like after crossing a process boundary: no class, only fields.
         throw {
-          code: 'RESIZE_SOURCE_TOO_LARGE',
+          code: 'RESIZE_ANY',
           retryable: false,
           message: 'crossed a process boundary',
         };
@@ -261,6 +261,10 @@ describe('consumeQueue', () => {
     );
     assert.equal(tasks.rows[0].status, 'dead');
     assert.equal(tasks.rows[0].attempts, 1);
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
   });
 
   test('a formerly terminal code without retryable: false is retried', async () => {
