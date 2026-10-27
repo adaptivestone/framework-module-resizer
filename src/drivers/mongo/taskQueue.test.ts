@@ -873,7 +873,7 @@ describe('MongoTaskQueue.findActive', () => {
     );
   });
 
-  test('prewarm confirms an existing Mongo task after losing its dispatch lock', async () => {
+  test('prewarm confirms the active Mongo task through findActive', async () => {
     const payload = request({
       previews: [
         {
@@ -885,16 +885,12 @@ describe('MongoTaskQueue.findActive', () => {
       ],
     });
     const existing = await addedTaskId(payload);
+    // A queue that gates by task needs no lock store: the active task is the gate.
     const resizer = new Resizer({
       storage: fakeStorage,
       config: makeImageConfig(),
       tasks,
       media: fakeMedia(),
-      locks: {
-        acquire: async () => false,
-        extend: async () => false,
-        release: async () => false,
-      },
       logger,
     });
     const result = await resizer.prewarm({
@@ -907,6 +903,7 @@ describe('MongoTaskQueue.findActive', () => {
     });
     assert.equal(result.status, 'accepted');
     assert.equal(result.tasks[0].taskId, existing);
+    assert.equal(await M.countDocuments({ fileId: payload.mediaId }), 1);
   });
 });
 

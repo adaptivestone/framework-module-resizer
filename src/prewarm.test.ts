@@ -8,11 +8,7 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
-import {
-  fakeMedia,
-  MemoryTaskQueue,
-  memoryLocks,
-} from './testHelpers/fakes.ts';
+import { fakeMedia, memoryLocks, PlainTaskQueue } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
@@ -22,7 +18,8 @@ import type {
 } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
-// Harness — a core Resizer with a memory task queue and database-owned locks.
+// Harness — a core Resizer with a memory task queue without gatesByTask (the SQS shape), so each
+// prewarm takes the gate lock of its media and pipeline in the lock store.
 // ---------------------------------------------------------------------------
 
 function installFakeApp() {
@@ -56,7 +53,7 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
 }
 
 function makeTaskQueue(behavior?: (task: NewTask) => TaskAddResult) {
-  const memory = new MemoryTaskQueue();
+  const memory = new PlainTaskQueue();
   const calls: NewTask[] = [];
   const tasks: TaskQueue = {
     add: async (task) => {
@@ -67,7 +64,6 @@ function makeTaskQueue(behavior?: (task: NewTask) => TaskAddResult) {
     renew: (task, leaseMs) => memory.renew(task, leaseMs),
     complete: (task) => memory.complete(task),
     fail: (task, next, error) => memory.fail(task, next, error),
-    findActive: (query) => memory.findActive(query),
     getTiming: () => memory.getTiming(),
   };
   return { tasks, calls };
@@ -123,7 +119,7 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// §11.1b prewarm — expand sizes×formats → add task-queue work via dispatch locks, never throw
+// §11.1b prewarm — expand sizes×formats → add task-queue work behind the gate, never throw
 // ---------------------------------------------------------------------------
 
 describe('prewarm — happy path', () => {
@@ -199,14 +195,16 @@ describe('prewarm — queue', () => {
       name: 'listings',
       queue: 'interactive',
     });
-    const media = { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } };
+    const original = { storageRef: { key: 'orig.jpg' } };
     await r.prewarm({
-      media,
+      media: { id: 'm1', original },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
+    // Another media: the gate is per Resizer, media and pipeline, whatever the queue, so the task
+    // of m1 would hold it.
     await r.prewarm({
-      media,
+      media: { id: 'm2', original },
       sizes: [{ width: 100, height: 100 }],
       formats: ['jpeg'],
       queue: 'bulk',
@@ -336,7 +334,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
     });
     assert.equal(accepted.length, 2);
     assert.equal(calls.length, 1);
-    assert.equal(acquired.length, 2);
+    assert.equal(acquired.length, 1); // one gate lock for the media and pipeline
   });
 
   test('SVG detected via original.format === "svg" is added to the task queue too', async () => {
@@ -457,30 +455,36 @@ describe('prewarm — no task queue (eager-only host)', () => {
   });
 });
 
-describe('prewarm — dispatch-lock winners only', () => {
-  test('lock losers are not counted; added tasks contain only the winners', async () => {
+describe('prewarm — a held gate lock queues nothing', () => {
+  test('one gate lock covers the whole request: every variant is in the task', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
-    // Only the jpeg dispatch lock is won; the webp one is already in flight elsewhere.
-    const { lockStore } = makeLocks((key) => key.endsWith(':jpeg:none'));
+    const { lockStore, acquired } = makeLocks(true);
     const r = makeResizer({
       storage: makeStorage(),
       tasks,
       lockStore,
+      name: 'listings',
+      pipelines: { photo: {} },
     });
     const { accepted } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg', 'webp'],
+      pipeline: 'photo',
     });
-    assert.equal(accepted.length, 1);
+    assert.equal(accepted.length, 2);
     assert.deepEqual(
       calls[0].previews.map((p) => p.format),
-      ['jpeg'],
+      ['jpeg', 'webp'],
+    );
+    assert.deepEqual(
+      acquired.map(({ key }) => key),
+      ['resize_gate:listings:m1:photo'],
     );
   });
 
-  test('no lock survives → nothing accepted and the task queue is not called', async () => {
+  test('a held gate lock → nothing accepted and the task queue is not called', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
     const { lockStore } = makeLocks(false);
@@ -489,18 +493,22 @@ describe('prewarm — dispatch-lock winners only', () => {
       tasks,
       lockStore,
     });
-    const { accepted } = await r.prewarm({
+    const { accepted, issues } = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
     assert.equal(accepted.length, 0);
     assert.equal(calls.length, 0);
+    assert.deepEqual(
+      issues.map(({ code, retryable }) => [code, retryable]),
+      [['RESIZE_ENQUEUE_LOCK_CONTENDED', true]],
+    );
   });
 });
 
 describe('prewarm — queue and lock failures never throw', () => {
-  test('task queue add throwing → nothing accepted, dispatch locks released, no reject', async () => {
+  test('add throwing → nothing accepted, the gate lock released, no reject', async () => {
     installFakeApp();
     const { tasks } = makeTaskQueue(() => {
       throw new Error('task queue down');
@@ -517,12 +525,10 @@ describe('prewarm — queue and lock failures never throw', () => {
       formats: ['jpeg'],
     });
     assert.equal(accepted.length, 0);
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
-    ]);
+    assert.deepEqual(released, ['resize_gate:default:m1:default']);
   });
 
-  test('an internal error (locks.acquire throws) is caught → nothing accepted, logged', async () => {
+  test('a rejecting gate-lock acquire is caught → nothing accepted, logged', async () => {
     const { errors } = installFakeApp();
     const { tasks } = makeTaskQueue();
     const lockStore: LockStore = {

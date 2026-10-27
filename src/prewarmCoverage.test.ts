@@ -28,6 +28,8 @@ const storage: ResizeStorage = {
   publicUrl: () => '',
 };
 
+// A task queue that gates by task (one add per prewarm, findActive after an in-flight add), or with
+// `gates: false` one without gatesByTask, so each prewarm takes the gate lock in the lock store.
 function makeTaskQueue(
   overrides: {
     add?: (task: NewTask) => Promise<TaskAddResult>;
@@ -36,11 +38,13 @@ function makeTaskQueue(
       mediaId: string;
       pipeline: string;
     }) => Promise<EnqueueReceipt[]>;
+    gates?: false;
   } = {},
 ) {
   const memory = new MemoryTaskQueue();
   const added: NewTask[] = [];
   const tasks: TaskQueue = {
+    ...(overrides.gates === false ? {} : { gatesByTask: true as const }),
     add: async (task) => {
       added.push(task);
       return overrides.add ? overrides.add(task) : memory.add(task);
@@ -58,18 +62,27 @@ function makeTaskQueue(
 function locks(
   acquire: boolean | ((key: string) => boolean | Promise<boolean>) = true,
 ) {
+  const acquired: string[] = [];
   const released: string[] = [];
   const lockStore: LockStore = {
-    acquire: async (key) =>
-      typeof acquire === 'function' ? acquire(key) : acquire,
+    acquire: async (key) => {
+      acquired.push(key);
+      return typeof acquire === 'function' ? acquire(key) : acquire;
+    },
     extend: async () => true,
     release: async (key) => {
       released.push(key);
       return true;
     },
   };
-  return { lockStore, released };
+  return { lockStore, acquired, released };
 }
+
+// The add result of a queue whose active task of this media and pipeline holds the gate.
+const inFlight = async (): Promise<TaskAddResult> => ({
+  status: 'in-flight',
+  taskId: 'active-1',
+});
 
 function makeResizer(
   options: {
@@ -135,13 +148,16 @@ describe('prewarm — explicit coverage', () => {
     assert.deepEqual(result.tasks, [{ taskId: 'task-1', previews: calls[0] }]);
   });
 
-  test('added tasks record the Resizer name and queue; findActive uses the Resizer, media, and pipeline scope', async () => {
+  test('added tasks record the Resizer name and queue; after an in-flight add, findActive uses the Resizer, media, and pipeline scope', async () => {
     const added: { resizer: string; queue: string }[] = [];
     const looked: { resizer: string; mediaId: string; pipeline: string }[] = [];
     const { tasks } = makeTaskQueue({
+      // The first prewarm adds the task; the second finds it in flight and looks it up.
       add: async ({ resizer, queue }) => {
         added.push({ resizer, queue });
-        return { status: 'added', taskId: 'task-1' };
+        return added.length === 1
+          ? { status: 'added', taskId: 'task-1' }
+          : { status: 'in-flight', taskId: 'task-1' };
       },
       findActive: async ({ resizer, mediaId, pipeline }) => {
         looked.push({ resizer, mediaId, pipeline });
@@ -150,9 +166,7 @@ describe('prewarm — explicit coverage', () => {
     });
     const r = makeResizer({
       storage,
-      // The jpeg lock is won for add; the webp lock is lost and checked via findActive.
       tasks,
-      lockStore: locks((key) => key.endsWith(':jpeg:none')).lockStore,
       name: 'listings',
       queue: 'interactive',
     });
@@ -176,7 +190,6 @@ describe('prewarm — explicit coverage', () => {
       { resizer: 'listings', queue: 'bulk' },
     ]);
     assert.deepEqual(looked, [
-      { resizer: 'listings', mediaId: 'm1', pipeline: 'default' },
       { resizer: 'listings', mediaId: 'm1', pipeline: 'default' },
     ]);
   });
@@ -314,13 +327,19 @@ describe('prewarm — explicit coverage', () => {
   });
 });
 
-describe('prewarm — dispatch-lock races and retries', () => {
-  test('a contended dispatch lock is incomplete without findActive proof', async () => {
+describe('prewarm — a task in flight, and the gate lock', () => {
+  test('a held gate lock is incomplete and adds nothing; findActive is not read', async () => {
     let addCalls = 0;
+    let lookups = 0;
     const { tasks } = makeTaskQueue({
+      gates: false,
       add: async () => {
         addCalls++;
         return { status: 'added', taskId: 'unexpected' };
+      },
+      findActive: async () => {
+        lookups++;
+        return [{ taskId: 'active-1', previews: [taskPreview()] }];
       },
     });
     const r = makeResizer({
@@ -336,21 +355,19 @@ describe('prewarm — dispatch-lock races and retries', () => {
     assert.equal(result.status, 'incomplete');
     assert.equal(result.accepted.length, 0);
     assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
+    assert.equal(result.issues[0].retryable, true);
     assert.equal(addCalls, 0);
+    assert.equal(lookups, 0);
   });
 
-  test('findActive may prove coverage by an existing active task', async () => {
+  test('findActive may prove coverage by the active task after an in-flight add', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ status: 'added', taskId: 'unexpected' }),
+      add: inFlight,
       findActive: async () => [
         { taskId: 'active-1', previews: [taskPreview()] },
       ],
     });
-    const r = makeResizer({
-      storage,
-      tasks,
-      lockStore: locks(false).lockStore,
-    });
+    const r = makeResizer({ storage, tasks });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -364,7 +381,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
 
   test('does not accept a findActive task with a matching identity but different payload', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => ({ status: 'added', taskId: 'unexpected' }),
+      add: inFlight,
       findActive: async () => [
         {
           taskId: 'other-payload',
@@ -372,11 +389,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
         },
       ],
     });
-    const r = makeResizer({
-      storage,
-      tasks,
-      lockStore: locks(false).lockStore,
-    });
+    const r = makeResizer({ storage, tasks });
 
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -387,7 +400,8 @@ describe('prewarm — dispatch-lock races and retries', () => {
     assert.equal(result.status, 'incomplete');
     assert.equal(result.accepted.length, 0);
     assert.equal(result.unconfirmed.length, 1);
-    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
+    assert.equal(result.issues[0].code, 'RESIZE_TASK_IN_FLIGHT');
+    assert.equal(result.issues[0].retryable, true);
   });
 
   test('rejects two different payloads that share one preview identity', async () => {
@@ -521,7 +535,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
   test('does not confirm a requested payload from a conflicting findActive receipt', async () => {
     const requested = taskPreview('webp');
     const { tasks } = makeTaskQueue({
-      add: async () => ({ status: 'added', taskId: 'unexpected' }),
+      add: inFlight,
       findActive: async () => [
         {
           taskId: 'active-conflict',
@@ -529,11 +543,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
         },
       ],
     });
-    const r = makeResizer({
-      storage,
-      tasks,
-      lockStore: locks(false).lockStore,
-    });
+    const r = makeResizer({ storage, tasks });
 
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
@@ -553,7 +563,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const jpeg = taskPreview('jpeg');
     const webp = taskPreview('webp');
     const { tasks } = makeTaskQueue({
-      add: async () => ({ status: 'added', taskId: 'unexpected' }),
+      add: inFlight,
       findActive: async () => [
         {
           taskId: 'active-conflict',
@@ -562,11 +572,7 @@ describe('prewarm — dispatch-lock races and retries', () => {
         { taskId: 'active-correct', previews: [webp] },
       ],
     });
-    const r = makeResizer({
-      storage,
-      tasks,
-      lockStore: locks(false).lockStore,
-    });
+    const r = makeResizer({ storage, tasks });
 
     const result = await r.prewarm({
       media: { id: 'm-separate', original: { storageRef: { key: 'x.jpg' } } },
@@ -584,9 +590,10 @@ describe('prewarm — dispatch-lock races and retries', () => {
     assert.deepEqual(result.issues[0].previews, [jpeg]);
   });
 
-  test('an add failure releases its dispatch lock and a later call can safely retry', async () => {
+  test('an add failure releases the gate lock and a later call can safely retry', async () => {
     let calls = 0;
     const { tasks } = makeTaskQueue({
+      gates: false,
       add: async () => {
         calls++;
         if (calls === 1) {
@@ -610,34 +617,9 @@ describe('prewarm — dispatch-lock races and retries', () => {
     const second = await r.prewarm(opts);
     assert.equal(first.status, 'incomplete');
     assert.equal(first.issues[0].code, 'RESIZE_ENQUEUE_QUEUE_FAILED');
-    assert.equal(released.length, 1);
+    assert.deepEqual(released, ['resize_gate:default:m1:default']);
     assert.equal(second.status, 'accepted');
     assert.equal(second.tasks[0].taskId, 'task-2');
-  });
-
-  test('partial lock coverage reports accepted and unconfirmed variants separately', async () => {
-    const { tasks } = makeTaskQueue({
-      add: async () => ({ status: 'added', taskId: 'jpeg-task' }),
-    });
-    const r = makeResizer({
-      storage,
-      tasks,
-      lockStore: locks((key) => key.includes(':jpeg:')).lockStore,
-    });
-    const result = await r.prewarm({
-      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg', 'webp'],
-    });
-    assert.equal(result.status, 'incomplete');
-    assert.deepEqual(
-      result.accepted.map((v) => v.format),
-      ['jpeg'],
-    );
-    assert.deepEqual(
-      result.unconfirmed.map((v) => v.format),
-      ['webp'],
-    );
   });
 });
 
@@ -679,57 +661,35 @@ describe('prewarm — pipeline scope is part of preview identity', () => {
 });
 
 describe('prewarm — issues describe only what stays unconfirmed', () => {
-  for (const [label, add, code] of [
-    [
-      'an unconfirmed add',
-      async (): Promise<TaskAddResult> => ({ status: 'unconfirmed' }),
-      'UNCONFIRMED',
-    ],
-    [
-      'an in-flight add',
-      async (): Promise<TaskAddResult> => ({ status: 'in-flight' }),
-      'UNCONFIRMED',
-    ],
-    [
-      'a throwing add',
-      async () => {
-        throw new Error('connection dropped after insert');
-      },
-      'QUEUE_FAILED',
-    ],
-  ] as const) {
-    test(`${label} confirmed by findActive leaves no RESIZE_ENQUEUE_${code} issue`, async () => {
-      const { tasks } = makeTaskQueue({
-        add,
-        findActive: async () => [
-          { taskId: 'active-1', previews: [taskPreview('jpeg')] },
-        ],
-      });
-      const r = makeResizer({ storage, tasks, lockStore: locks().lockStore });
-      const result = await r.prewarm({
-        media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
-        sizes: [{ width: 300, height: 300 }],
-        formats: ['jpeg'],
-      });
-      assert.equal(result.status, 'accepted');
-      assert.deepEqual(result.unconfirmed, []);
-      assert.deepEqual(result.issues, []);
-      assert.deepEqual(result.tasks, [
-        { taskId: 'active-1', previews: [taskPreview('jpeg')] },
-      ]);
-    });
-  }
-
-  test('a partly confirmed failure keeps its issue for the unconfirmed previews only', async () => {
+  test('an in-flight add whose active task holds every variant leaves no issue', async () => {
     const { tasks } = makeTaskQueue({
-      add: async () => {
-        throw new Error('connection dropped after insert');
-      },
+      add: inFlight,
       findActive: async () => [
         { taskId: 'active-1', previews: [taskPreview('jpeg')] },
       ],
     });
-    const r = makeResizer({ storage, tasks, lockStore: locks().lockStore });
+    const r = makeResizer({ storage, tasks });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.deepEqual(result.unconfirmed, []);
+    assert.deepEqual(result.issues, []);
+    assert.deepEqual(result.tasks, [
+      { taskId: 'active-1', previews: [taskPreview('jpeg')] },
+    ]);
+  });
+
+  test('a partly covered in-flight add reports RESIZE_TASK_IN_FLIGHT for the rest only', async () => {
+    const { tasks } = makeTaskQueue({
+      add: inFlight,
+      findActive: async () => [
+        { taskId: 'active-1', previews: [taskPreview('jpeg')] },
+      ],
+    });
+    const r = makeResizer({ storage, tasks });
     const result = await r.prewarm({
       media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
       sizes: [{ width: 300, height: 300 }],
@@ -740,13 +700,54 @@ describe('prewarm — issues describe only what stays unconfirmed', () => {
     assert.deepEqual(result.unconfirmed, [taskPreview('webp')]);
     assert.deepEqual(result.issues, [
       {
-        code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
-        message: 'adding the task failed; outcome is unconfirmed',
+        code: 'RESIZE_TASK_IN_FLIGHT',
+        message:
+          'a task for this media and pipeline is active, or cooling down after a dead-letter; a read after it finishes queues these',
         retryable: true,
         previews: [taskPreview('webp')],
       },
     ]);
   });
+
+  for (const [label, add, code] of [
+    [
+      'an unconfirmed add',
+      async (): Promise<TaskAddResult> => ({ status: 'unconfirmed' }),
+      'RESIZE_ENQUEUE_UNCONFIRMED',
+    ],
+    [
+      'a throwing add',
+      async () => {
+        throw new Error('connection dropped after insert');
+      },
+      'RESIZE_ENQUEUE_QUEUE_FAILED',
+    ],
+  ] as const) {
+    test(`${label} is never confirmed through findActive, which is read only after an in-flight add`, async () => {
+      let lookups = 0;
+      const { tasks } = makeTaskQueue({
+        add,
+        findActive: async () => {
+          lookups++;
+          return [{ taskId: 'active-1', previews: [taskPreview('jpeg')] }];
+        },
+      });
+      const r = makeResizer({ storage, tasks });
+      const result = await r.prewarm({
+        media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
+        sizes: [{ width: 300, height: 300 }],
+        formats: ['jpeg'],
+      });
+      assert.equal(result.status, 'incomplete');
+      assert.deepEqual(result.accepted, []);
+      assert.deepEqual(result.tasks, []);
+      assert.deepEqual(
+        result.issues.map((issue) => [issue.code, issue.retryable]),
+        [[code, true]],
+      );
+      assert.equal(lookups, 0);
+    });
+  }
 });
 
 describe('prewarm — an internal error after expansion', () => {
@@ -798,51 +799,52 @@ describe('prewarm — an internal error after expansion', () => {
   });
 });
 
-describe('prewarm — dispatch locks', () => {
-  test('are acquired in parallel; contended and failed locks are still reported', async () => {
-    const { tasks, added } = makeTaskQueue({
-      add: async () => ({ status: 'added', taskId: 'task-1' }),
-      findActive: async () => [],
+describe('prewarm — the gate lock of a queue without gatesByTask', () => {
+  const media = (id: string) => ({
+    id,
+    original: { storageRef: { key: 'x.jpg' } },
+  });
+  const request = {
+    sizes: [{ width: 300, height: 300 }],
+    formats: ['jpeg', 'webp'],
+  };
+
+  test('one acquire covers the request: a held lock is LOCK_CONTENDED, a rejecting one LOCK_FAILED, for every variant', async () => {
+    const { tasks, added } = makeTaskQueue({ gates: false });
+    const gate = locks((key) => {
+      if (key.includes(':failing:')) {
+        throw new Error('lock backend down');
+      }
+      return !key.includes(':held:');
     });
-    let inFlight = 0;
-    let maxInFlight = 0;
-    const r = makeResizer({
-      storage,
-      tasks,
-      lockStore: locks(async (key) => {
-        inFlight += 1;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise((resolve) => setImmediate(resolve));
-        inFlight -= 1;
-        if (key.includes(':avif:')) {
-          throw new Error('lock backend down');
-        }
-        return !key.includes(':webp:');
-      }).lockStore,
-    });
-    const result = await r.prewarm({
-      media: { id: 'm1', original: { storageRef: { key: 'x.jpg' } } },
-      sizes: [{ width: 300, height: 300 }],
-      formats: ['jpeg', 'webp', 'avif'],
-    });
-    assert.equal(maxInFlight, 3);
+    const r = makeResizer({ storage, tasks, lockStore: gate.lockStore });
+    const free = await r.prewarm({ media: media('free'), ...request });
+    const held = await r.prewarm({ media: media('held'), ...request });
+    const failing = await r.prewarm({ media: media('failing'), ...request });
+    assert.deepEqual(gate.acquired, [
+      'resize_gate:default:free:default',
+      'resize_gate:default:held:default',
+      'resize_gate:default:failing:default',
+    ]);
     assert.deepEqual(
-      added[0]?.previews.map((p) => p.format),
-      ['jpeg'],
+      added.map((task) => task.mediaId),
+      ['free'],
     );
-    assert.deepEqual(
-      result.accepted.map((p) => p.format),
-      ['jpeg'],
-    );
-    assert.deepEqual(
-      result.issues.map((issue) => [
-        issue.code,
-        issue.previews.map((p) => p.format),
-      ]),
-      [
-        ['RESIZE_ENQUEUE_LOCK_CONTENDED', ['webp']],
-        ['RESIZE_ENQUEUE_LOCK_FAILED', ['avif']],
-      ],
-    );
+    assert.equal(free.status, 'accepted');
+    for (const [result, code] of [
+      [held, 'RESIZE_ENQUEUE_LOCK_CONTENDED'],
+      [failing, 'RESIZE_ENQUEUE_LOCK_FAILED'],
+    ] as const) {
+      assert.equal(result.status, 'incomplete');
+      assert.deepEqual(result.accepted, []);
+      assert.deepEqual(
+        result.issues.map((issue) => [
+          issue.code,
+          issue.retryable,
+          issue.previews.map((p) => p.format),
+        ]),
+        [[code, true, ['jpeg', 'webp']]],
+      );
+    }
   });
 });

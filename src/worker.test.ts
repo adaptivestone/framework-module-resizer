@@ -37,6 +37,7 @@ import {
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
+  CoordinationOptions,
   MediaLike,
   Preview,
   QueueTimingOptions,
@@ -915,17 +916,20 @@ test('a Resizer whose task queue cannot be used makes runWorker reject at startu
     Pick<ResizerOptions, 'locks'>,
     QueueTimingOptions | object,
     string,
+    typeof MemoryTaskQueue | typeof PlainTaskQueue,
   ][] = [
-    [{}, {}, 'RESIZE_LOCKS_REQUIRED'],
+    // A task queue without gatesByTask needs a lock store for its gate locks.
+    [{}, {}, 'RESIZE_LOCKS_REQUIRED', PlainTaskQueue],
     [
       { locks: memoryLocks() },
       { leaseMs: 0 },
       'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+      MemoryTaskQueue,
     ],
   ];
-  for (const [locks, timing, code] of cases) {
+  for (const [locks, timing, code, Queue] of cases) {
     resetResizerForTests();
-    const tasks = new MemoryTaskQueue({ timing: timing as never });
+    const tasks = new Queue({ timing: timing as never });
     let claims = 0;
     tasks.claim = async () => {
       claims += 1;
@@ -1001,12 +1005,14 @@ describe('dead-letter cooldown', () => {
   const size: SizeInput = { width: 10, height: 10 };
 
   // A Resizer whose sources are all over limits.sourcePixels, so every task is dead-lettered on
-  // its first delivery. Dispatch locks last 1 s, the cooldown 10 s. A test whose unserved task must
-  // fail, not be given back, passes PlainTaskQueue (a queue without release).
+  // its first delivery. The worker's lock-based cooldown lasts 10 s (lockTtlMs.failed). A test
+  // whose unserved task must fail, not be given back, passes PlainTaskQueue (a queue without
+  // release). `extra` sets MemoryTaskQueue's cooldown clock and the Resizer's coordination.
   function setup(
     locks: LockStore,
     timing: Partial<QueueTimingOptions> = {},
     Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
+    extra: { now?: () => number; coordination?: CoordinationOptions } = {},
   ) {
     const tasks = new Queue({
       timing: {
@@ -1014,6 +1020,7 @@ describe('dead-letter cooldown', () => {
         lockTtlMs: { dispatch: 1000, worker: 1000, failed: 10_000 },
         ...timing,
       },
+      ...(extra.now ? { now: extra.now } : {}),
     });
     const docs = new Map<string, MediaLike>();
     // The Resizer's own errors (its Processor logs the cooldown's lock calls).
@@ -1038,6 +1045,7 @@ describe('dead-letter cooldown', () => {
       media: fakeMedia({ load: async (id) => docs.get(id) ?? null }),
       locks,
       tasks,
+      coordination: extra.coordination,
     });
     const errors: unknown[][] = [];
     const deadLettered: LeasedTask[] = [];
@@ -1067,7 +1075,6 @@ describe('dead-letter cooldown', () => {
       },
       read: (media: MediaLike, sizes: SizeInput[] = [size]) =>
         resizer.resolve({ media, sizes }),
-      queued: () => tasks.added.length,
       // Run the worker until the first dead-letter (or 5 s).
       async work() {
         const timer = setTimeout(() => stop.abort(), 5000);
@@ -1083,25 +1090,30 @@ describe('dead-letter cooldown', () => {
     };
   }
 
-  test('after a dead-letter, reads do not queue that variant again until the cooldown ends', async () => {
-    const clock = { ms: 0 };
-    const t = setup(expiringLocks(clock));
+  test('after a dead-letter, reads queue nothing for that media and pipeline until cooldownMs ends', async () => {
+    let now = 0;
+    const t = setup(expiringLocks({ ms: 0 }), {}, MemoryTaskQueue, {
+      now: () => now,
+      coordination: { cooldownMs: 10_000 },
+    });
     const m1 = t.media('m1');
     await t.read(m1);
-    assert.equal(t.queued(), 1);
+    assert.equal(t.tasks.rows.length, 1);
     await t.work();
     assert.equal(t.deadLettered.length, 1);
-    // Past the 1 s dispatch lock, inside the 10 s cooldown.
-    clock.ms = 5000;
+    assert.equal(t.tasks.rows[0].status, 'dead');
+    // Inside the 10 s cooldown the dead task holds the gate of m1 and its pipeline, for every
+    // variant.
+    now = 5000;
     await t.read(m1);
-    assert.equal(t.queued(), 1, 'the dead variant is not queued again');
-    // Another variant of that media, and the same variant of another media, are not held.
     await t.read(m1, [{ width: 20, height: 20 }]);
+    assert.equal(t.tasks.rows.length, 1, 'nothing is queued for m1');
+    // Another media is not held.
     await t.read(t.media('m2'));
-    assert.equal(t.queued(), 3);
-    clock.ms = 10_001;
+    assert.equal(t.tasks.rows.length, 2);
+    now = 10_000;
     await t.read(m1);
-    assert.equal(t.queued(), 4, 'queued again once the cooldown ends');
+    assert.equal(t.tasks.rows.length, 3, 'queued again once the cooldown ends');
   });
 
   test('a failing lock call is logged; nothing throws and the observer still fires', async () => {

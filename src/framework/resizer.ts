@@ -3,7 +3,9 @@
 // holds only behaviour (pipelines, hooks):
 // - config: the file's image settings;
 // - media: FrameworkMediaStore (the app's media model, `mediaModelName` in the file);
-// - locks: FrameworkLockStore (the framework's own Lock model), unless `tasks: false`;
+// - locks: FrameworkLockStore (the framework's own Lock model) beside a task queue without
+//   gatesByTask (the 'sqs' driver), for its gate locks; none beside the database queue, which
+//   keeps the gate in its task rows, and none for an eager-only Resizer;
 // - storage: the file's `storage` section ('local' or 's3');
 // - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
 // - coordination: the file's `coordination` section, which the core validates;
@@ -60,7 +62,9 @@ export interface FrameworkResizerOptions
   config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
   storage?: ResizeStorage; // default: built from the config's `storage`
   media?: MediaStore; // default: FrameworkMediaStore over the config's `mediaModelName`
-  locks?: LockStore; // default: FrameworkLockStore (the framework's Lock model), none if no tasks
+  // default: FrameworkLockStore (the framework's Lock model) beside a task queue without
+  // gatesByTask (SQS); none beside the database queue or without a task queue
+  locks?: LockStore;
   // default: built from the config's `queue`; `false` = eager only, whatever the config says
   tasks?: TaskQueue | false;
   coordination?: CoordinationOptions; // default: the config's `coordination`
@@ -98,6 +102,17 @@ export class FrameworkResizer extends Resizer {
     const read = (): ResolvedFrameworkConfig =>
       explicit ?? getResizeConfig(configName);
     const file = `src/config/${configName ?? 'resize'}.ts`;
+    // The task queue from the config, built once for the `tasks` part and the default `locks`
+    // part: the parts load in parallel, so the lock store waits for the same build. A failed
+    // build is forgotten, so the next call retries it.
+    let building: Promise<TaskQueue | undefined> | undefined;
+    const configQueue = (): Promise<TaskQueue | undefined> => {
+      building ??= buildQueue(read(), file).catch((err: unknown) => {
+        building = undefined;
+        throw err;
+      });
+      return building;
+    };
     super({
       ...rest,
       config: explicit ? explicit.image : () => read().image,
@@ -111,11 +126,16 @@ export class FrameworkResizer extends Resizer {
             ? { config: explicitConfig, configName }
             : { configName },
         ),
-      // An eager-only Resizer (`tasks: false`) takes no locks, so its verify() needs no Lock model.
-      locks: locks ?? (tasks === false ? undefined : new FrameworkLockStore()),
-      ...(tasks === false
-        ? {}
-        : { tasks: tasks ?? (() => buildQueue(read(), file)) }),
+      // Only a task queue without gatesByTask takes gate locks, so only then does verify() need
+      // the framework Lock model.
+      locks:
+        locks ??
+        (tasks === false
+          ? undefined
+          : tasks
+            ? gateLockStore(tasks)
+            : async () => gateLockStore(await configQueue())),
+      ...(tasks === false ? {} : { tasks: tasks ?? configQueue }),
       // Read only beside a task queue, when the core sets it up; the core validates it (a file
       // without the section gives {}: the defaults).
       coordination:
@@ -145,6 +165,11 @@ export class FrameworkResizer extends Resizer {
       checkQueueUser(this.#queueUser);
     }
   }
+}
+
+/** The lock store for the gate locks of `tasks`: needed only beside a queue without gatesByTask. */
+function gateLockStore(tasks: TaskQueue | undefined): LockStore | undefined {
+  return tasks && !tasks.gatesByTask ? new FrameworkLockStore() : undefined;
 }
 
 async function importDriver<T>(

@@ -26,6 +26,7 @@ import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
@@ -73,16 +74,23 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('FrameworkResizer fills the media and lock stores', () => {
+  test('FrameworkResizer fills the media store, and the lock store only beside a queue without gatesByTask', async () => {
     const eager = new FrameworkResizer(baseOpts());
     assert.ok(eager.media instanceof FrameworkMediaStore);
-    assert.ok(eager.locks instanceof FrameworkLockStore);
+    await eager.ready();
+    assert.equal(eager.locks, undefined); // no `queue` section: eager only
     resetResizerForTests();
     const tasks = new MemoryTaskQueue();
-    const queued = new FrameworkResizer({ ...baseOpts(), tasks });
-    assert.ok(queued.media instanceof FrameworkMediaStore);
-    assert.ok(queued.locks instanceof FrameworkLockStore);
-    assert.equal(queued.tasks, tasks);
+    const gating = new FrameworkResizer({ ...baseOpts(), tasks });
+    assert.ok(gating.media instanceof FrameworkMediaStore);
+    assert.equal(gating.locks, undefined);
+    assert.equal(gating.tasks, tasks);
+    resetResizerForTests();
+    const plain = new FrameworkResizer({
+      ...baseOpts(),
+      tasks: new PlainTaskQueue(),
+    });
+    assert.ok(plain.locks instanceof FrameworkLockStore);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
@@ -510,6 +518,8 @@ describe('ports', () => {
   const locksRequired = (e: unknown) =>
     e instanceof ResizeSetupError &&
     e.code === 'RESIZE_LOCKS_REQUIRED' &&
+    /SqsTaskQueue/.test(e.message) &&
+    /one gate lock per media and pipeline/.test(e.message) &&
     /FrameworkResizer/.test(e.message) &&
     /mongoParts/.test(e.message);
 
@@ -536,17 +546,26 @@ describe('ports', () => {
     );
   });
 
-  test('a lazy locks part that resolves to nothing beside a task queue: ready() resolves, verify() is RESIZE_LOCKS_REQUIRED', async () => {
-    const r = new Resizer({
+  test('a task queue with gatesByTask needs no locks; one without is RESIZE_LOCKS_REQUIRED from verify()', async () => {
+    const gating = new Resizer({
+      logger: silent,
+      storage,
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+    });
+    await gating.verify();
+    assert.equal(gating.locks, undefined);
+    resetResizerForTests();
+    const plain = new Resizer({
       logger: silent,
       storage,
       media: fakeMedia(),
       locks: () => undefined,
-      tasks: new MemoryTaskQueue(),
+      tasks: new PlainTaskQueue(),
     });
-    await r.ready();
-    assert.equal(r.locks, undefined);
-    await assert.rejects(() => r.verify(), locksRequired);
+    await plain.ready();
+    assert.equal(plain.locks, undefined);
+    await assert.rejects(() => plain.verify(), locksRequired);
   });
 
   test('ready() and verify() check the image config before the task queue, and log nothing about the queue', async () => {
@@ -634,7 +653,7 @@ describe('a task queue the Resizer cannot use', () => {
    */
   async function assertDegraded(
     parts: Pick<ResizerOptions, 'locks' | 'tasks'>,
-    tasks: MemoryTaskQueue,
+    tasks: MemoryTaskQueue | PlainTaskQueue,
     failed: (e: unknown) => boolean,
   ) {
     const errors: unknown[][] = [];
@@ -722,14 +741,15 @@ describe('a task queue the Resizer cannot use', () => {
     assert.match(result.issues[0].message, /leaseMs/);
   });
 
-  test('a task queue without locks: the same, and verify() is RESIZE_LOCKS_REQUIRED', async () => {
-    const tasks = new MemoryTaskQueue();
+  test('a task queue without gatesByTask and without locks: the same, and verify() is RESIZE_LOCKS_REQUIRED', async () => {
+    const tasks = new PlainTaskQueue();
     const result = await assertDegraded(
       { tasks },
       tasks,
       (e: unknown) =>
         e instanceof ResizeSetupError &&
         e.code === 'RESIZE_LOCKS_REQUIRED' &&
+        /SqsTaskQueue/.test(e.message) &&
         /FrameworkResizer/.test(e.message) &&
         /mongoParts/.test(e.message),
     );

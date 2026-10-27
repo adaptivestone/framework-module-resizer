@@ -8,7 +8,6 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from '../contracts/storage.ts';
-import { DEFAULT_SCOPE, getPreviewIdentity } from '../images.ts';
 import { DISPATCH_LOCK_OWNER } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
@@ -236,12 +235,15 @@ test('prepared indexes enforce the gate: concurrent adds create one active row',
 test('strict enqueue does not confirm a payload from a conflicting Mongo task', async () => {
   const fixture = await createFixture('strict_conflict');
   try {
+    // The gate index, as the host prepares it: without it no row is the gate.
+    await fixture.taskModel.createIndexes();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const conflictingPreviews = [
       { sizeKey: '30w', format: 'webp' as const, requestedWidth: 20 },
       { sizeKey: '30w', format: 'webp' as const, requestedWidth: 30 },
     ];
-    // The active task of this media holds two payloads for one preview identity.
+    // The active task of this media holds two payloads for one preview identity; as the gate it
+    // makes the prewarm's add in-flight.
     await fixture.taskModel.create({
       fileId: mediaId,
       pipeline: 'default',
@@ -250,21 +252,7 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       previews: conflictingPreviews,
     });
 
-    const identity = getPreviewIdentity(DEFAULT_SCOPE, '30w', 'webp');
-    assert.equal(
-      await fixture.locks.acquire(
-        `resize_dispatch:${mediaId}:${identity}`,
-        DISPATCH_LOCK_OWNER,
-        60_000,
-      ),
-      true,
-    );
-
-    const resizer = new FrameworkResizer({
-      storage,
-      locks: fixture.locks,
-      tasks: fixture.tasks,
-    });
+    const resizer = new FrameworkResizer({ storage, tasks: fixture.tasks });
     const result = await resizer.prewarm({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 30 }],
@@ -279,6 +267,10 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       result.issues.some(
         (issue) => issue.code === 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
       ),
+    );
+    assert.equal(
+      await fixture.taskModel.countDocuments({ fileId: mediaId }),
+      1,
     );
   } finally {
     await closeFixture(fixture);

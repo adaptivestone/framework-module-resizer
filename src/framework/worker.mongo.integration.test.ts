@@ -24,7 +24,6 @@ import { fakeMedia } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import { runWorker } from '../worker.ts';
-import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
 import ResizeTaskModel from './ResizeTaskModel.ts';
 import { FrameworkResizer } from './resizer.ts';
@@ -130,7 +129,7 @@ function memoryStorage(): { storage: ResizeStorage; uploads: string[] } {
   return { storage, uploads };
 }
 
-// In-memory media; the Resizers beside it keep their locks in the real framework Lock model.
+// In-memory media; the Resizers beside it queue their tasks on the real ResizeTask model.
 function memoryMedia(media: MediaLike): MediaStore {
   return fakeMedia({
     load: async (id) => (id === media.id ? media : null),
@@ -185,7 +184,8 @@ test('one worker serves two Resizers that share a task queue', async () => {
     tasks,
     media: memoryMedia(mediaB),
   });
-  assert.ok(media.locks instanceof FrameworkLockStore);
+  // The database queue gates by task: no lock store, and the worker renders without one.
+  assert.equal(media.locks, undefined);
 
   assert.equal(
     (await media.prewarm({ media: mediaA, sizes })).accepted.length,

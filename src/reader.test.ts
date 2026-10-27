@@ -5,6 +5,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { Catalog } from './catalog.ts';
+import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask, TaskAddResult } from './contracts/taskQueue.ts';
@@ -13,18 +14,17 @@ import { ResizeConfigError } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
-import { Reader, type ReaderDeps } from './reader.ts';
+import { prewarmFailure, Reader, type ReaderDeps } from './reader.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
-  memoryLocks,
+  PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
-import { timingOf } from './timing.ts';
 import type { MediaLike, ResizeLogger, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -64,9 +64,12 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   };
 }
 
-function makeTasks(behavior?: (task: NewTask) => TaskAddResult) {
+// A task queue that records every add; `tasks` defaults to a queue that gates by task.
+function makeTasks(
+  behavior?: (task: NewTask) => TaskAddResult,
+  tasks: MemoryTaskQueue | PlainTaskQueue = new MemoryTaskQueue(),
+) {
   const calls: NewTask[] = [];
-  const tasks = new MemoryTaskQueue();
   tasks.add = async (task) => {
     calls.push(task);
     return behavior ? behavior(task) : { status: 'added', taskId: 't1' };
@@ -141,8 +144,8 @@ describe('Reader', () => {
       readerDeps(
         new Dispatcher({
           tasks,
-          locks: memoryLocks(),
-          timing: timingOf(tasks),
+          locks: undefined, // a task queue that gates by task needs none
+          coordination: defaultCoordination,
           name: 'default',
           logger: silent,
         }),
@@ -274,6 +277,32 @@ describe('Reader', () => {
         'resize prewarm: unexpected internal error — nothing confirmed',
       ],
     );
+  });
+
+  test('prewarmFailure advises against a retry for setup, config and media errors, also from a duplicate package copy', () => {
+    // An error of another copy of this package: the brand and the class name, no shared class.
+    const branded = (name: string) => ({
+      [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
+      name,
+      message: 'm',
+      code: 'X',
+    });
+    const advice = (err: unknown) =>
+      prewarmFailure(err, []).issues[0].retryable;
+    for (const name of [
+      'ResizeSetupError',
+      'ResizeConfigError',
+      'ResizeMediaError',
+      'ResizeNoOriginalError',
+      'ResizeOriginalError',
+    ]) {
+      assert.equal(advice(branded(name)), false, name);
+    }
+    assert.equal(advice(new ResizeConfigError('m')), false);
+    assert.equal(advice(new Error('m')), true);
+    assert.equal(advice(branded('ResizeStorageError')), true);
+    // The class name alone, without the brand, is not this package's error.
+    assert.equal(advice({ name: 'ResizeSetupError', message: 'm' }), true);
   });
 });
 
@@ -717,9 +746,9 @@ describe('resolve — enqueue wiring', () => {
     assert.equal(calls.length, 0);
   });
 
-  test('uses String(media._id) for the dispatch lock when id is absent', async () => {
+  test('uses String(media._id) for the task and the gate lock when id is absent', async () => {
     installFakeApp();
-    const { tasks } = makeTasks();
+    const { tasks, calls } = makeTasks(undefined, new PlainTaskQueue());
     const { locks, acquired } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
@@ -735,18 +764,18 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(acquired.length, 1);
-    assert.equal(
-      acquired[0].key,
-      'resize_dispatch:abc123:default:default:300x300:jpeg:none',
+    assert.deepEqual(
+      acquired.map(({ key }) => key),
+      ['resize_gate:default:abc123:default'],
     );
+    assert.equal(calls[0].mediaId, 'abc123');
   });
 
-  test('resolve does not throw when tasks.add throws; survivor locks released', async () => {
+  test('resolve does not throw when tasks.add throws; the gate lock is released', async () => {
     installFakeApp();
     const { tasks } = makeTasks(() => {
       throw new Error('task queue down');
-    });
+    }, new PlainTaskQueue());
     const { locks, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
@@ -760,14 +789,15 @@ describe('resolve — enqueue wiring', () => {
       formats: ['jpeg'],
     });
     assert.equal(decision.missing.length, 1);
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
-    ]);
+    assert.deepEqual(released, ['resize_gate:default:m1:default']);
   });
 
-  test('resolve does not throw when the task queue cannot confirm the add; locks released', async () => {
+  test('resolve does not throw when the task queue cannot confirm the add; the gate lock is released', async () => {
     installFakeApp();
-    const { tasks } = makeTasks(() => ({ status: 'unconfirmed' }));
+    const { tasks } = makeTasks(
+      () => ({ status: 'unconfirmed' }),
+      new PlainTaskQueue(),
+    );
     const { locks, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
@@ -780,9 +810,7 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
-    ]);
+    assert.deepEqual(released, ['resize_gate:default:m1:default']);
   });
 
   test('an original without a key leaves variants missing without enqueueing or locking', async () => {

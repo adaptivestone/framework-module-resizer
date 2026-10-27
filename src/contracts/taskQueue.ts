@@ -155,9 +155,8 @@ export abstract class TaskQueue {
   /**
    * Optional: the active tasks (pending or processing) of this Resizer, media and pipeline on any
    * queue, each with the previews it covers; `[]` when there are none. A queue with `gatesByTask`
-   * returns at most one. The Dispatcher reads it for every variant still without a confirmed task
-   * (after a dispatch lock it could not take, an unconfirmed or in-flight add, or an add that
-   * threw). Omit when tasks can't be queried (e.g. SQS).
+   * returns at most one. The Dispatcher reads it only after an `in-flight` add: prewarm then
+   * accepts the variants the active task holds. Omit when tasks can't be queried (e.g. SQS).
    */
   findActive?(query: {
     resizer: string;

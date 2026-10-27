@@ -144,6 +144,7 @@ export interface EnqueueIssue {
     | 'RESIZE_ENQUEUE_UNCONFIRMED'
     | 'RESIZE_ENQUEUE_CONFIRM_FAILED'
     | 'RESIZE_ENQUEUE_VARIANT_CONFLICT'
+    | 'RESIZE_TASK_IN_FLIGHT' // a task of this media and pipeline is active or cooling down
     | 'RESIZE_PIPELINE_UNKNOWN' // the pipeline is not registered on this Resizer
     | 'RESIZE_FORMAT_NOT_CONFIGURED' // a requested format has no encode.formats entry
     | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)

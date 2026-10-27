@@ -237,8 +237,8 @@ describe('SqsTaskQueue.add', () => {
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     assert.deepEqual(await tasks.add(newTask()), { status: 'unconfirmed' });
   });
-  test('prewarm accepts a successful SQS MessageId receipt', async () => {
-    const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
+  test('prewarm accepts a successful SQS MessageId receipt; the message carries the gate lock owner', async () => {
+    const { client, sent } = makeFakeSqsClient({ messageId: 'mid-strict' });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     const resizer = new Resizer({
       config: makeImageConfig(),
@@ -258,8 +258,12 @@ describe('SqsTaskQueue.add', () => {
     });
     assert.equal(result.status, 'accepted');
     assert.equal(result.tasks[0].taskId, 'mid-strict');
+    assert.match(
+      JSON.parse(String(sent[0].input.MessageBody)).gateOwner,
+      /^[0-9a-f]{32}$/,
+    );
   });
-  test('prewarm leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
+  test('prewarm with a held gate lock is RESIZE_ENQUEUE_LOCK_CONTENDED and sends nothing (SQS has no lookup)', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     const resizer = new Resizer({
@@ -284,6 +288,7 @@ describe('SqsTaskQueue.add', () => {
     });
     assert.equal(result.status, 'incomplete');
     assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
+    assert.equal(result.issues[0].retryable, true);
     assert.equal(sent.length, 0);
   });
   test('add sends gateOwner in the body and claim returns it; the dead-letter body leaves it out', async () => {
