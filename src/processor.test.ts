@@ -3735,7 +3735,7 @@ describe('one worker serves every Resizer', () => {
     const { tasks, claimedQueues } = observedQueue();
     register(tasks);
     await addTask(tasks);
-    await addTask(tasks, { queue: 'bulk' });
+    await addTask(tasks, { queue: 'bulk', mediaId: 'm2' });
     await runResizeWorker({ queue: 'bulk' });
     assert.deepEqual(claimedQueues, ['bulk', 'bulk']);
     assert.deepEqual(

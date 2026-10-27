@@ -1,11 +1,16 @@
-// Test-only fakes for the driver contracts: a MediaStore built from parts, in-memory locks that
-// honour owners, and a complete in-memory TaskQueue (the reference for the contract's semantics:
-// request de-duplication, oldest-first claims, fenced leases, retry times and dead tasks), and one
-// with `release`.
+// Test-only fakes for the driver contracts: a MediaStore built from parts; locks that honour owners
+// (memoryLocks never expire, clockLocks expire on a clock the test controls); and in-memory task
+// queues that share one row store (oldest-first claims, fenced leases, retry times and dead tasks).
+// MemoryTaskQueue behaves like the database queue: it gates by task (one active task per Resizer,
+// media and pipeline, and a dead task holds the gate until its cooldown ends), filters claims by
+// Resizer and answers findActive. PlainTaskQueue has the SQS shape and stores every task;
+// ReleasingTaskQueue adds `release` to it.
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
   type ClaimedTask,
+  type ClaimOptions,
+  type FailOptions,
   type NewTask,
   type TaskAddResult,
   TaskQueue,
@@ -35,6 +40,53 @@ export function memoryLocks(): LockStore {
       }
       held.delete(key);
       return true;
+    },
+  };
+}
+
+/** A LockStore whose locks a test can inspect. */
+export interface ClockLocks extends LockStore {
+  /** The lock on `key`, expired or not; `undefined` when there is none. */
+  entry(key: string): { owner: string; expiresAt: number } | undefined;
+}
+
+/**
+ * In-memory locks that expire on `now` (default Date.now), as the lock contract says: a lock is
+ * live until `expiresAt`, and then another owner can take it over. An expired lock is never
+ * extended, but its owner can still release it until someone takes it over.
+ */
+export function clockLocks(now: () => number = () => Date.now()): ClockLocks {
+  const held = new Map<string, { owner: string; expiresAt: number }>();
+  const live = (key: string) => {
+    const lock = held.get(key);
+    return lock && lock.expiresAt > now() ? lock : undefined;
+  };
+  return {
+    acquire: async (key, owner, ttlMs) => {
+      if (live(key)) {
+        return false;
+      }
+      held.set(key, { owner, expiresAt: now() + ttlMs });
+      return true;
+    },
+    extend: async (key, owner, ttlMs) => {
+      const lock = live(key);
+      if (lock?.owner !== owner) {
+        return false;
+      }
+      lock.expiresAt = now() + ttlMs;
+      return true;
+    },
+    release: async (key, owner) => {
+      if (held.get(key)?.owner !== owner) {
+        return false;
+      }
+      held.delete(key);
+      return true;
+    },
+    entry: (key) => {
+      const lock = held.get(key);
+      return lock ? { ...lock } : undefined;
     },
   };
 }
@@ -85,12 +137,20 @@ interface Row {
   token: string | null;
   leaseUntil: number;
   availableAt: number;
+  /** True from `add` until `complete`, or until a later `add` takes over the dead row. */
+  active: boolean;
+  /** MemoryTaskQueue only: a dead row holds the gate until this time. */
+  cooldownUntil?: number;
   error?: string;
 }
 
-/** A complete in-memory TaskQueue. `rows` and `added` are open for assertions. */
-export class MemoryTaskQueue extends TaskQueue {
+/**
+ * The rows and the lease logic of the in-memory task queues: oldest-first claims, fenced leases,
+ * retry times and dead tasks. `rows` and `added` are open for assertions.
+ */
+abstract class RowQueue extends TaskQueue {
   readonly rows: Row[] = [];
+  /** Every `add` call, also those that stored nothing. */
   readonly added: NewTask[] = [];
   readonly #timing: Partial<QueueTimingOptions>;
   #seq = 0;
@@ -104,22 +164,8 @@ export class MemoryTaskQueue extends TaskQueue {
     return this.#timing;
   }
 
-  #active(row: Row): boolean {
-    return row.status === 'pending' || row.status === 'processing';
-  }
-
   async add(task: NewTask): Promise<TaskAddResult> {
     this.added.push(task);
-    const existing = this.rows.find(
-      (row) =>
-        this.#active(row) &&
-        row.task.mediaId === task.mediaId &&
-        row.task.pipeline === task.pipeline &&
-        row.task.requestKey === task.requestKey,
-    );
-    if (existing) {
-      return { status: 'added', taskId: existing.id };
-    }
     this.#seq += 1;
     const row: Row = {
       id: `task-${this.#seq}`,
@@ -129,16 +175,33 @@ export class MemoryTaskQueue extends TaskQueue {
       token: null,
       leaseUntil: 0,
       availableAt: 0,
+      active: true,
     };
     this.rows.push(row);
     return { status: 'added', taskId: row.id };
   }
 
-  async claim(queue: string, leaseMs: number): Promise<ClaimedTask | null> {
+  /** Claims any Resizer's task: `opts.resizers` is ignored. */
+  async claim(
+    queue: string,
+    leaseMs: number,
+    _signal?: AbortSignal,
+    _opts?: ClaimOptions,
+  ): Promise<ClaimedTask | null> {
+    return this.claimFirst(queue, leaseMs, () => true);
+  }
+
+  /** Lease the oldest due row of `queue` that `takes` accepts. */
+  protected claimFirst(
+    queue: string,
+    leaseMs: number,
+    takes: (row: Row) => boolean,
+  ): ClaimedTask | null {
     const now = Date.now();
     const row = this.rows.find(
       (r) =>
         r.task.queue === queue &&
+        takes(r) &&
         ((r.status === 'pending' && r.availableAt <= now) ||
           (r.status === 'processing' && r.leaseUntil < now)),
     );
@@ -162,7 +225,8 @@ export class MemoryTaskQueue extends TaskQueue {
     };
   }
 
-  #held(task: ClaimedTask): Row | undefined {
+  /** The row `task` still holds under its lease token. */
+  protected held(task: ClaimedTask): Row | undefined {
     return this.rows.find(
       (r) =>
         r.id === task.taskId &&
@@ -172,7 +236,7 @@ export class MemoryTaskQueue extends TaskQueue {
   }
 
   async renew(task: ClaimedTask, leaseMs: number): Promise<boolean> {
-    const row = this.#held(task);
+    const row = this.held(task);
     if (!row) {
       return false;
     }
@@ -181,20 +245,23 @@ export class MemoryTaskQueue extends TaskQueue {
   }
 
   async complete(task: ClaimedTask): Promise<boolean> {
-    const row = this.#held(task);
+    const row = this.held(task);
     if (!row) {
       return false;
     }
     row.status = 'completed';
+    row.active = false;
     return true;
   }
 
+  /** Without a gate there is no cooldown to keep: `opts.cooldownMs` is ignored. */
   async fail(
     task: ClaimedTask,
     next: { retryAt: Date } | 'dead',
     error: string,
+    _opts?: FailOptions,
   ): Promise<boolean> {
-    const row = this.#held(task);
+    const row = this.held(task);
     if (!row) {
       return false;
     }
@@ -208,30 +275,117 @@ export class MemoryTaskQueue extends TaskQueue {
     }
     return true;
   }
+}
 
+export interface MemoryTaskQueueOptions {
+  timing?: Partial<QueueTimingOptions>;
+  /** The cooldown clock (default Date.now). Leases and retry times stay on Date.now. */
+  now?: () => number;
+}
+
+/**
+ * The in-memory database queue. It keeps one active task per Resizer, media and pipeline: `add`
+ * reports any other active task as `in-flight`, through its retries, until `complete`. A dead task
+ * holds the gate for the `cooldownMs` given to `fail`; after that the next `add` takes it over.
+ * `claim` honours `resizers`.
+ */
+export class MemoryTaskQueue extends RowQueue {
+  readonly gatesByTask = true;
+  readonly claimFilters = true;
+  readonly #now: () => number;
+
+  constructor(opts: MemoryTaskQueueOptions = {}) {
+    super(opts);
+    this.#now = opts.now ?? (() => Date.now());
+  }
+
+  /** The active row of this Resizer, media and pipeline: the gate. */
+  #gate(key: {
+    resizer: string;
+    mediaId: string;
+    pipeline: string;
+  }): Row | undefined {
+    return this.rows.find(
+      (row) =>
+        row.active &&
+        row.task.resizer === key.resizer &&
+        row.task.mediaId === key.mediaId &&
+        row.task.pipeline === key.pipeline,
+    );
+  }
+
+  async add(task: NewTask): Promise<TaskAddResult> {
+    const gate = this.#gate(task);
+    if (gate) {
+      const cooledDown =
+        gate.status === 'dead' &&
+        (gate.cooldownUntil === undefined || gate.cooldownUntil <= this.#now());
+      if (!cooledDown) {
+        this.added.push(task);
+        return { status: 'in-flight', taskId: gate.id };
+      }
+      // The dead task's cooldown is over: it stops being the gate, and this task takes its place.
+      gate.active = false;
+    }
+    return super.add(task);
+  }
+
+  async claim(
+    queue: string,
+    leaseMs: number,
+    _signal?: AbortSignal,
+    opts?: ClaimOptions,
+  ): Promise<ClaimedTask | null> {
+    const served = opts?.resizers;
+    return this.claimFirst(
+      queue,
+      leaseMs,
+      (row) => served === undefined || served.includes(row.task.resizer),
+    );
+  }
+
+  async fail(
+    task: ClaimedTask,
+    next: { retryAt: Date } | 'dead',
+    error: string,
+    opts?: FailOptions,
+  ): Promise<boolean> {
+    const row = this.held(task);
+    if (!row || !(await super.fail(task, next, error))) {
+      return false;
+    }
+    if (next === 'dead') {
+      row.cooldownUntil = this.#now() + (opts?.cooldownMs ?? 0);
+    }
+    return true;
+  }
+
+  /** The gate, while it is pending or processing; a dead task in its cooldown is not reported. */
   async findActive(query: {
     resizer: string;
     mediaId: string;
     pipeline: string;
   }): Promise<EnqueueReceipt[]> {
-    return this.rows
-      .filter(
-        (r) =>
-          this.#active(r) &&
-          r.task.resizer === query.resizer &&
-          r.task.mediaId === query.mediaId &&
-          r.task.pipeline === query.pipeline,
-      )
-      .map((r) => ({ taskId: r.id, previews: r.task.previews }));
+    const gate = this.#gate(query);
+    if (!gate || (gate.status !== 'pending' && gate.status !== 'processing')) {
+      return [];
+    }
+    return [{ taskId: gate.id, previews: gate.task.previews }];
   }
 }
 
 /**
- * The in-memory TaskQueue with `release`: the task is due again at once, behind the tasks already
- * due (like the database queue, which claims the task that became due first), and the delivery is
- * not counted. `releaseCalls` lists the task ids passed to `release`.
+ * The SQS shape: no gate, no claim filter and no findActive. Every `add` stores a row, and any
+ * worker may claim any Resizer's task.
  */
-export class ReleasingTaskQueue extends MemoryTaskQueue {
+export class PlainTaskQueue extends RowQueue {}
+
+/**
+ * PlainTaskQueue with `release`: the task is due again at once, behind the tasks already due
+ * (like the database queue, which claims the task that became due first), and the delivery is not
+ * counted. `releaseCalls` lists the task ids passed to `release`.
+ */
+export class ReleasingTaskQueue extends PlainTaskQueue {
   readonly releaseCalls: string[] = [];
 
   async release(task: ClaimedTask): Promise<boolean> {

@@ -17,7 +17,11 @@ import {
   ResizeNoOriginalError,
 } from './errors.ts';
 import { consume } from './testHelpers/consume.ts';
-import { MemoryTaskQueue, ReleasingTaskQueue } from './testHelpers/fakes.ts';
+import {
+  MemoryTaskQueue,
+  type PlainTaskQueue,
+  ReleasingTaskQueue,
+} from './testHelpers/fakes.ts';
 import { timingOf } from './timing.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
@@ -46,7 +50,7 @@ const stoppedByShutdown = (
 
 /** Run the loop until the handler has started, then shut it down and wait for it to return. */
 async function shutDownMidTask(
-  tasks: MemoryTaskQueue,
+  tasks: MemoryTaskQueue | PlainTaskQueue,
   handle: (
     task: LeasedTask,
     opts: { signal: AbortSignal },
@@ -628,7 +632,7 @@ describe('Consumer', () => {
   test('only tasks of the consumed queue are claimed', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask({ queue: 'bulk', requestKey: 'b' }));
-    await tasks.add(newTask({ requestKey: 'd' }));
+    await tasks.add(newTask({ mediaId: 'm2', requestKey: 'd' }));
     const seen: string[] = [];
     await runUntil(
       tasks,
@@ -837,7 +841,7 @@ describe('a task the Consumer does not accept', () => {
    * Run the loop with `accepts` returning false, until the second claim starts. Resolves with the
    * gap between the two claims, the events, the logger's messages and the tasks `accepts` saw.
    */
-  async function declineOnce(tasks: MemoryTaskQueue) {
+  async function declineOnce(tasks: MemoryTaskQueue | PlainTaskQueue) {
     const claimedAt: number[] = [];
     const logged: unknown[][] = [];
     const seen: LeasedTask[] = [];

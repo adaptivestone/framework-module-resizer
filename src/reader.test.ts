@@ -167,9 +167,14 @@ describe('Reader', () => {
       tasks.added[0].previews.map((v) => v.sizeKey),
       ['20x20'],
     );
+    // Another media: the task queued above holds the gate of m1.
     assert.equal(
-      (await reader.prewarm({ media, sizes: [{ width: 30, height: 30 }] }))
-        .status,
+      (
+        await reader.prewarm({
+          media: { ...media, id: 'm2' },
+          sizes: [{ width: 30, height: 30 }],
+        })
+      ).status,
       'accepted',
     );
   });
