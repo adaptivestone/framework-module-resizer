@@ -346,6 +346,19 @@ describe('drivers given as functions', () => {
     assert.equal(reads, 2);
   });
 
+  test('resolve() returns the safe empty decision when a lazy config fails to validate', async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      config: () => ({ ...makeImageConfig(), upload: null }) as never,
+    });
+    assert.deepEqual(
+      await r.resolve({ media: { id: 'm1' }, sizes: [{ width: 10 }] }),
+      { decision: { ready: [], missing: [] }, output: undefined },
+    );
+  });
+
   test('a failed lazy task queue stays not ready until it loads', async () => {
     let taskCalls = 0;
     const tasks = new MemoryTaskQueue();
@@ -431,7 +444,10 @@ describe('ports', () => {
   const silent = { info() {}, warn() {}, error() {} };
   const storage = fakeStorage();
   const locksRequired = (e: unknown) =>
-    e instanceof ResizeSetupError && e.code === 'RESIZE_LOCKS_REQUIRED';
+    e instanceof ResizeSetupError &&
+    e.code === 'RESIZE_LOCKS_REQUIRED' &&
+    /FrameworkResizer/.test(e.message) &&
+    /mongoParts/.test(e.message);
 
   test('a missing media store is RESIZE_MEDIA_REQUIRED at construction', () =>
     assert.throws(
@@ -492,6 +508,31 @@ describe('ports', () => {
     });
     await assert.rejects(() => r.ready(), locksRequired);
     assert.equal(r.locks, undefined);
+  });
+
+  test('ready() validates the task queue timing; resolve() still never throws', async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage,
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks: new MemoryTaskQueue({ timing: { leaseMs: 0 } }),
+    });
+    const leaseInvalid = (e: unknown) =>
+      e instanceof ResizeConfigError &&
+      e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID';
+    await assert.rejects(() => r.ready(), leaseInvalid);
+    const media = { id: 'm1', original: { storageRef: { key: 'o' } } };
+    assert.deepEqual(await r.resolve({ media, sizes: [{ width: 10 }] }), {
+      decision: { ready: [], missing: [] },
+      output: undefined,
+    });
+    const result = await r.prewarm({ media, sizes: [{ width: 10 }] });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.requested, []);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false);
+    await assert.rejects(() => r.verify(), leaseInvalid);
   });
 
   test('an eager-only Resizer needs no locks, and has no db', async () => {
@@ -661,11 +702,20 @@ describe('Resizer registry', () => {
   });
 
   test('resetResizerForTests() runs every onResetResizerForTests hook', () => {
+    // A hook cannot be removed, so it counts only while this test runs: every later reset (each
+    // afterEach) leaves it a no-op.
+    let active = true;
     let resets = 0;
     onResetResizerForTests(() => {
-      resets += 1;
+      if (active) {
+        resets += 1;
+      }
     });
-    resetResizerForTests();
+    try {
+      resetResizerForTests();
+    } finally {
+      active = false;
+    }
     assert.equal(resets, 1);
   });
 });

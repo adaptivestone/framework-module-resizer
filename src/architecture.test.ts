@@ -7,8 +7,8 @@ import { test } from 'node:test';
 import { sourceFiles } from './testHelpers/imports.ts';
 
 const CORE_FILES = [
+  'dispatcher.ts',
   'engine.ts',
-  'enqueue.ts',
   'formatPictureUrls.ts',
   'images.ts',
   'resizeTask.ts',

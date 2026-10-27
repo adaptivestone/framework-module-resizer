@@ -3590,12 +3590,14 @@ describe('one worker serves every Resizer', () => {
         );
       });
     register(sibling);
-    // Invalid timing (the worker lock outlives the lease), with verify() bypassed, so the
-    // failure surfaces inside the running loop rather than at startup.
+    // Invalid timing (the worker lock outlives the lease), with ready() and verify() bypassed
+    // (both validate the timing), so the failure surfaces inside the running loop rather than at
+    // startup.
     const broken = new MemoryTaskQueue({
       timing: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 2000 } },
     });
     const r = register(broken, 'listings');
+    r.ready = async () => {};
     r.verify = async () => {};
     await assert.rejects(
       () => runWorker({ signal: new AbortController().signal }),

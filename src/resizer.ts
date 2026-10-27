@@ -19,8 +19,10 @@ import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { TaskQueue } from './contracts/taskQueue.ts';
-import { prewarmImpl, resolveImpl } from './engine.ts';
+import { Dispatcher } from './dispatcher.ts';
+import { prewarmFailure, prewarmImpl, resolveImpl } from './engine.ts';
 import { ResizeSetupError } from './errors.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { timingOf } from './queue.ts';
@@ -82,6 +84,7 @@ type PartName = (typeof PART_NAMES)[number];
 interface Services {
   catalog: Catalog;
   uploader: Uploader;
+  dispatcher: Dispatcher | undefined; // only with a task queue
 }
 
 // How framework hosts get the parts below filled in from their app.
@@ -246,11 +249,11 @@ export class Resizer {
 
   /**
    * Load the parts given as functions, each once, then build the services from the validated
-   * config. Every method of the Resizer (and the worker) awaits it first, so hosts only need it
-   * before reading `storage`, `media`, `locks` or `tasks` directly. A part whose function fails is
-   * retried by the next call, and so is a config that fails to load or validate; the parts that
-   * loaded are kept. Rejects with RESIZE_LOCKS_REQUIRED when a task queue has no lock store beside
-   * it.
+   * config and the task queue's validated timing. Every method of the Resizer (and the worker)
+   * awaits it first, so hosts only need it before reading `storage`, `media`, `locks` or `tasks`
+   * directly. A part whose function fails is retried by the next call, and so is a config or a
+   * timing that fails to load or validate; the parts that loaded are kept. Rejects with
+   * RESIZE_LOCKS_REQUIRED when a task queue has no lock store beside it.
    */
   async ready(): Promise<void> {
     if (this.#loadedParts.size < PART_NAMES.length) {
@@ -275,30 +278,53 @@ export class Resizer {
         }),
       ]);
     }
-    // Queued work locks every variant, so every call rejects without a lock store (resolve() and
-    // prewarm() turn that into their safe result).
-    if (this.#tasks && !this.#locks) {
-      throw locksRequired(this.name);
-    }
-    this.#buildServices();
+    this.#ensureServices();
   }
 
-  /** The services, built on the first call that succeeds; a failed build leaves nothing behind. */
-  #buildServices(): Services {
+  /**
+   * The services: built on the first call that succeeds, then the same object. A failed build
+   * leaves nothing behind. Called only after the parts are loaded.
+   */
+  #ensureServices(): Services {
     if (!this.#builtServices) {
+      const dispatcher = this.#buildDispatcher();
       const { config } = this;
       this.#builtServices = {
         catalog: new Catalog({ config }),
         uploader: new Uploader({ storage: this.storage, config }),
+        dispatcher,
       };
     }
     return this.#builtServices;
   }
 
+  /**
+   * The Dispatcher of a Resizer with a task queue, on the queue's validated timing (undefined: eager
+   * only). Queued work locks every variant, so a task queue without a lock store rejects every call
+   * (resolve() and prewarm() turn that into their safe result).
+   */
+  #buildDispatcher(): Dispatcher | undefined {
+    const tasks = this.#tasks;
+    if (!tasks) {
+      return undefined;
+    }
+    const locks = this.#locks;
+    if (!locks) {
+      throw locksRequired(this.name);
+    }
+    return new Dispatcher({
+      tasks,
+      locks,
+      timing: timingOf(tasks),
+      name: this.name,
+      logger: this.logger,
+    });
+  }
+
   /** The services, once ready() has loaded the parts and built them. */
   async #services(): Promise<Services> {
     await this.ready();
-    return this.#buildServices();
+    return this.#ensureServices();
   }
 
   /** Load one part given as a function; concurrent callers share its load while it runs. */
@@ -330,9 +356,9 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: load the drivers; resolve and validate the config; run the media
-   * store's and the lock store's verify(); check the task queue (its own verify(), its timing, and
-   * that it serves this Resizer's queue).
+   * Optional startup check: load the drivers; resolve and validate the config and the task queue's
+   * timing; run the media store's and the lock store's verify(); check the task queue (its own
+   * verify(), and that it serves this Resizer's queue).
    * Framework hosts call it after `Server.init()` to fail at boot instead of at the first upload or
    * read. The worker runs it for every Resizer before leasing.
    */
@@ -342,7 +368,6 @@ export class Resizer {
     await this.locks?.verify?.();
     if (this.tasks) {
       await this.tasks.verify?.();
-      timingOf(this.tasks);
       if (this.tasks.servesQueue && !this.tasks.servesQueue(this.queue)) {
         throw new ResizeSetupError(
           `resize: Resizer '${this.name}' queues to '${this.queue}', which its task queue does not serve`,
@@ -385,7 +410,18 @@ export class Resizer {
   async resolve(
     opts: ResolveOpts,
   ): Promise<{ decision: ReadDecision; output: unknown }> {
-    return resolveImpl(this, opts);
+    let services: Services;
+    try {
+      services = await this.#services(); // inside the never-throw guard
+    } catch (err) {
+      logNeverThrow(
+        this.logger,
+        'resize resolve: the Resizer is not ready — returning the safe empty decision',
+        err,
+      );
+      return { decision: { ready: [], missing: [] }, output: undefined };
+    }
+    return resolveImpl(this, services.dispatcher, opts);
   }
 
   /**
@@ -395,7 +431,18 @@ export class Resizer {
    * queued. NEVER throws (same guarantee as `resolve`): an internal error is `status: 'incomplete'`.
    */
   async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
-    return prewarmImpl(this, opts);
+    let services: Services;
+    try {
+      services = await this.#services(); // inside the never-throw guard
+    } catch (err) {
+      logNeverThrow(
+        this.logger,
+        'resize prewarm: the Resizer is not ready — nothing confirmed',
+        err,
+      );
+      return prewarmFailure(err, []);
+    }
+    return prewarmImpl(this, services.dispatcher, opts);
   }
 
   /**

@@ -8,7 +8,7 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from '../contracts/storage.ts';
-import { buildRequestKey } from '../enqueue.ts';
+import { buildRequestKey } from '../dispatcher.ts';
 import { DEFAULT_SCOPE, getPreviewIdentity } from '../images.ts';
 import { DISPATCH_LOCK_OWNER } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';

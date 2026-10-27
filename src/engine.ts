@@ -5,12 +5,19 @@
 // smaller than the box still gets a preview, made by the worker at the original's own size.
 // Every URL comes from the PURE, I/O-free storage.publicUrl of a stored preview. Imports the
 // Resizer TYPE only — resizer.ts imports resolveImpl as a value, so this cycle is runtime-free.
-import { enqueue, enqueueConfirmed } from './enqueue.ts';
+// The Resizer loads its parts before calling in, and passes its Dispatcher (undefined: no task
+// queue, eager only).
+import {
+  type Dispatcher,
+  type DispatchRequest,
+  noQueueResult,
+} from './dispatcher.ts';
 import {
   ResizeConfigError,
   ResizeMediaError,
   ResizeSetupError,
 } from './errors.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import {
   canonicalizeVariants,
   configuredFormats,
@@ -42,6 +49,7 @@ import type {
  */
 export async function resolveImpl(
   resizer: Resizer,
+  dispatcher: Dispatcher | undefined,
   opts: ResolveOpts,
 ): Promise<{ decision: ReadDecision; output: unknown }> {
   // Built incrementally so the never-throw catch can still return what was produced.
@@ -51,7 +59,6 @@ export async function resolveImpl(
   try {
     // Inside the guard, so a missing options object also returns the safe empty decision.
     const { media } = opts;
-    await resizer.ready(); // drivers given as functions load here, inside the never-throw guard
     const ctx = opts.ctx ?? {};
     const storage = resizer.storage; // required constructor option — always present (§17.3)
     const pipeline = opts.pipeline ?? 'default';
@@ -162,27 +169,26 @@ export async function resolveImpl(
       decision.missing = configured;
     }
 
-    // 9. Enqueue the missing variants. Default follows construction: a task queue means
-    // lazy mode (enqueue), none means eager-only (do not log-on-every-read).
-    const enqueueMissing = opts.enqueueMissing ?? resizer.tasks != null;
+    // 9. Enqueue the missing variants. Default follows construction: a task queue (so a
+    // Dispatcher) means lazy mode (enqueue), none means eager-only (do not log-on-every-read).
+    const enqueueMissing = opts.enqueueMissing ?? dispatcher !== undefined;
     if (enqueueMissing && decision.missing.length > 0) {
       if (media.original?.storageRef == null) {
         resizer.logger.info(
           `resize resolve: media ${mediaId} has no original storage ref — nothing enqueued`,
         );
-      } else if (!resizer.tasks) {
+      } else if (!dispatcher) {
         resizer.logger.warn(
           'resize resolve: missing previews but no task queue is configured — they stay placeholders (eager-only host? give the Resizer `tasks` for lazy mode)',
         );
       } else {
         try {
-          await enqueue(
-            resizer,
+          await dispatcher.enqueue({
             mediaId,
             pipeline,
-            decision.missing,
-            opts.queue ?? resizer.queue,
-          );
+            previews: decision.missing,
+            queue: opts.queue ?? resizer.queue,
+          });
         } catch (err) {
           // enqueue is internally guarded and should never reach here; belt-and-suspenders.
           resizer.logger.error(
@@ -207,7 +213,7 @@ export async function resolveImpl(
   } catch (err) {
     // Never-throw guarantee (layer 3): the read must not break on an internal error.
     logNeverThrow(
-      resizer,
+      resizer.logger,
       'resize resolve: unexpected internal error — returning the safe empty decision',
       err,
     );
@@ -226,42 +232,54 @@ export async function resolveImpl(
  */
 export async function prewarmImpl(
   resizer: Resizer,
+  dispatcher: Dispatcher | undefined,
   opts: PrewarmOpts,
 ): Promise<PrewarmResult> {
   // What prewarmStrict has expanded so far: an unexpected error reports it all as unconfirmed.
   const progress: PrewarmProgress = { requested: [] };
   try {
-    await resizer.ready(); // inside the never-throw guard
-    return await prewarmStrict(resizer, opts, progress);
+    return await prewarmStrict(resizer, dispatcher, opts, progress);
   } catch (err) {
     logNeverThrow(
-      resizer,
+      resizer.logger,
       'resize prewarm: unexpected internal error — nothing confirmed',
       err,
     );
-    return {
-      status: 'incomplete',
-      requested: [...progress.requested],
-      ready: [],
-      accepted: [],
-      notRequired: [],
-      unconfirmed: [...progress.requested],
-      tasks: [],
-      issues: [
-        {
-          code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
-          message: err instanceof Error ? err.message : String(err),
-          // An unusable media (e.g. no id) or a wiring/config mistake won't improve on retry.
-          retryable: !(
-            err instanceof ResizeMediaError ||
-            err instanceof ResizeConfigError ||
-            err instanceof ResizeSetupError
-          ),
-          previews: [...progress.requested],
-        },
-      ],
-    };
+    return prewarmFailure(err, progress.requested);
   }
+}
+
+/**
+ * Prewarm's result for an unexpected error: every variant `requested` so far is unconfirmed, with
+ * one RESIZE_ENQUEUE_INTERNAL_ERROR issue. Retryable unless the media is unusable or the wiring or
+ * config is wrong.
+ */
+export function prewarmFailure(
+  err: unknown,
+  requested: MissingPreview[],
+): PrewarmResult {
+  return {
+    status: 'incomplete',
+    requested: [...requested],
+    ready: [],
+    accepted: [],
+    notRequired: [],
+    unconfirmed: [...requested],
+    tasks: [],
+    issues: [
+      {
+        code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+        // An unusable media (e.g. no id) or a wiring/config mistake won't improve on retry.
+        retryable: !(
+          err instanceof ResizeMediaError ||
+          err instanceof ResizeConfigError ||
+          err instanceof ResizeSetupError
+        ),
+        previews: [...requested],
+      },
+    ],
+  };
 }
 
 interface PrewarmProgress {
@@ -271,6 +289,7 @@ interface PrewarmProgress {
 /** The pre-warm itself: every missing identity is either confirmed by a task receipt or explicit. */
 async function prewarmStrict(
   resizer: Resizer,
+  dispatcher: Dispatcher | undefined,
   opts: PrewarmOpts,
   progress: PrewarmProgress,
 ): Promise<PrewarmResult> {
@@ -456,13 +475,15 @@ async function prewarmStrict(
     });
   }
 
-  const attempt = await enqueueConfirmed(
-    resizer,
+  const request: DispatchRequest = {
     mediaId,
     pipeline,
-    required,
-    opts.queue ?? resizer.queue,
-  );
+    previews: required,
+    queue: opts.queue ?? resizer.queue,
+  };
+  const attempt = dispatcher
+    ? await dispatcher.enqueueConfirmed(request)
+    : noQueueResult(required);
   return finish({
     status: attempt.unconfirmed.length > 0 ? 'incomplete' : 'accepted',
     requested,
@@ -541,13 +562,4 @@ function logUnconfiguredTapFormats(
     [...new Set(unconfigured.map((variant) => variant?.format))],
     ' from a beforeEnqueue tap',
   );
-}
-
-/** Log a never-throw catch; a throwing host logger falls back to the console. */
-function logNeverThrow(resizer: Resizer, message: string, err: unknown): void {
-  try {
-    resizer.logger.error(message, err);
-  } catch {
-    console.error(message, err);
-  }
 }

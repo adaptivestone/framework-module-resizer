@@ -16,7 +16,7 @@ import type {
   NewTask,
   TaskEventHandler,
 } from '../../contracts/taskQueue.ts';
-import { buildRequestKey } from '../../enqueue.ts';
+import { buildRequestKey } from '../../dispatcher.ts';
 import {
   ResizeGenerateError,
   ResizeNoOriginalError,

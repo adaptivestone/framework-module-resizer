@@ -1,22 +1,21 @@
-// The enqueue half of the HTTP-side path (06 · §18). Turns the read's `missing`
-// variants into ONE queued task, collapsing a concurrent read fan-out into a single
-// dispatch via per-identity dispatch locks. Never throws into the caller's read: on any
-// task-queue failure it logs + releases the survivors' locks so a later read can retry.
-// Takes the Resizer type-only (the resizer.ts → engine.ts → enqueue.ts value chain never
-// closes back on this module at runtime — 05 · design delta).
+// The enqueue half of the read path. Turns the read's `missing` variants into ONE queued
+// task, collapsing a concurrent read fan-out into a single dispatch via per-identity dispatch
+// locks. Never throws into the caller's read: on any task-queue failure it logs + releases the
+// survivors' locks so a later read can retry. Prewarm's strict counterpart reports exactly what
+// was queued instead. A Dispatcher needs only the task queue, the lock store, the queue's timing,
+// its Resizer's name and a logger.
 import { createHash } from 'node:crypto';
 import type { LockStore } from './contracts/locks.ts';
-import type { NewTask } from './contracts/taskQueue.ts';
-import { ResizeSetupError } from './errors.ts';
+import type { NewTask, TaskQueue } from './contracts/taskQueue.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { DISPATCH_LOCK_OWNER, dispatchLockKey } from './lockKeys.ts';
-import { timingOf } from './queue.ts';
-import type { Resizer } from './resizer.ts';
+import type { QueueTiming } from './queue.ts';
 import type {
   EnqueueIssue,
   EnqueueReceipt,
   MissingPreview,
   PreviewScope,
+  ResizeLogger,
 } from './types.d.ts';
 
 /**
@@ -48,31 +47,59 @@ export function buildRequestKey(task: {
   return `v2:${createHash('sha256').update(json).digest('hex')}`;
 }
 
+export interface DispatcherDeps {
+  tasks: TaskQueue;
+  locks: LockStore;
+  timing: QueueTiming; // the task queue's validated timing (the dispatch lock TTL)
+  name: string; // the Resizer's name: part of every identity, lock key and task
+  logger: ResizeLogger;
+}
+
+/** What to queue: variants of one media and pipeline, on one queue. */
+export interface DispatchRequest {
+  mediaId: string;
+  pipeline: string;
+  previews: MissingPreview[];
+  queue: string;
+}
+
+/** Queues missing variants for one Resizer: it binds its deps to the two algorithms below. */
+export class Dispatcher {
+  readonly #deps: DispatcherDeps;
+
+  constructor(deps: DispatcherDeps) {
+    this.#deps = deps;
+  }
+
+  /** The read path's best-effort enqueue (see dispatch()). Never throws. */
+  enqueue(req: DispatchRequest): Promise<number> {
+    return dispatch(this.#deps, req);
+  }
+
+  /** Prewarm's enqueue: accepted only with a task receipt (see dispatchConfirmed()). */
+  enqueueConfirmed(req: DispatchRequest): Promise<ConfirmedEnqueueResult> {
+    return dispatchConfirmed(this.#deps, req);
+  }
+}
+
 /**
- * §18. Dedup `missing` by identity, acquire a per-variant dispatch lock, enqueue the
+ * Dedup `missing` by identity, acquire a per-variant dispatch lock, enqueue the
  * lock-winners as one task, and release those locks only on failure (a throw OR a
  * `taskId === null` soft failure). On success the locks are deliberately left to expire
  * — they collapse concurrent read fan-out into this single task.
  *
- * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead). Returns the number
- * of variants HANDED TO the task queue — the lock-winners on a successful enqueue. Every
- * non-success path returns 0: no task queue, no surviving lock, a throw, or a `taskId === null`
- * soft failure (the released locks let a later read retry, so nothing durable was queued).
+ * The read path's best-effort enqueue (prewarm uses dispatchConfirmed instead). Returns the
+ * number of variants HANDED TO the task queue — the lock-winners on a successful enqueue. Every
+ * non-success path returns 0: no surviving lock, a throw, or a `taskId === null` soft failure
+ * (the released locks let a later read retry, so nothing durable was queued).
  * resolve() ignores the count.
  */
-export async function enqueue(
-  resizer: Resizer,
-  mediaId: string,
-  pipeline: string,
-  missing: MissingPreview[],
-  queue: string,
+async function dispatch(
+  deps: DispatcherDeps,
+  req: DispatchRequest,
 ): Promise<number> {
-  // Defensive: resolve guarantees a task queue before calling us (§17 step 9), and ready() a lock
-  // store beside it, but never assume — bail before grabbing any lock we could not use.
-  const { tasks, locks } = resizer;
-  if (!tasks || !locks) {
-    return 0;
-  }
+  const { tasks, locks, timing, name, logger } = deps;
+  const { mediaId, pipeline, previews: missing, queue } = req;
 
   // 1. Canonicalize first so equivalent nested filter objects and list permutations
   // reach the task queue in a stable form. The dispatch lock remains per preview
@@ -80,9 +107,9 @@ export async function enqueue(
   // complete request key.
   const canonical = canonicalizeVariants(missing);
 
-  // 2. Dedup by identity — the one lookup/lock key, built one way (03 · Identity). The scope
-  // keeps another pipeline's (or Resizer's) dispatch lock from suppressing this request.
-  const scope: PreviewScope = { resizer: resizer.name, pipeline };
+  // 2. Dedup by identity — the one lookup/lock key, built one way. The scope keeps another
+  // pipeline's (or Resizer's) dispatch lock from suppressing this request.
+  const scope: PreviewScope = { resizer: name, pipeline };
   const byIdentity = new Map<string, MissingPreview>();
   for (const m of canonical) {
     const identity = getPreviewIdentity(scope, m.sizeKey, m.format, m.filters);
@@ -93,7 +120,7 @@ export async function enqueue(
 
   // 3. Acquire the dispatch lock per identity; keep only the winners (others are already
   // in flight from a concurrent read). Every dispatch lock has the one owner DISPATCH_LOCK_OWNER.
-  const dispatchTtlMs = timingOf(tasks).lockTtlMs.dispatch;
+  const dispatchTtlMs = timing.lockTtlMs.dispatch;
   const survivors: MissingPreview[] = [];
   const survivorLockKeys: string[] = [];
   const attempts = await acquireDispatchLocks(
@@ -106,7 +133,7 @@ export async function enqueue(
     // A rejecting acquire = this variant is NOT a survivor (log + continue); the other survivors
     // are unaffected and still reach the task queue. enqueue must never throw into the read.
     if (attempt.failed) {
-      resizer.logger.error(
+      logger.error(
         `resize enqueue: dispatch-lock acquire failed for ${attempt.lockKey} on media ${mediaId} — skipping this variant`,
         attempt.error,
       );
@@ -125,23 +152,23 @@ export async function enqueue(
   // locks so a later read retries instead of waiting out the TTL. NEVER throw to caller.
   try {
     const { taskId } = await tasks.add(
-      newTask(resizer.name, queue, mediaId, pipeline, survivors),
+      newTask(name, queue, mediaId, pipeline, survivors),
     );
     if (taskId === null) {
-      resizer.logger.error(
+      logger.error(
         `resize enqueue: the task queue returned a null taskId for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       );
-      await releaseAll(resizer, locks, survivorLockKeys);
+      await releaseAll(logger, locks, survivorLockKeys);
       return 0;
     }
     // A non-null taskId = success: the dispatch locks are intentionally held to their TTL.
     return survivors.length;
   } catch (err) {
-    resizer.logger.error(
+    logger.error(
       `resize enqueue: adding the task threw for media ${mediaId} — releasing ${survivorLockKeys.length} dispatch lock(s) so a later read retries`,
       err,
     );
-    await releaseAll(resizer, locks, survivorLockKeys);
+    await releaseAll(logger, locks, survivorLockKeys);
     return 0;
   }
 }
@@ -198,47 +225,42 @@ function groupVariants(
   return { unique, conflicts };
 }
 
+/** Prewarm without a task queue (an eager-only Resizer): nothing is queued, and no retry helps. */
+export function noQueueResult(
+  previews: MissingPreview[],
+): ConfirmedEnqueueResult {
+  const canonical = canonicalizeVariants(previews);
+  return {
+    accepted: [],
+    unconfirmed: canonical,
+    tasks: [],
+    issues: [
+      {
+        code: 'RESIZE_ENQUEUE_NO_QUEUE',
+        message: 'no task queue is configured',
+        retryable: false,
+        previews: canonical,
+      },
+    ],
+  };
+}
+
 /**
- * Strict counterpart to enqueue(). A dispatch lock is only an optimization: losing it is
+ * Strict counterpart to dispatch(). A dispatch lock is only an optimization: losing it is
  * never reported as accepted. Coverage is accepted only from a non-null enqueue receipt or
  * from an optional TaskQueue.findActive() proof.
  */
-export async function enqueueConfirmed(
-  resizer: Resizer,
-  mediaId: string,
-  pipeline: string,
-  missing: MissingPreview[],
-  queue: string,
+async function dispatchConfirmed(
+  deps: DispatcherDeps,
+  req: DispatchRequest,
 ): Promise<ConfirmedEnqueueResult> {
-  const taskQueue = resizer.tasks;
+  const { tasks: taskQueue, locks, timing, name, logger } = deps;
+  const { mediaId, pipeline, previews: missing, queue } = req;
   const canonical = canonicalizeVariants(missing);
-  if (!taskQueue) {
-    return {
-      accepted: [],
-      unconfirmed: canonical,
-      tasks: [],
-      issues: [
-        {
-          code: 'RESIZE_ENQUEUE_NO_QUEUE',
-          message: 'no task queue is configured',
-          retryable: false,
-          previews: canonical,
-        },
-      ],
-    };
-  }
-  // ready() rejects a task queue without a lock store, so prewarm never gets here without one.
-  const { locks } = resizer;
-  if (!locks) {
-    throw new ResizeSetupError(
-      `resize prewarm: Resizer '${resizer.name}' has a task queue but no \`locks\``,
-      { code: 'RESIZE_LOCKS_REQUIRED' },
-    );
-  }
 
   // Receipts from findActive belong to the same Resizer and pipeline (the task queue filters by
   // both), so one scope covers every identity built here.
-  const scope: PreviewScope = { resizer: resizer.name, pipeline };
+  const scope: PreviewScope = { resizer: name, pipeline };
   const requestedGroups = groupVariants(canonical, scope);
   const byIdentity = requestedGroups.unique;
   const conflicts = [...requestedGroups.conflicts.values()].flat();
@@ -257,7 +279,7 @@ export async function enqueueConfirmed(
   }
   const lockContended: MissingPreview[] = [];
   const lockFailed: MissingPreview[] = [];
-  const dispatchTtlMs = timingOf(taskQueue).lockTtlMs.dispatch;
+  const dispatchTtlMs = timing.lockTtlMs.dispatch;
 
   const attempts = await acquireDispatchLocks(
     locks,
@@ -267,7 +289,7 @@ export async function enqueueConfirmed(
   );
   for (const attempt of attempts) {
     if (attempt.failed) {
-      resizer.logger.error(
+      logger.error(
         `resize prewarm: dispatch-lock acquire failed for ${attempt.lockKey}`,
         attempt.error,
       );
@@ -286,7 +308,7 @@ export async function enqueueConfirmed(
   if (winners.length > 0) {
     try {
       const { taskId } = await taskQueue.add(
-        newTask(resizer.name, queue, mediaId, pipeline, winners),
+        newTask(name, queue, mediaId, pipeline, winners),
       );
       if (typeof taskId !== 'string' || taskId.length === 0) {
         issues.push({
@@ -295,7 +317,7 @@ export async function enqueueConfirmed(
           retryable: true,
           previews: winners,
         });
-        await releaseAll(resizer, locks, winnerKeys);
+        await releaseAll(logger, locks, winnerKeys);
       } else {
         const receipt = { taskId, previews: winners };
         tasks.push(receipt);
@@ -311,7 +333,7 @@ export async function enqueueConfirmed(
         }
       }
     } catch (error) {
-      resizer.logger.error(
+      logger.error(
         `resize prewarm: adding the task threw for media ${mediaId}`,
         error,
       );
@@ -321,14 +343,14 @@ export async function enqueueConfirmed(
         retryable: true,
         previews: winners,
       });
-      await releaseAll(resizer, locks, winnerKeys);
+      await releaseAll(logger, locks, winnerKeys);
     }
   }
 
   if (unresolved.size > 0 && taskQueue.findActive) {
     try {
       const confirmations = (
-        await taskQueue.findActive({ resizer: resizer.name, mediaId, pipeline })
+        await taskQueue.findActive({ resizer: name, mediaId, pipeline })
       ).map((receipt) => ({
         taskId: receipt.taskId,
         previews: canonicalizeVariants(receipt.previews ?? []),
@@ -371,7 +393,7 @@ export async function enqueueConfirmed(
         }
       }
     } catch (error) {
-      resizer.logger.error(
+      logger.error(
         `resize prewarm: active-task confirmation failed for media ${mediaId}`,
         error,
       );
@@ -486,7 +508,7 @@ async function acquireDispatchLocks(
 
 /** Best-effort release of every given dispatch lock; a failing release is logged, not thrown. */
 async function releaseAll(
-  resizer: Resizer,
+  logger: ResizeLogger,
   locks: LockStore,
   lockKeys: string[],
 ): Promise<void> {
@@ -494,7 +516,7 @@ async function releaseAll(
     try {
       await locks.release(key, DISPATCH_LOCK_OWNER);
     } catch (err) {
-      resizer.logger.error(
+      logger.error(
         `resize enqueue: failed to release dispatch lock ${key}`,
         err,
       );
