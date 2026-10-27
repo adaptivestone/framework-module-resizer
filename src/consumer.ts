@@ -1,7 +1,7 @@
 // The worker loop, the same for every TaskQueue backend: claiming, the lease heartbeat, the task
-// timeout, giving tasks back at shutdown, the retry policy (backoff, dead-lettering after
-// maxAttempts, non-retryable errors) and task events. Backends only implement the atomic TaskQueue
-// operations.
+// timeout, giving tasks back (at shutdown, and tasks the worker does not accept), the retry policy
+// (backoff, dead-lettering after maxAttempts, non-retryable errors) and task events. Backends only
+// implement the atomic TaskQueue operations.
 import type {
   ClaimedTask,
   LeasedTask,
@@ -46,6 +46,11 @@ function notRetryable(error: unknown): boolean {
 export interface ConsumerDeps {
   tasks: TaskQueue;
   timing: QueueTiming; // the queue's complete timing (timingOf)
+  // Optional, must not throw: whether this worker runs `task` (default: every task). A task it
+  // does not accept is never handled: it goes back unprocessed for another worker, before the
+  // maxAttempts check, so it is never dead-lettered here, and the loop waits idlePollMs before its
+  // next claim, so a queue that holds only such tasks is not claimed in a tight loop.
+  accepts?: (task: LeasedTask) => boolean;
   // Runs one task: resolving completes it, rejecting fails it. The signal aborts on a lost lease,
   // a timeout or the shutdown.
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>;
@@ -72,7 +77,7 @@ export class Consumer {
    * growing delay that resets after the next successful claim.
    */
   async run(queue: string, signal: AbortSignal): Promise<void> {
-    const { tasks, timing, logger } = this.#deps;
+    const { tasks, timing, accepts, logger } = this.#deps;
     const { leaseMs, idlePollMs, maxAttempts } = timing;
     let claimFailures = 0;
     while (!signal.aborted) {
@@ -103,6 +108,15 @@ export class Consumer {
         }
         continue;
       }
+      // Not a task this worker runs (see ConsumerDeps.accepts): back to the queue for another.
+      if (accepts && !accepts(toLeasedTask(task))) {
+        await this.#giveBack(
+          task,
+          `resize worker: task ${task.taskId} was given back: this worker does not accept it`,
+        );
+        await sleep(idlePollMs, signal);
+        continue;
+      }
       // Delivered more often than allowed (its workers kept crashing mid-task): dead, not retried.
       if (task.attempts > maxAttempts) {
         await this.#finish(
@@ -117,7 +131,7 @@ export class Consumer {
       }
       // The shutdown arrived while the claim ran (a claim that returns at once ignores the signal).
       if (signal.aborted) {
-        await this.#giveBack(task);
+        await this.#giveBackAtShutdown(task);
         break;
       }
       await this.#runTask(task, signal);
@@ -207,7 +221,7 @@ export class Consumer {
     } else if (signal.aborted && !leaseLost && !notRetryable(handlerError)) {
       // Stopped by the shutdown, not by its own failure: not an attempt. A non-retryable error
       // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
-      await this.#giveBack(task);
+      await this.#giveBackAtShutdown(task);
     } else {
       await this.#finish(task, handlerError);
     }
@@ -256,24 +270,31 @@ export class Consumer {
     }
   }
 
-  // The worker's shutdown stopped the task: it was not processed, so it goes back with no event,
-  // no backoff and, where the queue can release it, without counting the delivery. A queue without
-  // `release` retries it at once through `fail`; the delivery then counts, but it is never
-  // dead-lettered here.
-  async #giveBack(task: ClaimedTask): Promise<void> {
+  // The worker's shutdown stopped the task before or while it ran.
+  async #giveBackAtShutdown(task: ClaimedTask): Promise<void> {
+    await this.#giveBack(
+      task,
+      `resize worker: task ${task.taskId} was stopped by a worker shutdown`,
+      `resize worker: shutdown — task ${task.taskId} is back in the queue`,
+    );
+  }
+
+  // The task was not processed, so it goes back with no event, no backoff and, where the queue
+  // can release it, without counting the delivery. A queue without `release` retries it at once
+  // through `fail`, which records `reason`; the delivery then counts, but it is never dead-lettered
+  // here. `done`, when given, is logged once the task is back.
+  async #giveBack(
+    task: ClaimedTask,
+    reason: string,
+    done?: string,
+  ): Promise<void> {
     const { tasks, logger } = this.#deps;
     try {
       const held = tasks.release
         ? await tasks.release(task)
-        : await tasks.fail(
-            task,
-            { retryAt: new Date() },
-            `resize worker: task ${task.taskId} was stopped by a worker shutdown`,
-          );
-      if (held) {
-        logger.info(
-          `resize worker: shutdown — task ${task.taskId} is back in the queue`,
-        );
+        : await tasks.fail(task, { retryAt: new Date() }, reason);
+      if (held && done) {
+        logger.info(done);
       }
     } catch (err) {
       logger.error(

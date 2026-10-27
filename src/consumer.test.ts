@@ -17,33 +17,10 @@ import {
   ResizeNoOriginalError,
 } from './errors.ts';
 import { consume } from './testHelpers/consume.ts';
-import { MemoryTaskQueue } from './testHelpers/fakes.ts';
+import { MemoryTaskQueue, ReleasingTaskQueue } from './testHelpers/fakes.ts';
 import { timingOf } from './timing.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
-
-/** The in-memory queue with `release`: the task is due at once and the delivery is not counted. */
-class ReleasingTaskQueue extends MemoryTaskQueue {
-  readonly releaseCalls: string[] = [];
-
-  async release(task: ClaimedTask): Promise<boolean> {
-    this.releaseCalls.push(task.taskId);
-    const row = this.rows.find(
-      (r) =>
-        r.id === task.taskId &&
-        r.status === 'processing' &&
-        r.token === task.token,
-    );
-    if (!row) {
-      return false;
-    }
-    row.status = 'pending';
-    row.token = null;
-    row.availableAt = 0;
-    row.attempts -= 1;
-    return true;
-  }
-}
 
 // Like the worker on SIGTERM: the task signal aborts, the current variant ends, the remaining ones
 // are skipped, and the handler rejects as incomplete.
@@ -827,6 +804,113 @@ describe('Consumer shutdown', () => {
     assert.deepEqual(failCalls, ['task-1']); // fenced: the new holder keeps it
     assert.deepEqual(events, []);
     assert.equal(tasks.rows[0].token, 'another-worker');
+  });
+});
+
+describe('a task the Consumer does not accept', () => {
+  /**
+   * Run the loop with `accepts` returning false, until the second claim starts. Resolves with the
+   * gap between the two claims, the events, the logger's messages and the tasks `accepts` saw.
+   */
+  async function declineOnce(tasks: MemoryTaskQueue) {
+    const claimedAt: number[] = [];
+    const logged: unknown[][] = [];
+    const seen: LeasedTask[] = [];
+    let handled = 0;
+    const stop = new AbortController();
+    const realClaim = tasks.claim.bind(tasks);
+    tasks.claim = async (...args: Parameters<MemoryTaskQueue['claim']>) => {
+      claimedAt.push(Date.now());
+      if (claimedAt.length === 2) {
+        stop.abort();
+        return null;
+      }
+      return realClaim(...args);
+    };
+    const events: TaskEvent[] = [];
+    const record = (...args: unknown[]) => {
+      logged.push(args);
+    };
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await new Consumer({
+        tasks,
+        timing: timingOf(tasks),
+        accepts: (task) => {
+          seen.push(task);
+          return false;
+        },
+        handle: async () => {
+          handled += 1;
+        },
+        events: (event) => {
+          events.push(event);
+        },
+        logger: { info: record, warn: record, error: record },
+      }).run('default', stop.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(claimedAt.length, 2, 'the loop claimed again');
+    assert.equal(handled, 0, 'the handler never ran');
+    return { gapMs: claimedAt[1] - claimedAt[0], events, logged, seen };
+  }
+
+  const idlePollMs = 40;
+
+  test('is released unprocessed, even past maxAttempts, with no event or log; the next claim waits idlePollMs', async () => {
+    const tasks = new ReleasingTaskQueue({
+      timing: { ...fastTiming, idlePollMs },
+    });
+    await tasks.add(newTask());
+    // This claim is one more than maxAttempts allows, yet the task is not dead-lettered here.
+    tasks.rows[0].attempts = fastTiming.maxAttempts;
+    const { gapMs, events, logged, seen } = await declineOnce(tasks);
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    assert.equal(tasks.rows[0].status, 'pending');
+    assert.equal(
+      tasks.rows[0].attempts,
+      fastTiming.maxAttempts,
+      'the delivery is not counted',
+    );
+    assert.equal(tasks.rows[0].error, undefined);
+    assert.deepEqual(events, []);
+    assert.deepEqual(logged, []);
+    assert.equal(seen.length, 1);
+    assert.equal('token' in seen[0], false, 'accepts sees no lease token');
+    assert.ok(gapMs >= idlePollMs - 1, `claimed again after ${gapMs} ms`);
+  });
+
+  test('on a queue without release it is retried at once through fail: the delivery counts', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, idlePollMs },
+    });
+    await tasks.add(newTask());
+    tasks.rows[0].attempts = fastTiming.maxAttempts;
+    const { gapMs, events } = await declineOnce(tasks);
+    assert.equal(tasks.rows[0].status, 'pending', 'never dead-lettered here');
+    assert.equal(tasks.rows[0].attempts, fastTiming.maxAttempts + 1);
+    assert.ok(tasks.rows[0].availableAt <= Date.now(), 'no backoff');
+    assert.match(tasks.rows[0].error ?? '', /does not accept/);
+    assert.deepEqual(events, []);
+    assert.ok(gapMs >= idlePollMs - 1, `claimed again after ${gapMs} ms`);
+  });
+
+  test('a task it accepts runs as usual', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const stop = new AbortController();
+    await new Consumer({
+      tasks,
+      timing: timingOf(tasks),
+      accepts: () => true,
+      handle: async () => {
+        stop.abort();
+      },
+      logger: silent,
+    }).run('default', stop.signal);
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(tasks.releaseCalls, []);
   });
 });
 

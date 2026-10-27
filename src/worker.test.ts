@@ -7,7 +7,11 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
-import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
+import type {
+  LeasedTask,
+  TaskEvent,
+  TaskQueue,
+} from './contracts/taskQueue.ts';
 import {
   ResizeGenerateError,
   ResizeMediaError,
@@ -24,6 +28,7 @@ import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  ReleasingTaskQueue,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
@@ -383,26 +388,20 @@ const taskOf = (resizer: string) => ({
   requestKey: `${resizer}-request`,
 });
 
-test('runWorker({ resizers }) serves only the given Resizers', async () => {
-  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
-  const a = queuedResizer('a', tasks);
-  // Not listed, on its own task queue: it does not share a's queue, so the worker may start.
-  queuedResizer('c', new MemoryTaskQueue());
-  // A task of Resizer 'b', which only another process constructs. It is the older one, so it is
-  // claimed first.
-  await tasks.add(taskOf('b'));
-  await tasks.add(taskOf('a'));
-  const [bRow, aRow] = tasks.rows;
+/** Run the worker until `done()` (or 5 s), then stop it and wait for it to return. */
+async function workUntil(
+  opts: Omit<Parameters<typeof runWorker>[0], 'signal'>,
+  done: () => boolean,
+): Promise<void> {
   const stop = new AbortController();
-  const working = runWorker({
-    signal: stop.signal,
-    logger: silent,
-    resizers: [a],
-  });
+  const working = runWorker({ ...opts, signal: stop.signal });
   const until = Date.now() + 5000;
   try {
-    while (aRow.status !== 'completed') {
-      assert.ok(Date.now() < until, "a's task was never completed");
+    while (!done()) {
+      assert.ok(
+        Date.now() < until,
+        'the worker never reached the expected state',
+      );
       await new Promise((r) => setTimeout(r, 5));
     }
   } catch (err) {
@@ -413,9 +412,92 @@ test('runWorker({ resizers }) serves only the given Resizers', async () => {
   }
   stop.abort();
   await working;
-  assert.equal(bRow.status, 'pending');
-  assert.equal(bRow.attempts, 1);
-  assert.match(bRow.error ?? '', /Resizer 'b' is not served by this worker/);
+}
+
+// A second TaskQueue object over the same rows, as two MongoTaskQueue instances on one collection
+// are: the startup check compares task queue objects, so it cannot see that they share tasks.
+const sameRows = (tasks: ReleasingTaskQueue): TaskQueue => ({
+  add: (task) => tasks.add(task),
+  claim: (queue, leaseMs) => tasks.claim(queue, leaseMs),
+  renew: (task, leaseMs) => tasks.renew(task, leaseMs),
+  complete: (task) => tasks.complete(task),
+  fail: (task, next, error) => tasks.fail(task, next, error),
+  release: (task) => tasks.release(task),
+  getTiming: () => tasks.getTiming(),
+});
+
+test('a task of a Resizer the worker does not serve is given back, never run or dead-lettered, and logged once per Resizer', async () => {
+  const tasks = new ReleasingTaskQueue({
+    timing: { idlePollMs: 5, maxAttempts: 2 },
+  });
+  const a = queuedResizer('a', tasks);
+  let loads = 0;
+  queuedResizer('b', sameRows(tasks), async () => {
+    loads += 1;
+    return fakeMedia();
+  });
+  // Two tasks of 'b', older than a's, so they are claimed first.
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1', requestKey: 'b1' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b2', requestKey: 'b2' });
+  await tasks.add(taskOf('a'));
+  const [b1, b2, aRow] = tasks.rows;
+  const errors: unknown[][] = [];
+  await workUntil(
+    {
+      logger: { ...silent, error: (...args) => errors.push(args) },
+      resizers: [a],
+    },
+    // Each of b's tasks given back more often than maxAttempts allows deliveries.
+    () =>
+      aRow.status === 'completed' &&
+      tasks.releaseCalls.filter((id) => id === b1.id).length > 2 &&
+      tasks.releaseCalls.includes(b2.id),
+  );
+  for (const row of [b1, b2]) {
+    assert.equal(row.status, 'pending');
+    assert.equal(row.attempts, 0);
+    assert.equal(row.error, undefined);
+  }
+  assert.equal(loads, 0, "b's parts were never loaded");
+  const aboutB = errors.filter((args) =>
+    /Resizer 'b' is not served by this worker/.test(String(args[0])),
+  );
+  assert.equal(aboutB.length, 1, 'logged once for both tasks');
+  assert.match(String(aboutB[0][0]), /given back to the queue/);
+  assert.equal(aboutB[0].length, 1, 'the message alone');
+});
+
+test('runWorker({ resizers }) serves only the given Resizers; on a task queue without release, a task of another fails with RESIZE_NO_RESIZER', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  const a = queuedResizer('a', tasks);
+  // Not listed, on its own task queue: it does not share a's queue, so the worker may start.
+  queuedResizer('c', new MemoryTaskQueue());
+  // Two tasks of Resizer 'b', which only another process constructs. They are the older ones, so
+  // they are claimed first.
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1', requestKey: 'b1' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b2', requestKey: 'b2' });
+  await tasks.add(taskOf('a'));
+  const [b1, b2, aRow] = tasks.rows;
+  const errors: unknown[][] = [];
+  await workUntil(
+    {
+      logger: { ...silent, error: (...args) => errors.push(args) },
+      resizers: [a],
+    },
+    () => aRow.status === 'completed' && b1.attempts === 1 && b2.attempts === 1,
+  );
+  // Failed, so retried after a backoff (and dead-lettered after maxAttempts).
+  for (const row of [b1, b2]) {
+    assert.equal(row.status, 'pending');
+    assert.equal(row.attempts, 1);
+    assert.match(row.error ?? '', /Resizer 'b' is not served by this worker/);
+  }
+  const said = errors.filter((args) =>
+    /Resizer 'b' is not served by this worker.*cannot give tasks back, so its tasks fail with RESIZE_NO_RESIZER/.test(
+      String(args[0]),
+    ),
+  );
+  assert.equal(said.length, 1, 'logged once for both tasks');
 });
 
 test('runWorker({ resizers: [] }) fails with RESIZE_NO_RESIZER', async () => {

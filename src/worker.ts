@@ -8,13 +8,14 @@
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
 import { defaultQueueOptions } from './config/resize.ts';
-import { Consumer, type ConsumerDeps } from './consumer.ts';
+import { Consumer } from './consumer.ts';
 import type {
   LeasedTask,
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import {
   getResizer,
   listResizers,
@@ -118,9 +119,10 @@ export interface RunWorkerOptions {
   // CPU cores). Omitted: Sharp's settings are left as they are.
   sharp?: { concurrency: number; cache: boolean };
   // The Resizers to serve; default: every Resizer registered when the worker starts. Tasks and
-  // events are routed by name among these only: a task of any other Resizer fails with
-  // RESIZE_NO_RESIZER (it retries, then dead-letters), and its events are logged and dropped. A
-  // Resizer registered at start that shares a consumed task queue must be listed too
+  // events are routed by name among these only: a task of any other Resizer is never run here. It
+  // goes back to the queue for a worker that serves it, or, on a task queue without `release`,
+  // fails with RESIZE_NO_RESIZER (it retries, then dead-letters) and its events are logged and
+  // dropped. A Resizer registered at start that shares a consumed task queue must be listed too
   // (RESIZE_QUEUE_SHARED_RESIZER_UNLISTED), and two listed Resizers need two names.
   resizers?: Resizer[];
 }
@@ -201,18 +203,8 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     resizers.find((r) => r.name === task.resizer);
   const notServed = (task: LeasedTask) =>
     `Resizer '${task.resizer}' is not served by this worker (pass it in runWorker({ resizers }) or construct it before the worker starts)`;
-  // A task of a Resizer not served fails with RESIZE_NO_RESIZER, so it retries and dead-letters.
-  const handleOf =
-    (tasks: TaskQueue): ConsumerDeps['handle'] =>
-    async (task, taskOpts) => {
-      const owner = ownerOf(task);
-      if (!owner) {
-        throw new ResizeSetupError(`resize worker: ${notServed(task)}`, {
-          code: 'RESIZE_NO_RESIZER',
-        });
-      }
-      return runTask(owner, task, taskOpts, tasks);
-    };
+  // Events go to the observers of the task's Resizer. A task of a Resizer not served has events
+  // only on a task queue without `release`, where it fails: they are logged and dropped.
   const eventsOf =
     (tasks: TaskQueue): TaskEventHandler =>
     async (event, task, error) => {
@@ -240,6 +232,53 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       await processor.notify(event, task, error);
     };
 
+  // The Consumer of one task queue. A task of a Resizer not served is never run here: a task
+  // queue with `release` gives it back for a worker that serves it (`accepts`), even when other
+  // task queue objects over the same tasks hid it from the startup check; one without fails it
+  // with RESIZE_NO_RESIZER, so it retries and then dead-letters. Each such Resizer is logged once
+  // per task queue, not per task, by a log call that cannot throw.
+  const consumerOf = (tasks: TaskQueue): Consumer => {
+    const canGiveBack = typeof tasks.release === 'function';
+    const reported = new Set<string>();
+    const report = (task: LeasedTask) => {
+      if (!reported.has(task.resizer)) {
+        reported.add(task.resizer);
+        logNeverThrow(
+          logger,
+          canGiveBack
+            ? `resize worker: ${notServed(task)} — its tasks are given back to the queue for a worker that serves it`
+            : `resize worker: ${notServed(task)} — this task queue cannot give tasks back, so its tasks fail with RESIZE_NO_RESIZER (they retry, then dead-letter)`,
+        );
+      }
+    };
+    return new Consumer({
+      tasks,
+      // timingOf validates the queue's timing here, so invalid timing fails this loop.
+      timing: timingOf(tasks),
+      accepts: canGiveBack
+        ? (task) => {
+            if (ownerOf(task)) {
+              return true;
+            }
+            report(task);
+            return false;
+          }
+        : undefined,
+      handle: async (task, taskOpts) => {
+        const owner = ownerOf(task);
+        if (!owner) {
+          report(task);
+          throw new ResizeSetupError(`resize worker: ${notServed(task)}`, {
+            code: 'RESIZE_NO_RESIZER',
+          });
+        }
+        return runTask(owner, task, taskOpts, tasks);
+      },
+      events: eventsOf(tasks),
+      logger,
+    });
+  };
+
   if (opts.sharp) {
     sharp.concurrency(opts.sharp.concurrency);
     sharp.cache(opts.sharp.cache);
@@ -258,14 +297,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     await Promise.allSettled(
       [...queues].map(async (tasks) => {
         try {
-          // timingOf validates the queue's timing here, so invalid timing fails this loop.
-          await new Consumer({
-            tasks,
-            timing: timingOf(tasks),
-            handle: handleOf(tasks),
-            events: eventsOf(tasks),
-            logger,
-          }).run(queue, stop.signal);
+          await consumerOf(tasks).run(queue, stop.signal);
         } catch (err) {
           firstFailure ??= { error: err };
           stop.abort();

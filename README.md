@@ -158,20 +158,23 @@ module never creates them at runtime (`createResizeModels` sets `autoIndex: fals
 
 **The worker.** `runWorker({ signal, queue?, resizers?, logger?, sharp? })` serves the Resizers in
 `resizers`, by default every Resizer constructed in the process when it starts (an empty list
-rejects with `RESIZE_NO_RESIZER`). The list is resolved once, at start: a Resizer constructed
-later is not served, so its tasks fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) and
-its task events are logged and dropped. Before it claims anything, the worker readies and
-verifies every listed Resizer, so one that cannot start, or whose task queue cannot be used (no
-lock store, invalid timing), rejects `runWorker`. A list must name each Resizer once (two
-Resizers under one name: `RESIZE_DUPLICATE_RESIZER`), and it must include every Resizer of the
-process that uses a task queue the worker consumes: otherwise the worker would claim their tasks
-and dead-letter them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. Of a Resizer it
-does not serve it loads only the task queue, and it rejects the same way when that task queue
-cannot be loaded, since it may be a shared one. Resizers built only in other processes cannot be
-checked: construct every Resizer in the worker process too.
-`logger` receives the worker loop's own messages; a failed lock call (a release, the dead-letter
-cooldown) is logged through the owning Resizer's `logger`. Framework hosts run
-`npm run cli ResizeWorker`, which serves the Resizers that `src/resizer.ts` constructs.
+rejects with `RESIZE_NO_RESIZER`). The list is resolved once, at start: a Resizer constructed later
+is not served. A task for a Resizer the worker does not serve is never run there: it is given back
+to the queue for a worker that serves it, or, when the task queue cannot give tasks back (no
+`release`), retried: it fails with `RESIZE_NO_RESIZER`, then dead-letters after `maxAttempts`, and
+its task events are logged and dropped. The worker logs each such Resizer once. `SqsTaskQueue`
+counts every receive, so there a task given back often can still use up its `maxAttempts` and be
+dead-lettered by the worker that serves it. Before it claims anything, the worker readies and
+verifies every listed Resizer, so one that cannot start, or whose task queue cannot be used (no lock
+store, invalid timing), rejects `runWorker`. A list must name each Resizer once (two Resizers under
+one name: `RESIZE_DUPLICATE_RESIZER`), and it must include every Resizer of the process that uses a
+task queue the worker consumes: otherwise the worker would claim their tasks without running them,
+so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. For a Resizer it does not serve it loads
+only the task queue, and it rejects the same way when that task queue cannot be loaded, since it may
+be a shared one. Resizers built only in other processes cannot be checked: construct every Resizer
+in the worker process too. `logger` receives the worker loop's own messages; a failed lock call (a
+release, the dead-letter cooldown) is logged through the owning Resizer's `logger`. Framework hosts
+run `npm run cli ResizeWorker`, which serves the Resizers that `src/resizer.ts` constructs.
 
 ## Package exports
 
@@ -342,7 +345,9 @@ the owner in the `ResizeLock` row, and `FrameworkLockStore` in the framework `Lo
     it stopped, with no `onTaskFailed` / `onTaskDeadLettered` event and no backoff; a
     `ResizeError` with `retryable: false` (see [Operations](#operations)) is still dead-lettered
     with its event. Without `release`, the core retries the task at once through `fail`, which
-    counts.
+    counts. The worker also gives back, without running it, a task for a Resizer it does not
+    serve; without `release` such a task fails with `RESIZE_NO_RESIZER` (retried, then
+    dead-lettered).
   - Optionally `findActive({ resizer, mediaId, pipeline })` (lets `prewarm()` confirm work queued by
     another request), `servesQueue(queue)`, `getTiming()` and `verify()`.
 

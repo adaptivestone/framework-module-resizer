@@ -141,15 +141,17 @@
   (and the pre-release `{ queue: 1, status: 1, createdAt: 1 }`), and workers claim the task that
   became due first. Create it through your migration before or
   together with the new workers, then drop the old index.
-- The worker runs each task with the Resizer named in it; an unknown name rejects with
-  `RESIZE_NO_RESIZER` (the task retries, then dead-letters).
+- The worker runs each task with the Resizer named in it. A task for a Resizer the worker does
+  not serve is given back to the queue, without running it, for a worker that serves it (or
+  retried when the queue cannot give tasks back: it fails with `RESIZE_NO_RESIZER`, retries, then
+  dead-letters, and its events are logged and dropped). The worker logs each such Resizer once.
+  On SQS, which counts every receive, a task given back often can still use up `maxAttempts`.
 - The worker serves a fixed list of Resizers: `runWorker({ resizers })`, by default every Resizer
-  constructed in the process when it starts. The list is resolved once, at start: a task of a
-  Resizer constructed later fails with `RESIZE_NO_RESIZER` (retried, then dead-lettered) and its
-  events are logged and dropped. A listed Resizer that cannot start (its `ready()` or `verify()`
+  constructed in the process when it starts. The list is resolved once, at start: a Resizer
+  constructed later is not served. A listed Resizer that cannot start (its `ready()` or `verify()`
   rejects) makes `runWorker` reject before it claims anything. The list must include every
   Resizer of the process that uses a task queue the worker consumes (otherwise the worker would
-  claim their tasks and dead-letter them: `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`, also when an
+  claim their tasks without running them: `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`, also when an
   unlisted Resizer's task queue cannot be loaded, so it cannot be compared), and two listed
   Resizers need two names (`RESIZE_DUPLICATE_RESIZER`). `runWorker({ logger })` takes the
   worker loop's messages; failed lock calls (releases, the dead-letter cooldown) are logged through

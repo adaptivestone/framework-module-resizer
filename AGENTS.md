@@ -95,7 +95,8 @@ full box its steps were written for. To hand the private original to its owner, 
    carry an owner (`release(key, owner)` is a compare-and-delete). The core owns the queue logic
    (worker loop, retries, dead-letters, events); a `TaskQueue` only
    implements atomic `add` / `claim` / `renew` / `complete` / `fail` (optional `release` gives a
-   task back at worker shutdown; see the README contract). `claim` may wait for a task
+   task back at worker shutdown, and a task for a Resizer the worker does not serve; see the
+   README contract). `claim` may wait for a task
    (long poll), but must return once its `signal` aborts and never claim ahead of the call.
 
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
@@ -299,7 +300,8 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves one queue
   (`--queue`, default `'default'`) for every Resizer constructed in its process before the worker
   starts, with one consume loop per task queue (Resizers on the same backend share one), one task
-  at a time, each processed with its own Resizer.
+  at a time, each processed with its own Resizer. A task for a Resizer the worker does not serve
+  is given back to the queue (or retried when the queue cannot give tasks back).
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
@@ -357,9 +359,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config | optional peer not installed — install the packages named, see step 1 |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
-| `RESIZE_NO_RESIZER` in worker logs for a task | the worker does not serve that Resizer: it was not constructed in the worker process before the worker started (or not passed in `runWorker({ resizers })`) — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
+| `Resizer '…' is not served by this worker` in worker logs, or `RESIZE_NO_RESIZER` on a task | the worker does not serve that Resizer: it was not constructed in the worker process before the worker started (or not passed in `runWorker({ resizers })`). Its tasks are given back to the queue for a worker that serves it, or, when the queue cannot give tasks back, fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
 | `RESIZE_QUEUE_NOT_SERVED` at worker start | no task queue can consume that queue (e.g. `SqsTaskQueue` without it in `queues`) — add the queue URL, or start the worker for another queue |
-| `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED` at worker start | `runWorker({ resizers })` does not list a Resizer of the process that uses a task queue the worker consumes (the message names the queue and the Resizers); the worker would claim their tasks and dead-letter them — list them too, or give them their own task queue. When the message says a task queue failed to load, the worker could not compare that unlisted Resizer's task queue (the load error is the cause) — fix that task queue |
+| `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED` at worker start | `runWorker({ resizers })` does not list a Resizer of the process that uses a task queue the worker consumes (the message names the queue and the Resizers); the worker would claim their tasks without running them — list them too, or give them their own task queue. When the message says a task queue failed to load, the worker could not compare that unlisted Resizer's task queue (the load error is the cause) — fix that task queue |
 | `RESIZE_DUPLICATE_RESIZER` at worker start, "the `resizers` list names '…' twice" | two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |

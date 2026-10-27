@@ -1,6 +1,7 @@
 // Test-only fakes for the driver contracts: a MediaStore built from parts, in-memory locks that
 // honour owners, and a complete in-memory TaskQueue (the reference for the contract's semantics:
-// request de-duplication, oldest-first claims, fenced leases, retry times and dead tasks).
+// request de-duplication, oldest-first claims, fenced leases, retry times and dead tasks), and one
+// with `release`.
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
@@ -221,5 +222,34 @@ export class MemoryTaskQueue extends TaskQueue {
           r.task.pipeline === query.pipeline,
       )
       .map((r) => ({ taskId: r.id, previews: r.task.previews }));
+  }
+}
+
+/**
+ * The in-memory TaskQueue with `release`: the task is due again at once, behind the tasks already
+ * due (like the database queue, which claims the task that became due first), and the delivery is
+ * not counted. `releaseCalls` lists the task ids passed to `release`.
+ */
+export class ReleasingTaskQueue extends MemoryTaskQueue {
+  readonly releaseCalls: string[] = [];
+
+  async release(task: ClaimedTask): Promise<boolean> {
+    this.releaseCalls.push(task.taskId);
+    const index = this.rows.findIndex(
+      (r) =>
+        r.id === task.taskId &&
+        r.status === 'processing' &&
+        r.token === task.token,
+    );
+    if (index === -1) {
+      return false;
+    }
+    const [row] = this.rows.splice(index, 1);
+    row.status = 'pending';
+    row.token = null;
+    row.availableAt = 0;
+    row.attempts -= 1;
+    this.rows.push(row);
+    return true;
   }
 }

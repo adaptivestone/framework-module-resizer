@@ -88,10 +88,12 @@ export abstract class TaskQueue {
   ): Promise<boolean>;
 
   /**
-   * Optional: give a claimed task back unprocessed (the worker is shutting down). It becomes
-   * claimable at once, and this delivery should not count as an attempt; a backend that cannot take
-   * a delivery back (SQS counts receives) may still count it. `false` means the lease was already
-   * lost. Without it the core retries the task at once through `fail`, so the delivery counts.
+   * Optional: give a claimed task back unprocessed (the worker is shutting down, or the task is of
+   * a Resizer it does not serve). It becomes claimable at once, and this delivery should not count
+   * as an attempt; a backend that cannot take a delivery back (SQS counts receives) may still
+   * count it. `false` means the lease was already lost. Without it the core retries a stopped task
+   * at once through `fail`, so the delivery counts, and a task of a Resizer the worker does not
+   * serve fails with RESIZE_NO_RESIZER (it retries, then dead-letters).
    */
   release?(task: ClaimedTask): Promise<boolean>;
 
