@@ -661,6 +661,32 @@ describe('processTask — source handling', () => {
     assert.equal(uploads.length, 0);
   });
 
+  test('a beforeSteps result over the pixel limits is RESIZE_SOURCE_TOO_LARGE with retryable: false', async () => {
+    installApp({ limits: { sourcePixels: 4000 } }); // redPng is 64×48 = 3072 px
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(mediaDoc());
+    const grown = await sharp({
+      create: { width: 100, height: 100, channels: 3, background: '#000000' },
+    })
+      .png()
+      .toBuffer();
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+      pipelines: { default: { beforeSteps: [async () => grown] } },
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeMediaError &&
+        err.code === 'RESIZE_SOURCE_TOO_LARGE' &&
+        /processed source exceeds/.test(err.message) &&
+        err.retryable === false,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('inputPixels < source → rejected consistently at the guarded decode (orientation-6 source)', async () => {
     // inputPixels below the source pixel count, but sourcePixels stays huge (default) so the
     // sourcePixels guard does NOT catch it — every worker sharp() call must carry

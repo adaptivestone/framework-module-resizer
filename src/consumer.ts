@@ -35,15 +35,12 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
   };
 }
 
-// The thrower says when no retry can help (`retryable: false`), so the task is dead-lettered at
-// once instead of being downloaded and decoded again. Errors cross process boundaries as plain
-// objects, so read the field, never the class.
+// A ResizeError says when no retry can help (`retryable: false`), so the task is dead-lettered at
+// once instead of being downloaded and decoded again. The brand, not `instanceof`, identifies one:
+// it also matches an error from a duplicate copy of this package. Errors from other libraries are
+// retried, even with a `retryable` field of their own (an AWS SDK v2 4xx carries one).
 function notRetryable(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { retryable?: unknown }).retryable === false
-  );
+  return ResizeError.isResizeError(error) && error.retryable === false;
 }
 
 export interface ConsumerDeps {

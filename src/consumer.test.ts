@@ -281,17 +281,18 @@ describe('Consumer', () => {
     );
   });
 
-  test('a plain object with retryable: false is dead on the first failure', async () => {
+  test('a ResizeError from a duplicate copy of the package with retryable: false is dead on the first failure', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
     const events = await runUntil(
       tasks,
       async () => {
-        // What an error looks like after crossing a process boundary: no class, only fields.
+        // Another copy's class, so not `instanceof` this one's ResizeError: only the shared brand.
         throw {
+          [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
           code: 'RESIZE_ANY',
           retryable: false,
-          message: 'crossed a process boundary',
+          message: 'thrown by a duplicate copy',
         };
       },
       () => tasks.rows[0].status === 'dead',
@@ -301,6 +302,50 @@ describe('Consumer', () => {
     assert.deepEqual(
       events.map((e) => e.event),
       ['deadLettered'],
+    );
+  });
+
+  test('an error from another library with retryable: false is retried', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 60_000, max: 60_000 } },
+    });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        // E.g. an AWS SDK v2 error: its own `retryable` field means something else.
+        throw Object.assign(new Error('AccessDenied'), {
+          code: 'AccessDenied',
+          retryable: false,
+        });
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+  });
+
+  test('a plain object with retryable: false and no ResizeError brand is retried', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 60_000, max: 60_000 } },
+    });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw {
+          code: 'RESIZE_ANY',
+          retryable: false,
+          message: 'fields only',
+        };
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
     );
   });
 
@@ -470,20 +515,27 @@ describe('Consumer', () => {
       () => starts.length >= script.length + 1,
       { ...silent, error: (msg: unknown) => errors.push(String(msg)) },
     );
+    // The delays the loop chose: 10, 20, 40, 80, then capped at 10 × idlePollMs = 100 (uncapped it
+    // would be 160), and 10 again after the successful (empty) claim. The cap and the reset are read
+    // from these, not from the wall clock: a loaded machine runs a timer late, never early.
+    assert.deepEqual(
+      errors.map((e) =>
+        /\((\d+) in a row\) — retrying in (\d+) ms/.exec(e)?.slice(1),
+      ),
+      [
+        ['1', '10'],
+        ['2', '20'],
+        ['3', '40'],
+        ['4', '80'],
+        ['5', '100'],
+        ['1', '10'],
+      ],
+    );
+    // ...and the loop waited at least that long.
     const waitAfter = (i: number) => starts[i + 1] - ends[i];
-    // 10, 20, 40, 80, then capped at 10 × idlePollMs = 100
     assert.ok(waitAfter(2) >= 38, `third retry waited ${waitAfter(2)} ms`);
     assert.ok(waitAfter(3) >= 78, `fourth retry waited ${waitAfter(3)} ms`);
     assert.ok(waitAfter(4) >= 98, `fifth retry waited ${waitAfter(4)} ms`);
-    assert.ok(waitAfter(4) < 160, `the backoff is capped (${waitAfter(4)} ms)`);
-    // After the successful (empty) claim the next failure starts again from idlePollMs.
-    assert.ok(
-      waitAfter(6) < 60,
-      `reset after success: waited ${waitAfter(6)} ms`,
-    );
-    assert.match(errors[0], /failed \(1 in a row\) — retrying in 10 ms/);
-    assert.match(errors[4], /failed \(5 in a row\) — retrying in 100 ms/);
-    assert.match(errors[5], /failed \(1 in a row\)/);
   });
 
   test('an empty claim that already waited (a long poll) is retried at once; a quick one waits idlePollMs', async () => {
@@ -614,7 +666,13 @@ describe('Consumer shutdown', () => {
         new Promise<void>((_resolve, reject) => {
           signal.addEventListener(
             'abort',
-            () => reject({ code: 'RESIZE_ANY', retryable: false }),
+            () =>
+              reject(
+                new ResizeMediaError('resize: unusable source', {
+                  code: 'RESIZE_ANY',
+                  retryable: false,
+                }),
+              ),
             { once: true },
           );
         }),
@@ -625,6 +683,25 @@ describe('Consumer shutdown', () => {
     );
     assert.equal(tasks.rows[0].status, 'dead');
     assert.deepEqual(tasks.releaseCalls, []);
+  });
+
+  test('an unbranded retryable: false during shutdown is given back like any stopped task', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const events = await shutDownMidTask(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => reject({ code: 'AccessDenied', retryable: false }),
+            { once: true },
+          );
+        }),
+    );
+    assert.deepEqual(events, []);
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    assert.equal(tasks.rows[0].status, 'pending');
   });
 
   test('a queue without release retries the stopped task at once, with no event and never dead', async () => {

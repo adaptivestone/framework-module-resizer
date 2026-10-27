@@ -5,16 +5,18 @@
 // then answers the only question a catch block actually has — what do I DO about it:
 //   ResizeSetupError    — the wiring is wrong; fix the bootstrap code
 //   ResizeConfigError   — host config is invalid; crash at boot
-//   ResizeMediaError    — this record is unusable; skip it, do not retry
+//   ResizeMediaError    — this record is unusable; skip it in the request path (the task queue
+//                         still retries it unless it carries `retryable: false`)
 //   ResizeGenerateError — the operation produced nothing
 //   ResizeOriginalError — uploaded original bytes are invalid/unsupported/outside policy
 //   ResizeStorageError  — transient I/O; a retry may help
 //   ResizeSecurityError — a refusal (traversal, cross-bucket); never retry, log loudly
 //
-// The subclass guides a host's catch block; the task queue retries every error unless it carries
-// `retryable: false`. That per-throw field means another delivery of the same task cannot
-// succeed, so the consumer dead-letters it at once. It is a plain field, not the class, because
-// errors reach the consumer as plain objects across process boundaries.
+// The subclass guides a host's catch block; the task queue retries every error unless it is a
+// ResizeError carrying `retryable: false`. That per-throw field means another delivery of the
+// same task cannot succeed, so the consumer dead-letters it at once. The consumer reads the field
+// on an error with the brand below, never by class, so an error from a duplicate copy of this
+// package counts too; an error from another library is retried whatever fields it carries.
 
 /**
  * Brand for cross-copy identification. `instanceof` silently returns FALSE when two copies of
@@ -98,7 +100,11 @@ export class ResizeSecurityError extends ResizeError {
   }
 }
 
-/** This media record is unusable — skip it. Retrying the same document changes nothing. */
+/**
+ * This media record is unusable — skip it in the request path. A queued task that fails with one
+ * is retried unless the thrower sets `retryable: false` (as the source and SVG checks do, when the
+ * same document can never succeed).
+ */
 export class ResizeMediaError extends ResizeError {
   readonly mediaId: string | undefined;
 

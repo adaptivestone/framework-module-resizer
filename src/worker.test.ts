@@ -12,7 +12,12 @@ import type {
   TaskEvent,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-import { ResizeMediaError, ResizeSetupError } from './errors.ts';
+import {
+  ResizeGenerateError,
+  ResizeMediaError,
+  ResizeSecurityError,
+  ResizeSetupError,
+} from './errors.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -25,7 +30,12 @@ import {
   memoryLocks,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
-import type { MediaLike, QueueTimingOptions, SizeInput } from './types.d.ts';
+import type {
+  MediaLike,
+  Preview,
+  QueueTimingOptions,
+  SizeInput,
+} from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
@@ -196,6 +206,154 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
   assert.equal(downloads, 1);
   assert.equal(uploads, 0);
   assert.deepEqual(media.previews, []);
+});
+
+/** Consume `tasks` with processTask until the first task event (or 5 s), and return the events. */
+async function firstEvent(tasks: MemoryTaskQueue) {
+  const events: { event: TaskEvent; error?: unknown }[] = [];
+  const stop = new AbortController();
+  const timeout = setTimeout(() => stop.abort(), 5000);
+  try {
+    await consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => processTask(task, opts, tasks),
+      onEvent: (event, _task, error) => {
+        events.push({ event, error });
+        stop.abort();
+      },
+      logger: silent,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+  return events;
+}
+
+const webp10 = {
+  sizeKey: '10x10',
+  format: 'webp',
+  requestedWidth: 10,
+  requestedHeight: 10,
+};
+
+test('a storage.download security refusal is dead-lettered on its first delivery', async () => {
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+  });
+  let downloads = 0;
+  new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    storage: {
+      download: async () => {
+        downloads += 1;
+        throw new ResizeSecurityError('resize: the ref leaves the bucket');
+      },
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({
+      load: async () => ({
+        id: 'm1',
+        original: { storageRef: { key: '../o' } },
+        previews: [],
+      }),
+    }),
+    locks: memoryLocks(),
+    tasks,
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [webp10],
+    requestKey: 'security',
+  });
+  const events = await firstEvent(tasks);
+  assert.deepEqual(
+    events.map((e) => e.event),
+    ['deadLettered'],
+  );
+  assert.ok(events[0].error instanceof ResizeSecurityError);
+  assert.equal(events[0].error.retryable, false);
+  assert.equal(tasks.rows[0].status, 'dead');
+  assert.equal(tasks.rows[0].attempts, 1);
+  assert.equal(downloads, 1);
+});
+
+test('a variant error with retryable: false fails only its variant; the task fails with the retryable RESIZE_WORKER_INCOMPLETE', async () => {
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 60_000, max: 60_000 } },
+  });
+  const media: MediaLike = {
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [],
+  };
+  const stored = new Map<string, Preview[]>();
+  new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    storage: {
+      download: async () => png,
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({ load: async () => media, previews: stored }),
+    locks: memoryLocks(),
+    tasks,
+    pipelines: {
+      default: {
+        variantSteps: [
+          async (img, { variant }) => {
+            if (variant.sizeKey === '20x20') {
+              throw new ResizeMediaError(
+                'resize: this variant cannot be made',
+                {
+                  code: 'TEST_VARIANT_REFUSED',
+                  retryable: false,
+                },
+              );
+            }
+            return img;
+          },
+        ],
+      },
+    },
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [
+      webp10,
+      {
+        sizeKey: '20x20',
+        format: 'webp',
+        requestedWidth: 20,
+        requestedHeight: 20,
+      },
+    ],
+    requestKey: 'variant-refused',
+  });
+  const events = await firstEvent(tasks);
+  assert.deepEqual(
+    events.map((e) => e.event),
+    ['failed'],
+  );
+  assert.ok(events[0].error instanceof ResizeGenerateError);
+  assert.equal(events[0].error.code, 'RESIZE_WORKER_INCOMPLETE');
+  assert.equal(events[0].error.retryable, true);
+  assert.equal(tasks.rows[0].status, 'pending');
+  assert.equal(tasks.rows[0].attempts, 1);
+  // The other variant is stored.
+  assert.deepEqual(
+    (stored.get('m1') ?? []).map((preview) => preview.sizeKey),
+    ['10x10'],
+  );
 });
 
 // A Resizer named `name` on `tasks`. Its default media store has no docs, so each of its tasks is a
