@@ -4013,7 +4013,10 @@ describe('one worker serves every Resizer', () => {
       !logs.error.some((l) => String(l[0]).includes('event handler failed')),
     );
     assert.equal(tasks.rows[0].status, 'pending');
-    assert.match(tasks.rows[0].error ?? '', /no Resizer named 'ghost'/);
+    assert.match(
+      tasks.rows[0].error ?? '',
+      /Resizer 'ghost' is not served by this worker/,
+    );
   });
 
   test('a Resizer without a lock store cannot process a queued task', async () => {

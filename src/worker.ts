@@ -8,14 +8,13 @@
 // `worker.enabled` switch, process signals and the app logger.
 import sharp from 'sharp';
 import { defaultQueueOptions } from './config/resize.ts';
-import { Consumer } from './consumer.ts';
+import { Consumer, type ConsumerDeps } from './consumer.ts';
 import type {
   LeasedTask,
   TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
-import { Registry } from './registry.ts';
 import { getResizer, listResizers, type Resizer } from './resizer.ts';
 import { timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
@@ -72,13 +71,8 @@ export interface RunWorkerOptions {
 export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   const queue = opts.queue ?? 'default';
   const logger = opts.logger ?? console;
-  // The served Resizers by name, taken once now, so one constructed later is not served. The same
-  // Resizer listed twice counts once.
-  const served = new Registry<Resizer>();
-  for (const resizer of new Set(opts.resizers ?? listResizers())) {
-    served.register(resizer);
-  }
-  const resizers = served.list();
+  // The served Resizers, taken once now, so one constructed later is not served.
+  const resizers = [...(opts.resizers ?? listResizers())];
   if (resizers.length === 0) {
     throw new ResizeSetupError(
       opts.resizers
@@ -126,20 +120,36 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   // Dead-letter cooldowns run beside the loop, so they never delay it or the observers; the worker
   // waits for the pending ones before it returns.
   const cooldowns = new Set<Promise<void>>();
-  // Events are routed by the task's Resizer name among the served Resizers.
+  // Tasks and events are routed by the task's Resizer name among the served Resizers. Any other
+  // name, constructed in this process or not, is not served.
+  const ownerOf = (task: LeasedTask) =>
+    resizers.find((r) => r.name === task.resizer);
+  const notServed = (task: LeasedTask) =>
+    `Resizer '${task.resizer}' is not served by this worker (pass it in runWorker({ resizers }) or construct it before the worker starts)`;
+  // A task of a Resizer not served fails with RESIZE_NO_RESIZER, so it retries and dead-letters.
+  const handleOf =
+    (tasks: TaskQueue): ConsumerDeps['handle'] =>
+    async (task, taskOpts) => {
+      const owner = ownerOf(task);
+      if (!owner) {
+        throw new ResizeSetupError(`resize worker: ${notServed(task)}`, {
+          code: 'RESIZE_NO_RESIZER',
+        });
+      }
+      return runTask(owner, task, taskOpts, tasks);
+    };
   const eventsOf =
     (tasks: TaskQueue): TaskEventHandler =>
     async (event, task, error) => {
-      const owner = resizers.find((r) => r.name === task.resizer);
+      const owner = ownerOf(task);
       if (!owner) {
         logger.error(
-          `resize worker: ${event} for task ${task.taskId} of unknown Resizer '${task.resizer}'`,
+          `resize worker: ${event} for task ${task.taskId} dropped — ${notServed(task)}`,
         );
         return;
       }
-      // The Processor exists once the Resizer is ready. A served Resizer was readied and verified
-      // at startup, so this returns at once; it stays for the registry-routed processTask entry,
-      // whose Resizers no startup readied.
+      // A served Resizer was readied at startup, so this resolves at once; it is kept so the
+      // Processor is never read before ready().
       await owner.ready();
       const { processor } = owner;
       if (event === 'deadLettered') {
@@ -177,9 +187,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
           await new Consumer({
             tasks,
             timing: timingOf(tasks),
-            // An unknown name throws getResizer's RESIZE_NO_RESIZER.
-            handle: async (task, taskOpts) =>
-              runTask(served.get(task.resizer), task, taskOpts, tasks),
+            handle: handleOf(tasks),
             events: eventsOf(tasks),
             logger,
           }).run(queue, stop.signal);

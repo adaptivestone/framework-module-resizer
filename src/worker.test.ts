@@ -259,7 +259,7 @@ test('runWorker({ resizers }) serves only the given Resizers', async () => {
   await working;
   assert.equal(bRow.status, 'pending');
   assert.equal(bRow.attempts, 1);
-  assert.match(bRow.error ?? '', /no Resizer named 'b'/);
+  assert.match(bRow.error ?? '', /Resizer 'b' is not served by this worker/);
 });
 
 test('runWorker({ resizers: [] }) fails with RESIZE_NO_RESIZER', async () => {
@@ -268,11 +268,13 @@ test('runWorker({ resizers: [] }) fails with RESIZE_NO_RESIZER', async () => {
     () =>
       runWorker({ signal: AbortSignal.abort(), logger: silent, resizers: [] }),
     (err: unknown) =>
-      err instanceof ResizeSetupError && err.code === 'RESIZE_NO_RESIZER',
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_NO_RESIZER' &&
+      /the `resizers` list is empty/.test(err.message),
   );
 });
 
-test('runWorker serves a Resizer listed twice once', async () => {
+test('runWorker accepts a Resizer listed twice', async () => {
   const a = queuedResizer('default', new MemoryTaskQueue());
   await runWorker({
     signal: AbortSignal.abort(),
@@ -527,7 +529,9 @@ describe('dead-letter cooldown', () => {
     await working;
     assert.deepEqual(locks.calls, []);
     assert.ok(
-      t.errors.some((args) => /unknown Resizer 'ghost'/.test(String(args[0]))),
+      t.errors.some((args) =>
+        /Resizer 'ghost' is not served by this worker/.test(String(args[0])),
+      ),
     );
   });
 
@@ -569,13 +573,16 @@ describe('dead-letter cooldown', () => {
     await working;
     assert.equal(row.status, 'pending');
     assert.equal(row.attempts, 1);
-    assert.match(row.error ?? '', /no Resizer named 'late'/);
+    assert.match(
+      row.error ?? '',
+      /Resizer 'late' is not served by this worker/,
+    );
     assert.deepEqual(observed, []);
     assert.equal(loads, 0, 'the worker never readied it');
     assert.ok(
       t.errors.some((args) =>
         String(args[0]).includes(
-          `failed for task ${taskId} of unknown Resizer 'late'`,
+          `failed for task ${taskId} dropped — Resizer 'late' is not served by this worker`,
         ),
       ),
     );
