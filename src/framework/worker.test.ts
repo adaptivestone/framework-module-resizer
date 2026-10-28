@@ -4,8 +4,9 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import defaultResizeConfig, { defaultWorkerOptions } from '../config/resize.ts';
+import defaultResizeConfig from '../config/resize.ts';
 import { resetResizerForTests } from '../resizer.ts';
+import { defaultWorkerOptions } from './defaults.ts';
 import { runResizeWorker } from './worker.ts';
 
 const installApp = (enabled: boolean) => {

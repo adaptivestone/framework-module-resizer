@@ -3,7 +3,6 @@
 // The file holds the image settings (passed to the Resizer) plus what only this adapter reads:
 // `mediaModelName`, `storage`, `queue` (the task queue and its timing) and `worker` (the worker
 // command). Its `coordination` section goes to the Resizer as it is: the core validates it.
-import { defaultWorkerOptions } from '../config/resize.ts';
 import { ResizeConfigError } from '../errors.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import { fillTiming, LOCK_TTL_MOVES } from '../timing.ts';
@@ -17,6 +16,7 @@ import type {
   ResizeConfig,
 } from '../types.d.ts';
 import { getApp } from './app.ts';
+import { defaultWorkerOptions } from './defaults.ts';
 
 /** A validated framework config file, split by who reads each part. */
 export interface ResolvedFrameworkConfig {

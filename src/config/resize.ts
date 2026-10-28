@@ -1,15 +1,13 @@
 import type {
   CoordinationOptions,
-  FrameworkResizeConfig,
-  FrameworkWorkerConfig,
   QueueTimingOptions,
   ResizeConfig,
 } from '../types.d.ts';
 
-// Canonical defaults, pure data. The default export is the core image config (what
-// `new Resizer({ config })` takes). Framework hosts spread `defaultFrameworkResizeConfig`, which adds
-// the `coordination` and `worker` sections, and set `mediaModelName`, `storage` and `queue`
-// themselves; the framework applies resize.<NODE_ENV>.ts overrides.
+// The core defaults for a plain `new Resizer()`, pure data: the default export is the image config
+// (what `new Resizer({ config })` takes), `defaultQueueOptions` fills a task queue's missing timing
+// and `defaultCoordination` a Resizer's missing coordination. Framework hosts import
+// `defaultFrameworkResizeConfig` and `defaultWorkerOptions` from …/framework.js instead.
 const defaultResizeConfig: ResizeConfig = {
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
@@ -51,30 +49,5 @@ export const defaultCoordination = {
   gateTtlMs: 600_000,
   cooldownMs: 600_000,
 } satisfies Required<CoordinationOptions>;
-
-/** Framework worker command defaults. */
-export const defaultWorkerOptions: FrameworkWorkerConfig = {
-  enabled: false,
-  sharpConcurrency: 1,
-  sharpCache: false,
-};
-
-/**
- * What a framework host's config file spreads; it adds `mediaModelName`, `storage` and (for
- * background generation) `queue`. `coordination` and `worker` are typed as present, so
- * `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` stays a complete section
- * under strict TypeScript.
- */
-export const defaultFrameworkResizeConfig: Omit<
-  FrameworkResizeConfig,
-  'mediaModelName' | 'worker' | 'coordination'
-> & {
-  worker: FrameworkWorkerConfig;
-  coordination: Required<CoordinationOptions>;
-} = {
-  ...defaultResizeConfig,
-  coordination: defaultCoordination,
-  worker: defaultWorkerOptions,
-};
 
 export default defaultResizeConfig;

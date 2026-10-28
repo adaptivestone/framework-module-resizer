@@ -9,6 +9,7 @@ import {
   getResizeConfig,
   resolveFrameworkConfig,
 } from '../framework/config.ts';
+import { defaultWorkerOptions } from '../framework/defaults.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import {
   makeImageConfig,
@@ -16,9 +17,7 @@ import {
 } from '../testHelpers/resizeConfig.ts';
 import defaultResizeConfig, {
   defaultCoordination,
-  defaultFrameworkResizeConfig,
   defaultQueueOptions,
-  defaultWorkerOptions,
 } from './resize.ts';
 
 function install(config: unknown) {
@@ -44,14 +43,11 @@ describe('getResizeConfig', () => {
       'gif',
       'svg',
     ]);
-    // The core config holds image settings only; the framework defaults add the worker section.
-    // Storage and the queue are the host's choice: no defaults (no queue = eager only).
+    // The core config holds image settings only. Storage and the queue are the host's choice:
+    // no defaults (no queue = eager only).
     assert.equal('queue' in defaultResizeConfig, false);
     assert.equal('worker' in defaultResizeConfig, false);
     assert.equal(defaultResizeConfig.concurrency, 4);
-    assert.equal(defaultFrameworkResizeConfig.worker.enabled, false);
-    assert.equal('queue' in defaultFrameworkResizeConfig, false);
-    assert.equal('storage' in defaultFrameworkResizeConfig, false);
   });
 
   test('returns the final framework config without merging another defaults object', () => {
@@ -297,14 +293,38 @@ describe('config split: core validation vs framework loading', () => {
     ]);
   });
 
-  test('defaultFrameworkResizeConfig carries the coordination defaults', () => {
-    assert.deepEqual(
-      defaultFrameworkResizeConfig.coordination,
-      defaultCoordination,
-    );
+  test('…/config/resize.js holds only the core defaults', async () => {
+    const mod = await import('./resize.ts');
+    assert.deepEqual(Object.keys(mod).sort(), [
+      'default',
+      'defaultCoordination',
+      'defaultQueueOptions',
+    ]);
     assert.deepEqual(defaultCoordination, {
       gateTtlMs: 600_000,
       cooldownMs: 600_000,
+    });
+  });
+
+  test('defaultFrameworkResizeConfig is the per-Resizer defaults: the image settings, no process-wide section', async () => {
+    const framework = await import('../framework/index.ts');
+    assert.deepEqual(
+      framework.defaultFrameworkResizeConfig,
+      defaultResizeConfig,
+    );
+    for (const key of [
+      'worker',
+      'coordination',
+      'queue',
+      'queues',
+      'storage',
+    ]) {
+      assert.equal(key in framework.defaultFrameworkResizeConfig, false, key);
+    }
+    assert.deepEqual(framework.defaultWorkerOptions, {
+      enabled: false,
+      sharpConcurrency: 1,
+      sharpCache: false,
     });
   });
 

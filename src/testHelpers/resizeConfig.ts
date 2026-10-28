@@ -1,6 +1,8 @@
-import defaultResizeConfig, {
+import defaultResizeConfig from '../config/resize.ts';
+import {
   defaultFrameworkResizeConfig,
-} from '../config/resize.ts';
+  defaultWorkerOptions,
+} from '../framework/defaults.ts';
 import type {
   DeepPartial,
   FrameworkResizeConfig,
@@ -28,7 +30,10 @@ function merge(base: unknown, override: unknown): unknown {
   return override === undefined ? base : override;
 }
 
-/** Test-only: a framework config file (framework defaults + mediaModelName 'File') with overrides. */
+/**
+ * Test-only: a framework config file as the scaffold writes it (framework defaults, the default
+ * worker section, mediaModelName 'File') with overrides.
+ */
 export function makeResizeConfig(
   override: DeepPartial<FrameworkResizeConfig> = {},
 ): FrameworkResizeConfig & ResizeConfig {
@@ -37,6 +42,7 @@ export function makeResizeConfig(
   const base = structuredClone({
     ...defaultFrameworkResizeConfig,
     mediaModelName: 'File',
+    worker: defaultWorkerOptions,
   });
   return merge(base, override) as FrameworkResizeConfig & ResizeConfig;
 }

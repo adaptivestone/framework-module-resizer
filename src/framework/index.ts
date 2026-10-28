@@ -17,6 +17,10 @@ export type {
   FrameworkSqsQueueConfig,
   FrameworkStorageConfig,
 } from '../types.d.ts';
+export {
+  defaultFrameworkResizeConfig,
+  defaultWorkerOptions,
+} from './defaults.ts';
 export { FrameworkLockStore } from './locks.ts';
 export {
   FrameworkMediaStore,

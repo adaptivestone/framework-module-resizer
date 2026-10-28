@@ -136,6 +136,8 @@ const safe = [
   ['/framework.js', 'runResizeWorker'],
   ['/framework.js', 'resizeMediaSchemaFragment'],
   ['/framework.js', 'resizeMediaPaths'],
+  ['/framework.js', 'defaultFrameworkResizeConfig'],
+  ['/framework.js', 'defaultWorkerOptions'],
 ];
 for (const [sub, exp] of safe) {
   const m = await import(PKG + sub);
@@ -150,6 +152,8 @@ const expectedFramework = [
   'FrameworkResizer',
   'ResizeTaskModel',
   'ResizeWorker',
+  'defaultFrameworkResizeConfig',
+  'defaultWorkerOptions',
   'resizeMediaPaths',
   'resizeMediaSchemaFragment',
   'runResizeWorker',
@@ -256,25 +260,26 @@ import {
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
+  defaultFrameworkResizeConfig,
+  defaultWorkerOptions,
   FrameworkLockStore,
   FrameworkMediaStore,
   FrameworkResizer,
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
 import ResizeTaskModel from '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js';
-import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
 
 // The scaffold imports the defining model file so framework codegen can detect its ancestor.
 class ResizeTask extends ResizeTaskModel {}
 void ResizeTask;
 
-// The scaffolded config with its commented-out worker line enabled must stay a complete config.
+// The scaffolded config with its worker switched on must stay a complete config.
 const hostConfig = {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
   queue: { driver: 'database' },
-  worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
+  worker: { ...defaultWorkerOptions, enabled: true },
 } satisfies FrameworkResizeConfig;
 // An environment file switching both drivers.
 const productionConfig = {

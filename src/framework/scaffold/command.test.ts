@@ -15,10 +15,12 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import defaultResizeConfig, {
-  defaultFrameworkResizeConfig,
-} from '../../config/resize.ts';
+import defaultResizeConfig from '../../config/resize.ts';
 import { getResizeConfig } from '../config.ts';
+import {
+  defaultFrameworkResizeConfig,
+  defaultWorkerOptions,
+} from '../defaults.ts';
 import { runScaffold } from './command.ts';
 
 // A fresh temp project root per test (node:fs.mkdtemp under os.tmpdir()).
@@ -92,11 +94,26 @@ describe('runScaffold — default run', () => {
       /export \{ ResizeWorker as default \} from '@adaptivestone\/framework-module-resize\/framework\.js';/,
     );
     const configSource = await read(CONFIG);
+    for (const name of [
+      'defaultFrameworkResizeConfig',
+      'defaultWorkerOptions',
+    ]) {
+      assert.match(
+        configSource,
+        new RegExp(
+          `^import \\{[^}]*\\b${name}\\b[^}]*\\} from '@adaptivestone/framework-module-resize/framework\\.js';$`,
+          'm',
+        ),
+        `${name} is imported from …/framework.js`,
+      );
+    }
+    assert.doesNotMatch(configSource, /config\/resize\.js/);
+    assert.match(configSource, /\.\.\.defaultFrameworkResizeConfig/);
     assert.match(
       configSource,
-      /@adaptivestone\/framework-module-resize\/config\/resize\.js/,
+      /^ {2}worker: \{ \.\.\.defaultWorkerOptions, enabled: false \},$/m,
     );
-    assert.match(configSource, /\.\.\.defaultFrameworkResizeConfig/);
+    assert.match(configSource, /enabled: true[^\n]*`npm run cli ResizeWorker`/);
     assert.match(configSource, /satisfies FrameworkResizeConfig/);
     assert.match(configSource, /storage: \{ driver: 'local'/);
     assert.match(configSource, /^ {2}queue: \{ driver: 'database' \},$/m);
@@ -116,6 +133,7 @@ describe('runScaffold — default run', () => {
         publicBaseUrl: '/media',
       },
       queue: { driver: 'database' as const },
+      worker: { ...defaultWorkerOptions, enabled: false },
     };
     assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
     assert.equal(scaffoldedConfig.worker.enabled, false);
@@ -130,6 +148,7 @@ describe('runScaffold — default run', () => {
     assert.equal(resolved.mediaModelName, 'File');
     assert.strictEqual(resolved.queue, scaffoldedConfig.queue);
     assert.strictEqual(resolved.storage, scaffoldedConfig.storage);
+    assert.strictEqual(resolved.worker, scaffoldedConfig.worker);
     assert.strictEqual(resolved.image.encode, scaffoldedConfig.encode);
   });
 
@@ -293,6 +312,16 @@ describe('runScaffold — --eager', () => {
     assert.match(configSource, /storage: \{ driver: 'local'[^}]*publicBaseUrl/);
     assert.doesNotMatch(configSource, /^\s*queue:/m, 'eager: no task queue');
     assert.match(configSource, /Eager mode: no task queue/);
+    assert.match(
+      configSource,
+      /^import \{ defaultFrameworkResizeConfig \} from '@adaptivestone\/framework-module-resize\/framework\.js';$/m,
+    );
+    assert.doesNotMatch(configSource, /config\/resize\.js/);
+    assert.doesNotMatch(
+      configSource,
+      /^\s*(\/\/\s*)?worker:/m,
+      'eager: no worker section',
+    );
   });
 });
 

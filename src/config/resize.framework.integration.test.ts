@@ -42,7 +42,9 @@ test('the Framework loads the scaffold bridge and merges the environment overrid
     linkedPackage,
     process.platform === 'win32' ? 'junction' : 'dir',
   );
-  assert.equal(await runScaffold(['--eager', '--agents', 'skip'], root), 0);
+  // The queue scaffold: its config imports both defaults from …/framework.js and writes the full
+  // worker section, which the environment file below switches on field by field.
+  assert.equal(await runScaffold(['--agents', 'skip'], root), 0);
   await writeFile(
     join(root, 'src/config/resize.production.ts'),
     `export default { formats: ['webp'], worker: { enabled: true } };\n`,
@@ -55,7 +57,11 @@ test('the Framework loads the scaffold bridge and merges the environment overrid
   await server.init({ isSkipModelInit: true, isSkipModelLoading: true });
   const resolved = getResizeConfig();
   assert.deepEqual(resolved.image.formats, ['webp']);
-  assert.equal(resolved.worker.enabled, true);
+  assert.deepEqual(resolved.worker, {
+    enabled: true,
+    sharpConcurrency: 1,
+    sharpCache: false,
+  });
   assert.deepEqual(resolved.image.upload.formats, [
     'jpeg',
     'png',

@@ -4,7 +4,7 @@
 // The image settings go to the Resizer; FrameworkResizer builds `storage` and `queue` from this
 // file, and `worker` configures the worker command.
 import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
-import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
+import { defaultFrameworkResizeConfig, defaultWorkerOptions } from '@adaptivestone/framework-module-resize/framework.js';
 
 export default {
   ...defaultFrameworkResizeConfig,
@@ -21,6 +21,6 @@ export default {
   // Or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs); false = eager only.
   queue: { driver: 'database' },
   // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }, // the defaults; see README "Coordination"
-  // Allow the worker command, then run `npm run cli ResizeWorker` as its own process.
-  // worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
+  // enabled: true lets `npm run cli ResizeWorker` run; start it as its own process.
+  worker: { ...defaultWorkerOptions, enabled: false },
 } satisfies FrameworkResizeConfig;

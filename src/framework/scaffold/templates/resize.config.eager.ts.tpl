@@ -3,7 +3,7 @@
 // over this one (objects field by field) before getConfig('resize') is called.
 // The image settings go to the Resizer; FrameworkResizer builds `storage` from this file.
 import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
-import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
+import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';
 
 export default {
   ...defaultFrameworkResizeConfig,
