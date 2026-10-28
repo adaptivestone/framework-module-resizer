@@ -37,10 +37,15 @@ export interface MongoTaskQueueOptions {
   // The ResizeTask model, or a getter called on each use (for a model registered later).
   model?: TaskModel;
   getModel?: () => TaskModel;
-  // Queue timing (lease, retries, polling, task timeout); missing values use defaultQueueOptions.
+  // Queue timing (lease, retries, polling, task timeout) of every queue name; missing values use
+  // defaultQueueOptions.
   timing?: Partial<QueueTimingOptions>;
-  // The same, read on first use (the framework adapter reads it from its config file).
-  getTiming?: () => Partial<QueueTimingOptions>;
+  // One queue name's timing, read on that name's first use (the framework adapter reads it from
+  // its config file); when it gives none, `timing` applies.
+  getTiming?: (queue: string) => Partial<QueueTimingOptions> | undefined;
+  // The queue names this queue serves (servesQueue); default: every name. Claims are unchanged: a
+  // worker claims the tasks of the queue name it was started for.
+  queues?: readonly string[];
   logger?: ResizeLogger; // default: console
 }
 
@@ -128,20 +133,31 @@ export class MongoTaskQueue extends TaskQueue {
   readonly gatesByTask = true;
   readonly claimFilters = true;
   readonly #getModel: () => TaskModel;
-  readonly #getTiming: () => Partial<QueueTimingOptions>;
+  readonly #timing: Partial<QueueTimingOptions> | undefined;
+  readonly #getTiming:
+    | ((queue: string) => Partial<QueueTimingOptions> | undefined)
+    | undefined;
+  readonly #queues: readonly string[] | undefined;
   readonly #logger: ResizeLogger;
 
   constructor(opts: MongoTaskQueueOptions) {
     super();
     // A model that does not resolve is reported by verify() at boot and logged at runtime.
     this.#getModel = modelGetter<TaskModel>(opts, 'MongoTaskQueue');
-    const { timing, getTiming } = opts;
-    this.#getTiming = getTiming ?? (() => timing ?? {});
+    this.#timing = opts.timing;
+    this.#getTiming = opts.getTiming;
+    this.#queues = opts.queues;
     this.#logger = opts.logger ?? console;
   }
 
-  getTiming(): Partial<QueueTimingOptions> {
-    return this.#getTiming();
+  /** The names in `queues`; every name without that option. */
+  servesQueue(queue: string): boolean {
+    return this.#queues?.includes(queue) ?? true;
+  }
+
+  /** The `getTiming` option's timing for `queue`, else `timing`. */
+  getTiming(queue: string): Partial<QueueTimingOptions> {
+    return this.#getTiming?.(queue) ?? this.#timing ?? {};
   }
 
   /**

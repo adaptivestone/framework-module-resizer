@@ -280,7 +280,7 @@ describe('mongoParts', () => {
         parts.locks instanceof MongoLockStore &&
         parts.tasks instanceof MongoTaskQueue,
     );
-    assert.equal(timingOf(parts.tasks).maxAttempts, 2);
+    assert.equal(timingOf(parts.tasks, 'default').maxAttempts, 2);
     assert.equal(await parts.locks.acquire('p1', 'A', 1000), true);
     assert.equal(
       (await connection.models.ResizeLock.findById('p1').lean())?.owner,

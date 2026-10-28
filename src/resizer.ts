@@ -446,7 +446,7 @@ export class Resizer {
       throw locksRequired(this.name);
     }
     const source = this.#coordinationSource;
-    const timing = timingOf(tasks);
+    const timing = timingOf(tasks, this.queue);
     const coordination = fillCoordination(
       typeof source === 'function' ? source() : source,
     );

@@ -54,7 +54,7 @@ function notRetryable(error: unknown): boolean {
 
 export interface ConsumerDeps {
   tasks: TaskQueue;
-  timing: QueueTiming; // the queue's complete timing (timingOf)
+  timing: QueueTiming; // the consumed queue name's complete timing (timingOf)
   // Optional, must not throw: whether this worker runs `task` (default: every task). A task it
   // does not accept is never handled: it goes back unprocessed for another worker (holding its
   // gate lock, when coordinationOf gives one, as a task given back does), before the maxAttempts

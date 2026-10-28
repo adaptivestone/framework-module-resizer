@@ -361,12 +361,12 @@ describe('SqsTaskQueue.claim', () => {
       client,
       timing: { leaseMs: 30_000 },
     });
-    await tasks.claim('default', timingOf(tasks).leaseMs);
+    await tasks.claim('default', timingOf(tasks, 'default').leaseMs);
     assert.equal(receiveParams[0].VisibilityTimeout, 30);
     const { client: client2, receiveParams: receiveParams2 } =
       makeFakeSqsClient();
     const defaults = new SqsTaskQueue({ queueUrl: 'q', client: client2 });
-    await defaults.claim('default', timingOf(defaults).leaseMs);
+    await defaults.claim('default', timingOf(defaults, 'default').leaseMs);
     assert.equal(receiveParams2[0].VisibilityTimeout, 60);
   });
   test('a named queue is consumed from its URL in `queues`', async () => {
@@ -1089,7 +1089,7 @@ describe('Consumer with SqsTaskQueue', () => {
       client,
       timing: fastTiming,
     });
-    const { leaseMs, retryBackoffMs } = timingOf(tasks);
+    const { leaseMs, retryBackoffMs } = timingOf(tasks, 'default');
     // The gate lock the Dispatcher took when it queued the task, under the owner the body carries.
     const locks = clockLocks();
     const key = gateKey('default', 'default', 'm1', 'photo');
@@ -1156,25 +1156,90 @@ describe('SqsTaskQueue options', () => {
       timing: { lockTtlMs: { dispatch: 60_000, worker: 30_000 } } as never,
     });
     assert.throws(
-      () => timingOf(badLease),
+      () => timingOf(badLease, 'default'),
       (err: Error & { code?: string }) =>
         err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
     // A plain-Node host that still passes lock TTLs is told where they went.
     assert.throws(
-      () => timingOf(removed),
+      () => timingOf(removed, 'default'),
       (err: Error & { code?: string }) =>
         err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
         /coordination/.test(err.message),
     );
   });
-  test('requires queueUrl at construction', () => {
-    assert.throws(
-      () => new SqsTaskQueue({ queueUrl: '' }),
+  test('neither queueUrl nor a queues entry is RESIZE_SQS_QUEUE_URL_REQUIRED', () => {
+    for (const opts of [
+      undefined,
+      {},
+      { queueUrl: '' },
+      { queues: {} },
+      { queueUrl: '', queues: { bulk: '' } },
+    ]) {
+      assert.throws(
+        () => new SqsTaskQueue(opts as never),
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_SQS_QUEUE_URL_REQUIRED',
+      );
+    }
+  });
+  test('queueUrl may be left out when queues names the queues; queues.default serves default', async () => {
+    const DEFAULT_URL = 'https://q/default';
+    const { client, sent, receiveParams } = makeFakeSqsClient({
+      messageId: 'mid',
+    });
+    const tasks = new SqsTaskQueue({
+      queues: { default: DEFAULT_URL, bulk: BULK_URL },
+      client,
+    });
+    assert.equal(tasks.servesQueue('default'), true);
+    assert.equal(tasks.servesQueue('bulk'), true);
+    assert.equal(tasks.servesQueue('other'), false);
+    await tasks.add(newTask());
+    await tasks.add(newTask({ queue: 'bulk' }));
+    await tasks.claim('default', 60_000);
+    assert.deepEqual(
+      sent.map((command) => command.input.QueueUrl),
+      [DEFAULT_URL, BULK_URL],
+    );
+    assert.equal(receiveParams[0].QueueUrl, DEFAULT_URL);
+    // Without a URL for 'default', that name is not served.
+    const bulkOnly = new SqsTaskQueue({ queues: { bulk: BULK_URL }, client });
+    assert.equal(bulkOnly.servesQueue('default'), false);
+    assert.equal(bulkOnly.servesQueue('bulk'), true);
+    await assert.rejects(
+      () => bulkOnly.add(newTask()),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
-        err.code === 'RESIZE_SQS_QUEUE_URL_REQUIRED',
+        err.code === 'RESIZE_SQS_QUEUE_UNKNOWN',
     );
+    // queueUrl, when set, is the default queue's URL.
+    const both = new SqsTaskQueue({
+      queueUrl: 'https://q/url',
+      queues: { default: DEFAULT_URL },
+      client,
+    });
+    await both.add(newTask());
+    assert.equal(sent.at(-1)?.input.QueueUrl, 'https://q/url');
+  });
+  test('getTiming(queue) asks the option for that name', () => {
+    const asked: string[] = [];
+    const timing = { leaseMs: 90_000 };
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      queues: { bulk: BULK_URL },
+      timing,
+      getTiming: (name) => {
+        asked.push(name);
+        return name === 'bulk' ? { leaseMs: 30_000 } : undefined;
+      },
+    });
+    assert.deepEqual(tasks.getTiming('bulk'), { leaseMs: 30_000 });
+    assert.equal(tasks.getTiming('default'), timing, 'falls back to timing');
+    assert.deepEqual(asked, ['bulk', 'default']);
+    assert.equal(timingOf(tasks, 'bulk').leaseMs, 30_000);
+    assert.equal(timingOf(tasks, 'default').leaseMs, 90_000);
   });
   test('serves only the default queue and configured names and exposes its timing', () => {
     const timing = { idlePollMs: 123 };
@@ -1186,7 +1251,10 @@ describe('SqsTaskQueue options', () => {
     assert.equal(tasks.servesQueue('default'), true);
     assert.equal(tasks.servesQueue('bulk'), true);
     assert.equal(tasks.servesQueue('unknown'), false);
-    assert.equal(tasks.getTiming(), timing);
-    assert.deepEqual(new SqsTaskQueue({ queueUrl: 'q' }).getTiming(), {});
+    assert.equal(tasks.getTiming('default'), timing);
+    assert.deepEqual(
+      new SqsTaskQueue({ queueUrl: 'q' }).getTiming('default'),
+      {},
+    );
   });
 });

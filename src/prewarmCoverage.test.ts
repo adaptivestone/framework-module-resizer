@@ -54,7 +54,7 @@ function makeTaskQueue(
     complete: (task) => memory.complete(task),
     fail: (task, next, error) => memory.fail(task, next, error),
     findActive: overrides.findActive ?? ((query) => memory.findActive(query)),
-    getTiming: () => memory.getTiming(),
+    getTiming: (queue) => memory.getTiming(queue),
   };
   return { tasks, added };
 }

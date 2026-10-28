@@ -144,25 +144,46 @@ interface Row {
   error?: string;
 }
 
+export interface RowQueueOptions {
+  /** The timing of every queue name. */
+  timing?: Partial<QueueTimingOptions>;
+  /** Per queue name, over `timing`. */
+  queueTiming?: Record<string, Partial<QueueTimingOptions>>;
+  /** The queue names served; default: every name. */
+  queues?: readonly string[];
+}
+
 /**
  * The rows and the lease logic of the in-memory task queues: oldest-first claims, fenced leases,
  * retry times and dead tasks. A claimed task carries the `gateOwner` it was added with, when it has
- * one. `rows` and `added` are open for assertions.
+ * one. `rows`, `added` and `claims` are open for assertions.
  */
 abstract class RowQueue extends TaskQueue {
   readonly rows: Row[] = [];
   /** Every `add` call, also those that stored nothing. */
   readonly added: NewTask[] = [];
+  /** Every `claim` call, with the lease it asked for, also those that claimed nothing. */
+  readonly claims: Array<{ queue: string; leaseMs: number }> = [];
   readonly #timing: Partial<QueueTimingOptions>;
+  readonly #queueTiming: Record<string, Partial<QueueTimingOptions>>;
+  readonly #queues: readonly string[] | undefined;
   #seq = 0;
 
-  constructor(opts: { timing?: Partial<QueueTimingOptions> } = {}) {
+  constructor(opts: RowQueueOptions = {}) {
     super();
     this.#timing = opts.timing ?? {};
+    this.#queueTiming = opts.queueTiming ?? {};
+    this.#queues = opts.queues;
   }
 
-  getTiming(): Partial<QueueTimingOptions> {
-    return this.#timing;
+  servesQueue(queue: string): boolean {
+    return this.#queues?.includes(queue) ?? true;
+  }
+
+  getTiming(queue: string): Partial<QueueTimingOptions> {
+    return Object.hasOwn(this.#queueTiming, queue)
+      ? this.#queueTiming[queue]
+      : this.#timing;
   }
 
   async add(task: NewTask): Promise<TaskAddResult> {
@@ -192,12 +213,13 @@ abstract class RowQueue extends TaskQueue {
     return this.claimFirst(queue, leaseMs, () => true);
   }
 
-  /** Lease the oldest due row of `queue` that `takes` accepts. */
+  /** Lease the oldest due row of `queue` that `takes` accepts; every `claim` comes here. */
   protected claimFirst(
     queue: string,
     leaseMs: number,
     takes: (row: Row) => boolean,
   ): ClaimedTask | null {
+    this.claims.push({ queue, leaseMs });
     const now = Date.now();
     const row = this.rows.find(
       (r) =>
@@ -300,8 +322,7 @@ abstract class RowQueue extends TaskQueue {
   }
 }
 
-export interface MemoryTaskQueueOptions {
-  timing?: Partial<QueueTimingOptions>;
+export interface MemoryTaskQueueOptions extends RowQueueOptions {
   /** The cooldown clock (default Date.now). Leases and retry times stay on Date.now. */
   now?: () => number;
 }

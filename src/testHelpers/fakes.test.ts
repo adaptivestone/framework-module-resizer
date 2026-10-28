@@ -251,6 +251,33 @@ test('PlainTaskQueue stores every add and declares no gate, no claim filter and 
   assert.equal(claimed?.resizer, 'default');
 });
 
+test('the in-memory task queues record every claim, serve their listed names and read timing per name', async () => {
+  for (const Queue of [MemoryTaskQueue, PlainTaskQueue]) {
+    const timing = { leaseMs: 90_000 };
+    const tasks = new Queue({
+      timing,
+      queueTiming: { bulk: { leaseMs: 30_000 } },
+      queues: ['default', 'bulk'],
+    });
+    assert.equal(tasks.servesQueue('default'), true);
+    assert.equal(tasks.servesQueue('bulk'), true);
+    assert.equal(tasks.servesQueue('other'), false);
+    assert.deepEqual(tasks.getTiming('bulk'), { leaseMs: 30_000 });
+    assert.equal(tasks.getTiming('default'), timing);
+    await tasks.add(newTask({ queue: 'bulk' }));
+    assert.equal(await tasks.claim('default', 1000), null);
+    assert.equal((await tasks.claim('bulk', 30_000))?.queue, 'bulk');
+    assert.deepEqual(tasks.claims, [
+      { queue: 'default', leaseMs: 1000 },
+      { queue: 'bulk', leaseMs: 30_000 },
+    ]);
+  }
+  // Without a list every name is served; without timing every name has none of its own.
+  const plain = new PlainTaskQueue();
+  assert.equal(plain.servesQueue('anything'), true);
+  assert.deepEqual(plain.getTiming('default'), {});
+});
+
 test('clockLocks expires locks, lets them be taken over, and checks owners', async () => {
   let now = 0;
   const locks = clockLocks(() => now);

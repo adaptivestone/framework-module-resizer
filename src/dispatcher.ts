@@ -34,8 +34,8 @@ export interface DispatcherDeps {
   tasks: TaskQueue;
   locks: LockStore | undefined; // the gate locks, beside a task queue without gatesByTask
   coordination: Coordination; // the validated policy: a gate lock lasts gateTtlMs
-  // The task queue's lease (timingOf(tasks).leaseMs): how long a gate lock is kept when the queue
-  // may or may not have stored the task (never longer than gateTtlMs).
+  // The lease of the Resizer's queue name (timingOf(tasks, queue).leaseMs): how long a gate lock is
+  // kept when the queue may or may not have stored the task (never longer than gateTtlMs).
   leaseMs: number;
   name: string; // the Resizer's name: part of every identity, gate key and task
   logger: ResizeLogger;

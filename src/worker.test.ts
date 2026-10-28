@@ -432,7 +432,7 @@ const sameRows = (tasks: ReleasingTaskQueue): TaskQueue => ({
   complete: (task) => tasks.complete(task),
   fail: (task, next, error) => tasks.fail(task, next, error),
   release: (task) => tasks.release(task),
-  getTiming: () => tasks.getTiming(),
+  getTiming: (queue) => tasks.getTiming(queue),
 });
 
 test('a task of a Resizer the worker does not serve is given back, never run or dead-lettered, and logged once per Resizer', async () => {
@@ -764,6 +764,58 @@ test('on a task queue that filters claims, a worker starts beside unlisted Resiz
   assert.equal(bRow.attempts, 0);
   // Still first: a give-back would have moved it behind a's task.
   assert.equal(tasks.rows[0], bRow);
+});
+
+test('two Resizers on two names of one task queue: each lane is claimed by its own worker with its own lease', async () => {
+  const tasks = new MemoryTaskQueue({
+    queues: ['default', 'bulk'],
+    queueTiming: { bulk: { leaseMs: 30_000 } },
+  });
+  const a = queuedResizer('a', tasks);
+  const b = new Resizer({
+    name: 'b',
+    queue: 'bulk',
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    storage: {
+      download: async () => png,
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    // No docs, so b's task is a no-op complete.
+    media: fakeMedia(),
+    locks: memoryLocks(),
+    tasks,
+  });
+  const cold = (id: string): MediaLike => ({
+    id,
+    original: { storageRef: { key: `o-${id}` }, contentType: 'image/png' },
+    previews: [],
+  });
+  const sizes = [{ width: 10, height: 10 }];
+  await a.resolve({ media: cold('m1'), sizes });
+  await b.resolve({ media: cold('m2'), sizes });
+  assert.deepEqual(
+    tasks.rows.map((row) => ({
+      queue: row.task.queue,
+      resizer: row.task.resizer,
+    })),
+    [
+      { queue: 'default', resizer: 'a' },
+      { queue: 'bulk', resizer: 'b' },
+    ],
+  );
+  const [aRow, bRow] = tasks.rows;
+  await workUntil(
+    { queue: 'bulk', logger: silent, resizers: [a, b] },
+    () => bRow.status === 'completed',
+  );
+  assert.equal(aRow.status, 'pending');
+  assert.equal(aRow.attempts, 0);
+  assert.ok(tasks.claims.length > 0);
+  for (const claim of tasks.claims) {
+    assert.deepEqual(claim, { queue: 'bulk', leaseMs: 30_000 });
+  }
 });
 
 test('a task queue that filters claims is not given accepts: a task of another Resizer it hands out anyway fails with RESIZE_NO_RESIZER', async () => {

@@ -348,10 +348,42 @@ describe('MongoTaskQueue setup', () => {
       },
     });
     assert.equal(reads, 0);
-    assert.equal(timingOf(queue).leaseMs, 123_000);
-    assert.equal(timingOf(queue).maxAttempts, 5); // a default
-    assert.equal(timingOf(queue).leaseMs, 123_000);
+    assert.equal(timingOf(queue, 'default').leaseMs, 123_000);
+    assert.equal(timingOf(queue, 'default').maxAttempts, 5); // a default
+    assert.equal(timingOf(queue, 'default').leaseMs, 123_000);
     assert.equal(reads, 1);
+  });
+
+  test('servesQueue: every name without a list, only the listed names with one', () => {
+    const every = new MongoTaskQueue({ model: M });
+    assert.equal(every.servesQueue('default'), true);
+    assert.equal(every.servesQueue('bulk'), true);
+    const listed = new MongoTaskQueue({
+      model: M,
+      queues: ['default', 'bulk'],
+    });
+    assert.equal(listed.servesQueue('default'), true);
+    assert.equal(listed.servesQueue('bulk'), true);
+    assert.equal(listed.servesQueue('other'), false);
+  });
+
+  test('getTiming(queue) asks the option for that name and falls back to timing', () => {
+    const asked: string[] = [];
+    const timing = { leaseMs: 90_000 };
+    const queue = new MongoTaskQueue({
+      model: M,
+      timing,
+      getTiming: (name) => {
+        asked.push(name);
+        return name === 'bulk' ? { leaseMs: 30_000 } : undefined;
+      },
+    });
+    assert.deepEqual(queue.getTiming('bulk'), { leaseMs: 30_000 });
+    assert.equal(queue.getTiming('default'), timing);
+    assert.deepEqual(asked, ['bulk', 'default']);
+    assert.equal(timingOf(queue, 'bulk').leaseMs, 30_000);
+    assert.equal(timingOf(queue, 'default').leaseMs, 90_000);
+    assert.deepEqual(new MongoTaskQueue({ model: M }).getTiming('default'), {});
   });
 
   test('missing models make queue operations harmless soft failures', async () => {

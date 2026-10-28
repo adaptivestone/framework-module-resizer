@@ -266,8 +266,8 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     };
     return new Consumer({
       tasks,
-      // timingOf validates the queue's timing here, so invalid timing fails this loop.
-      timing: timingOf(tasks),
+      // timingOf validates the consumed queue's timing here, so invalid timing fails this loop.
+      timing: timingOf(tasks, queue),
       resizers: served,
       coordinationOf,
       accepts: givesBack

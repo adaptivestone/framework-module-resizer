@@ -31,13 +31,18 @@ import type {
 } from '../types.d.ts';
 
 export interface SqsTaskQueueOptions {
-  queueUrl: string; // serves the 'default' queue
-  queues?: Record<string, string>; // other named queues → queue URLs
+  // The 'default' queue's URL; it may be left out when `queues` names it, or when this task queue
+  // serves only other names. At least one of the two must give a URL.
+  queueUrl?: string;
+  queues?: Record<string, string>; // queue names → queue URLs ('default' too, unless queueUrl)
   // Where dead tasks go (their body plus the error), before they are deleted. Without it a dead
-  // task is logged and deleted.
+  // task is logged and deleted. One for every queue name.
   deadLetterQueueUrl?: string;
-  // Missing values use defaultQueueOptions. The core checks the timing on first use, not here.
+  // Timing of every queue name; missing values use defaultQueueOptions. The core checks the timing
+  // on first use, not here.
   timing?: Partial<QueueTimingOptions>;
+  // One queue name's timing, read on that name's first use; when it gives none, `timing` applies.
+  getTiming?: (queue: string) => Partial<QueueTimingOptions> | undefined;
   waitTimeSeconds?: number; // long poll per claim, 0–20; default 10
   logger?: ResizeLogger; // default: console
   region?: string;
@@ -77,10 +82,11 @@ export class SqsTaskQueue extends TaskQueue {
 
   constructor(opts: SqsTaskQueueOptions) {
     super();
-    if (!opts?.queueUrl) {
-      throw new ResizeSetupError('resize sqs: `queueUrl` is required', {
-        code: 'RESIZE_SQS_QUEUE_URL_REQUIRED',
-      });
+    if (!opts?.queueUrl && !Object.values(opts?.queues ?? {}).some(Boolean)) {
+      throw new ResizeSetupError(
+        'resize sqs: `queueUrl` or a `queues` entry is required',
+        { code: 'RESIZE_SQS_QUEUE_URL_REQUIRED' },
+      );
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
@@ -103,11 +109,18 @@ export class SqsTaskQueue extends TaskQueue {
     return this.#client;
   }
 
+  // The URL of a queue name: 'default' is queueUrl, else its `queues` entry; any other name is
+  // its `queues` entry only.
+  #urlOf(queue: string): string | undefined {
+    const queues = this.#opts.queues ?? {};
+    const named = Object.hasOwn(queues, queue) ? queues[queue] : undefined;
+    return queue === 'default' ? (this.#opts.queueUrl ?? named) : named;
+  }
+
   // The URL for a named queue. An unknown name is a wiring error, reported before any send or
   // receive, so a typo never silently drops or ignores tasks.
   #queueUrl(queue: string): string {
-    const url =
-      queue === 'default' ? this.#opts.queueUrl : this.#opts.queues?.[queue];
+    const url = this.#urlOf(queue);
     if (!url) {
       throw new ResizeSetupError(
         `resize sqs: no queue URL for queue '${queue}' — add it to the SqsTaskQueue \`queues\` option`,
@@ -117,13 +130,14 @@ export class SqsTaskQueue extends TaskQueue {
     return url;
   }
 
-  /** Only `'default'` (queueUrl) and the names in `queues` can be consumed. */
+  /** Only the names with a URL (`queueUrl` for 'default', or a `queues` entry) are served. */
   servesQueue(queue: string): boolean {
-    return queue === 'default' || Object.hasOwn(this.#opts.queues ?? {}, queue);
+    return Boolean(this.#urlOf(queue));
   }
 
-  getTiming(): Partial<QueueTimingOptions> {
-    return this.#opts.timing ?? {};
+  /** The `getTiming` option's timing for `queue`, else `timing`. */
+  getTiming(queue: string): Partial<QueueTimingOptions> {
+    return this.#opts.getTiming?.(queue) ?? this.#opts.timing ?? {};
   }
 
   async add(task: NewTask): Promise<TaskAddResult> {

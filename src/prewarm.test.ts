@@ -64,7 +64,7 @@ function makeTaskQueue(behavior?: (task: NewTask) => TaskAddResult) {
     renew: (task, leaseMs) => memory.renew(task, leaseMs),
     complete: (task) => memory.complete(task),
     fail: (task, next, error) => memory.fail(task, next, error),
-    getTiming: () => memory.getTiming(),
+    getTiming: (queue) => memory.getTiming(queue),
   };
   return { tasks, calls };
 }

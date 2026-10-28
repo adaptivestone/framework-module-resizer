@@ -1,9 +1,9 @@
-// Queue timing, the same for every TaskQueue backend: a queue's own timing keys over the defaults,
-// validated once per queue instance. The worker loop (src/consumer.ts) and the dispatch path read
-// it.
+// Queue timing, the same for every TaskQueue backend: a queue name's own timing keys over the
+// defaults, validated once per task queue and name. The worker loop (src/consumer.ts) and the
+// dispatch path read it.
 import { defaultQueueOptions } from './config/resize.ts';
 import type { TaskQueue } from './contracts/taskQueue.ts';
-import { ResizeConfigError } from './errors.ts';
+import { ResizeConfigError, ResizeError } from './errors.ts';
 import { validateQueueTiming } from './resizeConfig.ts';
 import type { QueueTimingOptions } from './types.d.ts';
 
@@ -25,7 +25,8 @@ export const LOCK_TTL_MOVES =
 /** Complete queue timing: every key set. */
 export type QueueTiming = QueueTimingOptions;
 
-const timings = new WeakMap<object, QueueTiming>();
+// The valid timing of each name a task queue was asked for.
+const timings = new WeakMap<TaskQueue, Map<string, QueueTiming>>();
 
 /**
  * Complete queue timing: the timing keys set in `own` over the defaults (other keys are ignored),
@@ -53,15 +54,40 @@ export function fillTiming(
 }
 
 /**
- * A queue's timing: its getTiming() over the defaults, validated once per queue instance (a lazy
- * getTiming is read on first use). Throws ResizeConfigError for invalid timing.
+ * The timing of the queue name `queue` on `tasks`: its getTiming(queue) over the defaults,
+ * validated once per task queue and name (a lazy getTiming is read on the name's first use).
+ * Throws ResizeConfigError for invalid timing, naming the queue; an invalid timing is not kept, so
+ * the next call reads it again.
  */
-export function timingOf(tasks: TaskQueue): QueueTiming {
-  const cached = timings.get(tasks);
+export function timingOf(tasks: TaskQueue, queue: string): QueueTiming {
+  let byName = timings.get(tasks);
+  const cached = byName?.get(queue);
   if (cached) {
     return cached;
   }
-  const timing = fillTiming(tasks.getTiming?.() ?? {});
-  timings.set(tasks, timing);
+  const timing = fillNamedTiming(tasks.getTiming?.(queue) ?? {}, queue);
+  if (!byName) {
+    byName = new Map();
+    timings.set(tasks, byName);
+  }
+  byName.set(queue, timing);
   return timing;
+}
+
+/** fillTiming, with the queue name added to the message of a timing it rejects. */
+function fillNamedTiming(
+  own: Partial<QueueTimingOptions>,
+  queue: string,
+): QueueTiming {
+  try {
+    return fillTiming(own);
+  } catch (err) {
+    if (ResizeError.isResizeError(err)) {
+      throw new ResizeConfigError(`${err.message} (queue '${queue}')`, {
+        code: err.code,
+        retryable: err.retryable,
+      });
+    }
+    throw err;
+  }
 }

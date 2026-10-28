@@ -327,9 +327,9 @@ test("a queue section without a driver is the app's ResizeTask queue; its timing
   const r = new FrameworkResizer({ configName: 'resizeListings' });
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
-  assert.equal(timingOf(r.tasks).leaseMs, 1234);
-  assert.equal(timingOf(r.tasks).idlePollMs, 50);
-  assert.equal(timingOf(r.tasks).maxAttempts, 5);
+  assert.equal(timingOf(r.tasks, 'default').leaseMs, 1234);
+  assert.equal(timingOf(r.tasks, 'default').idlePollMs, 50);
+  assert.equal(timingOf(r.tasks, 'default').maxAttempts, 5);
 });
 
 test("queue { driver: 'sqs' } builds an SqsTaskQueue with the config's URLs and timing", async () => {
@@ -352,7 +352,7 @@ test("queue { driver: 'sqs' } builds an SqsTaskQueue with the config's URLs and 
   assert.equal(r.tasks.servesQueue('default'), true);
   assert.equal(r.tasks.servesQueue('bulk'), true);
   assert.equal(r.tasks.servesQueue('other'), false);
-  assert.equal(timingOf(r.tasks).maxAttempts, 3);
+  assert.equal(timingOf(r.tasks, 'default').maxAttempts, 3);
   assert.ok(r.locks instanceof FrameworkLockStore); // locks stay in the framework Lock model
 });
 
@@ -475,7 +475,7 @@ test('an explicit config also feeds the database queue timing', async () => {
   });
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
-  assert.equal(timingOf(r.tasks).leaseMs, 4000);
+  assert.equal(timingOf(r.tasks, 'default').leaseMs, 4000);
 });
 
 test("the config file's coordination reaches the Resizer, and the option wins", async () => {
@@ -563,14 +563,18 @@ test('a core MongoTaskQueue needs one model, and the core validates its timing',
   }
   // Queue timing is validated by the core on first use, not at construction.
   assert.throws(
-    () => timingOf(new MongoTaskQueue({ model: {}, timing: { leaseMs: 0 } })),
+    () =>
+      timingOf(
+        new MongoTaskQueue({ model: {}, timing: { leaseMs: 0 } }),
+        'default',
+      ),
     (err: unknown) =>
       err instanceof ResizeConfigError &&
       err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
   );
   const t = new MongoTaskQueue({ model: {} });
-  assert.equal(timingOf(t).leaseMs, 60_000);
-  assert.equal(timingOf(t).maxAttempts, 5);
+  assert.equal(timingOf(t, 'default').leaseMs, 60_000);
+  assert.equal(timingOf(t, 'default').maxAttempts, 5);
 });
 
 test('nothing is read from the app until first use', async () => {
@@ -584,7 +588,7 @@ test('nothing is read from the app until first use', async () => {
   });
   await r.ready();
   assert.ok(r.tasks);
-  assert.equal(timingOf(r.tasks).leaseMs, 4321);
+  assert.equal(timingOf(r.tasks, 'default').leaseMs, 4321);
 });
 
 test('undefined values from getTiming never override the defaults', () => {
@@ -592,8 +596,8 @@ test('undefined values from getTiming never override the defaults', () => {
     model: {},
     getTiming: () => ({ leaseMs: undefined, maxAttempts: 7 }),
   });
-  assert.equal(timingOf(t).leaseMs, 60_000);
-  assert.equal(timingOf(t).maxAttempts, 7);
+  assert.equal(timingOf(t, 'default').leaseMs, 60_000);
+  assert.equal(timingOf(t, 'default').maxAttempts, 7);
 });
 
 test('verify() fails at boot when the ResizeTask model is not registered', async () => {
@@ -759,8 +763,8 @@ test('two config files with the same timing share the queue and its timing', asy
   await media.verify();
   await listings.verify();
   assert.ok(media.tasks);
-  assert.equal(timingOf(media.tasks).maxAttempts, 3);
-  assert.equal(timingOf(media.tasks).leaseMs, 5000);
+  assert.equal(timingOf(media.tasks, 'default').maxAttempts, 3);
+  assert.equal(timingOf(media.tasks, 'default').leaseMs, 5000);
 });
 
 test('timing is compared only between configs that use the same task queue', async () => {
@@ -795,12 +799,12 @@ test('timing is compared only between configs that use the same task queue', asy
     await r.verify();
   }
   assert.ok(media.tasks instanceof MongoTaskQueue);
-  assert.equal(timingOf(media.tasks).maxAttempts, 3);
+  assert.equal(timingOf(media.tasks, 'default').maxAttempts, 3);
   assert.equal(eager.tasks, undefined);
   assert.equal(off.tasks, undefined);
   assert.equal(explicit.tasks, own); // an explicit queue is never shared or replaced
   assert.ok(sqs.tasks instanceof SqsTaskQueue);
-  assert.equal(timingOf(sqs.tasks).maxAttempts, 6);
+  assert.equal(timingOf(sqs.tasks, 'default').maxAttempts, 6);
 });
 
 test('configs that select the same SQS queue share one SqsTaskQueue; another queue gets its own', async () => {
@@ -935,7 +939,7 @@ test('resetResizerForTests forgets the shared task queues and the configs that u
   });
   await Promise.all([first.ready(), firstSqs.ready()]);
   assert.ok(first.tasks);
-  assert.equal(timingOf(first.tasks).maxAttempts, 3);
+  assert.equal(timingOf(first.tasks, 'default').maxAttempts, 3);
 
   resetResizerForTests();
   // A forgotten Resizer's config no longer takes part, and the queues are new objects.
@@ -948,6 +952,6 @@ test('resetResizerForTests forgets the shared task queues and the configs that u
   await nextSqs.verify();
   assert.ok(next.tasks);
   assert.notEqual(next.tasks, first.tasks);
-  assert.equal(timingOf(next.tasks).maxAttempts, 4);
+  assert.equal(timingOf(next.tasks, 'default').maxAttempts, 4);
   assert.notEqual(nextSqs.tasks, firstSqs.tasks);
 });
