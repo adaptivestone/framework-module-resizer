@@ -202,7 +202,8 @@ function isDecoderShape(entry: unknown): entry is SourceDecoder {
  * ones. The core never checks `instanceof`: any object of the decoder's shape is accepted.
  */
 export function createDecoderSet(extra?: unknown): DecoderSet {
-  const given = extra ?? [];
+  // Only `undefined` means "no decoders": `null` is not a list.
+  const given = extra === undefined ? [] : extra;
   if (!Array.isArray(given)) {
     throw new ResizeSetupError(
       'resize: `decoders` must be an array of decoders (objects with `formats`, `inspect` and `render`)',

@@ -196,6 +196,47 @@ test('render keeps the frames, delays and loop count it is asked for', async () 
   assertNear(pixelAt(raster, 10, 10, 1).slice(0, 3), [0, 255, 0]);
 });
 
+test('render resizes every frame of an animation to the box', async () => {
+  const decoder = new SharpDecoder();
+  const raster = await decoder.render(
+    animatedGif,
+    { width: 10, height: 10 },
+    { limits, source: await decoder.inspect(animatedGif, limits), frames: 3 },
+  );
+  assert.equal(raster.info.width, 10);
+  assert.equal(raster.info.height, 10);
+  assert.equal(raster.info.frames, 3);
+  assert.equal(raster.data.length, 10 * 10 * raster.info.channels * 3);
+  assert.deepEqual(raster.info.delay, [100, 200, 300]);
+  assert.equal(raster.info.loop, 3);
+  assertNear(pixelAt(raster, 5, 5, 2).slice(0, 3), [0, 0, 255]);
+});
+
+test('a still image asked for several frames renders one consistent frame', async () => {
+  const png = await sharp({
+    create: { width: 8, height: 8, channels: 3, background: '#00ff00' },
+  })
+    .png()
+    .toBuffer();
+  const decoder = new SharpDecoder();
+  const source = await decoder.inspect(png, limits);
+  // The second source claims three pages: the frame count still comes from the output.
+  for (const claimed of [source, { ...source, pages: 3 }]) {
+    const raster = await decoder.render(
+      png,
+      { width: 8, height: 8 },
+      { limits, source: claimed, frames: 3 },
+    );
+    assert.equal(raster.info.frames ?? 1, 1);
+    assert.equal(
+      raster.data.length,
+      raster.info.width * raster.info.height * raster.info.channels,
+    );
+    assert.equal(raster.info.delay, undefined);
+    assert.equal(raster.info.loop, undefined);
+  }
+});
+
 test('render with frames 1 gives the first frame only', async () => {
   const decoder = new SharpDecoder();
   const raster = await decoder.render(

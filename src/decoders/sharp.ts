@@ -74,7 +74,9 @@ export class SharpDecoder extends SourceDecoder {
     box: DecodeBox,
     opts: RenderOptions,
   ): Promise<Raster> {
-    const { limits, frames } = opts;
+    const { limits } = opts;
+    // Never ask for more frames than the source has: a still image yields one.
+    const frames = Math.max(1, Math.min(opts.frames, opts.source.pages ?? 1));
     const timeout = { seconds: limits.processingTimeoutSeconds };
     let img = sharp(bytes, {
       failOn: 'none',
@@ -103,13 +105,16 @@ export class SharpDecoder extends SourceDecoder {
             .metadata()
         : undefined;
     const [{ data, info }, meta] = await Promise.all([rendering, timing]);
-    const count = frames > 1 ? (info.pages ?? 1) : 1;
+    // The frame count comes from the pixels themselves: Sharp echoes the requested `pages` in
+    // `info.pages` even when the loader read a single frame, but sets `pageHeight` only on a
+    // stacked multi-frame result.
+    const frameHeight = info.pageHeight ?? info.height;
+    const count = info.height / frameHeight;
     // Sharp's `premultiplied` flag is never copied: after a resize it reports true on raw output
     // whose bytes are straight alpha.
     const rasterInfo: RasterInfo = {
       width: info.width,
-      height:
-        count > 1 ? (info.pageHeight ?? info.height / count) : info.height,
+      height: frameHeight,
       channels: info.channels,
     };
     if (count > 1) {

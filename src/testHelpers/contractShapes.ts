@@ -1,5 +1,5 @@
 // Compiled by `npm run types:check` (tsconfig.test-helpers.json), never run. It pins the promise
-// that each driver contract is an abstract class, yet a plain object of the same shape still
+// that each contract is an abstract class, yet a plain object of the same shape still
 // type-checks as that contract. A contract change that breaks plain objects fails CI here.
 import type { SourceDecoder } from '../contracts/decoder.ts';
 import type { LockStore } from '../contracts/locks.ts';

@@ -199,14 +199,19 @@ test('when the probe finds nothing: RESIZE_DECODER_MISSING for an unlisted forma
   );
 });
 
-test('an empty stored format is probed with no mismatch', async () => {
-  const second = fake(['webp'], 'accept');
-  const result = await new DecoderSet([
-    fake(['png'], 'refuse'),
-    second,
-  ]).identify(bytes, limits, '');
-  assert.equal(result.decoder, second);
-  assert.equal(result.mismatch, undefined);
+test('an empty or non-string stored format is probed with no mismatch', async () => {
+  for (const stored of ['', 42, null]) {
+    const first = fake(['png'], 'refuse');
+    const second = fake(['webp'], 'accept');
+    const result = await new DecoderSet([first, second]).identify(
+      bytes,
+      limits,
+      stored,
+    );
+    assert.equal(result.decoder, second);
+    assert.equal(result.mismatch, undefined);
+    assert.equal(first.calls, 1);
+  }
 });
 
 test('an inspect result outside the contract is RESIZE_DECODER_INVALID', async () => {
@@ -251,6 +256,7 @@ test('createDecoderSet refuses entries that are not decoders with RESIZE_DECODER
   });
   const cases: [unknown, RegExp][] = [
     ['x', /decoders/],
+    [null, /decoders/],
     [[{}], /decoders\[0\]/],
     [[class {}], /decoders\[0\]/],
     [
