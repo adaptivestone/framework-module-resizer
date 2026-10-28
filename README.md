@@ -114,10 +114,12 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 2. Set `worker.enabled: true` in the config.
 3. Create the indexes through your migration process, before the worker starts: the framework CLI
    that runs the worker turns Mongoose's `autoIndex` off, so the worker builds none and stops with
-   `RESIZE_MONGO_INDEX_MISSING` without the gate index, on a fresh database too. An API with
-   `autoIndex` on builds them, and its `verify()` waits for that build, but a migration that runs
-   before both is the order that always works, also when a new pipeline needs the worker deployed
-   before the API requests it.
+   `RESIZE_MONGO_INDEX_MISSING` without the gate index, on a fresh database too. On a new database
+   only, an API with `autoIndex` on can build them first (Mongoose's own build at boot, no code of
+   yours), and its `verify()` waits for that build. When upgrading, create the gate index through
+   a migration before the new API and workers start (the order is in `CHANGELOG.md`). A migration
+   that runs before both always works, also when a new pipeline needs the worker deployed before
+   the API requests it.
 4. Run `npm run cli ResizeWorker` as a separate process.
 
 The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
@@ -389,7 +391,7 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     nothing was stored; `taskId` whenever the queue knows it); or `{ status: 'unconfirmed' }` (the
     queue cannot say whether the task was stored, e.g. a response lost after the write: the read
     path logs it once until an add is confirmed again, `prewarm()` reports the retryable
-    `RESIZE_ENQUEUE_UNCONFIRMED`; on a gating queue a stored task's row is the gate, and beside a
+    `RESIZE_ENQUEUE_UNCONFIRMED` (see [`prewarm()` issues](#prewarm-issues)); on a gating queue a stored task's row is the gate, and beside a
     queue without `gatesByTask` the core keeps the gate lock for one lease, at most `gateTtlMs`). A
     value in
     none of these shapes (a queue written for an older version, e.g. one that resolves a task id)
@@ -647,8 +649,11 @@ await ResizeTask.updateOne(
 ### `prewarm()` issues
 
 `prewarm()` never throws. A requested variant without a confirmed task is in `result.unconfirmed`,
-and `result.issues` says why, each issue with the variants it covers and `retryable`: whether
-calling `prewarm()` again can help without a change to the code, the config or the data.
+and `result.issues` says why, each issue with the variants it covers and `retryable`. `false`: the
+module knows that no retry can help until the request, the config or the code changes. `true`: the
+module has not ruled a retry out. The cause may pass by itself, or it is a fault that the queue
+can only report in the logs (an unregistered or outdated `ResizeTask` model, an SQS queue name
+without a URL, a lock store that fails): fix the logged cause before you retry.
 
 | `code` | When | `retryable` |
 |---|---|---|
@@ -658,10 +663,10 @@ calling `prewarm()` again can help without a change to the code, the config or t
 | `RESIZE_ENQUEUE_NO_QUEUE` | The Resizer has no task queue (eager only) | `false` |
 | `RESIZE_ENQUEUE_VARIANT_CONFLICT` | Different payloads share one preview identity, in the request (e.g. after a `beforeEnqueue` tap) or in the active task, so none of them can be confirmed | `false` |
 | `RESIZE_TASK_IN_FLIGHT` | A task queue with `gatesByTask` (Mongo): a task of this Resizer, media, pipeline and queue is active, or a dead one is cooling down, and does not hold these variants | `true`: call again after it ends |
-| `RESIZE_ENQUEUE_LOCK_CONTENDED` | A task queue without `gatesByTask` (SQS): the gate lock is held (a task queued, running or waiting for a retry, a dead task's cooldown, or the one-lease hold after an add the queue did not confirm); SQS cannot say which variants that task holds | `true`: call again after it ends |
-| `RESIZE_ENQUEUE_LOCK_FAILED` | A task queue without `gatesByTask`: acquiring the gate lock threw (logged) | `true` |
-| `RESIZE_ENQUEUE_QUEUE_FAILED` | `add()` threw (logged), e.g. an SQS send error, or a queue name the `SqsTaskQueue` has no URL for (`RESIZE_SQS_QUEUE_UNKNOWN`); the task may still be stored | `true` |
-| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue cannot say whether it stored the task (on Mongo a write error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`; `false` for a value in none of the shapes |
+| `RESIZE_ENQUEUE_LOCK_CONTENDED` | A task queue without `gatesByTask` (SQS): the gate lock is held (a task queued, running or waiting for a retry, a dead task's cooldown, or the one-lease hold after an add that threw or was not confirmed); SQS cannot say which variants that task holds | `true`: call again after it ends |
+| `RESIZE_ENQUEUE_LOCK_FAILED` | A task queue without `gatesByTask`: acquiring the gate lock threw (logged) | `true`, even when the lock store fails for good: fix the logged cause first |
+| `RESIZE_ENQUEUE_QUEUE_FAILED` | `add()` threw (logged), e.g. an SQS send error, or a queue name the `SqsTaskQueue` has no URL for (`RESIZE_SQS_QUEUE_UNKNOWN`); the task may still be stored. Beside a queue without `gatesByTask` the gate lock is then kept for one lease (at most `gateTtlMs`), so a `prewarm()` in that time reports `RESIZE_ENQUEUE_LOCK_CONTENDED` and the read path logs nothing | `true`, even for a queue name without a URL: fix the logged cause first |
+| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue did not confirm the task (on Mongo a database error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`, even for an unregistered or outdated model: fix the logged cause first; `false` for a value in none of the shapes |
 | `RESIZE_ENQUEUE_CONFIRM_FAILED` | After an `in-flight` add, `findActive()` threw (logged), so what the active task holds is unknown | `true` |
 | `RESIZE_ENQUEUE_INTERNAL_ERROR` | An unexpected error (e.g. a media without an id, `RESIZE_MEDIA_NO_ID`), a Resizer that could not start (a part that did not load, an invalid config), or a task queue that cannot be used (the error `verify()` reports, e.g. `RESIZE_LOCKS_REQUIRED`); the message is the error's | `false` when the error is a `ResizeError` with `retryable: false`, or a `ResizeMediaError`, `ResizeConfigError` or `ResizeSetupError` (or a subclass); otherwise `true` |
 
