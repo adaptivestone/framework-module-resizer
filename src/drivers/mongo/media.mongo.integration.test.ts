@@ -1,8 +1,10 @@
 // MongoMediaStore against a real MongoDB: one stored preview row per preview identity, however
-// many workers render it, the preview metadata a row records, the startup check for a media model
-// without those fields, and the `model` / `getModel` options.
+// many workers render it, rows swapped by identity in one write, the preview metadata a row
+// records, the startup check for a media model without those fields, and the `model` / `getModel`
+// options.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
+import { types } from 'node:util';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeSetupError } from '../../errors.ts';
@@ -253,6 +255,201 @@ describe('MongoMediaStore.appendPreviews: one row per preview identity', () => {
     const reloaded = await Hooked.findById(doc._id).lean();
     assert.equal(reloaded?.previews?.length, 1);
     assert.equal(reloaded?.original?.width, 64);
+  });
+});
+
+// The paths under `value` that hold null (an undefined written through an update pipeline would).
+function nullPaths(value: unknown, path = ''): string[] {
+  if (value === null) {
+    return [path];
+  }
+  if (
+    typeof value !== 'object' ||
+    value instanceof Date ||
+    value instanceof mongoose.Types.ObjectId
+  ) {
+    return [];
+  }
+  return Object.entries(value).flatMap(([key, inner]) =>
+    nullPaths(inner, path ? `${path}.${key}` : key),
+  );
+}
+
+describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', () => {
+  test('replacePreviews swaps rows by identity in one write and returns what it removed, as plain objects', async () => {
+    const seen: Array<{ pipeline: boolean; result: unknown }> = [];
+    const schema = new mongoose.Schema(
+      { ...resizeMediaSchemaFragment },
+      { minimize: false },
+    );
+    schema.post(
+      'findOneAndUpdate',
+      function (this: mongoose.Query<unknown, unknown>, result: unknown) {
+        seen.push({ pipeline: Array.isArray(this.getUpdate()), result });
+      },
+    );
+    const Hooked =
+      connection.models.ReplaceHookedMedia ??
+      connection.model('ReplaceHookedMedia', schema);
+    const store = new MongoMediaStore({ model: Hooked });
+    const doc = await Hooked.create({
+      original: { storageRef: { path: 'o.png' }, format: 'png' },
+      previews: [
+        preview(undefined, 'x0'),
+        preview(ID_A, 'a1'),
+        preview(ID_B, 'b1'),
+      ],
+    });
+    const mediaId = String(doc._id);
+    const createdAt = new Date('2026-10-28T12:00:00.000Z');
+    const next: Preview = { ...preview(ID_A, 'a9'), createdAt };
+
+    const result = await store.replacePreviews(mediaId, ['zzz'], [next]);
+
+    assert.deepEqual(
+      result.removed.map((row) => [row.identity, row.storageRef]),
+      [[ID_A, { path: 'a1.webp' }]],
+    );
+    assert.equal(Object.getPrototypeOf(result.removed[0]), Object.prototype);
+    assert.deepEqual(result.stored, [next]);
+    assert.equal(types.isProxy(result.stored), false);
+    assert.equal(Object.getPrototypeOf(result.stored[0]), Object.prototype);
+    // One write, an update pipeline, whose result is the pre-image projected on `previews`.
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].pipeline, true);
+    assert.deepEqual(Object.keys(seen[0].result as object).sort(), [
+      '_id',
+      'previews',
+    ]);
+    assert.equal(
+      (seen[0].result as { previews: unknown[] }).previews.length,
+      3,
+    );
+
+    const rows = (
+      (await Hooked.findById(mediaId).lean()) as { previews: Preview[] }
+    ).previews;
+    assert.deepEqual(
+      rows.map((row) => row.storageRef),
+      [{ path: 'x0.webp' }, { path: 'b1.webp' }, { path: 'a9.webp' }],
+    );
+    assert.ok(rows[2].createdAt instanceof Date);
+    assert.equal(rows[2].createdAt.getTime(), createdAt.getTime());
+    assert.deepEqual(nullPaths(rows), []);
+  });
+
+  test('replacePreviews stores what appendPreviews would on a strict schema', async () => {
+    const { origin: _origin, ...rowFields } =
+      resizeMediaSchemaFragment.previews[0];
+    const model = mediaModelWith('NoOriginReplaceMedia', [rowFields]);
+    const store = new MongoMediaStore({ model });
+    const create = async () =>
+      String(
+        (
+          await model.create({
+            original: { storageRef: { path: 'o.png' }, format: 'png' },
+            previews: [],
+          })
+        )._id,
+      );
+    const rowsOf = async (id: string) =>
+      (
+        (await model.findById(id).lean()) as { previews: Preview[] }
+      ).previews.map(({ _id, ...row }: Preview & { _id?: unknown }) => row);
+    const row = {
+      ...preview(ID_A, 'strict'),
+      origin: '8c64760b02a9f12a',
+      bytes: '12',
+    } as unknown as Preview;
+    const appended = await create();
+    const replaced = await create();
+
+    await store.appendPreviews(appended, [row]);
+    const result = await store.replacePreviews(replaced, [], [row]);
+
+    const [stored] = await rowsOf(replaced);
+    assert.deepEqual(await rowsOf(replaced), await rowsOf(appended));
+    assert.equal(Object.hasOwn(stored, 'origin'), false);
+    assert.equal(stored.bytes, 12);
+    assert.deepEqual(result, { stored: [stored], removed: [] });
+  });
+
+  test('replacePreviews with empty rows only removes', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia([
+      preview(undefined, 'x0'),
+      preview(ID_A, 'a1'),
+      preview(ID_B, 'b1'),
+    ]);
+
+    const result = await store.replacePreviews(mediaId, [ID_A, ID_B], []);
+
+    assert.deepEqual(result.stored, []);
+    assert.deepEqual(
+      result.removed.map((row) => row.storageRef),
+      [{ path: 'a1.webp' }, { path: 'b1.webp' }],
+    );
+    assert.deepEqual(
+      (await storedPreviews(mediaId)).map((row) => row.storageRef),
+      [{ path: 'x0.webp' }],
+    );
+  });
+
+  test('replacePreviews on a media that is gone resolves with two empty lists', async () => {
+    const gone = String(new mongoose.Types.ObjectId());
+    assert.deepEqual(
+      await mediaStore().replacePreviews(gone, [ID_A], [preview(ID_B)]),
+      { stored: [], removed: [] },
+    );
+    assert.equal(await Media().findById(gone), null);
+  });
+
+  test('concurrent replacePreviews of one identity leave one row', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia([preview(ID_A, 'a1'), preview(ID_B, 'b1')]);
+    const [first, second] = await Promise.all([
+      store.replacePreviews(mediaId, [], [preview(ID_A, 'first')]),
+      store.replacePreviews(mediaId, [], [preview(ID_A, 'second')]),
+    ]);
+
+    const rows = await storedPreviews(mediaId);
+    const aRows = rows.filter((row) => row.identity === ID_A);
+    assert.equal(aRows.length, 1);
+    assert.equal(rows.length, 2);
+    // Either order is valid: the write that ran last removed the other one's row, and the write
+    // that ran first removed the original.
+    const lastIsFirst =
+      (aRows[0].storageRef as { path: string }).path === 'first.webp';
+    const [last, earlier] = lastIsFirst ? [first, second] : [second, first];
+    assert.deepEqual(
+      last.stored.map((row) => row.storageRef),
+      [aRows[0].storageRef],
+    );
+    assert.deepEqual(
+      last.removed.map((row) => row.storageRef),
+      earlier.stored.map((row) => row.storageRef),
+    );
+    assert.deepEqual(
+      earlier.removed.map((row) => row.storageRef),
+      [{ path: 'a1.webp' }],
+    );
+  });
+
+  test('an identity that starts with $ is matched as a string, never read as a field path', async () => {
+    const store = mediaStore();
+    const odd = '$resizer:default:16x16:webp:';
+    const mediaId = await newMedia([preview(odd, 'odd'), preview(ID_A, 'a1')]);
+
+    const result = await store.replacePreviews(mediaId, [odd], []);
+
+    assert.deepEqual(
+      result.removed.map((row) => row.identity),
+      [odd],
+    );
+    assert.deepEqual(
+      (await storedPreviews(mediaId)).map((row) => row.identity),
+      [ID_A],
+    );
   });
 });
 

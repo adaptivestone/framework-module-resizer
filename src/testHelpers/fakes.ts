@@ -93,14 +93,17 @@ export function clockLocks(now: () => number = () => Date.now()): ClockLocks {
 
 /**
  * A MediaStore from optional parts; missing parts are harmless in-memory stand-ins. The default
- * appendPreviews follows the media contract: it keeps one row per preview identity in `previews`
- * (per media id; pass a map to seed or inspect it) and resolves with the previews it stored. A
- * preview without an identity is always stored.
+ * appendPreviews and replacePreviews follow the media contract on `previews` (rows per media id;
+ * pass a map to seed or inspect it; every media id counts as present). appendPreviews keeps one
+ * row per preview identity and resolves with the previews it stored; a preview without an identity
+ * is always stored. replacePreviews removes the rows whose identity is given or is one of the new
+ * rows', stores the first new row per identity, and resolves with both lists.
  */
 export function fakeMedia(
   parts: {
     load?: (mediaId: string) => Promise<MediaLike | null>;
     appendPreviews?: MediaStore['appendPreviews'];
+    replacePreviews?: MediaStore['replacePreviews'];
     previews?: Map<string, Preview[]>;
     verify?: () => void | Promise<void>;
   } = {},
@@ -122,9 +125,41 @@ export function fakeMedia(
     }
     return stored;
   };
+  const replacePreviews = async (
+    mediaId: string,
+    identities: string[],
+    previews: Preview[],
+  ) => {
+    const stored: Preview[] = [];
+    const seen = new Set<string>();
+    for (const preview of previews) {
+      if (preview.identity !== undefined) {
+        if (seen.has(preview.identity)) {
+          continue;
+        }
+        seen.add(preview.identity);
+      }
+      stored.push(preview);
+    }
+    const media = rows.get(mediaId) ?? [];
+    rows.set(mediaId, media);
+    const remove = new Set([...identities, ...seen]);
+    const kept: Preview[] = [];
+    const removed: Preview[] = [];
+    for (const row of media) {
+      (row.identity !== undefined && remove.has(row.identity)
+        ? removed
+        : kept
+      ).push(row);
+    }
+    // In place, like appendPreviews: a test that holds the seeded array sees the swap.
+    media.splice(0, media.length, ...kept, ...stored);
+    return { stored, removed };
+  };
   return {
     loadMedia: parts.load ?? (async () => null),
     appendPreviews: parts.appendPreviews ?? appendPreviews,
+    replacePreviews: parts.replacePreviews ?? replacePreviews,
     ...(parts.verify ? { verify: parts.verify } : {}),
   };
 }

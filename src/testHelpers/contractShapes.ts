@@ -37,11 +37,13 @@ export const fullTasks: TaskQueue = {
 export const media: MediaStore = {
   loadMedia: async () => null,
   appendPreviews: async (_id, previews) => previews,
+  replacePreviews: async () => ({ stored: [], removed: [] }),
 };
 // Spelled out: a spread of a class-typed value drops its methods from the type.
 export const verifiedMedia: MediaStore = {
   loadMedia: async () => null,
   appendPreviews: async (_id, previews) => previews,
+  replacePreviews: async () => ({ stored: [], removed: [] }),
   verify: () => {},
 };
 export const locks: LockStore = {
@@ -54,6 +56,13 @@ export const voidAppendMedia: MediaStore = {
   loadMedia: async () => null,
   // @ts-expect-error — appendPreviews resolves with the stored rows, never with nothing.
   appendPreviews: async () => {},
+  replacePreviews: async () => ({ stored: [], removed: [] }),
+};
+export const oldMedia: MediaStore = {
+  loadMedia: async () => null,
+  appendPreviews: async (_id, previews) => previews,
+  // @ts-expect-error — replacePreviews resolves with { stored, removed }, never with the stored rows alone.
+  replacePreviews: async (_id, _identities, rows) => rows,
 };
 // @ts-expect-error — a media store is not a lock store.
 export const locklessMedia: LockStore = media;

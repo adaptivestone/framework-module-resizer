@@ -73,6 +73,42 @@ test('fakeMedia keeps one row per identity and resolves with the stored rows', a
   assert.deepEqual(previews.get('m2'), [a]);
 });
 
+test("fakeMedia's replacePreviews follows the contract", async () => {
+  const legacy = preview(undefined, 'x0');
+  const a1 = preview('a', 'a1');
+  const b1 = preview('b', 'b1');
+  const previews = new Map([['m1', [legacy, a1, b1]]]);
+  const media = fakeMedia({ previews });
+  const a9 = preview('a', 'a9');
+
+  // The rows' own identities are replaced too; of two rows with one identity the first is stored.
+  assert.deepEqual(
+    await media.replacePreviews('m1', ['zzz'], [a9, preview('a', 'a-repeat')]),
+    { stored: [a9], removed: [a1] },
+  );
+  assert.deepEqual(previews.get('m1'), [legacy, b1, a9]);
+  // No rows: it only removes; a row without an identity is never removed.
+  assert.deepEqual(await media.replacePreviews('m1', ['a', 'b'], []), {
+    stored: [],
+    removed: [b1, a9],
+  });
+  assert.deepEqual(previews.get('m1'), [legacy]);
+
+  // A replacePreviews part replaces the default.
+  const calls: unknown[][] = [];
+  const custom = fakeMedia({
+    replacePreviews: async (...args) => {
+      calls.push(args);
+      return { stored: [], removed: [] };
+    },
+  });
+  assert.deepEqual(await custom.replacePreviews('m2', ['a'], [a9]), {
+    stored: [],
+    removed: [],
+  });
+  assert.deepEqual(calls, [['m2', ['a'], [a9]]]);
+});
+
 test('fakeMedia treats seeded previews as already stored', async () => {
   const seeded = preview('a', 'other-worker');
   const media = fakeMedia({ previews: new Map([['m1', [seeded]]]) });

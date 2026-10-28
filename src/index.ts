@@ -19,7 +19,7 @@ export type {
   WaterfallName,
 } from './contracts/hooks.ts';
 export { LockStore } from './contracts/locks.ts';
-export { MediaStore } from './contracts/media.ts';
+export { MediaStore, type ReplacedPreviews } from './contracts/media.ts';
 export type {
   BeforeStep,
   Pipeline,

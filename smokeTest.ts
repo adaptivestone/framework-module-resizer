@@ -195,6 +195,7 @@ const resizer = new mod.Resizer({
   media: {
     loadMedia: async () => null,
     appendPreviews: async (_id, previews) => previews,
+    replacePreviews: async () => ({ stored: [], removed: [] }),
   },
 });
 assert.equal(resizer.name, 'default');
@@ -204,6 +205,7 @@ const fs = await import(PKG + '/drivers/fs.js');
 class MemoryMedia extends mod.MediaStore {
   async loadMedia() { return null; }
   async appendPreviews(_id, previews) { return previews; }
+  async replacePreviews() { return { stored: [], removed: [] }; }
 }
 class MemoryLocks extends mod.LockStore {
   async acquire() { return true; }
@@ -258,6 +260,7 @@ import {
   MediaStore,
   type Preview,
   type QueueConfig,
+  type ReplacedPreviews,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
@@ -326,6 +329,7 @@ import {
   resizeMediaPaths,
   resizeMediaSchemaFragment,
 } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
+import mongoose from 'mongoose';
 
 // A host media model's schema spreads the fragment next to its own fields; the declarations keep
 // the literal leaf types a typed schema needs.
@@ -335,10 +339,22 @@ const mediaSchema: {
   previews: readonly { identity: { type: StringConstructor } }[];
 } = { name: { type: String }, ...resizeMediaSchemaFragment };
 const mediaPaths: readonly ['original', 'previews'] = resizeMediaPaths;
+// A typed Mongoose model of such a schema is a media model, castObject included (never called
+// here: compiling it is the check).
+const typedMediaStore = () => {
+  const File = mongoose.model(
+    'File',
+    new mongoose.Schema({ name: { type: String }, ...resizeMediaSchemaFragment }, { minimize: false }),
+  );
+  return [new MongoMediaStore({ model: File }), mongoParts(mongoose.connection, { mediaModel: File })];
+};
 
 class MemoryMedia extends MediaStore {
   async loadMedia(): Promise<null> { return null; }
   async appendPreviews(_id: string, previews: Preview[]): Promise<Preview[]> { return previews; }
+  async replacePreviews(_id: string, _identities: string[], rows: Preview[]): Promise<ReplacedPreviews> {
+    return { stored: rows, removed: [] };
+  }
 }
 class MemoryLocks extends LockStore {
   async acquire(): Promise<boolean> { return true; }
@@ -351,6 +367,7 @@ const locks: LockStore = new MemoryLocks();
 const plainMedia: MediaStore = {
   loadMedia: async () => null,
   appendPreviews: async (_id, previews) => previews,
+  replacePreviews: async () => ({ stored: [], removed: [] }),
 };
 // A core construction site (never called here: it would register a Resizer).
 const core = () =>
@@ -370,6 +387,7 @@ void [
   mongoParts,
   mediaSchema,
   mediaPaths,
+  typedMediaStore,
 ];
 
 type Equal<A, B> =

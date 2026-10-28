@@ -1,15 +1,25 @@
 // MongoMediaStore: the host's media documents in MongoDB, through the host's media model (its
-// schema spreads resizeMediaSchemaFragment). Each preview row is one conditional write, so of two
-// workers that rendered the same preview identity only one stores its row.
-import { MediaStore } from '../../contracts/media.ts';
+// schema spreads resizeMediaSchemaFragment). Each appended preview row is one conditional write, so
+// of two workers that rendered the same preview identity only one stores its row; a replacement is
+// one write per call that removes and stores rows by identity together.
+import { MediaStore, type ReplacedPreviews } from '../../contracts/media.ts';
 import { ResizeSetupError } from '../../errors.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { resolveModelOption } from './modelOption.ts';
 
+/** The `findOneAndUpdate` options the store passes (Mongoose query options). */
+export interface MongoMediaUpdateOptions {
+  projection: Record<string, 1>;
+  returnDocument?: 'before' | 'after';
+  updatePipeline?: boolean;
+  lean?: boolean;
+}
+
 /**
  * The media model methods the store calls (any Mongoose model has them). Writes go through
  * `findOneAndUpdate`, so the host's findOneAndUpdate middleware sees them; it resolves with the
- * matched document (only its `_id` is requested) or null. When the model also exposes its
+ * matched document projected as asked (appendPreviews asks for its `_id` only; replacePreviews for
+ * its `previews` before the write, as a plain object) or null. When the model also exposes its
  * `schema`, verify() checks it keeps the preview fields the store relies on.
  */
 export interface MongoMediaModel {
@@ -17,9 +27,11 @@ export interface MongoMediaModel {
   findById(id: string): PromiseLike<unknown>;
   findOneAndUpdate(
     filter: object,
-    update: object,
-    options: { projection: { _id: 1 } },
+    update: object | object[],
+    options: MongoMediaUpdateOptions,
   ): PromiseLike<unknown>;
+  // Mongoose's Model.castObject: cast to the schema, no write. Its typing allows a null `previews`.
+  castObject?(doc: { previews: Preview[] }): { previews?: unknown[] | null };
 }
 
 export interface MongoMediaStoreOptions {
@@ -28,8 +40,53 @@ export interface MongoMediaStoreOptions {
   getModel?: () => MongoMediaModel | null | undefined;
 }
 
-// Each write asks for the matched document's id only, not the whole media document.
+// Each append asks for the matched document's id only, not the whole media document.
 const ID_ONLY = { projection: { _id: 1 as const } };
+
+// A replacement reads the rows it removes from the document as it was before the write, in the
+// same write. Mongoose refuses an update pipeline unless `updatePipeline` is set.
+const PREVIEWS_BEFORE: MongoMediaUpdateOptions = {
+  projection: { previews: 1 },
+  returnDocument: 'before',
+  updatePipeline: true,
+  lean: true,
+};
+
+// The rows a replacement writes: the first row per identity (a row without an identity cannot be
+// de-duplicated and is kept), each without its undefined-valued keys, which the driver would store
+// as null.
+function uniqueRows(rows: Preview[]): Preview[] {
+  const seen = new Set<string>();
+  const unique: Preview[] = [];
+  for (const row of rows) {
+    if (typeof row.identity === 'string') {
+      if (seen.has(row.identity)) {
+        continue;
+      }
+      seen.add(row.identity);
+    }
+    unique.push(
+      Object.fromEntries(
+        Object.entries(row).filter(([, value]) => value !== undefined),
+      ) as Preview,
+    );
+  }
+  return unique;
+}
+
+// The stored rows a replacement removes: those whose identity is one of `remove`.
+function removedRows(
+  previews: unknown,
+  remove: ReadonlySet<string>,
+): Preview[] {
+  if (!Array.isArray(previews)) {
+    return [];
+  }
+  return (previews as unknown[]).filter((row): row is Preview => {
+    const identity = (row as { identity?: unknown } | null)?.identity;
+    return typeof identity === 'string' && remove.has(identity);
+  });
+}
 
 // The part of a Mongoose schema verify() reads (types only: no mongoose import).
 interface SchemaLike {
@@ -145,5 +202,70 @@ export class MongoMediaStore extends MediaStore {
       }
     }
     return stored;
+  }
+
+  /**
+   * One update pipeline per call: it keeps the stored rows whose identity is not replaced and
+   * appends the new ones, so a reader never sees the media with neither the old nor the new row,
+   * and of two concurrent replacements of one identity one row is left. The rows removed come from
+   * the same write's pre-image, not from a read before it. Mongoose does not cast an update
+   * pipeline, so the rows are cast to the schema first when the model can (strict rows lose the
+   * keys their schema does not declare, as with appendPreviews); a value that cannot be cast
+   * rejects with Mongoose's ValidationError before anything is written.
+   */
+  async replacePreviews(
+    mediaId: string,
+    identities: string[],
+    rows: Preview[],
+  ): Promise<ReplacedPreviews> {
+    const model = this.mediaModel();
+    const unique = uniqueRows(rows);
+    // A copy: Mongoose casts into its own array type, and callers get plain arrays.
+    const written = model.castObject
+      ? (Array.from(
+          model.castObject({ previews: unique }).previews ?? [],
+        ) as Preview[])
+      : unique;
+    const remove = [
+      ...new Set([
+        ...identities,
+        ...rows.flatMap((row) =>
+          typeof row.identity === 'string' ? [row.identity] : [],
+        ),
+      ]),
+    ];
+    // Both lists are literals: inside an expression a string that starts with `$` would be read
+    // as a field path, and resizer and pipeline names are the host's own strings.
+    const update = [
+      {
+        $set: {
+          previews: {
+            $concatArrays: [
+              {
+                $filter: {
+                  input: { $ifNull: ['$previews', []] },
+                  cond: {
+                    $not: [{ $in: ['$$this.identity', { $literal: remove }] }],
+                  },
+                },
+              },
+              { $literal: written },
+            ],
+          },
+        },
+      },
+    ];
+    const before = (await model.findOneAndUpdate(
+      { _id: mediaId },
+      update,
+      PREVIEWS_BEFORE,
+    )) as { previews?: unknown } | null;
+    if (!before) {
+      return { stored: [], removed: [] };
+    }
+    return {
+      stored: written,
+      removed: removedRows(before.previews, new Set(remove)),
+    };
   }
 }

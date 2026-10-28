@@ -195,6 +195,117 @@ describe('FrameworkMediaStore.appendPreviews', () => {
   });
 });
 
+describe('FrameworkMediaStore.replacePreviews', () => {
+  // A media model that records each findOneAndUpdate and resolves with `before` (the pre-image).
+  function pipelineModel(
+    before: unknown,
+    castObject?: (doc: { previews: Preview[] }) => { previews?: unknown[] },
+  ) {
+    const calls: Array<{ filter: unknown; update: unknown; options: unknown }> =
+      [];
+    return {
+      calls,
+      model: {
+        findOneAndUpdate(filter: unknown, update: unknown, options: unknown) {
+          calls.push({ filter, update, options });
+          return Promise.resolve(before);
+        },
+        ...(castObject ? { castObject } : {}),
+      },
+    };
+  }
+  const row = (identity: string | undefined, path: string) =>
+    ({
+      storageRef: { path },
+      ...(identity === undefined ? {} : { identity }),
+      sizeKey: '16x16',
+      format: 'webp',
+    }) as Preview;
+
+  test('FrameworkMediaStore.replacePreviews sends one update pipeline with returnDocument before', async () => {
+    const oldA = row('a', 'a1');
+    const oldB = row('b', 'b1');
+    const before = {
+      _id: 'm1',
+      previews: [row(undefined, 'x0'), oldA, oldB, row('c', 'c1')],
+    };
+    const casts: unknown[] = [];
+    const { calls, model } = pipelineModel(before, (doc) => {
+      casts.push(doc);
+      return { previews: doc.previews.map((p) => ({ ...p, cast: true })) };
+    });
+    installApp(model);
+    const next = row('a', 'a9');
+    const legacy = row(undefined, 'legacy');
+
+    const result = await mediaStore.replacePreviews(
+      'm1',
+      ['b', 'a'],
+      [next, row('a', 'a-repeat'), legacy],
+    );
+
+    // The first row per identity is cast; a row without an identity is kept.
+    assert.deepEqual(casts, [{ previews: [next, legacy] }]);
+    const written = [
+      { ...next, cast: true },
+      { ...legacy, cast: true },
+    ];
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].filter, { _id: 'm1' });
+    assert.deepEqual(calls[0].update, [
+      {
+        $set: {
+          previews: {
+            $concatArrays: [
+              {
+                $filter: {
+                  input: { $ifNull: ['$previews', []] },
+                  cond: {
+                    $not: [
+                      { $in: ['$$this.identity', { $literal: ['b', 'a'] }] },
+                    ],
+                  },
+                },
+              },
+              { $literal: written },
+            ],
+          },
+        },
+      },
+    ]);
+    assert.deepEqual(calls[0].options, {
+      projection: { previews: 1 },
+      returnDocument: 'before',
+      updatePipeline: true,
+      lean: true,
+    });
+    assert.deepEqual(result, { stored: written, removed: [oldA, oldB] });
+  });
+
+  test('a model without castObject gets the rows as given, minus undefined keys', async () => {
+    const { calls, model } = pipelineModel({ _id: 'm1', previews: [] });
+    installApp(model);
+    const given = {
+      ...row('a', 'a1'),
+      bytes: undefined,
+      origin: undefined,
+    } as Preview;
+
+    const result = await mediaStore.replacePreviews('m1', [], [given]);
+
+    const expected = row('a', 'a1');
+    const update = calls[0].update as Array<{
+      $set: { previews: { $concatArrays: [unknown, { $literal: Preview[] }] } };
+    }>;
+    const literal = update[0].$set.previews.$concatArrays[1].$literal;
+    assert.deepEqual(literal, [expected]);
+    assert.equal(Object.hasOwn(literal[0], 'bytes'), false);
+    assert.deepEqual(result, { stored: [expected], removed: [] });
+    // The caller's row is left as it was.
+    assert.equal(Object.hasOwn(given, 'bytes'), true);
+  });
+});
+
 describe('FrameworkMediaStore.verify: the media schema', () => {
   // A model-shaped object with a real schema whose preview rows are declared as given.
   const withRows = (modelName: string, row: Record<string, unknown>) => ({

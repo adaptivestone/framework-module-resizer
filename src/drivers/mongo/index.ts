@@ -11,6 +11,7 @@ export {
   type MongoMediaModel,
   MongoMediaStore,
   type MongoMediaStoreOptions,
+  type MongoMediaUpdateOptions,
 } from './media.ts';
 export {
   resizeMediaPaths,
