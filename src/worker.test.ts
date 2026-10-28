@@ -890,7 +890,7 @@ test("on a queue without gatesByTask, the gate lock lives in the task's Resizer'
   const held = locks.entry(key);
   assert.equal(held?.owner, 'g1');
   const left = (held?.expiresAt ?? 0) - Date.now();
-  assert.ok(left >= 29_900 && left <= 30_000, `held for ${left} ms`);
+  assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
 });
 
 test('on a queue without gatesByTask, the task of a Resizer the worker does not serve touches no lock, even with a gateOwner', async () => {

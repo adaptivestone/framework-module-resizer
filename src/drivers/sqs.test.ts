@@ -1134,7 +1134,8 @@ describe('Consumer with SqsTaskQueue', () => {
     const held = leaseMs + retryBackoffMs.base;
     const left = seen[0].left ?? 0;
     assert.ok(
-      left >= held - 100 && left <= held,
+      // More than the lease alone, at most the lease plus the backoff.
+      left > leaseMs && left <= held,
       `held for ${left} ms after the failure (expected about ${held})`,
     );
     assert.equal(seen[1].left, undefined, 'released on completion');

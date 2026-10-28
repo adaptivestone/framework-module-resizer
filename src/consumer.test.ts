@@ -1032,7 +1032,11 @@ describe('the gate lock on a task queue without gatesByTask', () => {
 
   test('a retry holds it for the backoff plus one lease', async () => {
     const locks = clockLocks();
-    const tasks = await gatedTask(locks);
+    // A 1 s lease, so the window below is wide and still tells the lease apart.
+    const tasks = await gatedTask(
+      locks,
+      new PlainTaskQueue({ timing: { ...gateTiming, leaseMs: 1000 } }),
+    );
     const events = await runUntil(
       tasks,
       async () => {
@@ -1052,7 +1056,8 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       ['failed'],
     );
     const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
-    assert.ok(left >= 60_100 && left <= 60_200, `held for ${left} ms`);
+    // More than the 60 s backoff alone, at most the backoff plus the lease.
+    assert.ok(left > 60_000 && left <= 61_000, `held for ${left} ms`);
   });
 
   test("a dead-letter holds it for the Resizer's cooldownMs", async () => {
@@ -1077,7 +1082,8 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       ['deadLettered'],
     );
     const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
-    assert.ok(left >= 29_900 && left <= 30_000, `held for ${left} ms`);
+    // The cooldown, not the 300 ms a running task holds it for.
+    assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
   });
 
   test('the cooldown hold is in place before the deadLettered event fires', async () => {
@@ -1119,7 +1125,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     assert.equal(owner, 'g1');
     // The cooldown, not the 200 ms lease the task started with.
     assert.ok(
-      left >= 29_900 && left <= 30_000,
+      left > 29_000 && left <= 30_000,
       `held for ${left} ms when the event fired`,
     );
   });
