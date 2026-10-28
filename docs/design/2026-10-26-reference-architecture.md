@@ -232,6 +232,7 @@ is exported for push-delivered tasks; S3 previews get `Cache-Control: public, ma
 immutable`; the per-read logs for media without original or with an unknown pipeline become
 metrics; the 2026-10-02 and 2026-10-05 design docs get superseded notes; README's terminal-error
 list is corrected.
+Test files are outside `types:check` (about 65 pre-existing type errors in tests, none added in S1/S2): add a tests tsconfig to `types:check`, fix them, keep them clean.
 
 ## Target usage
 
