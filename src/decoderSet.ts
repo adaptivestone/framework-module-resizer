@@ -4,6 +4,7 @@
 // logs a mismatch between the stored and the detected format.
 import type { SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
+import { SvgDecoder } from './decoders/svg.ts';
 import { ResizeError, ResizeMediaError, ResizeSetupError } from './errors.ts';
 import type { ResizeLimits } from './types.d.ts';
 
@@ -218,5 +219,9 @@ export function createDecoderSet(extra?: unknown): DecoderSet {
       );
     }
   });
-  return new DecoderSet([...(given as SourceDecoder[]), new SharpDecoder()]);
+  return new DecoderSet([
+    ...(given as SourceDecoder[]),
+    new SharpDecoder(),
+    new SvgDecoder(),
+  ]);
 }

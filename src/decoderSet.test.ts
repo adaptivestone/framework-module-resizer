@@ -1,5 +1,5 @@
 // DecoderSet tests: fake decoders (plain objects that count their `inspect` calls) for the choice
-// of a decoder, and the built-in decoder for createDecoderSet's order.
+// of a decoder, and the built-in decoders for createDecoderSet's order.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Raster, SourceDecoder, SourceInfo } from './contracts/decoder.ts';
@@ -234,13 +234,23 @@ test('an inspect result outside the contract is RESIZE_DECODER_INVALID', async (
   }
 });
 
-test('createDecoderSet puts the given decoders before the built-in one', () => {
+test('createDecoderSet puts the given decoders before the built-in ones', () => {
   const given = fake(['pdf'], 'accept');
   const set = createDecoderSet([given]);
-  assert.equal(set.decoders.length, 2);
+  assert.equal(set.decoders.length, 3);
   assert.equal(set.decoders[0], given);
   assert.ok(set.decoders[1].formats.includes('jpeg'));
-  assert.equal(createDecoderSet().decoders.length, 1);
+  assert.deepEqual(set.decoders[2].formats, ['svg']);
+  assert.equal(createDecoderSet().decoders.length, 2);
+});
+
+test('SVG bytes are identified by the SVG decoder after the Sharp decoder refuses them', async () => {
+  const svg = Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>',
+  );
+  const { decoder, info } = await createDecoderSet().identify(svg, limits);
+  assert.equal(info.format, 'svg');
+  assert.deepEqual(decoder.formats, ['svg']);
 });
 
 test('createDecoderSet refuses entries that are not decoders with RESIZE_DECODER_INVALID', () => {
