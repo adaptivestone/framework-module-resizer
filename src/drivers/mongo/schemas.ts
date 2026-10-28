@@ -17,8 +17,8 @@ export function resizeTaskFields(mediaModelName: string) {
     // The Resizer that queued the task and the named queue it waits in.
     resizer: { type: String, default: 'default' },
     queue: { type: String, default: 'default' },
-    // True while the task is the gate of its Resizer, media and pipeline: from add() until it
-    // completes, or until the next add() takes over a dead task whose cooldown has passed. Only
+    // True while the task is the gate of its Resizer, media, pipeline and queue: from add() until
+    // it completes, or until the next add() takes over a dead task whose cooldown has passed. Only
     // add() sets it true, so rows written before the gate never hold it.
     active: { type: Boolean, default: false },
     // A dead task keeps the gate until then.
@@ -55,7 +55,12 @@ export function resizeTaskFields(mediaModelName: string) {
 type IndexSpec = readonly [Record<string, 1 | -1>, Record<string, unknown>?];
 
 /** The keys of the gate index; the task queue tells its duplicate key from any other by them. */
-export const gateIndexKeys = { resizer: 1, fileId: 1, pipeline: 1 } as const;
+export const gateIndexKeys = {
+  resizer: 1,
+  fileId: 1,
+  pipeline: 1,
+  queue: 1,
+} as const;
 
 /** ResizeTask indexes. Create them through your migration process; the module never does. */
 export const resizeTaskIndexes: readonly IndexSpec[] = [
@@ -86,9 +91,9 @@ export const resizeTaskIndexes: readonly IndexSpec[] = [
   ],
   // Per-media task lookup, newest first.
   [{ fileId: 1, createdAt: -1 }],
-  // The gate: at most one active task per Resizer, media and pipeline. add() inserts an active
-  // row, so a duplicate key on this index means another task is in flight; rows that are not
-  // active (finished, taken over, or written before the gate) never block a new task.
+  // The gate: at most one active task per Resizer, media, pipeline and queue. add() inserts an
+  // active row, so a duplicate key on this index means another task is in flight; rows that are
+  // not active (finished, taken over, or written before the gate) never block a new task.
   [gateIndexKeys, { unique: true, partialFilterExpression: { active: true } }],
 ];
 

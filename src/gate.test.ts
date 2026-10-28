@@ -1,7 +1,7 @@
 // The gate, end to end through Resizer.resolve() and runWorker(): at most one task is active per
-// Resizer, media and pipeline. However many reads of a cold media arrive at once, one task is
-// queued; while that task waits for a retry, reads queue nothing for its media and pipeline, not
-// even for a new size. A task queue with gatesByTask (MemoryTaskQueue, like the database queue)
+// Resizer, media, pipeline and queue. However many reads of a cold media arrive at once, one task
+// is queued; while that task waits for a retry, reads queue nothing for its media and pipeline, not
+// even for a new size. A task on another queue never blocks them. A task queue with gatesByTask (MemoryTaskQueue, like the database queue)
 // keeps the gate in its task rows; beside one without it (PlainTaskQueue, the SQS shape) the gate
 // is a lock that the worker holds through the backoff and releases once the task completes.
 import assert from 'node:assert/strict';
@@ -37,7 +37,7 @@ const png = await sharp({
 
 const size: SizeInput = { width: 10, height: 10 };
 const newSize: SizeInput = { width: 20, height: 20 };
-const key = gateKey('default', 'm1', 'default');
+const key = gateKey('default', 'default', 'm1', 'default');
 
 afterEach(resetResizerForTests);
 
@@ -66,6 +66,7 @@ function gated(opts: {
   });
   return {
     resizer,
+    media,
     read: (sizes: SizeInput[] = [size]) => resizer.resolve({ media, sizes }),
   };
 }
@@ -207,4 +208,34 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   assert.equal(atCompletion.rows, 2);
   assert.equal(tasks.rows[0].status, 'completed');
   assert.equal(downloads, 2, 'the failed delivery, then its retry');
+});
+
+test('a task waiting on another queue with no worker does not block reads on the default queue', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  const { resizer, media, read } = gated({ tasks });
+  const stop = new AbortController();
+  const completed: string[] = [];
+  resizer.hook('afterTaskComplete', (task) => {
+    completed.push(task.queue);
+    stop.abort();
+  });
+  // Pre-warmed on a bulk queue that no worker consumes.
+  const prewarmed = await resizer.prewarm({
+    media,
+    sizes: [size],
+    queue: 'bulk',
+  });
+  assert.equal(prewarmed.status, 'accepted');
+  // A read on the default queue queues its own task, and the default worker runs it.
+  await read();
+  assert.deepEqual(
+    tasks.rows.map(({ task }) => task.queue),
+    ['bulk', 'default'],
+  );
+  await work(resizer, stop);
+  assert.deepEqual(completed, ['default']);
+  assert.deepEqual(
+    tasks.rows.map(({ status }) => status),
+    ['pending', 'completed'],
+  );
 });

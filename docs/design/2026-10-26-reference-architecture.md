@@ -92,12 +92,13 @@ dedup policy, not queue timing: `new Resizer({ coordination: { gateTtlMs, cooldo
 hosts: a `coordination` section in `resize.ts`). The core validates it against the queue timing
 (`gateTtlMs ≥ leaseMs`); no driver validates lock settings. `QueueTimingOptions` loses `lockTtlMs`.
 
-**F3. The task row is the gate.** One active task per `(resizer, mediaId, pipeline)`.
+**F3. The task row is the gate.** One active task per `(resizer, mediaId, pipeline, queue)`.
+The gate includes the queue: a lane split is the host's choice to render twice.
 
 - `TaskQueue.add(task)` returns `{ status: 'added', taskId } | { status: 'in-flight', taskId? } |
   { status: 'unconfirmed' }`. A queue that can enforce this declares `gatesByTask: true`.
 - **Mongo** (`gatesByTask`): rows carry `active: true` from `add` until `complete` or the end of
-  the dead-letter cooldown; a unique partial index on `{ resizer, fileId, pipeline }` with
+  the dead-letter cooldown; a unique partial index on `{ resizer, fileId, pipeline, queue }` with
   `partialFilterExpression: { active: true }` makes `add` an insert that either succeeds or reports
   `in-flight`. A task in retry backoff stays active, so the lock-release bug disappears. A dead
   row keeps the gate for `cooldownMs`; `add` takes over an expired dead row atomically. No locks on
@@ -105,7 +106,7 @@ hosts: a `coordination` section in `resize.ts`). The core validates it against t
   `requestKey` field and its index are removed (the gate replaces them); `findActive` returns the
   one active task so `prewarm` can report which requested variants it covers.
 - **Queues without the gate** (SQS, custom): the dispatcher takes one owned lock
-  `resize_gate:<resizer>:<mediaId>:<pipeline>` for `gateTtlMs` before `add` (owner = a request
+  `resize_gate:<resizer>:<queue>:<mediaId>:<pipeline>` for `gateTtlMs` before `add` (owner = a request
   token stored in the task payload as `gateOwner`), and releases it if `add` fails. After claim the
   worker extends it on every heartbeat to `leaseMs`; on `fail({ retryAt })` it extends it to
   `retryAt + leaseMs`; on `complete` it releases with compare-and-delete; on `fail('dead')` it

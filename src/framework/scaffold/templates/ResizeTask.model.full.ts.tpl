@@ -33,7 +33,7 @@ export default class ResizeTask extends BaseModel {
       // queue it waits in. Rows written before tasks recorded them read as 'default'.
       resizer: { type: String, default: 'default' },
       queue: { type: String, default: 'default' },
-      // True while the task is the gate of its Resizer, media and pipeline.
+      // True while the task is the gate of its Resizer, media, pipeline and queue.
       active: { type: Boolean, default: false },
       // A dead task keeps the gate until then.
       cooldownUntil: { type: Date },
@@ -98,11 +98,11 @@ export default class ResizeTask extends BaseModel {
     );
     // Per-media task lookup, newest first.
     schema.index({ fileId: 1, createdAt: -1 });
-    // The gate: at most one active task per Resizer, media and pipeline. add() inserts an active
-    // row, so a duplicate key on this index means another task is in flight; rows that are not
-    // active (finished, taken over, or written before the gate) never block a new task.
+    // The gate: at most one active task per Resizer, media, pipeline and queue. add() inserts an
+    // active row, so a duplicate key on this index means another task is in flight; rows that are
+    // not active (finished, taken over, or written before the gate) never block a new task.
     schema.index(
-      { resizer: 1, fileId: 1, pipeline: 1 },
+      { resizer: 1, fileId: 1, pipeline: 1, queue: 1 },
       { unique: true, partialFilterExpression: { active: true } },
     );
     // 👉 Add your custom indexes here.

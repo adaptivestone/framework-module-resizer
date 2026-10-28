@@ -766,7 +766,7 @@ describe('resolve — enqueue wiring', () => {
     });
     assert.deepEqual(
       acquired.map(({ key }) => key),
-      ['resize_gate:default:abc123:default'],
+      ['resize_gate:default:default:abc123:default'],
     );
     assert.equal(calls[0].mediaId, 'abc123');
   });
@@ -789,7 +789,7 @@ describe('resolve — enqueue wiring', () => {
       formats: ['jpeg'],
     });
     assert.equal(decision.missing.length, 1);
-    assert.deepEqual(released, ['resize_gate:default:m1:default']);
+    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
   });
 
   test('resolve does not throw when the task queue cannot confirm the add; the gate lock is released', async () => {
@@ -810,7 +810,7 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(released, ['resize_gate:default:m1:default']);
+    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
   });
 
   test('an original without a key leaves variants missing without enqueueing or locking', async () => {

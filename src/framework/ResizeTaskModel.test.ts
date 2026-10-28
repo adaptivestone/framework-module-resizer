@@ -180,11 +180,12 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     assert.deepEqual(idx[1], {});
   });
 
-  test('{ resizer:1, fileId:1, pipeline:1 } is unique among active rows', () => {
+  test('{ resizer:1, fileId:1, pipeline:1, queue:1 } is unique among active rows', () => {
     const idx = byFields(buildIndexes(), {
       resizer: 1,
       fileId: 1,
       pipeline: 1,
+      queue: 1,
     });
     assert.ok(idx);
     assert.deepEqual(idx[1], {

@@ -617,7 +617,7 @@ describe('prewarm — a task in flight, and the gate lock', () => {
     const second = await r.prewarm(opts);
     assert.equal(first.status, 'incomplete');
     assert.equal(first.issues[0].code, 'RESIZE_ENQUEUE_QUEUE_FAILED');
-    assert.deepEqual(released, ['resize_gate:default:m1:default']);
+    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
     assert.equal(second.status, 'accepted');
     assert.equal(second.tasks[0].taskId, 'task-2');
   });
@@ -822,9 +822,9 @@ describe('prewarm — the gate lock of a queue without gatesByTask', () => {
     const held = await r.prewarm({ media: media('held'), ...request });
     const failing = await r.prewarm({ media: media('failing'), ...request });
     assert.deepEqual(gate.acquired, [
-      'resize_gate:default:free:default',
-      'resize_gate:default:held:default',
-      'resize_gate:default:failing:default',
+      'resize_gate:default:default:free:default',
+      'resize_gate:default:default:held:default',
+      'resize_gate:default:default:failing:default',
     ]);
     assert.deepEqual(
       added.map((task) => task.mediaId),

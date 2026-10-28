@@ -244,7 +244,7 @@ describe('runScaffold — --eject', () => {
     );
     assert.match(
       model,
-      /\{ resizer: 1, fileId: 1, pipeline: 1 \}/,
+      /\{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 \}/,
       'the ejected schema carries the gate index',
     );
     assert.match(

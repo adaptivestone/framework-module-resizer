@@ -1,7 +1,8 @@
 // The enqueue half of the read path, and prewarm's strict counterpart. One dispatch turns the
-// missing variants of one media and pipeline into ONE task, behind one gate per Resizer, media and
-// pipeline: while a task of theirs is queued, running, waiting for a retry or cooling down after a
-// dead-letter, no other task is queued for them. A task queue with gatesByTask (the database
+// missing variants of one media and pipeline into ONE task on one queue, behind one gate per
+// Resizer, media, pipeline and queue: while a task of theirs is queued, running, waiting for a
+// retry or cooling down after a dead-letter, no other task is queued for them. A request on
+// another queue is a separate task. A task queue with gatesByTask (the database
 // queue) keeps the gate itself, so one `add` is the whole dispatch, and it reports `in-flight`
 // while the gate is held. Beside a queue without it (SQS), the Dispatcher takes the gate lock with
 // a fresh owner for coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the
@@ -276,7 +277,7 @@ export class Dispatcher {
         ),
       };
     }
-    const key = gateKey(name, req.mediaId, req.pipeline);
+    const key = gateKey(name, req.queue, req.mediaId, req.pipeline);
     const owner = randomHex();
     try {
       if (!(await locks.acquire(key, owner, coordination.gateTtlMs))) {
@@ -343,7 +344,7 @@ export class Dispatcher {
     issues: EnqueueIssue[],
   ): Promise<ConfirmedEnqueueResult> {
     const { tasks: taskQueue, name, logger } = this.#deps;
-    const { mediaId, pipeline } = req;
+    const { mediaId, pipeline, queue } = req;
     const scope = this.#scope(req);
     const unresolved = new Map(
       requested.map((preview) => [identityOf(scope, preview), preview]),
@@ -357,6 +358,7 @@ export class Dispatcher {
           resizer: name,
           mediaId,
           pipeline,
+          queue,
         });
       } catch (error) {
         logger.error(

@@ -60,7 +60,7 @@ test('two stores (two processes) share one lock and check owners', async () => {
 test('a gate lock taken by one store (the API) is extended and released by another (the worker) with the owner from the task', async () => {
   const api = new FrameworkLockStore();
   const worker = new FrameworkLockStore();
-  const key = gateKey('default', 'm1', 'default');
+  const key = gateKey('default', 'default', 'm1', 'default');
   assert.equal(await api.acquire(key, 'g1', 60_000), true);
   // The worker knows the owner only from the task's gateOwner.
   assert.equal(await worker.extend(key, 'g1', 600_000), true);

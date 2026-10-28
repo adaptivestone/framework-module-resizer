@@ -1092,7 +1092,7 @@ describe('Consumer with SqsTaskQueue', () => {
     const { leaseMs, retryBackoffMs } = timingOf(tasks);
     // The gate lock the Dispatcher took when it queued the task, under the owner the body carries.
     const locks = clockLocks();
-    const key = gateKey('default', 'm1', 'photo');
+    const key = gateKey('default', 'default', 'm1', 'photo');
     assert.equal(await locks.acquire(key, 'g1', 600_000), true);
     let deliveries = 0;
     const seen: { event: string; left?: number }[] = [];

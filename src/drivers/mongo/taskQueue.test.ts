@@ -165,7 +165,7 @@ function addedIds(results: TaskAddResult[]): string[] {
 function duplicateKey() {
   return Object.assign(new Error('E11000 duplicate key error'), {
     code: 11000,
-    keyPattern: { pipeline: 1, resizer: 1, fileId: 1 },
+    keyPattern: { pipeline: 1, queue: 1, resizer: 1, fileId: 1 },
   });
 }
 
@@ -576,28 +576,29 @@ describe('MongoTaskQueue.add', () => {
   });
 });
 
-describe('MongoTaskQueue.add: one active task per Resizer, media and pipeline', () => {
-  test('a second add is in-flight with the active task id; another pipeline, Resizer or media is a new task', async () => {
+describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and queue', () => {
+  test('a second add is in-flight with the active task id; another pipeline, Resizer, media or queue is a new task', async () => {
     const mediaId = fid();
     const first = await addedTaskId(request({ mediaId }));
-    // Whatever it asks for, and on whichever queue, a request for the same media and pipeline
-    // waits for the active task.
-    for (const over of [
-      { previews: [{ sizeKey: '600x600', format: 'webp' }] },
-      { queue: 'bulk' },
-    ]) {
-      assert.deepEqual(await tasks.add(request({ mediaId, ...over })), {
-        status: 'in-flight',
-        taskId: first,
-      });
-    }
+    // Whatever it asks for, a request for the same media, pipeline and queue waits for the active
+    // task.
+    assert.deepEqual(
+      await tasks.add(
+        request({
+          mediaId,
+          previews: [{ sizeKey: '600x600', format: 'webp' }],
+        }),
+      ),
+      { status: 'in-flight', taskId: first },
+    );
     const others = [
       await addedTaskId(request({ mediaId, pipeline: 'photo' })),
       await addedTaskId(request({ mediaId, resizer: 'listings' })),
       await addedTaskId(request()),
+      await addedTaskId(request({ mediaId, queue: 'bulk' })),
     ];
-    assert.equal(new Set([first, ...others]).size, 4);
-    assert.equal(await M.countDocuments({ fileId: mediaId }), 3);
+    assert.equal(new Set([first, ...others]).size, 5);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 4);
   });
 
   test('fifty concurrent adds store one active row; the others are in-flight with its id', async () => {
@@ -775,16 +776,21 @@ describe('MongoTaskQueue.add: one active task per Resizer, media and pipeline', 
 
   test('a duplicate key that does not name exactly the gate index keys is a write error', async () => {
     const message =
-      'E11000 duplicate key error index: resizer_1_fileId_1_pipeline_1';
+      'E11000 duplicate key error index: resizer_1_fileId_1_pipeline_1_queue_1';
     for (const failure of [
       Object.assign(new Error(message), { code: 11000 }), // no keyPattern
       Object.assign(new Error(message), {
         code: 11000,
         keyPattern: { resizer: 1, fileId: 1 },
       }),
+      // The gate keys of a build before the gate included the queue.
       Object.assign(new Error(message), {
         code: 11000,
-        keyPattern: { resizer: 1, fileId: 1, pipeline: 1, queue: 1 },
+        keyPattern: { resizer: 1, fileId: 1, pipeline: 1 },
+      }),
+      Object.assign(new Error(message), {
+        code: 11000,
+        keyPattern: { resizer: 1, fileId: 1, pipeline: 1, queue: 1, tenant: 1 },
       }),
       new Error(message), // only the message says so
     ]) {
@@ -808,6 +814,7 @@ describe('MongoTaskQueue.findActive', () => {
       resizer: 'default',
       mediaId: payload.mediaId,
       pipeline: 'photo',
+      queue: 'default',
     };
     const receipt = [
       { taskId, previews: canonicalizeVariants(payload.previews) },
@@ -824,6 +831,7 @@ describe('MongoTaskQueue.findActive', () => {
     for (const other of [
       { ...query, pipeline: 'default' },
       { ...query, mediaId: fid() },
+      { ...query, queue: 'bulk' },
     ]) {
       assert.deepEqual(await tasks.findActive(other), []);
     }
@@ -848,20 +856,23 @@ describe('MongoTaskQueue.findActive', () => {
         resizer: 'default',
         mediaId,
         pipeline: 'default',
+        queue: 'default',
       }),
       [],
     );
   });
 
-  test('only returns the task of the asking Resizer, on any queue', async () => {
+  test('only returns the task of the asking Resizer and queue', async () => {
     const mediaId = fid();
     const payload = request({ mediaId, pipeline: 'photo' });
     await addedTaskId(request({ ...payload, resizer: 'listings' }));
+    await addedTaskId(payload);
     const bulk = await addedTaskId(request({ ...payload, queue: 'bulk' }));
     const active = await tasks.findActive({
       resizer: 'default',
       mediaId,
       pipeline: 'photo',
+      queue: 'bulk',
     });
     assert.deepEqual(
       active.map(({ taskId, previews }) => ({
@@ -1256,23 +1267,21 @@ describe('MongoTaskQueue named queues and task events', () => {
     assert.equal(await tasks.claim('default', 300), null);
   });
 
-  test('add stores resizer and queue; the same request on another queue waits for that task', async () => {
+  test('add stores resizer and queue; the same request on another queue is a separate task', async () => {
     const payload = request({
       resizer: 'listings',
       queue: 'bulk',
       previews: [{ sizeKey: '300x300', format: 'webp' }],
     });
     const taskId = await addedTaskId(payload);
-    assert.deepEqual(
-      await tasks.add(request({ ...payload, queue: 'default' })),
-      {
-        status: 'in-flight',
-        taskId,
-      },
-    );
+    const other = await addedTaskId(request({ ...payload, queue: 'default' }));
+    assert.notEqual(other, taskId);
     const row = await M.findById(taskId).lean();
     assert.equal(row?.resizer, 'listings');
     assert.equal(row?.queue, 'bulk');
+    // A task waiting on bulk with no bulk worker never blocks the default queue's claim.
+    const claimed = await tasks.claim('default', 300);
+    assert.equal(claimed?.taskId, other);
   });
 
   test('a completed task event reports its resizer and queue', async () => {

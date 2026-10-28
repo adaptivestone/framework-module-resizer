@@ -985,7 +985,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     idlePollMs: 5,
     retryBackoffMs: { base: 60_000, max: 60_000 },
   };
-  const key = gateKey('default', 'm1', 'default');
+  const key = gateKey('default', 'default', 'm1', 'default');
 
   /** A PlainTaskQueue with one task of owner 'g1', whose gate lock is held for 50 ms. */
   async function gatedTask(locks: LockStore) {

@@ -112,7 +112,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
     assert.equal(added.status, 'added');
     assert.ok(added.taskId);
     fixture.tasks.verify();
-    const gate = gateKey('default', mediaId, 'default');
+    const gate = gateKey('default', 'default', mediaId, 'default');
     assert.equal(await fixture.locks.acquire(gate, 'g1', 60_000), true);
     const claimed = await fixture.tasks.claim('default', 60_000);
     assert.ok(claimed);
@@ -159,7 +159,7 @@ test('prepared indexes enforce the gate: concurrent adds create one active row',
       .listIndexes()
       .toArray();
     const gate = taskIndexes.find(({ key }) =>
-      hasExactKey(key, { resizer: 1, fileId: 1, pipeline: 1 }),
+      hasExactKey(key, { resizer: 1, fileId: 1, pipeline: 1, queue: 1 }),
     );
     assert.ok(gate, 'fixture should create the gate index');
     assert.equal(

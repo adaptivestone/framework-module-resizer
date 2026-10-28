@@ -1,8 +1,8 @@
 // MongoTaskQueue: the task queue as documents of a ResizeTask model (see createResizeModels).
 //
-// The task row is the gate: at most one row per Resizer, media and pipeline is `active`, and a
-// unique partial index enforces it. So add() is one insert that either stores the task or runs
-// into the active one and reports it in flight. A row stays active from add() until complete(),
+// The task row is the gate: at most one row per Resizer, media, pipeline and queue is `active`,
+// and a unique partial index enforces it. So add() is one insert that either stores the task or
+// runs into the active one and reports it in flight. A row stays active from add() until complete(),
 // through its retries and give-backs. A dead row stays active through its cooldown; the next
 // add() then retires it (`active: false`, its error kept for inspection) and inserts a new row.
 //
@@ -160,6 +160,7 @@ export class MongoTaskQueue extends TaskQueue {
       resizer: task.resizer,
       fileId: task.mediaId,
       pipeline: task.pipeline,
+      queue: task.queue,
     };
     try {
       for (let round = 0; round < ADD_ROUNDS; round++) {
@@ -303,13 +304,13 @@ export class MongoTaskQueue extends TaskQueue {
     });
   }
 
-  // The gate while it is pending or processing, on any queue: a task already waiting on another
-  // queue still covers the request. A dead task still holding the gate is not reported: nothing
-  // will run it.
+  // The gate while it is pending or processing. A dead task still holding the gate is not
+  // reported: nothing will run it.
   async findActive(query: {
     resizer: string;
     mediaId: string;
     pipeline: string;
+    queue: string;
   }): Promise<EnqueueReceipt[]> {
     const model = this.#model();
     if (!model) {
@@ -319,6 +320,7 @@ export class MongoTaskQueue extends TaskQueue {
       resizer: query.resizer,
       fileId: query.mediaId,
       pipeline: query.pipeline,
+      queue: query.queue,
       active: true,
       status: { $in: ['pending', 'processing'] },
     })) as TaskDoc | null;

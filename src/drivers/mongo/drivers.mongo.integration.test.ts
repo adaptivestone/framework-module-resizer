@@ -59,7 +59,11 @@ describe('createResizeModels', () => {
     await ResizeLock.createIndexes();
     const taskIndexes = await ResizeTask.collection.indexes();
     const gate = taskIndexes.find(
-      (i) => i.key.resizer === 1 && i.key.fileId === 1 && i.key.pipeline === 1,
+      (i) =>
+        i.key.resizer === 1 &&
+        i.key.fileId === 1 &&
+        i.key.pipeline === 1 &&
+        i.key.queue === 1,
     );
     assert.equal(gate?.unique, true);
     assert.deepEqual(gate?.partialFilterExpression, { active: true });

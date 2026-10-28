@@ -153,7 +153,7 @@ export abstract class TaskQueue {
   release?(task: ClaimedTask): Promise<boolean>;
 
   /**
-   * Optional: the active tasks (pending or processing) of this Resizer, media and pipeline on any
+   * Optional: the active tasks (pending or processing) of this Resizer, media, pipeline and
    * queue, each with the previews it covers; `[]` when there are none. A queue with `gatesByTask`
    * returns at most one. The Dispatcher reads it only after an `in-flight` add: prewarm then
    * accepts the variants the active task holds. Omit when tasks can't be queried (e.g. SQS).
@@ -162,6 +162,7 @@ export abstract class TaskQueue {
     resizer: string;
     mediaId: string;
     pipeline: string;
+    queue: string;
   }): Promise<EnqueueReceipt[]>;
 
   /** Optional: whether `queue` can be consumed here (default: every queue). */

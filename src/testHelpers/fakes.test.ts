@@ -1,7 +1,8 @@
 // The in-memory stores follow the contracts tests rely on: the media store keeps one stored preview
 // row per preview identity and resolves with the previews it stored; the locks honour owners, and
 // clockLocks also their TTLs. MemoryTaskQueue gates by task like the database queue: one active
-// task per Resizer, media and pipeline. PlainTaskQueue has the SQS shape and stores every task.
+// task per Resizer, media, pipeline and queue. PlainTaskQueue has the SQS shape and stores every
+// task.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { NewTask } from '../contracts/taskQueue.ts';
@@ -31,7 +32,12 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
   ...over,
 });
 
-const m1 = { resizer: 'default', mediaId: 'm1', pipeline: 'default' };
+const m1 = {
+  resizer: 'default',
+  mediaId: 'm1',
+  pipeline: 'default',
+  queue: 'default',
+};
 
 test('memoryLocks honours owners', async () => {
   const locks = memoryLocks();
@@ -76,7 +82,7 @@ test('fakeMedia treats seeded previews as already stored', async () => {
   );
 });
 
-test('MemoryTaskQueue gates by task: one active task per Resizer, media and pipeline', async () => {
+test('MemoryTaskQueue gates by task: one active task per Resizer, media, pipeline and queue', async () => {
   const tasks = new MemoryTaskQueue();
   assert.equal(tasks.gatesByTask, true);
   assert.deepEqual(await tasks.add(newTask()), {
@@ -97,8 +103,13 @@ test('MemoryTaskQueue gates by task: one active task per Resizer, media and pipe
     (await tasks.add(newTask({ resizer: 'listings' }))).status,
     'added',
   );
-  assert.equal(tasks.rows.length, 3);
-  assert.equal(tasks.added.length, 4);
+  // Another queue is a new task.
+  assert.deepEqual(await tasks.add(newTask({ queue: 'bulk' })), {
+    status: 'added',
+    taskId: 'task-4',
+  });
+  assert.equal(tasks.rows.length, 4);
+  assert.equal(tasks.added.length, 5);
 });
 
 test('retry backoff and release keep the gate; complete opens it', async (t) => {
@@ -186,6 +197,8 @@ test('findActive returns only a pending or processing active task', async () => 
   await tasks.add(newTask({ mediaId: 'm2' }));
   const receipt = { taskId: 'task-1', previews: newTask().previews };
   assert.deepEqual(await tasks.findActive(m1), [receipt]);
+  // The task of another queue is not this queue's gate.
+  assert.deepEqual(await tasks.findActive({ ...m1, queue: 'bulk' }), []);
 
   const claimed = await tasks.claim('default', 1000);
   assert.ok(claimed);

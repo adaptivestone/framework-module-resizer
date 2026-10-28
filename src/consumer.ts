@@ -75,8 +75,9 @@ export interface ConsumerDeps {
 }
 
 // The gate lock of a task on a queue without gatesByTask. Such a queue cannot tell that a task of
-// the same Resizer, media and pipeline is already active, so the Dispatcher takes a lock in the
-// Resizer's LockStore when it queues one, under an owner that travels with the task (`gateOwner`).
+// the same Resizer, media, pipeline and queue is already active, so the Dispatcher takes a lock in
+// the Resizer's LockStore when it queues one, under an owner that travels with the task
+// (`gateOwner`).
 // The Consumer keeps that lock for as long as the task can still run: one lease when the task
 // starts and on every heartbeat, the backoff plus one lease after a retry, the cooldown after a
 // dead-letter; it releases the lock once the task is completed. A task given back, or one whose
@@ -369,7 +370,7 @@ export class Consumer {
     }
     return {
       locks,
-      key: gateKey(task.resizer, task.mediaId, task.pipeline),
+      key: gateKey(task.resizer, task.queue, task.mediaId, task.pipeline),
       owner: task.gateOwner,
     };
   }

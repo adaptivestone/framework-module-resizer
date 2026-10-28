@@ -876,7 +876,7 @@ test("on a queue without gatesByTask, the gate lock lives in the task's Resizer'
     deadLettered.push(task);
   });
   // The lock the Dispatcher takes when it queues the task, under the owner the task carries.
-  const key = gateKey('default', 'm1', 'default');
+  const key = gateKey('default', 'default', 'm1', 'default');
   assert.equal(await locks.acquire(key, 'g1', 60_000), true);
   await tasks.add({
     ...taskOf('default'),
@@ -933,8 +933,8 @@ test('on a queue without gatesByTask, the task of a Resizer the worker does not 
       tasks,
     });
   const a = withLocks('a');
-  const aKey = gateKey('a', 'm1', 'default');
-  const ghostKey = gateKey('ghost', 'm1', 'default');
+  const aKey = gateKey('a', 'default', 'm1', 'default');
+  const ghostKey = gateKey('ghost', 'default', 'm1', 'default');
   // The gate locks their Dispatchers took, set in the store directly: `calls` lists the worker's.
   assert.equal(await store.acquire(ghostKey, 'g-ghost', 60_000), true);
   assert.equal(await store.acquire(aKey, 'g-a', 60_000), true);

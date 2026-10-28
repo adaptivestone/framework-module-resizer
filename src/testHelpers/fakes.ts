@@ -2,9 +2,9 @@
 // (memoryLocks never expire, clockLocks expire on a clock the test controls); and in-memory task
 // queues that share one row store (oldest-first claims, fenced leases, retry times and dead tasks).
 // MemoryTaskQueue behaves like the database queue: it gates by task (one active task per Resizer,
-// media and pipeline, and a dead task holds the gate until its cooldown ends), filters claims by
-// Resizer, gives tasks back with `release` and answers findActive. PlainTaskQueue has the SQS
-// shape and stores every task; ReleasingTaskQueue adds `release` to it.
+// media, pipeline and queue, and a dead task holds the gate until its cooldown ends), filters
+// claims by Resizer, gives tasks back with `release` and answers findActive. PlainTaskQueue has
+// the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it.
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
@@ -307,8 +307,8 @@ export interface MemoryTaskQueueOptions {
 }
 
 /**
- * The in-memory database queue. It keeps one active task per Resizer, media and pipeline: `add`
- * reports any other active task as `in-flight`, through its retries and a `release`, until
+ * The in-memory database queue. It keeps one active task per Resizer, media, pipeline and queue:
+ * `add` reports any other active task as `in-flight`, through its retries and a `release`, until
  * `complete`. A dead task holds the gate for the `cooldownMs` given to `fail`; after that the next
  * `add` takes it over. `claim` honours `resizers`.
  */
@@ -322,18 +322,20 @@ export class MemoryTaskQueue extends RowQueue {
     this.#now = opts.now ?? (() => Date.now());
   }
 
-  /** The active row of this Resizer, media and pipeline: the gate. */
+  /** The active row of this Resizer, media, pipeline and queue: the gate. */
   #gate(key: {
     resizer: string;
     mediaId: string;
     pipeline: string;
+    queue: string;
   }): Row | undefined {
     return this.rows.find(
       (row) =>
         row.active &&
         row.task.resizer === key.resizer &&
         row.task.mediaId === key.mediaId &&
-        row.task.pipeline === key.pipeline,
+        row.task.pipeline === key.pipeline &&
+        row.task.queue === key.queue,
     );
   }
 
@@ -393,6 +395,7 @@ export class MemoryTaskQueue extends RowQueue {
     resizer: string;
     mediaId: string;
     pipeline: string;
+    queue: string;
   }): Promise<EnqueueReceipt[]> {
     const gate = this.#gate(query);
     if (!gate || (gate.status !== 'pending' && gate.status !== 'processing')) {

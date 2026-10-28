@@ -480,7 +480,7 @@ describe('prewarm — a held gate lock queues nothing', () => {
     );
     assert.deepEqual(
       acquired.map(({ key }) => key),
-      ['resize_gate:listings:m1:photo'],
+      ['resize_gate:listings:default:m1:photo'],
     );
   });
 
@@ -525,7 +525,7 @@ describe('prewarm — queue and lock failures never throw', () => {
       formats: ['jpeg'],
     });
     assert.equal(accepted.length, 0);
-    assert.deepEqual(released, ['resize_gate:default:m1:default']);
+    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
   });
 
   test('a rejecting gate-lock acquire is caught → nothing accepted, logged', async () => {

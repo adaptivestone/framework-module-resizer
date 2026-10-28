@@ -115,8 +115,8 @@ const requestFor = (
   ...over,
 });
 
-// The gate lock of media m1 and the default pipeline of the 'default' Resizer.
-const GATE = 'resize_gate:default:m1:default';
+// The gate lock of media m1, the default pipeline and the default queue of the 'default' Resizer.
+const GATE = 'resize_gate:default:default:m1:default';
 
 test('noQueueResult reports every variant as unconfirmed with a non-retryable issue', () => {
   const webp = variant({ format: 'webp' });
@@ -227,7 +227,7 @@ describe('canonical variants', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The read path's enqueue: one gate per Resizer, media and pipeline
+// The read path's enqueue: one gate per Resizer, media, pipeline and queue
 // ---------------------------------------------------------------------------
 
 describe('a task queue that gates by task', () => {
@@ -255,10 +255,48 @@ describe('a task queue that gates by task', () => {
     );
     assert.equal(tasks.rows.length, 1);
   });
+
+  test('another pipeline, Resizer, media or queue is a new task', async () => {
+    const tasks = new MemoryTaskQueue();
+    const d = makeDispatcher({ tasks });
+    assert.equal(await d.enqueue(requestFor([v300])), 1);
+    for (const [label, dispatcher, over] of [
+      ['pipeline', d, { pipeline: 'watermark' }],
+      ['Resizer', makeDispatcher({ tasks, name: 'listings' }), {}],
+      ['media', d, { mediaId: 'm2' }],
+      ['queue', d, { queue: 'bulk' }],
+    ] as const) {
+      assert.equal(
+        await dispatcher.enqueue(requestFor([v300], over)),
+        1,
+        label,
+      );
+    }
+    assert.equal(tasks.rows.length, 5);
+  });
+
+  test('a prewarm on bulk while a default task is active queues a bulk task', async () => {
+    const tasks = new MemoryTaskQueue();
+    const d = makeDispatcher({ tasks });
+    assert.equal(await d.enqueue(requestFor([v300])), 1);
+    assert.deepEqual(
+      await d.enqueueConfirmed(requestFor([v300, v600], { queue: 'bulk' })),
+      {
+        accepted: [v300, v600],
+        unconfirmed: [],
+        tasks: [{ taskId: 'task-2', previews: [v300, v600] }],
+        issues: [],
+      },
+    );
+    assert.deepEqual(
+      tasks.rows.map(({ task }) => task.queue),
+      ['default', 'bulk'],
+    );
+  });
 });
 
 describe('a task queue without gatesByTask', () => {
-  test('one gate lock per Resizer, media and pipeline, owned by a fresh token that the task carries', async () => {
+  test('one gate lock per Resizer, media, pipeline and queue, owned by a fresh token that the task carries', async () => {
     const now = 5_000;
     const tasks = new PlainTaskQueue();
     const locks = clockLocks(() => now);
@@ -275,7 +313,7 @@ describe('a task queue without gatesByTask', () => {
     assert.equal(tasks.rows.length, 1);
     // Each dispatch takes its own owner token.
     assert.equal(await d.enqueue(requestFor([v300], { mediaId: 'm2' })), 1);
-    const other = locks.entry('resize_gate:default:m2:default');
+    const other = locks.entry('resize_gate:default:default:m2:default');
     assert.match(other?.owner ?? '', /^[0-9a-f]{32}$/);
     assert.notEqual(other?.owner, gate.owner);
     assert.equal(tasks.added[1].gateOwner, other?.owner);
@@ -369,7 +407,7 @@ describe('a task queue without gatesByTask', () => {
     );
   });
 
-  test('gate keys are separate per Resizer and per pipeline', async () => {
+  test('gate keys are separate per Resizer, pipeline and queue', async () => {
     const tasks = new PlainTaskQueue();
     const { locks, calls } = recordingLocks();
     assert.equal(
@@ -388,13 +426,21 @@ describe('a task queue without gatesByTask', () => {
       ),
       1,
     );
-    assert.equal(tasks.rows.length, 3);
+    // Another queue is a new task.
+    assert.equal(
+      await makeDispatcher({ tasks, locks }).enqueue(
+        requestFor([v300], { queue: 'bulk' }),
+      ),
+      1,
+    );
+    assert.equal(tasks.rows.length, 4);
     assert.deepEqual(
       calls.map(({ op, key }) => [op, key]),
       [
         ['acquire', GATE],
-        ['acquire', 'resize_gate:default:m1:watermark'],
-        ['acquire', 'resize_gate:listings:m1:default'],
+        ['acquire', 'resize_gate:default:default:m1:watermark'],
+        ['acquire', 'resize_gate:listings:default:m1:default'],
+        ['acquire', 'resize_gate:default:bulk:m1:default'],
       ],
     );
   });
