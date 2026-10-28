@@ -50,7 +50,9 @@ the enclosing schema's options.
   `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). Then drop the
   `{ fileId, pipeline, requestKey }` index when convenient: new rows never enter
   it. Backfilling `availableAt` is optional: rows without it still wait for the
-  retry time or lease end stored in `leaseExpiresAt`.
+  retry time or lease end stored in `leaseExpiresAt`. The worker runs on the
+  framework CLI with `autoIndex` off, so it never builds the indexes: they must
+  exist before the first worker starts.
 - Regenerate the model shim, which now imports `…/framework/ResizeTaskModel.js`:
   delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force`
   would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or
@@ -89,9 +91,8 @@ the enclosing schema's options.
   `svgRaster.js` (otherwise `RESIZE_SVG_RENDER_UNAVAILABLE`).
 - Resizers on the database queue (and Resizers with identical SQS settings) share
   one task queue with one timing: config files that share a queue must set the same
-  timing keys (and effective SQS `waitTimeSeconds`), or `verify()` and worker start
-  fail with
-  `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`. Without the framework, call
+  timing keys (and effective SQS `waitTimeSeconds`), or first use, `verify()` and
+  worker start fail with `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`. Without the framework, call
   `mongoParts(connection, { mediaModel })` once per process and spread the same parts
   into every Resizer (each call makes its own task queue). The pre-release database
   part is split in two: `media` (the media store) and `locks` (the lock store), beside
