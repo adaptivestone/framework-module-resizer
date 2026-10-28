@@ -668,6 +668,20 @@ describe('MongoTaskQueue setup', () => {
     await rejectsIndexMissing(model, /does not exist yet/);
   });
 
+  test('verify accepts the partial filter spelt { active: { $eq: true } }', async () => {
+    const model = await modelWith('ResizeTaskGateEq', [
+      [
+        gateKeys,
+        { unique: true, partialFilterExpression: { active: { $eq: true } } },
+      ],
+    ]);
+    await new MongoTaskQueue({ model }).verify();
+    const plain = await modelWith('ResizeTaskGatePlain', [
+      [gateKeys, { unique: true, partialFilterExpression: { active: true } }],
+    ]);
+    await new MongoTaskQueue({ model: plain }).verify();
+  });
+
   test('verify accepts the gate index with its keys in another order', async () => {
     const model = await modelWith('ResizeTaskGateReordered', [
       [

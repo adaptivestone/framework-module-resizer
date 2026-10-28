@@ -497,6 +497,13 @@ interface IndexInfo {
 // MongoDB's NamespaceNotFound: listing the indexes of a collection that does not exist.
 const NAMESPACE_NOT_FOUND = 26;
 
+// The partial filters that select the active rows: the one the package declares, and the same
+// filter spelt with `$eq` (the server keeps a filter as it was written).
+const ACTIVE_ROWS = [
+  gateIndexOptions.partialFilterExpression,
+  { active: { $eq: true } },
+];
+
 // Mongoose's connection states (Connection#readyState) the check tells apart.
 const CONNECTED = 1;
 const CONNECTING = 2;
@@ -560,9 +567,8 @@ async function checkGateIndex(model: TaskModel): Promise<void> {
     onGateKeys.some(
       (index) =>
         index.unique === true &&
-        isDeepStrictEqual(
-          index.partialFilterExpression,
-          gateIndexOptions.partialFilterExpression,
+        ACTIVE_ROWS.some((filter) =>
+          isDeepStrictEqual(index.partialFilterExpression, filter),
         ),
     )
   ) {
