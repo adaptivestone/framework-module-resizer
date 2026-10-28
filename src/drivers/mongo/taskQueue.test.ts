@@ -317,7 +317,7 @@ describe('MongoTaskQueue setup', () => {
     }
   });
 
-  test('resolves the model lazily and verifies registration', () => {
+  test('resolves the model lazily and verifies registration', async () => {
     let model: unknown;
     let reads = 0;
     const queue = new MongoTaskQueue({
@@ -327,14 +327,14 @@ describe('MongoTaskQueue setup', () => {
       },
     });
     assert.equal(reads, 0);
-    assert.throws(
-      () => queue.verify(),
+    await assert.rejects(
+      queue.verify(),
       (error: unknown) =>
         error instanceof ResizeSetupError &&
         error.code === 'RESIZE_MONGO_MODEL_MISSING',
     );
     model = M;
-    assert.doesNotThrow(() => queue.verify());
+    await queue.verify();
     assert.equal(reads, 2);
   });
 
@@ -372,7 +372,7 @@ describe('MongoTaskQueue setup', () => {
     assert.equal(errors.length, 7);
   });
 
-  test('verify rejects a model without the fields the queue writes (an ejected 0.2 model)', () => {
+  test('verify rejects a model without the fields the queue writes (an ejected 0.2 model)', async () => {
     // Strict mode would silently drop these from every insert: each task would then read as
     // Resizer 'default' on queue 'default', and no task would hold the gate.
     const {
@@ -390,8 +390,8 @@ describe('MongoTaskQueue setup', () => {
         new mongoose.Schema(oldFields, { timestamps: true, autoIndex: false }),
       );
     const queue = new MongoTaskQueue({ model: Old });
-    assert.throws(
-      () => queue.verify(),
+    await assert.rejects(
+      queue.verify(),
       (error: unknown) =>
         error instanceof ResizeSetupError &&
         error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
@@ -408,7 +408,7 @@ describe('MongoTaskQueue setup', () => {
     );
   });
 
-  test('verify rejects a model ejected before tasks carried availableAt', () => {
+  test('verify rejects a model ejected before tasks carried availableAt', async () => {
     // Without the path, strict mode drops every due time: retries would skip their backoff.
     const { availableAt: _availableAt, ...fields } = resizeTaskFields('File');
     const Old =
@@ -417,8 +417,8 @@ describe('MongoTaskQueue setup', () => {
         'ResizeTaskWithoutDueTime',
         new mongoose.Schema(fields, { timestamps: true, autoIndex: false }),
       );
-    assert.throws(
-      () => new MongoTaskQueue({ model: Old }).verify(),
+    await assert.rejects(
+      new MongoTaskQueue({ model: Old }).verify(),
       (error: unknown) =>
         error instanceof ResizeSetupError &&
         error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
@@ -426,7 +426,7 @@ describe('MongoTaskQueue setup', () => {
     );
   });
 
-  test('verify rejects a model without active or cooldownUntil, naming the field', () => {
+  test('verify rejects a model without active or cooldownUntil, naming the field', async () => {
     // Without active every add would succeed: the gate is off. Without cooldownUntil a dead
     // task would give up the gate at once, whatever its cooldown.
     const { active: _active, ...withoutActive } = resizeTaskFields('File');
@@ -443,8 +443,8 @@ describe('MongoTaskQueue setup', () => {
           name,
           new mongoose.Schema(fields, { timestamps: true, autoIndex: false }),
         );
-      assert.throws(
-        () => new MongoTaskQueue({ model: Old }).verify(),
+      await assert.rejects(
+        new MongoTaskQueue({ model: Old }).verify(),
         (error: unknown) =>
           error instanceof ResizeSetupError &&
           error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
@@ -453,12 +453,120 @@ describe('MongoTaskQueue setup', () => {
     }
   });
 
-  test('verify accepts the package model and a model-shaped object without a schema', () => {
-    assert.doesNotThrow(() => tasks.verify());
+  test('verify accepts the package model with its indexes, and a model-shaped object without a schema or collection', async () => {
+    await tasks.verify();
     const schemaless = new MongoTaskQueue({
       model: { findOneAndUpdate: async () => null },
     });
-    assert.doesNotThrow(() => schemaless.verify());
+    await schemaless.verify();
+  });
+
+  /** The package's ResizeTask schema on its own collection, with only `indexes` created. */
+  async function modelWith(
+    name: string,
+    indexes: [Record<string, 1>, Record<string, unknown>][],
+    create = true,
+  ) {
+    const model =
+      connection.models[name] ??
+      connection.model(
+        name,
+        new mongoose.Schema(resizeTaskFields('File'), {
+          timestamps: true,
+          minimize: false,
+          autoIndex: false,
+        }),
+      );
+    await model.collection.drop().catch(() => {});
+    if (create) {
+      await model.createCollection();
+    }
+    for (const [keys, options] of indexes) {
+      await model.collection.createIndex(keys, options);
+    }
+    return model;
+  }
+
+  const gateKeys = { resizer: 1, fileId: 1, pipeline: 1, queue: 1 } as const;
+
+  /** verify() rejects with RESIZE_MONGO_INDEX_MISSING, its message matching `why`. */
+  async function rejectsIndexMissing(model: unknown, why: RegExp) {
+    await assert.rejects(
+      new MongoTaskQueue({ model }).verify(),
+      (error: unknown) =>
+        error instanceof ResizeSetupError &&
+        error.code === 'RESIZE_MONGO_INDEX_MISSING' &&
+        why.test(error.message) &&
+        error.message.includes(
+          '{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 } with { unique: true, partialFilterExpression: { active: true } }',
+        ) &&
+        /create it through your migration process; the module never creates indexes/.test(
+          error.message,
+        ),
+    );
+  }
+
+  test('verify rejects a collection without the gate index, and creates none', async () => {
+    // Every other package index, none of them the gate.
+    const model = await modelWith(
+      'ResizeTaskWithoutGate',
+      resizeTaskIndexes
+        .filter(([, options]) => options?.unique !== true)
+        .map(([keys, options]) => [keys as Record<string, 1>, options ?? {}]),
+    );
+    const before = (await model.collection.indexes()).length;
+    await rejectsIndexMissing(
+      model,
+      new RegExp(
+        `collection '${model.collection.collectionName}' has no gate index`,
+      ),
+    );
+    assert.equal((await model.collection.indexes()).length, before);
+  });
+
+  test('verify rejects a gate index that is not unique or not partial on active rows', async () => {
+    for (const [name, options] of [
+      ['ResizeTaskGateNotPartial', { unique: true }],
+      [
+        'ResizeTaskGateNotUnique',
+        { partialFilterExpression: { active: true } },
+      ],
+      [
+        'ResizeTaskGateOtherFilter',
+        { unique: true, partialFilterExpression: { status: 'pending' } },
+      ],
+    ] as const) {
+      const model = await modelWith(name, [[gateKeys, options]]);
+      await rejectsIndexMissing(
+        model,
+        /is not unique or not partial on \{ active: true \}/,
+      );
+    }
+  });
+
+  test('verify rejects the gate index of a build before the gate included the queue', async () => {
+    const model = await modelWith('ResizeTaskGateWithoutQueue', [
+      [
+        { resizer: 1, fileId: 1, pipeline: 1 },
+        { unique: true, partialFilterExpression: { active: true } },
+      ],
+    ]);
+    await rejectsIndexMissing(model, /has no gate index/);
+  });
+
+  test('verify rejects a collection that does not exist yet', async () => {
+    const model = await modelWith('ResizeTaskNotCreated', [], false);
+    await rejectsIndexMissing(model, /does not exist yet/);
+  });
+
+  test('verify accepts the gate index with its keys in another order', async () => {
+    const model = await modelWith('ResizeTaskGateReordered', [
+      [
+        { queue: 1, pipeline: 1, fileId: 1, resizer: 1 },
+        { unique: true, partialFilterExpression: { active: true } },
+      ],
+    ]);
+    await new MongoTaskQueue({ model }).verify();
   });
 });
 

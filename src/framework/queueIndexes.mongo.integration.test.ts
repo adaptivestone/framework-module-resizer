@@ -111,7 +111,12 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
     });
     assert.equal(added.status, 'added');
     assert.ok(added.taskId);
-    fixture.tasks.verify();
+    // verify() reads the indexes and reports the missing gate index; it creates none.
+    await assert.rejects(
+      fixture.tasks.verify(),
+      (error: Error & { code?: string }) =>
+        error.code === 'RESIZE_MONGO_INDEX_MISSING',
+    );
     const gate = gateKey('default', 'default', mediaId, 'default');
     assert.equal(await fixture.locks.acquire(gate, 'g1', 60_000), true);
     const claimed = await fixture.tasks.claim('default', 60_000);
@@ -187,6 +192,8 @@ test('prepared indexes enforce the gate: concurrent adds create one active row',
     }
     assert.equal(gate.unique, true);
     assert.deepEqual(gate.partialFilterExpression, { active: true });
+    // The prepared collection passes verify().
+    await fixture.tasks.verify();
 
     const mediaId = new mongoose.Types.ObjectId().toString();
     const request = {

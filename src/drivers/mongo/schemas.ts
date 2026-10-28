@@ -62,6 +62,15 @@ export const gateIndexKeys = {
   queue: 1,
 } as const;
 
+/**
+ * The gate index's options: one active row per gate, and rows that are not active never block.
+ * MongoTaskQueue.verify() requires an index on the gate keys with exactly these.
+ */
+export const gateIndexOptions = {
+  unique: true,
+  partialFilterExpression: { active: true },
+} as const;
+
 /** ResizeTask indexes. Create them through your migration process; the module never does. */
 export const resizeTaskIndexes: readonly IndexSpec[] = [
   // Completed rows expire after 24 h.
@@ -94,7 +103,7 @@ export const resizeTaskIndexes: readonly IndexSpec[] = [
   // The gate: at most one active task per Resizer, media, pipeline and queue. add() inserts an
   // active row, so a duplicate key on this index means another task is in flight; rows that are
   // not active (finished, taken over, or written before the gate) never block a new task.
-  [gateIndexKeys, { unique: true, partialFilterExpression: { active: true } }],
+  [gateIndexKeys, gateIndexOptions],
 ];
 
 /** ResizeLock fields: the lock key is the document id; `owner` is who holds the lock. */

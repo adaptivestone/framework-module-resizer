@@ -10,6 +10,7 @@
 // claim, so a worker that lost its lease can never complete, fail or release a task another worker
 // now holds.
 import { hostname } from 'node:os';
+import { isDeepStrictEqual } from 'node:util';
 import {
   type ClaimedTask,
   type ClaimOptions,
@@ -27,7 +28,7 @@ import type {
   ResizeLogger,
 } from '../../types.d.ts';
 import { modelGetter } from './modelOption.ts';
-import { gateIndexKeys } from './schemas.ts';
+import { gateIndexKeys, gateIndexOptions } from './schemas.ts';
 
 // biome-ignore lint/suspicious/noExplicitAny: a host-registered mongoose model
 type TaskModel = any;
@@ -114,10 +115,11 @@ export class MongoTaskQueue extends TaskQueue {
   }
 
   /**
-   * Startup check: the ResizeTask model must be registered, and its schema (when the model exposes
-   * one) must have every field this queue writes.
+   * Startup check: the ResizeTask model must be registered, its schema (when the model exposes
+   * one) must have every field this queue writes, and its collection (when the model exposes one)
+   * must have the gate index. The check reads the indexes; it never creates one.
    */
-  verify(): void {
+  async verify(): Promise<void> {
     const model = this.#getModel();
     if (!model) {
       throw new ResizeSetupError(
@@ -126,16 +128,16 @@ export class MongoTaskQueue extends TaskQueue {
       );
     }
     const schema = model.schema;
-    if (typeof schema?.path !== 'function') {
-      return;
+    if (typeof schema?.path === 'function') {
+      const missing = WRITTEN_PATHS.filter((path) => !schema.path(path));
+      if (missing.length > 0) {
+        throw new ResizeSetupError(
+          `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
+          { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
+        );
+      }
     }
-    const missing = WRITTEN_PATHS.filter((path) => !schema.path(path));
-    if (missing.length > 0) {
-      throw new ResizeSetupError(
-        `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
-        { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
-      );
-    }
+    await checkGateIndex(model);
   }
 
   // At runtime a missing model is logged, not thrown: reads and prewarm never throw (verify()
@@ -424,6 +426,83 @@ function namedAll(values: readonly string[]): (string | null)[] {
 
 const GATE_KEYS = Object.keys(gateIndexKeys).sort();
 
+// True when `keys` (an index key or a duplicate key's keyPattern) names exactly the gate keys.
+function isGateKey(keys: object): boolean {
+  const names = Object.keys(keys).sort();
+  return (
+    names.length === GATE_KEYS.length &&
+    names.every((name, i) => name === GATE_KEYS[i])
+  );
+}
+
+// The gate index as a message names it: its keys, unique, partial on active rows.
+const GATE_INDEX_SPEC = `{ ${Object.entries(gateIndexKeys)
+  .map(([key, order]) => `${key}: ${order}`)
+  .join(
+    ', ',
+  )} } with { unique: true, partialFilterExpression: { active: true } }`;
+
+// An index as the server lists it (the fields this check reads).
+interface IndexInfo {
+  name?: string;
+  key?: object;
+  unique?: boolean;
+  partialFilterExpression?: unknown;
+}
+
+// MongoDB's NamespaceNotFound: listing the indexes of a collection that does not exist.
+const NAMESPACE_NOT_FOUND = 26;
+
+/**
+ * Reject unless the model's collection has the gate index: without it every add stores a task
+ * (no index), or every add after a completed task is in flight with no id (a unique index without
+ * the partial filter). A model that exposes no collection is not checked.
+ */
+async function checkGateIndex(model: TaskModel): Promise<void> {
+  const collection = model.collection;
+  if (typeof collection?.indexes !== 'function') {
+    return;
+  }
+  const name = String(collection.collectionName ?? model.modelName ?? '');
+  const missing = (why: string) =>
+    new ResizeSetupError(
+      `resize: the ResizeTask collection '${name}' ${why}: the gate needs the index ${GATE_INDEX_SPEC} — create it through your migration process; the module never creates indexes`,
+      { code: 'RESIZE_MONGO_INDEX_MISSING' },
+    );
+  let indexes: IndexInfo[];
+  try {
+    indexes = await collection.indexes();
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === NAMESPACE_NOT_FOUND) {
+      throw missing('does not exist yet, so it has no gate index');
+    }
+    throw err;
+  }
+  const onGateKeys = indexes.filter(
+    (index) =>
+      typeof index.key === 'object' &&
+      index.key !== null &&
+      isGateKey(index.key),
+  );
+  if (
+    onGateKeys.some(
+      (index) =>
+        index.unique === true &&
+        isDeepStrictEqual(
+          index.partialFilterExpression,
+          gateIndexOptions.partialFilterExpression,
+        ),
+    )
+  ) {
+    return;
+  }
+  throw missing(
+    onGateKeys.length > 0
+      ? `has an index on the gate keys ('${onGateKeys[0].name}') that is not unique or not partial on { active: true }`
+      : 'has no gate index',
+  );
+}
+
 // A duplicate key on the gate index: another task is in flight. A duplicate key on any other
 // unique index (one a host added to its model), or one that does not say which index, is a write
 // error: treating it as the gate would report every add in flight while storing nothing.
@@ -438,9 +517,5 @@ function isGateConflict(error: unknown): boolean {
   if (code !== 11000 || typeof keyPattern !== 'object' || keyPattern === null) {
     return false;
   }
-  const keys = Object.keys(keyPattern).sort();
-  return (
-    keys.length === GATE_KEYS.length &&
-    keys.every((key, i) => key === GATE_KEYS[i])
-  );
+  return isGateKey(keyPattern);
 }

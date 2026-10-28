@@ -580,8 +580,8 @@ test('undefined values from getTiming never override the defaults', () => {
 
 test('verify() fails at boot when the ResizeTask model is not registered', async () => {
   const t = new MongoTaskQueue({ getModel: () => undefined });
-  assert.throws(
-    () => t.verify(),
+  await assert.rejects(
+    t.verify(),
     (err: unknown) =>
       err instanceof ResizeSetupError &&
       err.code === 'RESIZE_MONGO_MODEL_MISSING',
