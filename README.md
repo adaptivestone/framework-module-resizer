@@ -187,6 +187,11 @@ construct every Resizer in the worker process too. Each task runs with the Resiz
 that Resizer's [coordination](#coordination), so a dead-letter gets that Resizer's `cooldownMs`.
 The task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
 `onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included).
+When a task's handler ends, the worker first waits for a lease renewal still in flight, on every
+task queue (a gating one too), within the same `min(leaseMs, 30000)` ms its gate calls get: a
+renewal that then answers `false` means the lease was lost, so there is no completion, failure or
+event, and the task is left to its next delivery. A renewal that does not answer in that time is
+logged, and the task ends without it (its gate calls are then sent without waiting).
 `logger` receives the worker loop's own messages, failed gate lock calls included; a logger that
 throws never stops the loop. Framework hosts run `npm run cli ResizeWorker`, which serves the
 Resizers that `src/resizer.ts` constructs.
