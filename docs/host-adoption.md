@@ -36,11 +36,13 @@ the enclosing schema's options.
   (`queue: { driver: 'database' }` for background generation). Move
   `worker.concurrency` to the top-level `concurrency`.
 - Create the `ResizeTask` indexes through the host's migration, in this order.
-  Create the gate index `{ resizer: 1, fileId: 1, pipeline: 1 }` (unique, partial
-  on `active: true`), which keeps one active task per Resizer, media and pipeline,
-  BEFORE the new API and workers start: without it every `add()` stores a task,
-  duplicate active rows build up, and the unique index build then fails with
-  E11000 until those tasks complete. Create the claim index
+  Create the gate index `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` (unique,
+  partial on `active: true`), which keeps one active task per Resizer, media,
+  pipeline and queue, BEFORE the new API and workers start: `resizer.verify()` and
+  worker start reject with `RESIZE_MONGO_INDEX_MISSING` until it exists, and
+  without it every `add()` stores a task, duplicate active rows build up, and the
+  unique index build then fails with E11000 until those rows are no longer active
+  (completed, or dead and taken over or expired). Create the claim index
   `{ queue: 1, status: 1, availableAt: 1 }` before or together with the new
   workers, then drop the old lease index (`{ status: 1, createdAt: 1 }`, or
   `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). Then drop the
@@ -53,14 +55,18 @@ the enclosing schema's options.
   hand-written model must add the `resizer`, `queue`, `availableAt`, `active` and
   `cooldownUntil` fields, the claim index and the gate index;
   `resize-scaffold --check` and `resizer.verify()` report a model without the fields
-  (neither checks indexes).
+  (and the queue's first `add()` logs it and queues nothing), and `resizer.verify()`
+  a collection without the gate index. Neither creates indexes.
 - Move `queue.lockTtlMs` to the Resizer's `coordination` (a `coordination` section
   in the config file, or `new Resizer({ coordination })`): `lockTtlMs.failed` →
   `cooldownMs`, `lockTtlMs.dispatch` → `gateTtlMs`, drop `lockTtlMs.worker`. A
   `lockTtlMs` left in queue timing fails with `RESIZE_CONFIG_REMOVED_KEY`. Both
-  values default to 600000; a host whose `queue.leaseMs` is above that must set
-  `gateTtlMs` to at least the lease, or its task queue degrades with
-  `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`.
+  values default to 600000. `gateTtlMs` is not the old dispatch lock renamed: that
+  was a short per-variant hold (60 s); `gateTtlMs` is how long the one gate lock of
+  a media, pipeline and queue holds a QUEUED task before a worker starts it (the
+  worker then holds it through the task), and it is used only beside a task queue
+  without `gatesByTask` (SQS). Set it to your worst queue wait, not to the old
+  dispatch value.
 - A hand-written media schema that declares preview rows as sub-documents must add
   `identity: { type: String }` to them (the fragment already has it);
   `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without it. Rows

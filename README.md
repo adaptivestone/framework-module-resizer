@@ -153,14 +153,15 @@ await runWorker({ signal, queue: 'default', sharp: { concurrency: 1, cache: fals
 An eager-only Resizer needs only `storage` and `media`: pass `media: new MongoMediaStore({ model:
 File })` (also from `…/drivers/mongo.js`) instead of the parts, which also register the task and
 lock models. `locks` is required only beside a task queue without `gatesByTask` (`SqsTaskQueue`,
-most custom queues), which takes one gate lock per media and pipeline it queues (see
+most custom queues), which takes one gate lock per media, pipeline and queue it queues (see
 [Coordination](#coordination)): without it `verify()` and the worker reject with
 `RESIZE_LOCKS_REQUIRED`, and reads serve stored previews only (see [Drivers](#drivers)).
 `MongoTaskQueue` keeps the gate in its own rows and uses no lock; `mongoParts` still returns a lock
 store, for a Resizer that swaps in `SqsTaskQueue`. With the parts, create the indexes of both
 models through your migration process (for example
 `await mongoose.connection.models.ResizeTask.createIndexes()`, and the same for `ResizeLock`); the
-module never creates them at runtime (`createResizeModels` sets `autoIndex: false`).
+module never creates them at runtime (`createResizeModels` sets `autoIndex: false`), and
+`verify()` rejects with `RESIZE_MONGO_INDEX_MISSING` until the gate index exists.
 
 **The worker.** `runWorker({ signal, queue?, resizers?, logger?, sharp? })` serves the Resizers in
 `resizers`, by default every Resizer constructed in the process when it starts (an empty list
@@ -234,7 +235,9 @@ nothing, `uploadOriginal()` and `generate()` work, `prewarm()` returns `incomple
 non-retryable `RESIZE_ENQUEUE_INTERNAL_ERROR` issue carrying the error, and `verify()` and the
 worker reject with it (`RESIZE_LOCKS_REQUIRED`, `RESIZE_CONFIG_QUEUE_*`,
 `RESIZE_CONFIG_REMOVED_KEY` for a `lockTtlMs` left in the queue's own `timing`,
-`RESIZE_CONFIG_COORDINATION_INVALID`, `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`). Call `verify()` at
+`RESIZE_CONFIG_COORDINATION_INVALID`). `verify()` also runs the drivers' own checks, among them
+`MongoTaskQueue`'s (`RESIZE_MONGO_MODEL_MISSING`, `RESIZE_MONGO_MODEL_OUTDATED`,
+`RESIZE_MONGO_INDEX_MISSING`). Call `verify()` at
 boot so such a misconfiguration stops the deploy instead of degrading reads. (`FrameworkResizer`
 validates the config file's `queue` section with the rest of the file, so there invalid timing is
 a config error on first use; the file's `coordination` section goes to the core as it is, so an
@@ -287,8 +290,15 @@ sub-documents without `identity` (a mixed or plain `previews` array passes),
 `MongoLockStore.verify()` with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock schema has no
 `owner` field (for example a `ResizeLock` model registered on the connection before this
 version), and `MongoTaskQueue.verify()` with `RESIZE_MONGO_MODEL_OUTDATED` when the `ResizeTask`
-schema lacks a field the queue writes (`active` and `cooldownUntil` among them; it does not check
-indexes). `MongoTaskQueue` sets `gatesByTask` and `claimFilters`: its rows are the gate (see
+schema lacks a field the queue writes (`active` and `cooldownUntil` among them). The queue checks
+the schema at its first use too, whether or not `verify()` ran: with such a model `add()` logs
+`RESIZE_MONGO_MODEL_OUTDATED` and resolves `unconfirmed` (a strict schema without `active` would
+store every task and turn the gate off), and its other methods reject with it.
+`MongoTaskQueue.verify()` also reads the collection's indexes and rejects with `ResizeSetupError`
+`RESIZE_MONGO_INDEX_MISSING` unless one is the gate index: unique on exactly
+`{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }`
+(a collection that does not exist yet has none). It only reads them: create the index through your
+migration process. `MongoTaskQueue` sets `gatesByTask` and `claimFilters`: its rows are the gate (see
 [Coordination](#coordination)), and a claim takes only tasks of the Resizers the worker serves. Its
 `add()` counts a duplicate key as the gate only on the gate index; a duplicate key on another unique
 index of your model is logged, and the add is `unconfirmed`.
@@ -320,7 +330,8 @@ can report `completed` and still run again (the worker skips previews that exist
 task can reach the dead-letter queue twice.
 
 The core takes one kind of lock: the gate lock of a task queue without `gatesByTask`, one per
-Resizer, media and pipeline (see [Coordination](#coordination)). There are no per-identity locks.
+Resizer, media, pipeline and queue (see [Coordination](#coordination)). There are no per-identity
+locks.
 Locks only prevent duplicate work; correctness never depends on them. Every lock has an owner,
 and `release(key, owner)` is a compare-and-delete: a holder whose lock expired and was taken over
 cannot remove or extend the new holder's lock. A gate lock gets a fresh random owner when a task
@@ -353,18 +364,23 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
   extends and releases it).
 - `TaskQueue` — each method one atomic operation:
   - `add(task)` stores `{ resizer, queue, mediaId, pipeline, previews, gateOwner? }` and resolves
-    with a `TaskAddResult`: `{ status: 'added', taskId }`; `{ status: 'in-flight', taskId? }` (a
-    task of this Resizer, media and pipeline is active, so nothing was stored; `taskId` when the
-    queue knows it); or `{ status: 'unconfirmed' }` (the write could not be confirmed). A value in
+    with a `TaskAddResult`: `{ status: 'added', taskId }`; `{ status: 'in-flight', taskId? }` (only
+    a queue with `gatesByTask`: a task of this Resizer, media, pipeline and queue is active, so
+    nothing was stored; `taskId` whenever the queue knows it); or `{ status: 'unconfirmed' }` (the
+    queue cannot say whether the task was stored, e.g. a response lost after the write; beside a
+    queue without `gatesByTask` the core then keeps the gate lock for one lease). A value in
     none of these shapes (a queue written for an older version, e.g. one that resolves a task id)
     is never counted as queued: the Resizer logs it once, and `prewarm()` reports its variants
     with a non-retryable `RESIZE_ENQUEUE_UNCONFIRMED`.
   - Optionally `gatesByTask: true`: the queue itself keeps at most one active task per Resizer,
-    media and pipeline, whatever variants either asks for, and `add()` reports `in-flight` while
-    one exists. Such a queue must keep a task active from `add()` through its retries and
-    give-backs until `complete()`, and keep a dead task active for the `cooldownMs` that `fail()`
-    passes; the Resizer then takes no gate lock and needs no `locks`. Without the flag, `add()`
-    stores every task it is given, and the core takes a gate lock instead.
+    media, pipeline and queue, whatever variants either asks for, and `add()` reports `in-flight`
+    (with the active task's id) while one exists. Such a queue must keep a task active from
+    `add()` through its retries and give-backs until `complete()`, and keep a dead task active for
+    the `cooldownMs` that `fail()` passes; the next `add()` after that cooldown must take the dead
+    task over (store the new task as the active one): a dead task left active blocks its media for
+    good. `findActive` reports the active task while it is pending or processing, `[]` for a dead
+    one. The Resizer then takes no gate lock and needs no `locks`. Without the flag, `add()` stores
+    every task it is given, with its `gateOwner`, and the core takes a gate lock instead.
   - Optionally `claimFilters: true`: `claim()` honours `opts.resizers` (`ClaimOptions`) and claims
     only tasks of those Resizers; the worker passes the Resizers it serves. Such a queue skips the
     worker's shared-queue start check and never sees a task given back as unserved; one that hands
@@ -379,7 +395,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     only one of the woken workers' claims wins.
   - `renew(task, leaseMs)`, `complete(task)`, `fail(task, { retryAt } | 'dead', error, opts?)` act
     only while the token still holds (`false` = lease lost). With `'dead'`, `opts.cooldownMs`
-    (`FailOptions`) is how long a queue with `gatesByTask` keeps the dead task as the gate.
+    (`FailOptions`) is how long a queue with `gatesByTask` keeps the dead task as the gate (the
+    core always passes it; absent counts as 0). A queue without `gatesByTask` ignores it. Once
+    `renew` reports the lease lost, the core makes no further call for that delivery.
   - Optionally `release(task)`: give a claimed task back unprocessed (`false` = lease lost). It
     becomes claimable at once, and the delivery should not count as an attempt; a backend that
     cannot take a delivery back may still count it (`MongoTaskQueue` takes the attempt back;
@@ -390,9 +408,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     counts. On a queue without `claimFilters` the worker also gives back, without running it, a
     task for a Resizer it does not serve; without `release` such a task fails with
     `RESIZE_NO_RESIZER` (retried, then dead-lettered).
-  - Optionally `findActive({ resizer, mediaId, pipeline })`: the active (pending or processing)
-    tasks of that Resizer, media and pipeline on any queue, each with the previews it covers; at
-    most one on a queue with `gatesByTask`, and `[]` when there are none. The core reads it only
+  - Optionally `findActive({ resizer, mediaId, pipeline, queue })`: the active (pending or
+    processing) tasks of that Resizer, media, pipeline and queue, each with the previews it covers;
+    at most one on a queue with `gatesByTask`, and `[]` when there are none. The core reads it only
     after an `in-flight` add, so `prewarm()` can accept the variants the active task holds. Also
     optionally `servesQueue(queue)`, `getTiming()` and `verify()`.
 
@@ -436,7 +454,7 @@ Resizer's [coordination](#coordination). The timing defaults are `defaultQueueOp
 
 | Option | Default | Notes |
 |---|---|---|
-| `leaseMs` | `60000` | Set to at least ~2× the slowest encode. Above `600000`, raise `coordination.gateTtlMs` with it |
+| `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
 | `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
 | `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. Claim errors back off from it up to 10× |
@@ -480,26 +498,41 @@ and `encode.flattenBackground` fail with `RESIZE_CONFIG_REMOVED_KEY`, and so do 
 
 ### Coordination
 
-A Resizer with a task queue keeps one **gate** per Resizer, media and pipeline: at most one of
-their tasks is active at a time, whether it is queued, running, waiting for a retry, or cooling
-down after a dead-letter. While the gate is held, a read that finds variants missing queues
-nothing, whatever variants the active task covers: a new size for that media waits for the active
-task, and the next read after the task ends queues it. So 1000 concurrent reads of a cold media
-create one task.
+A Resizer with a task queue keeps one **gate** per Resizer, media, pipeline and queue: at most
+one of their tasks is active at a time, whether it is queued, running, waiting for a retry, or
+cooling down after a dead-letter. While the gate is held, a read that finds variants missing
+queues nothing, whatever variants the active task covers: a new size for that media waits for the
+active task, and the next read after the task ends queues it. So 1000 concurrent reads of a cold
+media create one task. A request on another queue is a separate task, as before the gate: a
+`prewarm({ queue: 'bulk' })` waiting for a bulk worker never blocks reads on `'default'` (the media
+may then be rendered on both; the media store keeps one row per preview identity).
 
 - On `MongoTaskQueue` (`gatesByTask`) the task row is the gate. Its `active` field is `true` from
   `add()` until the task completes, through its retries, and a unique index on
-  `{ resizer: 1, fileId: 1, pipeline: 1 }` with `partialFilterExpression: { active: true }` lets one
-  row per gate be active. A dead row keeps the gate until its `cooldownUntil` (`deadAt` +
-  `cooldownMs`); the next `add()` after that retires it (`active: false`, its `error` kept) and
-  inserts a new row. No lock is taken.
+  `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }`
+  lets one row per gate be active (`verify()` rejects with `RESIZE_MONGO_INDEX_MISSING` until it
+  exists). A dead row keeps the gate until its `cooldownUntil` (`deadAt` + `cooldownMs`); the next
+  `add()` after that retires it (`active: false`, its `error` kept) and inserts a new row. No lock
+  is taken.
 - On a task queue without `gatesByTask` (`SqsTaskQueue`, most custom queues) the gate is one lock in
-  the Resizer's `LockStore`, `resize_gate:<resizer>:<mediaId>:<pipeline>`. The core takes it for
-  `gateTtlMs` with a fresh random owner when it queues a task, and the owner travels in the task as
-  `gateOwner`. The worker extends the lock: to one lease from now when the task starts and on every
-  heartbeat, to the retry time plus one lease after a failed attempt, and to `cooldownMs` from now
-  after a dead-letter; it releases the lock when the task completes. When the queue does not store
-  the task, the core releases the lock at once.
+  the Resizer's `LockStore`, `resize_gate:<resizer>:<queue>:<mediaId>:<pipeline>` (each part
+  URI-encoded). The core takes it for `gateTtlMs` with a fresh random owner when it queues a task,
+  and the owner travels in the task as `gateOwner`. When the queue does not confirm that it stored
+  the task (`unconfirmed`, a throw), the task may still be stored, so an ambiguous enqueue keeps the
+  gate for one lease (`leaseMs`) instead of releasing it: a stored task is claimed and extended
+  within it, otherwise it lapses and a later read queues the task. The worker extends the lock: to
+  one lease plus one heartbeat interval (`leaseMs / 2`) when the task starts and on every
+  heartbeat, so a redelivery after a worker crash still finds it held; to the retry time plus one
+  lease after a failed attempt; to `cooldownMs` after a dead-letter; and to `gateTtlMs` when it
+  gives a task back (at shutdown, or a task it does not serve). When an extend finds the lock lapsed
+  while the task runs, or for the retry and cooldown holds, the worker takes it back under the
+  task's owner, unless another request has taken the gate meanwhile. It releases the lock when the
+  task completes. Once a delivery's lease is known to be lost, the worker makes no call for it at
+  all (no completion, no gate call). Every lock store call waits at most `min(leaseMs, 30000)` ms,
+  and a task's end waits that long at most for all its gate calls, so a hanging lock store never
+  holds the worker; a call that does not answer in time is logged as failed. This gate is best
+  effort across a lost lease, an ambiguous enqueue (one lease) and a lock store failure: at worst a
+  second task renders the same variants, and the media store keeps one row per preview identity.
 
 There are no per-identity locks. The lease keeps a task with one worker at a time, its token fences
 every write, and `appendPreviews` keeps one row per preview identity when an expired lease lets two
@@ -507,8 +540,8 @@ workers render the same variant.
 
 | Option | Default | Notes |
 |---|---|---|
-| `gateTtlMs` | `600000` | How long a new gate lock holds its media and pipeline before a worker extends it (a task queue without `gatesByTask`; `MongoTaskQueue` takes no lock, but the value is still checked). Must be at least the task queue's `leaseMs` |
-| `cooldownMs` | `600000` | After a task is dead-lettered, no new task for that media and pipeline is queued for this long |
+| `gateTtlMs` | `600000` | How long the gate lock of a QUEUED task holds its media, pipeline and queue before a worker starts the task (from then on the worker extends it per lease), and how long a task given back holds it again. Raise it when tasks wait longer in the queue. Only a task queue without `gatesByTask` takes the lock; `MongoTaskQueue` ignores the value |
+| `cooldownMs` | `600000` | After a task is dead-lettered, no new task for that media, pipeline and queue is queued for this long. On Mongo a dead row is kept ~30 days (its TTL index), so a longer cooldown ends when the row expires |
 
 Pass it as `new Resizer({ coordination: { gateTtlMs, cooldownMs } })` (or a function returning it)
 or `new FrameworkResizer({ coordination })`, or set the `coordination` section of a framework config
@@ -516,16 +549,15 @@ file. Missing values take `defaultCoordination` from `…/config/resize.js` (the
 `CoordinationOptions`); an eager-only Resizer never reads it. Only the core validates it, when the
 Resizer sets up its task queue: a section that is not an object, or a value that is not a positive
 safe integer (ms), is `ResizeConfigError` `RESIZE_CONFIG_COORDINATION_INVALID` (the message names
-the key, or the value when the whole section is wrong), and a `gateTtlMs` below the task queue's
-`leaseMs` is `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`. Either degrades like a task queue that cannot
-be used (see `ready()` under [Drivers](#drivers)), in a config file too, so a host whose `leaseMs`
-is above `600000` must raise `gateTtlMs` with it. Each dead-letter gets the `cooldownMs` of the
-task's own Resizer.
+the key, or the value when the whole section is wrong); it degrades like a task queue that cannot
+be used (see `ready()` under [Drivers](#drivers)), in a config file too, and a section set to
+`null` is invalid, not the defaults. No value depends on the queue's lease. Each dead-letter gets
+the `cooldownMs` of the task's own Resizer.
 
 ## Operations
 
 - **Task states (Mongo):** `pending → processing → completed`. A row's `active` is `true` from
-  `add()` until the task completes: the row is the gate of its Resizer, media and pipeline (see
+  `add()` until the task completes: the row is the gate of its Resizer, media, pipeline and queue (see
   [Coordination](#coordination)). Rows written before the gate have no `active` and never block a
   new task.
   - A failed attempt returns to `pending` with backoff, still active.
@@ -561,7 +593,7 @@ task's own Resizer.
   takes the dead row over and queues a new task. Until then `prewarm()` reports the retryable
   `RESIZE_TASK_IN_FLIGHT` (on SQS, the retryable `RESIZE_ENQUEUE_LOCK_CONTENDED`). To replay the
   dead row itself instead, at any time, make it pending and active again. The gate index allows
-  one active row per Resizer, media and pipeline:
+  one active row per Resizer, media, pipeline and queue:
 
 ```ts
 await ResizeTask.updateOne(
@@ -576,7 +608,7 @@ await ResizeTask.updateOne(
       availableAt: new Date(),
     },
   },
-); // a duplicate-key error (11000) means another task for this media and pipeline is active
+); // a duplicate-key error (11000) means another task for this media, pipeline and queue is active
 ```
 
 - **Your app's responsibilities:** deleting media and their storage objects, access checks, the

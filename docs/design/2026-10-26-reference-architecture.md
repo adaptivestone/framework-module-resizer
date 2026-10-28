@@ -89,8 +89,9 @@ The framework adapter composes `FrameworkMediaStore` (the app's media model), `F
 
 **F2. Coordination policy belongs to the Resizer.** Lock durations and cooldowns are the core's
 dedup policy, not queue timing: `new Resizer({ coordination: { gateTtlMs, cooldownMs } })` (framework
-hosts: a `coordination` section in `resize.ts`). The core validates it against the queue timing
-(`gateTtlMs ≥ leaseMs`); no driver validates lock settings. `QueueTimingOptions` loses `lockTtlMs`.
+hosts: a `coordination` section in `resize.ts`). The core validates it (positive integers; the
+`gateTtlMs ≥ leaseMs` rule was dropped in S2, since the worker extends a running task's gate per
+lease); no driver validates lock settings. `QueueTimingOptions` loses `lockTtlMs`.
 
 **F3. The task row is the gate.** One active task per `(resizer, mediaId, pipeline, queue)`.
 The gate includes the queue: a lane split is the host's choice to render twice.
@@ -107,10 +108,11 @@ The gate includes the queue: a lane split is the host's choice to render twice.
   one active task so `prewarm` can report which requested variants it covers.
 - **Queues without the gate** (SQS, custom): the dispatcher takes one owned lock
   `resize_gate:<resizer>:<queue>:<mediaId>:<pipeline>` for `gateTtlMs` before `add` (owner = a request
-  token stored in the task payload as `gateOwner`), and releases it if `add` fails. After claim the
-  worker extends it on every heartbeat to `leaseMs`; on `fail({ retryAt })` it extends it to
+  token stored in the task payload as `gateOwner`), and shortens it to one lease if `add` is not
+  confirmed (the task may still be stored). After claim the worker extends it on every heartbeat
+  to `leaseMs` plus one heartbeat interval; on `fail({ retryAt })` it extends it to
   `retryAt + leaseMs`; on `complete` it releases with compare-and-delete; on `fail('dead')` it
-  extends it to `cooldownMs`.
+  extends it to `cooldownMs`; a lapsed lock is taken back under the task's owner.
 - Per-identity worker locks are removed: a media's task runs on one worker at a time by
   construction, the lease token fences task writes, and `appendPreviews` is identity-guarded.
 - Cost accepted: a new size requested for a media whose task is active waits for that task to

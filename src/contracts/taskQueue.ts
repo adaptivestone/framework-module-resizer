@@ -2,7 +2,8 @@
 // message broker can (SqsTaskQueue). Every method is ONE atomic operation; the core owns everything
 // else — the worker loop, lease heartbeat, task timeout, retry with backoff, dead-lettering, giving
 // tasks back at shutdown and task events — so every backend behaves the same. A queue that gates
-// by task keeps at most one active task per Resizer, media and pipeline. Extend this class, or
+// by task keeps at most one active task per Resizer, media, pipeline and queue (see
+// `gatesByTask`); for any other queue the core keeps that gate as a lock. Extend this class, or
 // pass any object of the same shape (the core never checks `instanceof`).
 import type {
   EnqueueReceipt,
@@ -50,9 +51,13 @@ export interface ClaimedTask extends LeasedTask {
 /**
  * What `add()` did with a task:
  * - `added`: the task is stored under `taskId`;
- * - `in-flight`: a queue that gates by task already holds an active task of this Resizer, media
- *   and pipeline (`taskId`, when the queue knows it), so it stored nothing;
- * - `unconfirmed`: the queue could not confirm the write.
+ * - `in-flight`: only from a queue with `gatesByTask`: an active task of this Resizer, media,
+ *   pipeline and queue exists, so nothing was stored. Give its `taskId` whenever the queue knows
+ *   it (prewarm confirms variants through it; an `in-flight` without an id is logged once);
+ * - `unconfirmed`: the queue cannot say whether the task was stored (a write error, a response
+ *   lost after the write). Beside a queue without `gatesByTask` the core then keeps the gate lock
+ *   for one lease, not released: a stored task is claimed and extends it within that lease;
+ *   otherwise it lapses and a later read queues the task.
  */
 export type TaskAddResult =
   | { status: 'added'; taskId: string }
@@ -61,13 +66,23 @@ export type TaskAddResult =
 
 /** Options for `claim()`. */
 export interface ClaimOptions {
-  /** The Resizers this worker serves: a queue with `claimFilters` claims only their tasks. */
+  /**
+   * The Resizers this worker serves. A queue with `claimFilters` must claim only their tasks; one
+   * that ignores the option may hand out any Resizer's task, which the worker then gives back
+   * (`release`) or fails with RESIZE_NO_RESIZER, and must not declare `claimFilters`.
+   */
   resizers?: readonly string[];
 }
 
 /** Options for `fail()`. */
 export interface FailOptions {
-  /** With `'dead'`: how long a queue that gates by task keeps the dead task as the gate. */
+  /**
+   * With `'dead'`: how long a queue with `gatesByTask` must keep the dead task as the gate, from
+   * now (the core always passes the cooldown of the task's Resizer; absent counts as 0, the gate
+   * opens at once). A queue without `gatesByTask` ignores it: the core holds its gate lock for the
+   * cooldown. A gating queue that ignores it opens the gate at once, so the next read queues the
+   * failing media again.
+   */
   cooldownMs?: number;
 }
 
@@ -84,20 +99,36 @@ export abstract class TaskQueue {
   // own `undefined` on every instance and hide a subclass that sets the flag with a getter.
 
   /**
-   * Optional: `add()` keeps at most one active task per Resizer, media and pipeline, and reports
-   * `in-flight` while one exists. Absent: `add()` never reports `in-flight`.
+   * Optional: the queue keeps the gate itself, at most one ACTIVE task per Resizer, media,
+   * pipeline and queue, whatever variants each asks for:
+   * - a task is active from `add()` until `complete()`, through its retries (`fail({ retryAt })`)
+   *   and give-backs (`release()`);
+   * - a dead task (`fail(task, 'dead', error, { cooldownMs })`) stays active until now +
+   *   `cooldownMs`; the NEXT `add()` after that must take it over: store the new task as the
+   *   active one (the dead one stops being the gate). A queue that keeps a dead task active
+   *   blocks its media for good;
+   * - while a task is active, `add()` stores nothing and reports `in-flight` with its id;
+   * - `findActive` returns the active task while it is pending or processing, and `[]` while a
+   *   dead one cools down.
+   *
+   * Absent: `add()` stores every task it is given and never reports `in-flight`, and the queue
+   * must store `gateOwner` with each task and hand it back unchanged from `claim()`: the core then
+   * keeps the gate as a lock in the Resizer's LockStore, under that owner.
    */
   declare readonly gatesByTask?: true;
 
-  /** Optional: `claim()` honours `ClaimOptions.resizers`. Absent: it may hand out any task. */
+  /**
+   * Optional: `claim()` honours `ClaimOptions.resizers` (it claims only tasks of those Resizers).
+   * Absent: it may hand out any task.
+   */
   declare readonly claimFilters?: true;
 
   /**
    * Store a task: the result says whether it was added, another task is in flight, or the write
    * is unconfirmed (see TaskAddResult). A queue with `gatesByTask` stores nothing while an active
-   * task of the same Resizer, media and pipeline exists, whatever variants either asks for, and
-   * reports `in-flight` (with that task's id when it knows it). A queue without it stores every
-   * task it is given.
+   * task of the same Resizer, media, pipeline and queue exists, whatever variants either asks for,
+   * and reports `in-flight` (with that task's id when it knows it); see `gatesByTask`. A queue
+   * without it stores every task it is given, with its `gateOwner`.
    */
   abstract add(task: NewTask): Promise<TaskAddResult>;
 
@@ -127,13 +158,16 @@ export abstract class TaskQueue {
   /** Extend the lease (the heartbeat). `false` means the lease was lost to another worker. */
   abstract renew(task: ClaimedTask, leaseMs: number): Promise<boolean>;
 
-  /** Mark the task done. `false` means the lease was lost (the result is dropped). */
+  /**
+   * Mark the task done; on a queue with `gatesByTask` it stops being the gate, so the next `add()`
+   * stores a new task. `false` means the lease was lost (the result is dropped).
+   */
   abstract complete(task: ClaimedTask): Promise<boolean>;
 
   /**
-   * Retry later (`{ retryAt }`) or give up (`'dead'`, keeping `error` for inspection). With
-   * `'dead'`, a queue that gates by task keeps the dead task as the gate for `opts.cooldownMs`.
-   * `false` means the lease was lost.
+   * Retry later (`{ retryAt }`; on a queue with `gatesByTask` the task stays active) or give up
+   * (`'dead'`, keeping `error` for inspection; such a queue keeps the dead task as the gate for
+   * `opts.cooldownMs`, see `gatesByTask`). `false` means the lease was lost.
    */
   abstract fail(
     task: ClaimedTask,
@@ -146,17 +180,19 @@ export abstract class TaskQueue {
    * Optional: give a claimed task back unprocessed (the worker is shutting down, or the task is of
    * a Resizer it does not serve). It becomes claimable at once, and this delivery should not count
    * as an attempt; a backend that cannot take a delivery back (SQS counts receives) may still
-   * count it. `false` means the lease was already lost. Without it the core retries a stopped task
-   * at once through `fail`, so the delivery counts, and a task of a Resizer the worker does not
-   * serve fails with RESIZE_NO_RESIZER (it retries, then dead-letters).
+   * count it. On a queue with `gatesByTask` the task stays active. `false` means the lease was
+   * already lost. Without it the core retries a stopped task at once through `fail`, so the
+   * delivery counts, and a task of a Resizer the worker does not serve fails with
+   * RESIZE_NO_RESIZER (it retries, then dead-letters).
    */
   release?(task: ClaimedTask): Promise<boolean>;
 
   /**
    * Optional: the active tasks (pending or processing) of this Resizer, media, pipeline and
    * queue, each with the previews it covers; `[]` when there are none. A queue with `gatesByTask`
-   * returns at most one. The Dispatcher reads it only after an `in-flight` add: prewarm then
-   * accepts the variants the active task holds. Omit when tasks can't be queried (e.g. SQS).
+   * returns at most one, and `[]` while a dead task holds the gate. The Dispatcher reads it only
+   * after an `in-flight` add: prewarm then accepts the variants the active task holds. Omit when
+   * tasks can't be queried (e.g. SQS).
    */
   findActive?(query: {
     resizer: string;
