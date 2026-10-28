@@ -173,6 +173,49 @@ test('plan.ts reaches no sharp at runtime and imports no contract but the decode
   );
 });
 
+test('plan.ts, raster.ts and render.ts reach no storage, media, task-queue or lock contract', () => {
+  const ports = [
+    'contracts/storage.ts',
+    'contracts/media.ts',
+    'contracts/taskQueue.ts',
+    'contracts/locks.ts',
+  ];
+  assert.ok(
+    walk('render.ts', { types: true }).files.has('contracts/pipeline.ts'),
+    'sanity check: the walk does reach the contracts render.ts uses',
+  );
+  for (const entry of ['plan.ts', 'raster.ts', 'render.ts']) {
+    const { files } = walk(entry, { types: true });
+    assert.deepEqual(
+      [...files.entries()]
+        .filter(([f]) => ports.includes(f))
+        .map(([, chain]) => chain.join(' → ')),
+      [],
+    );
+  }
+});
+
+test('only the allowed shipped files import sharp', () => {
+  const allowed = [
+    'contracts/pipeline.ts', // the Sharp type of variantSteps
+    'decoders/sharp.ts',
+    'decoders/svg.ts',
+    'helpers/svgDimensions.ts',
+    'helpers/svgRasterChild.ts',
+    'processor.ts', // until the Processor renders through render.ts
+    'raster.ts',
+    'render.ts',
+    'uploader.ts', // until the Uploader measures through the decoders
+    'worker.ts', // sharp.concurrency and sharp.cache
+  ];
+  const importers = sourceFiles().filter((f) =>
+    importSpecifiers(readFileSync(resolve(SRC, f), 'utf8'), {
+      types: true,
+    }).includes('sharp'),
+  );
+  assert.deepEqual(importers.sort(), allowed);
+});
+
 test('helpers and contracts import only helpers, contracts, errors and types', () => {
   const allowed = (t: string) =>
     t.startsWith('helpers/') ||
