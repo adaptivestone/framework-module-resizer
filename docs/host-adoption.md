@@ -27,7 +27,7 @@ survive persistence. Framework `BaseModel` already supplies this default; direct
 Mongoose schemas must set it explicitly. The field fragment alone cannot configure
 the enclosing schema's options.
 
-## Other changes a host must make for this version
+## Other changes a host must make for 0.3.0
 
 `CHANGELOG.md` (`# 0.3.0`) has the details.
 
@@ -50,7 +50,9 @@ the enclosing schema's options.
   `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). Then drop the
   `{ fileId, pipeline, requestKey }` index when convenient: new rows never enter
   it. Backfilling `availableAt` is optional: rows without it still wait for the
-  retry time or lease end stored in `leaseExpiresAt`.
+  retry time or lease end stored in `leaseExpiresAt`. The worker runs on the
+  framework CLI with `autoIndex` off, so it never builds the indexes: they must
+  exist before the first worker starts.
 - Regenerate the model shim, which now imports `…/framework/ResizeTaskModel.js`:
   delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force`
   would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or
@@ -89,9 +91,8 @@ the enclosing schema's options.
   `svgRaster.js` (otherwise `RESIZE_SVG_RENDER_UNAVAILABLE`).
 - Resizers on the database queue (and Resizers with identical SQS settings) share
   one task queue with one timing: config files that share a queue must set the same
-  timing keys (and effective SQS `waitTimeSeconds`), or `verify()` and worker start
-  fail with
-  `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`. Without the framework, call
+  timing keys (and effective SQS `waitTimeSeconds`), or first use, `verify()` and
+  worker start fail with `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`. Without the framework, call
   `mongoParts(connection, { mediaModel })` once per process and spread the same parts
   into every Resizer (each call makes its own task queue). The pre-release database
   part is split in two: `media` (the media store) and `locks` (the lock store), beside
@@ -108,7 +109,7 @@ the enclosing schema's options.
   been drained. Task rows from before the gate have no `active` field and are not
   gates, so during a rolling deploy a read can queue a second task for such a media.
   The next `add()` takes over a row that a worker from before the gate completed or
-  dead-lettered. There are no dispatch or worker locks any more: the only lock is the
+  dead-lettered (such a worker leaves it active and sets no cooldown). There are no dispatch or worker locks any more: the only lock is the
   gate lock of a task queue without `gatesByTask` (SQS), which lasts
   `coordination.gateTtlMs` until a worker extends it. An older SQS worker ignores
   the lock's owner, so the gate lock of a task it ran expires only after

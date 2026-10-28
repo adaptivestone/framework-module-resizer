@@ -16,7 +16,8 @@ export default {
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
   // Background generation: tasks wait in the scaffolded ResizeTask model. Create its indexes (the
   // gate index among them) through your migration process; the module never creates them. The
-  // framework Lock model is needed only beside the SQS queue (one gate lock per media).
+  // framework Lock model is needed only beside the SQS queue (one gate lock per Resizer, media,
+  // pipeline and queue).
   // Or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs); false = eager only.
   queue: { driver: 'database' },
   // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }, // the defaults; see README "Coordination"

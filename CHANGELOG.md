@@ -315,7 +315,8 @@
   queue. The per-identity
   dispatch and worker locks are gone: the lease, its token fencing every write, and
   `appendPreviews` keeping one row per identity prevent duplicate work.
-- `TaskQueue.add` resolves with a `TaskAddResult`: `{ status: 'added', taskId }`,
+- `TaskQueue.add` resolves with a `TaskAddResult` (in pre-release builds it resolved
+  `{ taskId: string | null }`): `{ status: 'added', taskId }`,
   `{ status: 'in-flight', taskId? }` (only from a gating queue: an active task of this Resizer,
   media, pipeline and queue exists, so nothing was stored; an `in-flight` without its id is logged
   once, since a gate index without its partial filter makes it constant) or
@@ -330,8 +331,9 @@
   { resizers })`; `fail(task, next, error, { cooldownMs })` (`FailOptions`: how long a gating queue
   keeps a dead task as the gate); and `gateOwner` on `NewTask` and `ClaimedTask`, which a queue
   without `gatesByTask` must store and hand back unchanged from `claim()`.
-  `findActive({ resizer, mediaId, pipeline, queue })` returns the active (pending or processing)
-  tasks of that queue, at most one on a gating queue and `[]` for a dead one; the core reads it
+  `findActive({ resizer, mediaId, pipeline, queue })` takes the queue (in pre-release builds it
+  took none and looked on any queue) and returns the active (pending or processing) tasks of that
+  queue, at most one on a gating queue and `[]` for a dead one; the core reads it
   only after an `in-flight` add.
 - `NewTask.requestKey` is removed, with the SHA-256 request key, the `ResizeTask.requestKey` field
   and its `{ fileId, pipeline, requestKey }` index.
@@ -346,7 +348,9 @@
   index) while it is missing, not unique, not partial on `active: true`, or the collection does not
   exist yet; the module never creates it. A filter spelt `{ active: { $eq: true } }` is accepted. It
   needs an open connection, or waits for an opening one; a closed one rejects at once with
-  `ResizeSetupError` `RESIZE_MONGO_NOT_CONNECTED` instead of a buffering timeout. An ejected or
+  `ResizeSetupError` `RESIZE_MONGO_NOT_CONNECTED` instead of a buffering timeout, and an opening
+  one that fails rejects with it once the driver gives up (`serverSelectionTimeoutMS`, 30 s by
+  default), the message naming the driver's error. An ejected or
   hand-written model adds the two fields (`RESIZE_MONGO_MODEL_OUTDATED` without them). `MongoTaskQueue` sets `gatesByTask` and
   `claimFilters`. After a dead row's cooldown the next `add()` retires it (`active: false`, its
   `error` kept) and inserts a new row. Its `add()` counts a duplicate key as the gate only on the
@@ -384,10 +388,14 @@
 - The worker filters claims by the Resizers it serves (see the worker above).
 - Task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
   `onTaskDeadLettered`) receive the task with `attempts`: `LeasedTask.attempts` counts the task's
-  deliveries, this one included (1 on the first).
+  deliveries, this one included (1 on the first). In pre-release builds `attempts` was on
+  `ClaimedTask` only; it moved to `LeasedTask`, which `ClaimedTask` extends.
 - Codes: new `RESIZE_TASK_IN_FLIGHT`, `RESIZE_CONFIG_COORDINATION_INVALID`,
-  `RESIZE_MONGO_INDEX_MISSING` and `RESIZE_MONGO_NOT_CONNECTED`; `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` and the pre-release
-  `RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID` are gone.
+  `RESIZE_MONGO_INDEX_MISSING` and `RESIZE_MONGO_NOT_CONNECTED`. Gone: the pre-release
+  `RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID` (an invalid `lockTtlMs`), whose successor is
+  `RESIZE_CONFIG_COORDINATION_INVALID` (an invalid `coordination`), and
+  `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE`, with no successor: its rule (`lockTtlMs.worker` within the
+  lease) went with `lockTtlMs.worker`.
 - Rollout of the gate: deploy the API and the workers together, after the pending tasks have
   finished or been drained. Task rows from before the gate have no `active` and are not gates, so
   during a rolling deploy a read can queue a second task for such a media. The next `add()` takes
