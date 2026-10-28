@@ -5,26 +5,32 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { Catalog } from './catalog.ts';
+import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type { NewTask } from './contracts/taskQueue.ts';
+import type { NewTask, TaskAddResult } from './contracts/taskQueue.ts';
 import { Dispatcher } from './dispatcher.ts';
-import { ResizeConfigError } from './errors.ts';
+import {
+  ResizeConfigError,
+  ResizeError,
+  ResizeNoOriginalError,
+  ResizeSetupError,
+  ResizeStorageError,
+} from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
-import { Reader, type ReaderDeps } from './reader.ts';
+import { prewarmFailure, Reader, type ReaderDeps } from './reader.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
-  memoryLocks,
+  PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
-import { timingOf } from './timing.ts';
 import type { MediaLike, ResizeLogger, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -64,31 +70,38 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   };
 }
 
-function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
+// A task queue that records every add; `tasks` defaults to a queue that gates by task.
+function makeTasks(
+  behavior?: (task: NewTask) => TaskAddResult,
+  tasks: MemoryTaskQueue | PlainTaskQueue = new MemoryTaskQueue(),
+) {
   const calls: NewTask[] = [];
-  const tasks = new MemoryTaskQueue();
   tasks.add = async (task) => {
     calls.push(task);
-    return behavior ? behavior(task) : { taskId: 't1' };
+    return behavior ? behavior(task) : { status: 'added', taskId: 't1' };
   };
   return { tasks, calls };
 }
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
+  const extended: { key: string; ttl: number }[] = [];
   const released: string[] = [];
   const locks: LockStore = {
     acquire: async (key, _owner, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
-    extend: async () => true,
+    extend: async (key, _owner, ttl) => {
+      extended.push({ key, ttl });
+      return true;
+    },
     release: async (key) => {
       released.push(key);
       return true;
     },
   };
-  return { locks, acquired, released };
+  return { locks, acquired, extended, released };
 }
 
 afterEach(() => {
@@ -141,8 +154,9 @@ describe('Reader', () => {
       readerDeps(
         new Dispatcher({
           tasks,
-          locks: memoryLocks(),
-          timing: timingOf(tasks),
+          locks: undefined, // a task queue that gates by task needs none
+          coordination: defaultCoordination,
+          leaseMs: 60_000,
           name: 'default',
           logger: silent,
         }),
@@ -167,9 +181,14 @@ describe('Reader', () => {
       tasks.added[0].previews.map((v) => v.sizeKey),
       ['20x20'],
     );
+    // Another media: the task queued above holds the gate of m1.
     assert.equal(
-      (await reader.prewarm({ media, sizes: [{ width: 30, height: 30 }] }))
-        .status,
+      (
+        await reader.prewarm({
+          media: { ...media, id: 'm2' },
+          sizes: [{ width: 30, height: 30 }],
+        })
+      ).status,
       'accepted',
     );
   });
@@ -269,6 +288,69 @@ describe('Reader', () => {
         'resize prewarm: unexpected internal error — nothing confirmed',
       ],
     );
+  });
+
+  test('prewarmFailure advises against a retry for setup, config and media errors, also from a duplicate package copy', () => {
+    // An error of another copy of this package: the brand and the class name, no shared class.
+    const branded = (name: string) => ({
+      [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
+      name,
+      message: 'm',
+      code: 'X',
+    });
+    const advice = (err: unknown) =>
+      prewarmFailure(err, []).issues[0].retryable;
+    for (const name of [
+      'ResizeSetupError',
+      'ResizeConfigError',
+      'ResizeMediaError',
+      'ResizeNoOriginalError',
+      'ResizeOriginalError',
+    ]) {
+      assert.equal(advice(branded(name)), false, name);
+    }
+    assert.equal(advice(new ResizeConfigError('m')), false);
+    assert.equal(advice(new Error('m')), true);
+    assert.equal(advice(branded('ResizeStorageError')), true);
+    // The class name alone, without the brand, is not this package's error.
+    assert.equal(advice({ name: 'ResizeSetupError', message: 'm' }), true);
+  });
+
+  test('prewarmFailure honours retryable: false on any error of this package', () => {
+    const advice = (err: unknown) =>
+      prewarmFailure(err, []).issues[0].retryable;
+    assert.equal(
+      advice(new ResizeStorageError('m', { retryable: false })),
+      false,
+    );
+    assert.equal(advice(new ResizeError('m', { retryable: false })), false);
+    assert.equal(advice(new ResizeStorageError('m')), true);
+    // From a duplicate copy of the package: the brand and the field.
+    assert.equal(
+      advice({
+        [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
+        name: 'ResizeStorageError',
+        message: 'm',
+        retryable: false,
+      }),
+      false,
+    );
+    // Without the brand the field is not this package's advice.
+    assert.equal(advice({ name: 'X', message: 'm', retryable: false }), true);
+  });
+
+  test("prewarmFailure keeps a subclass's advice: a host's subclass of a setup or media error", () => {
+    const advice = (err: unknown) =>
+      prewarmFailure(err, []).issues[0].retryable;
+    class HostSetupError extends ResizeSetupError {}
+    class TenantSetupError extends HostSetupError {}
+    class HostMediaError extends ResizeNoOriginalError {}
+    class HostStorageError extends ResizeStorageError {}
+    assert.equal(new HostSetupError('m').name, 'HostSetupError');
+    assert.equal(advice(new HostSetupError('m')), false);
+    assert.equal(advice(new TenantSetupError('m')), false);
+    assert.equal(advice(new HostMediaError('m1')), false);
+    assert.equal(advice(new HostStorageError('m')), true);
   });
 });
 
@@ -712,9 +794,9 @@ describe('resolve — enqueue wiring', () => {
     assert.equal(calls.length, 0);
   });
 
-  test('uses String(media._id) for the dispatch lock when id is absent', async () => {
+  test('uses String(media._id) for the task and the gate lock when id is absent', async () => {
     installFakeApp();
-    const { tasks } = makeTasks();
+    const { tasks, calls } = makeTasks(undefined, new PlainTaskQueue());
     const { locks, acquired } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
@@ -730,19 +812,19 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.equal(acquired.length, 1);
-    assert.equal(
-      acquired[0].key,
-      'resize_dispatch:abc123:default:default:300x300:jpeg:none',
+    assert.deepEqual(
+      acquired.map(({ key }) => key),
+      ['resize_gate:default:default:abc123:default'],
     );
+    assert.equal(calls[0].mediaId, 'abc123');
   });
 
-  test('resolve does not throw when tasks.add throws; survivor locks released', async () => {
+  test('resolve does not throw when tasks.add throws; the gate lock is shortened to one lease', async () => {
     installFakeApp();
     const { tasks } = makeTasks(() => {
       throw new Error('task queue down');
-    });
-    const { locks, released } = makeLocks(true);
+    }, new PlainTaskQueue());
+    const { locks, extended, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
@@ -755,15 +837,20 @@ describe('resolve — enqueue wiring', () => {
       formats: ['jpeg'],
     });
     assert.equal(decision.missing.length, 1);
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    // The default lease: the queue may have stored the task before it threw.
+    assert.deepEqual(extended, [
+      { key: 'resize_gate:default:default:m1:default', ttl: 60_000 },
     ]);
+    assert.deepEqual(released, []);
   });
 
-  test('resolve does not throw when task queue returns taskId null; locks released', async () => {
+  test('resolve does not throw when the task queue cannot confirm the add; the gate lock is shortened to one lease', async () => {
     installFakeApp();
-    const { tasks } = makeTasks(() => ({ taskId: null }));
-    const { locks, released } = makeLocks(true);
+    const { tasks } = makeTasks(
+      () => ({ status: 'unconfirmed' }),
+      new PlainTaskQueue(),
+    );
+    const { locks, extended, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
@@ -775,9 +862,10 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:300x300:jpeg:none',
+    assert.deepEqual(extended, [
+      { key: 'resize_gate:default:default:m1:default', ttl: 60_000 },
     ]);
+    assert.deepEqual(released, []);
   });
 
   test('an original without a key leaves variants missing without enqueueing or locking', async () => {

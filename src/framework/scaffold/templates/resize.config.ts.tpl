@@ -14,10 +14,12 @@ export default {
   // come from the AWS SDK's default chain):
   //   storage: { driver: 's3', bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: 'https://…' },
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  // Background generation: tasks wait in the scaffolded ResizeTask model. Create its indexes (and
-  // the framework Lock model's) through your migration process; the module never creates them.
+  // Background generation: tasks wait in the scaffolded ResizeTask model. Create its indexes (the
+  // gate index among them) through your migration process; the module never creates them. The
+  // framework Lock model is needed only beside the SQS queue (one gate lock per media).
   // Or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs); false = eager only.
   queue: { driver: 'database' },
+  // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }, // the defaults; see README "Coordination"
   // Allow the worker command, then run `npm run cli ResizeWorker` as its own process.
   // worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
 } satisfies FrameworkResizeConfig;

@@ -39,6 +39,7 @@ import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
@@ -306,7 +307,7 @@ function makeMediaStore(media: MediaLike | null): {
 type LockCall = { key: string; owner: string };
 
 // A recording lock store: every acquire and release with its key and owner.
-function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
+function makeLocks(): {
   locks: LockStore;
   acquired: LockCall[];
   released: LockCall[];
@@ -316,7 +317,7 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
   const locks: LockStore = {
     acquire: async (key, owner) => {
       acquired.push({ key, owner });
-      return typeof acquire === 'function' ? acquire(key) : acquire;
+      return true;
     },
     extend: async () => true,
     release: async (key, owner) => {
@@ -326,9 +327,6 @@ function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
   };
   return { locks, acquired, released };
 }
-
-/** The keys of recorded lock calls, in call order. */
-const keysOf = (calls: LockCall[]): string[] => calls.map(({ key }) => key);
 
 function mediaDoc(
   over: {
@@ -354,6 +352,7 @@ const task = (over: Partial<LeasedTask> = {}): LeasedTask => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [],
+  attempts: 1,
   ...over,
 });
 
@@ -389,14 +388,13 @@ function countRenders(): () => number {
 
 const silent: ResizeLogger = { info() {}, warn() {}, error() {} };
 
-/** A Processor on a jpeg-only config whose media store loads mediaDoc(); no `locks`: eager only. */
-function processorDeps(locks: LockStore | undefined): ProcessorDeps {
+/** A Processor on a jpeg-only config whose media store loads mediaDoc(). */
+function processorDeps(): ProcessorDeps {
   const config = makeImageConfig({ formats: ['jpeg'] });
   return {
     catalog: new Catalog({ config }),
     media: fakeMedia({ load: async () => mediaDoc() }),
     storage: makeStorage(redPng).storage,
-    locks,
     pipelines: new PipelineRegistry(),
     hooks: new HookBus({ logger: silent }),
     config,
@@ -406,49 +404,51 @@ function processorDeps(locks: LockStore | undefined): ProcessorDeps {
 }
 
 describe('Processor', () => {
-  test('a Processor renders a task with only its ports (no Resizer)', async () => {
-    const locks = memoryLocks();
+  test('a Processor renders a queued task with no lock store', async () => {
     const { storage, uploads } = makeStorage(redPng);
-    const deps = processorDeps(locks);
+    const deps = processorDeps();
     deps.storage = storage;
-    const processor = new Processor(deps);
-    await processor.processTask(task({ previews: [variant()] }), {
-      workerLockTtlMs: 1000,
-    });
+    await new Processor(deps).processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 1);
-    // Released: another owner takes it at once.
-    assert.equal(
-      await locks.acquire(
-        'resize_worker:m1:default:default:20x20:jpeg:none',
-        'other',
-        1000,
+  });
+
+  test('two workers rendering one task at once leave one row per identity, and both succeed', async () => {
+    // An expired lease can hand one task to a second worker while the first still renders it.
+    const rows = new Map<string, Preview[]>();
+    const { storage, uploads } = makeStorage(redPng);
+    const warnings: unknown[][] = [];
+    const deps = processorDeps();
+    deps.storage = storage;
+    deps.media = fakeMedia({
+      load: async () => ({ ...mediaDoc(), previews: rows.get('m1') ?? [] }),
+      previews: rows,
+    });
+    deps.logger = {
+      ...silent,
+      warn: (...a: unknown[]) => {
+        warnings.push(a);
+      },
+    };
+    const processor = new Processor(deps);
+    await Promise.all([
+      processor.processTask(task({ previews: [variant()] })),
+      processor.processTask(task({ previews: [variant()] })),
+    ]);
+    assert.equal(uploads.length, 2, 'both workers rendered the variant');
+    assert.equal(rows.get('m1')?.length, 1);
+    assert.ok(
+      warnings.some((a) =>
+        /already stored by another worker/.test(String(a[0])),
       ),
-      true,
     );
   });
 
-  test('processTask without a lock store is RESIZE_LOCKS_REQUIRED', async () => {
-    let loads = 0;
-    const deps = processorDeps(undefined);
-    deps.media = fakeMedia({
-      load: async () => {
-        loads++;
-        return mediaDoc();
-      },
-    });
-    await assert.rejects(
-      () =>
-        new Processor(deps).processTask(task({ previews: [variant()] }), {
-          workerLockTtlMs: 1000,
-        }),
-      (err: unknown) =>
-        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
-    );
-    assert.equal(loads, 0);
+  test('lockKeys exports only gateKey', async () => {
+    assert.deepEqual(Object.keys(await import('./lockKeys.ts')), ['gateKey']);
   });
 
   test('notify maps task events to their observers with ctx {}', async () => {
-    const deps = processorDeps(memoryLocks());
+    const deps = processorDeps();
     const seen: unknown[][] = [];
     deps.hooks.add('afterTaskComplete', (...args) => {
       seen.push(['afterTaskComplete', ...args]);
@@ -469,59 +469,6 @@ describe('Processor', () => {
       ['onTaskFailed', task(), err, {}],
       ['onTaskDeadLettered', task(), err, {}],
     ]);
-  });
-
-  test('holdFailedCooldown re-takes every dispatch lock of the task for ttlMs and never rejects', async () => {
-    const calls: unknown[][] = [];
-    const recorder: LockStore = {
-      acquire: async (key, owner, ttlMs) => {
-        calls.push(['acquire', key, owner, ttlMs]);
-        return true;
-      },
-      extend: async () => true,
-      release: async (key, owner) => {
-        calls.push(['release', key, owner]);
-        return true;
-      },
-    };
-    // Two copies of one variant: one lock.
-    const dead = task({ previews: [variant(), variant()] });
-    await new Processor(processorDeps(recorder)).holdFailedCooldown(
-      dead,
-      600_000,
-    );
-    const key = 'resize_dispatch:m1:default:default:20x20:jpeg:none';
-    assert.deepEqual(calls, [
-      ['release', key, 'resize:dispatch'],
-      ['acquire', key, 'resize:dispatch', 600_000],
-    ]);
-
-    const errors: unknown[][] = [];
-    const deps = processorDeps({
-      acquire: async () => true,
-      extend: async () => true,
-      release: () => {
-        throw new Error('lock store down');
-      },
-    });
-    deps.logger = {
-      info() {},
-      warn() {},
-      error(...a: unknown[]) {
-        errors.push(a);
-      },
-    };
-    const processor = new Processor(deps);
-    await processor.holdFailedCooldown(dead, 600_000);
-    // A malformed task payload is logged too.
-    await processor.holdFailedCooldown(task({ previews: null as never }), 1);
-    assert.deepEqual(
-      errors.map((a) => String(a[0])),
-      [
-        `resize worker: holding the dead-letter cooldown lock ${key} failed`,
-        'resize worker: the dead-letter cooldown of task t1 failed',
-      ],
-    );
   });
 
   test('processorOf() is RESIZE_NOT_READY until ready(); the Resizer has no public processor', async () => {
@@ -761,7 +708,7 @@ describe('processTask — source handling', () => {
 // ---------------------------------------------------------------------------
 
 describe('processTask — variants', () => {
-  test('skips an existing preview and releases its dispatch lock', async () => {
+  test('skips an existing preview', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const existing = {
@@ -773,24 +720,17 @@ describe('processTask — variants', () => {
     const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({ previews: [existing] }),
     );
-    const { locks, released } = makeLocks(true);
     new FrameworkResizer({
       storage,
       media: mediaStore,
-      locks,
+      locks: makeLocks().locks,
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
-    assert.deepEqual(released, [
-      {
-        key: 'resize_dispatch:m1:default:default:20x20:jpeg:none',
-        owner: 'resize:dispatch',
-      },
-    ]);
   });
 
-  test('renders the rest of a task and releases the dispatch lock of its one stored preview', async () => {
+  test('renders only the previews of a task that are not stored yet', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const existing = {
@@ -800,114 +740,16 @@ describe('processTask — variants', () => {
       contentType: 'image/jpeg',
     } as unknown as Preview;
     const { mediaStore } = makeMediaStore(mediaDoc({ previews: [existing] }));
-    const { locks, acquired, released } = makeLocks(true);
-    new FrameworkResizer({ storage, media: mediaStore, locks });
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+    });
     await processTask(
       task({ previews: [variant(), variant({ format: 'webp' })] }),
     );
     assert.equal(uploads.length, 1);
     assert.equal(uploads[0].contentType, 'image/webp');
-    const stored = 'default:default:20x20:jpeg:none';
-    assert.ok(
-      !acquired.some(({ key }) => key === `resize_worker:m1:${stored}`),
-    );
-    assert.deepEqual(
-      released.filter(({ key }) => key.endsWith(stored)),
-      [{ key: `resize_dispatch:m1:${stored}`, owner: 'resize:dispatch' }],
-    );
-  });
-
-  test('worker lock not acquired → variant skipped, still missing, not persisted', async () => {
-    installApp();
-    const { storage, uploads } = makeStorage(redPng);
-    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    const { locks, acquired } = makeLocks(false); // acquire always fails
-    new FrameworkResizer({
-      storage,
-      media: mediaStore,
-      locks,
-    });
-    await assert.rejects(
-      () => processTask(task({ previews: [variant()] })),
-      /incomplete/,
-    );
-    assert.deepEqual(keysOf(acquired), [
-      'resize_worker:m1:default:default:20x20:jpeg:none',
-    ]);
-    assert.equal(uploads.length, 0);
-    assert.equal(appendCalls.length, 0);
-  });
-
-  test('a worker lock is released with the owner that took it; dispatch locks with resize:dispatch', async () => {
-    installApp();
-    const { storage } = makeStorage(redPng);
-    const { mediaStore } = makeMediaStore(mediaDoc());
-    const { locks, acquired, released } = makeLocks(true);
-    new FrameworkResizer({ storage, media: mediaStore, locks });
-    await processTask(task({ previews: [variant()] }));
-    const workerKey = 'resize_worker:m1:default:default:20x20:jpeg:none';
-    const worker = acquired.find(({ key }) => key === workerKey);
-    assert.ok(worker);
-    assert.match(worker.owner, /^[0-9a-f]{32}$/);
-    assert.deepEqual(
-      released.find(({ key }) => key === workerKey),
-      { key: workerKey, owner: worker.owner },
-    );
-    assert.deepEqual(
-      released.find(({ key }) => key.startsWith('resize_dispatch:')),
-      {
-        key: 'resize_dispatch:m1:default:default:20x20:jpeg:none',
-        owner: 'resize:dispatch',
-      },
-    );
-  });
-
-  test('a rejecting worker-lock acquire skips only that variant; others generate + persist + release', async () => {
-    installApp();
-    const { storage, uploads } = makeStorage(redPng);
-    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    const released: string[] = [];
-    const locks: LockStore = {
-      // The webp worker-lock acquire REJECTS — treated exactly like a not-acquired lock: skip the
-      // variant (leave it missing), never reject the pool or skip persist/finally. The jpeg variant
-      // is unaffected: generated, persisted, and its locks released.
-      acquire: async (key: string) => {
-        if (key === 'resize_worker:m1:default:default:20x20:webp:none') {
-          throw new Error('lock backend down');
-        }
-        return true;
-      },
-      extend: async () => true,
-      release: async (key: string) => {
-        released.push(key);
-        return true;
-      },
-    };
-    new FrameworkResizer({
-      storage,
-      media: mediaStore,
-      locks,
-    });
-    await assert.rejects(
-      () =>
-        processTask(
-          task({ previews: [variant(), variant({ format: 'webp' })] }),
-        ),
-      /incomplete/,
-    );
-    assert.equal(uploads.length, 1);
-    assert.equal(uploads[0].key.split('.').pop(), 'jpeg');
-    assert.equal(appendCalls.length, 1);
-    assert.deepEqual(
-      appendCalls[0].previews.map((p) => p.format),
-      ['jpeg'],
-    );
-    assert.ok(
-      released.includes('resize_worker:m1:default:default:20x20:jpeg:none'),
-    );
-    assert.ok(
-      released.includes('resize_dispatch:m1:default:default:20x20:jpeg:none'),
-    );
   });
 
   test('variantSteps receive { variant } (with filters) and run in registration order', async () => {
@@ -1201,7 +1043,7 @@ describe('processTask — persistence & failure handling', () => {
     assert.equal(fired.length, 2);
   });
 
-  test('poison variant with zero successes → processTask THROWS and locks are released', async () => {
+  test('poison variant with zero successes → processTask THROWS', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const pipeline: Pipeline = {
@@ -1212,11 +1054,10 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    const { locks, released } = makeLocks(true);
     new FrameworkResizer({
       storage,
       media: mediaStore,
-      locks,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await assert.rejects(
@@ -1225,11 +1066,6 @@ describe('processTask — persistence & failure handling', () => {
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
-    // both the worker lock and the dispatch lock for the processed variant are released
-    assert.deepEqual(keysOf(released).sort(), [
-      'resize_dispatch:m1:default:default:20x20:jpeg:none',
-      'resize_worker:m1:default:default:20x20:jpeg:none',
-    ]);
   });
 
   test('partial success persists the good preview but throws so the task is retried', async () => {
@@ -1321,10 +1157,9 @@ describe('processTask — persistence & failure handling', () => {
     );
   });
 
-  test('a worker-lock loser is complete only after a concurrent preview becomes visible', async () => {
+  test('a variant that fails here is covered when a concurrent worker running the same task stored it', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const media = mediaDoc();
     let loads = 0;
     const concurrent = {
       storageRef: { key: 'concurrent.jpg' },
@@ -1332,23 +1167,31 @@ describe('processTask — persistence & failure handling', () => {
       sizeKey: '20x20',
       format: 'jpeg' as const,
     };
+    // A fresh document per read: the first has no previews, later ones the other worker's row.
     const mediaStore = fakeMedia({
       load: async () => {
         loads++;
-        if (loads >= 2) {
-          media.previews = [concurrent];
-        }
-        return media;
+        return mediaDoc({ previews: loads >= 2 ? [concurrent] : [] });
       },
-      appendPreviews: async (_mediaId, previews) => previews,
     });
     new FrameworkResizer({
       storage,
       media: mediaStore,
-      locks: makeLocks(false).locks,
+      locks: makeLocks().locks,
+      pipelines: {
+        default: {
+          variantSteps: [
+            async () => {
+              throw new Error('encoder failure');
+            },
+          ],
+        },
+      },
     });
+    // The re-read after rendering sees the other worker's row: the task is complete.
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
+    assert.equal(loads, 2);
   });
 
   test('deduplicates malformed task payloads by preview identity', async () => {
@@ -1939,11 +1782,10 @@ describe('unknown pipeline', () => {
     installApp();
     const { storage, uploads, downloads } = countingStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
-    const { locks, acquired } = makeLocks(true);
     new FrameworkResizer({
       storage,
       media: mediaStore,
-      locks,
+      locks: makeLocks().locks,
       pipelines: { watermark: {} },
     });
     await assert.rejects(
@@ -1954,7 +1796,6 @@ describe('unknown pipeline', () => {
     assert.equal(downloads(), 0);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
-    assert.deepEqual(acquired, []);
   });
 
   test('generate() with an unregistered pipeline throws before download', async () => {
@@ -2941,11 +2782,10 @@ describe('SVG rendering', () => {
     installApp({ limits: { processingTimeoutSeconds: 1 } });
     const { storage, uploads } = makeStorage(heavySvg);
     const { mediaStore, appendCalls } = makeMediaStore(svgDoc());
-    const { locks, acquired } = makeLocks(true);
     new FrameworkResizer({
       storage,
       media: mediaStore,
-      locks,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant(), fitVariant] })),
@@ -2956,7 +2796,6 @@ describe('SVG rendering', () => {
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
-    assert.deepEqual(acquired, []);
   });
 
   /** Red, green and blue of the pixel at x, y. */
@@ -3557,9 +3396,13 @@ describe('a source smaller than the box', () => {
 // runResizeWorker
 // ---------------------------------------------------------------------------
 
-// Stop idle test queues deterministically after their queued work has been handled.
-function observedQueue(onIdle: () => void = () => process.emit('SIGTERM')) {
-  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 1 } });
+// Stop idle test queues deterministically after their queued work has been handled. A test whose
+// unserved task must fail, not be given back, passes PlainTaskQueue (a queue without release).
+function observedQueue(
+  onIdle: () => void = () => process.emit('SIGTERM'),
+  Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
+) {
+  const tasks = new Queue({ timing: { idlePollMs: 1 } });
   const claimedQueues: string[] = [];
   const claim = tasks.claim.bind(tasks);
   tasks.claim = async (queue, leaseMs) => {
@@ -3573,9 +3416,12 @@ function observedQueue(onIdle: () => void = () => process.emit('SIGTERM')) {
   return { tasks, claimedQueues };
 }
 
-async function addTask(tasks: MemoryTaskQueue, over: Partial<NewTask> = {}) {
-  const { taskId: _taskId, ...payload } = task();
-  await tasks.add({ ...payload, requestKey: JSON.stringify(over), ...over });
+async function addTask(
+  tasks: MemoryTaskQueue | PlainTaskQueue,
+  over: Partial<NewTask> = {},
+) {
+  const { taskId: _taskId, attempts: _attempts, ...payload } = task();
+  await tasks.add({ ...payload, ...over });
 }
 
 describe('runResizeWorker', () => {
@@ -3695,7 +3541,7 @@ describe('runResizeWorker', () => {
 
 describe('one worker serves every Resizer', () => {
   function register(
-    tasks: MemoryTaskQueue,
+    tasks: MemoryTaskQueue | PlainTaskQueue,
     name = 'default',
     media = fakeMedia(),
   ) {
@@ -3734,7 +3580,7 @@ describe('one worker serves every Resizer', () => {
     const { tasks, claimedQueues } = observedQueue();
     register(tasks);
     await addTask(tasks);
-    await addTask(tasks, { queue: 'bulk' });
+    await addTask(tasks, { queue: 'bulk', mediaId: 'm2' });
     await runResizeWorker({ queue: 'bulk' });
     assert.deepEqual(claimedQueues, ['bulk', 'bulk']);
     assert.deepEqual(
@@ -3797,49 +3643,58 @@ describe('one worker serves every Resizer', () => {
     );
   });
 
-  test('a loop that fails stops the other loops, and its error rejects the worker', {
+  test('a throwing logger does not stop the loop', {
     timeout: 5000,
   }, async () => {
     installApp();
-    let siblingAborted = false;
-    const sibling = new MemoryTaskQueue();
-    sibling.claim = (_queue, _leaseMs, signal) =>
-      new Promise((_resolve, reject) => {
-        signal?.addEventListener(
-          'abort',
-          () => {
-            siblingAborted = true;
-            reject(new Error('aborted'));
-          },
-          { once: true },
-        );
-      });
-    register(sibling);
-    // A failing claim is retried, but the loop logs it first, and the worker's logger is host
-    // code: one that throws fails this loop while it runs. This relies on that claim-error log line
-    // in Consumer.run being unguarded; if it is ever wrapped (e.g. in logNeverThrow), this test
-    // needs a new trigger, or it only times out.
-    const failing = new MemoryTaskQueue();
-    failing.claim = async () => {
-      throw new Error('queue unreachable');
+    // Each message the worker's logger refuses falls back to the console, muted here.
+    const consoleError = mock.method(console, 'error', () => {});
+    const consoleInfo = mock.method(console, 'info', () => {});
+    const failing = new MemoryTaskQueue({ timing: { idlePollMs: 1 } });
+    const claim = failing.claim.bind(failing);
+    let claims = 0;
+    failing.claim = async (...args: Parameters<MemoryTaskQueue['claim']>) => {
+      claims += 1;
+      if (claims === 1) {
+        throw new Error('queue unreachable');
+      }
+      return claim(...args);
     };
-    register(failing, 'listings');
-    const logSinkDown = new Error('log sink down');
-    await assert.rejects(
-      () =>
-        runWorker({
-          signal: new AbortController().signal,
-          logger: {
-            info() {},
-            warn() {},
-            error() {
-              throw logSinkDown;
-            },
-          },
-        }),
-      (err: unknown) => err === logSinkDown,
+    const sibling = new MemoryTaskQueue({ timing: { idlePollMs: 1 } });
+    register(failing);
+    register(sibling, 'listings');
+    await addTask(failing);
+    await addTask(sibling, { resizer: 'listings' });
+    const rows = [...failing.rows, ...sibling.rows];
+    const sinkDown = () => {
+      throw new Error('log sink down');
+    };
+    const controller = new AbortController();
+    const outcome = runWorker({
+      signal: controller.signal,
+      logger: { info: sinkDown, warn: sinkDown, error: sinkDown },
+    }).then(
+      () => 'resolved',
+      (err: unknown) => err,
     );
-    assert.equal(siblingAborted, true);
+    const until = Date.now() + 4000;
+    try {
+      while (!rows.every((row) => row.status === 'completed')) {
+        assert.ok(Date.now() < until, 'both tasks were completed');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      controller.abort();
+    }
+    assert.equal(await outcome, 'resolved');
+    const said = (calls: typeof consoleError.mock.calls) =>
+      calls.map((call) => String(call.arguments[0]));
+    assert.ok(
+      said(consoleError.mock.calls).some((m) =>
+        m.includes('claiming a task failed'),
+      ),
+    );
+    assert.ok(said(consoleInfo.mock.calls).includes('resize worker stopped'));
   });
 
   test('a sibling claim aborted during shutdown does not reject the worker', async () => {
@@ -3917,34 +3772,20 @@ describe('one worker serves every Resizer', () => {
     );
   });
 
-  test('a task uses its owning Resizer locks and the delivering queue lock TTL', async () => {
+  test("a task renders without calling its Resizer's lock store", async () => {
     installApp();
-    const own = makeLocks();
-    const ttls: number[] = [];
+    const { storage, uploads } = makeStorage(redPng);
+    const { locks, acquired, released } = makeLocks();
     new FrameworkResizer({
-      storage: makeStorage(redPng).storage,
-      tasks: new MemoryTaskQueue(),
+      storage,
+      tasks: new PlainTaskQueue(),
       media: fakeMedia({ load: async () => mediaDoc() }),
-      locks: {
-        acquire: async (key, owner, ttlMs) => {
-          ttls.push(ttlMs);
-          return own.locks.acquire(key, owner, ttlMs);
-        },
-        extend: own.locks.extend,
-        release: own.locks.release,
-      },
+      locks,
     });
-    await processTask(
-      task({ previews: [variant()] }),
-      undefined,
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 2000 } },
-      }),
-    );
-    assert.deepEqual(keysOf(own.acquired), [
-      'resize_worker:m1:default:default:20x20:jpeg:none',
-    ]);
-    assert.deepEqual(ttls, [2000]);
+    await processTask(task({ previews: [variant()] }));
+    assert.equal(uploads.length, 1);
+    assert.deepEqual(acquired, []);
+    assert.deepEqual(released, []);
   });
 
   test('the worker verifies each Resizer (a bad lazy config fails before leasing)', async () => {
@@ -4030,7 +3871,7 @@ describe('one worker serves every Resizer', () => {
 
   test('an event for an unknown Resizer is logged, not thrown', async () => {
     const { logs } = installApp({ worker: { enabled: true } });
-    const { tasks } = observedQueue();
+    const { tasks } = observedQueue(undefined, PlainTaskQueue);
     register(tasks);
     await addTask(tasks, { resizer: 'ghost' });
     await runResizeWorker();
@@ -4044,29 +3885,6 @@ describe('one worker serves every Resizer', () => {
       tasks.rows[0].error ?? '',
       /Resizer 'ghost' is not served by this worker/,
     );
-  });
-
-  test('a Resizer without a lock store cannot process a queued task', async () => {
-    installApp();
-    const { storage, uploads } = makeStorage(redPng);
-    let loads = 0;
-    // Eager only (no task queue, no locks), yet another Resizer's queue hands it a task.
-    new Resizer({
-      storage,
-      media: fakeMedia({
-        load: async () => {
-          loads++;
-          return mediaDoc();
-        },
-      }),
-    });
-    await assert.rejects(
-      () => processTask(task({ previews: [variant()] })),
-      (err: unknown) =>
-        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
-    );
-    assert.equal(loads, 0);
-    assert.equal(uploads.length, 0);
   });
 
   test('a task for an unregistered Resizer fails with RESIZE_NO_RESIZER', async () => {
@@ -4184,35 +4002,26 @@ describe('scoped generation', () => {
     assert.equal(uploads.length, 1);
   });
 
-  test('worker lock keys carry the pipeline', async () => {
-    installApp();
-    const { storage } = makeStorage(redPng);
-    const media = mediaDoc();
-    const { mediaStore } = makeMediaStore(media);
-    const { locks, acquired } = makeLocks(true);
-    new FrameworkResizer({
-      storage,
-      media: mediaStore,
-      locks,
-      pipelines: { watermark: {} },
-    });
-    await processTask(task({ pipeline: 'watermark', previews: [variant()] }));
-    assert.ok(acquired.some(({ key }) => key.includes(':watermark:')));
-  });
-
   test('a default preview does not count as coverage for a watermark task', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
     // The reloaded media has only the default rendering of the requested variant.
     const media = mediaDoc({ previews: [cleanPreview] });
     const { mediaStore } = makeMediaStore(media);
-    // The worker lock for the watermark variant is held elsewhere, so nothing is generated.
-    const { locks } = makeLocks(false);
+    // The watermark variant fails here, so only the default row could cover it.
     new FrameworkResizer({
       storage,
       media: mediaStore,
-      locks,
-      pipelines: { watermark: {} },
+      locks: makeLocks().locks,
+      pipelines: {
+        watermark: {
+          variantSteps: [
+            async () => {
+              throw new Error('watermark failed');
+            },
+          ],
+        },
+      },
     });
     await assert.rejects(
       () => processTask(task({ pipeline: 'watermark', previews: [variant()] })),

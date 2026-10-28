@@ -1,8 +1,9 @@
 // The worker's task handler (processTask) inside the worker loop: a media error thrown while
 // reading the source reaches the retry policy unwrapped, so an unusable source is dead-lettered
 // on its first delivery instead of being downloaded and decoded again on every retry. After a
-// dead-letter the worker holds the variants' dispatch locks for a cooldown, so reads stop queueing
-// the same failing work. runWorker serves only the Resizers it starts with.
+// dead-letter the gate of its media, pipeline and queue is held for the cooldown, so reads stop
+// queueing the same failing work. runWorker serves only the Resizers it starts with, claims only their tasks
+// on a task queue that filters claims, and runs each task with its own Resizer's coordination.
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
@@ -17,7 +18,9 @@ import {
   ResizeMediaError,
   ResizeSecurityError,
   ResizeSetupError,
+  ResizeStorageError,
 } from './errors.ts';
+import { gateKey } from './lockKeys.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -25,13 +28,16 @@ import {
 } from './resizer.ts';
 import { consume } from './testHelpers/consume.ts';
 import {
+  clockLocks,
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  PlainTaskQueue,
   ReleasingTaskQueue,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
+  CoordinationOptions,
   MediaLike,
   Preview,
   QueueTimingOptions,
@@ -96,7 +102,6 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
         requestedHeight: 10,
       },
     ],
-    requestKey: 'k1',
   });
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -104,7 +109,7 @@ test('a source over limits.sourcePixels is dead-lettered on its first delivery',
   await consume(tasks, {
     queue: 'default',
     signal: stop.signal,
-    handle: (task, opts) => processTask(task, opts, tasks),
+    handle: (task, opts) => processTask(task, opts),
     onEvent: (event, task, error) => {
       events.push({ event, task, error });
       stop.abort();
@@ -176,7 +181,6 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
         requestedHeight: 10,
       },
     ],
-    requestKey: 'svg-geometry',
   });
   const events: { event: TaskEvent; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -185,7 +189,7 @@ test('a stored SVG with unsupported dimensions is dead-lettered on its first del
     await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
-      handle: (task, opts) => processTask(task, opts, tasks),
+      handle: (task, opts) => processTask(task, opts),
       onEvent: (event, _task, error) => {
         events.push({ event, error });
         stop.abort();
@@ -218,7 +222,7 @@ async function firstEvent(tasks: MemoryTaskQueue) {
     await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
-      handle: (task, opts) => processTask(task, opts, tasks),
+      handle: (task, opts) => processTask(task, opts),
       onEvent: (event, _task, error) => {
         events.push({ event, error });
         stop.abort();
@@ -270,7 +274,6 @@ test('a storage.download security refusal is dead-lettered on its first delivery
     mediaId: 'm1',
     pipeline: 'default',
     previews: [webp10],
-    requestKey: 'security',
   });
   const events = await firstEvent(tasks);
   assert.deepEqual(
@@ -338,7 +341,6 @@ test('a variant error with retryable: false fails only its variant; the task fai
         requestedHeight: 20,
       },
     ],
-    requestKey: 'variant-refused',
   });
   const events = await firstEvent(tasks);
   assert.deepEqual(
@@ -385,7 +387,6 @@ const taskOf = (resizer: string) => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [{ sizeKey: '10x10', format: 'webp' }],
-  requestKey: `${resizer}-request`,
 });
 
 /** Run the worker until `done()` (or 5 s), then stop it and wait for it to return. */
@@ -395,9 +396,17 @@ async function workUntil(
 ): Promise<void> {
   const stop = new AbortController();
   const working = runWorker({ ...opts, signal: stop.signal });
+  // A worker that fails before the wait ends (refused at start, say) fails the test with its error.
+  let failed: { error: unknown } | undefined;
+  working.catch((error: unknown) => {
+    failed = { error };
+  });
   const until = Date.now() + 5000;
   try {
     while (!done()) {
+      if (failed) {
+        throw failed.error;
+      }
       assert.ok(
         Date.now() < until,
         'the worker never reached the expected state',
@@ -437,8 +446,8 @@ test('a task of a Resizer the worker does not serve is given back, never run or 
     return fakeMedia();
   });
   // Two tasks of 'b', older than a's, so they are claimed first.
-  await tasks.add({ ...taskOf('b'), mediaId: 'b1', requestKey: 'b1' });
-  await tasks.add({ ...taskOf('b'), mediaId: 'b2', requestKey: 'b2' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b2' });
   await tasks.add(taskOf('a'));
   const [b1, b2, aRow] = tasks.rows;
   const errors: unknown[][] = [];
@@ -468,14 +477,14 @@ test('a task of a Resizer the worker does not serve is given back, never run or 
 });
 
 test('runWorker({ resizers }) serves only the given Resizers; on a task queue without release, a task of another fails with RESIZE_NO_RESIZER', async () => {
-  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
   const a = queuedResizer('a', tasks);
   // Not listed, on its own task queue: it does not share a's queue, so the worker may start.
   queuedResizer('c', new MemoryTaskQueue());
   // Two tasks of Resizer 'b', which only another process constructs. They are the older ones, so
   // they are claimed first.
-  await tasks.add({ ...taskOf('b'), mediaId: 'b1', requestKey: 'b1' });
-  await tasks.add({ ...taskOf('b'), mediaId: 'b2', requestKey: 'b2' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add({ ...taskOf('b'), mediaId: 'b2' });
   await tasks.add(taskOf('a'));
   const [b1, b2, aRow] = tasks.rows;
   const errors: unknown[][] = [];
@@ -521,6 +530,67 @@ test('runWorker accepts a Resizer listed twice', async () => {
   });
 });
 
+test('task observers and their resize:<hook> events carry attempts', async () => {
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+  });
+  const emitted: { name: string; args: unknown[] }[] = [];
+  let downloads = 0;
+  const resizer = new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    events: {
+      emit: (name, ...args) => {
+        emitted.push({ name, args });
+      },
+    },
+    storage: {
+      download: async () => {
+        downloads += 1;
+        if (downloads === 1) {
+          throw new ResizeStorageError('resize: the bucket did not answer');
+        }
+        return png;
+      },
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({
+      load: async () => ({
+        id: 'm1',
+        original: { storageRef: { key: 'o' } },
+        previews: [],
+      }),
+    }),
+    locks: memoryLocks(),
+    tasks,
+  });
+  const failed: number[] = [];
+  const completed: number[] = [];
+  resizer.hook('onTaskFailed', (task) => {
+    failed.push(task.attempts);
+  });
+  resizer.hook('afterTaskComplete', (task) => {
+    completed.push(task.attempts);
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [webp10],
+  });
+  await workUntil(
+    { logger: silent, resizers: [resizer] },
+    () => completed.length === 1,
+  );
+  assert.deepEqual(failed, [1]);
+  assert.deepEqual(completed, [2]);
+  const onFailed = emitted.find(({ name }) => name === 'resize:onTaskFailed');
+  assert.ok(onFailed, 'the failure is mirrored on the event bus');
+  assert.equal((onFailed.args[0] as LeasedTask).attempts, 1);
+});
+
 test('two different Resizers listed under one name are RESIZE_DUPLICATE_RESIZER', async () => {
   const tasks = new MemoryTaskQueue();
   const first = queuedResizer('x', tasks);
@@ -541,6 +611,8 @@ test('two different Resizers listed under one name are RESIZE_DUPLICATE_RESIZER'
   );
 });
 
+// On a task queue that does not filter claims (PlainTaskQueue, the SQS shape), the worker would
+// claim the unlisted Resizers' tasks.
 describe('a worker that serves only some of the Resizers on a task queue', () => {
   const unlisted = (err: unknown, names: RegExp) =>
     err instanceof ResizeSetupError &&
@@ -549,7 +621,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
     names.test(err.message);
 
   test('is refused at start, naming the queue and the unlisted Resizers, before any claim', async () => {
-    const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+    const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
     let claims = 0;
     tasks.claim = async () => {
       claims += 1;
@@ -572,7 +644,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
   });
 
   test('a Resizer whose task queue is a function that has not run yet is loaded and compared', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     const a = queuedResizer('a', tasks);
     queuedResizer('lazy', async () => tasks);
     await assert.rejects(
@@ -601,7 +673,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
     });
 
   test('a Resizer whose other parts fail to load is still compared by its task queue', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     const a = queuedResizer('a', tasks);
     // The storage fails first, while the task queue is still loading.
     storageDown('half', async () => {
@@ -620,7 +692,7 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
   });
 
   test('a Resizer whose task queue cannot be loaded fails startup: it may share one', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     let claims = 0;
     tasks.claim = async () => {
       claims += 1;
@@ -652,9 +724,9 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
   });
 
   test('an unserved Resizer on its own task queue, or eager-only, lets the worker start', async () => {
-    const tasks = new MemoryTaskQueue();
+    const tasks = new PlainTaskQueue();
     const a = queuedResizer('a', tasks);
-    storageDown('own', async () => new MemoryTaskQueue());
+    storageDown('own', async () => new PlainTaskQueue());
     storageDown('eager', undefined);
     await runWorker({
       signal: AbortSignal.abort(),
@@ -662,6 +734,259 @@ describe('a worker that serves only some of the Resizers on a task queue', () =>
       resizers: [a],
     });
   });
+});
+
+test('on a task queue that filters claims, a worker starts beside unlisted Resizers and never claims their tasks', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  // Every task the worker claims, recorded: `pending` with no attempts would also describe a task
+  // that was claimed and then given back, since a give-back does not count the delivery.
+  const claimed: string[] = [];
+  const claim = tasks.claim.bind(tasks);
+  tasks.claim = async (queue, leaseMs, signal, opts) => {
+    const task = await claim(queue, leaseMs, signal, opts);
+    if (task) {
+      claimed.push(task.taskId);
+    }
+    return task;
+  };
+  const a = queuedResizer('a', tasks);
+  queuedResizer('b', tasks);
+  // b's task is the older one, so a queue that ignored the filter would hand it out first.
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add(taskOf('a'));
+  const [bRow, aRow] = tasks.rows;
+  await workUntil(
+    { logger: silent, resizers: [a] },
+    () => aRow.status === 'completed',
+  );
+  assert.deepEqual(claimed, [aRow.id]);
+  assert.equal(bRow.status, 'pending');
+  assert.equal(bRow.attempts, 0);
+  // Still first: a give-back would have moved it behind a's task.
+  assert.equal(tasks.rows[0], bRow);
+});
+
+test('a task queue that filters claims is not given accepts: a task of another Resizer it hands out anyway fails with RESIZE_NO_RESIZER', async () => {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+  // A broken queue that ignores the filter.
+  const claim = tasks.claim.bind(tasks);
+  tasks.claim = (queue, leaseMs, signal) => claim(queue, leaseMs, signal);
+  const a = queuedResizer('a', tasks);
+  await tasks.add({ ...taskOf('b'), mediaId: 'b1' });
+  await tasks.add(taskOf('a'));
+  const [bRow, aRow] = tasks.rows;
+  const errors: unknown[][] = [];
+  await workUntil(
+    {
+      logger: { ...silent, error: (...args) => errors.push(args) },
+      resizers: [a],
+    },
+    // Failed, not given back: a release would leave its attempts at 0.
+    () =>
+      aRow.status === 'completed' &&
+      bRow.status === 'pending' &&
+      bRow.attempts === 1,
+  );
+  assert.match(bRow.error ?? '', /Resizer 'b' is not served by this worker/);
+  assert.ok(
+    errors.some((args) =>
+      /although it filters claims, so its tasks fail with RESIZE_NO_RESIZER/.test(
+        String(args[0]),
+      ),
+    ),
+  );
+});
+
+test('when every consumed task queue filters claims, an unserved Resizer whose task queue cannot be loaded does not stop the start', async () => {
+  const tasks = new MemoryTaskQueue();
+  const a = queuedResizer('a', tasks);
+  queuedResizer('broken', async () => {
+    throw new Error('queue not up');
+  });
+  await runWorker({
+    signal: AbortSignal.abort(),
+    logger: silent,
+    resizers: [a],
+  });
+});
+
+// A Resizer whose every source is over limits.sourcePixels, so each of its tasks is dead-lettered
+// on its first delivery.
+function tooLargeResizer(
+  name: string,
+  tasks: ResizerOptions['tasks'],
+  over: Pick<ResizerOptions, 'coordination' | 'locks'>,
+): Resizer {
+  return new Resizer({
+    name,
+    config: makeImageConfig({
+      formats: ['webp'],
+      limits: { sourcePixels: 100 },
+    }),
+    coordination: over.coordination,
+    logger: silent,
+    storage: {
+      download: async () => png,
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({
+      load: async (id) => ({
+        id,
+        original: { storageRef: { key: `o-${id}` } },
+        previews: [],
+      }),
+    }),
+    locks: over.locks ?? memoryLocks(),
+    tasks,
+  });
+}
+
+test("each dead-letter gets the cooldown of the task's own Resizer", async () => {
+  const tasks = new MemoryTaskQueue({
+    now: () => 0,
+    timing: { idlePollMs: 5 },
+  });
+  const a = tooLargeResizer('a', tasks, {
+    coordination: { cooldownMs: 30_000 },
+  });
+  const b = tooLargeResizer('b', tasks, {
+    coordination: { cooldownMs: 90_000 },
+  });
+  await tasks.add({ ...taskOf('a'), previews: [webp10] });
+  await tasks.add({ ...taskOf('b'), previews: [webp10] });
+  const [aRow, bRow] = tasks.rows;
+  await workUntil(
+    { logger: silent, resizers: [a, b] },
+    () => aRow.status === 'dead' && bRow.status === 'dead',
+  );
+  assert.equal(aRow.cooldownUntil, 30_000);
+  assert.equal(bRow.cooldownUntil, 90_000);
+});
+
+test("on a queue without gatesByTask, the gate lock lives in the task's Resizer's lock store", async () => {
+  const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
+  const locks = clockLocks();
+  const resizer = tooLargeResizer('default', tasks, {
+    coordination: { cooldownMs: 30_000 },
+    locks,
+  });
+  const deadLettered: LeasedTask[] = [];
+  resizer.hook('onTaskDeadLettered', (task) => {
+    deadLettered.push(task);
+  });
+  // The lock the Dispatcher takes when it queues the task, under the owner the task carries.
+  const key = gateKey('default', 'default', 'm1', 'default');
+  assert.equal(await locks.acquire(key, 'g1', 60_000), true);
+  await tasks.add({
+    ...taskOf('default'),
+    previews: [webp10],
+    gateOwner: 'g1',
+  });
+  await workUntil(
+    { logger: silent, resizers: [resizer] },
+    () => deadLettered.length === 1,
+  );
+  const held = locks.entry(key);
+  assert.equal(held?.owner, 'g1');
+  const left = (held?.expiresAt ?? 0) - Date.now();
+  assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
+});
+
+test('on a queue without gatesByTask, the task of a Resizer the worker does not serve touches no lock, even with a gateOwner', async () => {
+  const tasks = new PlainTaskQueue({ timing: { idlePollMs: 5 } });
+  // One lock store for both Resizers, recording every call the worker makes.
+  const store = clockLocks();
+  const calls: string[] = [];
+  const locks: LockStore = {
+    acquire: (key, owner, ttlMs) => {
+      calls.push(`acquire ${key}`);
+      return store.acquire(key, owner, ttlMs);
+    },
+    extend: (key, owner, ttlMs) => {
+      calls.push(`extend ${key}`);
+      return store.extend(key, owner, ttlMs);
+    },
+    release: (key, owner) => {
+      calls.push(`release ${key}`);
+      return store.release(key, owner);
+    },
+  };
+  const withLocks = (name: string) =>
+    new Resizer({
+      name,
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => png,
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia({
+        load: async (id) => ({
+          id,
+          original: { storageRef: { key: 'o' } },
+          previews: [],
+        }),
+      }),
+      locks,
+      tasks,
+    });
+  const a = withLocks('a');
+  const aKey = gateKey('a', 'default', 'm1', 'default');
+  const ghostKey = gateKey('ghost', 'default', 'm1', 'default');
+  // The gate locks their Dispatchers took, set in the store directly: `calls` lists the worker's.
+  assert.equal(await store.acquire(ghostKey, 'g-ghost', 60_000), true);
+  assert.equal(await store.acquire(aKey, 'g-a', 60_000), true);
+  const ghostLock = store.entry(ghostKey);
+  // The ghost's task is the older one, so it is claimed first.
+  await tasks.add({ ...taskOf('ghost'), gateOwner: 'g-ghost' });
+  await tasks.add({ ...taskOf('a'), gateOwner: 'g-a' });
+  const [ghostRow, aRow] = tasks.rows;
+  const stop = new AbortController();
+  const working = runWorker({
+    signal: stop.signal,
+    logger: silent,
+    resizers: [a],
+  });
+  // Constructed after the worker took its list, on the same lock store: it is not served.
+  withLocks('ghost');
+  const until = Date.now() + 5000;
+  try {
+    // a's task completed; the ghost's was claimed once and failed (PlainTaskQueue has no release).
+    while (
+      aRow.status !== 'completed' ||
+      ghostRow.attempts === 0 ||
+      ghostRow.status === 'processing'
+    ) {
+      assert.ok(Date.now() < until, 'the tasks were never settled');
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  } catch (err) {
+    // A failed wait still stops the worker, so the test file can exit; the assertion is the error.
+    stop.abort();
+    await working.catch(() => {});
+    throw err;
+  }
+  stop.abort();
+  await working;
+  assert.equal(ghostRow.status, 'pending');
+  assert.equal(ghostRow.attempts, 1);
+  assert.match(
+    ghostRow.error ?? '',
+    /Resizer 'ghost' is not served by this worker/,
+  );
+  assert.deepEqual(
+    calls.filter((call) => call.endsWith(ghostKey)),
+    [],
+    "the ghost's gate lock was never extended or released",
+  );
+  assert.deepEqual(store.entry(ghostKey), ghostLock);
+  // The same store holds the gate lock of a's task: extended while it ran, then released.
+  const aCalls = calls.filter((call) => call.endsWith(aKey));
+  assert.ok(aCalls.includes(`extend ${aKey}`), aCalls.join(', '));
+  assert.equal(aCalls.at(-1), `release ${aKey}`);
+  assert.equal(store.entry(aKey), undefined);
 });
 
 test('a listed Resizer whose ready() rejects makes runWorker reject at startup before any claim', async () => {
@@ -701,17 +1026,20 @@ test('a Resizer whose task queue cannot be used makes runWorker reject at startu
     Pick<ResizerOptions, 'locks'>,
     QueueTimingOptions | object,
     string,
+    typeof MemoryTaskQueue | typeof PlainTaskQueue,
   ][] = [
-    [{}, {}, 'RESIZE_LOCKS_REQUIRED'],
+    // A task queue without gatesByTask needs a lock store for its gate locks.
+    [{}, {}, 'RESIZE_LOCKS_REQUIRED', PlainTaskQueue],
     [
       { locks: memoryLocks() },
       { leaseMs: 0 },
       'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+      MemoryTaskQueue,
     ],
   ];
-  for (const [locks, timing, code] of cases) {
+  for (const [locks, timing, code, Queue] of cases) {
     resetResizerForTests();
-    const tasks = new MemoryTaskQueue({ timing: timing as never });
+    const tasks = new Queue({ timing: timing as never });
     let claims = 0;
     tasks.claim = async () => {
       claims += 1;
@@ -744,73 +1072,28 @@ test('a Resizer whose task queue cannot be used makes runWorker reject at startu
 });
 
 describe('dead-letter cooldown', () => {
-  /**
-   * Locks that expire, on a clock the test moves forward: `clock.ms` is added to real time. Owners
-   * are checked like a real store: an expired lock is taken over by any owner, and `release` or
-   * `extend` by another owner returns false and keeps the lock.
-   */
-  function expiringLocks(clock: { ms: number }) {
-    const held = new Map<string, { owner: string; expiresAt: number }>();
-    const calls: string[] = [];
-    const locks: LockStore & { calls: string[] } = {
-      calls,
-      acquire: async (key, owner, ttlMs) => {
-        calls.push(`acquire ${key} ${ttlMs}`);
-        const now = Date.now() + clock.ms;
-        if ((held.get(key)?.expiresAt ?? 0) > now) {
-          return false;
-        }
-        held.set(key, { owner, expiresAt: now + ttlMs });
-        return true;
-      },
-      extend: async (key, owner, ttlMs) => {
-        const now = Date.now() + clock.ms;
-        const lock = held.get(key);
-        if (!lock || lock.owner !== owner || lock.expiresAt <= now) {
-          return false;
-        }
-        lock.expiresAt = now + ttlMs;
-        return true;
-      },
-      release: async (key, owner) => {
-        calls.push(`release ${key}`);
-        if (held.get(key)?.owner !== owner) {
-          return false;
-        }
-        held.delete(key);
-        return true;
-      },
-    };
-    return locks;
-  }
-
   const size: SizeInput = { width: 10, height: 10 };
 
   // A Resizer whose sources are all over limits.sourcePixels, so every task is dead-lettered on
-  // its first delivery. Dispatch locks last 1 s, the cooldown 10 s.
-  function setup(locks: LockStore, timing: Partial<QueueTimingOptions> = {}) {
-    const tasks = new MemoryTaskQueue({
-      timing: {
-        idlePollMs: 5,
-        lockTtlMs: { dispatch: 1000, worker: 1000, failed: 10_000 },
-        ...timing,
-      },
+  // its first delivery. A test whose unserved task must fail, not be given back, passes
+  // PlainTaskQueue (a queue without release). `extra` sets MemoryTaskQueue's cooldown clock and
+  // the Resizer's coordination.
+  function setup(
+    locks: LockStore | undefined,
+    Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
+    extra: { now?: () => number; coordination?: CoordinationOptions } = {},
+  ) {
+    const tasks = new Queue({
+      timing: { idlePollMs: 5 },
+      ...(extra.now ? { now: extra.now } : {}),
     });
     const docs = new Map<string, MediaLike>();
-    // The Resizer's own errors (its Processor logs the cooldown's lock calls).
-    const resizerErrors: unknown[][] = [];
     const resizer = new Resizer({
       config: makeImageConfig({
         formats: ['webp'],
         limits: { sourcePixels: 100 },
       }),
-      logger: {
-        info() {},
-        warn() {},
-        error: (...args: unknown[]) => {
-          resizerErrors.push(args);
-        },
-      },
+      logger: silent,
       storage: {
         download: async () => png,
         upload: async () => ({ key: 'k' }),
@@ -819,6 +1102,7 @@ describe('dead-letter cooldown', () => {
       media: fakeMedia({ load: async (id) => docs.get(id) ?? null }),
       locks,
       tasks,
+      coordination: extra.coordination,
     });
     const errors: unknown[][] = [];
     const deadLettered: LeasedTask[] = [];
@@ -831,7 +1115,6 @@ describe('dead-letter cooldown', () => {
       tasks,
       resizer,
       errors,
-      resizerErrors,
       deadLettered,
       stop,
       media(id: string): MediaLike {
@@ -848,7 +1131,6 @@ describe('dead-letter cooldown', () => {
       },
       read: (media: MediaLike, sizes: SizeInput[] = [size]) =>
         resizer.resolve({ media, sizes }),
-      queued: () => tasks.added.length,
       // Run the worker until the first dead-letter (or 5 s).
       async work() {
         const timer = setTimeout(() => stop.abort(), 5000);
@@ -864,107 +1146,57 @@ describe('dead-letter cooldown', () => {
     };
   }
 
-  test('after a dead-letter, reads do not queue that variant again until the cooldown ends', async () => {
-    const clock = { ms: 0 };
-    const t = setup(expiringLocks(clock));
+  test('after a dead-letter on a queue that gates by task, reads queue nothing for that media, pipeline and queue until cooldownMs ends', async () => {
+    let now = 0;
+    const t = setup(undefined, MemoryTaskQueue, {
+      now: () => now,
+      coordination: { cooldownMs: 10_000 },
+    });
     const m1 = t.media('m1');
     await t.read(m1);
-    assert.equal(t.queued(), 1);
+    assert.equal(t.tasks.rows.length, 1);
     await t.work();
     assert.equal(t.deadLettered.length, 1);
-    // Past the 1 s dispatch lock, inside the 10 s cooldown.
-    clock.ms = 5000;
+    assert.equal(t.tasks.rows[0].status, 'dead');
+    // Inside the 10 s cooldown the dead task holds the gate of m1 and its pipeline, for every
+    // variant.
+    now = 5000;
     await t.read(m1);
-    assert.equal(t.queued(), 1, 'the dead variant is not queued again');
-    // Another variant of that media, and the same variant of another media, are not held.
     await t.read(m1, [{ width: 20, height: 20 }]);
+    assert.equal(t.tasks.rows.length, 1, 'nothing is queued for m1');
+    // Another media is not held.
     await t.read(t.media('m2'));
-    assert.equal(t.queued(), 3);
-    clock.ms = 10_001;
+    assert.equal(t.tasks.rows.length, 2);
+    now = 10_000;
     await t.read(m1);
-    assert.equal(t.queued(), 4, 'queued again once the cooldown ends');
+    assert.equal(t.tasks.rows.length, 3, 'queued again once the cooldown ends');
   });
 
-  test('a failing lock call is logged; nothing throws and the observer still fires', async () => {
-    const locks = expiringLocks({ ms: 0 });
-    const t = setup(locks);
-    await t.read(t.media('m1'));
-    locks.release = async () => {
-      throw new Error('lock store down');
-    };
+  test('after a dead-letter on a queue without gatesByTask, reads queue nothing for that media, pipeline and queue until cooldownMs ends', async () => {
+    let now = 0;
+    const t = setup(
+      clockLocks(() => now),
+      PlainTaskQueue,
+      { coordination: { cooldownMs: 10_000 } },
+    );
+    const m1 = t.media('m1');
+    await t.read(m1);
+    assert.equal(t.tasks.rows.length, 1);
     await t.work();
     assert.equal(t.deadLettered.length, 1);
-    assert.ok(
-      t.resizerErrors.some((args) => /cooldown/.test(String(args[0]))),
-      "the failed cooldown is logged by the Resizer's logger",
-    );
-  });
-
-  test('the observer does not wait for the cooldown; the worker returns only after it', async () => {
-    const locks = expiringLocks({ ms: 0 });
-    const t = setup(locks);
-    await t.read(t.media('m1'));
-    let openGate!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      openGate = resolve;
-    });
-    let released = false;
-    const release = locks.release;
-    locks.release = async (key, owner) => {
-      await gate;
-      released = true;
-      return release(key, owner);
-    };
-    let returned = false;
-    const working = t.work().then(() => {
-      returned = true;
-    });
-    while (t.deadLettered.length === 0) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-    assert.equal(
-      released,
-      false,
-      'the observer fired before the lock calls ended',
-    );
-    await new Promise((r) => setTimeout(r, 30));
-    assert.equal(
-      returned,
-      false,
-      'the worker waits for the cooldown to be written',
-    );
-    openGate();
-    await working;
-    assert.equal(released, true);
-  });
-
-  test('a dead task of a Resizer unknown in this process takes no lock', async () => {
-    const locks = expiringLocks({ ms: 0 });
-    const t = setup(locks, { maxAttempts: 1 });
-    await t.tasks.add({
-      resizer: 'ghost',
-      queue: 'default',
-      mediaId: 'm1',
-      pipeline: 'default',
-      previews: [{ sizeKey: '10x10', format: 'webp' }],
-      requestKey: 'ghost-request',
-    });
-    const working = t.work();
-    while (t.tasks.rows[0].status !== 'dead') {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-    t.stop.abort();
-    await working;
-    assert.deepEqual(locks.calls, []);
-    assert.ok(
-      t.errors.some((args) =>
-        /Resizer 'ghost' is not served by this worker/.test(String(args[0])),
-      ),
-    );
+    assert.equal(t.tasks.rows[0].status, 'dead');
+    // Inside the 10 s cooldown the gate lock of m1 and its pipeline is held, for every variant.
+    now = 5000;
+    await t.read(m1);
+    await t.read(m1, [{ width: 20, height: 20 }]);
+    assert.equal(t.tasks.rows.length, 1, 'nothing is queued for m1');
+    now = 10_001;
+    await t.read(m1);
+    assert.equal(t.tasks.rows.length, 2, 'queued again once the cooldown ends');
   });
 
   test('a Resizer constructed after the worker started is not served: its task fails with RESIZE_NO_RESIZER and its observers never fire', async () => {
-    const t = setup(expiringLocks({ ms: 0 }));
+    const t = setup(clockLocks(), PlainTaskQueue);
     const working = t.work(); // runWorker has taken its list of Resizers
     // The worker routes tasks and events only among the Resizers it started with.
     let loads = 0;
@@ -982,7 +1214,8 @@ describe('dead-letter cooldown', () => {
     late.hook('onTaskDeadLettered', () => {
       observed.push('dead');
     });
-    const { taskId } = await t.tasks.add(taskOf('late'));
+    const added = await t.tasks.add(taskOf('late'));
+    assert.equal(added.status, 'added');
     const [row] = t.tasks.rows;
     const until = Date.now() + 5000;
     try {
@@ -1010,7 +1243,7 @@ describe('dead-letter cooldown', () => {
     assert.ok(
       t.errors.some((args) =>
         String(args[0]).includes(
-          `failed for task ${taskId} dropped — Resizer 'late' is not served by this worker`,
+          `failed for task ${added.taskId} dropped — Resizer 'late' is not served by this worker`,
         ),
       ),
     );

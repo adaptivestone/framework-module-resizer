@@ -1,6 +1,6 @@
 // Pure identity, catalog + dimension helpers. ONE identity, built one way, used everywhere
-// (read map, dedup, dispatch lock, worker lock), and the one implementation of which stored rows
-// count and which formats have encoder settings. No external deps.
+// (read map, task dedup, one stored row per identity), and the one implementation of which stored
+// rows count and which formats have encoder settings. No external deps.
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import type {
@@ -83,7 +83,7 @@ export function parseSizeKey(key: string): ParsedSizeKey {
 
 // Escape the `|` (pair separator) and `:` (key/value separator) so a filter key/value that
 // contains them cannot forge a boundary — otherwise `{ a: '1|b:2' }` collides with
-// `{ a: 1, b: 2 }` (same identity → cache confusion + lock shadowing). Backslash is escaped
+// `{ a: 1, b: 2 }` (same identity → cache confusion + row shadowing). Backslash is escaped
 // FIRST so the escapes we then add for `|`/`:` are not themselves re-escaped. (03 · §7 review fix)
 function escapeFilterPart(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/:/g, '\\:');
@@ -93,7 +93,7 @@ function escapeFilterPart(s: string): string {
  * Return a JSON-safe filter value with nested object keys in lexical order.
  *
  * Runtime Mongo `Mixed` fields can contain richer values than the public flat
- * filter type. This is shared by queue request keys and preview identities so
+ * filter type. This is shared by queued task payloads and preview identities so
  * they cannot disagree about equivalent nested filter objects.
  */
 export function canonicalizeFilterValue(value: unknown): unknown {
@@ -104,8 +104,8 @@ export function canonicalizeFilterValue(value: unknown): unknown {
     const record = value as Record<string, unknown>;
     const result: Record<string, unknown> = {};
     for (const key of Object.keys(record).sort()) {
-      // JSON.stringify omits undefined object values. The request-key payload
-      // does too, so omit them here before identity construction.
+      // JSON.stringify omits undefined object values, and so does a stored task
+      // payload, so omit them here before identity construction.
       if (record[key] !== undefined) {
         // Define, never assign: `result['__proto__'] = …` would hit the prototype setter
         // and drop an own "__proto__" key (JSON.parse creates one), so two different
@@ -125,8 +125,8 @@ export function canonicalizeFilterValue(value: unknown): unknown {
 
 /**
  * Convert a canonical runtime filter value into a deterministic, type-preserving
- * identity fragment. This deliberately uses the same JSON value representation as
- * the durable request key: `1` and `'1'` are different filter values.
+ * identity fragment. This deliberately uses the JSON value representation, so
+ * `1` and `'1'` are different filter values.
  */
 function getFilterValueSig(value: unknown): string {
   return JSON.stringify(value) ?? 'undefined';
@@ -186,7 +186,7 @@ export function previewScope(preview: {
 }
 
 /**
- * The one lookup and lock identity, used everywhere: which Resizer and pipeline rendered which
+ * The one lookup and storage identity, used everywhere: which Resizer and pipeline rendered which
  * size, format and filters (`resizer:pipeline:sizeKey:format:filterSig`). Names are
  * URI-encoded, so a ':' inside a name cannot shift the fields.
  */
@@ -367,8 +367,8 @@ function normalizeVariant(variant: MissingPreview): MissingPreview {
 /**
  * Canonicalize a complete queue payload: normalize nested filter keys, remove exact
  * duplicate variants, and sort the result by the canonical representation. The
- * stable result goes into the request key, so a list permutation cannot create another
- * durable task in a queue that deduplicates by it.
+ * stable result is what a task stores, so a list permutation of one request
+ * reaches the task queue as the same payload.
  */
 export function canonicalizeVariants(
   variants: readonly MissingPreview[],

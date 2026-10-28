@@ -1,14 +1,19 @@
 // The worker loop (Consumer) against the in-memory TaskQueue: the same lifecycle every backend
 // gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash loops,
-// timeouts, lost leases, graceful shutdown and resilient claiming.
+// timeouts, lost leases, graceful shutdown and resilient claiming — plus the gate lock it holds on
+// a queue without gatesByTask, the dead-letter cooldown it passes to a queue with it, and a host
+// logger that throws.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { backoffMs, Consumer } from './consumer.ts';
+import type { LockStore } from './contracts/locks.ts';
 import type {
   ClaimedTask,
+  ClaimOptions,
   LeasedTask,
   NewTask,
   TaskEvent,
+  TaskQueue,
 } from './contracts/taskQueue.ts';
 import {
   ResizeError,
@@ -16,8 +21,14 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
 } from './errors.ts';
+import { gateKey } from './lockKeys.ts';
 import { consume } from './testHelpers/consume.ts';
-import { MemoryTaskQueue, ReleasingTaskQueue } from './testHelpers/fakes.ts';
+import {
+  clockLocks,
+  MemoryTaskQueue,
+  PlainTaskQueue,
+  ReleasingTaskQueue,
+} from './testHelpers/fakes.ts';
 import { timingOf } from './timing.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
@@ -46,7 +57,7 @@ const stoppedByShutdown = (
 
 /** Run the loop until the handler has started, then shut it down and wait for it to return. */
 async function shutDownMidTask(
-  tasks: MemoryTaskQueue,
+  tasks: MemoryTaskQueue | PlainTaskQueue,
   handle: (
     task: LeasedTask,
     opts: { signal: AbortSignal },
@@ -90,25 +101,28 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
   mediaId: 'm1',
   pipeline: 'default',
   previews: [{ sizeKey: '10x10', format: 'webp' }],
-  requestKey: 'k1',
   ...over,
 });
 
 const fastTiming = {
   leaseMs: 200,
-  lockTtlMs: { dispatch: 1000, worker: 200 },
   idlePollMs: 5,
   taskTimeoutMs: 2000,
   retryBackoffMs: { base: 10, max: 40 },
   maxAttempts: 3,
 };
 
-/** Run the loop until `done()` (or 5 s), then stop it and wait for it to return. */
+type ConsumeOptions = Parameters<typeof consume>[1];
+
+/**
+ * Run the loop until `done()` (or 5 s), then stop it and wait for it to return. `opts` go to the
+ * Consumer (default logger: silent).
+ */
 async function runUntil(
-  tasks: MemoryTaskQueue,
+  tasks: MemoryTaskQueue | PlainTaskQueue,
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>,
   done: () => boolean,
-  logger: { info(): void; warn(): void; error(...a: unknown[]): void } = silent,
+  opts: Pick<ConsumeOptions, 'logger' | 'resizers' | 'coordinationOf'> = {},
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -119,7 +133,8 @@ async function runUntil(
     onEvent: (event, task, error) => {
       events.push({ event, task, error });
     },
-    logger,
+    logger: silent,
+    ...opts,
   });
   const until = Date.now() + 5000;
   try {
@@ -177,10 +192,35 @@ describe('Consumer', () => {
     );
     assert.equal(handled.length, 1);
     assert.equal('token' in handled[0], false);
-    assert.equal('attempts' in handled[0], false);
+    assert.equal(handled[0].attempts, 1);
     assert.deepEqual(
       events.map((e) => e.event),
       ['completed'],
+    );
+  });
+
+  test('task events carry the delivery count', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 1, max: 1 } },
+    });
+    await tasks.add(newTask());
+    let calls = 0;
+    const events = await runUntil(
+      tasks,
+      async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error('once');
+        }
+      },
+      () => tasks.rows[0].status === 'completed',
+    );
+    assert.deepEqual(
+      events.map((e) => [e.event, e.task.attempts]),
+      [
+        ['failed', 1],
+        ['completed', 2],
+      ],
     );
   });
 
@@ -426,7 +466,6 @@ describe('Consumer', () => {
       timing: {
         ...fastTiming,
         leaseMs: 20,
-        lockTtlMs: { dispatch: 1000, worker: 20 },
       },
     });
     await tasks.add(newTask());
@@ -463,7 +502,7 @@ describe('Consumer', () => {
       tasks,
       async () => {},
       () => tasks.rows[0].status === 'completed',
-      { ...silent, error: (...a: unknown[]) => errors.push(a) },
+      { logger: { ...silent, error: (...a: unknown[]) => errors.push(a) } },
     );
     assert.equal(errors.length, 2);
   });
@@ -490,7 +529,12 @@ describe('Consumer', () => {
       tasks,
       async () => {},
       () => starts.length >= script.length + 1,
-      { ...silent, error: (msg: unknown) => errors.push(String(msg)) },
+      {
+        logger: {
+          ...silent,
+          error: (msg: unknown) => errors.push(String(msg)),
+        },
+      },
     );
     // The delays the loop chose: 10, 20, 40, 80, then capped at 10 × idlePollMs = 100 (uncapped it
     // would be 160), and 10 again after the successful (empty) claim. The cap and the reset are read
@@ -602,8 +646,8 @@ describe('Consumer', () => {
 
   test('only tasks of the consumed queue are claimed', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
-    await tasks.add(newTask({ queue: 'bulk', requestKey: 'b' }));
-    await tasks.add(newTask({ requestKey: 'd' }));
+    await tasks.add(newTask({ queue: 'bulk' }));
+    await tasks.add(newTask({ mediaId: 'm2' }));
     const seen: string[] = [];
     await runUntil(
       tasks,
@@ -682,7 +726,7 @@ describe('Consumer shutdown', () => {
   });
 
   test('a queue without release retries the stopped task at once, with no event and never dead', async () => {
-    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    const tasks = new PlainTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
     tasks.rows[0].attempts = 2; // this delivery is the last one allowed
     const events = await shutDownMidTask(tasks);
@@ -759,12 +803,11 @@ describe('Consumer shutdown', () => {
     assert.deepEqual(tasks.releaseCalls, []);
   });
 
-  test('a task whose lease was lost before the shutdown is not released', async () => {
+  test('a task whose lease was lost before the shutdown is neither released nor failed', async () => {
     const tasks = new ReleasingTaskQueue({
       timing: {
         ...fastTiming,
         leaseMs: 20,
-        lockTtlMs: { dispatch: 1000, worker: 20 },
       },
     });
     await tasks.add(newTask());
@@ -800,8 +843,9 @@ describe('Consumer shutdown', () => {
       },
       logger: silent,
     });
+    // The lease was known to be lost: no terminal call at all, so the new holder keeps it.
     assert.deepEqual(tasks.releaseCalls, []);
-    assert.deepEqual(failCalls, ['task-1']); // fenced: the new holder keeps it
+    assert.deepEqual(failCalls, []);
     assert.deepEqual(events, []);
     assert.equal(tasks.rows[0].token, 'another-worker');
   });
@@ -812,7 +856,7 @@ describe('a task the Consumer does not accept', () => {
    * Run the loop with `accepts` returning false, until the second claim starts. Resolves with the
    * gap between the two claims, the events, the logger's messages and the tasks `accepts` saw.
    */
-  async function declineOnce(tasks: MemoryTaskQueue) {
+  async function declineOnce(tasks: MemoryTaskQueue | PlainTaskQueue) {
     const claimedAt: number[] = [];
     const logged: unknown[][] = [];
     const seen: LeasedTask[] = [];
@@ -882,7 +926,7 @@ describe('a task the Consumer does not accept', () => {
   });
 
   test('on a queue without release it is retried at once through fail: the delivery counts', async () => {
-    const tasks = new MemoryTaskQueue({
+    const tasks = new PlainTaskQueue({
       timing: { ...fastTiming, idlePollMs },
     });
     await tasks.add(newTask());
@@ -912,6 +956,1357 @@ describe('a task the Consumer does not accept', () => {
     assert.equal(tasks.rows[0].status, 'completed');
     assert.deepEqual(tasks.releaseCalls, []);
   });
+});
+
+/** A LockStore that records every call and holds nothing. */
+function recordingLocks() {
+  const calls: string[] = [];
+  const locks: LockStore = {
+    acquire: async (key) => {
+      calls.push(`acquire ${key}`);
+      return true;
+    },
+    extend: async (key) => {
+      calls.push(`extend ${key}`);
+      return true;
+    },
+    release: async (key) => {
+      calls.push(`release ${key}`);
+      return true;
+    },
+  };
+  return { locks, calls };
+}
+
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe('the gate lock on a task queue without gatesByTask', () => {
+  const gateTiming = {
+    ...fastTiming,
+    leaseMs: 200,
+    idlePollMs: 5,
+    retryBackoffMs: { base: 60_000, max: 60_000 },
+  };
+  const key = gateKey('default', 'default', 'm1', 'default');
+
+  /** A queue (default: a PlainTaskQueue) with one task of owner 'g1', whose gate lock is held for ttlMs. */
+  async function gatedTask<Q extends PlainTaskQueue>(
+    locks: LockStore,
+    tasks: Q = new PlainTaskQueue({ timing: gateTiming }) as Q,
+    ttlMs = 50,
+  ): Promise<Q> {
+    assert.equal(await locks.acquire(key, 'g1', ttlMs), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    return tasks;
+  }
+
+  test('is extended when the task starts and on every heartbeat, and released on completion', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    const left: number[] = [];
+    const remaining = () => (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    const events = await runUntil(
+      tasks,
+      async () => {
+        left.push(remaining());
+        await sleepMs(250); // past the first lease: only heartbeats keep it
+        left.push(remaining());
+      },
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.ok(left[0] > 100, `held for ${left[0]} ms when the task started`);
+    assert.ok(left[1] > 0, `held for ${left[1]} ms after 250 ms`);
+    assert.equal(locks.entry(key), undefined, 'released on completion');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+  });
+
+  test('a retry holds it for the backoff plus one lease', async () => {
+    const locks = clockLocks();
+    // A 1 s lease, so the window below is wide and still tells the lease apart.
+    const tasks = await gatedTask(
+      locks,
+      new PlainTaskQueue({ timing: { ...gateTiming, leaseMs: 1000 } }),
+    );
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new Error('once');
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+    const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    // More than the 60 s backoff alone, at most the backoff plus the lease.
+    assert.ok(left > 60_000 && left <= 61_000, `held for ${left} ms`);
+  });
+
+  test("a dead-letter holds it for the Resizer's cooldownMs", async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeMediaError('x', { retryable: false });
+      },
+      () => tasks.rows[0].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    // The cooldown, not the 300 ms a running task holds it for.
+    assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
+  });
+
+  test('the cooldown hold is in place before the deadLettered event fires', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    // What the observer sees of the gate lock, read inside the event handler.
+    const seen: { event: TaskEvent; owner?: string; left: number }[] = [];
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async () => {
+          throw new ResizeMediaError('x', { retryable: false });
+        },
+        onEvent: (event) => {
+          const lock = locks.entry(key);
+          seen.push({
+            event,
+            owner: lock?.owner,
+            left: (lock?.expiresAt ?? 0) - Date.now(),
+          });
+          stop.abort();
+        },
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+        logger: silent,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(seen.length, 1);
+    const [{ event, owner, left }] = seen;
+    assert.equal(event, 'deadLettered');
+    assert.equal(owner, 'g1');
+    // The cooldown, not the 200 ms lease the task started with.
+    assert.ok(
+      left > 29_000 && left <= 30_000,
+      `held for ${left} ms when the event fired`,
+    );
+  });
+
+  test('a lock another request took over after it expired stays theirs', async () => {
+    let t = 0;
+    const locks = clockLocks(() => t);
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    assert.equal(await locks.acquire(key, 'g1', 10), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    t = 100; // g1's lock expired, and a new request took the gate
+    assert.equal(await locks.acquire(key, 'g2', 10_000), true);
+    const events = await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    assert.deepEqual(locks.entry(key), { owner: 'g2', expiresAt: 10_100 });
+  });
+
+  test('a rejecting lock store is logged and never changes the outcome', async () => {
+    const locks = clockLocks();
+    const tasks = await gatedTask(locks);
+    locks.extend = async () => {
+      throw new Error('lock store down');
+    };
+    locks.release = async () => {
+      throw new Error('lock store down');
+    };
+    const errors: unknown[][] = [];
+    const events = await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+        logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
+      },
+    );
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    assert.ok(errors.length > 0, 'the failures are logged');
+    for (const [message, err] of errors) {
+      assert.match(String(message), /gate/);
+      assert.match(String(err), /lock store down/);
+    }
+  });
+
+  test('a task without gateOwner touches no lock', async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    await tasks.add(newTask());
+    await tasks.add(newTask({ mediaId: 'm2' }));
+    const events = await runUntil(
+      tasks,
+      async (task) => {
+        if (task.mediaId === 'm2') {
+          throw new ResizeMediaError('x', { retryable: false });
+        }
+        await sleepMs(150); // past a heartbeat
+      },
+      () => tasks.rows[1].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed', 'deadLettered'],
+    );
+    assert.deepEqual(calls, []);
+  });
+
+  test('a task whose lease was lost leaves it to the new holder after the start', async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new PlainTaskQueue({ timing: gateTiming });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    // Another worker took the task over: no heartbeat extends the lock, and fail() is fenced.
+    tasks.renew = async () => {
+      tasks.rows[0].token = 'another-worker';
+      return false;
+    };
+    let aborted = false;
+    const events = await runUntil(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(new Error('lease lost'));
+            },
+            { once: true },
+          );
+        }),
+      () => aborted,
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(events, []);
+    assert.deepEqual(calls, [`extend ${key}`]);
+  });
+
+  for (const outcome of ['resolves', 'rejects'] as const) {
+    test(`after a known lease loss a handler that ${outcome} leads to no terminal call, no gate call and no event`, async () => {
+      const base = clockLocks();
+      const lockCalls: string[] = [];
+      const locks: LockStore = {
+        acquire: (lockKey, owner, ttlMs) => {
+          lockCalls.push('acquire');
+          return base.acquire(lockKey, owner, ttlMs);
+        },
+        extend: (lockKey, owner, ttlMs) => {
+          lockCalls.push('extend');
+          return base.extend(lockKey, owner, ttlMs);
+        },
+        release: (lockKey, owner) => {
+          lockCalls.push('release');
+          return base.release(lockKey, owner);
+        },
+      };
+      const tasks = new PlainTaskQueue({ timing: gateTiming });
+      assert.equal(await base.acquire(key, 'g1', 60_000), true);
+      await tasks.add({ ...newTask(), gateOwner: 'g1' });
+      // The renewal says the lease is gone, although the stale lease would still accept a write
+      // (as SQS accepts the delete of an old receipt): only the Consumer can hold back.
+      tasks.renew = async () => false;
+      const terminal: string[] = [];
+      for (const op of ['complete', 'fail'] as const) {
+        const real = tasks[op].bind(tasks) as (
+          ...a: unknown[]
+        ) => Promise<boolean>;
+        tasks[op] = (async (...args: unknown[]) => {
+          terminal.push(op);
+          return real(...args);
+        }) as never;
+      }
+      const warned: unknown[][] = [];
+      let settled = false;
+      let atStart: { owner: string; expiresAt: number } | undefined;
+      const events = await runUntil(
+        tasks,
+        (_task, { signal }) =>
+          new Promise<void>((resolve, reject) => {
+            atStart = base.entry(key);
+            signal.addEventListener(
+              'abort',
+              () => {
+                settled = true;
+                if (outcome === 'resolves') {
+                  resolve();
+                } else {
+                  reject(new Error('lease lost'));
+                }
+              },
+              { once: true },
+            );
+          }),
+        () => settled && warned.length > 0,
+        {
+          coordinationOf: () => ({
+            cooldownMs: 30_000,
+            gateTtlMs: 600_000,
+            locks,
+          }),
+          logger: { ...silent, warn: (...a: unknown[]) => warned.push(a) },
+        },
+      );
+      const lock = base.entry(key);
+      assert.deepEqual(terminal, []);
+      assert.deepEqual(lockCalls, ['extend'], 'only the extend at the start');
+      assert.equal(lock?.owner, 'g1');
+      assert.deepEqual(lock, atStart, 'the gate entry is as the start left it');
+      assert.equal(tasks.rows[0].status, 'processing');
+      assert.deepEqual(events, []);
+      assert.equal(warned.length, 1);
+      assert.match(
+        String(warned[0][0]),
+        /lost its lease — left to its next delivery/,
+      );
+    });
+  }
+
+  test('a task given back at shutdown holds it for gateTtlMs, as a freshly queued task does', async () => {
+    const locks = clockLocks();
+    const replaced = await gatedTask(
+      locks,
+      new ReleasingTaskQueue({ timing: gateTiming }),
+    );
+    const stop = new AbortController();
+    await consume(replaced, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => {
+        const stopped = stoppedByShutdown(task, opts);
+        stop.abort();
+        return stopped;
+      },
+      logger: silent,
+      coordinationOf: () => ({ cooldownMs: 30_000, gateTtlMs: 45_000, locks }),
+    });
+    assert.deepEqual(replaced.releaseCalls, ['task-1']);
+    const lock = locks.entry(key);
+    assert.equal(lock?.owner, 'g1');
+    const left = (lock?.expiresAt ?? 0) - Date.now();
+    // gateTtlMs, not the lease and heartbeat (300 ms) the task started with.
+    assert.ok(left > 44_000 && left <= 45_000, `held for ${left} ms`);
+  });
+
+  test('a task the worker does not accept holds it for gateTtlMs when it goes back', async () => {
+    const locks = clockLocks();
+    // No start extend runs for it: the Dispatcher's lock must still be live at the give-back.
+    const replaced = await gatedTask(
+      locks,
+      new ReleasingTaskQueue({ timing: gateTiming }),
+      5_000,
+    );
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await new Consumer({
+        tasks: replaced,
+        timing: timingOf(replaced),
+        accepts: () => {
+          stop.abort();
+          return false;
+        },
+        handle: async () => {},
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 45_000,
+          locks,
+        }),
+        logger: silent,
+      }).run('default', stop.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(replaced.releaseCalls, ['task-1']);
+    const left = (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    assert.ok(left > 44_000 && left <= 45_000, `held for ${left} ms`);
+  });
+
+  describe('a gate lock that lapsed is taken back under the task owner', () => {
+    // The lock the Dispatcher took expired before the worker got to the task; nobody took it.
+    async function lapsed() {
+      const clock = { t: 0 };
+      const locks = clockLocks(() => clock.t);
+      const tasks = new PlainTaskQueue({ timing: gateTiming });
+      assert.equal(await locks.acquire(key, 'g1', 10), true);
+      await tasks.add({ ...newTask(), gateOwner: 'g1' });
+      clock.t = 100;
+      return { clock, locks, tasks };
+    }
+    const coordinationOf = (locks: LockStore) => () => ({
+      cooldownMs: 30_000,
+      gateTtlMs: 600_000,
+      locks,
+    });
+
+    test('at task start', async () => {
+      const { locks, tasks } = await lapsed();
+      let atStart: { owner: string; expiresAt: number } | undefined;
+      await runUntil(
+        tasks,
+        async () => {
+          await sleepMs(5); // the start's extend, then its acquire
+          atStart = locks.entry(key);
+        },
+        () => tasks.rows[0].status === 'completed',
+        { coordinationOf: coordinationOf(locks) },
+      );
+      // Taken back for the lease and one heartbeat, then released on completion.
+      assert.deepEqual(atStart, { owner: 'g1', expiresAt: 100 + 200 + 100 });
+      assert.equal(locks.entry(key), undefined);
+    });
+
+    test('for the retry hold', async () => {
+      const { clock, locks, tasks } = await lapsed();
+      await runUntil(
+        tasks,
+        async () => {
+          clock.t = 10_000; // past what the start took back
+          throw new Error('once');
+        },
+        () =>
+          tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+        { coordinationOf: coordinationOf(locks) },
+      );
+      const lock = locks.entry(key);
+      assert.equal(lock?.owner, 'g1');
+      // The 60 s backoff plus one 200 ms lease, from the moved clock.
+      const held = (lock?.expiresAt ?? 0) - 10_000;
+      assert.ok(held > 60_000 && held <= 60_200, `held for ${held} ms`);
+    });
+
+    test('for the cooldown hold after a dead-letter', async () => {
+      const { clock, locks, tasks } = await lapsed();
+      await runUntil(
+        tasks,
+        async () => {
+          clock.t = 10_000;
+          throw new ResizeMediaError('x', { retryable: false });
+        },
+        () => tasks.rows[0].status === 'dead',
+        { coordinationOf: coordinationOf(locks) },
+      );
+      assert.deepEqual(locks.entry(key), {
+        owner: 'g1',
+        expiresAt: 10_000 + 30_000,
+      });
+    });
+
+    test('for the cooldown of a task past maxAttempts', async () => {
+      const { locks, tasks } = await lapsed();
+      tasks.rows[0].attempts = gateTiming.maxAttempts; // the next claim is one too many
+      let handled = 0;
+      await runUntil(
+        tasks,
+        async () => {
+          handled += 1;
+        },
+        () => tasks.rows[0].status === 'dead',
+        { coordinationOf: coordinationOf(locks) },
+      );
+      assert.equal(handled, 0);
+      assert.deepEqual(locks.entry(key), {
+        owner: 'g1',
+        expiresAt: 100 + 30_000,
+      });
+    });
+  });
+
+  test('after a worker crash the redelivery finds its gate still held', async () => {
+    // The lease (600 ms) and the gate lock are moved by the same heartbeat tick, every 300 ms.
+    const timing = { ...gateTiming, leaseMs: 600 };
+    const base = clockLocks();
+    const calls: { op: string; held: boolean }[] = [];
+    const locks: LockStore = {
+      acquire: async (lockKey, owner, ttlMs) => {
+        const held = await base.acquire(lockKey, owner, ttlMs);
+        calls.push({ op: 'acquire', held });
+        return held;
+      },
+      extend: async (lockKey, owner, ttlMs) => {
+        const held = await base.extend(lockKey, owner, ttlMs);
+        calls.push({ op: 'extend', held });
+        return held;
+      },
+      release: base.release,
+    };
+    const tasks = new PlainTaskQueue({ timing });
+    // The Dispatcher's lock, short, so the workers' extends decide how long it lasts.
+    assert.equal(await base.acquire(key, 'g1', 50), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const coordination = { cooldownMs: 30_000, gateTtlMs: 600_000, locks };
+
+    // The first worker claims the task, extends the gate at the start, and dies: its heartbeat
+    // never gets an answer again, so neither its lease nor its gate lock is extended.
+    const dying: TaskQueue = {
+      add: (task) => tasks.add(task),
+      claim: (...args) => tasks.claim(...args),
+      renew: () => new Promise<boolean>(() => {}),
+      complete: (task) => tasks.complete(task),
+      fail: (...args) => tasks.fail(...args),
+      getTiming: () => timing,
+    };
+    const crashed = new AbortController();
+    let firstStarted = false;
+    const first = new Consumer({
+      tasks: dying,
+      timing: timingOf(tasks),
+      handle: (_task, { signal }) => {
+        firstStarted = true;
+        return new Promise<void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('gone')));
+        });
+      },
+      coordinationOf: () => coordination,
+      logger: silent,
+    }).run('default', crashed.signal);
+    const until = Date.now() + 5000;
+    while (!firstStarted) {
+      assert.ok(Date.now() < until, 'the first worker never started');
+      await sleepMs(2);
+    }
+    const startCalls = calls.length;
+
+    // Once the lease has ended, the next worker gets the task again.
+    let atRedelivery: { live: boolean; owner?: string; taken?: boolean } = {
+      live: false,
+    };
+    try {
+      await runUntil(
+        tasks,
+        async () => {
+          const lock = base.entry(key);
+          atRedelivery = {
+            live: (lock?.expiresAt ?? 0) > Date.now(),
+            owner: lock?.owner,
+            // Another request trying to queue a task for the media now.
+            taken: await base.acquire(key, 'another request', 60_000),
+          };
+        },
+        () => tasks.rows[0].status === 'completed',
+        { coordinationOf: () => coordination },
+      );
+    } finally {
+      crashed.abort();
+      await first;
+    }
+    // The dead worker's late shutdown (its handler stopped at last) took nothing back.
+    assert.equal(base.entry(key), undefined);
+    assert.equal(tasks.rows[0].attempts, 2, 'redelivered once');
+    assert.deepEqual(atRedelivery, { live: true, owner: 'g1', taken: false });
+    // The redelivery's start extend found the lock still held: nothing had to take it back.
+    assert.deepEqual(calls.slice(startCalls, startCalls + 1), [
+      { op: 'extend', held: true },
+    ]);
+    assert.equal(
+      calls.some(({ op }) => op === 'acquire'),
+      false,
+    );
+  });
+
+  test('a task given back at shutdown leaves the lock to its next holder once it is back', async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new ReleasingTaskQueue({ timing: gateTiming });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const stop = new AbortController();
+    await consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => {
+        const stopped = stoppedByShutdown(task, opts);
+        stop.abort();
+        return stopped;
+      },
+      logger: silent,
+      coordinationOf: () => ({ cooldownMs: 30_000, gateTtlMs: 600_000, locks }),
+    });
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    // The start extend and the give-back hold, made before the task went back; no release.
+    assert.deepEqual(calls, [`extend ${key}`, `extend ${key}`]);
+  });
+
+  test('a slow lock store gets one heartbeat extend at a time, and the release follows the task', async () => {
+    // Each extend takes longer than a heartbeat (100 ms), and less than the gate bound (200 ms).
+    const latencyMs = 150;
+    const handlerMs = 600;
+    const base = clockLocks();
+    const calls: { op: 'extend' | 'release'; at: number }[] = [];
+    const slow: LockStore = {
+      acquire: base.acquire,
+      extend: async (lockKey, owner, ttlMs) => {
+        calls.push({ op: 'extend', at: Date.now() });
+        const held = await base.extend(lockKey, owner, ttlMs);
+        await sleepMs(latencyMs);
+        return held;
+      },
+      release: async (lockKey, owner) => {
+        calls.push({ op: 'release', at: Date.now() });
+        return base.release(lockKey, owner);
+      },
+    };
+    const tasks = new PlainTaskQueue({
+      timing: {
+        ...fastTiming,
+        leaseMs: 200,
+      },
+    });
+    assert.equal(await slow.acquire(key, 'g1', 1000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    let handlerEnded = 0;
+    await runUntil(
+      tasks,
+      async () => {
+        await sleepMs(handlerMs);
+        handlerEnded = Date.now();
+      },
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks: slow,
+        }),
+      },
+    );
+    const extendCalls = calls.filter((call) => call.op === 'extend');
+    // The extends run one after another and each takes latencyMs, so while the handler runs at
+    // most handlerMs / latencyMs of them start after the start extend, and at most one more is
+    // pending when it ends: 1 + 600 / 150 = 5 at most. One extend per heartbeat would make about
+    // 1 + 600 / 100 = 7.
+    assert.ok(
+      extendCalls.length >= 2 && extendCalls.length <= 5,
+      `${extendCalls.length} extends`,
+    );
+    const release = calls.find((call) => call.op === 'release');
+    assert.ok(release, 'the gate lock is released');
+    // The release waits for at most the one pending extend (latencyMs; 350 leaves room for slow
+    // timers). A backlog of one extend per heartbeat would delay it by about a second.
+    const gapMs = release.at - handlerEnded;
+    assert.ok(gapMs < 350, `released ${gapMs} ms after the handler ended`);
+    assert.equal(base.entry(key), undefined);
+  });
+});
+
+describe('a lock store that never answers', () => {
+  // The gate bound is min(leaseMs, 30 s): 300 ms here.
+  const leaseMs = 300;
+  const hangingTiming = {
+    ...fastTiming,
+    leaseMs,
+    retryBackoffMs: { base: 60_000, max: 60_000 },
+  };
+
+  /** clockLocks whose extend never settles; acquire and release answer. */
+  function hangingExtend() {
+    const base = clockLocks();
+    let extends_ = 0;
+    const locks: LockStore = {
+      acquire: base.acquire,
+      extend: () => {
+        extends_ += 1;
+        return new Promise<boolean>(() => {});
+      },
+      release: base.release,
+    };
+    return { base, locks, extends: () => extends_ };
+  }
+
+  test('each task completes about one bound after its handler, and the loop keeps consuming', async () => {
+    const { base, locks, extends: extendCount } = hangingExtend();
+    const tasks = new PlainTaskQueue({ timing: hangingTiming });
+    for (const [mediaId, owner] of [
+      ['m1', 'g1'],
+      ['m2', 'g2'],
+    ]) {
+      const gate = gateKey('default', 'default', mediaId, 'default');
+      assert.equal(await base.acquire(gate, owner, 60_000), true);
+      await tasks.add({ ...newTask({ mediaId }), gateOwner: owner });
+    }
+    const handled: Record<string, number> = {};
+    const completed: Record<string, number> = {};
+    const errors: unknown[][] = [];
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async (task) => {
+          handled[task.mediaId] = Date.now();
+        },
+        onEvent: (event, task) => {
+          if (event === 'completed') {
+            completed[task.mediaId] = Date.now();
+          }
+          if (Object.keys(completed).length === 2) {
+            stop.abort();
+          }
+        },
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+        logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(
+      tasks.rows.map(({ status }) => status),
+      ['completed', 'completed'],
+    );
+    for (const mediaId of ['m1', 'm2']) {
+      // The start extend hangs; the end waits for it one bound at most, then releases.
+      const waited = completed[mediaId] - handled[mediaId];
+      assert.ok(
+        waited <= leaseMs + 150,
+        `${mediaId} completed ${waited} ms after its handler`,
+      );
+      assert.equal(
+        base.entry(gateKey('default', 'default', mediaId, 'default')),
+        undefined,
+        'released',
+      );
+    }
+    assert.ok(extendCount() >= 2);
+    // The log names the wait that was applied, at most the 300 ms bound.
+    const waits = errors.flatMap(([message]) => {
+      const found = /timed out: gave up waiting after (\d+) ms/.exec(
+        String(message),
+      );
+      return found ? [Number(found[1])] : [];
+    });
+    assert.ok(waits.length > 0, 'a timed-out call is logged');
+    for (const waited of waits) {
+      assert.ok(waited <= leaseMs, `${waited} ms`);
+    }
+    assert.ok(
+      errors.some(([message]) =>
+        /extending the gate lock of task task-1 timed out/.test(
+          String(message),
+        ),
+      ),
+    );
+  });
+
+  test('the task timeout aborts the handler at once, while a gate call hangs', async () => {
+    const { locks } = hangingExtend();
+    const tasks = new PlainTaskQueue({
+      timing: { ...hangingTiming, taskTimeoutMs: 50 },
+    });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    let startedAt = 0;
+    let abortedAt = 0;
+    const events = await runUntil(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>(() => {
+          startedAt = Date.now();
+          signal.addEventListener('abort', () => {
+            abortedAt = Date.now();
+          });
+        }),
+      () => tasks.rows[0].status === 'pending' && tasks.rows[0].attempts === 1,
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    // Aborted at the timeout (50 ms), not after the hanging start extend's bound (300 ms).
+    assert.ok(abortedAt > 0, 'the handler was aborted');
+    assert.ok(
+      abortedAt - startedAt < 250,
+      `aborted ${abortedAt - startedAt} ms after the start`,
+    );
+    assert.deepEqual(
+      events.map(({ event, error }) => [
+        event,
+        (error as { code?: string }).code,
+      ]),
+      [['failed', 'RESIZE_TASK_TIMEOUT']],
+    );
+  });
+
+  test('run() resolves within one bound after the shutdown', async () => {
+    const { locks } = hangingExtend();
+    const tasks = new ReleasingTaskQueue({ timing: hangingTiming });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const stop = new AbortController();
+    let stoppedAt = 0;
+    const loop = consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => {
+        const stopped = stoppedByShutdown(task, opts);
+        // The deploy arrives while the start extend hangs.
+        setTimeout(() => {
+          stoppedAt = Date.now();
+          stop.abort();
+        }, 50);
+        return stopped;
+      },
+      coordinationOf: () => ({ cooldownMs: 30_000, gateTtlMs: 600_000, locks }),
+      logger: silent,
+    });
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await loop;
+    } finally {
+      clearTimeout(timer);
+    }
+    const tookMs = Date.now() - stoppedAt;
+    assert.ok(
+      tookMs <= leaseMs + 150,
+      `run() resolved ${tookMs} ms after the abort`,
+    );
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+  });
+});
+
+describe('a late answer never undoes the end of a task', () => {
+  // The gate bound is min(leaseMs, 30 s): 200 ms here; the heartbeat runs every 100 ms.
+  const lateTiming = {
+    ...fastTiming,
+    leaseMs: 200,
+    retryBackoffMs: { base: 60_000, max: 60_000 },
+  };
+  const key = gateKey('default', 'default', 'm1', 'default');
+
+  /**
+   * clockLocks whose call number `slowCall` (counting extends and acquires together) answers
+   * `delayMs` late, and is applied to the lock only then, as a store that is slow to write.
+   * `landed` resolves once that call has been applied.
+   */
+  function slowOnce(slowCall: number, delayMs: number) {
+    const base = clockLocks();
+    let calls = 0;
+    let markLanded!: () => void;
+    const landed = new Promise<void>((resolve) => {
+      markLanded = resolve;
+    });
+    const slow =
+      <A extends unknown[]>(op: (...args: A) => Promise<boolean>) =>
+      async (...args: A) => {
+        calls += 1;
+        if (calls !== slowCall) {
+          return op(...args);
+        }
+        await sleepMs(delayMs);
+        const held = await op(...args);
+        markLanded();
+        return held;
+      };
+    const locks: LockStore = {
+      acquire: slow(base.acquire),
+      extend: slow(base.extend),
+      release: base.release,
+    };
+    return { base, locks, landed };
+  }
+
+  test("a dead-letter's cooldown hold survives a heartbeat extend that lands after it", async () => {
+    // Call 1 is the start extend; call 2, the first heartbeat's, lands 450 ms late (past the bound).
+    const { base, locks, landed } = slowOnce(2, 450);
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const events = await runUntil(
+      tasks,
+      async () => {
+        await sleepMs(150); // one heartbeat runs while the task does
+        throw new ResizeMediaError('x', { retryable: false });
+      },
+      () => tasks.rows[0].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    await landed;
+    await sleepMs(50); // the cooldown hold, made again after the late extend
+    const lock = base.entry(key);
+    assert.equal(lock?.owner, 'g1');
+    const left = (lock?.expiresAt ?? 0) - Date.now();
+    // The cooldown, not the 300 ms the late heartbeat extend set.
+    assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
+  });
+
+  test("a completed task's lock stays released when a slow re-take lands after the release", async () => {
+    // The Dispatcher's lock lapsed before the task started: the start extend is refused (call 1),
+    // and its re-take (call 2) lands 400 ms late, after the completion released the gate.
+    const { base, locks, landed } = slowOnce(2, 400);
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 10), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    await sleepMs(30);
+    const events = await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    await landed;
+    await sleepMs(50); // the release, made again after the late re-take
+    assert.equal(base.entry(key), undefined, 'the gate stays open');
+  });
+
+  /** The timers that keep the process alive now (an unref'd timer is not one of them). */
+  const refedTimers = () =>
+    process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout')
+      .length;
+
+  test('a final action made again does not keep the process alive after run() resolved', async () => {
+    const baseline = refedTimers();
+    const base = clockLocks();
+    let extendCalls = 0;
+    let markLanded!: () => void;
+    const landed = new Promise<void>((resolve) => {
+      markLanded = resolve;
+    });
+    let markAgain!: () => void;
+    const madeAgain = new Promise<void>((resolve) => {
+      markAgain = resolve;
+    });
+    const locks: LockStore = {
+      acquire: base.acquire,
+      release: base.release,
+      extend: async (lockKey, owner, ttlMs) => {
+        extendCalls += 1;
+        if (extendCalls === 2) {
+          // The first heartbeat's extend lands after the cooldown hold.
+          await sleepMs(450);
+          const held = await base.extend(lockKey, owner, ttlMs);
+          markLanded();
+          return held;
+        }
+        if (extendCalls >= 4) {
+          // The cooldown hold made again: the store never answers it.
+          markAgain();
+          return new Promise<boolean>(() => {});
+        }
+        return base.extend(lockKey, owner, ttlMs);
+      },
+    };
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    await runUntil(
+      tasks,
+      async () => {
+        await sleepMs(150);
+        throw new ResizeMediaError('x', { retryable: false });
+      },
+      () => tasks.rows[0].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    // run() has resolved; the late extend lands, and the hold made again waits for its answer.
+    await landed;
+    await madeAgain;
+    await sleepMs(10);
+    assert.equal(
+      refedTimers(),
+      baseline,
+      "only an unref'd timer waits for the answer",
+    );
+  });
+
+  test('a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store', async () => {
+    const base = clockLocks();
+    const locks: LockStore = {
+      acquire: base.acquire,
+      extend: base.extend,
+      release: async (lockKey, owner) => {
+        await sleepMs(20);
+        return base.release(lockKey, owner);
+      },
+    };
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    let renewSent!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      renewSent = resolve;
+    });
+    tasks.renew = () => {
+      renewSent();
+      return new Promise<boolean>(() => {});
+    };
+    const lines: string[] = [];
+    const record = (...a: unknown[]) => {
+      lines.push(String(a[0]));
+    };
+    const events = await runUntil(
+      tasks,
+      async () => {
+        await sent;
+      },
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+        logger: { info() {}, warn: record, error: record },
+      },
+    );
+    await sleepMs(40); // the release lands after the worker stopped waiting for it
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    assert.ok(
+      lines.some((line) =>
+        /the lease renewal of task task-1 did not answer within 200 ms — the task ends without its answer; no time left after the lease renewal/.test(
+          line,
+        ),
+      ),
+      lines.join('\n'),
+    );
+    assert.ok(
+      lines.some((line) =>
+        /releasing the gate lock of task task-1 was sent with no time left to wait for it/.test(
+          line,
+        ),
+      ),
+      lines.join('\n'),
+    );
+    assert.equal(
+      lines.some((line) => /gave up waiting after 0 ms/.test(line)),
+      false,
+    );
+    assert.equal(base.entry(key), undefined, 'released all the same');
+  });
+
+  test('nothing is made again once a renewal reported the lease lost', async () => {
+    const base = clockLocks();
+    let extendCalls = 0;
+    let markLanded!: () => void;
+    const landed = new Promise<void>((resolve) => {
+      markLanded = resolve;
+    });
+    let releases = 0;
+    const locks: LockStore = {
+      acquire: base.acquire,
+      extend: async (lockKey, owner, ttlMs) => {
+        extendCalls += 1;
+        if (extendCalls === 2) {
+          // The first heartbeat's extend lands after the completion's release.
+          await sleepMs(600);
+          const held = await base.extend(lockKey, owner, ttlMs);
+          markLanded();
+          return held;
+        }
+        return base.extend(lockKey, owner, ttlMs);
+      },
+      release: async (lockKey, owner) => {
+        releases += 1;
+        return base.release(lockKey, owner);
+      },
+    };
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    // The first renewal holds the lease; the second reports it lost, after the task completed.
+    let renewCalls = 0;
+    tasks.renew = async () => {
+      renewCalls += 1;
+      if (renewCalls === 1) {
+        return true;
+      }
+      await sleepMs(300);
+      return false;
+    };
+    await runUntil(
+      tasks,
+      async () => {
+        await sleepMs(250);
+      },
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    await landed;
+    await sleepMs(50);
+    assert.equal(
+      releases,
+      1,
+      'the completion released it; nothing after the loss',
+    );
+  });
+
+  test('a renewal that reports the lease lost after the handler resolved stops the completion', async () => {
+    const base = clockLocks();
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    // The first renewal is in flight when the handler resolves, and answers 50 ms later.
+    let renewSent!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      renewSent = resolve;
+    });
+    let answerRenew!: (held: boolean) => void;
+    tasks.renew = () => {
+      renewSent();
+      return new Promise<boolean>((resolve) => {
+        answerRenew = resolve;
+      });
+    };
+    const completeCalls: string[] = [];
+    const realComplete = tasks.complete.bind(tasks);
+    tasks.complete = async (task: ClaimedTask) => {
+      completeCalls.push(task.taskId);
+      return realComplete(task);
+    };
+    const warned: unknown[][] = [];
+    let atStart: { owner: string; expiresAt: number } | undefined;
+    const events = await runUntil(
+      tasks,
+      async () => {
+        atStart = base.entry(key);
+        await sent;
+        setTimeout(() => answerRenew(false), 50);
+      },
+      () => warned.length > 0,
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks: base,
+        }),
+        logger: { ...silent, warn: (...a: unknown[]) => warned.push(a) },
+      },
+    );
+    assert.deepEqual(completeCalls, []);
+    assert.deepEqual(events, []);
+    assert.equal(tasks.rows[0].status, 'processing');
+    assert.deepEqual(
+      base.entry(key),
+      atStart,
+      'the gate is as the start left it',
+    );
+    assert.match(
+      String(warned[0][0]),
+      /lost its lease — left to its next delivery/,
+    );
+  });
+});
+
+describe('the dead-letter cooldown on a task queue with gatesByTask', () => {
+  const deadOnce = async () => {
+    throw new ResizeMediaError('x', { retryable: false });
+  };
+
+  test("fail('dead') receives the Resizer's cooldownMs, and no lock is touched", async () => {
+    const { locks, calls } = recordingLocks();
+    const tasks = new MemoryTaskQueue({ timing: fastTiming, now: () => 1_000 });
+    // Even with a gateOwner: the task row is the gate here.
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const events = await runUntil(
+      tasks,
+      deadOnce,
+      () => tasks.rows[0].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    assert.equal(tasks.rows[0].cooldownUntil, 31_000);
+    assert.deepEqual(calls, []);
+  });
+
+  for (const [label, opts] of [
+    ['coordinationOf gives none', { coordinationOf: () => undefined }],
+    ['the Consumer has no coordinationOf', {}],
+  ] as const) {
+    test(`without coordination for the task, a dead-letter gets the default cooldown (${label})`, async () => {
+      const tasks = new MemoryTaskQueue({
+        timing: fastTiming,
+        now: () => 1_000,
+      });
+      await tasks.add(newTask());
+      await runUntil(
+        tasks,
+        deadOnce,
+        () => tasks.rows[0].status === 'dead',
+        opts,
+      );
+      assert.equal((tasks.rows[0].cooldownUntil ?? 0) - 1_000, 600_000);
+    });
+  }
+});
+
+test('claim receives the served Resizer names', async () => {
+  const tasks = new MemoryTaskQueue({ timing: fastTiming });
+  const seen: (ClaimOptions | undefined)[] = [];
+  const stop = new AbortController();
+  tasks.claim = async (_queue, _leaseMs, _signal, opts) => {
+    seen.push(opts);
+    stop.abort();
+    return null;
+  };
+  await new Consumer({
+    tasks,
+    timing: timingOf(tasks),
+    resizers: ['a', 'b'],
+    handle: async () => {},
+    logger: silent,
+  }).run('default', stop.signal);
+  assert.deepEqual(seen, [{ resizers: ['a', 'b'] }]);
+});
+
+test('a throwing logger never stops the loop or fails a task', async (t) => {
+  // The fallback writes to the console: keep the test output clean, and count the lines.
+  const fallback = t.mock.method(console, 'error', () => {});
+  const tasks = new MemoryTaskQueue({ timing: fastTiming });
+  await tasks.add(newTask());
+  const realClaim = tasks.claim.bind(tasks);
+  let claims = 0;
+  tasks.claim = async (...args: Parameters<MemoryTaskQueue['claim']>) => {
+    claims += 1;
+    if (claims === 1) {
+      throw new Error('db blip');
+    }
+    return realClaim(...args);
+  };
+  const logSinkDown = () => {
+    throw new Error('log sink down');
+  };
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), 5000);
+  try {
+    await new Consumer({
+      tasks,
+      timing: timingOf(tasks),
+      handle: async () => {
+        stop.abort();
+      },
+      events: () => {
+        throw new Error('observer bug');
+      },
+      logger: { info: logSinkDown, warn: logSinkDown, error: logSinkDown },
+    }).run('default', stop.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(tasks.rows[0].status, 'completed');
+  // The claim failure and the observer failure, each written to the console instead.
+  assert.equal(fallback.mock.callCount(), 2);
 });
 
 describe('backoffMs', () => {

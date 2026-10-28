@@ -8,9 +8,7 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from '../contracts/storage.ts';
-import { buildRequestKey } from '../dispatcher.ts';
-import { DEFAULT_SCOPE, getPreviewIdentity } from '../images.ts';
-import { DISPATCH_LOCK_OWNER } from '../lockKeys.ts';
+import { gateKey } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { FrameworkLockStore } from './locks.ts';
@@ -104,24 +102,23 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
   const fixture = await createFixture('no_effects');
   try {
     const mediaId = new mongoose.Types.ObjectId().toString();
-    const { taskId } = await fixture.tasks.add({
+    const added = await fixture.tasks.add({
       resizer: 'default',
       queue: 'default',
       mediaId,
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' }],
-      requestKey: 'index-side-effect-test',
     });
-    assert.ok(taskId);
-    fixture.tasks.verify();
-    assert.equal(
-      await fixture.locks.acquire(
-        'resize_dispatch:test',
-        DISPATCH_LOCK_OWNER,
-        60_000,
-      ),
-      true,
+    assert.equal(added.status, 'added');
+    assert.ok(added.taskId);
+    // verify() reads the indexes and reports the missing gate index; it creates none.
+    await assert.rejects(
+      fixture.tasks.verify(),
+      (error: Error & { code?: string }) =>
+        error.code === 'RESIZE_MONGO_INDEX_MISSING',
     );
+    const gate = gateKey('default', 'default', mediaId, 'default');
+    assert.equal(await fixture.locks.acquire(gate, 'g1', 60_000), true);
     const claimed = await fixture.tasks.claim('default', 60_000);
     assert.ok(claimed);
     assert.equal(await fixture.tasks.renew(claimed, 60_000), true);
@@ -136,10 +133,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
     const retried = await fixture.tasks.claim('default', 60_000);
     assert.ok(retried);
     assert.equal(await fixture.tasks.complete(retried), true);
-    assert.equal(
-      await fixture.locks.release('resize_dispatch:test', DISPATCH_LOCK_OWNER),
-      true,
-    );
+    assert.equal(await fixture.locks.release(gate, 'g1'), true);
 
     assert.deepEqual(
       (await fixture.taskModel.collection.listIndexes().toArray()).map(
@@ -158,7 +152,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
   }
 });
 
-test('prepared indexes preserve concurrent enqueue deduplication', async () => {
+test('prepared indexes enforce the gate: concurrent adds create one active row', async () => {
   const fixture = await createFixture('prepared');
   try {
     await Promise.all([
@@ -169,10 +163,17 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
     const taskIndexes = await fixture.taskModel.collection
       .listIndexes()
       .toArray();
-    const dedupe = taskIndexes.find(({ key }) =>
-      hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
+    const gate = taskIndexes.find(({ key }) =>
+      hasExactKey(key, { resizer: 1, fileId: 1, pipeline: 1, queue: 1 }),
     );
-    assert.ok(dedupe, 'fixture should create the active-request dedupe index');
+    assert.ok(gate, 'fixture should create the gate index');
+    assert.equal(
+      taskIndexes.some(({ key }) =>
+        hasExactKey(key, { fileId: 1, pipeline: 1, requestKey: 1 }),
+      ),
+      false,
+      'the request-key index is gone',
+    );
     assert.ok(
       taskIndexes.some(({ key }) =>
         hasExactKey(key, { queue: 1, status: 1, availableAt: 1 }),
@@ -189,11 +190,10 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
         `the old lease index ${JSON.stringify(old)} is gone`,
       );
     }
-    assert.equal(dedupe.unique, true);
-    assert.deepEqual(dedupe.partialFilterExpression, {
-      status: { $in: ['pending', 'processing'] },
-      requestKey: { $exists: true },
-    });
+    assert.equal(gate.unique, true);
+    assert.deepEqual(gate.partialFilterExpression, { active: true });
+    // The prepared collection passes verify().
+    await fixture.tasks.verify();
 
     const mediaId = new mongoose.Types.ObjectId().toString();
     const request = {
@@ -203,19 +203,26 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
       pipeline: 'default',
       previews: [{ sizeKey: '640x480', format: 'webp' as const }],
     };
-    const receipts = await Promise.all(
-      Array.from({ length: 20 }, () =>
-        fixture.tasks.add({ ...request, requestKey: buildRequestKey(request) }),
-      ),
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => fixture.tasks.add(request)),
     );
-    const taskIds = receipts.map(({ taskId }) => taskId);
-    assert.ok(taskIds.every((taskId) => typeof taskId === 'string' && taskId));
-    assert.equal(new Set(taskIds).size, 1);
+    const added = results.flatMap((result) =>
+      result.status === 'added' ? [result.taskId] : [],
+    );
+    assert.equal(added.length, 1);
+    assert.deepEqual(
+      results.filter((result) => result.status !== 'added'),
+      Array.from({ length: 19 }, () => ({
+        status: 'in-flight',
+        taskId: added[0],
+      })),
+    );
     assert.equal(
-      await fixture.taskModel.countDocuments({
-        fileId: mediaId,
-        status: { $in: ['pending', 'processing'] },
-      }),
+      await fixture.taskModel.countDocuments({ fileId: mediaId, active: true }),
+      1,
+    );
+    assert.equal(
+      await fixture.taskModel.countDocuments({ fileId: mediaId }),
       1,
     );
   } finally {
@@ -226,34 +233,24 @@ test('prepared indexes preserve concurrent enqueue deduplication', async () => {
 test('strict enqueue does not confirm a payload from a conflicting Mongo task', async () => {
   const fixture = await createFixture('strict_conflict');
   try {
+    // The gate index, as the host prepares it: without it no row is the gate.
+    await fixture.taskModel.createIndexes();
     const mediaId = new mongoose.Types.ObjectId().toString();
     const conflictingPreviews = [
       { sizeKey: '30w', format: 'webp' as const, requestedWidth: 20 },
       { sizeKey: '30w', format: 'webp' as const, requestedWidth: 30 },
     ];
+    // The active task of this media holds two payloads for one preview identity; as the gate it
+    // makes the prewarm's add in-flight.
     await fixture.taskModel.create({
       fileId: mediaId,
       pipeline: 'default',
-      requestKey: 'legacy-conflicting-payload',
+      active: true,
       status: 'pending',
       previews: conflictingPreviews,
     });
 
-    const identity = getPreviewIdentity(DEFAULT_SCOPE, '30w', 'webp');
-    assert.equal(
-      await fixture.locks.acquire(
-        `resize_dispatch:${mediaId}:${identity}`,
-        DISPATCH_LOCK_OWNER,
-        60_000,
-      ),
-      true,
-    );
-
-    const resizer = new FrameworkResizer({
-      storage,
-      locks: fixture.locks,
-      tasks: fixture.tasks,
-    });
+    const resizer = new FrameworkResizer({ storage, tasks: fixture.tasks });
     const result = await resizer.prewarm({
       media: { id: mediaId, original: { storageRef: { key: 'original.jpg' } } },
       sizes: [{ width: 30 }],
@@ -268,6 +265,10 @@ test('strict enqueue does not confirm a payload from a conflicting Mongo task', 
       result.issues.some(
         (issue) => issue.code === 'RESIZE_ENQUEUE_VARIANT_CONFLICT',
       ),
+    );
+    assert.equal(
+      await fixture.taskModel.countDocuments({ fileId: mediaId }),
+      1,
     );
   } finally {
     await closeFixture(fixture);

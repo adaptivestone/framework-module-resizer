@@ -10,6 +10,7 @@ import {
 import Lock from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { gateKey } from '../lockKeys.ts';
 import { FrameworkLockStore } from './locks.ts';
 
 // The framework Lock model as the app registers it: its strict schema and its statics.
@@ -56,13 +57,21 @@ test('two stores (two processes) share one lock and check owners', async () => {
   assert.equal(await a.extend('k1', 'B', 60_000), true);
 });
 
-test('a dispatch lock taken by one store is released and taken again by another with the fixed owner', async () => {
-  const a = new FrameworkLockStore();
-  const b = new FrameworkLockStore();
-  const key = 'resize_dispatch:m1:x';
-  assert.equal(await a.acquire(key, 'resize:dispatch', 60_000), true);
-  assert.equal(await b.release(key, 'resize:dispatch'), true);
-  assert.equal(await b.acquire(key, 'resize:dispatch', 600_000), true);
+test('a gate lock taken by one store (the API) is extended and released by another (the worker) with the owner from the task', async () => {
+  const api = new FrameworkLockStore();
+  const worker = new FrameworkLockStore();
+  const key = gateKey('default', 'default', 'm1', 'default');
+  assert.equal(await api.acquire(key, 'g1', 60_000), true);
+  // The worker knows the owner only from the task's gateOwner.
+  assert.equal(await worker.extend(key, 'g1', 600_000), true);
+  const held = await LockModel.findById(key).lean();
+  assert.ok(
+    (held?.expiredAt?.getTime() ?? 0) > Date.now() + 500_000,
+    'extended to the new TTL',
+  );
+  assert.equal(await api.acquire(key, 'g2', 60_000), false);
+  assert.equal(await worker.release(key, 'g1'), true);
+  assert.equal(await api.acquire(key, 'g2', 60_000), true);
 });
 
 test('the owner is stored despite the strict schema, and the framework statics still see the lock', async () => {

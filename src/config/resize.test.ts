@@ -5,13 +5,17 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
-import { getResizeConfig } from '../framework/config.ts';
+import {
+  getResizeConfig,
+  resolveFrameworkConfig,
+} from '../framework/config.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
 } from '../testHelpers/resizeConfig.ts';
 import defaultResizeConfig, {
+  defaultCoordination,
   defaultFrameworkResizeConfig,
   defaultQueueOptions,
   defaultWorkerOptions,
@@ -143,9 +147,6 @@ describe('getResizeConfig', () => {
     for (const config of [
       makeResizeConfig({ upload: { maxBytes: 0 } }),
       makeResizeConfig({ queue: { leaseMs: 0 } }),
-      makeResizeConfig({
-        queue: { leaseMs: 60_000, lockTtlMs: { worker: 120_000 } },
-      }),
     ]) {
       install(config);
       assert.throws(
@@ -262,35 +263,62 @@ describe('config split: core validation vs framework loading', () => {
     assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
   });
 
-  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes and is validated', () => {
-    assert.equal(defaultQueueOptions.lockTtlMs.failed, 600_000);
-    install(
-      makeResizeConfig({
-        queue: {
-          driver: 'database',
-          lockTtlMs: { dispatch: 30_000, worker: 30_000 },
-        },
-      }),
+  test('queue.lockTtlMs in a config file is RESIZE_CONFIG_REMOVED_KEY naming the file and coordination', () => {
+    for (const value of [{ failed: 600_000 }, undefined]) {
+      install(
+        makeResizeConfig({
+          queue: { driver: 'database', lockTtlMs: value } as never,
+        }),
+      );
+      assert.throws(
+        () => getResizeConfig('resizeListings'),
+        (err: unknown) =>
+          err instanceof ResizeConfigError &&
+          err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+          err.message.includes('`queue.lockTtlMs`') &&
+          err.message.includes('src/config/resizeListings.ts') &&
+          err.message.includes('coordination in the same file') &&
+          err.message.includes('lockTtlMs.failed → cooldownMs') &&
+          err.message.includes('lockTtlMs.dispatch → gateTtlMs') &&
+          err.message.includes('drop lockTtlMs.worker'),
+        JSON.stringify(value),
+      );
+    }
+  });
+
+  test('defaultQueueOptions has no lockTtlMs', () => {
+    assert.equal('lockTtlMs' in defaultQueueOptions, false);
+    assert.deepEqual(Object.keys(defaultQueueOptions).sort(), [
+      'idlePollMs',
+      'leaseMs',
+      'maxAttempts',
+      'retryBackoffMs',
+      'taskTimeoutMs',
+    ]);
+  });
+
+  test('defaultFrameworkResizeConfig carries the coordination defaults', () => {
+    assert.deepEqual(
+      defaultFrameworkResizeConfig.coordination,
+      defaultCoordination,
     );
-    assert.deepEqual(getResizeConfig().timing.lockTtlMs, {
-      dispatch: 30_000,
-      worker: 30_000,
-      failed: 600_000,
+    assert.deepEqual(defaultCoordination, {
+      gateTtlMs: 600_000,
+      cooldownMs: 600_000,
     });
-    resetAppInstance();
-    install(
-      makeResizeConfig({
-        queue: {
-          driver: 'database',
-          lockTtlMs: { dispatch: 30_000, worker: 30_000, failed: -5 },
-        },
-      }),
-    );
-    assert.throws(
-      () => getResizeConfig(),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
+  });
+
+  test("a config file's coordination is passed on unvalidated, outside the image config", () => {
+    const resolved = resolveFrameworkConfig({
+      ...makeResizeConfig(),
+      coordination: { gateTtlMs: 0 },
+    });
+    assert.deepEqual(resolved.coordination, { gateTtlMs: 0 });
+    assert.equal('coordination' in resolved.image, false);
+    const { coordination: _omit, ...withoutSection } = makeResizeConfig();
+    assert.equal(
+      resolveFrameworkConfig(withoutSection).coordination,
+      undefined,
     );
   });
 
@@ -298,16 +326,12 @@ describe('config split: core validation vs framework loading', () => {
     install(makeResizeConfig({ queue: false }));
     assert.equal(getResizeConfig().queue, false);
     resetAppInstance();
-    install(
-      makeResizeConfig({
-        queue: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 5000 } },
-      }),
-    );
+    install(makeResizeConfig({ queue: { maxAttempts: 0 } }));
     assert.throws(
       () => getResizeConfig(),
       (err: unknown) =>
         err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+        err.code === 'RESIZE_CONFIG_QUEUE_INVALID',
     );
   });
 

@@ -1,23 +1,22 @@
-// Lock keys and owners. A dispatch lock is held per preview identity of a media while that variant
-// is queued, so concurrent reads queue it once; the worker also holds it for a cooldown after the
-// variant's task is dead-lettered. A worker lock is held while one worker renders the variant.
+// The gate lock key. At most one task is active per Resizer, media, pipeline and queue: that is
+// the gate. A task queue with gatesByTask keeps the gate in its own task rows and takes no lock. On
+// a task queue without it (e.g. SqsTaskQueue) the gate is a lock in the Resizer's LockStore: the
+// Dispatcher takes it when it queues a task and hands its owner to the task, and the worker holds
+// it while the task is in flight, waiting for a retry, and for the cooldown after a dead-letter,
+// and releases it once the task completes. No other lock exists: the queue leases each task to one
+// worker at a time, and the media store keeps one row per preview identity.
 
 /**
- * The owner of every dispatch lock. The worker releases dispatch locks that a read took, possibly
- * in another process: when it skips a preview that is already stored, once it has rendered, and for
- * the dead-letter cooldown (release, then acquire for `lockTtlMs.failed`). An owner chosen by each
- * read would make those calls fail: the read's lock would stay until its TTL, and the cooldown
- * would shrink to the dispatch TTL even for errors that dead-letter at once. So all dispatch locks
- * share this owner, and only worker locks get a fresh random owner per acquire.
+ * The gate lock of one Resizer, queue, media and pipeline on a task queue without gatesByTask:
+ * while it is held, no other task is queued for them. Its owner travels with the task as
+ * `gateOwner`. Each part is URI-encoded, so a `:` inside a name or an id cannot make two of them
+ * share a key.
  */
-export const DISPATCH_LOCK_OWNER = 'resize:dispatch';
-
-/** The dispatch lock of one preview identity of a media: while held, reads do not queue it. */
-export function dispatchLockKey(mediaId: string, identity: string): string {
-  return `resize_dispatch:${mediaId}:${identity}`;
-}
-
-/** The worker lock of one preview identity of a media: one worker renders it at a time. */
-export function workerLockKey(mediaId: string, identity: string): string {
-  return `resize_worker:${mediaId}:${identity}`;
+export function gateKey(
+  resizer: string,
+  queue: string,
+  mediaId: string,
+  pipeline: string,
+): string {
+  return `resize_gate:${[resizer, queue, mediaId, pipeline].map(encodeURIComponent).join(':')}`;
 }

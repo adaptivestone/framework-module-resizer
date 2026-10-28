@@ -1,5 +1,5 @@
-// A task queue's timing: its own keys over the defaults, the default dead-letter cooldown, and
-// validation, read once per queue instance.
+// A task queue's timing: its own keys over the defaults, validated and read once per queue
+// instance. Lock TTLs are not timing: they moved to the Resizer's coordination.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { ResizeConfigError } from './errors.ts';
@@ -21,52 +21,42 @@ describe('timingOf', () => {
     assert.equal(reads, 1);
   });
 
-  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes, also beside set lock TTLs', () => {
-    assert.equal(timingOf(new MemoryTaskQueue()).lockTtlMs.failed, 600_000);
-    const own = timingOf(
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
-      }),
-    );
-    assert.deepEqual(own.lockTtlMs, {
-      dispatch: 1000,
-      worker: 1000,
-      failed: 600_000,
-    });
-    const set = timingOf(
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 5000 } },
-      }),
-    );
-    assert.equal(set.lockTtlMs.failed, 5000);
-  });
-
-  for (const failed of [0, -1, 1.5, '600000', null]) {
-    test(`lockTtlMs.failed ${JSON.stringify(failed)} is a config error`, () => {
-      const tasks = new MemoryTaskQueue({
-        timing: {
-          lockTtlMs: { dispatch: 1000, worker: 1000, failed } as never,
-        },
-      });
-      assert.throws(
-        () => timingOf(tasks),
-        (err: unknown) =>
-          err instanceof ResizeConfigError &&
-          err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
-          /lockTtlMs\.failed/.test(err.message),
-      );
-    });
-  }
-
-  test('invalid timing is a config error (worker lock must fit the lease)', () => {
+  test("lockTtlMs in a task queue's timing is RESIZE_CONFIG_REMOVED_KEY, pointing to coordination", () => {
+    // Built outside assert.throws: the queue takes any timing, the core rejects it when it reads it.
     const tasks = new MemoryTaskQueue({
-      timing: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 5000 } },
+      timing: { lockTtlMs: { failed: 1 } } as never,
     });
     assert.throws(
       () => timingOf(tasks),
       (err: unknown) =>
         err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+        err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+        /`lockTtlMs`/.test(err.message) &&
+        /coordination/.test(err.message) &&
+        /lockTtlMs\.failed → cooldownMs/.test(err.message) &&
+        /lockTtlMs\.dispatch → gateTtlMs/.test(err.message) &&
+        /drop lockTtlMs\.worker/.test(err.message),
+    );
+  });
+
+  test('the filled timing has no lock TTLs', () => {
+    assert.deepEqual(Object.keys(timingOf(new MemoryTaskQueue())).sort(), [
+      'idlePollMs',
+      'leaseMs',
+      'maxAttempts',
+      'retryBackoffMs',
+      'taskTimeoutMs',
+    ]);
+  });
+
+  test('invalid timing is a config error naming the key', () => {
+    const tasks = new MemoryTaskQueue({ timing: { leaseMs: 0 } });
+    assert.throws(
+      () => timingOf(tasks),
+      (err: unknown) =>
+        err instanceof ResizeConfigError &&
+        err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID' &&
+        /leaseMs/.test(err.message),
     );
   });
 });
