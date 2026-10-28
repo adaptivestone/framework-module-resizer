@@ -322,20 +322,28 @@ export type FrameworkStorageConfig =
   | FrameworkLocalStorageConfig
   | FrameworkS3StorageConfig;
 
-// One named queue: where its tasks wait, and that queue's timing (any QueueTimingOptions key; the
-// rest default). A framework host defines each queue once, in `queues` of src/config/resize.ts.
+/**
+ * One named queue: where its tasks wait, and that queue's timing (any QueueTimingOptions key; the
+ * rest default). A framework host defines each queue once, in `queues` of src/config/resize.ts.
+ */
+export type QueueConfig = DatabaseQueueConfig | SqsQueueConfig;
+/** A queue whose tasks wait in the app's ResizeTask model, with that queue's timing. */
 export interface DatabaseQueueConfig extends Partial<QueueTimingOptions> {
-  driver: 'database'; // the app's queue over its ResizeTask model
+  /** The app's queue over its ResizeTask model. */
+  driver: 'database';
 }
+/** A queue whose tasks wait in its own SQS queue, with that queue's timing. */
 export interface SqsQueueConfig extends Partial<QueueTimingOptions> {
-  driver: 'sqs'; // SqsTaskQueue (needs @aws-sdk/client-sqs)
-  queueUrl: string; // this queue's own SQS queue
+  /** SqsTaskQueue (needs @aws-sdk/client-sqs). */
+  driver: 'sqs';
+  /** This queue's own SQS queue. */
+  queueUrl: string;
   deadLetterQueueUrl?: string;
-  waitTimeSeconds?: number; // long poll per claim; default 10
+  /** Long poll per claim; default 10. */
+  waitTimeSeconds?: number;
   region?: string;
   endpoint?: string;
 }
-export type QueueConfig = DatabaseQueueConfig | SqsQueueConfig;
 
 // A config file a framework host writes: `src/config/resize.ts`, or another Resizer's file
 // (`configName`). The image settings, `mediaModelName`, `storage` and `queue` belong to that
@@ -345,10 +353,15 @@ export type QueueConfig = DatabaseQueueConfig | SqsQueueConfig;
 export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   storage?: FrameworkStorageConfig; // required unless the code passes `storage`
-  // The queue name of this Resizer's tasks (a key of `queues`), or false for eager only. Missing:
-  // 'default' when `queues` has entries, else eager only.
+  /**
+   * The queue name of this Resizer's tasks (a key of `queues`), or false for eager only. Missing:
+   * 'default' when `queues` has entries, else eager only.
+   */
   queue?: string | false;
-  queues?: Record<string, QueueConfig>; // process-wide: every queue, by name
-  worker?: Partial<FrameworkWorkerConfig>; // process-wide; a missing key takes defaultWorkerOptions
-  coordination?: CoordinationOptions; // process-wide; default: defaultCoordination
+  /** Process-wide: every queue, by name. */
+  queues?: Record<string, QueueConfig>;
+  /** Process-wide; a missing key takes defaultWorkerOptions. */
+  worker?: Partial<FrameworkWorkerConfig>;
+  /** Process-wide; default: defaultCoordination. */
+  coordination?: CoordinationOptions;
 }

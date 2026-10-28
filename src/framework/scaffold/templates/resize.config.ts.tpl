@@ -26,11 +26,13 @@ export default {
   // 'database' driver keeps tasks in the scaffolded ResizeTask model. Create its indexes (the
   // gate index among them) through your migration process; the module never creates them.
   queues: { default: { driver: 'database' } },
-  // or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs), one SQS queue per name; beside
-  // SQS the framework Lock model holds one gate lock per Resizer, media, pipeline and queue.
-  // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }, // the defaults; see README "Coordination"
+  // or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs), one SQS queue per name;
+  // beside SQS, the framework Lock model holds a gate lock per Resizer, media, pipeline and queue.
+  // The coordination defaults (see README "Coordination"):
+  // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 },
   // enabled: true lets `npm run cli ResizeWorker` run; start it as its own process.
   worker: { ...defaultWorkerOptions, enabled: false },
 } satisfies FrameworkResizeConfig;
-// resize.<NODE_ENV>.ts holds only what it changes, so it ends with `satisfies Partial<FrameworkResizeConfig>`.
-// Likewise, a resize.ts that holds only the process-wide sections (no default Resizer) writes `satisfies Partial<FrameworkResizeConfig>`.
+// resize.<NODE_ENV>.ts holds only what it changes, so it ends with
+// `satisfies Partial<FrameworkResizeConfig>`. Likewise, a resize.ts that holds only the
+// process-wide sections (no default Resizer) writes `satisfies Partial<FrameworkResizeConfig>`.

@@ -871,6 +871,18 @@ test("a file without queue uses 'default'; without a 'default' entry that is RES
       "resize config: Resizer 'listings' queues to 'nope', which `queues` in src/config/resize.ts does not define — add queues.nope, set `queue` to a defined name, or queue: false for eager only",
     ),
   );
+  // A name from the `queueName` option: the fix names the option (it wins over the file).
+  const byOption = new FrameworkResizer({
+    name: 'byOption',
+    queueName: 'nope',
+  });
+  await assert.rejects(
+    () => byOption.ready(),
+    configError(
+      'RESIZE_CONFIG_QUEUE_UNKNOWN',
+      "resize config: Resizer 'byOption' queues to 'nope', which `queues` in src/config/resize.ts does not define — add queues.nope, set `queueName` to a defined name, or pass tasks: false for eager only",
+    ),
+  );
   resetResizerForTests();
   resetAppInstance();
 
@@ -925,7 +937,7 @@ test('without queues a Resizer is eager only; queue: false is eager only beside 
   assert.ok(listings.tasks instanceof MongoTaskQueue);
 });
 
-test('tasks from code never read queues: an undefined queue name in the file is no error', async () => {
+test('tasks from code never choose a lane from queues: an undefined queue name in the file is no error', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
@@ -945,7 +957,24 @@ test('tasks from code never read queues: an undefined queue name in the file is 
   resetResizerForTests();
   resetAppInstance();
 
-  // Not even a broken queues section is read (the coordination comes from code too).
+  // No resize.ts is needed: the lane comes from code, and a missing file has no coordination.
+  installApp({
+    resize: {},
+    resizeListings: makeResizeConfig({ storage: localStorage }),
+  });
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+    tasks: new MemoryTaskQueue(),
+  });
+  await listings.verify();
+  assert.equal(listings.queueName, 'default');
+  resetResizerForTests();
+  resetAppInstance();
+
+  // A present resize.ts is validated as a whole whenever it is read (Ruling S2b-6): the
+  // coordination comes from the same file, so a broken queues section still fails verify().
+  // Only with the coordination from code too is the process-wide part never read.
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
@@ -953,7 +982,16 @@ test('tasks from code never read queues: an undefined queue name in the file is 
       queues: { default: { driver: 'redis' } } as never,
     }),
   });
+  const broken = new FrameworkResizer({ tasks: new MemoryTaskQueue() });
+  await assert.rejects(
+    broken.verify(),
+    configError(
+      'RESIZE_CONFIG_INVALID',
+      '`queues.default` in src/config/resize.ts',
+    ),
+  );
   const coded = new FrameworkResizer({
+    name: 'coded',
     tasks: new MemoryTaskQueue(),
     coordination: {},
   });
@@ -1052,6 +1090,63 @@ test('backendKey: one database backend; SQS by region, endpoint, dead-letter que
     }),
     'sqs:["eu-west-1","http://localhost:4566","https://sqs.example/dead",20]',
   );
+});
+
+// In a child process, where the SQS driver has not been imported yet: its first import fails.
+test('a per-backend task queue whose build failed is built again on the next call', async () => {
+  const href = (path: string) =>
+    JSON.stringify(new URL(path, import.meta.url).href);
+  const { stdout } = await runNode(process.execPath, [
+    '--experimental-strip-types',
+    '--input-type=module',
+    '-e',
+    `
+      import { registerHooks } from 'node:module';
+      import { setAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
+      import { FrameworkResizer } from ${href('./resizer.ts')};
+      import { makeResizeConfig } from ${href('../testHelpers/resizeConfig.ts')};
+      let imports = 0;
+      registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (specifier === '../drivers/sqs.ts' && context.parentURL?.endsWith('/framework/queue.ts')) {
+            imports += 1;
+            if (imports === 1) {
+              throw Object.assign(new Error('the first import fails'), { code: 'ERR_TEST_TRANSIENT' });
+            }
+          }
+          return nextResolve(specifier, context);
+        },
+      });
+      const configs = {
+        resize: makeResizeConfig({
+          storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+          queues: { default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' } },
+        }),
+      };
+      setAppInstance({
+        getConfig: (name) => configs[name] ?? {},
+        getModel: () => ({ findById: async () => null }),
+        logger: { info() {}, warn() {}, error() {} },
+      });
+      const resizer = new FrameworkResizer();
+      const first = await resizer.ready().then(() => 'resolved', (err) => err.code);
+      await resizer.ready();
+      // A build that succeeded is kept: another Resizer on the backend shares it.
+      const other = new FrameworkResizer({ name: 'other' });
+      await other.ready();
+      console.log(JSON.stringify({
+        first,
+        imports,
+        queue: resizer.tasks.constructor.name,
+        shared: other.tasks === resizer.tasks,
+      }));
+    `,
+  ]);
+  const seen = JSON.parse(stdout);
+  assert.equal(seen.first, 'ERR_TEST_TRANSIENT');
+  assert.equal(seen.imports, 2);
+  assert.equal(seen.queue, 'SqsTaskQueue');
+  assert.equal(seen.shared, true);
 });
 
 test('resetResizerForTests forgets the per-backend task queues', async () => {

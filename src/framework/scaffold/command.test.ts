@@ -142,12 +142,21 @@ describe('runScaffold — default run', () => {
       '// coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }',
       'worker: { ...defaultWorkerOptions, enabled: false },',
       '} satisfies FrameworkResizeConfig;',
-      'a resize.ts that holds only the process-wide sections (no default Resizer) writes `satisfies Partial<FrameworkResizeConfig>`',
     ]) {
       const next = configSource.indexOf(part, at + 1);
       assert.ok(next > at, `${part} comes next`);
       at = next;
     }
+    // The closing comment after it, read as one text across its wrapped lines.
+    assert.ok(
+      configSource
+        .slice(at)
+        .replace(/\n\s*\/\/\s*/g, ' ')
+        .includes(
+          'a resize.ts that holds only the process-wide sections (no default Resizer) writes `satisfies Partial<FrameworkResizeConfig>`',
+        ),
+      'the closing comment says what a process-only resize.ts writes',
+    );
 
     // The template's effective config, mirrored here so it is checked by the resolvers.
     const scaffoldedConfig = {

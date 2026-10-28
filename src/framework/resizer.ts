@@ -214,8 +214,13 @@ function chooseLane(opts: {
       name === undefined
         ? ` (the default when ${where} sets no \`queue\`)`
         : '';
+    // The option wins over the file, so a name from it is fixed in the code.
+    const fix =
+      option === undefined
+        ? 'set `queue` to a defined name, or queue: false for eager only'
+        : 'set `queueName` to a defined name, or pass tasks: false for eager only';
     throw new ResizeConfigError(
-      `resize config: Resizer '${resizer}' queues to '${queueName}'${implied}, which \`queues\` in src/config/resize.ts does not define — add queues.${queueName}, set \`queue\` to a defined name, or queue: false for eager only`,
+      `resize config: Resizer '${resizer}' queues to '${queueName}'${implied}, which \`queues\` in src/config/resize.ts does not define — add queues.${queueName}, ${fix}`,
       { code: 'RESIZE_CONFIG_QUEUE_UNKNOWN' },
     );
   }

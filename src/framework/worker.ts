@@ -2,7 +2,7 @@
 // worker leaves to the host: the `worker.enabled` switch and Sharp tuning from `worker` in
 // src/config/resize.ts (process-wide: whatever files the process's Resizers read), graceful
 // shutdown on SIGTERM/SIGINT, and the app logger.
-import { ResizeSetupError } from '../errors.ts';
+import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
 import { listResizers } from '../resizer.ts';
 import { runWorker } from '../worker.ts';
 import { getApp } from './app.ts';
@@ -11,6 +11,13 @@ import { getProcessConfig } from './config.ts';
 export async function runResizeWorker(
   opts: { queue?: string } = {},
 ): Promise<void> {
+  // Removed with the CLI's --config: a JS caller passing it gets the fix, not a silent default.
+  if (Object.hasOwn(opts, 'configName')) {
+    throw new ResizeConfigError(
+      'resize worker: `configName` (the old `--config`) is removed — the worker reads `worker` and `queues` from src/config/resize.ts',
+      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+    );
+  }
   const app = getApp();
   const { worker } = getProcessConfig();
   if (worker.enabled === false) {

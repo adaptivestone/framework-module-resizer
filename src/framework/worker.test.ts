@@ -59,6 +59,30 @@ describe('runResizeWorker', () => {
     );
   });
 
+  test('configName (the old --config) is RESIZE_CONFIG_REMOVED_KEY, before any config is read', async () => {
+    const asked: string[] = [];
+    setAppInstance({
+      getConfig: (name: string) => {
+        asked.push(name);
+        return {};
+      },
+      getModel: () => undefined,
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    await assert.rejects(
+      runResizeWorker({ configName: 'x' } as never),
+      (err: Error & { code?: string }) => {
+        assert.equal(err.code, 'RESIZE_CONFIG_REMOVED_KEY');
+        assert.equal(
+          err.message,
+          'resize worker: `configName` (the old `--config`) is removed — the worker reads `worker` and `queues` from src/config/resize.ts',
+        );
+        return true;
+      },
+    );
+    assert.deepEqual(asked, []);
+  });
+
   test('names the command fix when the worker process built no Resizer', async () => {
     installApp(true);
     await assert.rejects(
