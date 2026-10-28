@@ -238,8 +238,9 @@ export class Reader {
    * Pre-warm the catalog at UPLOAD: queue every missing variant without blocking on image work,
    * and report each requested variant (ready / accepted / not required / unconfirmed, with task
    * receipts and issues): every missing identity is either confirmed by a task receipt or
-   * explicit. A task already in flight for the media and pipeline confirms only the variants it
-   * holds (the queue's findActive() reports them); a held gate lock never counts as queued. Uses
+   * explicit. A task already in flight for the media, pipeline and queue confirms only the
+   * variants it holds (the queue's findActive() reports them); a held gate lock never counts as
+   * queued. Uses
    * the read path's `resolveSizes` / `beforeEnqueue` waterfalls. NEVER throws: an upload
    * must not fail because pre-warming hiccuped, so an unexpected error becomes
    * `status: 'incomplete'` with a RESIZE_ENQUEUE_INTERNAL_ERROR issue.

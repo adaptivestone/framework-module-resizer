@@ -1,8 +1,8 @@
 // The worker's task handler (processTask) inside the worker loop: a media error thrown while
 // reading the source reaches the retry policy unwrapped, so an unusable source is dead-lettered
 // on its first delivery instead of being downloaded and decoded again on every retry. After a
-// dead-letter the gate of its media and pipeline is held for the cooldown, so reads stop queueing
-// the same failing work. runWorker serves only the Resizers it starts with, claims only their tasks
+// dead-letter the gate of its media, pipeline and queue is held for the cooldown, so reads stop
+// queueing the same failing work. runWorker serves only the Resizers it starts with, claims only their tasks
 // on a task queue that filters claims, and runs each task with its own Resizer's coordination.
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
@@ -1146,7 +1146,7 @@ describe('dead-letter cooldown', () => {
     };
   }
 
-  test('after a dead-letter on a queue that gates by task, reads queue nothing for that media and pipeline until cooldownMs ends', async () => {
+  test('after a dead-letter on a queue that gates by task, reads queue nothing for that media, pipeline and queue until cooldownMs ends', async () => {
     let now = 0;
     const t = setup(undefined, MemoryTaskQueue, {
       now: () => now,
@@ -1172,7 +1172,7 @@ describe('dead-letter cooldown', () => {
     assert.equal(t.tasks.rows.length, 3, 'queued again once the cooldown ends');
   });
 
-  test('after a dead-letter on a queue without gatesByTask, reads queue nothing for that media and pipeline until cooldownMs ends', async () => {
+  test('after a dead-letter on a queue without gatesByTask, reads queue nothing for that media, pipeline and queue until cooldownMs ends', async () => {
     let now = 0;
     const t = setup(
       clockLocks(() => now),

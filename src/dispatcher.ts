@@ -7,9 +7,9 @@
 // held. Beside a queue without it (SQS), the Dispatcher takes the gate lock with a fresh owner for
 // coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the worker then holds
 // that lock until the task ends. When the queue does not say it stored the task, the lock is
-// shortened to one lease, or gateTtlMs when that is shorter (see #dispatch). The read path never throws and counts only an added
-// task; prewarm accepts only what the new task, or the active one, holds. A Dispatcher needs only
-// the task queue, the lock store (beside a queue without gatesByTask), the coordination, the
+// shortened to one lease, or gateTtlMs when that is shorter (see #dispatch). The read path never
+// throws and counts only an added task; prewarm accepts only what the new task, or the active one,
+// holds. A Dispatcher needs only the task queue, the lock store (beside a queue without gatesByTask), the coordination, the
 // queue's lease, its Resizer's name and a logger.
 import type { LockStore } from './contracts/locks.ts';
 import type {
@@ -122,8 +122,8 @@ export class Dispatcher {
   /**
    * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead): queue the missing
    * variants, one per identity, as one task. Returns the number of variants in the task it added;
-   * 0 when nothing was added: a task of this media and pipeline is in flight, its gate lock is
-   * held, or the add or the lock failed (logged). resolve() ignores the count. Never throws.
+   * 0 when nothing was added: a task of this media, pipeline and queue is in flight, its gate lock
+   * is held, or the add or the lock failed (logged). resolve() ignores the count. Never throws.
    */
   async enqueue(req: DispatchRequest): Promise<number> {
     const { logger } = this.#deps;
@@ -260,7 +260,8 @@ export class Dispatcher {
   }
 
   /**
-   * One dispatch of `variants` (canonical, one per identity) for the request's media and pipeline.
+   * One dispatch of `variants` (canonical, one per identity) for the request's media, pipeline and
+   * queue.
    * On a queue with gatesByTask it is one `add`. Without it: acquire the gate lock with a fresh
    * owner for gateTtlMs, then `add` the task carrying that owner. The lock, by outcome:
    * - held by another request, or the acquire failed: this call never had it;

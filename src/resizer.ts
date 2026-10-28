@@ -50,8 +50,8 @@ import { Uploader } from './uploader.ts';
 // Constructor options. `storage` and `media` are required — both modes need them, so a missing
 // driver is a boot-time type/throw error, not a runtime degradation. `tasks` is optional
 // (eager-only hosts omit it), and `locks` is required beside a task queue without gatesByTask
-// (e.g. SqsTaskQueue): such a queue cannot keep the gate of a media and pipeline itself, so the
-// gate is a lock in this store.
+// (e.g. SqsTaskQueue): such a queue cannot keep the gate of a media, pipeline and queue itself, so
+// the gate is a lock in this store.
 // ---------------------------------------------------------------------------
 
 export interface ResizerOptions {
@@ -64,8 +64,8 @@ export interface ResizerOptions {
   storage: ResizeStorage | LazyPart<ResizeStorage>; // REQUIRED: files (originals, previews)
   media: MediaStore | LazyPart<MediaStore>; // REQUIRED: media documents and their previews
   // Locks for queued work, e.g. mongoParts(…).locks. Required beside a task queue without
-  // gatesByTask, which takes one gate lock per media and pipeline it queues; eager-only hosts may
-  // omit it.
+  // gatesByTask, which takes one gate lock per media, pipeline and queue it queues; eager-only
+  // hosts may omit it.
   locks?: LockStore | LazyPart<LockStore | undefined>;
   // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. mongoParts(…).tasks or
   // an SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
@@ -127,7 +127,7 @@ const mediaRequired = () =>
 
 const locksRequired = (name: string) =>
   new ResizeSetupError(
-    `resize: Resizer '${name}' has a task queue without gatesByTask (e.g. SqsTaskQueue) but no \`locks\` — it takes one gate lock per media and pipeline it queues (e.g. the locks of mongoParts(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
+    `resize: Resizer '${name}' has a task queue without gatesByTask (e.g. SqsTaskQueue) but no \`locks\` — it takes one gate lock per media, pipeline and queue it queues (e.g. the locks of mongoParts(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
     { code: 'RESIZE_LOCKS_REQUIRED' },
   );
 
@@ -549,7 +549,7 @@ export class Resizer {
    * Pre-warm at upload: queue every missing variant of the catalog without waiting for image work,
    * so the previews are usually ready by the first read. Reports each variant (ready / accepted /
    * not required / unconfirmed, with task receipts and issues). A task already in flight for the
-   * media and pipeline is reported, not counted as queued: only the variants it holds are
+   * media, pipeline and queue is reported, not counted as queued: only the variants it holds are
    * accepted, and the rest are RESIZE_TASK_IN_FLIGHT; a held gate lock never counts as queued.
    * NEVER throws (same guarantee as `resolve`): an internal error is `status: 'incomplete'`.
    */

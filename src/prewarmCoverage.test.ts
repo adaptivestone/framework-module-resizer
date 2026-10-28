@@ -82,7 +82,7 @@ function locks(
   return { lockStore, acquired, extended, released };
 }
 
-// The add result of a queue whose active task of this media and pipeline holds the gate.
+// The add result of a queue whose active task of this media, pipeline and queue holds the gate.
 const inFlight = async (): Promise<TaskAddResult> => ({
   status: 'in-flight',
   taskId: 'active-1',

@@ -98,8 +98,9 @@ test('the worker loop logs only through logNeverThrow', () => {
   }
 });
 
-// One gate per Resizer, media and pipeline replaced the per-identity dispatch and worker locks:
-// the gate, the queue's lease and the media store's one row per identity deduplicate the work.
+// One gate per Resizer, media, pipeline and queue replaced the per-identity dispatch and worker
+// locks: the gate, the queue's lease and the media store's one row per identity deduplicate the
+// work.
 test('per-identity locks are gone: no source builds a dispatch or worker lock', () =>
   assert.deepEqual(
     sourceFiles().filter((f) =>

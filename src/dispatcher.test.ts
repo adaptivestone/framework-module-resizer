@@ -243,7 +243,7 @@ describe('a task queue that gates by task', () => {
     const { locks, calls } = recordingLocks();
     const d = makeDispatcher({ tasks, locks });
     assert.equal(await d.enqueue(requestFor([v300])), 1);
-    // Another variant of the same media and pipeline: the active task is the gate.
+    // Another variant of the same media, pipeline and queue: the active task is the gate.
     assert.equal(await d.enqueue(requestFor([v600])), 0);
     assert.equal(tasks.rows.length, 1);
     assert.equal(tasks.added.length, 2);
@@ -341,7 +341,7 @@ describe('a task queue without gatesByTask', () => {
     assert.match(gate.owner, /^[0-9a-f]{32}$/);
     assert.equal(tasks.added[0].gateOwner, gate.owner);
     assert.equal(gate.expiresAt - now, coordination.gateTtlMs);
-    // While the gate lock is held, the media and pipeline get no other task.
+    // While the gate lock is held, the media, pipeline and queue get no other task.
     assert.equal(await d.enqueue(requestFor([v300])), 0);
     assert.equal(tasks.rows.length, 1);
     // Each dispatch takes its own owner token.
@@ -392,7 +392,7 @@ describe('a task queue without gatesByTask', () => {
         { owner: acquire.owner, expiresAt: now + leaseMs },
         label,
       );
-      // While it lasts, the media and pipeline get no other task.
+      // While it lasts, the media, pipeline and queue get no other task.
       tasks.add = PlainTaskQueue.prototype.add;
       assert.equal(await d.enqueue(requestFor([v300])), 0, label);
       assert.equal(tasks.rows.length, 0, label);

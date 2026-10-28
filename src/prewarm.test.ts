@@ -19,7 +19,7 @@ import type {
 
 // ---------------------------------------------------------------------------
 // Harness — a core Resizer with a memory task queue without gatesByTask (the SQS shape), so each
-// prewarm takes the gate lock of its media and pipeline in the lock store.
+// prewarm takes the gate lock of its media, pipeline and queue in the lock store.
 // ---------------------------------------------------------------------------
 
 function installFakeApp() {
@@ -201,8 +201,8 @@ describe('prewarm — queue', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    // Another media: the gate is per Resizer, media and pipeline, whatever the queue, so the task
-    // of m1 would hold it.
+    // Another media and queue: each gets its own task (the gate is per Resizer, media, pipeline and
+    // queue).
     await r.prewarm({
       media: { id: 'm2', original },
       sizes: [{ width: 100, height: 100 }],
@@ -334,7 +334,7 @@ describe('prewarm — SVG original uses the normal queue', () => {
     });
     assert.equal(accepted.length, 2);
     assert.equal(calls.length, 1);
-    assert.equal(acquired.length, 1); // one gate lock for the media and pipeline
+    assert.equal(acquired.length, 1); // one gate lock for the media, pipeline and queue
   });
 
   test('SVG detected via original.format === "svg" is added to the task queue too', async () => {

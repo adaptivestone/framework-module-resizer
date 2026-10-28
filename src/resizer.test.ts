@@ -519,7 +519,7 @@ describe('ports', () => {
     e instanceof ResizeSetupError &&
     e.code === 'RESIZE_LOCKS_REQUIRED' &&
     /SqsTaskQueue/.test(e.message) &&
-    /one gate lock per media and pipeline/.test(e.message) &&
+    /one gate lock per media, pipeline and queue/.test(e.message) &&
     /FrameworkResizer/.test(e.message) &&
     /mongoParts/.test(e.message);
 

@@ -288,8 +288,8 @@ export interface CoordinationOptions {
   // until a worker starts the task and extends it per lease (on a task queue without its own gate,
   // e.g. SQS); a task given back is held for it again. Raise it when tasks wait longer.
   gateTtlMs?: number;
-  // default 600000 — after a task is dead-lettered, no new task for that media and pipeline is
-  // queued for this long.
+  // default 600000 — after a task is dead-lettered, no new task for that media, pipeline and
+  // queue is queued for this long.
   cooldownMs?: number;
 }
 

@@ -89,7 +89,8 @@ test('MemoryTaskQueue gates by task: one active task per Resizer, media, pipelin
     status: 'added',
     taskId: 'task-1',
   });
-  // Another request for the same media and pipeline waits for the active task, whatever it asks.
+  // Another request for the same media, pipeline and queue waits for the active task, whatever it
+  // asks.
   assert.deepEqual(
     await tasks.add(
       newTask({

@@ -1269,7 +1269,7 @@ describe('the gate under concurrent reads (MongoDB)', () => {
       await tasks.fail(leased, { retryAt: new Date(Date.now() + 60_000) }, 'x'),
       true,
     );
-    // Ten reads, one of them of a new size: the gate is per media and pipeline.
+    // Ten reads, one of them of a new size: the gate is per media, pipeline and queue.
     await Promise.all([
       ...Array.from({ length: 9 }, () => read()),
       read([{ width: 20, height: 20 }]),

@@ -1,7 +1,7 @@
 // The gate, end to end through Resizer.resolve() and runWorker(): at most one task is active per
 // Resizer, media, pipeline and queue. However many reads of a cold media arrive at once, one task
-// is queued; while that task waits for a retry, reads queue nothing for its media and pipeline, not
-// even for a new size. A task on another queue never blocks them. A task queue with gatesByTask
+// is queued; while that task waits for a retry, reads queue nothing for its media, pipeline and
+// queue, not even for a new size. A task on another queue never blocks them. A task queue with gatesByTask
 // (MemoryTaskQueue, like the database queue) keeps the gate in its task rows; beside one without it
 // (PlainTaskQueue, the SQS shape) the gate is a lock that the worker holds through the backoff and
 // releases once the task completes.
@@ -132,7 +132,7 @@ test('1000 concurrent reads of a cold media create one task (a queue without gat
   assert.equal(locks.entry(key)?.owner, tasks.rows[0].task.gateOwner);
 });
 
-test('a task in retry backoff blocks new tasks for its media and pipeline', async () => {
+test('a task in retry backoff blocks new tasks for its media, pipeline and queue', async () => {
   const tasks = new MemoryTaskQueue({
     timing: { idlePollMs: 5, retryBackoffMs: { base: 60_000, max: 60_000 } },
   });

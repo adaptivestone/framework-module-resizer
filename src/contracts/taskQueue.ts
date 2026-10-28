@@ -12,9 +12,9 @@ import type {
 } from '../types.d.ts';
 
 /**
- * A task to store: variants of one media and pipeline, for one Resizer. `gateOwner` is set only
- * for a queue without `gatesByTask`; such a queue stores it with the task and hands it back from
- * `claim()`.
+ * A task to store: variants of one media and pipeline, for one Resizer, on one queue. `gateOwner`
+ * is set only for a queue without `gatesByTask`; such a queue stores it with the task and hands it
+ * back from `claim()`.
  */
 export interface NewTask {
   resizer: string;
