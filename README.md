@@ -95,9 +95,11 @@ reuses your own S3 client, `queueName: 'bulk'` sends the Resizer's tasks to anot
 `queues`, and `tasks: false` keeps a Resizer eager whatever the config says. A task queue passed as
 `tasks` skips only the choice of the Resizer's queue from `queues` (its queue is the `queueName`
 option, else the file's `queue`, else `'default'`, and `verify()` checks that the task queue serves
-it); a `src/config/resize.ts` that exists is still read and validated as a whole for `worker` and
-`coordination`, so a broken `queues` there fails `verify()` unless `coordination` is passed in code
-too.
+it); a `src/config/resize.ts` that exists is still read for its `coordination` (`worker` belongs to
+the worker process) and validated as a whole, so a broken `queues` or `worker` section there fails
+`verify()` while the Resizer's calls run in the degraded mode (see [Config
+reference](#config-reference)). Passing `coordination` in code too keeps the file from being read at
+all.
 
 Add `...resizeMediaSchemaFragment` (from `…/framework.js`) to your media model's schema, then:
 

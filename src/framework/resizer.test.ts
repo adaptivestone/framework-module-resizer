@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { afterEach, test } from 'node:test';
+import { afterEach, mock, test } from 'node:test';
 import { promisify } from 'node:util';
 import {
   resetAppInstance,
@@ -27,7 +27,7 @@ import {
 } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
-import type { QueueConfig } from '../types.d.ts';
+import type { Preview, QueueConfig } from '../types.d.ts';
 import { getProcessConfig } from './config.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
@@ -1034,13 +1034,21 @@ test('with tasks in code, a broken process section is the degraded mode: stored 
     .png()
     .toBuffer();
   const tasks = new MemoryTaskQueue();
+  // The media store holds the rows generate() writes, and loads them back for invalidate().
+  const stored = new Map<string, Preview[]>();
+  const store = fakeMedia({
+    previews: stored,
+    load: async (id) =>
+      stored.has(id) ? { id, previews: [...(stored.get(id) ?? [])] } : null,
+  });
+  const replace = mock.method(store, 'replacePreviews');
   const r = new FrameworkResizer({
     storage: {
       download: async () => red,
       upload: async ({ key }) => ({ key }),
       publicUrl: () => '',
     },
-    media: fakeMedia(),
+    media: store,
     tasks,
   });
   await r.ready();
@@ -1061,6 +1069,7 @@ test('with tasks in code, a broken process section is the degraded mode: stored 
   });
   assert.equal(created.length, 1);
   assert.equal(failed, 0);
+  assert.equal(stored.get('m1')?.length, 1);
 
   const { decision } = await r.resolve({
     media,
@@ -1076,7 +1085,9 @@ test('with tasks in code, a broken process section is the degraded mode: stored 
   assert.equal(warmed.issues[0]?.retryable, false);
   assert.match(warmed.issues[0]?.message ?? '', /`worker\.enabled`/);
   assert.deepEqual(tasks.added, []);
-  assert.deepEqual(await r.invalidate({ media }), []);
+  assert.deepEqual(await r.invalidate({ media }), [created[0].storageRef]);
+  assert.equal(replace.mock.callCount(), 1);
+  assert.deepEqual(stored.get('m1'), []);
 
   await assert.rejects(
     r.verify(),

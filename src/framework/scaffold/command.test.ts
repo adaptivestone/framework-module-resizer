@@ -699,8 +699,17 @@ describe('runScaffold — --check', () => {
       assert.match(out, /ok\s+src\/config\/resize\.ts/);
       assert.match(
         out,
-        /drift\s+src\/config\/resize\.production\.ts — uses the old config shape/,
+        /drift\s+src\/config\/resize\.production\.ts — uses the old config shape — define the queue in queues of src\/config\/resize\.ts \(or in this override\)/,
       );
+      // The scaffold never writes an override, so its hint never says to re-run it.
+      const line = out
+        .split('\n')
+        .find((l) => l.includes('resize.production.ts'));
+      assert.ok(
+        line?.includes('then delete the old queue: { … } object'),
+        line,
+      );
+      assert.doesNotMatch(line ?? '', /re-run resize-scaffold/);
     }
     await writeFile(
       join(root, production),

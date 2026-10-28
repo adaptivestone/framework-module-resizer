@@ -101,9 +101,10 @@ gets the full box its steps were written for. To hand the private original to it
    A `queueName` option is readable at once; a name from the config file only after
    `await resizer.ready()` or the first call (`RESIZE_NOT_READY` before). A `tasks` queue in code
    skips only the choice of the queue from `queues` (the name is `queueName`, else the file's
-   `queue`, else `'default'`); a `src/config/resize.ts` that exists is still validated as a whole,
-   so a broken `queues` there fails `verify()` unless `coordination` is passed in code too (its
-   calls then run in the degraded mode of step 4).
+   `queue`, else `'default'`); a `src/config/resize.ts` that exists is still read for its
+   `coordination` and validated as a whole, so a broken `queues` or `worker` section there fails
+   `verify()` while the Resizer's calls run in the degraded mode of step 4. Passing `coordination`
+   in code too keeps the file from being read at all.
 
    Without the framework: `new Resizer({ storage, media, locks?, tasks?, coordination?, queueName? })` from
    the main entry (`locks` is required only beside a task queue without `gatesByTask`, such as

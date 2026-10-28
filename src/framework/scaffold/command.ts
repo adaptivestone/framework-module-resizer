@@ -135,6 +135,10 @@ function isOldConfigShape(content: string): boolean {
 // into it. Another Resizer's `configName` file is not known here, so it is not checked.
 const CONFIG_OVERRIDE = /^resize\.[^.]+\.ts$/;
 
+// The scaffold never writes an environment override, so its fix is to edit it in place.
+const OLD_OVERRIDE_HINT =
+  "uses the old config shape — define the queue in queues of src/config/resize.ts (or in this override), e.g. queues: { default: { driver: 'sqs', queueUrl: '…' } }, set queue to its name, then delete the old queue: { … } object (CHANGELOG 0.3.0); only full-line // comments are skipped";
+
 const OLD_CONFIG_HINT =
   "uses the old config shape — define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run resize-scaffold and copy your settings back (only full-line // comments are skipped; a configName file of another Resizer is not checked)";
 
@@ -281,7 +285,7 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
     items.push({
       target: `${dirname(CONFIG)}/${file}`,
       validate: (c) => !isOldConfigShape(c),
-      hint: OLD_CONFIG_HINT,
+      hint: OLD_OVERRIDE_HINT,
     });
   }
 
