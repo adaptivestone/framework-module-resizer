@@ -338,8 +338,8 @@
   queue: from `add()` until the task completes) and `cooldownUntil` (a dead row keeps the gate
   until then), and the gate index: unique on `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }`
   with `partialFilterExpression: { active: true }`. The host creates the index through its
-  migration; `MongoTaskQueue.verify()` (so `resizer.verify()` and worker start) reads the indexes
-  and rejects with `ResizeSetupError` `RESIZE_MONGO_INDEX_MISSING` (naming the collection and the
+  migration; `MongoTaskQueue.verify()` (so `resizer.verify()` and worker start), now async (await
+  it when you call it yourself), reads the indexes and rejects with `ResizeSetupError` `RESIZE_MONGO_INDEX_MISSING` (naming the collection and the
   index) while it is missing, not unique, not partial on `active: true`, or the collection does not
   exist yet; the module never creates it. An ejected or hand-written model adds the two fields
   (`RESIZE_MONGO_MODEL_OUTDATED` without them). `MongoTaskQueue` sets `gatesByTask` and
