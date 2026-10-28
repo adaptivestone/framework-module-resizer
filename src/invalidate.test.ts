@@ -162,17 +162,22 @@ describe('invalidate', () => {
 
   test('a store without replacePreviews is RESIZE_MEDIA_REPLACE_MISSING; a wrong result is RESIZE_MEDIA_REPLACE_RESULT_INVALID', async () => {
     const { media } = seeded();
-    const load = async (id: string) => ({
-      id,
-      previews: [d1(), w1()],
-    });
+    const load = async (id: string) =>
+      id === 'gone' ? null : { id, previews: [d1(), w1()] };
     // A custom store written before replacePreviews existed.
     const oldStore = {
       loadMedia: load,
       appendPreviews: async (_id: string, previews: Preview[]) => previews,
     } as unknown as MediaStore;
+    const old = resizer(oldStore);
+    // A gone media, or nothing in scope, resolves [] before the store is checked.
+    assert.deepEqual(await old.invalidate({ media: { id: 'gone' } }), []);
+    assert.deepEqual(
+      await old.invalidate({ media, pipeline: 'no-such-pipeline' }),
+      [],
+    );
     await assert.rejects(
-      () => resizer(oldStore).invalidate({ media }),
+      () => old.invalidate({ media }),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_MEDIA_REPLACE_MISSING' &&
@@ -234,6 +239,35 @@ describe('invalidate', () => {
       (err: unknown) => err === loadFailure,
     );
     assert.equal(media.previews?.length, 5);
+  });
+
+  test("a caller's previews that cannot be changed still resolve with the removed refs and log one warning", async () => {
+    const { store, replace, media, stored } = seeded();
+    Object.freeze(media.previews);
+    const warnings: unknown[][] = [];
+    const r = new Resizer({
+      logger: {
+        info() {},
+        error() {},
+        warn(...args: unknown[]) {
+          warnings.push(args);
+        },
+      },
+      storage,
+      media: store,
+      pipelines: { wm: {} },
+    });
+
+    // The rows are gone from the store, so the refs are the host's only record of the objects.
+    const refs = await r.invalidate({ media, pipeline: 'wm' });
+
+    assert.deepEqual(refs, [w1().storageRef]);
+    assert.equal(replace.mock.callCount(), 1);
+    assert.deepEqual(refsOf(stored()), refsOf([d1(), d2(), l1(), x0()]));
+    assert.equal(media.previews?.length, 5);
+    assert.equal(warnings.length, 1);
+    assert.match(String(warnings[0][0]), /\bmedia m1\b/);
+    assert.doesNotMatch(String(warnings[0][0]), /\n/);
   });
 
   test('invalidate works on an eager-only Resizer and for an unregistered pipeline', async () => {

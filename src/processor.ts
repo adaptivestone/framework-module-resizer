@@ -272,7 +272,7 @@ export class Processor {
    * be registered, so the rows of a renamed pipeline can still be removed.
    */
   async invalidate(opts: InvalidateOpts): Promise<StorageRef[]> {
-    const { media: mediaStore, name } = this.#deps;
+    const { logger, media: mediaStore, name } = this.#deps;
     const mediaId = requireMediaId(opts.media);
     const media = await mediaStore.loadMedia(mediaId);
     if (!media) {
@@ -304,15 +304,24 @@ export class Processor {
         { code: 'RESIZE_MEDIA_REPLACE_RESULT_INVALID' },
       );
     }
-    // Off the caller's in-memory doc too, so a same-request resolve() does not serve the rows.
-    const previews = opts.media.previews;
-    if (Array.isArray(previews)) {
-      for (let i = previews.length - 1; i >= 0; i -= 1) {
-        const identity = previews[i]?.identity;
-        if (typeof identity === 'string' && identities.has(identity)) {
-          previews.splice(i, 1);
+    // Off the caller's in-memory doc too, so a same-request resolve() does not serve the rows. The
+    // store has already removed them, so an array that cannot be changed (a frozen one, say) is
+    // only logged: the refs are the host's only record of the removed objects.
+    try {
+      const previews = opts.media.previews;
+      if (Array.isArray(previews)) {
+        for (let i = previews.length - 1; i >= 0; i -= 1) {
+          const identity = previews[i]?.identity;
+          if (typeof identity === 'string' && identities.has(identity)) {
+            previews.splice(i, 1);
+          }
         }
       }
+    } catch (err) {
+      logger.warn(
+        `resize: invalidate removed previews of media ${mediaId} from the media store but could not take them off the caller's media.previews, so a same-request resolve() may still serve them`,
+        err,
+      );
     }
     return result.removed.map((row) => row.storageRef);
   }
