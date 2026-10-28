@@ -338,7 +338,7 @@ middleware on the media model also sees that call and must accept an array updat
 first cast with the model's `castObject` when it has one (Mongoose's `Model.castObject`: strict rows
 lose the keys they do not declare, loose rows (`strict: false`) keep them, and a value it cannot
 cast rejects with Mongoose's `ValidationError` before anything is written; `storageRef` and
-`filters` are stored as given (cast or not)); without it they are written as given, minus their
+`filters` are stored as given, cast or not); without it they are written as given, minus their
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
 sub-documents without `identity`, `origin` or `encodeSig` (a mixed or plain `previews` array, or

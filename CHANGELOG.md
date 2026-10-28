@@ -120,7 +120,7 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`,
   after casting the rows with the model's optional `castObject` (Mongoose's `Model.castObject`:
   strict rows lose the keys they do not declare, loose rows (`strict: false`) keep them;
-  `storageRef` and `filters` are stored as given (cast or not); a value it cannot cast, such as
+  `storageRef` and `filters` are stored as given, cast or not; a value it cannot cast, such as
   `bytes: 'abc'`, rejects with Mongoose's `ValidationError` before anything is written). Without
   `castObject` the rows are written as given, minus their `undefined` top-level keys. A
   `findOneAndUpdate` middleware on the media model also sees that call, so it must accept an array

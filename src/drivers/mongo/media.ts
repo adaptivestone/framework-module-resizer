@@ -152,7 +152,10 @@ function withOpaqueValues(cast: Preview[], rows: Preview[]): Preview[] {
     if (!row) {
       return castRow;
     }
-    const restored = { ...castRow, storageRef: row.storageRef };
+    const restored: Preview = { ...castRow };
+    if (Object.hasOwn(row, 'storageRef')) {
+      restored.storageRef = row.storageRef;
+    }
     if (Object.hasOwn(row, 'filters')) {
       restored.filters = row.filters;
     }
