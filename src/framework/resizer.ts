@@ -137,10 +137,16 @@ export class FrameworkResizer extends Resizer {
             : async () => gateLockStore(await configQueue())),
       ...(tasks === false ? {} : { tasks: tasks ?? configQueue }),
       // Read only beside a task queue, when the core sets it up; the core validates it (a file
-      // without the section gives {}: the defaults).
+      // without the section gives {}: the defaults; any other value, null too, is validated as
+      // it is).
       coordination:
         coordination ??
-        (explicit ? explicit.coordination : () => read().coordination ?? {}),
+        (explicit
+          ? explicit.coordination
+          : () => {
+              const own = read().coordination;
+              return own === undefined ? {} : own;
+            }),
     });
     // Registered once constructed (a rejected name or config registers nothing).
     if (tasks === undefined) {

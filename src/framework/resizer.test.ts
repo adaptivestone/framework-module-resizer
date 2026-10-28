@@ -507,6 +507,24 @@ test("the config file's coordination reaches the Resizer, and the option wins", 
   assert.equal(taskCoordinationOf(explicit).cooldownMs, 77);
 });
 
+test("a config file's coordination: null is validated, not read as the defaults", async () => {
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queue: { driver: 'database' },
+      coordination: null as never,
+    }),
+  });
+  const r = new FrameworkResizer();
+  await assert.rejects(
+    () => r.verify(),
+    (err: unknown) =>
+      err instanceof ResizeConfigError &&
+      err.code === 'RESIZE_CONFIG_COORDINATION_INVALID' &&
+      /got null/.test(err.message),
+  );
+});
+
 test('a broken config file fails as itself, before the task queue is set up: nothing is logged about the queue', async () => {
   const { logger } = installApp({
     resize: makeResizeConfig({
