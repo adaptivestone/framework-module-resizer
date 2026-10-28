@@ -711,7 +711,7 @@ describe('prewarm — issues describe only what stays unconfirmed', () => {
       {
         code: 'RESIZE_TASK_IN_FLIGHT',
         message:
-          'a task for this media and pipeline is active, or cooling down after a dead-letter; a read after it finishes queues these',
+          'a task for this media, pipeline and queue is active, or cooling down after a dead-letter; a read after it finishes queues these',
         retryable: true,
         previews: [taskPreview('webp')],
       },

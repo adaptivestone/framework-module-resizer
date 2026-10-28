@@ -80,12 +80,22 @@ test('only images.ts decides which stored rows count', () => {
 });
 
 // The host's logger is host code and may throw; the worker loop must survive that, so it logs only
-// through logNeverThrow, which falls back to the console.
+// through logNeverThrow, which falls back to the console. Optional calls (`logger?.error(`) and
+// references (`logger.error.bind`) count as direct too.
 test('the worker loop logs only through logNeverThrow', () => {
   const direct = ['consumer.ts', 'worker.ts'].filter((f) =>
-    /\blogger\.(info|warn|error)\(/.test(read(f)),
+    /\blogger\??\.(info|warn|error)\b/.test(read(f)),
   );
   assert.deepEqual(direct, []);
+  // The pattern itself: each of these forms is caught.
+  for (const call of [
+    'logger.error(',
+    'logger?.warn(',
+    'this.#deps.logger.info(',
+    'logger.error.bind(',
+  ]) {
+    assert.match(call, /\blogger\??\.(info|warn|error)\b/, call);
+  }
 });
 
 // One gate per Resizer, media and pipeline replaced the per-identity dispatch and worker locks:

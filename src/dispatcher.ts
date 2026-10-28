@@ -228,7 +228,7 @@ export class Dispatcher {
       case 'gate-held':
         return none(
           'RESIZE_ENQUEUE_LOCK_CONTENDED',
-          "the gate lock of this media and pipeline is held: another request queued it, or a dead task's cooldown runs",
+          "the gate lock of this media, pipeline and queue is held: a task of theirs is queued, running or waiting for a retry, or a dead task's cooldown runs",
         );
       case 'gate-failed':
         logger.error(
@@ -475,7 +475,7 @@ export class Dispatcher {
       result.issues.push({
         code: 'RESIZE_TASK_IN_FLIGHT',
         message:
-          'a task for this media and pipeline is active, or cooling down after a dead-letter; a read after it finishes queues these',
+          'a task for this media, pipeline and queue is active, or cooling down after a dead-letter; a read after it finishes queues these',
         retryable: true,
         previews: waiting,
       });

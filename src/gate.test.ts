@@ -1,9 +1,15 @@
 // The gate, end to end through Resizer.resolve() and runWorker(): at most one task is active per
 // Resizer, media, pipeline and queue. However many reads of a cold media arrive at once, one task
 // is queued; while that task waits for a retry, reads queue nothing for its media and pipeline, not
-// even for a new size. A task on another queue never blocks them. A task queue with gatesByTask (MemoryTaskQueue, like the database queue)
-// keeps the gate in its task rows; beside one without it (PlainTaskQueue, the SQS shape) the gate
-// is a lock that the worker holds through the backoff and releases once the task completes.
+// even for a new size. A task on another queue never blocks them. A task queue with gatesByTask
+// (MemoryTaskQueue, like the database queue) keeps the gate in its task rows; beside one without it
+// (PlainTaskQueue, the SQS shape) the gate is a lock that the worker holds through the backoff and
+// releases once the task completes.
+//
+// These in-memory scenarios prove the gate's logic, not its atomicity: MemoryTaskQueue checks and
+// stores in one synchronous step, so concurrent adds never interleave there. The proof under real
+// interleaving is the MongoDB twin, 'the gate under concurrent reads (MongoDB)' in
+// src/drivers/mongo/taskQueue.test.ts, against the real unique partial index.
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import sharp from 'sharp';
