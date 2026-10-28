@@ -10,7 +10,13 @@ import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask, TaskAddResult } from './contracts/taskQueue.ts';
 import { Dispatcher } from './dispatcher.ts';
-import { ResizeConfigError } from './errors.ts';
+import {
+  ResizeConfigError,
+  ResizeError,
+  ResizeNoOriginalError,
+  ResizeSetupError,
+  ResizeStorageError,
+} from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
@@ -308,6 +314,43 @@ describe('Reader', () => {
     assert.equal(advice(branded('ResizeStorageError')), true);
     // The class name alone, without the brand, is not this package's error.
     assert.equal(advice({ name: 'ResizeSetupError', message: 'm' }), true);
+  });
+
+  test('prewarmFailure honours retryable: false on any error of this package', () => {
+    const advice = (err: unknown) =>
+      prewarmFailure(err, []).issues[0].retryable;
+    assert.equal(
+      advice(new ResizeStorageError('m', { retryable: false })),
+      false,
+    );
+    assert.equal(advice(new ResizeError('m', { retryable: false })), false);
+    assert.equal(advice(new ResizeStorageError('m')), true);
+    // From a duplicate copy of the package: the brand and the field.
+    assert.equal(
+      advice({
+        [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
+        name: 'ResizeStorageError',
+        message: 'm',
+        retryable: false,
+      }),
+      false,
+    );
+    // Without the brand the field is not this package's advice.
+    assert.equal(advice({ name: 'X', message: 'm', retryable: false }), true);
+  });
+
+  test("prewarmFailure keeps a subclass's advice: a host's subclass of a setup or media error", () => {
+    const advice = (err: unknown) =>
+      prewarmFailure(err, []).issues[0].retryable;
+    class HostSetupError extends ResizeSetupError {}
+    class TenantSetupError extends HostSetupError {}
+    class HostMediaError extends ResizeNoOriginalError {}
+    class HostStorageError extends ResizeStorageError {}
+    assert.equal(new HostSetupError('m').name, 'HostSetupError');
+    assert.equal(advice(new HostSetupError('m')), false);
+    assert.equal(advice(new TenantSetupError('m')), false);
+    assert.equal(advice(new HostMediaError('m1')), false);
+    assert.equal(advice(new HostStorageError('m')), true);
   });
 });
 
