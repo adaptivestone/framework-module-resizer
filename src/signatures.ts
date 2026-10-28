@@ -21,7 +21,7 @@ function shortHash(text: string): string {
 /**
  * JSON with object keys sorted at every depth and `undefined` values dropped, so two equal
  * values always give one string whatever their key order. The value goes through JSON first, so
- * it is signed as it would be stored (a Date becomes its ISO string).
+ * it is signed by its JSON form.
  */
 export function canonicalJson(value: object): string {
   return JSON.stringify(

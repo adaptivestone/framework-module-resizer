@@ -4199,6 +4199,57 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
     assert.equal(appended[0].encodeSig, raw[0].encodeSig);
   });
 
+  test('origin signs the stored dimensions, not the measured pair, when the original has them', async () => {
+    // orientedJpeg measures 48×64 (EXIF orientation 6); the media stores 64×48 for it.
+    const ref = { key: 'uploads/orig' };
+    const stored = previewOrigin(ref, { width: 64, height: 48 });
+    const measured = previewOrigin(ref, { width: 48, height: 64 });
+    assert.notEqual(stored, measured);
+    const media = () =>
+      mediaDoc({ original: { storageRef: ref, width: 64, height: 48 } });
+    const sizes = [{ width: 10, height: 10 }];
+
+    const eager = rowDeps(orientedJpeg);
+    const { created } = await new Processor(eager.deps).generate({
+      media: media(),
+      sizes,
+      formats: ['jpeg'],
+    });
+    assert.equal(created[0].origin, stored);
+    assert.notEqual(created[0].origin, measured);
+    assert.equal(eager.appendCalls.length, 1);
+    assert.equal(eager.appendCalls[0].backfillDims, undefined);
+
+    const appendCalls: Array<{
+      previews: Preview[];
+      backfillDims?: { width: number; height: number };
+    }> = [];
+    const queued = rowDeps(orientedJpeg, {
+      media: fakeMedia({
+        load: async () => media(),
+        appendPreviews: async (_mediaId, previews, backfillDims) => {
+          appendCalls.push({ previews, backfillDims });
+          return previews;
+        },
+      }),
+    });
+    await new Processor(queued.deps).processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '10x10',
+            requestedWidth: 10,
+            requestedHeight: 10,
+          }),
+        ],
+      }),
+    );
+    assert.equal(appendCalls.length, 1);
+    assert.equal(appendCalls[0].previews[0].origin, stored);
+    assert.notEqual(appendCalls[0].previews[0].origin, measured);
+    assert.equal(appendCalls[0].backfillDims, undefined);
+  });
+
   test("a pipeline's version reaches encodeSig", async () => {
     const { deps, config } = rowDeps(redPng, {
       pipelines: new PipelineRegistry({ wm: { version: 'v2' } }),

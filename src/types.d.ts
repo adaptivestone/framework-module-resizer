@@ -83,10 +83,14 @@ export interface Preview {
   contentType: string;
   fit?: boolean; // true = uncropped "full"/contain variant (the `fit` token)
   // Recorded on every row from this release on; absent on rows written before.
-  bytes?: number; // the encoded preview's size
-  createdAt?: Date; // when the preview was stored
-  origin?: string; // previewOrigin of the original it was made from
-  encodeSig?: string; // encodeSignature of its format, settings and pipeline version
+  /** The encoded preview's size in bytes. */
+  bytes?: number;
+  /** When the preview was stored. */
+  createdAt?: Date;
+  /** A signature of the original it was made from (its storage ref and dimensions). */
+  origin?: string;
+  /** A signature of its format's encode settings and the pipeline version. */
+  encodeSig?: string;
 }
 
 export interface MediaLike {
