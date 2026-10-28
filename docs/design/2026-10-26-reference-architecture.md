@@ -222,8 +222,9 @@ task rows gain `startedAt` and `finishedAt`; observers receive `attempts`.
 **F9. Freshness on every preview, plus `invalidate`.** The identity string stays
 `resizer:pipeline:sizeKey:format:filterSig`. Each stored preview also records `origin` (a
 fingerprint of `original.storageRef` and its dimensions) and `encodeSig` (a hash of the format's
-encode options, `sharpen`, `flatten`, `maxSize`, `limits.resultDimension` and the pipeline's
-optional `version`). The read path treats a mismatch as missing; the worker's
+encode options and `flatten`, the `sharpen` flag of the row's fit mode, `animated` and
+`limits.animationFrames` for animated formats, `maxSize` for fit rows, `limits.resultDimension` and
+the pipeline's optional `version`). The read path treats a mismatch as missing; the worker's
 `replacePreviews` swaps the stale row for the new one. `resizer.invalidate({ media, pipeline? })`
 removes the rows and returns their `storageRef`s for the host to delete (deletion stays the
 host's job). Rows without the fields are stale.

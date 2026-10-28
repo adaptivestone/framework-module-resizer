@@ -22,9 +22,10 @@ those drivers with framework models and config.
 Queues are named (`'default'` unless set). A framework host defines each name once, in `queues`
 of `src/config/resize.ts`, with its own timing. There is one TaskQueue per backend (every
 `database` entry is one backend; SQS entries with the same `region`, `endpoint`,
-`deadLetterQueueUrl` and `waitTimeSeconds` are one), and each name is a lane on it. A Resizer's
-tasks go to its `queueName` (in a framework host, its config file's `queue`); a call may name
-another queue of the same backend.
+`deadLetterQueueUrl` and `waitTimeSeconds` are one: set `region` (and `endpoint`) on every SQS entry
+or on none — an omitted `region` and an explicit one equal to `AWS_REGION` count as two backends),
+and each name is a lane on it. A Resizer's tasks go to its `queueName` (in a framework host, its
+config file's `queue`); a call may name another queue of the same backend.
 
 Queued work has one gate per Resizer, media, pipeline and queue: at most one of their tasks is
 active (queued, running, waiting for a retry, or cooling down for `coordination.cooldownMs` after
@@ -101,7 +102,8 @@ gets the full box its steps were written for. To hand the private original to it
    `await resizer.ready()` or the first call (`RESIZE_NOT_READY` before). A `tasks` queue in code
    skips only the choice of the queue from `queues` (the name is `queueName`, else the file's
    `queue`, else `'default'`); a `src/config/resize.ts` that exists is still validated as a whole,
-   so a broken `queues` there fails `verify()` unless `coordination` is passed in code too.
+   so a broken `queues` there fails `verify()` unless `coordination` is passed in code too (its
+   calls then run in the degraded mode of step 4).
 
    Without the framework: `new Resizer({ storage, media, locks?, tasks?, coordination?, queueName? })` from
    the main entry (`locks` is required only beside a task queue without `gatesByTask`, such as
@@ -137,9 +139,11 @@ gets the full box its steps were written for. To hand the private original to it
    beside a queue without `gatesByTask`, invalid `timing`), or an invalid `coordination`, does not
    fail calls: it is logged once, reads serve stored previews and queue nothing, uploads and
    `generate()` work, and only `verify()`, `prewarm()` and worker start report it. For a
-   `FrameworkResizer`, invalid timing in a `queues` entry of `src/config/resize.ts` is still a
-   config error at the first call, like the rest of the file; its `coordination` section degrades
-   as above. The
+   `FrameworkResizer` that takes its task queue from the config file, invalid timing in a `queues`
+   entry of `src/config/resize.ts` (or a malformed `queues` or `worker` section) is still a config
+   error at the first call, like the rest of the file; its `coordination` section degrades as
+   above. With a task queue passed in code (and no `coordination` in code), the file is read only
+   for `coordination`, so any broken section of it degrades as above. The
    worker process imports it from the
    scaffolded `src/commands/ResizeWorker.ts` (`import '../resizer.ts'` plus a re-export of the
    module's command); keep that import if you edit the command.
@@ -185,11 +189,13 @@ gets the full box its steps were written for. To hand the private original to it
    uses one backend: moving only some queues to another backend in `resize.<NODE_ENV>.ts` (only
    `queues.default` to SQS, say) splits them there, and calls on the other backend's queues queue
    nothing (`RESIZE_QUEUE_NOT_SERVED`). Move all of a Resizer's queues together until routing
-   between backends ships; SQS entries with different dead-letter queues are different backends too.
-   Put environment-only changes in `resize.<NODE_ENV>.ts` (for example, S3 in
-   `resize.production.ts`); the framework merges that file field by field before this module
-   reads and validates the resolved config. Do not add a second runtime merge. When an
-   environment file switches the storage driver, set `publicBaseUrl` there too.
+   between backends ships; SQS entries with different dead-letter queues are different backends too,
+   so set `region` (and `endpoint`) on every SQS entry or on none — an omitted `region` and an
+   explicit one equal to `AWS_REGION` count as two backends. Put environment-only changes in
+   `resize.<NODE_ENV>.ts` (for example, S3 in `resize.production.ts`); the framework merges that
+   file field by field before this module reads and validates the resolved config. Do not add a
+   second runtime merge. When an environment file switches the storage driver, set `publicBaseUrl`
+   there too.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
    instead of hand-writing those fields (single source of truth for schema + types). It is
@@ -239,7 +245,9 @@ gets the full box its steps were written for. To hand the private original to it
    An ejected `ResizeTask` model (`--eject`) also declares `startedAt` and `finishedAt` (when the
    latest delivery started, and when the task completed or was dead-lettered). An older ejected
    model keeps working without them (the times are dropped), but `resize-scaffold --check` reports
-   it as drift: add both as `{ type: Date }`, or re-run `npx resize-scaffold --eject`.
+   it as drift: add both as `{ type: Date }`, or move `src/models/ResizeTask.ts` aside (or delete
+   it), re-run `npx resize-scaffold --eject`, then restore your customizations (the scaffold never
+   overwrites an existing file, so re-running `--eject` alone changes nothing).
 
    When upgrading from a version without the gate (0.2.x or a 0.3 pre-release build), deploy the
    API and the workers together, after the pending tasks have finished or been drained. Task rows
@@ -350,7 +358,9 @@ const { created, failed } = await getResizer().generate({
 No original throws `ResizeNoOriginalError`; every requested variant failing throws
 `ResizeGenerateError`. `created` is only this call; `failed > 0` means a partial success.
 `generate` also appends `created` onto `media.previews` (when persist is on) so a same-request
-`resolve({ media })` sees them.
+`resolve({ media })` sees them. Reload the media before saving it after `generate()` or
+`invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is
+marked modified, and saving the stale list would drop rows a worker stored since it was loaded).
 
 Errors: EVERY throw from this module extends `ResizeError`, so one check separates a module
 rejection from a sharp/S3/mongo failure. Subclasses say what to do — `ResizeSetupError` (wiring
@@ -396,7 +406,8 @@ const refs = await getResizer().invalidate({ media: fileDoc, pipeline: 'default'
 
 It removes only this Resizer's rows that carry an `identity`, in one write through
 `MediaStore.replacePreviews`, and drops them from `fileDoc.previews` too (when that array cannot
-be changed, it logs a warning and still returns the refs). Only an omitted
+be changed, it logs a warning and still returns the refs). Reload the media before saving it
+after `generate()` or `invalidate()`; the module wrote the rows itself. Only an omitted
 `pipeline` means every pipeline (`pipeline: null` matches nothing). It takes no gate: a task
 running for that media can store rows after it returns. A custom `MediaStore` must implement
 `replacePreviews(mediaId, identities, rows)` → `{ stored, removed }` (`verify()` rejects one
@@ -484,7 +495,7 @@ previews are not regenerated yet).
 | `RESIZE_MEDIA_APPEND_RESULT_INVALID` | a custom `MediaStore.appendPreviews` resolved with something other than an array — resolve with the previews it stored (`[]` when none) |
 | `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config file named in the message, or pass `storage` to `new FrameworkResizer()` |
 | `RESIZE_FS_PRIVATE_ROOT_PUBLIC` (`ResizeSecurityError`) when `LocalFsStorage` is constructed (from a config file: at first use or `verify()`) | `privateRootDir` is `rootDir` itself or inside it, so private originals would be served — put it outside `rootDir` (`storage.privateRootDir` in the config file), or leave it out for `rootDir` + `-private` |
-| `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` driver other than `'local'` or `'s3'`, a `queues` map that is not an object of names, a `queues` entry with a blank name or without driver `'database'` or `'sqs'`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), or image settings of the wrong type (`maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`) — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use) |
+| `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` driver other than `'local'` or `'s3'`, a `queues` map that is not an object of names, a `queues` entry with a blank name or without driver `'database'` or `'sqs'`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), an unknown `worker` key (e.g. a misspelled `sharpConcurency`), or image settings of the wrong type (`maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`) — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use) |
 | `RESIZE_CONFIG_UPLOAD_INVALID`, `RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID` or `RESIZE_CONFIG_UPLOAD_FORMATS_INVALID` | `upload` is not an object, `upload.maxBytes` is not a positive safe integer, or `upload.formats` is not a non-empty list of non-empty format ids — fix that key, e.g. spread the defaults' `upload` and change one value |
 | `RESIZE_NOT_READY` | host code read `resizer.storage` / `media` / `locks` / `tasks`, or a `resizer.queueName` that comes from the config file (or from a function), before the Resizer loaded them — `await resizer.ready()` first (the Resizer's methods do this themselves). A string `queueName` option is readable at once. `resizer.queue` is gone: read `resizer.queueName` |
 | `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`; framework hosts define queues in `queues` and keep `worker` in `src/config/resize.ts`; `worker.concurrency` (in a framework config file too) moves to the top-level `concurrency` |
@@ -495,8 +506,8 @@ previews are not regenerated yet).
 | `RESIZE_ENQUEUE_UNCONFIRMED` in `prewarm()` issues | `retryable: true` (even for an unregistered or outdated model): the task queue's `add()` resolved `unconfirmed`, so the queue did not confirm the task — on `MongoTaskQueue` a database error or a duplicate key on another unique index of the host's `ResizeTask` model (each logged), an unregistered `ResizeTask` model (logged), or an outdated one (`RESIZE_MONGO_MODEL_OUTDATED`, logged once; every add stays unconfirmed until it is fixed); on SQS a send that returned no `MessageId`. Fix the logged cause first, then call `prewarm()` again. `retryable: false`: a custom `TaskQueue` resolved a value in none of the `TaskAddResult` shapes (written for an older version, e.g. `{ taskId }`), logged once — resolve `{ status: 'added', taskId }`, `{ status: 'in-flight', taskId? }` or `{ status: 'unconfirmed' }` |
 | `RESIZE_MONGO_INDEX_MISSING` from `verify()` or at worker start, or the warning "reported a task in flight without its id" | the `ResizeTask` collection has no gate index — unique on exactly `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }` (or `{ active: { $eq: true } }`) — or does not exist yet, or an index on those keys lacks `unique` or that partial filter, or Mongoose's own index build (`autoIndex`) failed (the error's `cause`, e.g. duplicate active rows) (without the filter every add after a completed task is in flight with no id and nothing queues). Create it through your migration (e.g. `ResizeTask.createIndexes()` or `syncIndexes()`; drop a wrong index on those keys first); the module never creates indexes, and a worker on the framework CLI (`autoIndex` off) neither builds them nor waits for a build: create them before it starts (step 7) |
 | `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), the lock model (the framework's `Lock`, needed only beside a task queue without `gatesByTask`, or the model passed to `MongoLockStore`), or the media model of a plain `MongoMediaStore` (framework hosts get `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` instead) |
-| `RESIZE_MONGO_MODEL_OUTDATED` from `verify()`, at worker start, or logged once by `add()` (every add is then unconfirmed and queues nothing until the model is fixed; claims reject with it), or `resize-scaffold --check` reports drift in `src/models/ResizeTask.ts` | a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `availableAt`, `active` or `cooldownUntil` fields: port them (and the `{ queue, status, availableAt }` index and the gate index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx resize-scaffold --eject`. Right after the upgrade `--check` also reports every ejected model without `startedAt` and `finishedAt` — intended (such a model keeps working; the times are dropped and `RESIZE_MONGO_MODEL_OUTDATED` does not list them): add both as `{ type: Date }`, or re-run `npx resize-scaffold --eject` |
-| `resize-scaffold --check` reports drift in `src/config/resize.ts` ("uses the old config shape") right after the upgrade | intended, for every config scaffolded by an earlier version: a `queue: { … }` object, or `defaultFrameworkResizeConfig` imported from `…/config/resize.js` (`//` comment lines are not checked) — rewrite it to the new shape (step 5), or move it aside, re-run `npx resize-scaffold` and copy your settings back. The config file is never diffed |
+| `RESIZE_MONGO_MODEL_OUTDATED` from `verify()`, at worker start, or logged once by `add()` (every add is then unconfirmed and queues nothing until the model is fixed; claims reject with it), or `resize-scaffold --check` reports drift in `src/models/ResizeTask.ts` | a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `availableAt`, `active` or `cooldownUntil` fields: port them (and the `{ queue, status, availableAt }` index and the gate index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx resize-scaffold --eject`. Right after the upgrade `--check` also reports every ejected model without `startedAt` and `finishedAt` — intended (such a model keeps working; the times are dropped and `RESIZE_MONGO_MODEL_OUTDATED` does not list them): add both as `{ type: Date }`, or move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`, then restore your customizations (re-running `--eject` alone never overwrites the file) |
+| `resize-scaffold --check` reports drift in `src/config/resize.ts` or a `resize.<NODE_ENV>.ts` override ("uses the old config shape") right after the upgrade | intended, for every config scaffolded by an earlier version: a top-level `queue: { … }` object (a `queue` entry inside `queues` is fine), or `defaultFrameworkResizeConfig` imported from `…/config/resize.js` (only full-line `//` comments are skipped) — rewrite it to the new shape (step 5), or move it aside, re-run `npx resize-scaffold` and copy your settings back. The config file is never diffed, and a second Resizer's `configName` file is not checked: review it yourself |
 | `RESIZE_MONGO_NOT_CONNECTED` from `verify()` or at worker start | the Mongoose connection of the `ResizeTask` model is closed (never opened, or disconnected: at once), or failed to open (after the driver's `serverSelectionTimeoutMS`, 30 s by default; the message names the driver's error) — call `verify()` after the connection has opened (after `Server.init()` in a framework host); an opening connection is awaited |
 | `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` from `verify()` or at worker start | the media schema declares preview rows as strict sub-documents without `identity`, `origin` or `encodeSig` (the message names them; a mixed or plain `previews` array, or rows with `strict: false`, pass) — spread the current `resizeMediaSchemaFragment`, or add each missing field to the row as `{ type: String }` |
 | previews written before `0.3.0-rc.1` (no `origin` / `encodeSig`), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are served for now and will be regenerated once a later release's freshness check ships (plan the storage cost); rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews` — delete their files yourself |

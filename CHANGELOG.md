@@ -24,7 +24,7 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   queue: 'default', // a key of `queues`, or false for eager only
   queues: {
     default: { driver: 'database', maxAttempts: 5 }, // tasks in the app's ResizeTask model
-    bulk: { driver: 'sqs', queueUrl: 'https://sqs.eu-west-1.amazonaws.com/123456789012/resize-bulk' },
+    bulk: { driver: 'database', leaseMs: 300_000 }, // a second lane, with its own timing
   },
   ```
 
@@ -57,16 +57,22 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   key. A second Resizer's file (`configName`) holds only that Resizer's sections: its image
   settings, `mediaModelName`, `storage` and `queue`. `coordination` is one per process (it was one
   per file; `new FrameworkResizer({ coordination })` still sets one Resizer's), and every key of
-  `worker` is optional: a missing one takes `defaultWorkerOptions`, and only a wrong type is
-  `RESIZE_CONFIG_INVALID`. Only `queue: false` in the Resizer's own file (with no `queueName`
-  option), `tasks: false` in code, or a task queue and `coordination` both passed in code keep a
-  Resizer from reading `src/config/resize.ts`; every other Resizer, one whose file sets no `queue`
-  too (it reads `queues` to learn whether it is eager only or on `'default'`), validates that whole
-  file on first use. So a malformed `queues` or `worker` section there fails that Resizer's first
-  call and its `verify()`: `uploadOriginal()`, `generate()` and `invalidate()` throw the config
-  error (e.g. `RESIZE_CONFIG_INVALID`), and `resolve()` and `prewarm()`, which never throw, return
-  the empty decision and `incomplete`, so even stored previews are not served until the file is
-  fixed.
+  `worker` is optional: a missing one takes `defaultWorkerOptions`, and only a wrong type or an
+  unknown key (a misspelled `sharpConcurency`, say) is `RESIZE_CONFIG_INVALID`. A `queues` entry
+  set to `undefined` is not defined, so an environment file can remove a queue that way. Only
+  `queue: false` in the Resizer's own file (with no `queueName` option), `tasks: false` in code, or
+  a task queue and `coordination` both passed in code keep a Resizer from reading
+  `src/config/resize.ts`; every other Resizer validates that whole file on first use, and a
+  malformed `queues` or `worker` section there fails in one of two ways. A Resizer that takes its
+  task queue from the file, or whose file sets no `queue` (it reads `queues` to learn whether it is
+  eager only or on `'default'`), fails its first call and its `verify()`: `uploadOriginal()`,
+  `generate()` and `invalidate()` throw the config error (e.g. `RESIZE_CONFIG_INVALID`), and
+  `resolve()` and `prewarm()`, which never throw, return the empty decision and `incomplete`, so
+  even stored previews are not served until the file is fixed. A Resizer with a task queue passed
+  in code (and no `coordination` in code) reads the file only for `coordination`, so a broken file
+  is the degraded mode of an invalid `coordination`: it is logged once, reads serve stored previews
+  and queue nothing, `uploadOriginal()`, `generate()` and `invalidate()` work, and `verify()`,
+  `prewarm()` and worker start report it.
 - **`runResizeWorker({ configName })` is removed, together with the worker's `--config` flag.**
   The worker reads `worker` and `queues` from `src/config/resize.ts`; both are rejected with
   `RESIZE_CONFIG_REMOVED_KEY`. A host whose Resizers read only named files adds a
@@ -113,7 +119,8 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   calls `findOneAndUpdate` with an array update and
   `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`,
   after casting the rows with the model's optional `castObject` (Mongoose's `Model.castObject`:
-  strict rows lose the keys they do not declare; a value it cannot cast, such as `bytes: 'abc'`,
+  strict rows lose the keys they do not declare, loose rows (`strict: false`) keep them; a value
+  it cannot cast, such as `bytes: 'abc'`,
   rejects with Mongoose's `ValidationError` before anything is written). Without `castObject` the
   rows are written as given, minus their `undefined` top-level keys. A `findOneAndUpdate`
   middleware on the media model also sees that call, so it must accept an array update.
@@ -141,16 +148,21 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   queue of the other backend queues nothing (`RESIZE_QUEUE_NOT_SERVED`, above). Move all of a
   Resizer's queues together until routing between backends ships. The same goes for SQS entries
   with different dead-letter queues (or a different `region`, `endpoint` or `waitTimeSeconds`):
-  each set is a backend of its own.
+  each set is a backend of its own, so set `region` (and `endpoint`) on every SQS entry or on none —
+  an omitted `region` and an explicit one equal to `AWS_REGION` count as two backends.
 - **`resize-scaffold --check` reports drift right after the upgrade.** It does so for every
-  `src/config/resize.ts` scaffolded by an earlier version (one with a `queue: { … }` object, or
-  that imports `defaultFrameworkResizeConfig` from `…/config/resize.js`; `//` comment lines are not
-  checked), and for every ejected `ResizeTask` model (one without `startedAt` and `finishedAt`).
-  This is intended. To clear it, rewrite `src/config/resize.ts` to the new shape (or move it aside,
-  re-run `npx resize-scaffold` and copy your settings back), and add `startedAt: { type: Date }`
-  and `finishedAt: { type: Date }` to an ejected model (or re-run `npx resize-scaffold --eject`).
-  The config file is still never diffed. An ejected model without the two times keeps working:
-  they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
+  `src/config/resize.ts`, and every `resize.<NODE_ENV>.ts` override of it, scaffolded by an earlier
+  version (one with a top-level `queue: { … }` object, or that imports
+  `defaultFrameworkResizeConfig` from `…/config/resize.js`; only full-line `//` comments are
+  skipped, a `queue` entry inside `queues` is not drift, and a second Resizer's `configName` file
+  is not checked), and for every ejected `ResizeTask` model (one without `startedAt` and
+  `finishedAt`). This is intended. To clear it, rewrite the config to the new shape (or move it
+  aside, re-run `npx resize-scaffold` and copy your settings back), and add
+  `startedAt: { type: Date }` and `finishedAt: { type: Date }` to an ejected model (or
+  move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`, then
+  restore your customizations; the scaffold never overwrites a file, so re-running `--eject` alone
+  changes nothing). The config file is still never diffed. An ejected model without the two times
+  keeps working: they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
 - **Old preview rows.** Rows written before `0.3.0-rc.1` have no `origin` or `encodeSig`. They are
   served for now, and will be regenerated once a later release's freshness check ships, so plan
   the storage cost of rendering them again. Rows without an `identity` (written before 0.3.0) are
@@ -450,12 +462,13 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
 - One task queue per backend in a framework app, and each queue name is a lane on it, with its own
   timing. Every `database` entry of `queues` is one backend (the app's `ResizeTask` model), and the
   SQS entries that share `region`, `endpoint`, `deadLetterQueueUrl` and the effective
-  `waitTimeSeconds` (default 10) are one backend: one `SqsTaskQueue` for all their names. The
-  worker runs one loop per task queue, one task at a time, each task processed with its own
-  Resizer. `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is removed: each queue name is defined once, so
-  two files can no longer disagree about its timing. Without the framework, each `mongoParts()`
-  call makes its own queue, with one timing for every name: call it once and spread the same parts
-  into every Resizer.
+  `waitTimeSeconds` (default 10) are one backend: one `SqsTaskQueue` for all their names (set
+  `region` (and `endpoint`) on every SQS entry or on none — an omitted `region` and an explicit one
+  equal to `AWS_REGION` count as two backends). The worker runs one loop per task queue, one task at
+  a time, each task processed with its own Resizer. `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is
+  removed: each queue name is defined once, so two files can no longer disagree about its timing.
+  Without the framework, each `mongoParts()` call makes its own queue, with one timing for every
+  name: call it once and spread the same parts into every Resizer.
 - The default JPEG quality is 88 (was 80).
 - A task's `leasedBy` is `<hostname>:<pid>` instead of `resizer-<pid>`, so pods with the same pid
   are told apart.
@@ -645,7 +658,9 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   `[]`.
 - Preview rows record `bytes` (the encoded size), `createdAt` (when the row was stored), `origin`
   (a signature of the original it was made from: its storage ref and dimensions) and `encodeSig`
-  (a signature of its format's encode settings and the pipeline version), from the worker and from
+  (a signature of its format's encode settings, the sharpen setting of its fit mode, its animation
+  settings (for animated formats), the result-dimension cap, the fit box (for fit rows) and the
+  pipeline version), from the worker and from
   `generate()`; `resizeMediaSchemaFragment` declares them. The read path does not check them yet.
 - `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it to mark the
   pipeline's stored previews as made with older settings. They are not regenerated yet. It is not

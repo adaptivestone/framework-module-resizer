@@ -156,21 +156,26 @@ export default {
   `FrameworkSqsQueueConfig` are removed.
 - Every `database` entry shares one task queue, and so do the SQS entries with the same `region`,
   `endpoint`, `deadLetterQueueUrl` and `waitTimeSeconds`: one task queue per backend, and each name
-  is a lane on it with its own timing. `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is gone: a queue is
-  defined once, so two files can no longer disagree about its timing. Calls on a queue of another
-  backend queue nothing (`RESIZE_QUEUE_NOT_SERVED`, statement 5 below).
+  is a lane on it with its own timing. So set `region` (and `endpoint`) on every SQS entry or on
+  none — an omitted `region` and an explicit one equal to `AWS_REGION` count as two backends.
+  `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is gone: a queue is defined once, so two files can no longer
+  disagree about its timing. Calls on a queue of another backend queue nothing
+  (`RESIZE_QUEUE_NOT_SERVED`, statement 5 below).
 
 ## Six things to know after the upgrade
 
 1. **`resize-scaffold --check` reports drift right after the upgrade.** It does so for every
-   `src/config/resize.ts` scaffolded by an earlier version (a `queue: { … }` object, or
-   `defaultFrameworkResizeConfig` imported from `…/config/resize.js`), and for every ejected
-   `ResizeTask` model. This is intended. To clear it:
-   - rewrite `src/config/resize.ts` to the new shape (above), or move it aside, re-run
+   `src/config/resize.ts`, and every `resize.<NODE_ENV>.ts` override of it, scaffolded by an
+   earlier version (a top-level `queue: { … }` object, or `defaultFrameworkResizeConfig` imported
+   from `…/config/resize.js`; only full-line `//` comments are skipped, and a second Resizer's
+   `configName` file is not checked), and for every ejected `ResizeTask` model. This is intended.
+   To clear it:
+   - rewrite the config to the new shape (above), or move it aside, re-run
      `npx resize-scaffold` and copy your settings back;
    - add `startedAt: { type: Date }` and `finishedAt: { type: Date }` to an ejected model, or
-     re-run `npx resize-scaffold --eject`. Without them the model keeps working, but loses the two
-     times.
+     move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`,
+     then restore your customizations (the scaffold never overwrites a file, so re-running `--eject`
+     alone changes nothing). Without them the model keeps working, but loses the two times.
 2. **A custom model-shaped `MongoMediaModel` must accept an update pipeline.** `replacePreviews`
    (which `invalidate` uses) calls `findOneAndUpdate` with an array update and
    `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`,
@@ -304,8 +309,10 @@ export default {
   beside a queue without `gatesByTask`, invalid timing on a task queue passed in
   code, or an invalid `coordination`) no longer fails reads or uploads: `resolve()`
   serves stored previews and queues nothing, and only `verify()`, `prewarm()` and
-  worker start report it. Invalid timing in a `queues` entry of `src/config/resize.ts` is still
-  a config error on first use.
+  worker start report it. Invalid timing in a `queues` entry of `src/config/resize.ts` (or a
+  malformed `queues` or `worker` section) is still a config error on first use for a Resizer that
+  takes its task queue from the file; beside a task queue passed in code (and no `coordination` in
+  code) the file is read only for `coordination`, and a broken file degrades as above.
 - Deploy the API and the workers together, after the pending tasks have finished or
   been drained. Task rows from before the gate have no `active` field and are not
   gates, so during a rolling deploy a read can queue a second task for such a media.
