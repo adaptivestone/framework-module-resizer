@@ -113,9 +113,7 @@ test('lock settings are validated only in the core', () => {
     sourceFiles().filter(
       (f) =>
         f !== 'coordination.ts' &&
-        /RESIZE_CONFIG_(COORDINATION_INVALID|GATE_TTL_BELOW_LEASE)/.test(
-          read(f),
-        ),
+        /RESIZE_CONFIG_COORDINATION_INVALID/.test(read(f)),
     ),
     [],
   );

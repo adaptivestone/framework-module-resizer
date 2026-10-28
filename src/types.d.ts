@@ -284,9 +284,9 @@ export interface QueueTimingOptions {
 // values take the defaults (defaultCoordination); only the core validates them, when the Resizer
 // sets up its task queue. An eager-only Resizer never reads them.
 export interface CoordinationOptions {
-  // default 600000 — how long the gate lock of a queued task holds its media and pipeline until a
-  // worker extends it (on a task queue without its own gate, e.g. SQS); must be ≥ the task queue's
-  // leaseMs.
+  // default 600000 — how long the gate lock of a queued task holds its media, pipeline and queue
+  // until a worker starts the task and extends it per lease (on a task queue without its own gate,
+  // e.g. SQS); a task given back is held for it again. Raise it when tasks wait longer.
   gateTtlMs?: number;
   // default 600000 — after a task is dead-lettered, no new task for that media and pipeline is
   // queued for this long.

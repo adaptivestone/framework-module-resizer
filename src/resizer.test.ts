@@ -853,22 +853,17 @@ describe('coordination', () => {
     assert.ok(invalidCooldown(errors[0][1]));
   });
 
-  test("the gate is checked against the lease of the Resizer's own task queue", async () => {
+  test("a gateTtlMs below the task queue's lease is fine (a database queue with a long lease needs no coordination)", async () => {
     const r = new Resizer({
       logger: silent,
       storage: fakeStorage(),
       media: fakeMedia(),
       locks: memoryLocks(),
-      tasks: new MemoryTaskQueue({ timing: { leaseMs: 120_000 } }),
+      tasks: new MemoryTaskQueue({ timing: { leaseMs: 1_200_000 } }),
       coordination: { gateTtlMs: 60_000 },
     });
-    await r.ready();
-    await assert.rejects(
-      () => r.verify(),
-      (e: unknown) =>
-        e instanceof ResizeConfigError &&
-        e.code === 'RESIZE_CONFIG_GATE_TTL_BELOW_LEASE',
-    );
+    await r.verify();
+    assert.equal(taskCoordinationOf(r).gateTtlMs, 60_000);
   });
 
   test('coordination given as a function is read once, when the task queue is set up; an eager-only Resizer never reads it', async () => {

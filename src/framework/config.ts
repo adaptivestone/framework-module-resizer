@@ -25,7 +25,8 @@ export interface ResolvedFrameworkConfig {
   storage: FrameworkStorageConfig | undefined; // the file's `storage`, if any
   queue: FrameworkQueueConfig | false; // the file's `queue`; false when missing (eager only)
   timing: QueueTimingOptions; // the queue's timing, with the defaults filled in
-  // The file's `coordination`, unvalidated: the Resizer validates it against its task queue.
+  // The file's `coordination`, unvalidated: the Resizer validates it when it sets up its task
+  // queue.
   coordination: CoordinationOptions | undefined;
   worker: FrameworkWorkerConfig; // the file's `worker`, or the defaults
 }

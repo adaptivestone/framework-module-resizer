@@ -72,8 +72,8 @@ export interface ResizerOptions {
   tasks?: TaskQueue | LazyPart<TaskQueue | undefined>;
   // How queued work is coordinated (`gateTtlMs`, `cooldownMs`; missing values default), or a
   // function returning it. Read only beside a task queue, when the Resizer sets it up (a function
-  // is called then, and again only after a failed set-up), and validated against the queue's
-  // timing; an eager-only Resizer never reads it.
+  // is called then, and again only after a failed set-up), and validated then; an eager-only
+  // Resizer never reads it.
   coordination?: CoordinationOptions | (() => CoordinationOptions);
   queue?: string; // default queue name for this Resizer's tasks; default 'default'
   pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
@@ -437,9 +437,9 @@ export class Resizer {
   /**
    * The Dispatcher with the validated coordination. A task queue without gatesByTask needs the
    * lock store for its gate locks, so without one it is RESIZE_LOCKS_REQUIRED; a queue that gates
-   * by task needs none. The coordination is read here (a function is called) and validated
-   * against the queue's timing; it is kept only when the Dispatcher is built, so a failed set-up
-   * reads it again on the next call.
+   * by task needs none. The queue's timing is validated here (the Dispatcher takes its lease), and
+   * the coordination is read (a function is called) and validated; it is kept only when the
+   * Dispatcher is built, so a failed set-up reads it again on the next call.
    */
   #buildDispatcher(tasks: TaskQueue): Dispatcher {
     if (!this.#locks && !tasks.gatesByTask) {
@@ -449,7 +449,6 @@ export class Resizer {
     const timing = timingOf(tasks);
     const coordination = fillCoordination(
       typeof source === 'function' ? source() : source,
-      timing,
     );
     this.#coordination = coordination;
     return new Dispatcher({
