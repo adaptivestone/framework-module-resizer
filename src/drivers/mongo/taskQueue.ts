@@ -68,6 +68,34 @@ const WRITTEN_PATHS = [
   'error',
 ] as const;
 
+// The schema check of each model: its RESIZE_MONGO_MODEL_OUTDATED error, or null when the schema
+// has every written path (or the model exposes none). A model is checked once.
+const schemaErrors = new WeakMap<object, ResizeSetupError | null>();
+
+/** The model's RESIZE_MONGO_MODEL_OUTDATED error, or undefined when its schema is complete. */
+function schemaError(model: TaskModel): ResizeSetupError | undefined {
+  const cached = schemaErrors.get(model);
+  if (cached !== undefined) {
+    return cached ?? undefined;
+  }
+  const schema = model.schema;
+  const missing =
+    typeof schema?.path === 'function'
+      ? WRITTEN_PATHS.filter((path) => !schema.path(path))
+      : [];
+  const error =
+    missing.length > 0
+      ? new ResizeSetupError(
+          `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
+          { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
+        )
+      : null;
+  if (typeof model === 'object' || typeof model === 'function') {
+    schemaErrors.set(model, error);
+  }
+  return error ?? undefined;
+}
+
 // Who holds a lease: the host name tells pods apart (every container's main process is pid 1).
 const LEASE_HOLDER = `${hostname().slice(0, 64)}:${process.pid}`;
 
@@ -127,21 +155,18 @@ export class MongoTaskQueue extends TaskQueue {
         { code: 'RESIZE_MONGO_MODEL_MISSING' },
       );
     }
-    const schema = model.schema;
-    if (typeof schema?.path === 'function') {
-      const missing = WRITTEN_PATHS.filter((path) => !schema.path(path));
-      if (missing.length > 0) {
-        throw new ResizeSetupError(
-          `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
-          { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
-        );
-      }
+    const outdated = schemaError(model);
+    if (outdated) {
+      throw outdated;
     }
     await checkGateIndex(model);
   }
 
   // At runtime a missing model is logged, not thrown: reads and prewarm never throw (verify()
-  // reports it at boot).
+  // reports it at boot). A model whose schema lacks a field this queue writes throws
+  // RESIZE_MONGO_MODEL_OUTDATED on first use, whether or not verify() ran: a strict schema would
+  // drop the field silently (without `active` every add would store a task). add() logs it and
+  // resolves unconfirmed; every other method rejects with it.
   #model(): TaskModel | null {
     const model = this.#getModel();
     if (!model) {
@@ -150,14 +175,14 @@ export class MongoTaskQueue extends TaskQueue {
       );
       return null;
     }
+    const outdated = schemaError(model);
+    if (outdated) {
+      throw outdated;
+    }
     return model;
   }
 
   async add(task: NewTask): Promise<TaskAddResult> {
-    const model = this.#model();
-    if (!model) {
-      return { status: 'unconfirmed' };
-    }
     const gate = {
       resizer: task.resizer,
       fileId: task.mediaId,
@@ -165,6 +190,10 @@ export class MongoTaskQueue extends TaskQueue {
       queue: task.queue,
     };
     try {
+      const model = this.#model();
+      if (!model) {
+        return { status: 'unconfirmed' };
+      }
       for (let round = 0; round < ADD_ROUNDS; round++) {
         const taskId = await insertActive(model, task);
         if (taskId !== null) {

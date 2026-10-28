@@ -453,6 +453,72 @@ describe('MongoTaskQueue setup', () => {
     }
   });
 
+  test('a model without active fails at first use, verify() or not: adds are unconfirmed and logged, and store nothing', async () => {
+    // An ejected model from before the gate: a strict schema would drop `active` from every
+    // insert, so every add would store a task and the gate would be off.
+    const { active: _active, ...fields } = resizeTaskFields('File');
+    const Ejected =
+      connection.models.EjectedWithoutActive ??
+      connection.model(
+        'EjectedWithoutActive',
+        new mongoose.Schema(fields, { timestamps: true, autoIndex: false }),
+      );
+    const { errors } = configureQueue(() => Ejected);
+    const mediaId = fid();
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => tasks.add(request({ mediaId }))),
+    );
+    assert.deepEqual(
+      results,
+      Array.from({ length: 20 }, () => ({ status: 'unconfirmed' })),
+    );
+    assert.equal(await Ejected.countDocuments({}), 0);
+    assert.equal(errors.length, 20);
+    for (const [message, error] of errors) {
+      assert.match(String(message), /adding a task failed/);
+      assert.equal(
+        (error as { code?: unknown }).code,
+        'RESIZE_MONGO_MODEL_OUTDATED',
+      );
+    }
+    // Every other method rejects with it.
+    const outdated = (error: unknown) =>
+      error instanceof ResizeSetupError &&
+      error.code === 'RESIZE_MONGO_MODEL_OUTDATED' &&
+      error.message.includes('has no active field');
+    const claimed: ClaimedTask = {
+      ...request({ mediaId }),
+      taskId: new mongoose.Types.ObjectId().toString(),
+      token: 'token',
+      attempts: 1,
+    };
+    await assert.rejects(tasks.claim('default', 300), outdated);
+    await assert.rejects(tasks.complete(claimed), outdated);
+    await assert.rejects(tasks.fail(claimed, 'dead', 'x'), outdated);
+    await assert.rejects(tasks.findActive(claimed), outdated);
+  });
+
+  test('the schema of a model is checked once, at its first use', async () => {
+    const asked: string[] = [];
+    const stored = { _id: new mongoose.Types.ObjectId() };
+    const model = {
+      schema: {
+        path: (path: string) => {
+          asked.push(path);
+          return {};
+        },
+      },
+      create: async () => [stored],
+    };
+    configureQueue(() => model);
+    assert.equal((await tasks.add(request())).status, 'added');
+    const checked = asked.length;
+    assert.ok(checked > 0, 'the first add checks the schema');
+    assert.equal((await tasks.add(request())).status, 'added');
+    await new MongoTaskQueue({ model }).verify();
+    assert.equal(asked.length, checked, 'later uses reuse the result');
+  });
+
   test('verify accepts the package model with its indexes, and a model-shaped object without a schema or collection', async () => {
     await tasks.verify();
     const schemaless = new MongoTaskQueue({
