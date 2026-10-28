@@ -39,7 +39,8 @@ the enclosing schema's options.
   Create the gate index `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` (unique,
   partial on `active: true`), which keeps one active task per Resizer, media,
   pipeline and queue, BEFORE the new API and workers start: `resizer.verify()` and
-  worker start reject with `RESIZE_MONGO_INDEX_MISSING` until it exists, and
+  worker start reject with `RESIZE_MONGO_INDEX_MISSING` until it exists (with
+  Mongoose's `autoIndex` on, `verify()` first waits for that build), and
   without it every `add()` stores a task, duplicate active rows build up, and the
   unique index build then fails with E11000 until those rows are no longer active
   (completed, or dead and taken over or expired). Create the claim index
@@ -55,7 +56,7 @@ the enclosing schema's options.
   hand-written model must add the `resizer`, `queue`, `availableAt`, `active` and
   `cooldownUntil` fields, the claim index and the gate index;
   `resize-scaffold --check` and `resizer.verify()` report a model without the fields
-  (and the queue's first `add()` logs it and queues nothing), and `resizer.verify()`
+  (and the queue logs it once, then queues nothing until it is fixed), and `resizer.verify()`
   a collection without the gate index. Neither creates indexes.
 - Move `queue.lockTtlMs` to the Resizer's `coordination` (a `coordination` section
   in the config file, or `new Resizer({ coordination })`): `lockTtlMs.failed` →
