@@ -2002,6 +2002,136 @@ describe('MongoTaskQueue.release', () => {
   });
 });
 
+describe('MongoTaskQueue task times', () => {
+  test('claim sets startedAt; a second delivery sets it again', async () => {
+    const inserted = await insert();
+    const before = Date.now();
+    const first = await tasks.claim('default', 300);
+    assert.ok(first);
+    const row = await M.findById(inserted._id).lean();
+    assert.ok(row?.startedAt instanceof Date);
+    const started = (row.startedAt as Date).getTime();
+    assert.ok(started >= before && started <= Date.now());
+    // The claim's own instant: the lease runs from it.
+    assert.equal((row.leaseExpiresAt as Date).getTime() - started, 300);
+    assert.equal(row.finishedAt, undefined);
+
+    // The lease ends unrenewed, and a later delivery starts.
+    await M.updateOne(
+      { _id: inserted._id },
+      { $set: { leaseExpiresAt: past(), availableAt: past() } },
+    );
+    await sleep(5);
+    const second = await tasks.claim('default', 300);
+    assert.equal(second?.taskId, first.taskId);
+    assert.equal(second?.attempts, 2);
+    const again = await M.findById(inserted._id).lean();
+    assert.ok(again?.startedAt instanceof Date);
+    const restarted = (again.startedAt as Date).getTime();
+    assert.ok(restarted > started, 'the latest delivery overwrites the start');
+    assert.equal((again.leaseExpiresAt as Date).getTime() - restarted, 300);
+    assert.equal(again.finishedAt, undefined);
+  });
+
+  test('complete and a dead-letter set finishedAt; a retry and a release do not', async () => {
+    const done = await insert();
+    const completing = await tasks.claim('default', 300);
+    assert.equal(completing?.taskId, String(done._id));
+    assert.equal(await tasks.complete(completing), true);
+    const completed = await M.findById(done._id).lean();
+    assert.ok(completed?.finishedAt instanceof Date);
+    assert.equal(
+      (completed.finishedAt as Date).getTime(),
+      (completed.completedAt as Date).getTime(),
+    );
+    assert.ok(
+      (completed.startedAt as Date).getTime() <=
+        (completed.finishedAt as Date).getTime(),
+    );
+
+    const failing = await insert();
+    const dying = await tasks.claim('default', 300);
+    assert.equal(dying?.taskId, String(failing._id));
+    assert.equal(await tasks.fail(dying, 'dead', 'fatal'), true);
+    const dead = await M.findById(failing._id).lean();
+    assert.ok(dead?.finishedAt instanceof Date);
+    assert.equal(
+      (dead.finishedAt as Date).getTime(),
+      (dead.deadAt as Date).getTime(),
+    );
+
+    // The row holds a finish time already, so a retry or release that cleared it would show; the
+    // pause makes a write of either time at the give-back show too.
+    const earlier = new Date(Date.now() - 3_600_000);
+    for (const giveBack of [
+      (task: ClaimedTask) =>
+        tasks.fail(task, { retryAt: new Date(Date.now() + 60_000) }, 'boom'),
+      (task: ClaimedTask) => tasks.release(task),
+    ]) {
+      const waiting = await insert({ finishedAt: earlier });
+      const leased = await tasks.claim('default', 300);
+      assert.ok(leased);
+      assert.equal(leased.taskId, String(waiting._id));
+      const claimed = await M.findById(waiting._id).lean();
+      assert.ok(claimed?.startedAt instanceof Date);
+      await sleep(5);
+      assert.equal(await giveBack(leased), true);
+      const row = await M.findById(waiting._id).lean();
+      assert.ok(row);
+      assert.equal(row.status, 'pending');
+      assert.equal(
+        (row.startedAt as Date).getTime(),
+        (claimed.startedAt as Date).getTime(),
+      );
+      assert.equal((row.finishedAt as Date).getTime(), earlier.getTime());
+    }
+  });
+
+  test('a strict model without startedAt and finishedAt still verifies and completes tasks', async () => {
+    // A model ejected before the times existed: strict mode drops them from every write, and
+    // nothing else changes, because the gate and the lease never read them.
+    const {
+      startedAt: _startedAt,
+      finishedAt: _finishedAt,
+      ...fields
+    } = resizeTaskFields('File');
+    assert.equal('startedAt' in fields, false);
+    const name = 'ResizeTaskWithoutTimes';
+    let Strict = connection.models[name];
+    if (!Strict) {
+      const schema = new mongoose.Schema(fields, {
+        timestamps: true,
+        minimize: false,
+        autoIndex: false,
+      });
+      for (const [keys, options] of resizeTaskIndexes) {
+        schema.index(keys, options);
+      }
+      Strict = connection.model(name, schema);
+      await Strict.createCollection();
+      await Strict.createIndexes();
+    }
+    const { errors } = configureQueue(() => Strict);
+
+    await tasks.verify();
+    const added = await tasks.add(request());
+    assert.equal(added.status, 'added');
+    const leased = await tasks.claim('default', 300);
+    assert.ok(leased);
+    assert.equal(leased.taskId, added.taskId);
+    assert.equal(await tasks.complete(leased), true);
+
+    const row = await Strict.findById(added.taskId).lean();
+    assert.ok(row);
+    assert.equal(row.status, 'completed');
+    assert.ok(row.completedAt instanceof Date);
+    assert.equal(row.active, false);
+    assert.equal('startedAt' in row, false);
+    assert.equal('finishedAt' in row, false);
+    assert.deepEqual(errors, []);
+  });
+});
+
 describe('MongoTaskQueue.renew fencing', () => {
   test('a valid token extends the lease; a stale token does not match', async () => {
     await insert();

@@ -49,11 +49,13 @@ export interface MongoTaskQueueOptions {
   logger?: ResizeLogger; // default: console
 }
 
-// The schema paths this queue writes. Mongoose strict mode silently drops a path its schema lacks:
-// a model ejected before tasks carried a Resizer and queue would file every task under Resizer
-// 'default' on queue 'default'; one without availableAt would lose every retry time; one without
-// active would turn the gate off (every add would store a task); one without cooldownUntil would
-// end every dead task's cooldown at once.
+// The schema paths the gate and the lease need. Mongoose strict mode silently drops a path its
+// schema lacks: a model ejected before tasks carried a Resizer and queue would file every task
+// under Resizer 'default' on queue 'default'; one without availableAt would lose every retry time;
+// one without active would turn the gate off (every add would store a task); one without
+// cooldownUntil would end every dead task's cooldown at once. The queue also writes startedAt and
+// finishedAt, which are not listed: nothing reads them, so a model without them only loses the
+// times, while a missing listed path makes every add unconfirmed.
 const WRITTEN_PATHS = [
   'fileId',
   'resizer',
@@ -301,6 +303,7 @@ export class MongoTaskQueue extends TaskQueue {
           leaseToken: randomHex(),
           leaseExpiresAt: leaseEnd,
           availableAt: leaseEnd,
+          startedAt: now, // this delivery's start
         },
         $inc: { attempts: 1 },
       },
@@ -318,13 +321,20 @@ export class MongoTaskQueue extends TaskQueue {
 
   // Done: the task stops being the gate, so the next add() stores a new task.
   async complete(task: ClaimedTask): Promise<boolean> {
+    const completedAt = new Date();
     return this.#fenced(task, {
-      $set: { status: 'completed', completedAt: new Date(), active: false },
+      $set: {
+        status: 'completed',
+        completedAt,
+        finishedAt: completedAt,
+        active: false,
+      },
     });
   }
 
   // A retry keeps the gate. A dead task keeps it for `opts.cooldownMs` (none by default): until
-  // then add() reports it in flight, and after that the next add() takes it over.
+  // then add() reports it in flight, and after that the next add() takes it over. Only a dead
+  // task is finished; a retry leaves startedAt and finishedAt as they are.
   async fail(
     task: ClaimedTask,
     next: { retryAt: Date } | 'dead',
@@ -337,6 +347,7 @@ export class MongoTaskQueue extends TaskQueue {
         $set: {
           status: 'dead',
           deadAt,
+          finishedAt: deadAt,
           error,
           cooldownUntil: new Date(deadAt.getTime() + (opts?.cooldownMs ?? 0)),
         },
@@ -353,7 +364,7 @@ export class MongoTaskQueue extends TaskQueue {
     });
   }
 
-  // Due at once, and the claim's attempt taken back. The task keeps the gate.
+  // Due at once, and the claim's attempt taken back. The task keeps the gate and its times.
   async release(task: ClaimedTask): Promise<boolean> {
     return this.#fenced(task, {
       $set: {

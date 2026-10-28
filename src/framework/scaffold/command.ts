@@ -32,8 +32,10 @@ const MODEL_MARKERS = [
   '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js',
 ];
 // An ejected model (`--eject`) owns its schema: a full BaseModel subclass with the task fields
-// the current driver needs. The patterns match schema declarations however the host formats
-// them, and not the gate index's partial filter (`active: true`).
+// the current driver writes. startedAt and finishedAt are among them although the driver works
+// without them: a model that lacks them loses the times silently, so it is drift. The patterns
+// match schema declarations however the host formats them, and not the gate index's partial
+// filter (`active: true`).
 const EJECTED_MODEL_MARKERS = [
   'extends BaseModel',
   '@adaptivestone/framework/modules/BaseModel.js',
@@ -44,6 +46,8 @@ const EJECTED_MODEL_FIELDS = [
   /\bavailableAt:\s*\{\s*type:/,
   /\bactive:\s*\{\s*type:/,
   /\bcooldownUntil:\s*\{\s*type:/,
+  /\bstartedAt:\s*\{\s*type:/,
+  /\bfinishedAt:\s*\{\s*type:/,
 ];
 // The worker command imports the construction site AND re-exports the module's command, so the
 // worker process has the Resizers its tasks name (a bare re-export starts with none).
@@ -186,7 +190,7 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
           MODEL_MARKERS.every((marker) => c.includes(marker)) ||
           (EJECTED_MODEL_MARKERS.every((marker) => c.includes(marker)) &&
             EJECTED_MODEL_FIELDS.every((field) => field.test(c))),
-        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework/ResizeTaskModel.js (or be an ejected BaseModel with resizer, queue, availableAt, active and cooldownUntil fields) — delete the file and re-run resize-scaffold for a fresh shim; for an ejected model, port the resizer, queue, availableAt, active and cooldownUntil fields (and the gate index), or delete the file and re-run resize-scaffold --eject',
+        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework/ResizeTaskModel.js (or be an ejected BaseModel with resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields) — delete the file and re-run resize-scaffold for a fresh shim; for an ejected model, port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields (and the gate index), or delete the file and re-run resize-scaffold --eject',
       },
       {
         target: COMMAND,

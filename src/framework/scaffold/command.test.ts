@@ -470,7 +470,7 @@ describe('runScaffold — --check', () => {
       assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
       assert.match(
         out,
-        /port the resizer, queue, availableAt, active and cooldownUntil fields \(and the gate index\)/,
+        /port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields \(and the gate index\)/,
       );
       assert.match(out, /delete the file and re-run resize-scaffold --eject/);
       assert.doesNotMatch(out, /--force/);
@@ -481,6 +481,36 @@ describe('runScaffold — --check', () => {
       );
     });
   }
+
+  test('--check reports an ejected model without startedAt or finishedAt as drift naming them; the --eject template passes', async () => {
+    await run(['--eject']);
+    const ejected = await read(MODEL);
+    assert.match(ejected, /startedAt:\s*\{\s*type:\s*Date\s*\}/);
+    assert.match(ejected, /finishedAt:\s*\{\s*type:\s*Date\s*\}/);
+    const clean = await run(['--check']);
+    assert.equal(clean.code, 0, clean.out);
+    assert.doesNotMatch(clean.out, /drift/);
+
+    for (const field of ['startedAt', 'finishedAt']) {
+      const model = ejected.replace(
+        new RegExp(`^ {6}${field}: \\{[^\\n]+\\n`, 'm'),
+        '',
+      );
+      assert.notEqual(model, ejected, `the template declares ${field}`);
+      await writeFile(join(root, MODEL), model);
+      const { code, out } = await run(['--check']);
+      assert.equal(code, 1, out);
+      assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
+      assert.match(
+        out,
+        /an ejected BaseModel with resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields/,
+      );
+      assert.match(
+        out,
+        /port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields \(and the gate index\)/,
+      );
+    }
+  });
 
   test('an old model shim importing the removed subpath → exit 1 + drift', async () => {
     await run([]);

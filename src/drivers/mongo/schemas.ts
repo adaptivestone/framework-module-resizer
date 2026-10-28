@@ -48,6 +48,11 @@ export function resizeTaskFields(mediaModelName: string) {
     leaseExpiresAt: { type: Date }, // the current lease ends; null while the task waits
     completedAt: { type: Date },
     deadAt: { type: Date },
+    // When the latest delivery started (every claim sets it), and when the task completed or was
+    // dead-lettered. For inspection only: the queue never reads them, so a model without them
+    // loses the times and nothing else.
+    startedAt: { type: Date },
+    finishedAt: { type: Date },
     error: { type: String },
   } as const;
 }
