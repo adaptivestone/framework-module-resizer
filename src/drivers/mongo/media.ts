@@ -19,8 +19,10 @@ export interface MongoMediaUpdateOptions {
  * The media model methods the store calls (any Mongoose model has them). Writes go through
  * `findOneAndUpdate`, so the host's findOneAndUpdate middleware sees them; it resolves with the
  * matched document projected as asked (appendPreviews asks for its `_id` only; replacePreviews for
- * its `previews` before the write, as a plain object) or null. When the model also exposes its
- * `schema`, verify() checks it keeps the preview fields the store relies on.
+ * its `previews` before the write, as a plain object) or null. replacePreviews sends an update
+ * pipeline (an array update) through `findOneAndUpdate`, so host middleware on that hook must
+ * accept an array update. When the model also exposes its `schema`, verify() checks it keeps the
+ * preview fields the store relies on.
  */
 export interface MongoMediaModel {
   modelName?: string;
@@ -54,7 +56,8 @@ const PREVIEWS_BEFORE: MongoMediaUpdateOptions = {
 
 // The rows a replacement writes: the first row per identity (a row without an identity cannot be
 // de-duplicated and is kept), each without its undefined-valued keys, which the driver would store
-// as null.
+// as null. Only top-level keys are stripped: nested storage refs come from drivers that omit
+// absent keys.
 function uniqueRows(rows: Preview[]): Preview[] {
   const seen = new Set<string>();
   const unique: Preview[] = [];

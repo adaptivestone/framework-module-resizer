@@ -374,6 +374,22 @@ describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', 
     assert.deepEqual(result, { stored: [stored], removed: [] });
   });
 
+  test('a row the strict schema cannot cast rejects with a ValidationError and leaves the document unchanged', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia([preview(ID_A, 'a1'), preview(ID_B, 'b1')]);
+    const before = await storedPreviews(mediaId);
+    const uncastable = {
+      ...preview('default:default:8x8:webp:', 'bad'),
+      bytes: 'abc',
+    } as unknown as Preview;
+
+    await assert.rejects(
+      () => store.replacePreviews(mediaId, [ID_A], [uncastable]),
+      (err: unknown) => err instanceof Error && err.name === 'ValidationError',
+    );
+    assert.deepEqual(await storedPreviews(mediaId), before);
+  });
+
   test('replacePreviews with empty rows only removes', async () => {
     const store = mediaStore();
     const mediaId = await newMedia([
