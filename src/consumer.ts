@@ -614,19 +614,19 @@ export class Consumer {
         }
       });
     }
+    // The wait this call gets: what is left of its deadline (none once a task's end has used up
+    // its one gate bound).
+    const waitMs = Math.max(0, deadline - Date.now());
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(
-        () => resolve(TIMED_OUT),
-        Math.max(0, deadline - Date.now()),
-      );
+      timer = setTimeout(() => resolve(TIMED_OUT), waitMs);
     });
     try {
       const result = await Promise.race([answer, late]);
       if (result === TIMED_OUT) {
         logNeverThrow(
           logger,
-          `resize worker: ${what} timed out (the lock store did not answer within ${this.#gateWaitMs} ms) — the worker goes on without it`,
+          `resize worker: ${what} timed out: gave up waiting after ${waitMs} ms (the gate bound is ${this.#gateWaitMs} ms per call, and for all the calls at a task's end) — the call goes on without the worker`,
         );
         return undefined;
       }

@@ -1746,6 +1746,17 @@ describe('a lock store that never answers', () => {
       );
     }
     assert.ok(extendCount() >= 2);
+    // The log names the wait that was applied, at most the 300 ms bound.
+    const waits = errors.flatMap(([message]) => {
+      const found = /timed out: gave up waiting after (\d+) ms/.exec(
+        String(message),
+      );
+      return found ? [Number(found[1])] : [];
+    });
+    assert.ok(waits.length > 0, 'a timed-out call is logged');
+    for (const waited of waits) {
+      assert.ok(waited <= leaseMs, `${waited} ms`);
+    }
     assert.ok(
       errors.some(([message]) =>
         /extending the gate lock of task task-1 timed out/.test(
