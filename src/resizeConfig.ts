@@ -171,8 +171,7 @@ function validateRequiredResizeConfigFields(
 }
 
 /**
- * Validate queue timing and lock TTLs (a task queue's timing, and the framework config file's
- * `queue` section). A worker lock must expire within the lease.
+ * Validate queue timing (a task queue's timing, and the framework config file's `queue` section).
  */
 export function validateQueueTiming(
   queue: unknown,
@@ -183,28 +182,10 @@ export function validateQueueTiming(
       'RESIZE_CONFIG_QUEUE_INVALID',
     );
   }
-  const leaseMs = queue.leaseMs;
-  if (!isPositiveSafeInteger(leaseMs)) {
+  if (!isPositiveSafeInteger(queue.leaseMs)) {
     invalid(
       'resize queue options: leaseMs must be a positive safe integer',
       'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
-    );
-  }
-  const lockTtlMs = queue.lockTtlMs;
-  if (!isRecord(lockTtlMs)) {
-    return invalid(
-      'resize queue options: lockTtlMs must be an object',
-      'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
-    );
-  }
-  const workerTtlMs = lockTtlMs.worker;
-  if (
-    !isPositiveSafeInteger(lockTtlMs.dispatch) ||
-    !isPositiveSafeInteger(workerTtlMs)
-  ) {
-    invalid(
-      'resize queue options: lockTtlMs.dispatch and lockTtlMs.worker must be positive safe integers',
-      'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
     );
   }
   const retryBackoffMs = queue.retryBackoffMs;
@@ -219,12 +200,6 @@ export function validateQueueTiming(
     invalid(
       'resize queue options: retryBackoffMs, maxAttempts, idlePollMs and taskTimeoutMs must be positive safe integers',
       'RESIZE_CONFIG_QUEUE_INVALID',
-    );
-  }
-  if ((workerTtlMs as number) > (leaseMs as number)) {
-    invalid(
-      `resize queue options: lockTtlMs.worker (${workerTtlMs}) must be ≤ leaseMs (${leaseMs}) — a worker lock must expire within the lease`,
-      'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
     );
   }
 }

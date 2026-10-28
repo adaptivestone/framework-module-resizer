@@ -28,8 +28,11 @@ export type {
 export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
 export {
   type ClaimedTask,
+  type ClaimOptions,
+  type FailOptions,
   type LeasedTask,
   type NewTask,
+  type TaskAddResult,
   type TaskEvent,
   type TaskEventHandler,
   TaskQueue,
@@ -70,7 +73,8 @@ export {
   Resizer,
   resetResizerForTests,
 } from './resizer.ts';
-// --- data shapes and method options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts, …) ---
+// --- data shapes and options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts,
+// CoordinationOptions, …) ---
 export type * from './types.d.ts';
 // --- the framework-free worker (framework hosts run `runResizeWorker` from …/framework.js) ---
 export type { RunWorkerOptions } from './worker.ts';

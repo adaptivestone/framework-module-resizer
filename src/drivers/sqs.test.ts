@@ -8,9 +8,10 @@ import type {
   TaskEventHandler,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { gateKey } from '../lockKeys.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { consume } from '../testHelpers/consume.ts';
-import { fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
+import { clockLocks, fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
 import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
@@ -112,7 +113,6 @@ const newTask = (over: Partial<NewTask> = {}): NewTask => ({
   mediaId: 'm1',
   pipeline: 'photo',
   previews: [variant()],
-  requestKey: 'request-key',
   ...over,
 });
 const message = (over: Partial<FakeMessage> = {}): FakeMessage => ({
@@ -198,7 +198,7 @@ describe('SqsTaskQueue.add', () => {
       client,
     });
     const res = await tasks.add(newTask());
-    assert.equal(res.taskId, 'mid-1');
+    assert.deepEqual(res, { status: 'added', taskId: 'mid-1' });
     assert.equal(sent[0].input.QueueUrl, 'https://q/url');
     assert.deepEqual(JSON.parse(String(sent[0].input.MessageBody)), {
       resizer: 'default',
@@ -233,13 +233,13 @@ describe('SqsTaskQueue.add', () => {
     );
     assert.equal(sent.length, 0);
   });
-  test('returns a null taskId when the send response has no MessageId', async () => {
+  test('reports unconfirmed when the send response has no MessageId', async () => {
     const { client } = makeFakeSqsClient();
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
-    assert.equal((await tasks.add(newTask())).taskId, null);
+    assert.deepEqual(await tasks.add(newTask()), { status: 'unconfirmed' });
   });
-  test('prewarm accepts a successful SQS MessageId receipt', async () => {
-    const { client } = makeFakeSqsClient({ messageId: 'mid-strict' });
+  test('prewarm accepts a successful SQS MessageId receipt; the message carries the gate lock owner', async () => {
+    const { client, sent } = makeFakeSqsClient({ messageId: 'mid-strict' });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     const resizer = new Resizer({
       config: makeImageConfig(),
@@ -259,8 +259,12 @@ describe('SqsTaskQueue.add', () => {
     });
     assert.equal(result.status, 'accepted');
     assert.equal(result.tasks[0].taskId, 'mid-strict');
+    assert.match(
+      JSON.parse(String(sent[0].input.MessageBody)).gateOwner,
+      /^[0-9a-f]{32}$/,
+    );
   });
-  test('prewarm leaves an SQS lock loser unconfirmed (SQS has no lookup)', async () => {
+  test('prewarm with a held gate lock is RESIZE_ENQUEUE_LOCK_CONTENDED and sends nothing (SQS has no lookup)', async () => {
     const { client, sent } = makeFakeSqsClient({ messageId: 'unused' });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     const resizer = new Resizer({
@@ -285,7 +289,31 @@ describe('SqsTaskQueue.add', () => {
     });
     assert.equal(result.status, 'incomplete');
     assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
+    assert.equal(result.issues[0].retryable, true);
     assert.equal(sent.length, 0);
+  });
+  test('add sends gateOwner in the body and claim returns it; the dead-letter body leaves it out', async () => {
+    const { client, sent } = makeFakeSqsClient({ messageId: 'mid-g' });
+    const producer = new SqsTaskQueue({ queueUrl: 'q', client });
+    await producer.add(newTask({ gateOwner: 'g1' }));
+    const body = String(sent[0].input.MessageBody);
+    assert.equal(JSON.parse(body).gateOwner, 'g1');
+    // The worker receives the body that add sent.
+    const { client: received, sent: deadSent } = makeFakeSqsClient({
+      message: message({ Body: body }),
+    });
+    const consumer = new SqsTaskQueue({
+      queueUrl: 'q',
+      client: received,
+      deadLetterQueueUrl: DEAD_URL,
+    });
+    const claimed = await consumer.claim('default', 60_000);
+    assert.ok(claimed);
+    assert.equal(claimed.gateOwner, 'g1');
+    assert.equal(await consumer.fail(claimed, 'dead', 'x'), true);
+    assert.equal(deadSent[0].input.QueueUrl, DEAD_URL);
+    const deadBody = JSON.parse(String(deadSent[0].input.MessageBody));
+    assert.equal('gateOwner' in deadBody, false);
   });
 });
 
@@ -331,10 +359,7 @@ describe('SqsTaskQueue.claim', () => {
     const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       client,
-      timing: {
-        leaseMs: 30_000,
-        lockTtlMs: { dispatch: 60_000, worker: 30_000 },
-      },
+      timing: { leaseMs: 30_000 },
     });
     await tasks.claim('default', timingOf(tasks).leaseMs);
     assert.equal(receiveParams[0].VisibilityTimeout, 30);
@@ -501,6 +526,50 @@ describe('SqsTaskQueue.claim', () => {
       });
       assert.deepEqual(deletes[0], { QueueUrl: 'q', ReceiptHandle: 'rh' });
     }
+  });
+  test('a body without gateOwner (queued before the gate) is claimed without one', async () => {
+    // A gateOwner that is not a string is not copied either.
+    for (const extra of [{}, { gateOwner: 42 }]) {
+      const { client } = makeFakeSqsClient({
+        message: message({
+          Body: JSON.stringify({
+            mediaId: 'm1',
+            pipeline: 'photo',
+            previews: [variant()],
+            ...extra,
+          }),
+        }),
+      });
+      const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+      const claimed = await tasks.claim('default', 60_000);
+      assert.ok(claimed);
+      assert.equal('gateOwner' in claimed, false);
+    }
+  });
+  test('claim ignores a resizers filter: SQS cannot filter by Resizer', async () => {
+    const { client } = makeFakeSqsClient({
+      message: message({
+        Body: JSON.stringify({
+          resizer: 'other',
+          mediaId: 'm1',
+          pipeline: 'photo',
+          previews: [variant()],
+        }),
+      }),
+    });
+    const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
+    const claimed = await tasks.claim('default', 60_000, undefined, {
+      resizers: ['default'],
+    });
+    assert.equal(claimed?.resizer, 'other');
+  });
+  test('SqsTaskQueue declares neither gatesByTask nor claimFilters', () => {
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client: makeFakeSqsClient().client,
+    });
+    assert.equal(tasks.gatesByTask, undefined);
+    assert.equal(tasks.claimFilters, undefined);
   });
 });
 
@@ -735,6 +804,7 @@ describe('Consumer with SqsTaskQueue', () => {
       mediaId: 'm1',
       pipeline: 'photo',
       previews: [variant()],
+      attempts: 1,
     });
   });
   test('a throwing handler reports failed with the original error and schedules redelivery without deletion', async () => {
@@ -839,11 +909,7 @@ describe('Consumer with SqsTaskQueue', () => {
     const tasks = new SqsTaskQueue({
       queueUrl: 'q',
       client,
-      timing: {
-        ...fastTiming,
-        leaseMs: 20,
-        lockTtlMs: { dispatch: 20, worker: 20 },
-      },
+      timing: { ...fastTiming, leaseMs: 20 },
     });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -993,35 +1059,113 @@ describe('Consumer with SqsTaskQueue', () => {
     assert.equal(deletes.length, 1);
     assert.equal(changeVis.length, 0);
   });
+  test('a retry holds the gate lock for the backoff plus one lease; completion releases it', async () => {
+    // The task's message, delivered twice: the first delivery fails, the retry completes.
+    const body = JSON.stringify({
+      mediaId: 'm1',
+      pipeline: 'photo',
+      previews: [variant()],
+      gateOwner: 'g1',
+    });
+    const { client, deletes } = makeFakeSqsClient({
+      outputs: {
+        ReceiveMessageCommand: [
+          { Messages: [message({ Body: body })] },
+          {
+            Messages: [
+              message({
+                Body: body,
+                ReceiptHandle: 'rh-2',
+                Attributes: { ApproximateReceiveCount: '2' },
+              }),
+            ],
+          },
+        ],
+      },
+    });
+    // The default lease (60 s) and a 1 s backoff.
+    const tasks = new SqsTaskQueue({
+      queueUrl: 'q',
+      client,
+      timing: fastTiming,
+    });
+    const { leaseMs, retryBackoffMs } = timingOf(tasks);
+    // The gate lock the Dispatcher took when it queued the task, under the owner the body carries.
+    const locks = clockLocks();
+    const key = gateKey('default', 'default', 'm1', 'photo');
+    assert.equal(await locks.acquire(key, 'g1', 600_000), true);
+    let deliveries = 0;
+    const seen: { event: string; left?: number }[] = [];
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2000);
+    try {
+      await consume(tasks, {
+        signal: ctrl.signal,
+        queue: 'default',
+        handle: async () => {
+          deliveries += 1;
+          if (deliveries === 1) {
+            throw new Error('handler boom');
+          }
+        },
+        coordinationOf: () => ({
+          cooldownMs: 600_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+        onEvent: (event) => {
+          const lock = locks.entry(key);
+          seen.push({
+            event,
+            ...(lock ? { left: lock.expiresAt - Date.now() } : {}),
+          });
+          if (event === 'completed') {
+            ctrl.abort();
+          }
+        },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(
+      seen.map(({ event }) => event),
+      ['failed', 'completed'],
+    );
+    const held = leaseMs + retryBackoffMs.base;
+    const left = seen[0].left ?? 0;
+    assert.ok(
+      // More than the lease alone, at most the lease plus the backoff.
+      left > leaseMs && left <= held,
+      `held for ${left} ms after the failure (expected about ${held})`,
+    );
+    assert.equal(seen[1].left, undefined, 'released on completion');
+    assert.equal(locks.entry(key), undefined);
+    assert.deepEqual(deletes, [{ QueueUrl: 'q', ReceiptHandle: 'rh-2' }]);
+  });
 });
 
 describe('SqsTaskQueue options', () => {
-  test('accepts any timing at construction; the core rejects bad lock TTLs when it reads the timing', () => {
-    const ttl = (err: Error & { code?: string }) =>
-      err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID';
-    // Built outside assert.throws, so a constructor that still checks the TTLs fails the test.
-    const badTtls = new SqsTaskQueue({
+  test('accepts any timing at construction; the core validates it when it reads the timing', () => {
+    // Built outside assert.throws, so a constructor that checks the timing fails the test.
+    const badLease = new SqsTaskQueue({
       queueUrl: 'q',
-      timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
+      timing: { leaseMs: 0 },
     });
-    const badCooldown = new SqsTaskQueue({
+    const removed = new SqsTaskQueue({
       queueUrl: 'q',
-      timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
+      timing: { lockTtlMs: { dispatch: 60_000, worker: 30_000 } } as never,
     });
-    assert.throws(() => timingOf(badTtls), ttl);
     assert.throws(
-      () => timingOf(badCooldown),
+      () => timingOf(badLease),
       (err: Error & { code?: string }) =>
-        ttl(err) && /lockTtlMs\.failed/.test(err.message),
+        err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
-    assert.equal(
-      timingOf(
-        new SqsTaskQueue({
-          queueUrl: 'q',
-          timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
-        }),
-      ).lockTtlMs.failed,
-      600_000,
+    // A plain-Node host that still passes lock TTLs is told where they went.
+    assert.throws(
+      () => timingOf(removed),
+      (err: Error & { code?: string }) =>
+        err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+        /coordination/.test(err.message),
     );
   });
   test('requires queueUrl at construction', () => {

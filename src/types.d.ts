@@ -144,6 +144,7 @@ export interface EnqueueIssue {
     | 'RESIZE_ENQUEUE_UNCONFIRMED'
     | 'RESIZE_ENQUEUE_CONFIRM_FAILED'
     | 'RESIZE_ENQUEUE_VARIANT_CONFLICT'
+    | 'RESIZE_TASK_IN_FLIGHT' // a task of this media, pipeline and queue is active or cooling down
     | 'RESIZE_PIPELINE_UNKNOWN' // the pipeline is not registered on this Resizer
     | 'RESIZE_FORMAT_NOT_CONFIGURED' // a requested format has no encode.formats entry
     | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)
@@ -267,19 +268,29 @@ export interface ResizeConfig {
   concurrency: number;
 }
 
-// Queue timing and lock TTLs: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the
-// framework config file's `queue` section feeds the framework's queue).
+// Queue timing: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the framework
+// config file's `queue` section feeds the framework's queue). How long locks last is not timing:
+// that is the Resizer's `coordination` (CoordinationOptions).
 export interface QueueTimingOptions {
-  // dispatch: default 60000 — one read's enqueue holds each variant this long;
-  // worker: default 60000, must be ≤ leaseMs;
-  // failed: default 600000 — after a task is dead-lettered, reads do not queue its variants again
-  // for this long.
-  lockTtlMs: { dispatch: number; worker: number; failed?: number };
   leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
   retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
   maxAttempts: number; // default 5 — deliveries before dead-letter (every lease counts, incl. reclaims)
   idlePollMs: number; // default 1000 — sleep after an empty poll
   taskTimeoutMs: number; // default 600000 — a task running longer is failed
+}
+
+// How a Resizer with a task queue coordinates its queued work, in ms
+// (`new Resizer({ coordination })`, or the framework config file's `coordination` section). Missing
+// values take the defaults (defaultCoordination); only the core validates them, when the Resizer
+// sets up its task queue. An eager-only Resizer never reads them.
+export interface CoordinationOptions {
+  // default 600000 — how long the gate lock of a queued task holds its media, pipeline and queue
+  // until a worker starts the task and extends it per lease (on a task queue without its own gate,
+  // e.g. SQS); a task given back is held for it again. Raise it when tasks wait longer.
+  gateTtlMs?: number;
+  // default 600000 — after a task is dead-lettered, no new task for that media, pipeline and
+  // queue is queued for this long.
+  cooldownMs?: number;
 }
 
 // The framework worker command's settings (the config file's `worker` section).
@@ -337,5 +348,6 @@ export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   storage?: FrameworkStorageConfig; // required unless the code passes `storage`
   queue?: FrameworkQueueConfig | false; // missing or false: eager only (no task queue)
+  coordination?: CoordinationOptions; // default: defaultCoordination; read only beside a queue
   worker?: FrameworkWorkerConfig; // default: defaultWorkerOptions
 }

@@ -13,11 +13,7 @@ import {
   type DispatchRequest,
   noQueueResult,
 } from './dispatcher.ts';
-import {
-  ResizeConfigError,
-  ResizeMediaError,
-  ResizeSetupError,
-} from './errors.ts';
+import { ResizeError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import type { HookBus } from './hooks.ts';
 import { getSizeKey, requireMediaId, toMissingPreview } from './images.ts';
@@ -242,8 +238,10 @@ export class Reader {
    * Pre-warm the catalog at UPLOAD: queue every missing variant without blocking on image work,
    * and report each requested variant (ready / accepted / not required / unconfirmed, with task
    * receipts and issues): every missing identity is either confirmed by a task receipt or
-   * explicit. A held dispatch lock never counts as queued: the queue's findActive() must confirm
-   * it. Uses the read path's `resolveSizes` / `beforeEnqueue` waterfalls. NEVER throws: an upload
+   * explicit. A task already in flight for the media, pipeline and queue confirms only the
+   * variants it holds (the queue's findActive() reports them); a held gate lock never counts as
+   * queued. Uses
+   * the read path's `resolveSizes` / `beforeEnqueue` waterfalls. NEVER throws: an upload
    * must not fail because pre-warming hiccuped, so an unexpected error becomes
    * `status: 'incomplete'` with a RESIZE_ENQUEUE_INTERNAL_ERROR issue.
    */
@@ -419,10 +417,52 @@ export class Reader {
   }
 }
 
+// The errors of this package that a prewarm retry cannot fix: an unusable media, or wrong wiring or
+// config. Told by the brand and the class names, so an error from a duplicate copy of the package
+// gets the same advice.
+const NOT_RETRYABLE_ON_PREWARM = new Set([
+  'ResizeMediaError',
+  'ResizeNoOriginalError',
+  'ResizeOriginalError',
+  'ResizeConfigError',
+  'ResizeSetupError',
+]);
+
+/**
+ * True when a prewarm retry cannot help `err`: an error of this package (by its brand) that says
+ * so itself (`retryable: false`), or one of the classes above, or a subclass of one (a host's
+ * `class HostSetupError extends ResizeSetupError`): its name, or a constructor name along its
+ * prototype chain, without `instanceof`, which a duplicate package copy would defeat.
+ */
+function notRetryableOnPrewarm(err: unknown): boolean {
+  if (!ResizeError.isResizeError(err)) {
+    return false;
+  }
+  if (err.retryable === false || NOT_RETRYABLE_ON_PREWARM.has(err.name)) {
+    return true;
+  }
+  try {
+    for (
+      let proto: unknown = Object.getPrototypeOf(err);
+      proto !== null && proto !== Object.prototype;
+      proto = Object.getPrototypeOf(proto)
+    ) {
+      const name = (proto as { constructor?: { name?: unknown } }).constructor
+        ?.name;
+      if (typeof name === 'string' && NOT_RETRYABLE_ON_PREWARM.has(name)) {
+        return true;
+      }
+    }
+  } catch {
+    // A prototype chain that cannot be read: no class advice, the error stays retryable.
+  }
+  return false;
+}
+
 /**
  * Prewarm's result for an unexpected error: every variant `requested` so far is unconfirmed, with
- * one RESIZE_ENQUEUE_INTERNAL_ERROR issue. Retryable unless the media is unusable or the wiring or
- * config is wrong. This `retryable` is advice to the prewarm caller, so it differs from
+ * one RESIZE_ENQUEUE_INTERNAL_ERROR issue. Retryable unless the error says no retry can help, the
+ * media is unusable, or the wiring or config is wrong. This `retryable` is advice to the prewarm caller, so it differs from
  * ResizeError.retryable on purpose: a ResizeSetupError will not improve on the caller's retry, yet
  * a queued task that hits one is retried (a worker deployed with the fix can run it).
  */
@@ -443,11 +483,7 @@ export function prewarmFailure(
         code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
         message: err instanceof Error ? err.message : String(err),
         // An unusable media (e.g. no id) or a wiring/config mistake won't improve on retry.
-        retryable: !(
-          err instanceof ResizeMediaError ||
-          err instanceof ResizeConfigError ||
-          err instanceof ResizeSetupError
-        ),
+        retryable: !notRetryableOnPrewarm(err),
         previews: [...requested],
       },
     ],

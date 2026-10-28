@@ -7,13 +7,18 @@
 // reads a framework app. Framework hosts use FrameworkResizer (src/framework/resizer.ts), which
 // builds every part from the app's config file.
 import { Catalog } from './catalog.ts';
-import defaultResizeConfig from './config/resize.ts';
+import defaultResizeConfig, { defaultCoordination } from './config/resize.ts';
 import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { TaskQueue } from './contracts/taskQueue.ts';
+import {
+  type Coordination,
+  fillCoordination,
+  type TaskCoordination,
+} from './coordination.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
@@ -25,6 +30,7 @@ import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { timingOf } from './timing.ts';
 import type {
+  CoordinationOptions,
   GenerateOpts,
   GenerateResult,
   LazyPart,
@@ -43,8 +49,9 @@ import { Uploader } from './uploader.ts';
 // ---------------------------------------------------------------------------
 // Constructor options. `storage` and `media` are required — both modes need them, so a missing
 // driver is a boot-time type/throw error, not a runtime degradation. `tasks` is optional
-// (eager-only hosts omit it), and `locks` is required beside it: reads and the worker lock every
-// variant they queue or render.
+// (eager-only hosts omit it), and `locks` is required beside a task queue without gatesByTask
+// (e.g. SqsTaskQueue): such a queue cannot keep the gate of a media, pipeline and queue itself, so
+// the gate is a lock in this store.
 // ---------------------------------------------------------------------------
 
 export interface ResizerOptions {
@@ -56,12 +63,18 @@ export interface ResizerOptions {
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
   storage: ResizeStorage | LazyPart<ResizeStorage>; // REQUIRED: files (originals, previews)
   media: MediaStore | LazyPart<MediaStore>; // REQUIRED: media documents and their previews
-  // Locks for queued work, e.g. mongoParts(…).locks. Required when `tasks` is set; eager-only
+  // Locks for queued work, e.g. mongoParts(…).locks. Required beside a task queue without
+  // gatesByTask, which takes one gate lock per media, pipeline and queue it queues; eager-only
   // hosts may omit it.
   locks?: LockStore | LazyPart<LockStore | undefined>;
   // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. mongoParts(…).tasks or
   // an SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
   tasks?: TaskQueue | LazyPart<TaskQueue | undefined>;
+  // How queued work is coordinated (`gateTtlMs`, `cooldownMs`; missing values default), or a
+  // function returning it. Read only beside a task queue, when the Resizer sets it up (a function
+  // is called then, and again only after a failed set-up), and validated then; an eager-only
+  // Resizer never reads it.
+  coordination?: CoordinationOptions | (() => CoordinationOptions);
   queue?: string; // default queue name for this Resizer's tasks; default 'default'
   pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
   // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
@@ -72,9 +85,10 @@ export interface ResizerOptions {
 const registry = new Registry<Resizer>();
 
 // Set by the Resizer class, which alone can read its private services and parts (see
-// processorOf() and tasksPartOf()).
+// processorOf(), tasksPartOf() and taskCoordinationOf()).
 let readProcessor: (resizer: Resizer) => Processor;
 let loadTasksPart: (resizer: Resizer) => Promise<TaskQueue | undefined>;
+let readTaskCoordination: (resizer: Resizer) => TaskCoordination;
 
 const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
 type PartName = (typeof PART_NAMES)[number];
@@ -113,7 +127,7 @@ const mediaRequired = () =>
 
 const locksRequired = (name: string) =>
   new ResizeSetupError(
-    `resize: Resizer '${name}' has a task queue but no \`locks\` — reads and the worker lock every variant they queue or render (e.g. the parts of mongoParts(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
+    `resize: Resizer '${name}' has a task queue without gatesByTask (e.g. SqsTaskQueue) but no \`locks\` — it takes one gate lock per media, pipeline and queue it queues (e.g. the locks of mongoParts(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
     { code: 'RESIZE_LOCKS_REQUIRED' },
   );
 
@@ -135,6 +149,7 @@ export class Resizer {
   #media: MediaStore | undefined;
   #locks: LockStore | undefined;
   #tasks: TaskQueue | undefined;
+  readonly #coordinationSource: ResizerOptions['coordination'];
   // Each part loads once: the parts usable now (given as objects, or loaded) and the loads in
   // flight. A part whose function failed is retried alone; the parts that loaded are kept.
   readonly #loadedParts = new Set<PartName>();
@@ -145,16 +160,31 @@ export class Resizer {
   // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
   #dispatcher: Dispatcher | undefined;
   #queueFailure: QueueFailure | undefined;
+  // The validated coordination, kept with the Dispatcher it was built for.
+  #coordination: Coordination | undefined;
   // The Dispatcher was built or its failure changed after the Reader was built.
   #readerStale = false;
 
   static {
-    // processorOf() and tasksPartOf() (below) read through these; the services stay private.
+    // processorOf(), tasksPartOf() and taskCoordinationOf() (below) read through these; the
+    // services stay private.
     readProcessor = (resizer) =>
       resizer.#builtServices?.processor ?? resizer.#notReady('processor');
     loadTasksPart = async (resizer) => {
       await resizer.#loadTasks();
       return resizer.#tasks;
+    };
+    readTaskCoordination = (resizer) => {
+      if (!resizer.#builtServices) {
+        resizer.#notReady('coordination');
+      }
+      return {
+        cooldownMs:
+          resizer.#coordination?.cooldownMs ?? defaultCoordination.cooldownMs,
+        gateTtlMs:
+          resizer.#coordination?.gateTtlMs ?? defaultCoordination.gateTtlMs,
+        locks: resizer.#locks,
+      };
     };
   }
 
@@ -200,6 +230,7 @@ export class Resizer {
       locks: opts.locks,
       tasks: opts.tasks,
     };
+    this.#coordinationSource = opts.coordination;
     // Parts given as objects are usable at once; functions wait for ready().
     if (typeof opts.storage !== 'function') {
       this.#storage = opts.storage;
@@ -272,14 +303,14 @@ export class Resizer {
   /**
    * Load the parts given as functions, each once, then build the services. Every method of the
    * Resizer (and the worker) awaits it first, so hosts only need it before reading `storage`,
-   * `media`, `locks` or `tasks` directly. In this order: the parts load; a Resizer with a task
-   * queue builds its Dispatcher; the image config is read and validated; the services are built.
-   * A part or config failure rejects. A Dispatcher failure (a task queue without a lock store,
-   * RESIZE_LOCKS_REQUIRED, or invalid queue timing) does not: it is logged once, reads serve
-   * stored previews and queue nothing, uploads and generate() work, prewarm() reports it and
-   * verify() rejects with it. The next call retries what failed: a part that did not load, a
-   * config that did not validate, a Dispatcher that could not be built. The parts that loaded are
-   * kept.
+   * `media`, `locks` or `tasks` directly. In this order: the parts load; the image config is read
+   * and validated; a Resizer with a task queue builds its Dispatcher; the services are built.
+   * A part or config failure rejects. A Dispatcher failure (a task queue without gatesByTask and
+   * no lock store, RESIZE_LOCKS_REQUIRED, invalid queue timing, or an invalid coordination) does
+   * not: it is logged once, reads serve stored previews and queue nothing, uploads and generate()
+   * work, prewarm() reports it and verify() rejects with it. The next call retries what failed: a
+   * part that did not load, a config that did not validate, a Dispatcher that could not be built.
+   * The parts that loaded are kept.
    */
   async ready(): Promise<void> {
     await this.#services();
@@ -324,13 +355,16 @@ export class Resizer {
 
   /**
    * The services: built on the first call that succeeds, then the same object (a failed build
-   * leaves nothing behind). The Dispatcher comes first, in its own step, so its failure leaves the
-   * others usable. Called only after the parts are loaded.
+   * leaves nothing behind). The image config comes first: a broken config file, which a lazy
+   * coordination reads too, fails as itself and is never logged as a queue failure. The Dispatcher
+   * comes next, in its own step, so its failure leaves the others usable. Called only after the
+   * parts are loaded.
    */
   #ensureServices(): Services {
+    const config = this.config;
     this.#ensureDispatcher();
     if (!this.#builtServices) {
-      const { config, storage, media } = this;
+      const { storage, media } = this;
       const catalog = new Catalog({ config });
       this.#builtServices = {
         catalog,
@@ -340,7 +374,6 @@ export class Resizer {
           catalog,
           media,
           storage,
-          locks: this.#locks,
           pipelines: this.#pipelines,
           hooks: this.#hooks,
           config,
@@ -402,18 +435,27 @@ export class Resizer {
   }
 
   /**
-   * The Dispatcher on the queue's validated timing. Queued work locks every variant, so a task
-   * queue without a lock store is RESIZE_LOCKS_REQUIRED.
+   * The Dispatcher with the validated coordination. A task queue without gatesByTask needs the
+   * lock store for its gate locks, so without one it is RESIZE_LOCKS_REQUIRED; a queue that gates
+   * by task needs none. The queue's timing is validated here (the Dispatcher takes its lease), and
+   * the coordination is read (a function is called) and validated; it is kept only when the
+   * Dispatcher is built, so a failed set-up reads it again on the next call.
    */
   #buildDispatcher(tasks: TaskQueue): Dispatcher {
-    const locks = this.#locks;
-    if (!locks) {
+    if (!this.#locks && !tasks.gatesByTask) {
       throw locksRequired(this.name);
     }
+    const source = this.#coordinationSource;
+    const timing = timingOf(tasks);
+    const coordination = fillCoordination(
+      typeof source === 'function' ? source() : source,
+    );
+    this.#coordination = coordination;
     return new Dispatcher({
       tasks,
-      locks,
-      timing: timingOf(tasks),
+      locks: this.#locks,
+      coordination,
+      leaseMs: timing.leaseMs,
       name: this.name,
       logger: this.logger,
     });
@@ -448,20 +490,20 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: load the drivers; check that a task queue can be used (a lock store
-   * beside it, and its timing), then resolve and validate the config; run the media store's and
-   * the lock store's verify(); check the task queue (its own verify(), and that it serves this
-   * Resizer's queue). Framework hosts call it after `Server.init()` to fail at boot instead of at
-   * the first upload or read; it is the one call that rejects for a task queue that cannot be used
-   * (the read path degrades instead). The worker runs it for every Resizer before leasing.
+   * Optional startup check: load the drivers and resolve and validate the config (see ready());
+   * check that a task queue can be used (a lock store beside one without gatesByTask, its timing
+   * and the coordination); run the media store's and the lock store's verify(); check the task
+   * queue (its own verify(), and that it serves this Resizer's queue). Framework hosts call it
+   * after `Server.init()` to fail at boot instead of at the first upload or read; it is the one
+   * call that rejects for a task queue that cannot be used (the read path degrades instead). The
+   * worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
-    await this.#loadParts();
-    this.#ensureDispatcher();
+    // ready() resolves while the task queue cannot be used; verify() rejects with the reason.
+    await this.ready();
     if (this.#queueFailure) {
       throw this.#queueFailure.error;
     }
-    await this.ready();
     await this.media.verify?.();
     await this.locks?.verify?.();
     if (this.tasks) {
@@ -506,8 +548,10 @@ export class Resizer {
   /**
    * Pre-warm at upload: queue every missing variant of the catalog without waiting for image work,
    * so the previews are usually ready by the first read. Reports each variant (ready / accepted /
-   * not required / unconfirmed, with task receipts and issues); a held dispatch lock never counts as
-   * queued. NEVER throws (same guarantee as `resolve`): an internal error is `status: 'incomplete'`.
+   * not required / unconfirmed, with task receipts and issues). A task already in flight for the
+   * media, pipeline and queue is reported, not counted as queued: only the variants it holds are
+   * accepted, and the rest are RESIZE_TASK_IN_FLIGHT; a held gate lock never counts as queued.
+   * NEVER throws (same guarantee as `resolve`): an internal error is `status: 'incomplete'`.
    */
   async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
     let services: Services;
@@ -555,9 +599,9 @@ export function listResizers(): Resizer[] {
 }
 
 /**
- * The Processor of `resizer`, which renders previews: the worker's entry for one queued task, the
- * dead-letter cooldown and the task observers. Throws RESIZE_NOT_READY until ready() has built
- * the services. Internal: the main entry does not export it, and it may change in any release.
+ * The Processor of `resizer`, which renders previews: the worker's entry for one queued task and
+ * the task observers. Throws RESIZE_NOT_READY until ready() has built the services. Internal: the
+ * main entry does not export it, and it may change in any release.
  * @internal
  */
 export function processorOf(resizer: Resizer): Processor {
@@ -573,6 +617,17 @@ export function processorOf(resizer: Resizer): Processor {
  */
 export function tasksPartOf(resizer: Resizer): Promise<TaskQueue | undefined> {
   return loadTasksPart(resizer);
+}
+
+/**
+ * What the worker needs for each task of `resizer`: the `cooldownMs` and `gateTtlMs` of its
+ * validated coordination (the defaults when it has no task queue it can use) and its lock store. Throws
+ * RESIZE_NOT_READY until ready() has built the services. Internal: the main entry does not export
+ * it, and it may change in any release.
+ * @internal
+ */
+export function taskCoordinationOf(resizer: Resizer): TaskCoordination {
+  return readTaskCoordination(resizer);
 }
 
 /**

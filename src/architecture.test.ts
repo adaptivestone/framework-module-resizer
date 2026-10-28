@@ -22,6 +22,10 @@ const GLOBAL_LOOKUPS = new Set([
   'listResizers',
 ]);
 
+/** The source of `f`, a path relative to src/. */
+const read = (f: string): string =>
+  readFileSync(new URL(`./${f}`, import.meta.url), 'utf8');
+
 /** Names imported as runtime values (`import type` and `type X` specifiers are erased). */
 function valueImports(source: string): string[] {
   const names: string[] = [];
@@ -70,11 +74,58 @@ for (const file of CORE_FILES) {
 // export come back.
 test('only images.ts decides which stored rows count', () => {
   const users = sourceFiles().filter(
-    (f) =>
-      f !== 'images.ts' &&
-      readFileSync(new URL(`./${f}`, import.meta.url), 'utf8').includes(
-        'isUsablePreview(',
-      ),
+    (f) => f !== 'images.ts' && read(f).includes('isUsablePreview('),
   );
   assert.deepEqual(users, []);
+});
+
+// The host's logger is host code and may throw; the worker loop must survive that, so it logs only
+// through logNeverThrow, which falls back to the console. Optional calls (`logger?.error(`) and
+// references (`logger.error.bind`) count as direct too.
+test('the worker loop logs only through logNeverThrow', () => {
+  const direct = ['consumer.ts', 'worker.ts'].filter((f) =>
+    /\blogger\??\.(info|warn|error)\b/.test(read(f)),
+  );
+  assert.deepEqual(direct, []);
+  // The pattern itself: each of these forms is caught.
+  for (const call of [
+    'logger.error(',
+    'logger?.warn(',
+    'this.#deps.logger.info(',
+    'logger.error.bind(',
+  ]) {
+    assert.match(call, /\blogger\??\.(info|warn|error)\b/, call);
+  }
+});
+
+// One gate per Resizer, media, pipeline and queue replaced the per-identity dispatch and worker
+// locks: the gate, the queue's lease and the media store's one row per identity deduplicate the
+// work.
+test('per-identity locks are gone: no source builds a dispatch or worker lock', () =>
+  assert.deepEqual(
+    sourceFiles().filter((f) =>
+      /resize_dispatch|resize_worker|DISPATCH_LOCK_OWNER|dispatchLockKey|workerLockKey/.test(
+        read(f),
+      ),
+    ),
+    [],
+  ));
+
+// The core owns the lock settings: the Resizer validates its coordination (coordination.ts), and
+// the core's timing check rejects the removed lockTtlMs key. A driver never reads or checks them.
+test('lock settings are validated only in the core', () => {
+  assert.deepEqual(
+    sourceFiles().filter(
+      (f) => f.startsWith('drivers/') && /lockTtlMs|gateTtlMs/.test(read(f)),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    sourceFiles().filter(
+      (f) =>
+        f !== 'coordination.ts' &&
+        /RESIZE_CONFIG_COORDINATION_INVALID/.test(read(f)),
+    ),
+    [],
+  );
 });

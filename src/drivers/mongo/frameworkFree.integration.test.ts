@@ -114,11 +114,7 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
   );
   const parts = mongoParts(connection, {
     mediaModel: File,
-    timing: {
-      lockTtlMs: { dispatch: 60_000, worker: 5000 },
-      idlePollMs: 20,
-      leaseMs: 5000,
-    },
+    timing: { idlePollMs: 20, leaseMs: 5000 },
     logger: silent,
   });
   const { ResizeTask, ResizeLock } = connection.models;

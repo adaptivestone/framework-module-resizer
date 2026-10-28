@@ -5,6 +5,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import { defaultCoordination } from './config/resize.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
@@ -19,11 +20,13 @@ import {
   Resizer,
   type ResizerOptions,
   resetResizerForTests,
+  taskCoordinationOf,
 } from './resizer.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
@@ -71,16 +74,23 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('Resizer constructor — driver wiring', () => {
-  test('FrameworkResizer fills the media and lock stores', () => {
+  test('FrameworkResizer fills the media store, and the lock store only beside a queue without gatesByTask', async () => {
     const eager = new FrameworkResizer(baseOpts());
     assert.ok(eager.media instanceof FrameworkMediaStore);
-    assert.ok(eager.locks instanceof FrameworkLockStore);
+    await eager.ready();
+    assert.equal(eager.locks, undefined); // no `queue` section: eager only
     resetResizerForTests();
     const tasks = new MemoryTaskQueue();
-    const queued = new FrameworkResizer({ ...baseOpts(), tasks });
-    assert.ok(queued.media instanceof FrameworkMediaStore);
-    assert.ok(queued.locks instanceof FrameworkLockStore);
-    assert.equal(queued.tasks, tasks);
+    const gating = new FrameworkResizer({ ...baseOpts(), tasks });
+    assert.ok(gating.media instanceof FrameworkMediaStore);
+    assert.equal(gating.locks, undefined);
+    assert.equal(gating.tasks, tasks);
+    resetResizerForTests();
+    const plain = new FrameworkResizer({
+      ...baseOpts(),
+      tasks: new PlainTaskQueue(),
+    });
+    assert.ok(plain.locks instanceof FrameworkLockStore);
   });
 
   test('keeps passed drivers (no defaulting when provided)', () => {
@@ -508,6 +518,8 @@ describe('ports', () => {
   const locksRequired = (e: unknown) =>
     e instanceof ResizeSetupError &&
     e.code === 'RESIZE_LOCKS_REQUIRED' &&
+    /SqsTaskQueue/.test(e.message) &&
+    /one gate lock per media, pipeline and queue/.test(e.message) &&
     /FrameworkResizer/.test(e.message) &&
     /mongoParts/.test(e.message);
 
@@ -534,46 +546,62 @@ describe('ports', () => {
     );
   });
 
-  test('a lazy locks part that resolves to nothing beside a task queue: ready() resolves, verify() is RESIZE_LOCKS_REQUIRED', async () => {
-    const r = new Resizer({
+  test('a task queue with gatesByTask needs no locks; one without is RESIZE_LOCKS_REQUIRED from verify()', async () => {
+    const gating = new Resizer({
+      logger: silent,
+      storage,
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+    });
+    await gating.verify();
+    assert.equal(gating.locks, undefined);
+    resetResizerForTests();
+    const plain = new Resizer({
       logger: silent,
       storage,
       media: fakeMedia(),
       locks: () => undefined,
-      tasks: new MemoryTaskQueue(),
+      tasks: new PlainTaskQueue(),
     });
-    await r.ready();
-    assert.equal(r.locks, undefined);
-    await assert.rejects(() => r.verify(), locksRequired);
+    await plain.ready();
+    assert.equal(plain.locks, undefined);
+    await assert.rejects(() => plain.verify(), locksRequired);
   });
 
-  test('verify() checks the queue timing before the image config; ready() rejects only for the config', async () => {
+  test('ready() and verify() check the image config before the task queue, and log nothing about the queue', async () => {
     let configReads = 0;
+    let timingReads = 0;
+    const errors: unknown[][] = [];
+    const tasks = new MemoryTaskQueue();
+    tasks.getTiming = () => {
+      timingReads += 1;
+      return { leaseMs: 0 };
+    };
     const r = new Resizer({
-      logger: silent,
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => {
+          errors.push(args);
+        },
+      },
       storage,
       media: fakeMedia(),
       locks: memoryLocks(),
-      tasks: new MemoryTaskQueue({ timing: { leaseMs: 0 } }),
+      tasks,
       config: () => {
         configReads += 1;
         return { ...makeImageConfig(), upload: null } as never;
       },
     });
-    await assert.rejects(
-      () => r.verify(),
-      (e: unknown) =>
-        e instanceof ResizeConfigError &&
-        e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
-    );
-    assert.equal(configReads, 0);
-    await assert.rejects(
-      () => r.ready(),
-      (e: unknown) =>
-        e instanceof ResizeConfigError &&
-        /upload must be an object/.test(e.message),
-    );
-    assert.equal(configReads, 1);
+    const badConfig = (e: unknown) =>
+      e instanceof ResizeConfigError &&
+      /upload must be an object/.test(e.message);
+    await assert.rejects(() => r.ready(), badConfig);
+    await assert.rejects(() => r.verify(), badConfig);
+    assert.equal(configReads, 2);
+    assert.equal(timingReads, 0);
+    assert.deepEqual(errors, []);
   });
 
   test('an eager-only Resizer needs no locks, and has no db', async () => {
@@ -625,7 +653,7 @@ describe('a task queue the Resizer cannot use', () => {
    */
   async function assertDegraded(
     parts: Pick<ResizerOptions, 'locks' | 'tasks'>,
-    tasks: MemoryTaskQueue,
+    tasks: MemoryTaskQueue | PlainTaskQueue,
     failed: (e: unknown) => boolean,
   ) {
     const errors: unknown[][] = [];
@@ -713,14 +741,15 @@ describe('a task queue the Resizer cannot use', () => {
     assert.match(result.issues[0].message, /leaseMs/);
   });
 
-  test('a task queue without locks: the same, and verify() is RESIZE_LOCKS_REQUIRED', async () => {
-    const tasks = new MemoryTaskQueue();
+  test('a task queue without gatesByTask and without locks: the same, and verify() is RESIZE_LOCKS_REQUIRED', async () => {
+    const tasks = new PlainTaskQueue();
     const result = await assertDegraded(
       { tasks },
       tasks,
       (e: unknown) =>
         e instanceof ResizeSetupError &&
         e.code === 'RESIZE_LOCKS_REQUIRED' &&
+        /SqsTaskQueue/.test(e.message) &&
         /FrameworkResizer/.test(e.message) &&
         /mongoParts/.test(e.message),
     );
@@ -770,6 +799,165 @@ describe('a task queue the Resizer cannot use', () => {
     );
     await r.verify();
     assert.equal(errors.length, 2);
+  });
+});
+
+describe('coordination', () => {
+  const silent = { info() {}, warn() {}, error() {} };
+  const media = () => ({
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [],
+  });
+  const sizes = [{ width: 20, height: 20 }];
+  const invalidCooldown = (e: unknown) =>
+    e instanceof ResizeConfigError &&
+    e.code === 'RESIZE_CONFIG_COORDINATION_INVALID' &&
+    /cooldownMs/.test(e.message);
+
+  test('a bad coordination degrades like a bad queue: ready() resolves, verify() rejects, resolve() queues nothing, prewarm() reports it', async () => {
+    const errors: unknown[][] = [];
+    const tasks = new MemoryTaskQueue();
+    const r = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => {
+          errors.push(args);
+        },
+      },
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks,
+      coordination: { cooldownMs: 0 },
+    });
+    await r.ready();
+    await assert.rejects(() => r.verify(), invalidCooldown);
+    const { decision } = await r.resolve({ media: media(), sizes });
+    assert.deepEqual(
+      decision.missing.map((variant) => variant.sizeKey),
+      ['20x20'],
+    );
+    assert.equal(tasks.added.length, 0);
+    const result = await r.prewarm({ media: media(), sizes });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false);
+    assert.match(result.issues[0].message, /cooldownMs/);
+    assert.equal(tasks.added.length, 0);
+    assert.equal(errors.length, 1, 'logged once');
+    assert.match(String(errors[0][0]), /cannot use its task queue/);
+    assert.ok(invalidCooldown(errors[0][1]));
+  });
+
+  test("a gateTtlMs below the task queue's lease is fine (a database queue with a long lease needs no coordination)", async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks: new MemoryTaskQueue({ timing: { leaseMs: 1_200_000 } }),
+      coordination: { gateTtlMs: 60_000 },
+    });
+    await r.verify();
+    assert.equal(taskCoordinationOf(r).gateTtlMs, 60_000);
+  });
+
+  test('coordination given as a function is read once, when the task queue is set up; an eager-only Resizer never reads it', async () => {
+    let reads = 0;
+    const r = new Resizer({
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks: new MemoryTaskQueue(),
+      coordination: () => {
+        reads += 1;
+        return { cooldownMs: 30_000 };
+      },
+    });
+    assert.equal(reads, 0);
+    await r.ready();
+    assert.equal(reads, 1);
+    await r.resolve({ media: media(), sizes });
+    await r.prewarm({ media: media(), sizes });
+    await r.verify();
+    await r.ready();
+    assert.equal(reads, 1);
+    assert.equal(taskCoordinationOf(r).cooldownMs, 30_000);
+
+    // Invalid, but never read: an eager-only Resizer has no task queue to coordinate.
+    let eagerReads = 0;
+    const eager = new Resizer({
+      name: 'eager',
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      coordination: () => {
+        eagerReads += 1;
+        return { cooldownMs: 0 };
+      },
+    });
+    await eager.ready();
+    await eager.resolve({ media: media(), sizes });
+    await eager.prewarm({ media: media(), sizes });
+    await eager.verify();
+    assert.equal(eagerReads, 0);
+  });
+
+  test('taskCoordinationOf gives the cooldown, the gate TTL and the lock store, or the defaults without a task queue', async () => {
+    const locks = memoryLocks();
+    const r = new Resizer({
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      locks,
+      tasks: new MemoryTaskQueue(),
+      coordination: { cooldownMs: 30_000, gateTtlMs: 90_000 },
+    });
+    assert.throws(
+      () => taskCoordinationOf(r),
+      (e: unknown) =>
+        e instanceof ResizeSetupError && e.code === 'RESIZE_NOT_READY',
+    );
+    await r.ready();
+    const own = taskCoordinationOf(r);
+    assert.equal(own.cooldownMs, 30_000);
+    assert.equal(own.gateTtlMs, 90_000);
+    assert.equal(own.locks, locks);
+
+    const eager = new Resizer({
+      name: 'eager',
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      coordination: { cooldownMs: 30_000 },
+    });
+    await eager.ready();
+    assert.deepEqual(taskCoordinationOf(eager), {
+      cooldownMs: defaultCoordination.cooldownMs,
+      gateTtlMs: defaultCoordination.gateTtlMs,
+      locks: undefined,
+    });
+
+    // A task queue the Resizer cannot use: the defaults, and its lock store.
+    const broken = new Resizer({
+      name: 'broken',
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      locks,
+      tasks: new MemoryTaskQueue(),
+      coordination: { cooldownMs: 0 },
+    });
+    await broken.ready();
+    const fallback = taskCoordinationOf(broken);
+    assert.equal(fallback.cooldownMs, defaultCoordination.cooldownMs);
+    assert.equal(fallback.gateTtlMs, defaultCoordination.gateTtlMs);
+    assert.equal(fallback.locks, locks);
   });
 });
 

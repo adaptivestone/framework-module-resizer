@@ -4,6 +4,7 @@
 //   renew    = ChangeMessageVisibility        complete = DeleteMessage
 //   retry    = ChangeMessageVisibility(delay) dead     = send to deadLetterQueueUrl (if set), delete
 //   release  = ChangeMessageVisibility(0)
+// `gateOwner` is the core's gate-lock token; SQS only carries it.
 // The SQS client is built from region/endpoint on first use unless the host passes `client`;
 // credentials come from the AWS provider chain. Subpath-only entry: the optional AWS SDK peer is
 // resolved only when this file is imported, so a missing SDK fails at the host's import line.
@@ -17,7 +18,9 @@ import {
 } from '@aws-sdk/client-sqs';
 import {
   type ClaimedTask,
+  type ClaimOptions,
   type NewTask,
+  type TaskAddResult,
   TaskQueue,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
@@ -49,6 +52,7 @@ interface TaskBody {
   mediaId: string;
   pipeline: string;
   previews: MissingPreview[];
+  gateOwner?: string;
 }
 
 const MAX_VISIBILITY_SECONDS = 43_200; // SQS limit: 12 hours
@@ -122,13 +126,14 @@ export class SqsTaskQueue extends TaskQueue {
     return this.#opts.timing ?? {};
   }
 
-  async add(task: NewTask): Promise<{ taskId: string | null }> {
+  async add(task: NewTask): Promise<TaskAddResult> {
     const body: TaskBody = {
       resizer: task.resizer,
       queue: task.queue,
       mediaId: task.mediaId,
       pipeline: task.pipeline,
       previews: task.previews,
+      ...(task.gateOwner !== undefined ? { gateOwner: task.gateOwner } : {}),
     };
     const out = await this.#sqs().send(
       new SendMessageCommand({
@@ -136,13 +141,18 @@ export class SqsTaskQueue extends TaskQueue {
         MessageBody: JSON.stringify(body),
       }),
     );
-    return { taskId: out.MessageId ?? null };
+    return typeof out.MessageId === 'string'
+      ? { status: 'added', taskId: out.MessageId }
+      : { status: 'unconfirmed' };
   }
 
+  // `opts` is ignored: SQS cannot select messages by their content, so a claim may hand out a task
+  // of any Resizer.
   async claim(
     queue: string,
     leaseMs: number,
     signal?: AbortSignal,
+    _opts?: ClaimOptions,
   ): Promise<ClaimedTask | null> {
     const queueUrl = this.#queueUrl(queue);
     const out = await this.#sqs().send(
@@ -183,6 +193,9 @@ export class SqsTaskQueue extends TaskQueue {
       // The URL travels with the token: complete/fail/renew act on the queue it came from.
       token: JSON.stringify([queueUrl, message.ReceiptHandle]),
       attempts: Number(receiveCount ?? 1),
+      ...(typeof body.gateOwner === 'string'
+        ? { gateOwner: body.gateOwner }
+        : {}),
     };
   }
 

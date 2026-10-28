@@ -89,15 +89,17 @@ The framework adapter composes `FrameworkMediaStore` (the app's media model), `F
 
 **F2. Coordination policy belongs to the Resizer.** Lock durations and cooldowns are the core's
 dedup policy, not queue timing: `new Resizer({ coordination: { gateTtlMs, cooldownMs } })` (framework
-hosts: a `coordination` section in `resize.ts`). The core validates it against the queue timing
-(`gateTtlMs ≥ leaseMs`); no driver validates lock settings. `QueueTimingOptions` loses `lockTtlMs`.
+hosts: a `coordination` section in `resize.ts`). The core validates it (positive integers; the
+`gateTtlMs ≥ leaseMs` rule was dropped in S2, since the worker extends a running task's gate per
+lease); no driver validates lock settings. `QueueTimingOptions` loses `lockTtlMs`.
 
-**F3. The task row is the gate.** One active task per `(resizer, mediaId, pipeline)`.
+**F3. The task row is the gate.** One active task per `(resizer, mediaId, pipeline, queue)`.
+The gate includes the queue: a lane split is the host's choice to render twice.
 
 - `TaskQueue.add(task)` returns `{ status: 'added', taskId } | { status: 'in-flight', taskId? } |
   { status: 'unconfirmed' }`. A queue that can enforce this declares `gatesByTask: true`.
 - **Mongo** (`gatesByTask`): rows carry `active: true` from `add` until `complete` or the end of
-  the dead-letter cooldown; a unique partial index on `{ resizer, fileId, pipeline }` with
+  the dead-letter cooldown; a unique partial index on `{ resizer, fileId, pipeline, queue }` with
   `partialFilterExpression: { active: true }` makes `add` an insert that either succeeds or reports
   `in-flight`. A task in retry backoff stays active, so the lock-release bug disappears. A dead
   row keeps the gate for `cooldownMs`; `add` takes over an expired dead row atomically. No locks on
@@ -105,11 +107,12 @@ hosts: a `coordination` section in `resize.ts`). The core validates it against t
   `requestKey` field and its index are removed (the gate replaces them); `findActive` returns the
   one active task so `prewarm` can report which requested variants it covers.
 - **Queues without the gate** (SQS, custom): the dispatcher takes one owned lock
-  `resize_gate:<resizer>:<mediaId>:<pipeline>` for `gateTtlMs` before `add` (owner = a request
-  token stored in the task payload as `gateOwner`), and releases it if `add` fails. After claim the
-  worker extends it on every heartbeat to `leaseMs`; on `fail({ retryAt })` it extends it to
+  `resize_gate:<resizer>:<queue>:<mediaId>:<pipeline>` for `gateTtlMs` before `add` (owner = a request
+  token stored in the task payload as `gateOwner`), and shortens it to one lease if `add` is not
+  confirmed (the task may still be stored). After claim the worker extends it on every heartbeat
+  to `leaseMs` plus one heartbeat interval; on `fail({ retryAt })` it extends it to
   `retryAt + leaseMs`; on `complete` it releases with compare-and-delete; on `fail('dead')` it
-  extends it to `cooldownMs`.
+  extends it to `cooldownMs`; a lapsed lock is taken back under the task's owner.
 - Per-identity worker locks are removed: a media's task runs on one worker at a time by
   construction, the lease token fences task writes, and `appendPreviews` is identity-guarded.
 - Cost accepted: a new size requested for a media whose task is active waits for that task to
@@ -232,6 +235,7 @@ is exported for push-delivered tasks; S3 previews get `Cache-Control: public, ma
 immutable`; the per-read logs for media without original or with an unknown pipeline become
 metrics; the 2026-10-02 and 2026-10-05 design docs get superseded notes; README's terminal-error
 list is corrected.
+Test files are outside `types:check` (about 65 pre-existing type errors in tests, none added in S1/S2): add a tests tsconfig to `types:check`, fix them, keep them clean.
 
 ## Target usage
 

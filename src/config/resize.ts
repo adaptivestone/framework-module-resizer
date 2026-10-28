@@ -1,4 +1,5 @@
 import type {
+  CoordinationOptions,
   FrameworkResizeConfig,
   FrameworkWorkerConfig,
   QueueTimingOptions,
@@ -7,8 +8,8 @@ import type {
 
 // Canonical defaults, pure data. The default export is the core image config (what
 // `new Resizer({ config })` takes). Framework hosts spread `defaultFrameworkResizeConfig`, which adds
-// the `worker` section, and set `mediaModelName`, `storage` and `queue` themselves; the framework
-// applies resize.<NODE_ENV>.ts overrides.
+// the `coordination` and `worker` sections, and set `mediaModelName`, `storage` and `queue`
+// themselves; the framework applies resize.<NODE_ENV>.ts overrides.
 const defaultResizeConfig: ResizeConfig = {
   formats: ['jpeg', 'webp', 'avif'],
   upload: {
@@ -36,15 +37,20 @@ const defaultResizeConfig: ResizeConfig = {
   concurrency: 4,
 };
 
-/** Queue timing and lock TTL defaults (a task queue's missing timing values). */
+/** Queue timing defaults (a task queue's missing timing values). */
 export const defaultQueueOptions = {
-  lockTtlMs: { dispatch: 60_000, worker: 60_000, failed: 600_000 },
   leaseMs: 60_000,
   retryBackoffMs: { base: 5_000, max: 300_000 },
   maxAttempts: 5,
   idlePollMs: 1_000,
   taskTimeoutMs: 600_000,
 } satisfies QueueTimingOptions;
+
+/** Coordination defaults (a Resizer's missing coordination values). */
+export const defaultCoordination = {
+  gateTtlMs: 600_000,
+  cooldownMs: 600_000,
+} satisfies Required<CoordinationOptions>;
 
 /** Framework worker command defaults. */
 export const defaultWorkerOptions: FrameworkWorkerConfig = {
@@ -55,15 +61,19 @@ export const defaultWorkerOptions: FrameworkWorkerConfig = {
 
 /**
  * What a framework host's config file spreads; it adds `mediaModelName`, `storage` and (for
- * background generation) `queue`. `worker` is typed as present, so
+ * background generation) `queue`. `coordination` and `worker` are typed as present, so
  * `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` stays a complete section
  * under strict TypeScript.
  */
 export const defaultFrameworkResizeConfig: Omit<
   FrameworkResizeConfig,
-  'mediaModelName' | 'worker'
-> & { worker: FrameworkWorkerConfig } = {
+  'mediaModelName' | 'worker' | 'coordination'
+> & {
+  worker: FrameworkWorkerConfig;
+  coordination: Required<CoordinationOptions>;
+} = {
   ...defaultResizeConfig,
+  coordination: defaultCoordination,
   worker: defaultWorkerOptions,
 };
 
