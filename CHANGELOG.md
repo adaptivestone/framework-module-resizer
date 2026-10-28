@@ -40,9 +40,12 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
     object into `queues.default` of `src/config/resize.ts` and write `queue: 'default'`. An SQS
     object's `queues: { bulk: url }` becomes an entry of its own,
     `bulk: { driver: 'sqs', queueUrl: url }`, with the same `region`, `endpoint`,
-    `deadLetterQueueUrl` and `waitTimeSeconds`. A second Resizer's file (`configName`) that had its
-    own `queue` object moves it into `queues` of `src/config/resize.ts` under a name of its own and
-    writes `queue: '<that name>'`. A `queue` object, in any file, is `RESIZE_CONFIG_REMOVED_KEY`
+    `deadLetterQueueUrl` and `waitTimeSeconds`. A second Resizer's file (`configName`) whose own
+    `queue` object was on the same backend (both `database`, or the same SQS settings) drops it and
+    keeps `queue: 'default'`: the Resizers share that queue, and no new worker is needed. Only a
+    queue on a different backend, or one that should get its own timing, needs a name of its own in
+    `queues` and `queue: '<that name>'`, and every new name needs its own worker process:
+    `npm run cli ResizeWorker -- --queue=<name>`. A `queue` object, in any file, is `RESIZE_CONFIG_REMOVED_KEY`
     with the new shape in the message, and so is `queues.<name>.queues` (give each SQS queue its own
     entry).
   - `RESIZE_CONFIG_INVALID` also covers a malformed `queues` map or entry (no `driver`, an SQS
@@ -55,9 +58,15 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   settings, `mediaModelName`, `storage` and `queue`. `coordination` is one per process (it was one
   per file; `new FrameworkResizer({ coordination })` still sets one Resizer's), and every key of
   `worker` is optional: a missing one takes `defaultWorkerOptions`, and only a wrong type is
-  `RESIZE_CONFIG_INVALID`. An eager-only Resizer (`queue: false`, or `tasks: false` in code) never
-  reads the process-wide sections, so a malformed `worker` section fails only worker start and the
-  `verify()` of the Resizers that queue.
+  `RESIZE_CONFIG_INVALID`. Only `queue: false` in the Resizer's own file (with no `queueName`
+  option), `tasks: false` in code, or a task queue and `coordination` both passed in code keep a
+  Resizer from reading `src/config/resize.ts`; every other Resizer, one whose file sets no `queue`
+  too (it reads `queues` to learn whether it is eager only or on `'default'`), validates that whole
+  file on first use. So a malformed `queues` or `worker` section there fails that Resizer's first
+  call and its `verify()`: `uploadOriginal()`, `generate()` and `invalidate()` throw the config
+  error (e.g. `RESIZE_CONFIG_INVALID`), and `resolve()` and `prewarm()`, which never throw, return
+  the empty decision and `incomplete`, so even stored previews are not served until the file is
+  fixed.
 - **`runResizeWorker({ configName })` is removed, together with the worker's `--config` flag.**
   The worker reads `worker` and `queues` from `src/config/resize.ts`; both are rejected with
   `RESIZE_CONFIG_REMOVED_KEY`. A host whose Resizers read only named files adds a

@@ -231,7 +231,7 @@ Resizers that `src/resizer.ts` constructs.
 | `…/drivers/s3.js` | `S3Storage` |
 | `…/drivers/mongo.js` | `mongoParts`, `MongoMediaStore`, `MongoLockStore`, `MongoTaskQueue`, `createResizeModels`, the schemas, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
 | `…/drivers/sqs.js` | `SqsTaskQueue` |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), `FrameworkResizeConfig` and its section types (with the queue entry types re-exported) |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`, `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported). `FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every config type |
 | `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim |
 
 ## Drivers
@@ -605,10 +605,16 @@ and the worker use. They are read only from that file: in another file, or in th
   sets one Resizer's instead.
 
 A missing `src/config/resize.ts` means no queues, the default `worker` and the default
-`coordination`. A Resizer that is eager only (`queue: false`, or `tasks: false` in code) never reads
-the process-wide sections, so a malformed `worker` section fails only worker start and the
-`verify()` of the Resizers that queue. `src/config/resize.ts` needs `mediaModelName` only while the
-default Resizer reads it as its own file.
+`coordination`. Only `queue: false` in the Resizer's own file (with no `queueName` option),
+`tasks: false` in code, or a task queue and `coordination` both passed in code keep a Resizer from
+reading `src/config/resize.ts`; every other Resizer, one whose file sets no `queue` too (it reads
+`queues` to learn whether it is eager only or on `'default'`), validates that whole file on first
+use. So a malformed `queues` or `worker` section there fails that Resizer's first call and its
+`verify()`: `uploadOriginal()`, `generate()` and `invalidate()` throw the config error (e.g.
+`RESIZE_CONFIG_INVALID`), and `resolve()` and `prewarm()`, which never throw, return the empty
+decision and `incomplete`, so even stored previews are not served until the file is fixed.
+`src/config/resize.ts` needs `mediaModelName` only while the default Resizer reads it as its own
+file.
 
 Every file writes `satisfies FrameworkResizeConfig`: `src/config/resize.ts` and each other
 Resizer's file. Two files write `satisfies Partial<FrameworkResizeConfig>` instead: an environment
@@ -679,7 +685,7 @@ object in a framework config file (define the queue in `queues` of `src/config/r
 task queue's `timing` or a `queues` entry (use [coordination](#coordination): `failed` →
 `cooldownMs`, `dispatch` → `gateTtlMs`, drop `worker`); and the worker's `--config` flag and
 `runResizeWorker({ configName })` (the worker reads `worker` and `queues` from
-`src/config/resize.ts`). `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is gone: each queue is defined once.
+`src/config/resize.ts`).
 
 ### Coordination
 

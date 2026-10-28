@@ -73,8 +73,9 @@ export interface Preview {
   identity?: string;
   resizer?: string; // Resizer that generated it; absent → 'default'
   pipeline?: string; // pipeline that generated it; absent → 'default'
-  sizeKey: string; // canonical size key — see 03 · Identity
-  filters?: Filters; // part of identity — see 03 · Identity
+  // canonical size key; part of the preview identity (resizer:pipeline:sizeKey:format:filterSig)
+  sizeKey: string;
+  filters?: Filters; // part of the preview identity, as its filter signature
   requestedWidth?: number;
   requestedHeight?: number;
   actualWidth?: number;

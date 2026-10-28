@@ -124,15 +124,20 @@ export default {
 } satisfies FrameworkResizeConfig;
 ```
 
-- Move each `queue: { … }` object into `queues` of `src/config/resize.ts` and set `queue` to its
-  name: the default Resizer's under `default`, another Resizer's under a name of its own. An SQS
+- Move the default Resizer's `queue: { … }` object into `queues.default` of `src/config/resize.ts`
+  and set `queue: 'default'`. Another Resizer's file whose `queue` object was on the same backend
+  (both `database`, or the same SQS settings) drops it and keeps `queue: 'default'`: the Resizers
+  share that queue, and no new worker is needed. Only a queue on a different backend (`listings`
+  above), or one that should get its own timing, needs a name of its own in `queues` and
+  `queue: '<that name>'`. An SQS
   object's `queues: { name: url }` becomes one entry per name, `{ driver: 'sqs', queueUrl: url }`,
   with the same `region`, `endpoint`, `deadLetterQueueUrl` and `waitTimeSeconds`. Its timing keys
   go to every entry they applied to. A `queue` object, in any file, now fails with
   `RESIZE_CONFIG_REMOVED_KEY`, and so does `queues.<name>.queues`.
 - A name is defined once, so two Resizers that used `'default'` on different backends now need
-  two names (`default` and `listings` above). A worker consumes one queue name: start one for each
-  new name (`npm run cli ResizeWorker -- --queue=listings`), or its tasks stay pending.
+  two names (`default` and `listings` above). A worker consumes one queue name, so every new name
+  needs its own worker process, `npm run cli ResizeWorker -- --queue=<name>`
+  (`--queue=listings` above), or its tasks stay pending.
 - `queue` is a name. Without `queue`, a Resizer uses `'default'` when `queues` has entries and is
   eager only when there are none; `queue: false` is eager only. A name that `queues` does not
   define (the implied `'default'` too) is `RESIZE_CONFIG_QUEUE_UNKNOWN`.

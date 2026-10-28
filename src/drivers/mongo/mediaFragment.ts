@@ -1,11 +1,11 @@
 // Optional `as const` schema fragment the host SPREADS into its media (`File`/`Media`)
-// model's `modelSchema` (spec/08 §12 closing note). It is the single source of truth for
+// model's `modelSchema`. It is the single source of truth for
 // the `original` + full `previews[]` shapes (src/types.d.ts Original/Preview), so a
 // hand-written host schema can't silently DROP a field the worker `$push`es
 // (fit / actualWidth / filters / …) on write.
 //
 // PLAIN POJO — NO imports at all (especially NO `mongoose` and NO
-// `@adaptivestone/framework`, keeping 01 · §15/§16): only global constructors
+// `@adaptivestone/framework`, so this file loads without either): only global constructors
 // (String/Number/Boolean/Date) and the 'Mixed' string alias. Where Mongoose infers loosely
 // (Mixed / subdoc arrays) the HOST layers the framework's TsTypeOverride<Original> /
 // TsTypeOverride<Preview[]> for exact field types — see the usage note below.

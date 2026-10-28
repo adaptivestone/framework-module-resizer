@@ -177,7 +177,8 @@ gets the full box its steps were written for. To hand the private original to it
    `new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })`. That file holds only
    the Resizer's own sections (image settings, `mediaModelName`, `storage`, and `queue`, e.g.
    `queue: 'bulk'` naming an entry of `queues` in `resize.ts`), and also `satisfies
-   FrameworkResizeConfig`. A `resize.<NODE_ENV>.ts` override, and a `resize.ts` that holds only the
+   FrameworkResizeConfig`. An environment override (`<name>.<NODE_ENV>.ts`, e.g.
+   `resize.production.ts` or `resizeListings.production.ts`), and a `resize.ts` that holds only the
    process-wide sections (no default Resizer, so no `mediaModelName`), write `satisfies
    Partial<FrameworkResizeConfig>`. The worker reads `worker` and `queues` from
    `src/config/resize.ts`: its `--config` flag is removed (`RESIZE_CONFIG_REMOVED_KEY`). One Resizer
@@ -394,7 +395,8 @@ const refs = await getResizer().invalidate({ media: fileDoc, pipeline: 'default'
 ```
 
 It removes only this Resizer's rows that carry an `identity`, in one write through
-`MediaStore.replacePreviews`, and drops them from `fileDoc.previews` too. Only an omitted
+`MediaStore.replacePreviews`, and drops them from `fileDoc.previews` too (when that array cannot
+be changed, it logs a warning and still returns the refs). Only an omitted
 `pipeline` means every pipeline (`pipeline: null` matches nothing). It takes no gate: a task
 running for that media can store rows after it returns. A custom `MediaStore` must implement
 `replacePreviews(mediaId, identities, rows)` → `{ stored, removed }` (`verify()` rejects one
