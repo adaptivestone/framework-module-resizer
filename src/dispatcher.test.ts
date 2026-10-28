@@ -23,11 +23,14 @@ import type { MissingPreview, ResizeLogger } from './types.d.ts';
 // logger. No Resizer, no media store, no storage and no framework app.
 // ---------------------------------------------------------------------------
 
-// Every logged error of the current test.
+// Every logged error and warning of the current test.
 let errors: unknown[][] = [];
+let warnings: unknown[][] = [];
 const recordingLogger: ResizeLogger = {
   info() {},
-  warn() {},
+  warn(...a: unknown[]) {
+    warnings.push(a);
+  },
   error(...a: unknown[]) {
     errors.push(a);
   },
@@ -35,6 +38,7 @@ const recordingLogger: ResizeLogger = {
 
 beforeEach(() => {
   errors = [];
+  warnings = [];
 });
 
 interface LockCall {
@@ -275,6 +279,32 @@ describe('a task queue that gates by task', () => {
       );
     }
     assert.equal(tasks.rows.length, 5);
+  });
+
+  test('an in-flight result without a task id is logged once per Dispatcher at warn; the outcome is unchanged', async () => {
+    const tasks = new MemoryTaskQueue();
+    tasks.add = async () => ({ status: 'in-flight' });
+    const d = makeDispatcher({ tasks });
+    assert.equal(await d.enqueue(requestFor([v300])), 0);
+    assert.equal(await d.enqueue(requestFor([v600])), 0);
+    const confirmed = await d.enqueueConfirmed(requestFor([v300]));
+    assert.deepEqual(
+      confirmed.issues.map(({ code }) => code),
+      ['RESIZE_TASK_IN_FLIGHT'],
+    );
+    assert.equal(warnings.length, 1);
+    assert.match(
+      String(warnings[0][0]),
+      /reported a task in flight without its id; if this repeats, the gate index may lack its partial filter — see RESIZE_MONGO_INDEX_MISSING/,
+    );
+    assert.deepEqual(errors, []);
+    // With its id it is the normal gate: nothing logged.
+    warnings = [];
+    const plain = new MemoryTaskQueue();
+    const other = makeDispatcher({ tasks: plain });
+    assert.equal(await other.enqueue(requestFor([v300])), 1);
+    assert.equal(await other.enqueue(requestFor([v300])), 0);
+    assert.deepEqual(warnings, []);
   });
 
   test('a prewarm on bulk while a default task is active queues a bulk task', async () => {

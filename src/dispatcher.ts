@@ -18,6 +18,7 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import type { Coordination } from './coordination.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { gateKey } from './lockKeys.ts';
@@ -108,6 +109,8 @@ export class Dispatcher {
   readonly #deps: DispatcherDeps;
   // An add result in none of the TaskAddResult shapes is logged once, not on every read.
   #warnedInvalidAdd = false;
+  // So is an `in-flight` without a task id from a queue that gates by task.
+  #warnedIdlessInFlight = false;
 
   constructor(deps: DispatcherDeps) {
     this.#deps = deps;
@@ -276,7 +279,23 @@ export class Dispatcher {
       previews: canonicalizeVariants(variants),
     };
     if (tasks.gatesByTask) {
-      return this.#add(task);
+      const outcome = await this.#add(task);
+      // Rare by design (the gate changed hands while add ran), constant when a unique index on the
+      // gate keys lacks its partial filter: every add after a completed task then meets that row.
+      if (
+        outcome.status === 'in-flight' &&
+        outcome.taskId === undefined &&
+        !this.#warnedIdlessInFlight
+      ) {
+        this.#warnedIdlessInFlight = true;
+        logNeverThrow(
+          this.#deps.logger,
+          `resize enqueue: the task queue of Resizer '${name}' reported a task in flight without its id; if this repeats, the gate index may lack its partial filter — see RESIZE_MONGO_INDEX_MISSING`,
+          undefined,
+          'warn',
+        );
+      }
+      return outcome;
     }
     if (!locks) {
       return {
