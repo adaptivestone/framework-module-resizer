@@ -4,6 +4,8 @@
 //   ResizeTask model or the CLI command;
 // - drivers import only contracts, errors, helpers, types and other drivers, never core code;
 // - decoders likewise import only contracts, errors, helpers, types and other decoders;
+// - plan.ts (the pure size plan) reaches no sharp at runtime and imports no port but the decoder
+//   and pipeline types;
 // - helpers and contracts are leaves: they import only each other, errors and types;
 // - resizer.ts is the composition root: only the entry points (index.ts, worker.ts) and the
 //   framework adapter import it, and nothing it reaches imports it back, not even as a type;
@@ -147,6 +149,28 @@ test('decoders import only contracts, errors, helpers, types and other decoders'
       .map((t) => `${f} → ${t}`),
   );
   assert.deepEqual(offending, []);
+});
+
+test('plan.ts reaches no sharp at runtime and imports no contract but the decoder and pipeline types', () => {
+  const { bare } = walk('plan.ts');
+  assert.deepEqual(
+    [...bare.entries()]
+      .filter(([spec]) => spec === 'sharp' || spec.startsWith('sharp/'))
+      .map(([, chain]) => chain.join(' → ')),
+    [],
+  );
+  const contracts = localImports('plan.ts', { types: true }).filter((t) =>
+    t.startsWith('contracts/'),
+  );
+  assert.ok(
+    contracts.includes('contracts/decoder.ts'),
+    "sanity check: the listing does see plan.ts's contracts",
+  );
+  const allowed = ['contracts/decoder.ts', 'contracts/pipeline.ts'];
+  assert.deepEqual(
+    contracts.filter((t) => !allowed.includes(t)).map((t) => `plan.ts → ${t}`),
+    [],
+  );
 });
 
 test('helpers and contracts import only helpers, contracts, errors and types', () => {
