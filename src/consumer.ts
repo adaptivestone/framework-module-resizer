@@ -87,11 +87,19 @@ export interface ConsumerDeps {
 // completed. When an extend finds the lock lapsed (`false`) while the task runs, or for a retry
 // or a cooldown hold, the Consumer takes it back once under the task's owner (`acquire`), which
 // succeeds only while nobody else holds it: a lock another request took over stays theirs. A
-// give-back only extends it. Once a task's lease is known to be lost, the Consumer makes no
-// call for it at all: no terminal call, no gate call, no event. Every call is best effort: a
-// failure is logged, and neither changes the task's outcome or its events. A call that has not answered within the gate bound
+// give-back only extends it. Once a task's lease is known to be lost (a renewal still in flight
+// when the task ends is awaited first), the Consumer makes no call for it at all: no terminal
+// call, no gate call, no event. Every call is best effort: a failure is logged, and neither
+// changes the task's outcome or its events. A call that has not answered within the gate bound
 // (min(leaseMs, 30 s)) counts as failed, and a task's end waits for its gate calls for at most one
 // bound in all, so a hanging lock store never holds a task, the loop or the shutdown longer.
+//
+// Order: the gate calls made while a task runs go one after another, and the task's final gate
+// action (the release, or the retry, cooldown or give-back hold) comes after them, so it lands
+// last. When the end stops waiting for a call that has not answered (a slow lock store), that call
+// may still land after the final action and undo it (cut a cooldown short, re-create a released
+// lock). So a call of the running phase that answers after the final action has started is
+// followed by the final action again, once per such call, itself bounded and best effort.
 interface GateLock {
   locks: LockStore;
   key: string;
@@ -109,10 +117,19 @@ const MAX_GATE_WAIT_MS = 30_000;
 // A gate call that has not answered in time.
 const TIMED_OUT = Symbol('timed out');
 
+// The gate calls of one task run (see GateLock): once the final gate action has started, the
+// action (`final`) and how to make it again (`again`), for a running call that answers later.
+interface GateRun {
+  final?: Promise<void>;
+  again?: () => Promise<void>;
+}
+
 // The retake rules of a hold made after the task ended: a retry or cooldown hold takes a lapsed
 // lock back, a give-back only extends it (see #giveBack).
 const always = () => true;
 const never = () => false;
+
+const nothing = () => {};
 
 export class Consumer {
   readonly #deps: ConsumerDeps;
@@ -188,7 +205,7 @@ export class Consumer {
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
             { code: 'RESIZE_TASK_MAX_ATTEMPTS' },
           ),
-          true,
+          { forceDead: true },
         );
         continue;
       }
@@ -235,10 +252,15 @@ export class Consumer {
     // pending then must not take a lapsed lock back behind the end's own call.
     let settled = false;
     const running = () => !leaseLost && !settled;
+    const run: GateRun = {};
+    const hold = () =>
+      this.#holdGate(task, gate, runningGateMs, { retake: running, run });
     let extendPending = false;
-    let gateCalls = this.#holdGate(task, gate, runningGateMs, running);
+    let gateCalls = hold();
+    // The renewals not answered yet: one may still report the lease lost when the task ends.
+    const renewals = new Set<Promise<void>>();
     const heartbeat = setInterval(() => {
-      tasks.renew(task, leaseMs).then(
+      const renewal = tasks.renew(task, leaseMs).then(
         (held) => {
           if (!held) {
             leaseLost = true;
@@ -247,11 +269,7 @@ export class Consumer {
             extendPending = true;
             gateCalls = gateCalls
               // Not after the task ended, or once its lease is known to be lost.
-              .then(() =>
-                ended || leaseLost
-                  ? undefined
-                  : this.#holdGate(task, gate, runningGateMs, running),
-              )
+              .then(() => (ended || leaseLost ? undefined : hold()))
               .finally(() => {
                 extendPending = false;
               });
@@ -261,6 +279,8 @@ export class Consumer {
           logNeverThrow(logger, 'resize worker: lease renewal failed', err);
         },
       );
+      renewals.add(renewal);
+      void renewal.then(() => renewals.delete(renewal));
     }, heartbeatMs);
 
     // Race the handler against taskTimeoutMs: one hung I/O call must not wedge the worker (the
@@ -301,6 +321,15 @@ export class Consumer {
       // is harmless: later writes are token-fenced, and previews it pushes are valid ones.
       taskController.abort();
     }
+    // From here on every wait of this task shares one deadline: the task's end, and with it the
+    // loop and the shutdown, waits for the queue's renewals and the lock store for at most one gate
+    // bound in all. A gate call made after the deadline is still sent, but its answer is not
+    // waited for.
+    const gateDeadline = Date.now() + this.#gateWaitMs;
+    // A renewal still in flight may yet report the lease lost: wait for its answer first.
+    if (renewals.size > 0) {
+      await this.#within(Promise.all(renewals).then(nothing), gateDeadline);
+    }
     if (leaseLost) {
       // Another worker may hold the task now. Any write would be stale: SQS accepts the delete of
       // an old receipt, and both deliveries share the gate owner, so a completion here would
@@ -315,10 +344,6 @@ export class Consumer {
       );
       return;
     }
-    // From here on every gate call of this task shares one deadline: the task's end, and with it
-    // the loop and the shutdown, waits for the lock store for at most one gate bound in all. A
-    // call made after the deadline is still sent, but its answer is not waited for.
-    const gateDeadline = Date.now() + this.#gateWaitMs;
     await this.#within(gateCalls, gateDeadline);
     settled = true;
 
@@ -330,13 +355,16 @@ export class Consumer {
           `resize worker: task ${task.taskId} exceeded taskTimeoutMs (${taskTimeoutMs}ms)`,
           { code: 'RESIZE_TASK_TIMEOUT' },
         ),
-        false,
-        gateDeadline,
+        { gateDeadline, run },
       );
     } else if (ok) {
       try {
         if (await tasks.complete(task)) {
-          await this.#releaseGate(task, gate, gateDeadline);
+          await this.#finalGate(
+            run,
+            (deadline) => this.#releaseGate(task, gate, deadline),
+            gateDeadline,
+          );
           await this.#report('completed', task);
         }
       } catch (err) {
@@ -349,9 +377,12 @@ export class Consumer {
     } else if (signal.aborted && !notRetryable(handlerError)) {
       // Stopped by the shutdown, not by its own failure: not an attempt. A non-retryable error
       // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
-      await this.#giveBackAtShutdown(task, coordination, gateDeadline);
+      await this.#giveBackAtShutdown(task, coordination, { gateDeadline, run });
     } else {
-      await this.#finish(task, coordination, handlerError, false, gateDeadline);
+      await this.#finish(task, coordination, handlerError, {
+        gateDeadline,
+        run,
+      });
     }
   }
 
@@ -375,38 +406,49 @@ export class Consumer {
   /**
    * Retry the task after its backoff, or dead-letter it (forced, not retryable, last attempt) with
    * its Resizer's cooldown. Its gate lock is then held until the retry is due plus one lease, or
-   * for the cooldown; the gate call waits until `gateDeadline` at most.
+   * for the cooldown: the task's final gate action (see #finalGate), whose call waits until
+   * `opts.gateDeadline` at most (default: one gate bound).
    */
   async #finish(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
     error: unknown,
-    forceDead = false,
-    gateDeadline = Date.now() + this.#gateWaitMs,
+    opts: { forceDead?: boolean; gateDeadline?: number; run?: GateRun } = {},
   ): Promise<void> {
     const { tasks, timing, logger } = this.#deps;
     const dead =
-      forceDead || notRetryable(error) || task.attempts >= timing.maxAttempts;
+      opts.forceDead ||
+      notRetryable(error) ||
+      task.attempts >= timing.maxAttempts;
     const message = String(error).slice(0, 1000);
     const gate = this.#gate(task, coordination);
+    const gateDeadline = opts.gateDeadline ?? Date.now() + this.#gateWaitMs;
     try {
       if (dead) {
         const cooldownMs =
           coordination?.cooldownMs ?? defaultCoordination.cooldownMs;
         if (await tasks.fail(task, 'dead', message, { cooldownMs })) {
-          await this.#holdGate(task, gate, cooldownMs, always, gateDeadline);
+          await this.#holdUntil(
+            task,
+            gate,
+            Date.now() + cooldownMs,
+            always,
+            gateDeadline,
+            opts.run,
+          );
           await this.#report('deadLettered', task, error);
         }
         return;
       }
       const retryAt = new Date(Date.now() + backoffMs(task.attempts, timing));
       if (await tasks.fail(task, { retryAt }, message)) {
-        await this.#holdGate(
+        await this.#holdUntil(
           task,
           gate,
-          Math.max(0, retryAt.getTime() - Date.now()) + timing.leaseMs,
+          Math.max(Date.now(), retryAt.getTime()) + timing.leaseMs,
           always,
           gateDeadline,
+          opts.run,
         );
         await this.#report('failed', task, error);
       }
@@ -441,35 +483,81 @@ export class Consumer {
   }
 
   /**
-   * Move the gate lock's expiry to `ttlMs` from now, when there is one, waiting until `deadline`
-   * at most (default: one gate bound). When the extend finds the lock lapsed, take it back once
-   * under the task's owner, while `retake()` still allows it; `false` from that acquire (another
-   * request holds the gate) is ignored. Never rejects.
+   * Move the gate lock's expiry to `ttlMs` from now, when there is one, waiting until
+   * `opts.deadline` at most (default: one gate bound). When the extend finds the lock lapsed, take
+   * it back once under the task's owner, while `opts.retake()` still allows it (default: always);
+   * `false` from that acquire (another request holds the gate) is ignored. `opts.run` marks the
+   * calls of a task's running phase (see GateLock). Never rejects.
    */
   async #holdGate(
     task: ClaimedTask,
     gate: GateLock | undefined,
     ttlMs: number,
-    retake: () => boolean = always,
-    deadline = Date.now() + this.#gateWaitMs,
+    opts: { retake?: () => boolean; deadline?: number; run?: GateRun } = {},
   ): Promise<void> {
     if (!gate) {
       return;
     }
+    const deadline = opts.deadline ?? Date.now() + this.#gateWaitMs;
     const held = await this.#gateCall(
       task,
       'extending',
       () => gate.locks.extend(gate.key, gate.owner, ttlMs),
       deadline,
+      opts.run,
     );
-    if (held === false && retake()) {
+    if (held === false && (opts.retake ?? always)()) {
       await this.#gateCall(
         task,
         'taking back',
         () => gate.locks.acquire(gate.key, gate.owner, ttlMs),
         deadline,
+        opts.run,
       );
     }
+  }
+
+  /**
+   * A final hold (see #finalGate): the gate lock held until `until`, so a hold made again later
+   * keeps the same end, and one made after `until` is skipped.
+   */
+  #holdUntil(
+    task: ClaimedTask,
+    gate: GateLock | undefined,
+    until: number,
+    retake: () => boolean,
+    gateDeadline: number,
+    run: GateRun | undefined,
+  ): Promise<void> {
+    return this.#finalGate(
+      run,
+      (deadline) => {
+        const ttlMs = until - Date.now();
+        return ttlMs > 0
+          ? this.#holdGate(task, gate, ttlMs, { retake, deadline })
+          : Promise.resolve();
+      },
+      gateDeadline,
+    );
+  }
+
+  /**
+   * The task's final gate action, `act`, waiting until `deadline` at most. With the task's running
+   * phase behind it (`run`), every running call that answers after this point is followed by
+   * `act` again, with one more gate bound: that call's write may have landed after this one (see
+   * GateLock). Never rejects.
+   */
+  #finalGate(
+    run: GateRun | undefined,
+    act: (deadline: number) => Promise<void>,
+    deadline: number,
+  ): Promise<void> {
+    const first = act(deadline);
+    if (run) {
+      run.final = first;
+      run.again = () => act(Date.now() + this.#gateWaitMs);
+    }
+    return first;
   }
 
   /** Release the gate lock, when there is one, waiting until `deadline` at most. Never rejects. */
@@ -500,6 +588,7 @@ export class Consumer {
     action: 'extending' | 'releasing' | 'taking back',
     call: () => Promise<boolean>,
     deadline: number,
+    run?: GateRun,
   ): Promise<boolean | undefined> {
     const { logger } = this.#deps;
     const what = `${action} the gate lock of task ${task.taskId}`;
@@ -514,6 +603,16 @@ export class Consumer {
       answer = Promise.resolve(call()).then((held) => held, failed);
     } catch (err) {
       return failed(err);
+    }
+    if (run) {
+      // A running call that answers after the final gate action has started: make that action
+      // again, after it (see GateLock).
+      void answer.then(() => {
+        const { final, again } = run;
+        if (final && again) {
+          void final.then(again);
+        }
+      });
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<typeof TIMED_OUT>((resolve) => {
@@ -554,14 +653,14 @@ export class Consumer {
   async #giveBackAtShutdown(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
-    gateDeadline?: number,
+    opts: { gateDeadline?: number; run?: GateRun } = {},
   ): Promise<void> {
     await this.#giveBack(
       task,
       coordination,
       `resize worker: task ${task.taskId} was stopped by a worker shutdown`,
       `resize worker: shutdown — task ${task.taskId} is back in the queue`,
-      gateDeadline,
+      opts,
     );
   }
 
@@ -576,14 +675,23 @@ export class Consumer {
     coordination: TaskCoordination | undefined,
     reason: string,
     done?: string,
-    gateDeadline?: number,
+    opts: { gateDeadline?: number; run?: GateRun } = {},
   ): Promise<void> {
     const { tasks, logger } = this.#deps;
     // The hold comes first, while the task is not back yet. It only extends the lock, never takes
     // a lapsed one back: a worker that lost its lease without knowing it (its renewals hung) gives
     // the task back after the next holder may have completed it and released the gate.
     const gate = this.#gate(task, coordination);
-    await this.#holdGate(task, gate, gate?.gateTtlMs ?? 0, never, gateDeadline);
+    if (gate) {
+      await this.#holdUntil(
+        task,
+        gate,
+        Date.now() + gate.gateTtlMs,
+        never,
+        opts.gateDeadline ?? Date.now() + this.#gateWaitMs,
+        opts.run,
+      );
+    }
     try {
       const held = tasks.release
         ? await tasks.release(task)

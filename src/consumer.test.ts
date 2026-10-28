@@ -1832,6 +1832,167 @@ describe('a lock store that never answers', () => {
   });
 });
 
+describe('a late answer never undoes the end of a task', () => {
+  // The gate bound is min(leaseMs, 30 s): 200 ms here; the heartbeat runs every 100 ms.
+  const lateTiming = {
+    ...fastTiming,
+    leaseMs: 200,
+    retryBackoffMs: { base: 60_000, max: 60_000 },
+  };
+  const key = gateKey('default', 'default', 'm1', 'default');
+
+  /**
+   * clockLocks whose call number `slowCall` (counting extends and acquires together) answers
+   * `delayMs` late, and is applied to the lock only then, as a store that is slow to write.
+   * `landed` resolves once that call has been applied.
+   */
+  function slowOnce(slowCall: number, delayMs: number) {
+    const base = clockLocks();
+    let calls = 0;
+    let markLanded!: () => void;
+    const landed = new Promise<void>((resolve) => {
+      markLanded = resolve;
+    });
+    const slow =
+      <A extends unknown[]>(op: (...args: A) => Promise<boolean>) =>
+      async (...args: A) => {
+        calls += 1;
+        if (calls !== slowCall) {
+          return op(...args);
+        }
+        await sleepMs(delayMs);
+        const held = await op(...args);
+        markLanded();
+        return held;
+      };
+    const locks: LockStore = {
+      acquire: slow(base.acquire),
+      extend: slow(base.extend),
+      release: base.release,
+    };
+    return { base, locks, landed };
+  }
+
+  test("a dead-letter's cooldown hold survives a heartbeat extend that lands after it", async () => {
+    // Call 1 is the start extend; call 2, the first heartbeat's, lands 450 ms late (past the bound).
+    const { base, locks, landed } = slowOnce(2, 450);
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const events = await runUntil(
+      tasks,
+      async () => {
+        await sleepMs(150); // one heartbeat runs while the task does
+        throw new ResizeMediaError('x', { retryable: false });
+      },
+      () => tasks.rows[0].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    await landed;
+    await sleepMs(50); // the cooldown hold, made again after the late extend
+    const lock = base.entry(key);
+    assert.equal(lock?.owner, 'g1');
+    const left = (lock?.expiresAt ?? 0) - Date.now();
+    // The cooldown, not the 300 ms the late heartbeat extend set.
+    assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
+  });
+
+  test("a completed task's lock stays released when a slow re-take lands after the release", async () => {
+    // The Dispatcher's lock lapsed before the task started: the start extend is refused (call 1),
+    // and its re-take (call 2) lands 400 ms late, after the completion released the gate.
+    const { base, locks, landed } = slowOnce(2, 400);
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 10), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    await sleepMs(30);
+    const events = await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    await landed;
+    await sleepMs(50); // the release, made again after the late re-take
+    assert.equal(base.entry(key), undefined, 'the gate stays open');
+  });
+
+  test('a renewal that reports the lease lost after the handler resolved stops the completion', async () => {
+    const base = clockLocks();
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    // The first renewal is in flight when the handler resolves, and answers 50 ms later.
+    let renewSent!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      renewSent = resolve;
+    });
+    let answerRenew!: (held: boolean) => void;
+    tasks.renew = () => {
+      renewSent();
+      return new Promise<boolean>((resolve) => {
+        answerRenew = resolve;
+      });
+    };
+    const completeCalls: string[] = [];
+    const realComplete = tasks.complete.bind(tasks);
+    tasks.complete = async (task: ClaimedTask) => {
+      completeCalls.push(task.taskId);
+      return realComplete(task);
+    };
+    const warned: unknown[][] = [];
+    let atStart: { owner: string; expiresAt: number } | undefined;
+    const events = await runUntil(
+      tasks,
+      async () => {
+        atStart = base.entry(key);
+        await sent;
+        setTimeout(() => answerRenew(false), 50);
+      },
+      () => warned.length > 0,
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks: base,
+        }),
+        logger: { ...silent, warn: (...a: unknown[]) => warned.push(a) },
+      },
+    );
+    assert.deepEqual(completeCalls, []);
+    assert.deepEqual(events, []);
+    assert.equal(tasks.rows[0].status, 'processing');
+    assert.deepEqual(
+      base.entry(key),
+      atStart,
+      'the gate is as the start left it',
+    );
+    assert.match(
+      String(warned[0][0]),
+      /lost its lease — left to its next delivery/,
+    );
+  });
+});
+
 describe('the dead-letter cooldown on a task queue with gatesByTask', () => {
   const deadOnce = async () => {
     throw new ResizeMediaError('x', { retryable: false });
