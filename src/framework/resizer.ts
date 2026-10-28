@@ -67,7 +67,8 @@ export interface FrameworkResizerOptions
   // gatesByTask (SQS); none beside the database queue or without a task queue
   locks?: LockStore;
   // default: the task queue of the Resizer's queue in `queues` of src/config/resize.ts; `false` =
-  // eager only, whatever the config says. Given here, `queues` is never read.
+  // eager only, whatever the config says. Given here, the queue is not chosen from `queues`, but a
+  // src/config/resize.ts that exists is still validated whole when `coordination` is read from it.
   tasks?: TaskQueue | false;
   coordination?: CoordinationOptions; // default: `coordination` in src/config/resize.ts
   logger?: ResizeLogger; // default: the app logger
@@ -182,8 +183,9 @@ interface Lane {
 
 /**
  * Choose the queue of a Resizer from the `queueName` option (`option`), else its file's `queue`
- * (`file`). With a task queue in code (`fromCode`), `queues` is never read: the name is the option,
- * the file's name, or 'default'. Otherwise false is eager only; no name is 'default' when
+ * (`file`). With a task queue in code (`fromCode`), the lane is not looked up in `queues`: the name
+ * is the option, the file's name, or 'default' (`coordination` may still read and validate
+ * src/config/resize.ts as a whole). Otherwise false is eager only; no name is 'default' when
  * src/config/resize.ts defines queues, and eager only when it defines none; a name it does not
  * define is RESIZE_CONFIG_QUEUE_UNKNOWN.
  */

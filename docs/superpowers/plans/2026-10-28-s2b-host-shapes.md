@@ -50,7 +50,7 @@ Each line gives the cost if the decision is wrong. The owner summary has example
    - `queue: false` is eager only.
    - A missing `resize.ts` means no queues, the default worker settings and the default coordination. The framework returns a new `{}` for a missing file and logs a warning on every request, so `getProcessConfig()` remembers an empty result per app instance and does not ask again.
    - Cost if wrong: a host with only `queues.bulk` fails loudly instead of running silently eager.
-3. **A FrameworkResizer given `tasks` in code never reads `queues`.**
+3. **A FrameworkResizer given `tasks` in code does not choose its queue from `queues`.** (Amended by Ruling S2b-6: only the lane choice skips `queues`; a `src/config/resize.ts` that exists is still validated whole when `worker` or `coordination` is read from it, so a broken `queues` there fails `verify()` unless `coordination` is passed in code too.)
    - Its `queueName` is the `queueName` option, else the file's `queue` name, else `'default'`.
    - `verify()` checks that `tasks.servesQueue(queueName)` is true.
    - `tasks: false` is eager only, as today.
