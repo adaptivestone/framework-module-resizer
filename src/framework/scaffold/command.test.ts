@@ -72,7 +72,7 @@ describe('runScaffold — default run', () => {
     assert.match(resizer, /framework\.js/);
     assert.doesNotMatch(
       resizer,
-      /^\s*(storage|tasks|db):/m,
+      /^\s*(storage|media|locks|tasks):/m,
       'drivers live in the config',
     );
     assert.match(

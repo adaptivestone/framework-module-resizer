@@ -1,6 +1,6 @@
 // Direct unit coverage for the four INTERNAL generic helpers. Behavior these express is also
-// exercised through images/engine/resizeTask/mongo tests; here we pin the utilities themselves
-// (guards edge cases, hex shape, abortable sleep, bounded pool + abort) at their new location.
+// exercised through images/uploader/processor/consumer/mongo tests; we pin the utilities themselves
+// (guards edge cases, hex shape, abortable sleep, bounded pool + abort) directly.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { runBounded } from './concurrency.ts';

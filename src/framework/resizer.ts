@@ -2,15 +2,17 @@
 // this subclass builds them from the Resizer's config file, so a framework host's src/resizer.ts
 // holds only behaviour (pipelines, hooks):
 // - config: the file's image settings;
-// - db: FrameworkDatabase (the app's media model, the framework Lock model, the ResizeTask queue);
+// - media: FrameworkMediaStore (the app's media model, `mediaModelName` in the file);
+// - locks: FrameworkLockStore (the framework's own Lock model), unless `tasks: false`;
 // - storage: the file's `storage` section ('local' or 's3');
 // - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
 // - logger and events: the app's.
 // Options win over the config file. Nothing is read from the app until first use, and the AWS
 // drivers (optional peers) are imported only when the config selects them. The task queues this
-// builds are shared per backend (see ./database.ts): Resizers whose config selects the same backend
+// builds are shared per backend (see ./queue.ts): Resizers whose config selects the same backend
 // get the same queue object, so the worker runs one loop for it, and their timing must agree.
-import type { ResizeDatabase } from '../contracts/database.ts';
+import type { LockStore } from '../contracts/locks.ts';
+import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
@@ -27,27 +29,29 @@ import {
   type ResolvedFrameworkConfig,
   resolveFrameworkConfig,
 } from './config.ts';
+import { FrameworkLockStore } from './locks.ts';
+import { FrameworkMediaStore } from './media.ts';
 import {
   addQueueUser,
+  appTaskQueue,
   backendKey,
   backendTiming,
   checkQueueUser,
   DATABASE_BACKEND,
-  databaseForResizer,
-  isAppTaskQueue,
   type QueueUser,
   sharedQueue,
-} from './database.ts';
+} from './queue.ts';
 
 export interface FrameworkResizerOptions
   extends Omit<
     ResizerOptions,
-    'config' | 'storage' | 'db' | 'tasks' | 'logger' | 'events'
+    'config' | 'storage' | 'media' | 'locks' | 'tasks' | 'logger' | 'events'
   > {
   configName?: string; // the config file this Resizer reads; default 'resize'
   config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
   storage?: ResizeStorage; // default: built from the config's `storage`
-  db?: ResizeDatabase; // default: FrameworkDatabase
+  media?: MediaStore; // default: FrameworkMediaStore over the config's `mediaModelName`
+  locks?: LockStore; // default: FrameworkLockStore (the framework's Lock model), none if no tasks
   // default: built from the config's `queue`; `false` = eager only, whatever the config says
   tasks?: TaskQueue | false;
   logger?: ResizeLogger; // default: the app logger
@@ -69,7 +73,8 @@ export class FrameworkResizer extends Resizer {
       configName,
       config: explicitConfig,
       storage,
-      db,
+      media,
+      locks,
       tasks,
       logger,
       events,
@@ -82,38 +87,33 @@ export class FrameworkResizer extends Resizer {
     const read = (): ResolvedFrameworkConfig =>
       explicit ?? getResizeConfig(configName);
     const file = `src/config/${configName ?? 'resize'}.ts`;
-    const database =
-      db ??
-      databaseForResizer(
-        explicitConfig
-          ? { config: explicitConfig, configName }
-          : { configName },
-      );
     super({
       ...rest,
       config: explicit ? explicit.image : () => read().image,
       logger: logger ?? appLogger,
       events: events ?? appEvents,
-      db: database,
       storage: storage ?? (() => buildStorage(read(), file)),
+      media:
+        media ??
+        new FrameworkMediaStore(
+          explicitConfig
+            ? { config: explicitConfig, configName }
+            : { configName },
+        ),
+      // An eager-only Resizer (`tasks: false`) takes no locks, so its verify() needs no Lock model.
+      locks: locks ?? (tasks === false ? undefined : new FrameworkLockStore()),
       ...(tasks === false
         ? {}
-        : { tasks: tasks ?? (() => buildQueue(read(), database, file)) }),
+        : { tasks: tasks ?? (() => buildQueue(read(), file)) }),
     });
-    // Registered once constructed (a rejected name or config registers nothing). With the
-    // 'database' driver, the queue is shared only when it is the app's one ResizeTask queue.
+    // Registered once constructed (a rejected name or config registers nothing).
     if (tasks === undefined) {
       this.#queueUser = {
         source: explicit
           ? `the config passed to new FrameworkResizer({ name: '${this.name}' })`
           : file,
         read,
-        backend: (config) => {
-          const key = backendKey(config.queue);
-          return key === DATABASE_BACKEND && !isAppTaskQueue(database.tasks)
-            ? undefined
-            : key;
-        },
+        backend: (config) => backendKey(config.queue),
       };
       addQueueUser(this.#queueUser);
     }
@@ -210,7 +210,6 @@ async function buildStorage(
 
 async function buildQueue(
   config: ResolvedFrameworkConfig,
-  database: ResizeDatabase,
   file: string,
 ): Promise<TaskQueue | undefined> {
   const { queue } = config;
@@ -244,17 +243,8 @@ async function buildQueue(
         }),
     );
   }
-  // 'database': the database's own queue (FrameworkDatabase: the app's one ResizeTask queue).
-  if (!database.tasks) {
-    throw new ResizeConfigError(
-      `resize config: \`queue\` in ${file} selects the 'database' driver, but the database passed to new FrameworkResizer() has no task queue — pass \`tasks\`, or set queue: false`,
-      { code: 'RESIZE_CONFIG_INVALID' },
-    );
-  }
-  // The core reads a queue's timing once; check it here so every Resizer sees a conflict on its
-  // own first use.
-  if (isAppTaskQueue(database.tasks)) {
-    backendTiming(DATABASE_BACKEND);
-  }
-  return database.tasks;
+  // 'database': the app's one task queue over its ResizeTask model. The core reads a queue's
+  // timing once; check it here so every Resizer sees a conflict on its own first use.
+  backendTiming(DATABASE_BACKEND);
+  return appTaskQueue();
 }

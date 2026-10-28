@@ -172,3 +172,49 @@ describe('ResizeGenerateError', () => {
     assert.ok(err instanceof ResizeGenerateError);
   });
 });
+
+describe('ResizeError.retryable', () => {
+  test('defaults to true and follows the option bag', () => {
+    assert.equal(new ResizeError('m').retryable, true);
+    for (const Ctor of [
+      ResizeSetupError,
+      ResizeConfigError,
+      ResizeStorageError,
+      ResizeSecurityError,
+      ResizeMediaError,
+      ResizeOriginalError,
+    ]) {
+      assert.equal(
+        new Ctor('m', { retryable: false }).retryable,
+        false,
+        Ctor.name,
+      );
+    }
+    assert.equal(
+      new ResizeGenerateError({ mediaId: 'm', failed: 1, requested: 1 })
+        .retryable,
+      true,
+    );
+  });
+
+  test('a media without an original is never retryable', () => {
+    assert.equal(new ResizeNoOriginalError('m1').retryable, false);
+  });
+
+  test('a security refusal is never retryable by default', () => {
+    assert.equal(new ResizeSecurityError('m').retryable, false);
+    assert.equal(
+      new ResizeSecurityError('m', { retryable: true }).retryable,
+      true,
+    );
+  });
+
+  test('survives JSON serialization (structured logs)', () => {
+    assert.equal(
+      JSON.parse(
+        JSON.stringify(new ResizeMediaError('m', { retryable: false })),
+      ).retryable,
+      false,
+    );
+  });
+});

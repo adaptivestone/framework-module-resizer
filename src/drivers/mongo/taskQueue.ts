@@ -15,6 +15,7 @@ import type {
   QueueTimingOptions,
   ResizeLogger,
 } from '../../types.d.ts';
+import { modelGetter } from './modelOption.ts';
 
 // biome-ignore lint/suspicious/noExplicitAny: a host-registered mongoose model
 type TaskModel = any;
@@ -73,14 +74,9 @@ export class MongoTaskQueue extends TaskQueue {
 
   constructor(opts: MongoTaskQueueOptions) {
     super();
-    if (!opts || (opts.model === undefined) === (opts.getModel === undefined)) {
-      throw new ResizeSetupError(
-        'resize: MongoTaskQueue needs exactly one of `model` or `getModel`',
-        { code: 'RESIZE_MONGO_MODEL_REQUIRED' },
-      );
-    }
-    const { model, getModel, timing, getTiming } = opts;
-    this.#getModel = getModel ?? (() => model);
+    // A model that does not resolve is reported by verify() at boot and logged at runtime.
+    this.#getModel = modelGetter<TaskModel>(opts, 'MongoTaskQueue');
+    const { timing, getTiming } = opts;
     this.#getTiming = getTiming ?? (() => timing ?? {});
     this.#logger = opts.logger ?? console;
   }

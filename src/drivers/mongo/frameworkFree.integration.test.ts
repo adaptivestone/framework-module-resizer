@@ -8,14 +8,13 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
 import defaultResizeConfig from '../../config/resize.ts';
-import type { ResizeDatabase } from '../../contracts/database.ts';
+import type { MediaStore } from '../../contracts/media.ts';
 import type { ResizeStorage } from '../../contracts/storage.ts';
 import { Resizer, resetResizerForTests } from '../../index.ts';
 import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
-import { fakeDb } from '../../testHelpers/fakes.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { runWorker } from '../../worker.ts';
-import { mongoDatabase } from './index.ts';
+import { mongoParts } from './index.ts';
 
 const png = await sharp({
   create: { width: 64, height: 48, channels: 3, background: '#3366cc' },
@@ -46,16 +45,18 @@ function memoryStorage(): ResizeStorage {
   };
 }
 
-function memoryDatabase(docs: Map<string, MediaLike>): ResizeDatabase {
-  return fakeDb({
-    load: async (id) => docs.get(id) ?? null,
+function memoryMedia(docs: Map<string, MediaLike>): MediaStore {
+  return {
+    loadMedia: async (id) => docs.get(id) ?? null,
     appendPreviews: async (id, previews: Preview[]) => {
       const doc = docs.get(id);
-      if (doc) {
-        doc.previews = [...(doc.previews ?? []), ...previews];
+      if (!doc) {
+        return [];
       }
+      doc.previews = [...(doc.previews ?? []), ...previews];
+      return previews;
     },
-  });
+  };
 }
 
 afterEach(() => {
@@ -69,7 +70,7 @@ test('eager: upload, generate and resolve with no framework app', async () => {
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
     storage: memoryStorage(),
-    db: memoryDatabase(docs),
+    media: memoryMedia(docs),
   });
   const media: MediaLike = {
     id: 'm1',
@@ -111,7 +112,7 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
     'File',
     new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
   );
-  const db = mongoDatabase(connection, {
+  const parts = mongoParts(connection, {
     mediaModel: File,
     timing: {
       lockTtlMs: { dispatch: 60_000, worker: 5000 },
@@ -131,8 +132,7 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
     storage: memoryStorage(),
-    db,
-    tasks: db.tasks,
+    ...parts,
   });
   const original = await resizer.uploadOriginal({
     body: png,

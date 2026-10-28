@@ -1,154 +1,51 @@
-// The constructor-wired public surface (02 · §6, design delta #12): every driver is
-// injected in ONE visible options literal at construction and fixed for the process
-// lifetime — no register-call sequence, no hidden global registries. The class also
-// carries the named-pipeline set (04 · §8) and the cross-cutting hook bus (04 · §9).
+// The constructor-wired public surface: every driver is injected in ONE visible options literal
+// at construction and fixed for the process lifetime — no register-call sequence. The Resizer
+// holds its named pipelines (src/pipelines.ts) and its hook bus (src/hooks.ts), and registers
+// itself by name in the process registry below. It is the composition root: ready() builds the
+// services from the parts, and no service receives the Resizer.
 // Each Resizer owns its config, logger and event bus, all passed in explicitly: the core never
 // reads a framework app. Framework hosts use FrameworkResizer (src/framework/resizer.ts), which
 // builds every part from the app's config file.
-import type { Metadata, Sharp } from 'sharp';
+import { Catalog } from './catalog.ts';
 import defaultResizeConfig from './config/resize.ts';
-// The driver contracts live in src/contracts/ so drivers import them without this module. They
-// are re-exported here (types only) for the core files that import them from resizer.ts.
-import type { ResizeDatabase } from './contracts/database.ts';
+import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
+import type { LockStore } from './contracts/locks.ts';
+import type { MediaStore } from './contracts/media.ts';
+import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import type {
-  ClaimedTask,
-  LeasedTask,
-  NewTask,
-  TaskEvent,
-  TaskEventHandler,
-  TaskQueue,
-} from './contracts/taskQueue.ts';
-import {
-  type PrewarmOpts,
-  prewarmImpl,
-  type ResolveOpts,
-  resolveImpl,
-} from './engine.ts';
+import type { TaskQueue } from './contracts/taskQueue.ts';
+import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
-import { uploadOriginalImpl } from './original.ts';
-import { timingOf } from './queue.ts';
+import { logNeverThrow } from './helpers/log.ts';
+import { HookBus } from './hooks.ts';
+import { PipelineRegistry } from './pipelines.ts';
+import { Processor } from './processor.ts';
+import { prewarmFailure, Reader } from './reader.ts';
+import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
-import { generateImpl } from './resizeTask.ts';
+import { timingOf } from './timing.ts';
 import type {
-  MediaLike,
-  MissingPreview,
+  GenerateOpts,
+  GenerateResult,
+  LazyPart,
   Original,
-  Preview,
-  PreviewFormat,
+  PrewarmOpts,
   PrewarmResult,
   ReadDecision,
   ResizeConfig,
   ResizeEventBus,
   ResizeLogger,
-  SizeInput,
+  ResolveOpts,
   UploadOriginalOpts,
 } from './types.d.ts';
-
-export type {
-  ClaimedTask,
-  LeasedTask,
-  NewTask,
-  ResizeDatabase,
-  ResizeStorage,
-  TaskEvent,
-  TaskEventHandler,
-  TaskQueue,
-};
+import { Uploader } from './uploader.ts';
 
 // ---------------------------------------------------------------------------
-// Named pipeline types (04 · §8) — the per-media-type pixel work. sharp is a hard dep;
-// these reference its types (erased at runtime, so this module stays pure logic).
+// Constructor options. `storage` and `media` are required — both modes need them, so a missing
+// driver is a boot-time type/throw error, not a runtime degradation. `tasks` is optional
+// (eager-only hosts omit it), and `locks` is required beside it: reads and the worker lock every
+// variant they queue or render.
 // ---------------------------------------------------------------------------
-
-export type BeforeStep = (
-  buffer: Buffer,
-  meta: { media: MediaLike; metadata: Metadata; ctx: Record<string, unknown> },
-) => Buffer | Promise<Buffer>;
-
-export type VariantStep = (
-  img: Sharp,
-  meta: { variant: MissingPreview; ctx: Record<string, unknown> }, // variant carries `filters`, `fit`
-) => Sharp | Promise<Sharp>;
-
-export interface Pipeline {
-  beforeSteps?: BeforeStep[]; // async; run ONCE on the original buffer, before any resize
-  variantSteps?: VariantStep[]; // run PER variant, after resize, before encode
-}
-
-// ---------------------------------------------------------------------------
-// Hook names (04 · §9). Waterfall hooks thread a value through their taps (default =
-// identity); observer hooks are fire-and-forget side effects (return ignored; errors
-// logged). NOT pipelines (those are per-media-type pixel work, above).
-// ---------------------------------------------------------------------------
-
-export type WaterfallName =
-  | 'resolveSizes'
-  | 'beforeEnqueue'
-  | 'formatPublicUrls';
-export type ObserverName =
-  | 'onPreviewGenerated'
-  | 'afterTaskComplete'
-  | 'onTaskFailed'
-  | 'onTaskDeadLettered';
-export type HookName = WaterfallName | ObserverName;
-
-// Per-hook tap signatures (04 · §9 review fix). The public `hook(name, fn)` + the `hooks:`
-// constructor option infer `fn`'s exact shape from `name`, so a typo'd tap body or a wrong
-// return shape is a COMPILE error instead of silent `any`. Waterfalls thread + return their
-// value; observers are fire-and-forget (return ignored). `task` is always the backend-agnostic
-// LeasedTask, and the worker observers receive `ctx === {}`.
-export interface HookSignatures {
-  resolveSizes: (
-    sizes: SizeInput[],
-    ctx: Record<string, unknown>,
-  ) => SizeInput[] | Promise<SizeInput[]>;
-  beforeEnqueue: (
-    missing: MissingPreview[],
-    ctx: Record<string, unknown>,
-  ) => MissingPreview[] | Promise<MissingPreview[]>;
-  formatPublicUrls: (
-    decision: ReadDecision,
-    ctx: Record<string, unknown>,
-  ) => unknown | Promise<unknown>;
-  onPreviewGenerated: (
-    preview: Preview,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-  afterTaskComplete: (
-    task: LeasedTask,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-  onTaskFailed: (
-    task: LeasedTask,
-    error: unknown,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-  onTaskDeadLettered: (
-    task: LeasedTask,
-    error: unknown,
-    ctx: Record<string, unknown>,
-  ) => unknown;
-}
-
-// Deliberately loose: the bus stores heterogeneous taps uniformly. The PUBLIC surface
-// (`hook<N>`, `ResizerOptions.hooks`) is typed via HookSignatures above; internal storage +
-// runWaterfall/runObservers keep this loose type with contained casts.
-// biome-ignore lint/suspicious/noExplicitAny: heterogeneous tap signatures; typed at Resizer.hook
-export type HookFn = (...args: any[]) => unknown;
-
-// ---------------------------------------------------------------------------
-// Constructor options (02 · §6). `storage` and `db` are required — both modes need them
-// (05 · §10.4), so a missing driver is a boot-time type/throw error, not a runtime
-// degradation. `tasks` is optional (eager-only hosts omit it — 11 · Modes).
-// ---------------------------------------------------------------------------
-
-/**
- * A part given as a function: called once, on first use, sync or async. It lets a Resizer be
- * constructed at import time and build a driver later, e.g. from config that is not loaded yet or
- * from an optional peer imported only when selected.
- */
-export type LazyPart<T> = () => T | Promise<T>;
 
 export interface ResizerOptions {
   name?: string; // registry key; default 'default'
@@ -158,43 +55,45 @@ export interface ResizerOptions {
   logger?: ResizeLogger; // default: console
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
   storage: ResizeStorage | LazyPart<ResizeStorage>; // REQUIRED: files (originals, previews)
-  db: ResizeDatabase | LazyPart<ResizeDatabase>; // REQUIRED: media documents and locks
-  // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. `db.tasks` or an
-  // SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
+  media: MediaStore | LazyPart<MediaStore>; // REQUIRED: media documents and their previews
+  // Locks for queued work, e.g. mongoParts(…).locks. Required when `tasks` is set; eager-only
+  // hosts may omit it.
+  locks?: LockStore | LazyPart<LockStore | undefined>;
+  // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. mongoParts(…).tasks or
+  // an SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
   tasks?: TaskQueue | LazyPart<TaskQueue | undefined>;
   queue?: string; // default queue name for this Resizer's tasks; default 'default'
-  pipelines?: Record<string, Pipeline>; // initial named pipelines (04 · §8)
-  // Initial taps (04 · §9) — each name infers its typed signature (single fn or array).
-  hooks?: { [N in HookName]?: HookSignatures[N] | HookSignatures[N][] };
+  pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
+  // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
+  hooks?: HookTaps;
 }
 
-// Options for eager `generate` (11 · Modes §11.1) — a NAMED type so hosts can annotate their
-// call sites and the method signature stays DRY (ResolveOpts / PrewarmOpts live in engine.ts).
-export interface GenerateOpts {
-  media: MediaLike;
-  sizes: SizeInput[];
-  pipeline?: string; // selects a registered pipeline; default 'default'
-  formats?: PreviewFormat[]; // default = config.formats
-  ctx?: Record<string, unknown>; // real ctx reaches pipeline steps (eager mode, 04 · §8)
-  persist?: boolean; // default true → $push previews + backfill dims
+// Constructed Resizers by name (see src/registry.ts).
+const registry = new Registry<Resizer>();
+
+// Set by the Resizer class, which alone can read its private services and parts (see
+// processorOf() and tasksPartOf()).
+let readProcessor: (resizer: Resizer) => Processor;
+let loadTasksPart: (resizer: Resizer) => Promise<TaskQueue | undefined>;
+
+const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
+type PartName = (typeof PART_NAMES)[number];
+
+// What the Resizer's methods run on, built once by ready() from the loaded parts and the
+// validated config. No service receives the Resizer. The Reader alone uses the Dispatcher, so it
+// is built again when the Dispatcher's state changes.
+interface Services {
+  catalog: Catalog;
+  uploader: Uploader;
+  reader: Reader;
+  processor: Processor;
 }
 
-// `created` is only the rows THIS call produced. Empty + `failed === 0` is success
-// (already stored or an empty catalog). Total failure throws.
-export interface GenerateResult {
-  created: Preview[];
-  failed: number;
+// Why a Resizer with a task queue has no Dispatcher; `message` tells a new failure from the last.
+interface QueueFailure {
+  error: unknown;
+  message: string;
 }
-
-// Unknown pipeline name → the shared, frozen empty pipeline (no steps). One frozen
-// constant avoids per-call allocation + accidental mutation of a "default" (04 · §8).
-const EMPTY_PIPELINE: Pipeline = Object.freeze({});
-
-// Constructed Resizers by name. Entry points (the worker, host code) look them up here;
-// core code always receives its Resizer as an argument.
-const resizers = new Map<string, Resizer>();
-
-type PartName = 'storage' | 'db' | 'tasks';
 
 // How framework hosts get the parts below filled in from their app.
 const FRAMEWORK_HINT =
@@ -206,10 +105,16 @@ const storageRequired = () =>
     { code: 'RESIZE_STORAGE_REQUIRED' },
   );
 
-const databaseRequired = () =>
+const mediaRequired = () =>
   new ResizeSetupError(
-    `resize: \`db\` is required — it loads media, saves preview metadata and holds locks (e.g. mongoDatabase(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
-    { code: 'RESIZE_DATABASE_REQUIRED' },
+    `resize: \`media\` is required — it loads media documents and records their previews (e.g. the parts of mongoParts(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
+    { code: 'RESIZE_MEDIA_REQUIRED' },
+  );
+
+const locksRequired = (name: string) =>
+  new ResizeSetupError(
+    `resize: Resizer '${name}' has a task queue but no \`locks\` — reads and the worker lock every variant they queue or render (e.g. the parts of mongoParts(connection, { mediaModel })); ${FRAMEWORK_HINT}`,
+    { code: 'RESIZE_LOCKS_REQUIRED' },
   );
 
 /**
@@ -224,26 +129,39 @@ export class Resizer {
   readonly #config: () => ResizeConfig;
   #resolvedConfig: ResizeConfig | undefined;
   readonly logger: ResizeLogger;
-  readonly #events: ResizeEventBus | undefined;
   // The drivers. A part given as a function stays unset until ready() has loaded it.
-  readonly #sources: Pick<ResizerOptions, 'storage' | 'db' | 'tasks'>;
+  readonly #sources: Pick<ResizerOptions, PartName>;
   #storage: ResizeStorage | undefined;
-  #db: ResizeDatabase | undefined;
+  #media: MediaStore | undefined;
+  #locks: LockStore | undefined;
   #tasks: TaskQueue | undefined;
   // Each part loads once: the parts usable now (given as objects, or loaded) and the loads in
   // flight. A part whose function failed is retried alone; the parts that loaded are kept.
   readonly #loadedParts = new Set<PartName>();
   readonly #loadingParts = new Map<PartName, Promise<void>>();
-  // Named pipelines: last-wins per name (04 · §8).
-  readonly #pipelines: Map<string, Pipeline>;
-  // Hook bus: taps run in REGISTRATION order, awaited sequentially (04 · §9).
-  readonly #hooks: Map<HookName, HookFn[]>;
+  readonly #pipelines: PipelineRegistry;
+  readonly #hooks: HookBus;
+  #builtServices: Services | undefined;
+  // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
+  #dispatcher: Dispatcher | undefined;
+  #queueFailure: QueueFailure | undefined;
+  // The Dispatcher was built or its failure changed after the Reader was built.
+  #readerStale = false;
+
+  static {
+    // processorOf() and tasksPartOf() (below) read through these; the services stay private.
+    readProcessor = (resizer) =>
+      resizer.#builtServices?.processor ?? resizer.#notReady('processor');
+    loadTasksPart = async (resizer) => {
+      await resizer.#loadTasks();
+      return resizer.#tasks;
+    };
+  }
 
   constructor(opts: ResizerOptions) {
-    // Runtime storage validation (02 · §6 review fix): `storage` is the ONE required option —
-    // both modes need it (05 · §10.4). The type system enforces it for TS hosts, but a JS host or
-    // a half-filled scaffold would otherwise fail with a downstream TypeError at the first
-    // publicUrl/download — throw a NAMED error at construction instead.
+    // Runtime validation of the required parts (`storage` here, `media` below): the type system
+    // enforces them for TS hosts, but a JS host or a half-filled scaffold would otherwise fail with
+    // a downstream TypeError at the first publicUrl/download — throw a NAMED error at construction.
     if (!opts?.storage) {
       throw storageRequired();
     }
@@ -253,12 +171,6 @@ export class Resizer {
         code: 'RESIZE_NAME_INVALID',
       });
     }
-    if (resizers.has(name)) {
-      throw new ResizeSetupError(
-        `resize: a Resizer named '${name}' already exists in this process — construct each name once and use getResizer('${name}') elsewhere`,
-        { code: 'RESIZE_DUPLICATE_RESIZER' },
-      );
-    }
     const queue = opts.queue ?? 'default';
     if (typeof queue !== 'string' || queue.trim().length === 0) {
       throw new ResizeSetupError('resize: `queue` must be a non-empty string', {
@@ -266,8 +178,8 @@ export class Resizer {
       });
     }
     // The core takes every part explicitly; it never reads a framework app.
-    if (!opts.db) {
-      throw databaseRequired();
+    if (!opts.media) {
+      throw mediaRequired();
     }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
@@ -279,46 +191,49 @@ export class Resizer {
       this.#config = () => config;
     }
     this.logger = opts.logger ?? console;
-    this.#events = opts.events;
     this.name = name;
     this.queue = queue;
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
-    this.#sources = { storage: opts.storage, db: opts.db, tasks: opts.tasks };
+    this.#sources = {
+      storage: opts.storage,
+      media: opts.media,
+      locks: opts.locks,
+      tasks: opts.tasks,
+    };
     // Parts given as objects are usable at once; functions wait for ready().
     if (typeof opts.storage !== 'function') {
       this.#storage = opts.storage;
       this.#loadedParts.add('storage');
     }
-    if (typeof opts.db !== 'function') {
-      this.#db = opts.db;
-      this.#loadedParts.add('db');
+    if (typeof opts.media !== 'function') {
+      this.#media = opts.media;
+      this.#loadedParts.add('media');
+    }
+    if (typeof opts.locks !== 'function') {
+      this.#locks = opts.locks;
+      this.#loadedParts.add('locks');
     }
     if (typeof opts.tasks !== 'function') {
       this.#tasks = opts.tasks;
       this.#loadedParts.add('tasks');
     }
-    this.#pipelines = new Map(Object.entries(opts.pipelines ?? {}));
-    // A seeded hooks value may be a single fn or an array — normalize to arrays and
-    // COPY them, so a caller mutating its own array later cannot bypass hook().
-    this.#hooks = new Map();
-    for (const [hookName, fns] of Object.entries(opts.hooks ?? {})) {
-      const arr = (Array.isArray(fns) ? [...fns] : [fns]) as HookFn[];
-      this.#hooks.set(hookName as HookName, arr);
-    }
-    resizers.set(name, this);
+    this.#pipelines = new PipelineRegistry(opts.pipelines);
+    this.#hooks = new HookBus({
+      logger: this.logger,
+      events: opts.events,
+      taps: opts.hooks,
+    });
+    // Last, so a rejected construction never claims the name; a taken name throws
+    // RESIZE_DUPLICATE_RESIZER.
+    registry.register(this);
   }
 
   /**
-   * Register a tap — `fn` is inferred from `name` via HookSignatures (04 · §9). Multiple taps per
-   * name are allowed; registration order is preserved. (Internal storage stays loosely typed.)
+   * Register a tap — `fn` is inferred from `name` via HookSignatures. Multiple taps per name are
+   * allowed; registration order is preserved.
    */
   hook<N extends HookName>(name: N, fn: HookSignatures[N]): void {
-    const taps = this.#hooks.get(name);
-    if (taps) {
-      taps.push(fn as HookFn);
-    } else {
-      this.#hooks.set(name, [fn as HookFn]);
-    }
+    this.#hooks.add(name, fn);
   }
 
   /** Files: originals and previews. Available once the parts are loaded (see `ready()`). */
@@ -326,9 +241,17 @@ export class Resizer {
     return this.#storage ?? this.#notReady('storage');
   }
 
-  /** Media documents and locks. Available once the parts are loaded (see `ready()`). */
-  get db(): ResizeDatabase {
-    return this.#db ?? this.#notReady('db');
+  /** Media documents and their previews. Available once the parts are loaded (see `ready()`). */
+  get media(): MediaStore {
+    return this.#media ?? this.#notReady('media');
+  }
+
+  /** Locks for queued work (undefined: eager only). Available once the parts are loaded. */
+  get locks(): LockStore | undefined {
+    if (!this.#loadedParts.has('locks')) {
+      this.#notReady('locks');
+    }
+    return this.#locks;
   }
 
   /** Where tasks wait (undefined: eager only). Available once the parts are loaded. */
@@ -347,31 +270,153 @@ export class Resizer {
   }
 
   /**
-   * Load the parts given as functions, each once. Every method of the Resizer (and the worker)
-   * awaits it first, so hosts only need it before reading `storage`, `db` or `tasks` directly. A
-   * part whose function fails is retried by the next call; the parts that loaded are kept.
+   * Load the parts given as functions, each once, then build the services. Every method of the
+   * Resizer (and the worker) awaits it first, so hosts only need it before reading `storage`,
+   * `media`, `locks` or `tasks` directly. In this order: the parts load; a Resizer with a task
+   * queue builds its Dispatcher; the image config is read and validated; the services are built.
+   * A part or config failure rejects. A Dispatcher failure (a task queue without a lock store,
+   * RESIZE_LOCKS_REQUIRED, or invalid queue timing) does not: it is logged once, reads serve
+   * stored previews and queue nothing, uploads and generate() work, prewarm() reports it and
+   * verify() rejects with it. The next call retries what failed: a part that did not load, a
+   * config that did not validate, a Dispatcher that could not be built. The parts that loaded are
+   * kept.
    */
   async ready(): Promise<void> {
-    if (this.#loadedParts.size === 3) {
+    await this.#services();
+  }
+
+  /** The services, once the parts are loaded (see ready()). */
+  async #services(): Promise<Services> {
+    await this.#loadParts();
+    return this.#ensureServices();
+  }
+
+  /** Load the parts given as functions, each once; a failure rejects. */
+  async #loadParts(): Promise<void> {
+    if (this.#loadedParts.size < PART_NAMES.length) {
+      await Promise.all([
+        this.#loadPart('storage', this.#sources.storage, (storage) => {
+          if (!storage) {
+            throw storageRequired();
+          }
+          this.#storage = storage;
+        }),
+        this.#loadPart('media', this.#sources.media, (media) => {
+          if (!media) {
+            throw mediaRequired();
+          }
+          this.#media = media;
+        }),
+        this.#loadPart('locks', this.#sources.locks, (locks) => {
+          this.#locks = locks ?? undefined;
+        }),
+        this.#loadTasks(),
+      ]);
+    }
+  }
+
+  /** Load the task queue part alone, once (ready() loads it with the others). */
+  #loadTasks(): Promise<void> {
+    return this.#loadPart('tasks', this.#sources.tasks, (tasks) => {
+      this.#tasks = tasks ?? undefined;
+    });
+  }
+
+  /**
+   * The services: built on the first call that succeeds, then the same object (a failed build
+   * leaves nothing behind). The Dispatcher comes first, in its own step, so its failure leaves the
+   * others usable. Called only after the parts are loaded.
+   */
+  #ensureServices(): Services {
+    this.#ensureDispatcher();
+    if (!this.#builtServices) {
+      const { config, storage, media } = this;
+      const catalog = new Catalog({ config });
+      this.#builtServices = {
+        catalog,
+        uploader: new Uploader({ storage, config }),
+        reader: this.#buildReader(catalog),
+        processor: new Processor({
+          catalog,
+          media,
+          storage,
+          locks: this.#locks,
+          pipelines: this.#pipelines,
+          hooks: this.#hooks,
+          config,
+          logger: this.logger,
+          name: this.name,
+        }),
+      };
+    } else if (this.#readerStale) {
+      this.#builtServices.reader = this.#buildReader(
+        this.#builtServices.catalog,
+      );
+    }
+    this.#readerStale = false;
+    return this.#builtServices;
+  }
+
+  /** The Reader, on the Dispatcher as it is now, or on the reason there is none. */
+  #buildReader(catalog: Catalog): Reader {
+    return new Reader({
+      catalog,
+      dispatcher: this.#dispatcher,
+      queueFailure: this.#queueFailure,
+      hooks: this.#hooks,
+      pipelines: this.#pipelines,
+      storage: this.storage,
+      logger: this.logger,
+      name: this.name,
+      queue: this.queue,
+    });
+  }
+
+  /**
+   * Build the Dispatcher of a Resizer with a task queue, unless it exists. A failure is kept for
+   * verify() and prewarm() and logged when it first happens or its message changes, never on every
+   * call; a later call that succeeds (e.g. a lazy getTiming() that is valid now) clears it.
+   */
+  #ensureDispatcher(): void {
+    const tasks = this.#tasks;
+    if (this.#dispatcher || !tasks) {
       return;
     }
-    await Promise.all([
-      this.#loadPart('storage', this.#sources.storage, (storage) => {
-        if (!storage) {
-          throw storageRequired();
-        }
-        this.#storage = storage;
-      }),
-      this.#loadPart('db', this.#sources.db, (db) => {
-        if (!db) {
-          throw databaseRequired();
-        }
-        this.#db = db;
-      }),
-      this.#loadPart('tasks', this.#sources.tasks, (tasks) => {
-        this.#tasks = tasks ?? undefined;
-      }),
-    ]);
+    try {
+      this.#dispatcher = this.#buildDispatcher(tasks);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.#queueFailure?.message !== message) {
+        this.#queueFailure = { error, message };
+        this.#readerStale = true;
+        logNeverThrow(
+          this.logger,
+          `resize: Resizer '${this.name}' cannot use its task queue — reads serve stored previews only and queue nothing, prewarm() reports it, verify() rejects`,
+          error,
+        );
+      }
+      return;
+    }
+    this.#queueFailure = undefined;
+    this.#readerStale = true;
+  }
+
+  /**
+   * The Dispatcher on the queue's validated timing. Queued work locks every variant, so a task
+   * queue without a lock store is RESIZE_LOCKS_REQUIRED.
+   */
+  #buildDispatcher(tasks: TaskQueue): Dispatcher {
+    const locks = this.#locks;
+    if (!locks) {
+      throw locksRequired(this.name);
+    }
+    return new Dispatcher({
+      tasks,
+      locks,
+      timing: timingOf(tasks),
+      name: this.name,
+      logger: this.logger,
+    });
   }
 
   /** Load one part given as a function; concurrent callers share its load while it runs. */
@@ -403,19 +448,24 @@ export class Resizer {
   }
 
   /**
-   * Optional startup check: load the drivers; resolve and validate the config; run the database's
-   * verify(); check the task queue (its own verify(), its timing, and that it serves this
-   * Resizer's queue).
-   * Framework hosts call it after `Server.init()` to fail at boot instead of at the first upload or
-   * read. The worker runs it for every Resizer before leasing.
+   * Optional startup check: load the drivers; check that a task queue can be used (a lock store
+   * beside it, and its timing), then resolve and validate the config; run the media store's and
+   * the lock store's verify(); check the task queue (its own verify(), and that it serves this
+   * Resizer's queue). Framework hosts call it after `Server.init()` to fail at boot instead of at
+   * the first upload or read; it is the one call that rejects for a task queue that cannot be used
+   * (the read path degrades instead). The worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
+    await this.#loadParts();
+    this.#ensureDispatcher();
+    if (this.#queueFailure) {
+      throw this.#queueFailure.error;
+    }
     await this.ready();
-    void this.config;
-    await this.db.verify?.();
+    await this.media.verify?.();
+    await this.locks?.verify?.();
     if (this.tasks) {
       await this.tasks.verify?.();
-      timingOf(this.tasks);
       if (this.tasks.servesQueue && !this.tasks.servesQueue(this.queue)) {
         throw new ResizeSetupError(
           `resize: Resizer '${this.name}' queues to '${this.queue}', which its task queue does not serve`,
@@ -425,83 +475,32 @@ export class Resizer {
     }
   }
 
-  /** Register a named pipeline — last-wins per name (04 · §8). */
-  registerPipeline(name: string, p: Pipeline): void {
-    this.#pipelines.set(name, p);
-  }
-
-  /** Look up a pipeline; an unknown name → the shared frozen empty pipeline (no steps). */
-  getPipeline(name: string): Pipeline {
-    return this.#pipelines.get(name) ?? EMPTY_PIPELINE;
-  }
-
   /** True when `name` is registered. `default` always exists: unregistered, it has no steps. */
   hasPipeline(name: string): boolean {
-    return name === 'default' || this.#pipelines.has(name);
+    return this.#pipelines.has(name);
   }
 
   /**
-   * Thread `value` through the name's taps in order, awaiting each. Taps are HOST code
-   * on the read path, so each is GUARDED: on throw, log and keep the prior value (treat
-   * the tap as identity). No taps → returns the input unchanged. (04 · §9)
-   */
-  async runWaterfall(
-    name: WaterfallName,
-    value: unknown,
-    ctx: Record<string, unknown>,
-    // `optional` (0.2 formatPublicUrls): no taps / every tap throws → `undefined`
-    // instead of leaking the raw decision as a DTO. Other waterfalls stay `identity`.
-    mode: 'identity' | 'optional' = 'identity',
-  ): Promise<unknown> {
-    const taps = this.#hooks.get(name) ?? [];
-    if (mode === 'optional' && taps.length === 0) {
-      return undefined;
-    }
-    let succeeded = false;
-    for (const fn of taps) {
-      try {
-        value = await fn(value, ctx);
-        succeeded = true;
-      } catch (e) {
-        this.logger.error(`resize waterfall ${name} tap failed (skipped)`, e);
-      }
-    }
-    if (mode === 'optional' && !succeeded) {
-      return undefined;
-    }
-    return value;
-  }
-
-  /**
-   * Fire an observer. First a fire-and-forget mirror onto the framework event bus as
-   * `resize:<name>` (its own try/catch) so ecosystem subscribers see it BEFORE the taps;
-   * then await each registered tap sequentially, error-isolated (log + continue). Return
-   * values are ignored. (04 · §9)
-   */
-  async runObservers(name: ObserverName, ...args: unknown[]): Promise<void> {
-    try {
-      this.#events?.emit(`resize:${name}`, ...args);
-    } catch (e) {
-      this.logger.error(`resize event ${name} listener failed`, e);
-    }
-    for (const fn of this.#hooks.get(name) ?? []) {
-      try {
-        await fn(...args);
-      } catch (e) {
-        this.logger.error(`resize hook ${name} failed`, e);
-      }
-    }
-  }
-
-  /**
-   * Read path (06 · §17) — the host calls this from its DTO builders. Delegates to the
-   * engine (src/engine.ts), which partitions ready vs missing, enqueues the missing set,
-   * and never throws into the caller's read.
+   * Read path — the host calls this from its DTO builders. Delegates to the Reader
+   * (src/reader.ts), which partitions ready vs missing, enqueues the missing set, and never
+   * throws into the caller's read.
    */
   async resolve(
     opts: ResolveOpts,
   ): Promise<{ decision: ReadDecision; output: unknown }> {
-    return resolveImpl(this, opts);
+    let services: Services;
+    try {
+      // The Reader guards the rest, but it does not exist until ready() succeeds.
+      services = await this.#services();
+    } catch (err) {
+      logNeverThrow(
+        this.logger,
+        'resize resolve: the Resizer could not start — returning the safe empty decision',
+        err,
+      );
+      return { decision: { ready: [], missing: [] }, output: undefined };
+    }
+    return services.reader.resolve(opts);
   }
 
   /**
@@ -511,59 +510,80 @@ export class Resizer {
    * queued. NEVER throws (same guarantee as `resolve`): an internal error is `status: 'incomplete'`.
    */
   async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
-    return prewarmImpl(this, opts);
+    let services: Services;
+    try {
+      // The Reader guards the rest, but it does not exist until ready() succeeds.
+      services = await this.#services();
+    } catch (err) {
+      logNeverThrow(
+        this.logger,
+        'resize prewarm: the Resizer could not start — nothing confirmed',
+        err,
+      );
+      return prewarmFailure(err, []);
+    }
+    return services.reader.prewarm(opts);
   }
 
   /**
-   * Eager mode (11 · Modes §11.1) — synchronous generate at upload; no queue/worker/locks.
-   * Delegates to the SHARED resize core (src/resizeTask.ts): resolveSizes waterfall with the
-   * caller's REAL ctx → expand sizes × formats, skipping identities already in media.previews
-   * (idempotent) → download once → beforeSteps once → per-variant resize/encode/upload
-   * (bounded by config.concurrency, NO locks). `persist !== false` → one
-   * db.appendPreviews (+ display-dim backfill); else the previews are returned unstored.
+   * Eager mode — generate at upload, within this call. It uses no task queue, worker or locks, so
+   * it also works on a Resizer whose task queue cannot be used. Delegates to the
+   * Processor (src/processor.ts): resolveSizes waterfall with the caller's REAL ctx → expand
+   * sizes × formats, skipping identities already in media.previews (idempotent) → download once →
+   * beforeSteps once → per-variant resize/encode/upload (bounded by config.concurrency, NO locks).
+   * `persist !== false` → one media.appendPreviews (+ display-dim backfill); else the previews are
+   * returned unstored.
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
-    await this.ready();
-    return generateImpl(this, opts);
+    return (await this.#services()).processor.generate(opts);
   }
 
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
   async uploadOriginal(opts: UploadOriginalOpts): Promise<Original> {
-    await this.ready();
-    return uploadOriginalImpl(this, opts);
+    return (await this.#services()).uploader.upload(opts);
   }
 }
 
-/** The Resizer registered under `name` (worker entry, host code, late taps). */
-export function getResizer(name = 'default'): Resizer {
-  const resizer = resizers.get(name);
-  if (!resizer) {
-    throw new ResizeSetupError(
-      `resize: no Resizer named '${name}' — construct it in bootstrap code that runs in every process that uses it`,
-      { code: 'RESIZE_NO_RESIZER' },
-    );
-  }
-  return resizer;
+/** The Resizer registered under `name`, default 'default' (worker entry, host code, late taps). */
+export function getResizer(name?: string): Resizer {
+  return registry.get(name);
 }
 
 /** Every registered Resizer, in construction order (the worker serves all of them). */
 export function listResizers(): Resizer[] {
-  return [...resizers.values()];
+  return registry.list();
 }
 
-// Per-process state an adapter keeps beside the registry (the framework adapter's shared task
-// queues), cleared with it.
-const resetHooks = new Set<() => void>();
+/**
+ * The Processor of `resizer`, which renders previews: the worker's entry for one queued task, the
+ * dead-letter cooldown and the task observers. Throws RESIZE_NOT_READY until ready() has built
+ * the services. Internal: the main entry does not export it, and it may change in any release.
+ * @internal
+ */
+export function processorOf(resizer: Resizer): Processor {
+  return readProcessor(resizer);
+}
 
-/** Run `reset` on every resetResizerForTests() (for an adapter's per-process state). */
+/**
+ * The task queue of `resizer` (undefined: eager only), loading only that part when it is a
+ * function that has not run, so a failure of another part cannot hide it. Rejects when the task
+ * queue itself cannot be loaded. The worker uses it to see which task queue a Resizer it does not
+ * serve uses. Internal: the main entry does not export it, and it may change in any release.
+ * @internal
+ */
+export function tasksPartOf(resizer: Resizer): Promise<TaskQueue | undefined> {
+  return loadTasksPart(resizer);
+}
+
+/**
+ * Run `reset` on every resetResizerForTests(): for per-process state an adapter keeps beside the
+ * registry (the framework adapter's shared task queues).
+ */
 export function onResetResizerForTests(reset: () => void): void {
-  resetHooks.add(reset);
+  registry.onReset(reset);
 }
 
 /** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */
 export function resetResizerForTests(): void {
-  resizers.clear();
-  for (const reset of resetHooks) {
-    reset();
-  }
+  registry.reset();
 }

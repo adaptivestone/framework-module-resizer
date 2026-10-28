@@ -1,8 +1,9 @@
-// The core queue loop (consumeQueue) against the in-memory TaskQueue: the same lifecycle every
-// backend gets — completion, retry with backoff, dead-lettering, terminal errors, crash loops,
+// The worker loop (Consumer) against the in-memory TaskQueue: the same lifecycle every backend
+// gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash loops,
 // timeouts, lost leases, graceful shutdown and resilient claiming.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { backoffMs, Consumer } from './consumer.ts';
 import type {
   ClaimedTask,
   LeasedTask,
@@ -10,39 +11,16 @@ import type {
   TaskEvent,
 } from './contracts/taskQueue.ts';
 import {
-  ResizeConfigError,
   ResizeError,
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
 } from './errors.ts';
-import { backoffMs, consumeQueue, timingOf } from './queue.ts';
-import { MemoryTaskQueue } from './testHelpers/fakes.ts';
+import { consume } from './testHelpers/consume.ts';
+import { MemoryTaskQueue, ReleasingTaskQueue } from './testHelpers/fakes.ts';
+import { timingOf } from './timing.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
-
-/** The in-memory queue with `release`: the task is due at once and the delivery is not counted. */
-class ReleasingTaskQueue extends MemoryTaskQueue {
-  readonly releaseCalls: string[] = [];
-
-  async release(task: ClaimedTask): Promise<boolean> {
-    this.releaseCalls.push(task.taskId);
-    const row = this.rows.find(
-      (r) =>
-        r.id === task.taskId &&
-        r.status === 'processing' &&
-        r.token === task.token,
-    );
-    if (!row) {
-      return false;
-    }
-    row.status = 'pending';
-    row.token = null;
-    row.availableAt = 0;
-    row.attempts -= 1;
-    return true;
-  }
-}
 
 // Like the worker on SIGTERM: the task signal aborts, the current variant ends, the remaining ones
 // are skipped, and the handler rejects as incomplete.
@@ -77,7 +55,7 @@ async function shutDownMidTask(
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
   let started = false;
-  const loop = consumeQueue(tasks, {
+  const loop = consume(tasks, {
     queue: 'default',
     signal: stop.signal,
     handle: (task, opts) => {
@@ -90,9 +68,16 @@ async function shutDownMidTask(
     logger: silent,
   });
   const until = Date.now() + 5000;
-  while (!started) {
-    assert.ok(Date.now() < until, 'the handler never started');
-    await new Promise((r) => setTimeout(r, 2));
+  try {
+    while (!started) {
+      assert.ok(Date.now() < until, 'the handler never started');
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  } catch (err) {
+    // A failed wait still stops the loop, so the test file can exit; the assertion is the error.
+    stop.abort();
+    await loop.catch(() => {});
+    throw err;
   }
   stop.abort();
   await loop;
@@ -127,7 +112,7 @@ async function runUntil(
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
-  const loop = consumeQueue(tasks, {
+  const loop = consume(tasks, {
     queue: 'default',
     signal: stop.signal,
     handle,
@@ -137,19 +122,48 @@ async function runUntil(
     logger,
   });
   const until = Date.now() + 5000;
-  while (!done()) {
-    assert.ok(
-      Date.now() < until,
-      'the queue loop did not reach the expected state',
-    );
-    await new Promise((r) => setTimeout(r, 5));
+  try {
+    while (!done()) {
+      assert.ok(
+        Date.now() < until,
+        'the queue loop did not reach the expected state',
+      );
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  } catch (err) {
+    // A failed wait still stops the loop, so the test file can exit; the assertion is the error.
+    stop.abort();
+    await loop.catch(() => {});
+    throw err;
   }
   stop.abort();
   await loop;
   return events;
 }
 
-describe('consumeQueue', () => {
+describe('Consumer', () => {
+  test('a Consumer completes a task with only its own deps', {
+    timeout: 5000,
+  }, async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const stop = new AbortController();
+    const events: TaskEvent[] = [];
+    await new Consumer({
+      tasks,
+      timing: timingOf(tasks),
+      handle: async () => {
+        stop.abort();
+      },
+      events: (event) => {
+        events.push(event);
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    }).run('default', stop.signal);
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(events, ['completed']);
+  });
+
   test('a successful task is completed and reported, without its lease token', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
@@ -223,33 +237,114 @@ describe('consumeQueue', () => {
     );
   });
 
-  for (const code of [
-    'RESIZE_SOURCE_TOO_LARGE',
-    'RESIZE_SOURCE_METADATA_MISSING',
-    'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-    'RESIZE_SVG_RENDER_TIMEOUT', // rendering cannot get faster on a retry
-  ]) {
-    test(`an unusable source (${code}) is dead on the first failure`, async () => {
-      const tasks = new MemoryTaskQueue({ timing: fastTiming });
-      await tasks.add(newTask());
-      const events = await runUntil(
-        tasks,
-        async () => {
-          throw new ResizeMediaError('resize: unusable source', {
-            mediaId: 'm1',
-            code,
-          });
-        },
-        () => tasks.rows[0].status === 'dead',
-      );
-      assert.equal(tasks.rows[0].attempts, 1);
-      assert.deepEqual(
-        events.map((e) => e.event),
-        ['deadLettered'],
-      );
-      assert.equal((events[0].error as { code?: string }).code, code);
+  test('an error with retryable: false is dead on the first failure', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeMediaError('resize: unusable source', {
+          mediaId: 'm1',
+          code: 'RESIZE_ANY',
+          retryable: false,
+        });
+      },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(tasks.rows[0].attempts, 1);
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+  });
+
+  test('a ResizeError from a duplicate copy of the package with retryable: false is dead on the first failure', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        // Another copy's class, so not `instanceof` this one's ResizeError: only the shared brand.
+        throw {
+          [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
+          code: 'RESIZE_ANY',
+          retryable: false,
+          message: 'thrown by a duplicate copy',
+        };
+      },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(tasks.rows[0].status, 'dead');
+    assert.equal(tasks.rows[0].attempts, 1);
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+  });
+
+  test('an error from another library with retryable: false is retried', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 60_000, max: 60_000 } },
     });
-  }
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        // E.g. an AWS SDK v2 error: its own `retryable` field means something else.
+        throw Object.assign(new Error('AccessDenied'), {
+          code: 'AccessDenied',
+          retryable: false,
+        });
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+  });
+
+  test('a plain object with retryable: false and no ResizeError brand is retried', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 60_000, max: 60_000 } },
+    });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw {
+          code: 'RESIZE_ANY',
+          retryable: false,
+          message: 'fields only',
+        };
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+  });
+
+  test('a formerly terminal code without retryable: false is retried', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, retryBackoffMs: { base: 60_000, max: 60_000 } },
+    });
+    await tasks.add(newTask());
+    const events = await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeMediaError('x', { code: 'RESIZE_SOURCE_TOO_LARGE' });
+      },
+      () => tasks.rows[0].attempts === 1 && tasks.rows[0].status === 'pending',
+    );
+    assert.equal(tasks.rows[0].attempts, 1);
+    assert.equal(tasks.rows[0].status, 'pending');
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['failed'],
+    );
+  });
 
   for (const code of ['RESIZE_WORKER_INCOMPLETE', 'RESIZE_PIPELINE_UNKNOWN']) {
     test(`${code} stays a retryable failure`, async () => {
@@ -397,29 +492,37 @@ describe('consumeQueue', () => {
       () => starts.length >= script.length + 1,
       { ...silent, error: (msg: unknown) => errors.push(String(msg)) },
     );
+    // The delays the loop chose: 10, 20, 40, 80, then capped at 10 × idlePollMs = 100 (uncapped it
+    // would be 160), and 10 again after the successful (empty) claim. The cap and the reset are read
+    // from these, not from the wall clock: a loaded machine runs a timer late, never early.
+    assert.deepEqual(
+      errors.map((e) =>
+        /\((\d+) in a row\) — retrying in (\d+) ms/.exec(e)?.slice(1),
+      ),
+      [
+        ['1', '10'],
+        ['2', '20'],
+        ['3', '40'],
+        ['4', '80'],
+        ['5', '100'],
+        ['1', '10'],
+      ],
+    );
+    // ...and the loop waited at least that long.
     const waitAfter = (i: number) => starts[i + 1] - ends[i];
-    // 10, 20, 40, 80, then capped at 10 × idlePollMs = 100
     assert.ok(waitAfter(2) >= 38, `third retry waited ${waitAfter(2)} ms`);
     assert.ok(waitAfter(3) >= 78, `fourth retry waited ${waitAfter(3)} ms`);
     assert.ok(waitAfter(4) >= 98, `fifth retry waited ${waitAfter(4)} ms`);
-    assert.ok(waitAfter(4) < 160, `the backoff is capped (${waitAfter(4)} ms)`);
-    // After the successful (empty) claim the next failure starts again from idlePollMs.
-    assert.ok(
-      waitAfter(6) < 60,
-      `reset after success: waited ${waitAfter(6)} ms`,
-    );
-    assert.match(errors[0], /failed \(1 in a row\) — retrying in 10 ms/);
-    assert.match(errors[4], /failed \(5 in a row\) — retrying in 100 ms/);
-    assert.match(errors[5], /failed \(1 in a row\)/);
   });
 
   test('an empty claim that already waited (a long poll) is retried at once; a quick one waits idlePollMs', async () => {
+    const idlePollMs = 60;
     for (const [claimWaitMs, expectGap] of [
       [80, 'none'],
       [0, 'idle'],
     ] as const) {
       const tasks = new MemoryTaskQueue({
-        timing: { ...fastTiming, idlePollMs: 60 },
+        timing: { ...fastTiming, idlePollMs },
       });
       const starts: number[] = [];
       const ends: number[] = [];
@@ -434,16 +537,19 @@ describe('consumeQueue', () => {
         async () => {},
         () => starts.length >= 3,
       );
-      const gap = starts[1] - ends[0];
       if (expectGap === 'none') {
+        const gap = starts[1] - ends[0];
         assert.ok(
           gap < 30,
           `a long poll is not followed by a sleep (${gap} ms)`,
         );
       } else {
+        // The loop waits until idlePollMs has passed since the claim STARTED, so measure from
+        // there (3 ms covers the clock tick between the loop's claimStarted and starts[0]).
+        const idleGap = starts[1] - starts[0];
         assert.ok(
-          gap >= 55,
-          `a quick empty claim waits idlePollMs (${gap} ms)`,
+          idleGap >= idlePollMs - 3,
+          `a quick empty claim waits idlePollMs (${idleGap} ms)`,
         );
       }
     }
@@ -454,7 +560,7 @@ describe('consumeQueue', () => {
     await tasks.add(newTask());
     const errors: unknown[][] = [];
     const stop = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: async () => {},
@@ -463,8 +569,16 @@ describe('consumeQueue', () => {
       },
       logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
     });
-    while (tasks.rows[0].status !== 'completed') {
-      await new Promise((r) => setTimeout(r, 5));
+    const until = Date.now() + 5000;
+    try {
+      while (tasks.rows[0].status !== 'completed') {
+        assert.ok(Date.now() < until, 'the task was never completed');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } catch (err) {
+      stop.abort();
+      await loop.catch(() => {});
+      throw err;
     }
     stop.abort();
     await loop;
@@ -503,7 +617,7 @@ describe('consumeQueue', () => {
   });
 });
 
-describe('consumeQueue shutdown', () => {
+describe('Consumer shutdown', () => {
   for (const prior of [0, 2]) {
     test(`a shutdown mid-task gives the task back unprocessed (${prior} earlier attempts of 3)`, async () => {
       const tasks = new ReleasingTaskQueue({ timing: fastTiming });
@@ -519,43 +633,53 @@ describe('consumeQueue shutdown', () => {
     });
   }
 
-  for (const code of [
-    'RESIZE_NO_ORIGINAL',
-    'RESIZE_SOURCE_METADATA_MISSING',
-    'RESIZE_SOURCE_TOO_LARGE',
-    'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-    'RESIZE_SVG_RENDER_TIMEOUT',
-  ]) {
-    test(`a terminal error (${code}) during shutdown is still dead-lettered, not given back`, async () => {
-      const tasks = new ReleasingTaskQueue({ timing: fastTiming });
-      await tasks.add(newTask());
-      // The shutdown arrives while the handler inspects the source, which then proves unusable.
-      const events = await shutDownMidTask(
-        tasks,
-        (_task, { signal }) =>
-          new Promise<void>((_resolve, reject) => {
-            signal.addEventListener(
-              'abort',
-              () =>
-                reject(
-                  new ResizeMediaError('resize: unusable source', {
-                    mediaId: 'm1',
-                    code,
-                  }),
-                ),
-              { once: true },
-            );
-          }),
-      );
-      assert.deepEqual(
-        events.map((e) => e.event),
-        ['deadLettered'],
-      );
-      assert.equal((events[0].error as { code?: string }).code, code);
-      assert.equal(tasks.rows[0].status, 'dead');
-      assert.deepEqual(tasks.releaseCalls, []);
-    });
-  }
+  test('a non-retryable error during shutdown is still dead-lettered, not given back', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    // The shutdown arrives while the handler inspects the source, which then proves unusable.
+    const events = await shutDownMidTask(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () =>
+              reject(
+                new ResizeMediaError('resize: unusable source', {
+                  code: 'RESIZE_ANY',
+                  retryable: false,
+                }),
+              ),
+            { once: true },
+          );
+        }),
+    );
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    assert.equal(tasks.rows[0].status, 'dead');
+    assert.deepEqual(tasks.releaseCalls, []);
+  });
+
+  test('an unbranded retryable: false during shutdown is given back like any stopped task', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const events = await shutDownMidTask(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => reject({ code: 'AccessDenied', retryable: false }),
+            { once: true },
+          );
+        }),
+    );
+    assert.deepEqual(events, []);
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    assert.equal(tasks.rows[0].status, 'pending');
+  });
 
   test('a queue without release retries the stopped task at once, with no event and never dead', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
@@ -601,7 +725,7 @@ describe('consumeQueue shutdown', () => {
     };
     let ran = false;
     const events: TaskEvent[] = [];
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: async () => {
@@ -657,7 +781,7 @@ describe('consumeQueue shutdown', () => {
     };
     const stop = new AbortController();
     const events: TaskEvent[] = [];
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       queue: 'default',
       signal: stop.signal,
       handle: (_task, { signal }) =>
@@ -683,70 +807,114 @@ describe('consumeQueue shutdown', () => {
   });
 });
 
-describe('timingOf / backoffMs', () => {
-  test('fills defaults, keeps set values, and is read once per queue', () => {
-    let reads = 0;
-    const tasks = new MemoryTaskQueue();
-    tasks.getTiming = () => {
-      reads += 1;
-      return { leaseMs: 120_000, maxAttempts: undefined };
+describe('a task the Consumer does not accept', () => {
+  /**
+   * Run the loop with `accepts` returning false, until the second claim starts. Resolves with the
+   * gap between the two claims, the events, the logger's messages and the tasks `accepts` saw.
+   */
+  async function declineOnce(tasks: MemoryTaskQueue) {
+    const claimedAt: number[] = [];
+    const logged: unknown[][] = [];
+    const seen: LeasedTask[] = [];
+    let handled = 0;
+    const stop = new AbortController();
+    const realClaim = tasks.claim.bind(tasks);
+    tasks.claim = async (...args: Parameters<MemoryTaskQueue['claim']>) => {
+      claimedAt.push(Date.now());
+      if (claimedAt.length === 2) {
+        stop.abort();
+        return null;
+      }
+      return realClaim(...args);
     };
-    const timing = timingOf(tasks);
-    assert.equal(timing.leaseMs, 120_000);
-    assert.equal(timing.maxAttempts, 5);
-    timingOf(tasks);
-    assert.equal(reads, 1);
-  });
-
-  test('the dead-letter cooldown lockTtlMs.failed defaults to 10 minutes, also beside set lock TTLs', () => {
-    assert.equal(timingOf(new MemoryTaskQueue()).lockTtlMs.failed, 600_000);
-    const own = timingOf(
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
-      }),
-    );
-    assert.deepEqual(own.lockTtlMs, {
-      dispatch: 1000,
-      worker: 1000,
-      failed: 600_000,
-    });
-    const set = timingOf(
-      new MemoryTaskQueue({
-        timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 5000 } },
-      }),
-    );
-    assert.equal(set.lockTtlMs.failed, 5000);
-  });
-
-  for (const failed of [0, -1, 1.5, '600000', null]) {
-    test(`lockTtlMs.failed ${JSON.stringify(failed)} is a config error`, () => {
-      const tasks = new MemoryTaskQueue({
-        timing: {
-          lockTtlMs: { dispatch: 1000, worker: 1000, failed } as never,
+    const events: TaskEvent[] = [];
+    const record = (...args: unknown[]) => {
+      logged.push(args);
+    };
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await new Consumer({
+        tasks,
+        timing: timingOf(tasks),
+        accepts: (task) => {
+          seen.push(task);
+          return false;
         },
-      });
-      assert.throws(
-        () => timingOf(tasks),
-        (err: unknown) =>
-          err instanceof ResizeConfigError &&
-          err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
-          /lockTtlMs\.failed/.test(err.message),
-      );
-    });
+        handle: async () => {
+          handled += 1;
+        },
+        events: (event) => {
+          events.push(event);
+        },
+        logger: { info: record, warn: record, error: record },
+      }).run('default', stop.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(claimedAt.length, 2, 'the loop claimed again');
+    assert.equal(handled, 0, 'the handler never ran');
+    return { gapMs: claimedAt[1] - claimedAt[0], events, logged, seen };
   }
 
-  test('invalid timing is a config error (worker lock must fit the lease)', () => {
-    const tasks = new MemoryTaskQueue({
-      timing: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 5000 } },
+  const idlePollMs = 40;
+
+  test('is released unprocessed, even past maxAttempts, with no event or log; the next claim waits idlePollMs', async () => {
+    const tasks = new ReleasingTaskQueue({
+      timing: { ...fastTiming, idlePollMs },
     });
-    assert.throws(
-      () => timingOf(tasks),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+    await tasks.add(newTask());
+    // This claim is one more than maxAttempts allows, yet the task is not dead-lettered here.
+    tasks.rows[0].attempts = fastTiming.maxAttempts;
+    const { gapMs, events, logged, seen } = await declineOnce(tasks);
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    assert.equal(tasks.rows[0].status, 'pending');
+    assert.equal(
+      tasks.rows[0].attempts,
+      fastTiming.maxAttempts,
+      'the delivery is not counted',
     );
+    assert.equal(tasks.rows[0].error, undefined);
+    assert.deepEqual(events, []);
+    assert.deepEqual(logged, []);
+    assert.equal(seen.length, 1);
+    assert.equal('token' in seen[0], false, 'accepts sees no lease token');
+    assert.ok(gapMs >= idlePollMs - 1, `claimed again after ${gapMs} ms`);
   });
 
+  test('on a queue without release it is retried at once through fail: the delivery counts', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, idlePollMs },
+    });
+    await tasks.add(newTask());
+    tasks.rows[0].attempts = fastTiming.maxAttempts;
+    const { gapMs, events } = await declineOnce(tasks);
+    assert.equal(tasks.rows[0].status, 'pending', 'never dead-lettered here');
+    assert.equal(tasks.rows[0].attempts, fastTiming.maxAttempts + 1);
+    assert.ok(tasks.rows[0].availableAt <= Date.now(), 'no backoff');
+    assert.match(tasks.rows[0].error ?? '', /does not accept/);
+    assert.deepEqual(events, []);
+    assert.ok(gapMs >= idlePollMs - 1, `claimed again after ${gapMs} ms`);
+  });
+
+  test('a task it accepts runs as usual', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const stop = new AbortController();
+    await new Consumer({
+      tasks,
+      timing: timingOf(tasks),
+      accepts: () => true,
+      handle: async () => {
+        stop.abort();
+      },
+      logger: silent,
+    }).run('default', stop.signal);
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual(tasks.releaseCalls, []);
+  });
+});
+
+describe('backoffMs', () => {
   test('backoff doubles per attempt up to the maximum', () => {
     const timing = timingOf(
       new MemoryTaskQueue({

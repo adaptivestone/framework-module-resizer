@@ -8,10 +8,11 @@ import type {
   TaskEventHandler,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { consumeQueue, timingOf } from '../queue.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
-import { fakeDb } from '../testHelpers/fakes.ts';
+import { consume } from '../testHelpers/consume.ts';
+import { fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
+import { timingOf } from '../timing.ts';
 import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
 import { SqsTaskQueue } from './sqs.ts';
 
@@ -247,7 +248,8 @@ describe('SqsTaskQueue.add', () => {
         upload: async ({ key }) => ({ key }),
         publicUrl: () => '',
       },
-      db: fakeDb(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
       tasks,
     });
     const result = await resizer.prewarm({
@@ -268,9 +270,12 @@ describe('SqsTaskQueue.add', () => {
         upload: async ({ key }) => ({ key }),
         publicUrl: () => '',
       },
-      db: fakeDb({
-        locks: { acquire: async () => false, release: async () => {} },
-      }),
+      media: fakeMedia(),
+      locks: {
+        acquire: async () => false,
+        extend: async () => false,
+        release: async () => false,
+      },
       tasks,
     });
     const result = await resizer.prewarm({
@@ -300,7 +305,7 @@ describe('SqsTaskQueue.claim', () => {
     const rec = makeEvents();
     let handlerCalls = 0;
     const ctrl = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -697,7 +702,7 @@ describe('SqsTaskQueue lease operations', () => {
   });
 });
 
-describe('consumeQueue with SqsTaskQueue', () => {
+describe('Consumer with SqsTaskQueue', () => {
   test('a resolving handler reports completed and deletes the receipt handle', async () => {
     const { client, deletes } = makeFakeSqsClient({
       message: message({ ReceiptHandle: 'rh-1' }),
@@ -707,7 +712,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     const seen: LeasedTask[] = [];
     const ctrl = new AbortController();
     let deletesAtEvent = 0;
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async (task) => {
@@ -744,7 +749,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     const rec = makeEvents();
     const boom = new Error('handler boom');
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -777,7 +782,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       timing: fastTiming,
     });
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {},
@@ -802,7 +807,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       ),
     );
   });
-  test('aborting opts.signal stops polling and resolves consumeQueue', async (t) => {
+  test('aborting the signal stops polling and resolves Consumer.run', async (t) => {
     const { client, receiveParams, receiveOptions } = makeFakeSqsClient();
     const tasks = new SqsTaskQueue({
       queueUrl: 'q',
@@ -810,7 +815,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       timing: fastTiming,
     });
     const ctrl = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {},
@@ -845,7 +850,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
       release = resolve;
     });
     const ctrl = new AbortController();
-    const loop = consumeQueue(tasks, {
+    const loop = consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -878,7 +883,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {},
@@ -903,7 +908,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     });
     let handlerCalls = 0;
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       logger,
@@ -933,7 +938,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     });
     const rec = makeEvents();
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: (_task, { signal }) =>
@@ -970,7 +975,7 @@ describe('consumeQueue with SqsTaskQueue', () => {
     const rec = makeEvents();
     const boom = new Error('handler boom');
     const ctrl = new AbortController();
-    await consumeQueue(tasks, {
+    await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
       handle: async () => {
@@ -991,32 +996,33 @@ describe('consumeQueue with SqsTaskQueue', () => {
 });
 
 describe('SqsTaskQueue options', () => {
-  test('rejects invalid lock TTLs at construction', () => {
-    assert.throws(
-      () =>
-        new SqsTaskQueue({
-          queueUrl: 'q',
-          timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
-        }),
-      (err: Error & { code?: string }) =>
-        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID',
-    );
-    assert.throws(
-      () =>
-        new SqsTaskQueue({
-          queueUrl: 'q',
-          timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
-        }),
-      (err: Error & { code?: string }) =>
-        err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID' &&
-        /lockTtlMs\.failed/.test(err.message),
-    );
-    // Optional: the default cooldown applies.
-    const tasks = new SqsTaskQueue({
+  test('accepts any timing at construction; the core rejects bad lock TTLs when it reads the timing', () => {
+    const ttl = (err: Error & { code?: string }) =>
+      err.code === 'RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID';
+    // Built outside assert.throws, so a constructor that still checks the TTLs fails the test.
+    const badTtls = new SqsTaskQueue({
       queueUrl: 'q',
-      timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
+      timing: { lockTtlMs: { dispatch: 0, worker: 0 } },
     });
-    assert.equal(timingOf(tasks).lockTtlMs.failed, 600_000);
+    const badCooldown = new SqsTaskQueue({
+      queueUrl: 'q',
+      timing: { lockTtlMs: { dispatch: 1000, worker: 1000, failed: 0 } },
+    });
+    assert.throws(() => timingOf(badTtls), ttl);
+    assert.throws(
+      () => timingOf(badCooldown),
+      (err: Error & { code?: string }) =>
+        ttl(err) && /lockTtlMs\.failed/.test(err.message),
+    );
+    assert.equal(
+      timingOf(
+        new SqsTaskQueue({
+          queueUrl: 'q',
+          timing: { lockTtlMs: { dispatch: 1000, worker: 1000 } },
+        }),
+      ).lockTtlMs.failed,
+      600_000,
+    );
   });
   test('requires queueUrl at construction', () => {
     assert.throws(

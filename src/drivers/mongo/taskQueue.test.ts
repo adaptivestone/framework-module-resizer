@@ -16,17 +16,19 @@ import type {
   NewTask,
   TaskEventHandler,
 } from '../../contracts/taskQueue.ts';
-import { buildRequestKey, canonicalizeVariants } from '../../enqueue.ts';
+import { buildRequestKey } from '../../dispatcher.ts';
 import {
   ResizeGenerateError,
   ResizeNoOriginalError,
   ResizeSetupError,
 } from '../../errors.ts';
 import ResizeTaskModel from '../../framework/ResizeTaskModel.ts';
-import { consumeQueue, timingOf } from '../../queue.ts';
+import { canonicalizeVariants } from '../../images.ts';
 import { Resizer, resetResizerForTests } from '../../resizer.ts';
-import { fakeDb } from '../../testHelpers/fakes.ts';
+import { consume } from '../../testHelpers/consume.ts';
+import { fakeMedia } from '../../testHelpers/fakes.ts';
 import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
+import { timingOf } from '../../timing.ts';
 import type {
   MissingPreview,
   QueueTimingOptions,
@@ -186,7 +188,7 @@ function startConsumer(
   opts: { queue?: string; onEvent?: TaskEventHandler } = {},
 ) {
   const ctrl = new AbortController();
-  const done = consumeQueue(tasks, {
+  const done = consume(tasks, {
     queue: opts.queue ?? 'default',
     signal: ctrl.signal,
     handle,
@@ -733,12 +735,12 @@ describe('MongoTaskQueue.add', () => {
       storage: fakeStorage,
       config: makeImageConfig(),
       tasks,
-      db: fakeDb({
-        locks: {
-          acquire: async () => false,
-          release: async () => {},
-        },
-      }),
+      media: fakeMedia(),
+      locks: {
+        acquire: async () => false,
+        extend: async () => false,
+        release: async () => false,
+      },
       logger,
     });
     const result = await resizer.prewarm({
@@ -1098,7 +1100,7 @@ describe('MongoTaskQueue named queues and task events', () => {
     assert.equal((await M.findById(second._id).lean())?.status, 'completed');
   });
 
-  test('consumeQueue consumes only its queue', async () => {
+  test('the Consumer consumes only its queue', async () => {
     const bulk = await insert({ queue: 'bulk' }, new Date(1000));
     const own = await insert({}, new Date(2000));
     const seen: string[] = [];
@@ -1193,7 +1195,7 @@ describe('MongoTaskQueue.complete fencing', () => {
   });
 });
 
-describe('MongoTaskQueue.fail and consumeQueue retry policy', () => {
+describe('MongoTaskQueue.fail and the Consumer retry policy', () => {
   test('below maxAttempts returns to pending with a future retry date and failed event', async () => {
     const inserted = await insert();
     const before = Date.now();
@@ -1401,7 +1403,7 @@ describe('MongoTaskQueue.renew fencing', () => {
   });
 });
 
-describe('consumeQueue exhausted Mongo leases', () => {
+describe('Consumer with exhausted Mongo leases', () => {
   test('a crash-looped task dies exactly once with a dead-letter event and no handler call', async () => {
     const inserted = await insert({
       status: 'processing',
@@ -1447,7 +1449,7 @@ describe('consumeQueue exhausted Mongo leases', () => {
   });
 });
 
-describe('consumeQueue with MongoTaskQueue', () => {
+describe('Consumer with MongoTaskQueue', () => {
   test('add, claim, handle, and complete report the completed task', async () => {
     const payload = request({ pipeline: 'photo' });
     const { taskId } = await tasks.add(payload);

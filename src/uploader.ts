@@ -1,9 +1,12 @@
+// Stores an original as uploaded. Sharp only reads its metadata to check the upload rules; the
+// bytes go to storage unchanged. It needs only the storage and the image config; it creates no
+// media, queues no work and logs nothing.
 import sharp, { type Metadata } from 'sharp';
+import type { ResizeStorage } from './contracts/storage.ts';
 import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
 import { isAvifBuffer } from './helpers/imageFormat.ts';
 import { randomHex } from './helpers/random.ts';
 import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
-import type { Resizer } from './resizer.ts';
 import type {
   Original,
   OriginalFormat,
@@ -116,7 +119,7 @@ async function prepareOriginal(
     if (density === undefined) {
       throw new ResizeOriginalError(
         'resize uploadOriginal: SVG dimensions cannot be rasterized within the renderer limits',
-        { code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' },
+        { code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED', retryable: false },
       );
     }
   }
@@ -127,79 +130,92 @@ async function prepareOriginal(
   };
 }
 
-export async function uploadOriginalImpl(
-  resizer: Resizer,
-  opts: UploadOriginalOpts,
-): Promise<Original> {
-  if (
-    !opts ||
-    (!Buffer.isBuffer(opts.body) && !(opts.body instanceof Uint8Array))
-  ) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: body must be a Buffer or Uint8Array',
-      { code: 'RESIZE_ORIGINAL_BODY_INVALID' },
-    );
+export interface UploaderDeps {
+  storage: ResizeStorage;
+  config: ResizeConfig;
+}
+
+export class Uploader {
+  readonly #storage: ResizeStorage;
+  readonly #config: ResizeConfig;
+
+  constructor(deps: UploaderDeps) {
+    this.#storage = deps.storage;
+    this.#config = deps.config;
   }
-  if (opts.visibility !== 'public' && opts.visibility !== 'private') {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: visibility must be public or private',
-      { code: 'RESIZE_ORIGINAL_VISIBILITY_INVALID' },
-    );
-  }
-  const body = asBuffer(opts.body);
-  if (body.byteLength === 0) {
-    throw new ResizeOriginalError('resize uploadOriginal: body is empty', {
-      code: 'RESIZE_ORIGINAL_EMPTY',
-    });
-  }
-  const { config } = resizer;
-  if (body.byteLength > config.upload.maxBytes) {
-    throw new ResizeOriginalError(
-      `resize uploadOriginal: body exceeds upload.maxBytes (${config.upload.maxBytes})`,
-      { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
-    );
-  }
-  const prepared = await prepareOriginal(body, config);
-  if (!config.upload.formats.includes(prepared.format)) {
-    throw new ResizeOriginalError(
-      `resize uploadOriginal: format ${prepared.format} is disabled by upload.formats`,
-      { code: 'RESIZE_ORIGINAL_FORMAT_DISABLED' },
-    );
-  }
-  if (prepared.format === 'svg' && opts.visibility === 'public') {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: SVG originals must be stored privately',
-      { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
-    );
-  }
-  const key = `originals/${randomHex()}.${prepared.extension}`;
-  let ref: StorageRef;
-  try {
-    ref = await resizer.storage.upload({
-      key,
-      body,
+
+  /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
+  async upload(opts: UploadOriginalOpts): Promise<Original> {
+    if (
+      !opts ||
+      (!Buffer.isBuffer(opts.body) && !(opts.body instanceof Uint8Array))
+    ) {
+      throw new ResizeOriginalError(
+        'resize uploadOriginal: body must be a Buffer or Uint8Array',
+        { code: 'RESIZE_ORIGINAL_BODY_INVALID' },
+      );
+    }
+    if (opts.visibility !== 'public' && opts.visibility !== 'private') {
+      throw new ResizeOriginalError(
+        'resize uploadOriginal: visibility must be public or private',
+        { code: 'RESIZE_ORIGINAL_VISIBILITY_INVALID' },
+      );
+    }
+    const body = asBuffer(opts.body);
+    if (body.byteLength === 0) {
+      throw new ResizeOriginalError('resize uploadOriginal: body is empty', {
+        code: 'RESIZE_ORIGINAL_EMPTY',
+      });
+    }
+    const config = this.#config;
+    if (body.byteLength > config.upload.maxBytes) {
+      throw new ResizeOriginalError(
+        `resize uploadOriginal: body exceeds upload.maxBytes (${config.upload.maxBytes})`,
+        { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
+      );
+    }
+    const prepared = await prepareOriginal(body, config);
+    if (!config.upload.formats.includes(prepared.format)) {
+      throw new ResizeOriginalError(
+        `resize uploadOriginal: format ${prepared.format} is disabled by upload.formats`,
+        { code: 'RESIZE_ORIGINAL_FORMAT_DISABLED' },
+      );
+    }
+    if (prepared.format === 'svg' && opts.visibility === 'public') {
+      throw new ResizeOriginalError(
+        'resize uploadOriginal: SVG originals must be stored privately',
+        { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
+      );
+    }
+    const key = `originals/${randomHex()}.${prepared.extension}`;
+    let ref: StorageRef;
+    try {
+      ref = await this.#storage.upload({
+        key,
+        body,
+        contentType: prepared.contentType,
+        visibility: opts.visibility,
+        ...(opts.namespace === undefined ? {} : { namespace: opts.namespace }),
+      });
+    } catch (cause) {
+      throw new ResizeStorageError(
+        `resize uploadOriginal: storage upload failed for ${prepared.format} original`,
+        { code: 'RESIZE_ORIGINAL_UPLOAD_FAILED', cause },
+      );
+    }
+    if (ref === null || ref === undefined) {
+      throw new ResizeStorageError(
+        'resize uploadOriginal: storage returned an invalid original locator',
+        { code: 'RESIZE_ORIGINAL_STORAGE_REF_INVALID' },
+      );
+    }
+    return {
+      storageRef: ref,
+      format: prepared.format,
       contentType: prepared.contentType,
-      visibility: opts.visibility,
-      ...(opts.namespace === undefined ? {} : { namespace: opts.namespace }),
-    });
-  } catch (cause) {
-    throw new ResizeStorageError(
-      `resize uploadOriginal: storage upload failed for ${prepared.format} original`,
-      { code: 'RESIZE_ORIGINAL_UPLOAD_FAILED', cause },
-    );
+      size: body.byteLength,
+      ...(prepared.width !== undefined ? { width: prepared.width } : {}),
+      ...(prepared.height !== undefined ? { height: prepared.height } : {}),
+    };
   }
-  if (ref === null || ref === undefined) {
-    throw new ResizeStorageError(
-      'resize uploadOriginal: storage returned an invalid original locator',
-      { code: 'RESIZE_ORIGINAL_STORAGE_REF_INVALID' },
-    );
-  }
-  return {
-    storageRef: ref,
-    format: prepared.format,
-    contentType: prepared.contentType,
-    size: body.byteLength,
-    ...(prepared.width !== undefined ? { width: prepared.width } : {}),
-    ...(prepared.height !== undefined ? { height: prepared.height } : {}),
-  };
 }

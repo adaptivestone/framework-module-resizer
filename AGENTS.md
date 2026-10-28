@@ -64,8 +64,9 @@ full box its steps were written for. To hand the private original to its owner, 
 
 3. `src/resizer.ts` holds behaviour only — ONE construction call, `new FrameworkResizer({
    pipelines, hooks })`. It builds every part from the config file on first use: the image
-   settings, `storage`, the task queue (`queue`), the database (`FrameworkDatabase`: the app's
-   media model, the framework `Lock` model, the scaffolded `ResizeTask` model) and the app logger:
+   settings, `storage`, the task queue (`queue`; the database queue is the scaffolded `ResizeTask`
+   model), `media` (`FrameworkMediaStore`: the app's media model), `locks` (`FrameworkLockStore`:
+   the framework `Lock` model) and the app logger:
 
    ```ts
    import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
@@ -75,28 +76,38 @@ full box its steps were written for. To hand the private original to its owner, 
 
    Nothing is read from the framework until first use, so this file can be imported statically
    anywhere, even before `Server.init()`. Options win over the config: `storage` (e.g. an
-   `S3Storage` with the host's own `client`), `db`, `tasks` (a `TaskQueue`, or `false` = eager
-   only), `logger`, `events`, `config`, `configName`, `queue` (the queue name), `name`.
+   `S3Storage` with the host's own `client`), `media`, `locks`, `tasks` (a `TaskQueue`, or
+   `false` = eager only), `logger`, `events`, `config`, `configName`, `queue` (the queue name),
+   `name`.
 
-   Without the framework: `new Resizer({ storage, db, tasks? })` from the main entry, with
-   `@adaptivestone/framework-module-resize/drivers/mongo.js` → `mongoDatabase(connection, {
-   mediaModel, timing? })` (media, locks and `.tasks` with the package's `ResizeTask` /
-   `ResizeLock` models; also `MongoDatabase`, `MongoTaskQueue`, `createResizeModels`; call it once
-   and pass that `.tasks` to every Resizer — each call makes its own queue),
+   Without the framework: `new Resizer({ storage, media, locks?, tasks? })` from the main entry
+   (`locks` is required when `tasks` is set: `verify()` rejects without it), with
+   `@adaptivestone/framework-module-resize/drivers/mongo.js` → `...mongoParts(connection, {
+   mediaModel, timing? })` (`{ media, locks, tasks }`: the host media model, and locks and the task
+   queue on the package's `ResizeLock` / `ResizeTask` models; also `MongoMediaStore`,
+   `MongoLockStore`, `MongoTaskQueue`, `createResizeModels`; call it once and spread the same parts
+   into every Resizer — each call makes its own queue),
    `…/drivers/fs.js` → `LocalFsStorage`, `…/drivers/s3.js` → `S3Storage`, `…/drivers/sqs.js` →
    `SqsTaskQueue`. Any part may be a function (sync or async) called once on first use. A custom
-   driver extends the exported abstract class (`ResizeStorage`, `ResizeDatabase`, `TaskQueue`) or
-   is any object of the same shape — no `app` parameter; a driver closes over its own client. The
-   core owns the queue logic (worker loop, retries, dead-letters, events); a `TaskQueue` only
+   driver extends the exported abstract class (`ResizeStorage`, `MediaStore`, `LockStore`,
+   `TaskQueue`) or is any object of the same shape — no `app` parameter; a driver closes over its
+   own client. `MediaStore.appendPreviews` resolves with the previews it stored; `LockStore` locks
+   carry an owner (`release(key, owner)` is a compare-and-delete). The core owns the queue logic
+   (worker loop, retries, dead-letters, events); a `TaskQueue` only
    implements atomic `add` / `claim` / `renew` / `complete` / `fail` (optional `release` gives a
-   task back at worker shutdown; see the README contract). `claim` may wait for a task
+   task back at worker shutdown, and a task for a Resizer the worker does not serve; see the
+   README contract). `claim` may wait for a task
    (long poll), but must return once its `signal` aborts and never claim ahead of the call.
 
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
    on a bad config, call `await getResizer().verify()` after `Server.init()`; otherwise a config
-   error appears at the first call. The worker process imports it from the scaffolded
-   `src/commands/ResizeWorker.ts` (`import '../resizer.ts'` plus a re-export of the module's
-   command); keep that import if you edit the command.
+   error appears at the first call. A task queue passed in code that cannot be used (no lock store,
+   invalid `timing`) does not fail calls: it is logged once, reads serve stored previews and queue
+   nothing, uploads and `generate()` work, and only `verify()`, `prewarm()` and worker start report
+   it. For a `FrameworkResizer`, invalid timing in the config file's `queue` section is still a
+   config error at the first call, like the rest of the file. The worker process imports it from the
+   scaffolded `src/commands/ResizeWorker.ts` (`import '../resizer.ts'` plus a re-export of the
+   module's command); keep that import if you edit the command.
 
 5. The scaffolded `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
    `@adaptivestone/framework-module-resize/config/resize.js` and `satisfies
@@ -135,7 +146,7 @@ full box its steps were written for. To hand the private original to its owner, 
    default). Direct Mongoose users must pass `{ minimize: false }` to `new Schema`.
    Otherwise empty objects in opaque `storageRef` values can disappear on save/update. A
    hand-written schema that declares preview rows as sub-documents must also give them
-   `identity: { type: String }`: the database stores one row per preview identity.
+   `identity: { type: String }`: the media store keeps one row per preview identity.
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model and
    the framework's `Lock` model declare their indexes; the host's normal lifecycle or an explicit
@@ -243,13 +254,18 @@ No original throws `ResizeNoOriginalError`; every requested variant failing thro
 
 Errors: EVERY throw from this module extends `ResizeError`, so one check separates a module
 rejection from a sharp/S3/mongo failure. Subclasses say what to do — `ResizeSetupError` (wiring
-is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this record;
-`ResizeNoOriginalError` and `ResizeOriginalError` extend it), `ResizeGenerateError` (eager produced
-nothing or queued coverage is incomplete),
+is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this record in the
+request path; `ResizeNoOriginalError` and `ResizeOriginalError` extend it), `ResizeGenerateError`
+(eager produced nothing or queued coverage is incomplete),
 `ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
-Every instance carries a stable `err.code`. Use `ResizeError.isResizeError(err)` rather than
-`instanceof` when the error may cross a package boundary — duplicate copies of the package
-break `instanceof` but not the symbol brand.
+Every instance carries a stable `err.code` and `err.retryable` (default `true`; `false`: no retry
+can help). The worker reads `retryable` on the error that fails the task, when it is a
+`ResizeError` — including one from a duplicate copy of the package; errors from other libraries
+are retried. It dead-letters the task at once when it is `false`; an error inside one variant
+(`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with the
+retryable `RESIZE_WORKER_INCOMPLETE`. Use `ResizeError.isResizeError(err)` rather than
+`instanceof` when the error may cross a package boundary — duplicate copies of the package break
+`instanceof` but not the symbol brand.
 
 ```ts
 import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
@@ -282,9 +298,11 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
 - Construct each Resizer ONCE, at one construction site, with `new FrameworkResizer`. Most
   hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
-  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves all Resizers in its process
-  for one queue (`--queue`, default `'default'`), with one consume loop per task queue (Resizers
-  on the same backend share one), one task at a time, each processed with its own Resizer.
+  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves one queue
+  (`--queue`, default `'default'`) for every Resizer constructed in its process before the worker
+  starts, with one consume loop per task queue (Resizers on the same backend share one), one task
+  at a time, each processed with its own Resizer. A task for a Resizer the worker does not serve
+  is given back to the queue (or retried when the queue cannot give tasks back).
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
@@ -320,17 +338,21 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | Symptom | Cause → fix |
 |---|---|
 | `resize config: mediaModelName is required` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
-| `RESIZE_DATABASE_REQUIRED` at construction | `new Resizer()` takes its `db` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `mongoDatabase(connection, { mediaModel })` |
+| `RESIZE_MEDIA_REQUIRED` at construction | `new Resizer()` takes its `media` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `...mongoParts(connection, { mediaModel })` |
+| `RESIZE_LOCKS_REQUIRED` from `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it) | a Resizer with `tasks` has no `locks` — spread `mongoParts(connection, { mediaModel })` (or pass a `LockStore`), or drop `tasks` for an eager-only Resizer |
+| `RESIZE_CONFIG_QUEUE_INVALID`, `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or `RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID` | the queue timing is invalid — fix the key the message names (`queue` in the config file, or the task queue's `timing`). A framework config file fails on first use with the rest of the file; a task queue's own `timing` fails `verify()` and worker start, while reads serve stored previews, queue nothing, and `prewarm()` reports it |
+| `RESIZE_MEDIA_APPEND_RESULT_INVALID` | a custom `MediaStore.appendPreviews` resolved with something other than an array — resolve with the previews it stored (`[]` when none) |
 | `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config file named in the message, or pass `storage` to `new FrameworkResizer()` |
-| `RESIZE_NOT_READY` | host code read `resizer.storage` / `db` / `tasks` before the drivers loaded — `await resizer.ready()` first (the Resizer's methods do this themselves) |
+| `RESIZE_NOT_READY` | host code read `resizer.storage` / `media` / `locks` / `tasks` before the drivers loaded — `await resizer.ready()` first (the Resizer's methods do this themselves) |
 | `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`; `worker.concurrency` (in a framework config file too) moves to the top-level `concurrency` |
-| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), the lock model (the framework's `Lock`, or the `lockModel` passed to `MongoDatabase`), or the media model of a plain `MongoDatabase` (framework hosts get `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` instead) |
+| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), the lock model (the framework's `Lock`, or the model passed to `MongoLockStore`), or the media model of a plain `MongoMediaStore` (framework hosts get `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` instead) |
 | `RESIZE_MONGO_MODEL_OUTDATED`, or `resize-scaffold --check` reports drift in `src/models/ResizeTask.ts` | a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `requestKey` or `availableAt` fields: port them (and the `{ queue, status, availableAt }` index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx resize-scaffold --eject` |
 | `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` from `verify()` or at worker start | the media schema declares preview rows as sub-documents without `identity` (a mixed or plain `previews` array passes) — spread the current `resizeMediaSchemaFragment`, or add `identity: { type: String }` to the row |
+| `RESIZE_MONGO_LOCK_MODEL_OUTDATED` from `verify()` or at worker start | the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
 | `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` | two config files share one task queue but set different timing (the message names both files and the keys) — set the same values in both |
 | a variant stays missing for ~10 min after its task was dead-lettered | `lockTtlMs.failed` (default 600000): reads do not queue a dead task's previews again until it expires — fix the cause in the logs first |
-| `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoDatabase()` / `new MongoTaskQueue()` needs a model or a getter — or use `mongoDatabase(connection, { mediaModel })` |
+| `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoMediaStore()` / `new MongoLockStore()` / `new MongoTaskQueue()` needs exactly one of `model` or `getModel` — or use `mongoParts(connection, { mediaModel })` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key is still in `resize.ts` / `resize.<NODE_ENV>.ts` — move it to the path named in the message |
 | `formats [...] have no encode.formats entry`, `RESIZE_FORMAT_NOT_CONFIGURED` | add `encode.formats.<id>` (`{}` for Sharp defaults), or request only configured ids; use `'jpeg'`, not the alias `'jpg'` |
@@ -338,11 +360,13 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config | optional peer not installed — install the packages named, see step 1 |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
-| `RESIZE_NO_RESIZER` in worker logs for a task | the worker process did not construct that Resizer — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
+| `Resizer '…' is not served by this worker` in worker logs, or `RESIZE_NO_RESIZER` on a task | the worker does not serve that Resizer: it was not constructed in the worker process before the worker started (or not passed in `runWorker({ resizers })`). Its tasks are given back to the queue for a worker that serves it, or, when the queue cannot give tasks back, fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) — construct every Resizer in `src/resizer.ts`, which both the API and the worker load |
 | `RESIZE_QUEUE_NOT_SERVED` at worker start | no task queue can consume that queue (e.g. `SqsTaskQueue` without it in `queues`) — add the queue URL, or start the worker for another queue |
+| `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED` at worker start | `runWorker({ resizers })` does not list a Resizer of the process that uses a task queue the worker consumes (the message names the queue and the Resizers); the worker would claim their tasks without running them — list them too, or give them their own task queue. When the message says a task queue failed to load, the worker could not compare that unlisted Resizer's task queue (the load error is the cause) — fix that task queue |
+| `RESIZE_DUPLICATE_RESIZER` at worker start, "the `resizers` list names '…' twice" | two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
-| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` (on first use, `verify()` or worker start) | raise the lease (`queue.leaseMs` in the config file, or the task queue's `timing.leaseMs`) or lower `lockTtlMs.worker` |
+| `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` (a config file: on first use; a task queue's `timing`: from `verify()` or at worker start, while reads serve stored previews and `prewarm()` reports it) | raise the lease (`queue.leaseMs` in the config file, or the task queue's `timing.leaseMs`) or lower `lockTtlMs.worker` |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |

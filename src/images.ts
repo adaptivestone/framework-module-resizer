@@ -1,5 +1,6 @@
-// Pure identity + dimension helpers. ONE identity, built one way, used everywhere
-// (read map, dedup, dispatch lock, worker lock). No external deps — see 03 · Identity.
+// Pure identity, catalog + dimension helpers. ONE identity, built one way, used everywhere
+// (read map, dedup, dispatch lock, worker lock), and the one implementation of which stored rows
+// count and which formats have encoder settings. No external deps.
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { isPositiveFinite } from './helpers/guards.ts';
 import type {
@@ -199,13 +200,49 @@ export function getPreviewIdentity(
 }
 
 /**
+ * The usable stored previews of `scope`, keyed by identity; of two rows with one identity the later
+ * wins. A row's identity comes from its own fields (its scope, size key, format and filters), so
+ * another Resizer's or pipeline's rendering never matches. The one rule for which stored rows
+ * count: the read path, prewarm, eager generate and the worker all use it.
+ */
+export function storedPreviews(
+  media: MediaLike,
+  scope: PreviewScope,
+): Map<string, Preview> {
+  const byIdentity = new Map<string, Preview>();
+  for (const preview of media.previews ?? []) {
+    if (!isUsablePreview(preview)) {
+      continue;
+    }
+    const own = previewScope(preview);
+    if (own.resizer === scope.resizer && own.pipeline === scope.pipeline) {
+      byIdentity.set(
+        getPreviewIdentity(
+          own,
+          preview.sizeKey,
+          preview.format,
+          preview.filters,
+        ),
+        preview,
+      );
+    }
+  }
+  return byIdentity;
+}
+
+/** The identities of the usable stored previews of `scope` (see storedPreviews). */
+export function storedIdentities(
+  media: MediaLike,
+  scope: PreviewScope,
+): Set<string> {
+  return new Set(storedPreviews(media, scope).keys());
+}
+
+/**
  * Expand `sizes × formats` into a deduped `MissingPreview[]`, skipping any size whose key can't
- * be built (`getSizeKey` throws) and any identity already present in `media.previews`. This is
- * the SHARED expansion for the two modes that queue/generate the WHOLE catalog up front — eager
- * `generateImpl` (11 · §11.1 step 2–3) and pre-warm `prewarmImpl` (11 · §11.1b step 2–3): both
- * skip-existing + dedup into the exact same `MissingPreview` shapes. The read path (06 · §17
- * step 7) does NOT use this: its per-cell loop interleaves expansion with ready/fast-path serving,
- * so it keeps its own inline version.
+ * be built (`getSizeKey` throws) and any identity already stored for `scope`. Eager `generate`
+ * and `prewarm` expand the whole catalog up front this way. The read path does not: its
+ * per-cell loop interleaves expansion with serving the ready cells.
  */
 export function expandMissingPreviews(
   media: MediaLike,
@@ -213,14 +250,7 @@ export function expandMissingPreviews(
   formats: PreviewFormat[],
   scope: PreviewScope,
 ): MissingPreview[] {
-  const existing = new Set<string>();
-  for (const p of media.previews ?? []) {
-    if (isUsablePreview(p)) {
-      existing.add(
-        getPreviewIdentity(previewScope(p), p.sizeKey, p.format, p.filters),
-      );
-    }
-  }
+  const existing = storedIdentities(media, scope);
   return expandPreviewRequests(sizes, formats, scope).filter(
     (preview) =>
       !existing.has(
@@ -302,13 +332,115 @@ export function isCatalogCovered(
   return expandMissingPreviews(media, sizes, formats, scope).length === 0;
 }
 
-export function isUsablePreview(preview: Preview): boolean {
+/** A row that can be served: it has a storage ref and a raster content type (never SVG). */
+function isUsablePreview(preview: Preview): boolean {
   return Boolean(
     preview.storageRef != null &&
       preview.contentType &&
       preview.contentType !== 'image/svg+xml' &&
       preview.format !== 'svg',
   );
+}
+
+function normalizeVariant(variant: MissingPreview): MissingPreview {
+  const normalized: MissingPreview = {
+    sizeKey: variant.sizeKey,
+    format: variant.format,
+  };
+  if (variant.filters && Object.keys(variant.filters).length > 0) {
+    normalized.filters = canonicalizeFilterValue(
+      variant.filters,
+    ) as MissingPreview['filters'];
+  }
+  if (variant.requestedWidth !== undefined) {
+    normalized.requestedWidth = variant.requestedWidth;
+  }
+  if (variant.requestedHeight !== undefined) {
+    normalized.requestedHeight = variant.requestedHeight;
+  }
+  if (variant.fit !== undefined) {
+    normalized.fit = variant.fit;
+  }
+  return normalized;
+}
+
+/**
+ * Canonicalize a complete queue payload: normalize nested filter keys, remove exact
+ * duplicate variants, and sort the result by the canonical representation. The
+ * stable result goes into the request key, so a list permutation cannot create another
+ * durable task in a queue that deduplicates by it.
+ */
+export function canonicalizeVariants(
+  variants: readonly MissingPreview[],
+): MissingPreview[] {
+  const byKey = new Map<string, MissingPreview>();
+  for (const variant of variants) {
+    const normalized = normalizeVariant(variant);
+    const key = JSON.stringify(normalized);
+    if (!byKey.has(key)) {
+      byKey.set(key, normalized);
+    }
+  }
+  return (
+    [...byKey.entries()]
+      // Do not use localeCompare: durable identity ordering must be independent of
+      // the host process locale.
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([, variant]) => variant)
+  );
+}
+
+/**
+ * True when `format` is an own key of `encoders` (`config.encode.formats`). Format ids are open
+ * strings: an alias such as 'jpg' would skip the JPEG options, and an arbitrary Sharp id such as
+ * 'raw' would publish a pixel dump.
+ */
+function isConfiguredFormat(
+  encoders: Record<string, unknown>,
+  format: unknown,
+): format is PreviewFormat {
+  return typeof format === 'string' && Object.hasOwn(encoders, format);
+}
+
+/**
+ * Split the requested formats into those with encoder settings (in order, repeats kept) and the
+ * rest (each named once).
+ */
+export function configuredFormats(
+  encoders: Record<string, unknown>,
+  requested: readonly PreviewFormat[],
+): { formats: PreviewFormat[]; dropped: PreviewFormat[] } {
+  const formats: PreviewFormat[] = [];
+  const dropped = new Set<PreviewFormat>();
+  for (const format of requested) {
+    if (isConfiguredFormat(encoders, format)) {
+      formats.push(format);
+    } else {
+      dropped.add(format);
+    }
+  }
+  return { formats, dropped: [...dropped] };
+}
+
+/**
+ * Split variants by the same rule as configuredFormats. A `beforeEnqueue` tap may add or rewrite
+ * a variant to a format with no encoder settings, which a worker could never produce; a malformed
+ * entry (not an object, no string format) is unconfigured too, never thrown on.
+ */
+export function splitConfigured(
+  encoders: Record<string, unknown>,
+  variants: readonly MissingPreview[],
+): { configured: MissingPreview[]; unconfigured: MissingPreview[] } {
+  const configured: MissingPreview[] = [];
+  const unconfigured: MissingPreview[] = [];
+  for (const variant of variants) {
+    if (isConfiguredFormat(encoders, variant?.format)) {
+      configured.push(variant);
+    } else {
+      unconfigured.push(variant);
+    }
+  }
+  return { configured, unconfigured };
 }
 
 export interface ResizedDimensions {

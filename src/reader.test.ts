@@ -4,23 +4,28 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import { Catalog } from './catalog.ts';
+import type { LockStore } from './contracts/locks.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask } from './contracts/taskQueue.ts';
+import { Dispatcher } from './dispatcher.ts';
+import { ResizeConfigError } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
+import { HookBus } from './hooks.ts';
+import { PipelineRegistry } from './pipelines.ts';
+import { Reader, type ReaderDeps } from './reader.ts';
+import { Resizer, resetResizerForTests } from './resizer.ts';
 import {
-  Resizer,
-  type ResizeStorage,
-  resetResizerForTests,
-} from './resizer.ts';
-import {
-  type FakeLocks,
-  fakeDb,
+  fakeMedia,
   MemoryTaskQueue,
+  memoryLocks,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
-import type { MediaLike, StorageRef } from './types.d.ts';
+import { timingOf } from './timing.ts';
+import type { MediaLike, ResizeLogger, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
 // Harness — a recording ambient app (getConfig('resize') → { mediaModelName },
@@ -72,13 +77,15 @@ function makeTasks(behavior?: (task: NewTask) => { taskId: string | null }) {
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
   const released: string[] = [];
-  const locks: FakeLocks = {
-    acquire: async (key, ttl) => {
+  const locks: LockStore = {
+    acquire: async (key, _owner, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
+    extend: async () => true,
     release: async (key) => {
       released.push(key);
+      return true;
     },
   };
   return { locks, acquired, released };
@@ -90,7 +97,183 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 read-path — ready vs missing partitioning
+// A Reader built from its parts: no Resizer, no media store, no framework app.
+// ---------------------------------------------------------------------------
+
+const silent: ResizeLogger = { info() {}, warn() {}, error() {} };
+
+/** A Reader on a webp-only config; `dispatcher` undefined means an eager-only Resizer. */
+function readerDeps(dispatcher: Dispatcher | undefined): ReaderDeps {
+  const config = makeImageConfig({ formats: ['webp'] });
+  return {
+    catalog: new Catalog({ config }),
+    dispatcher,
+    hooks: new HookBus({ logger: silent }),
+    pipelines: new PipelineRegistry(),
+    storage: {
+      download: async () => Buffer.alloc(0),
+      upload: async () => ({ key: 'k' }),
+      publicUrl: (ref) => `https://cdn/${(ref as { key: string }).key}`,
+    },
+    logger: silent,
+    name: 'default',
+    queue: 'default',
+  };
+}
+
+describe('Reader', () => {
+  const media: MediaLike = {
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [
+      {
+        storageRef: { key: 'p' },
+        sizeKey: '10x10',
+        format: 'webp',
+        contentType: 'image/webp',
+      },
+    ],
+  };
+
+  test('a Reader serves stored previews and queues the missing ones, with no Resizer and no media store', async () => {
+    const tasks = new MemoryTaskQueue();
+    const reader = new Reader(
+      readerDeps(
+        new Dispatcher({
+          tasks,
+          locks: memoryLocks(),
+          timing: timingOf(tasks),
+          name: 'default',
+          logger: silent,
+        }),
+      ),
+    );
+    const { decision } = await reader.resolve({
+      media,
+      sizes: [
+        { width: 10, height: 10 },
+        { width: 20, height: 20 },
+      ],
+    });
+    assert.deepEqual(
+      decision.ready.map((e) => e.url),
+      ['https://cdn/p'],
+    );
+    assert.deepEqual(
+      decision.missing.map((v) => v.sizeKey),
+      ['20x20'],
+    );
+    assert.deepEqual(
+      tasks.added[0].previews.map((v) => v.sizeKey),
+      ['20x20'],
+    );
+    assert.equal(
+      (await reader.prewarm({ media, sizes: [{ width: 30, height: 30 }] }))
+        .status,
+      'accepted',
+    );
+  });
+
+  test('a Reader without a Dispatcher (eager only) reports RESIZE_ENQUEUE_NO_QUEUE from prewarm', async () => {
+    const reader = new Reader(readerDeps(undefined));
+    const result = await reader.prewarm({
+      media,
+      sizes: [{ width: 30, height: 30 }],
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_NO_QUEUE');
+    assert.equal(result.issues[0].retryable, false);
+  });
+
+  test('a Reader whose task queue cannot be used serves stored previews, queues nothing, logs nothing and prewarm reports the failure', async () => {
+    const logged: unknown[][] = [];
+    const deps = readerDeps(undefined);
+    deps.logger = {
+      info: (...a: unknown[]) => logged.push(a),
+      warn: (...a: unknown[]) => logged.push(a),
+      error: (...a: unknown[]) => logged.push(a),
+    };
+    const failure = new ResizeConfigError('the lease is invalid', {
+      code: 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    });
+    deps.queueFailure = { error: failure };
+    const reader = new Reader(deps);
+    const sizes = [
+      { width: 10, height: 10 },
+      { width: 20, height: 20 },
+    ];
+    for (const enqueueMissing of [undefined, true]) {
+      const { decision } = await reader.resolve({
+        media,
+        sizes,
+        ...(enqueueMissing ? { enqueueMissing } : {}),
+      });
+      assert.deepEqual(
+        decision.ready.map((e) => e.url),
+        ['https://cdn/p'],
+      );
+      assert.deepEqual(
+        decision.missing.map((v) => v.sizeKey),
+        ['20x20'],
+      );
+    }
+    const result = await reader.prewarm({ media, sizes });
+    assert.deepEqual(logged, []);
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      result.requested.map((v) => v.sizeKey),
+      ['10x10', '20x20'],
+    );
+    assert.deepEqual(
+      result.ready.map((v) => v.sizeKey),
+      ['10x10'],
+    );
+    assert.deepEqual(
+      result.unconfirmed.map((v) => v.sizeKey),
+      ['20x20'],
+    );
+    assert.deepEqual(result.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_INTERNAL_ERROR',
+        message: 'the lease is invalid',
+        retryable: false,
+        previews: result.unconfirmed,
+      },
+    ]);
+  });
+
+  test('a Reader never throws: an unexpected error is logged once and returns the safe result', async () => {
+    const errors: unknown[][] = [];
+    const deps = readerDeps(undefined);
+    deps.logger = {
+      info() {},
+      warn() {},
+      error(...a: unknown[]) {
+        errors.push(a);
+      },
+    };
+    const reader = new Reader(deps);
+    assert.deepEqual(await reader.resolve(undefined as never), {
+      decision: { ready: [], missing: [] },
+      output: undefined,
+    });
+    const result = await reader.prewarm(undefined as never);
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.requested, []);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, true);
+    assert.deepEqual(
+      errors.map((e) => String(e[0])),
+      [
+        'resize resolve: unexpected internal error — returning the safe empty decision',
+        'resize prewarm: unexpected internal error — nothing confirmed',
+      ],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read path — ready vs missing partitioning
 // ---------------------------------------------------------------------------
 
 describe('resolve — partitioning', () => {
@@ -169,7 +352,8 @@ describe('resolve — partitioning', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         formatPublicUrls: (decision) =>
           decision.ready.map((entry) => entry.url),
@@ -225,7 +409,8 @@ describe('resolve — partitioning', () => {
         },
       }),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: {
@@ -318,7 +503,7 @@ describe('resolve — partitioning', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 read-path — hooks (resolveSizes / formatPublicUrls / beforeEnqueue)
+// Read path — hooks (resolveSizes / formatPublicUrls / beforeEnqueue)
 // ---------------------------------------------------------------------------
 
 describe('resolve — waterfall hooks', () => {
@@ -418,7 +603,7 @@ describe('resolve — waterfall hooks', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 step 9 → §18 — enqueue wiring
+// Read path — enqueue wiring (missing variants reach the Dispatcher)
 // ---------------------------------------------------------------------------
 
 describe('resolve — enqueue wiring', () => {
@@ -429,7 +614,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       pipelines: { photo: {} },
     });
     const media: MediaLike = {
@@ -467,7 +653,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       name: 'listings',
       queue: 'interactive',
     });
@@ -502,7 +689,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -531,7 +719,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     await r.resolve({
       media: {
@@ -557,7 +746,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -577,7 +767,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -596,7 +787,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -616,7 +808,8 @@ describe('resolve — enqueue wiring', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1' },
@@ -638,7 +831,8 @@ describe('prewarm — missing original key', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const result = await r.prewarm({
       media: { id: 'm1', original: {} as MediaLike['original'] },
@@ -653,7 +847,7 @@ describe('prewarm — missing original key', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 step 9 — no task queue on the instance
+// Read path — no task queue on the instance
 // ---------------------------------------------------------------------------
 
 describe('resolve — no task queue (eager-only host)', () => {
@@ -698,7 +892,8 @@ describe('resolve — SVG raster previews', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const media: MediaLike = {
       id: 'm1',
@@ -817,7 +1012,8 @@ describe('resolve — the original is never served', () => {
         canServeOriginalPublicly: () => true,
       } as Partial<ResizeStorage>),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: smallOriginal(),
@@ -909,7 +1105,7 @@ describe('resolve — the original is never served', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §17 never-throw guarantee
+// Read path — the never-throw guarantee
 // ---------------------------------------------------------------------------
 
 describe('resolve — never throws', () => {
@@ -952,7 +1148,8 @@ describe('resolve — never throws', () => {
     const r = new FrameworkResizer({
       storage: throwingStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         formatPublicUrls: (decision) =>
           decision.ready.map((entry) => entry.url),
@@ -1039,7 +1236,8 @@ describe('resolve — unknown pipeline', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         beforeEnqueue: (missing) => {
           beforeEnqueueCalls += 1;
@@ -1112,7 +1310,8 @@ describe('resolve — per-call formats', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
     });
     const { decision } = await r.resolve({
       media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
@@ -1146,7 +1345,8 @@ describe('resolve — per-call formats', () => {
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
-      db: fakeDb({ locks }),
+      media: fakeMedia(),
+      locks,
       hooks: {
         beforeEnqueue: (missing) => [
           ...missing,
@@ -1227,17 +1427,17 @@ describe('several Resizers in one process', () => {
       },
     });
     // Core Resizers with explicit parts: no framework app is installed in this test.
-    const db = fakeDb();
+    const mediaStore = fakeMedia();
     const a = new Resizer({
       storage: makeStorage(),
-      db,
+      media: mediaStore,
       config: makeImageConfig({ formats: ['webp'] }),
       logger: logger(errorsA),
     });
     const b = new Resizer({
       name: 'listings',
       storage: makeStorage(),
-      db,
+      media: mediaStore,
       config: makeImageConfig({ formats: ['jpeg'] }),
       logger: logger(errorsB),
     });

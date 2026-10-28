@@ -1,5 +1,6 @@
-// MongoDatabase media writes against a real MongoDB: one stored preview row per preview identity,
-// however many workers render it, and the startup check for a media model without that field.
+// MongoMediaStore against a real MongoDB: one stored preview row per preview identity, however
+// many workers render it, the startup check for a media model without that field, and the
+// `model` / `getModel` options.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
@@ -7,7 +8,7 @@ import mongoose from 'mongoose';
 import { ResizeSetupError } from '../../errors.ts';
 import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
 import type { Preview } from '../../types.d.ts';
-import { createResizeModels, MongoDatabase } from './index.ts';
+import { MongoMediaStore, type MongoMediaStoreOptions } from './index.ts';
 
 let server: MongoMemoryServer;
 let connection: mongoose.Connection;
@@ -16,7 +17,7 @@ before(async () => {
   server = await MongoMemoryServer.create({ instance: { ip: '127.0.0.1' } });
   connection = await mongoose
     .createConnection(server.getUri(), {
-      dbName: `resize_mongo_database_${process.pid}`,
+      dbName: `resize_mongo_media_${process.pid}`,
     })
     .asPromise();
 });
@@ -63,11 +64,8 @@ const mediaModelWith = (name: string, previews: unknown) =>
     ),
   );
 
-function database(): MongoDatabase {
-  return new MongoDatabase({
-    mediaModel: Media(),
-    lockModel: createResizeModels(connection).ResizeLock,
-  });
+function mediaStore(): MongoMediaStore {
+  return new MongoMediaStore({ model: Media() });
 }
 
 async function newMedia(previews: Preview[] = []): Promise<string> {
@@ -98,15 +96,15 @@ function preview(identity: string | undefined, path = identity): Preview {
 const ID_A = 'default:default:16x16:webp:';
 const ID_B = 'default:default:32x32:webp:';
 
-describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
+describe('MongoMediaStore.appendPreviews: one row per preview identity', () => {
   test('a second append of a stored identity leaves one row and resolves with nothing stored', async () => {
-    const db = database();
+    const store = mediaStore();
     const mediaId = await newMedia();
     const first = preview(ID_A, 'first');
     const second = preview(ID_A, 'second');
 
-    assert.deepEqual(await db.appendPreviews(mediaId, [first]), [first]);
-    assert.deepEqual(await db.appendPreviews(mediaId, [second]), []);
+    assert.deepEqual(await store.appendPreviews(mediaId, [first]), [first]);
+    assert.deepEqual(await store.appendPreviews(mediaId, [second]), []);
 
     const rows = await storedPreviews(mediaId);
     assert.equal(rows.length, 1);
@@ -115,11 +113,11 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
   });
 
   test('concurrent appends of one identity store exactly one row', async () => {
-    const db = database();
+    const store = mediaStore();
     const mediaId = await newMedia();
     const results = await Promise.all(
       Array.from({ length: 8 }, (_, i) =>
-        db.appendPreviews(mediaId, [preview(ID_A, `worker-${i}`)]),
+        store.appendPreviews(mediaId, [preview(ID_A, `worker-${i}`)]),
       ),
     );
 
@@ -132,13 +130,13 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
   });
 
   test('different identities are all stored, and a repeat inside one call is stored once', async () => {
-    const db = database();
+    const store = mediaStore();
     const mediaId = await newMedia();
     const a = preview(ID_A);
     const b = preview(ID_B);
 
     assert.deepEqual(
-      await db.appendPreviews(mediaId, [a, b, preview(ID_A, 'repeat')]),
+      await store.appendPreviews(mediaId, [a, b, preview(ID_A, 'repeat')]),
       [a, b],
     );
     const rows = await storedPreviews(mediaId);
@@ -149,37 +147,37 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
   });
 
   test('a preview without an identity is always stored', async () => {
-    const db = database();
+    const store = mediaStore();
     const mediaId = await newMedia();
     const legacy = preview(undefined, 'legacy');
 
-    assert.deepEqual(await db.appendPreviews(mediaId, [legacy]), [legacy]);
-    assert.deepEqual(await db.appendPreviews(mediaId, [legacy]), [legacy]);
+    assert.deepEqual(await store.appendPreviews(mediaId, [legacy]), [legacy]);
+    assert.deepEqual(await store.appendPreviews(mediaId, [legacy]), [legacy]);
     assert.equal((await storedPreviews(mediaId)).length, 2);
   });
 
   test('a row stored without an identity never matches a new one', async () => {
-    const db = database();
+    const store = mediaStore();
     const mediaId = await newMedia([preview(undefined, 'old-row')]);
     const fresh = preview(ID_A, 'fresh');
 
-    assert.deepEqual(await db.appendPreviews(mediaId, [fresh]), [fresh]);
+    assert.deepEqual(await store.appendPreviews(mediaId, [fresh]), [fresh]);
     assert.equal((await storedPreviews(mediaId)).length, 2);
   });
 
   test('the dimension backfill is applied, also when every preview was skipped', async () => {
-    const db = database();
+    const store = mediaStore();
     const mediaId = await newMedia();
-    await db.appendPreviews(mediaId, [preview(ID_A)]);
+    await store.appendPreviews(mediaId, [preview(ID_A)]);
 
     assert.deepEqual(
-      await db.appendPreviews(mediaId, [preview(ID_A, 'late')], {
+      await store.appendPreviews(mediaId, [preview(ID_A, 'late')], {
         width: 64,
         height: 48,
       }),
       [],
     );
-    const loaded = await db.loadMedia(mediaId);
+    const loaded = await store.loadMedia(mediaId);
     assert.equal(loaded?.original?.width, 64);
     assert.equal(loaded?.original?.height, 48);
     assert.equal(loaded?.previews?.length, 1);
@@ -187,26 +185,26 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
     const other = await newMedia();
     const stored = preview(ID_B);
     assert.deepEqual(
-      await db.appendPreviews(other, [stored], { width: 10, height: 20 }),
+      await store.appendPreviews(other, [stored], { width: 10, height: 20 }),
       [stored],
     );
-    const loadedOther = await db.loadMedia(other);
+    const loadedOther = await store.loadMedia(other);
     assert.equal(loadedOther?.original?.width, 10);
     assert.equal(loadedOther?.original?.height, 20);
     assert.equal(loadedOther?.previews?.length, 1);
   });
 
   test('media that no longer exists is a silent no-op', async () => {
-    const db = database();
+    const store = mediaStore();
     const gone = String(new mongoose.Types.ObjectId());
     assert.deepEqual(
-      await db.appendPreviews(gone, [preview(ID_A), preview(undefined)], {
+      await store.appendPreviews(gone, [preview(ID_A), preview(undefined)], {
         width: 1,
         height: 1,
       }),
       [],
     );
-    assert.equal(await db.loadMedia(gone), null);
+    assert.equal(await store.loadMedia(gone), null);
   });
 
   test("every write runs the host's findOneAndUpdate middleware and returns only the id", async () => {
@@ -229,10 +227,7 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
     );
     const Hooked =
       connection.models.HookedMedia ?? connection.model('HookedMedia', schema);
-    const db = new MongoDatabase({
-      mediaModel: Hooked,
-      lockModel: createResizeModels(connection).ResizeLock,
-    });
+    const store = new MongoMediaStore({ model: Hooked });
     const doc = await Hooked.create({
       original: { storageRef: { path: 'o.png' }, format: 'png' },
       previews: [],
@@ -240,7 +235,7 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
     const stored = preview(ID_A);
 
     assert.deepEqual(
-      await db.appendPreviews(
+      await store.appendPreviews(
         String(doc._id),
         [stored, preview(ID_A, 'again')],
         { width: 64, height: 48 },
@@ -259,14 +254,11 @@ describe('MongoDatabase.appendPreviews: one row per preview identity', () => {
   });
 });
 
-describe('MongoDatabase.verify(): the media model must store preview identities', () => {
+describe('MongoMediaStore.verify(): the media model must store preview identities', () => {
   test('a media model without previews.identity is a setup error', () => {
-    const db = new MongoDatabase({
-      mediaModel: OutdatedMedia(),
-      lockModel: createResizeModels(connection).ResizeLock,
-    });
+    const store = new MongoMediaStore({ model: OutdatedMedia() });
     assert.throws(
-      () => db.verify(),
+      () => store.verify(),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
@@ -278,14 +270,11 @@ describe('MongoDatabase.verify(): the media model must store preview identities'
   test('rows declared through an explicit row schema without identity are rejected too', () => {
     const { identity: _identity, ...rowFields } =
       resizeMediaSchemaFragment.previews[0];
-    const db = new MongoDatabase({
-      mediaModel: mediaModelWith('RowSchemaMedia', [
-        new mongoose.Schema(rowFields),
-      ]),
-      lockModel: createResizeModels(connection).ResizeLock,
+    const store = new MongoMediaStore({
+      model: mediaModelWith('RowSchemaMedia', [new mongoose.Schema(rowFields)]),
     });
     assert.throws(
-      () => db.verify(),
+      () => store.verify(),
       (err: unknown) =>
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED',
@@ -293,7 +282,6 @@ describe('MongoDatabase.verify(): the media model must store preview identities'
   });
 
   test('previews kept as a mixed or plain array, another type, or loose rows pass', () => {
-    const lockModel = createResizeModels(connection).ResizeLock;
     for (const [name, previews] of [
       ['MixedArrayMedia', [mongoose.Schema.Types.Mixed]],
       ['EmptyArrayMedia', []],
@@ -305,37 +293,35 @@ describe('MongoDatabase.verify(): the media model must store preview identities'
         [new mongoose.Schema({ sizeKey: String }, { strict: false })],
       ],
     ] as const) {
-      const db = new MongoDatabase({
-        mediaModel: mediaModelWith(name, previews),
-        lockModel,
+      const store = new MongoMediaStore({
+        model: mediaModelWith(name, previews),
       });
-      assert.doesNotThrow(() => db.verify(), name);
+      assert.doesNotThrow(() => store.verify(), name);
     }
   });
 
   test('a mixed or plain previews array really stores and matches identity', async () => {
-    const lockModel = createResizeModels(connection).ResizeLock;
     for (const [name, previews] of [
       ['MixedArrayMedia', [mongoose.Schema.Types.Mixed]],
       ['ArrayCtorMedia', Array],
     ] as const) {
       const model = mediaModelWith(name, previews);
-      const db = new MongoDatabase({ mediaModel: model, lockModel });
+      const store = new MongoMediaStore({ model });
       const doc = await model.create({
         original: { storageRef: { path: 'o.png' }, format: 'png' },
         previews: [],
       });
       const id = String(doc._id);
       const first = preview(ID_A, 'first');
-      assert.deepEqual(await db.appendPreviews(id, [first]), [first], name);
+      assert.deepEqual(await store.appendPreviews(id, [first]), [first], name);
       assert.deepEqual(
-        await db.appendPreviews(id, [preview(ID_A, 'second')]),
+        await store.appendPreviews(id, [preview(ID_A, 'second')]),
         [],
         name,
       );
       const results = await Promise.all(
         Array.from({ length: 6 }, (_, i) =>
-          db.appendPreviews(id, [preview(ID_B, `worker-${i}`)]),
+          store.appendPreviews(id, [preview(ID_B, `worker-${i}`)]),
         ),
       );
       assert.equal(results.flat().length, 1, name);
@@ -351,16 +337,64 @@ describe('MongoDatabase.verify(): the media model must store preview identities'
   });
 
   test('the current fragment and a model-shaped object without a schema pass', () => {
-    const lockModel = createResizeModels(connection).ResizeLock;
-    assert.doesNotThrow(() =>
-      new MongoDatabase({ mediaModel: Media(), lockModel }).verify(),
-    );
+    assert.doesNotThrow(() => new MongoMediaStore({ model: Media() }).verify());
     const shaped = {
       findById: async () => null,
       findOneAndUpdate: async () => null,
     };
-    assert.doesNotThrow(() =>
-      new MongoDatabase({ mediaModel: shaped, lockModel }).verify(),
+    assert.doesNotThrow(() => new MongoMediaStore({ model: shaped }).verify());
+  });
+});
+
+describe('MongoMediaStore options', () => {
+  test('getModel is resolved on use, not at construction', async () => {
+    let calls = 0;
+    const lazy = new MongoMediaStore({
+      getModel: () => {
+        calls++;
+        return Media();
+      },
+    });
+    assert.equal(calls, 0);
+    const mediaId = await newMedia();
+    assert.equal((await lazy.loadMedia(mediaId))?.id, mediaId);
+    assert.deepEqual(await lazy.appendPreviews(mediaId, [preview(ID_A)]), [
+      preview(ID_A),
+    ]);
+    assert.equal(calls, 2);
+  });
+
+  test('a getter that resolves to no model is a setup error, never missing media', async () => {
+    const lazy = new MongoMediaStore({
+      getModel: () => connection.models.MisspelledMedia,
+    });
+    const missing = (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_MONGO_MODEL_MISSING' &&
+      /media model does not resolve/.test(err.message);
+    assert.throws(() => lazy.verify(), missing);
+    await assert.rejects(() => lazy.loadMedia('m1'), missing);
+    await assert.rejects(
+      () => lazy.appendPreviews('m1', [preview(ID_A)]),
+      missing,
+    );
+  });
+
+  test('needs exactly one of model or getModel', () => {
+    const required = (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_MONGO_MODEL_REQUIRED' &&
+      /MongoMediaStore needs exactly one of `model` or `getModel`/.test(
+        err.message,
+      );
+    assert.throws(
+      () => new MongoMediaStore(undefined as unknown as MongoMediaStoreOptions),
+      required,
+    );
+    assert.throws(() => new MongoMediaStore({}), required);
+    assert.throws(
+      () => new MongoMediaStore({ model: Media(), getModel: Media }),
+      required,
     );
   });
 });

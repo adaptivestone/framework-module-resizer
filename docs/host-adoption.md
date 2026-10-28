@@ -71,7 +71,22 @@ the enclosing schema's options.
   timing keys (and effective SQS `waitTimeSeconds`), or `verify()` and worker start
   fail with
   `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT`. Without the framework, call
-  `mongoDatabase()` once and pass its `tasks` to every Resizer.
+  `mongoParts(connection, { mediaModel })` once per process and spread the same parts
+  into every Resizer (each call makes its own task queue). The pre-release database
+  part is split in two: `media` (the media store) and `locks` (the lock store), beside
+  `tasks`.
+- Call `resizer.verify()` at boot. A task queue that cannot be used (no `locks`, or
+  invalid timing on a task queue passed in code) no longer fails reads or uploads:
+  `resolve()` serves stored previews and queues nothing, and only `verify()`,
+  `prewarm()` and worker start report it. Invalid timing in a framework config file
+  is still a config error on first use.
+- Deploy the API and the worker together. Locks now carry an owner, and a release
+  deletes only the owner's lock. `ResizeLock` and framework `Lock` rows written by an
+  older version have no owner, so this version cannot release them early: they expire
+  by their TTL (by default 60 s for dispatch and worker locks, 10 min for a dead-letter
+  cooldown), and an expired one is taken over as usual. In a mixed-version rollout an
+  older process still deletes any lock by its key, this version's too. Locks only
+  prevent duplicate work, so the cost is a variant that waits or is queued twice.
 - A host whose Resizers read only named config files (no `resize.ts`) starts the
   worker with `npm run cli ResizeWorker -- --config=<name>`.
 - Previews stored before preview identity included the Resizer and the pipeline

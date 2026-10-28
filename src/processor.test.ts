@@ -1,5 +1,5 @@
-// Worker core tests (07 · Worker + 11 · Modes). Real sharp on tiny in-memory fixtures
-// generated with sharp itself; fakes for storage, database and task queues.
+// Processor tests: queued tasks, eager generate and the worker that runs them. Real sharp on tiny
+// in-memory fixtures generated with sharp itself; fakes for storage, media, locks and task queues.
 // Fresh Resizer + fake ambient app per test (node:test = per-file process isolation).
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
@@ -14,7 +14,11 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
-import type { ResizeDatabase } from './contracts/database.ts';
+import { Catalog } from './catalog.ts';
+import type { LockStore } from './contracts/locks.ts';
+import type { MediaStore } from './contracts/media.ts';
+import type { Pipeline } from './contracts/pipeline.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
 import {
   ResizeConfigError,
@@ -26,24 +30,26 @@ import {
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { runResizeWorker } from './framework/worker.ts';
+import { HookBus } from './hooks.ts';
 import { getSizeKey, toMissingPreview } from './images.ts';
+import { PipelineRegistry } from './pipelines.ts';
+import { Processor, type ProcessorDeps } from './processor.ts';
+import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
 import {
-  type Pipeline,
-  Resizer,
-  type ResizeStorage,
-  resetResizerForTests,
-} from './resizer.ts';
-import {
-  type FakeLocks,
-  fakeDb,
+  fakeMedia,
   MemoryTaskQueue,
+  memoryLocks,
 } from './testHelpers/fakes.ts';
-import { makeResizeConfig } from './testHelpers/resizeConfig.ts';
+import {
+  makeImageConfig,
+  makeResizeConfig,
+} from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
   MissingPreview,
   Original,
   Preview,
+  ResizeLogger,
 } from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
 
@@ -272,8 +278,10 @@ function makeStorage(
   return { storage, uploads };
 }
 
-function makeDatabase(media: MediaLike | null): {
-  db: ResizeDatabase;
+// A media store that loads `media` and records every appendPreviews call; it reports every
+// preview it was given as stored.
+function makeMediaStore(media: MediaLike | null): {
+  mediaStore: MediaStore;
   appendCalls: Array<{
     mediaId: string;
     previews: Preview[];
@@ -285,39 +293,42 @@ function makeDatabase(media: MediaLike | null): {
     previews: Preview[];
     backfillDims?: { width: number; height: number };
   }> = [];
-  const db = fakeDb({
+  const mediaStore = fakeMedia({
     load: async () => media,
     appendPreviews: async (mediaId, previews, backfillDims) => {
       appendCalls.push({ mediaId, previews, backfillDims });
+      return previews;
     },
   });
-  return { db, appendCalls };
+  return { mediaStore, appendCalls };
 }
 
+type LockCall = { key: string; owner: string };
+
+// A recording lock store: every acquire and release with its key and owner.
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true): {
-  lockProvider: FakeLocks;
-  acquired: string[];
-  released: string[];
+  locks: LockStore;
+  acquired: LockCall[];
+  released: LockCall[];
 } {
-  const acquired: string[] = [];
-  const released: string[] = [];
-  const lockProvider: FakeLocks = {
-    acquire: async (key) => {
-      acquired.push(key);
+  const acquired: LockCall[] = [];
+  const released: LockCall[] = [];
+  const locks: LockStore = {
+    acquire: async (key, owner) => {
+      acquired.push({ key, owner });
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
-    release: async (key) => {
-      released.push(key);
+    extend: async () => true,
+    release: async (key, owner) => {
+      released.push({ key, owner });
+      return true;
     },
   };
-  return { lockProvider, acquired, released };
+  return { locks, acquired, released };
 }
 
-function fakeLockMethods(
-  locks: FakeLocks,
-): Pick<ResizeDatabase, 'acquireLock' | 'releaseLock'> {
-  return { acquireLock: locks.acquire, releaseLock: locks.release };
-}
+/** The keys of recorded lock calls, in call order. */
+const keysOf = (calls: LockCall[]): string[] => calls.map(({ key }) => key);
 
 function mediaDoc(
   over: {
@@ -373,6 +384,167 @@ function countRenders(): () => number {
 }
 
 // ---------------------------------------------------------------------------
+// A Processor built from its parts: no Resizer, no framework app.
+// ---------------------------------------------------------------------------
+
+const silent: ResizeLogger = { info() {}, warn() {}, error() {} };
+
+/** A Processor on a jpeg-only config whose media store loads mediaDoc(); no `locks`: eager only. */
+function processorDeps(locks: LockStore | undefined): ProcessorDeps {
+  const config = makeImageConfig({ formats: ['jpeg'] });
+  return {
+    catalog: new Catalog({ config }),
+    media: fakeMedia({ load: async () => mediaDoc() }),
+    storage: makeStorage(redPng).storage,
+    locks,
+    pipelines: new PipelineRegistry(),
+    hooks: new HookBus({ logger: silent }),
+    config,
+    logger: silent,
+    name: 'default',
+  };
+}
+
+describe('Processor', () => {
+  test('a Processor renders a task with only its ports (no Resizer)', async () => {
+    const locks = memoryLocks();
+    const { storage, uploads } = makeStorage(redPng);
+    const deps = processorDeps(locks);
+    deps.storage = storage;
+    const processor = new Processor(deps);
+    await processor.processTask(task({ previews: [variant()] }), {
+      workerLockTtlMs: 1000,
+    });
+    assert.equal(uploads.length, 1);
+    // Released: another owner takes it at once.
+    assert.equal(
+      await locks.acquire(
+        'resize_worker:m1:default:default:20x20:jpeg:none',
+        'other',
+        1000,
+      ),
+      true,
+    );
+  });
+
+  test('processTask without a lock store is RESIZE_LOCKS_REQUIRED', async () => {
+    let loads = 0;
+    const deps = processorDeps(undefined);
+    deps.media = fakeMedia({
+      load: async () => {
+        loads++;
+        return mediaDoc();
+      },
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).processTask(task({ previews: [variant()] }), {
+          workerLockTtlMs: 1000,
+        }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
+    );
+    assert.equal(loads, 0);
+  });
+
+  test('notify maps task events to their observers with ctx {}', async () => {
+    const deps = processorDeps(memoryLocks());
+    const seen: unknown[][] = [];
+    deps.hooks.add('afterTaskComplete', (...args) => {
+      seen.push(['afterTaskComplete', ...args]);
+    });
+    deps.hooks.add('onTaskFailed', (...args) => {
+      seen.push(['onTaskFailed', ...args]);
+    });
+    deps.hooks.add('onTaskDeadLettered', (...args) => {
+      seen.push(['onTaskDeadLettered', ...args]);
+    });
+    const processor = new Processor(deps);
+    const err = new Error('boom');
+    await processor.notify('completed', task());
+    await processor.notify('failed', task(), err);
+    await processor.notify('deadLettered', task(), err);
+    assert.deepEqual(seen, [
+      ['afterTaskComplete', task(), {}],
+      ['onTaskFailed', task(), err, {}],
+      ['onTaskDeadLettered', task(), err, {}],
+    ]);
+  });
+
+  test('holdFailedCooldown re-takes every dispatch lock of the task for ttlMs and never rejects', async () => {
+    const calls: unknown[][] = [];
+    const recorder: LockStore = {
+      acquire: async (key, owner, ttlMs) => {
+        calls.push(['acquire', key, owner, ttlMs]);
+        return true;
+      },
+      extend: async () => true,
+      release: async (key, owner) => {
+        calls.push(['release', key, owner]);
+        return true;
+      },
+    };
+    // Two copies of one variant: one lock.
+    const dead = task({ previews: [variant(), variant()] });
+    await new Processor(processorDeps(recorder)).holdFailedCooldown(
+      dead,
+      600_000,
+    );
+    const key = 'resize_dispatch:m1:default:default:20x20:jpeg:none';
+    assert.deepEqual(calls, [
+      ['release', key, 'resize:dispatch'],
+      ['acquire', key, 'resize:dispatch', 600_000],
+    ]);
+
+    const errors: unknown[][] = [];
+    const deps = processorDeps({
+      acquire: async () => true,
+      extend: async () => true,
+      release: () => {
+        throw new Error('lock store down');
+      },
+    });
+    deps.logger = {
+      info() {},
+      warn() {},
+      error(...a: unknown[]) {
+        errors.push(a);
+      },
+    };
+    const processor = new Processor(deps);
+    await processor.holdFailedCooldown(dead, 600_000);
+    // A malformed task payload is logged too.
+    await processor.holdFailedCooldown(task({ previews: null as never }), 1);
+    assert.deepEqual(
+      errors.map((a) => String(a[0])),
+      [
+        `resize worker: holding the dead-letter cooldown lock ${key} failed`,
+        'resize worker: the dead-letter cooldown of task t1 failed',
+      ],
+    );
+  });
+
+  test('processorOf() is RESIZE_NOT_READY until ready(); the Resizer has no public processor', async () => {
+    const r = new Resizer({
+      logger: silent,
+      storage: makeStorage(redPng).storage,
+      media: fakeMedia(),
+    });
+    assert.throws(
+      () => processorOf(r),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_NOT_READY' &&
+        err.message.includes('processor'),
+    );
+    await r.ready();
+    assert.ok(processorOf(r) instanceof Processor);
+    assert.equal(processorOf(r), processorOf(r));
+    assert.equal('processor' in r, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // processTask — download / metadata / beforeSteps
 // ---------------------------------------------------------------------------
 
@@ -380,10 +552,11 @@ describe('processTask — source handling', () => {
   test('no media doc → logged no-op success (nothing uploaded)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(null);
+    const { mediaStore, appendCalls } = makeMediaStore(null);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
@@ -401,14 +574,15 @@ describe('processTask — source handling', () => {
         return redPng;
       },
     };
-    const { db } = makeDatabase({
+    const { mediaStore } = makeMediaStore({
       id: 'm1',
       original: {},
       previews: [],
     } as MediaLike);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -425,7 +599,7 @@ describe('processTask — source handling', () => {
   test('SVG original → raster preview persisted by the normal worker', async () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
-    const { db, appendCalls } = makeDatabase(
+    const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({
         original: {
           storageRef: { key: 'uploads/x.svg' },
@@ -435,7 +609,8 @@ describe('processTask — source handling', () => {
     );
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -461,10 +636,11 @@ describe('processTask — source handling', () => {
     const { storage } = makeStorage(
       Buffer.from('this is definitely not an image'),
     );
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(() => processTask(task({ previews: [variant()] })));
   });
@@ -472,10 +648,11 @@ describe('processTask — source handling', () => {
   test('sourcePixels guard → throws before any decode/upload', async () => {
     installApp({ limits: { sourcePixels: 10 } }); // redPng is 64×48 = 3072 px
     const { storage, uploads } = makeStorage(redPng);
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -484,16 +661,43 @@ describe('processTask — source handling', () => {
     assert.equal(uploads.length, 0);
   });
 
+  test('a beforeSteps result over the pixel limits is RESIZE_SOURCE_TOO_LARGE with retryable: false', async () => {
+    installApp({ limits: { sourcePixels: 4000 } }); // redPng is 64×48 = 3072 px
+    const { storage, uploads } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(mediaDoc());
+    const grown = await sharp({
+      create: { width: 100, height: 100, channels: 3, background: '#000000' },
+    })
+      .png()
+      .toBuffer();
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+      pipelines: { default: { beforeSteps: [async () => grown] } },
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeMediaError &&
+        err.code === 'RESIZE_SOURCE_TOO_LARGE' &&
+        /processed source exceeds/.test(err.message) &&
+        err.retryable === false,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('inputPixels < source → rejected consistently at the guarded decode (orientation-6 source)', async () => {
     // inputPixels below the source pixel count, but sourcePixels stays huge (default) so the
     // sourcePixels guard does NOT catch it — every worker sharp() call must carry
-    // limitInputPixels (01 · §16), so the guarded metadata/normalize decode rejects it.
+    // limitInputPixels, so the guarded metadata/normalize decode rejects it.
     installApp({ limits: { inputPixels: 100 } }); // orientedJpeg 64×48 = 3072 px > 100
     const { storage, uploads } = makeStorage(orientedJpeg);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -518,10 +722,11 @@ describe('processTask — source handling', () => {
         },
       ],
     };
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await processTask(task({ previews: [variant()] }));
@@ -537,10 +742,11 @@ describe('processTask — source handling', () => {
       // ONCE before beforeSteps, so the pixels are already display-oriented + EXIF-free.
       beforeSteps: [async (buf) => sharp(buf).toBuffer()],
     };
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await processTask(task({ previews: [fitVariant] }));
@@ -564,64 +770,123 @@ describe('processTask — variants', () => {
       storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
-    const { db, appendCalls } = makeDatabase(
+    const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({ previews: [existing] }),
     );
-    const { lockProvider, released } = makeLocks(true);
+    const { locks, released } = makeLocks(true);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
     assert.deepEqual(released, [
-      'resize_dispatch:m1:default:default:20x20:jpeg:none',
+      {
+        key: 'resize_dispatch:m1:default:default:20x20:jpeg:none',
+        owner: 'resize:dispatch',
+      },
     ]);
+  });
+
+  test('renders the rest of a task and releases the dispatch lock of its one stored preview', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const existing = {
+      sizeKey: '20x20',
+      format: 'jpeg',
+      storageRef: { key: 'e' },
+      contentType: 'image/jpeg',
+    } as unknown as Preview;
+    const { mediaStore } = makeMediaStore(mediaDoc({ previews: [existing] }));
+    const { locks, acquired, released } = makeLocks(true);
+    new FrameworkResizer({ storage, media: mediaStore, locks });
+    await processTask(
+      task({ previews: [variant(), variant({ format: 'webp' })] }),
+    );
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].contentType, 'image/webp');
+    const stored = 'default:default:20x20:jpeg:none';
+    assert.ok(
+      !acquired.some(({ key }) => key === `resize_worker:m1:${stored}`),
+    );
+    assert.deepEqual(
+      released.filter(({ key }) => key.endsWith(stored)),
+      [{ key: `resize_dispatch:m1:${stored}`, owner: 'resize:dispatch' }],
+    );
   });
 
   test('worker lock not acquired → variant skipped, still missing, not persisted', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
-    const { lockProvider, acquired } = makeLocks(false); // acquire always fails
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    const { locks, acquired } = makeLocks(false); // acquire always fails
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
       /incomplete/,
     );
-    assert.deepEqual(acquired, [
+    assert.deepEqual(keysOf(acquired), [
       'resize_worker:m1:default:default:20x20:jpeg:none',
     ]);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
   });
 
+  test('a worker lock is released with the owner that took it; dispatch locks with resize:dispatch', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore } = makeMediaStore(mediaDoc());
+    const { locks, acquired, released } = makeLocks(true);
+    new FrameworkResizer({ storage, media: mediaStore, locks });
+    await processTask(task({ previews: [variant()] }));
+    const workerKey = 'resize_worker:m1:default:default:20x20:jpeg:none';
+    const worker = acquired.find(({ key }) => key === workerKey);
+    assert.ok(worker);
+    assert.match(worker.owner, /^[0-9a-f]{32}$/);
+    assert.deepEqual(
+      released.find(({ key }) => key === workerKey),
+      { key: workerKey, owner: worker.owner },
+    );
+    assert.deepEqual(
+      released.find(({ key }) => key.startsWith('resize_dispatch:')),
+      {
+        key: 'resize_dispatch:m1:default:default:20x20:jpeg:none',
+        owner: 'resize:dispatch',
+      },
+    );
+  });
+
   test('a rejecting worker-lock acquire skips only that variant; others generate + persist + release', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     const released: string[] = [];
-    const lockProvider: FakeLocks = {
+    const locks: LockStore = {
       // The webp worker-lock acquire REJECTS — treated exactly like a not-acquired lock: skip the
       // variant (leave it missing), never reject the pool or skip persist/finally. The jpeg variant
-      // is unaffected: generated, persisted, and its locks released (1.2a).
+      // is unaffected: generated, persisted, and its locks released.
       acquire: async (key: string) => {
         if (key === 'resize_worker:m1:default:default:20x20:webp:none') {
           throw new Error('lock backend down');
         }
         return true;
       },
+      extend: async () => true,
       release: async (key: string) => {
         released.push(key);
+        return true;
       },
     };
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
     });
     await assert.rejects(
       () =>
@@ -663,10 +928,11 @@ describe('processTask — variants', () => {
         },
       ],
     };
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await processTask(task({ previews: [variant({ filters: { blur: 3 } })] }));
@@ -683,10 +949,11 @@ describe('processTask — variants', () => {
           v.filters?.blur ? img.blur(Number(v.filters.blur)) : img,
       ],
     };
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await processTask(
@@ -704,10 +971,11 @@ describe('processTask — variants', () => {
   test('per-format encode: bodies really are jpeg/webp/avif; dims + contentType from encoded info', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -751,10 +1019,11 @@ describe('processTask — variants', () => {
       encode: { formats: { tiff: { compression: 'lzw' } } },
     });
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
 
     await processTask(task({ previews: [variant({ format: 'tiff' })] }));
@@ -770,10 +1039,11 @@ describe('processTask — variants', () => {
       encode: { formats: { heif: { compression: 'av1' } } },
     });
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
 
     await processTask(task({ previews: [variant({ format: 'heif' })] }));
@@ -790,10 +1060,11 @@ describe('processTask — variants', () => {
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(alphaPng);
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -817,10 +1088,11 @@ describe('processTask — variants', () => {
     installApp({ limits: { resultDimension: 100 } });
     // 400×300 is larger than the requested 300×300 box, so it is cover-cropped, to the cap.
     const { storage } = makeStorage(bigPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -841,10 +1113,11 @@ describe('processTask — variants', () => {
   test('fit uses inside+withoutEnlargement — no upscale of a small source', async () => {
     installApp();
     const { storage } = makeStorage(redPng); // 64×48
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(task({ previews: [fitVariant] }));
     const p = appendCalls[0].previews[0];
@@ -862,10 +1135,11 @@ describe('processTask — persistence & failure handling', () => {
   test('ONE appendPreviews call; backfill dims are display-swapped when original dims missing', async () => {
     installApp();
     const { storage } = makeStorage(orientedJpeg); // display 48×64
-    const { db, appendCalls } = makeDatabase(mediaDoc()); // no original dims
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc()); // no original dims
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -885,7 +1159,7 @@ describe('processTask — persistence & failure handling', () => {
   test('no dims backfill when the original already carries width/height', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(
+    const { mediaStore, appendCalls } = makeMediaStore(
       mediaDoc({
         original: {
           storageRef: { key: 'uploads/orig' },
@@ -896,7 +1170,8 @@ describe('processTask — persistence & failure handling', () => {
     );
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(appendCalls.length, 1);
@@ -906,11 +1181,12 @@ describe('processTask — persistence & failure handling', () => {
   test('onPreviewGenerated fired once per pushed preview', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     const fired: Preview[] = [];
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       hooks: {
         onPreviewGenerated: (preview: unknown) => {
           fired.push(preview as Preview);
@@ -935,11 +1211,12 @@ describe('processTask — persistence & failure handling', () => {
         },
       ],
     };
-    const { db, appendCalls } = makeDatabase(mediaDoc());
-    const { lockProvider, released } = makeLocks(true);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    const { locks, released } = makeLocks(true);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
       pipelines: { default: pipeline },
     });
     await assert.rejects(
@@ -949,7 +1226,7 @@ describe('processTask — persistence & failure handling', () => {
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
     // both the worker lock and the dispatch lock for the processed variant are released
-    assert.deepEqual([...released].sort(), [
+    assert.deepEqual(keysOf(released).sort(), [
       'resize_dispatch:m1:default:default:20x20:jpeg:none',
       'resize_worker:m1:default:default:20x20:jpeg:none',
     ]);
@@ -968,10 +1245,11 @@ describe('processTask — persistence & failure handling', () => {
         },
       ],
     };
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await assert.rejects(
@@ -1007,16 +1285,17 @@ describe('processTask — persistence & failure handling', () => {
       ],
     };
     const media = mediaDoc();
-    const db: ResizeDatabase = {
-      ...fakeDb(),
-      loadMedia: async () => media,
+    const mediaStore = fakeMedia({
+      load: async () => media,
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [...(media.previews ?? []), ...previews];
+        return previews;
       },
-    };
+    });
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     const queued = task({
@@ -1053,20 +1332,20 @@ describe('processTask — persistence & failure handling', () => {
       sizeKey: '20x20',
       format: 'jpeg' as const,
     };
-    const db: ResizeDatabase = {
-      ...fakeDb(),
-      loadMedia: async () => {
+    const mediaStore = fakeMedia({
+      load: async () => {
         loads++;
         if (loads >= 2) {
           media.previews = [concurrent];
         }
         return media;
       },
-      appendPreviews: async () => {},
-    };
+      appendPreviews: async (_mediaId, previews) => previews,
+    });
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks(false).lockProvider) },
+      media: mediaStore,
+      locks: makeLocks(false).locks,
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
@@ -1076,16 +1355,17 @@ describe('processTask — persistence & failure handling', () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
     const media = mediaDoc();
-    const db: ResizeDatabase = {
-      ...fakeDb(),
-      loadMedia: async () => media,
+    const mediaStore = fakeMedia({
+      load: async () => media,
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [...(media.previews ?? []), ...previews];
+        return previews;
       },
-    };
+    });
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -1103,10 +1383,11 @@ describe('processTask — persistence & failure handling', () => {
     installApp({ concurrency: 1 });
     const controller = new AbortController();
     const { storage, uploads } = makeStorage(redPng, () => controller.abort());
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () =>
@@ -1153,10 +1434,11 @@ describe('processTask — persistence & failure handling', () => {
         },
       ],
     };
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await processTask(
@@ -1199,10 +1481,11 @@ describe('processTask — persistence & failure handling', () => {
         },
       ],
     };
-    const { db } = makeDatabase(mediaDoc());
+    const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { default: pipeline },
     });
     await processTask(
@@ -1231,15 +1514,15 @@ describe('processTask — persistence & failure handling', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Eager mode — resizer.generate (11 · §11.1)
+// Eager mode — resizer.generate
 // ---------------------------------------------------------------------------
 
 describe('generate (eager)', () => {
   test('persists via appendPreviews by default', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(null); // load unused in eager mode
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore, appendCalls } = makeMediaStore(null); // load unused in eager mode
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const result = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -1254,8 +1537,8 @@ describe('generate (eager)', () => {
   test('appends created onto media.previews so a same-request resolve sees them', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const media = mediaDoc();
     const { created } = await r.generate({
       media,
@@ -1269,8 +1552,8 @@ describe('generate (eager)', () => {
   test('persist:false → returns previews without persisting (but still uploads)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const media = mediaDoc();
     const { created } = await r.generate({
       media,
@@ -1293,8 +1576,8 @@ describe('generate (eager)', () => {
       storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
-    const { db, appendCalls } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const result = await r.generate({
       media: mediaDoc({ previews: [existing] }),
       sizes: [{ width: 20, height: 20 }],
@@ -1309,8 +1592,8 @@ describe('generate (eager)', () => {
   test('throws a named error when media has neither id nor _id (host-facing)', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1330,8 +1613,8 @@ describe('generate (eager)', () => {
   test('SVG original → eager JPEG/WebP/AVIF previews', async () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
-    const { db, appendCalls } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: {
@@ -1361,8 +1644,8 @@ describe('generate (eager)', () => {
   test('SVG fit keeps the original size when a cover sibling needs high density', async () => {
     installApp();
     const { storage, uploads } = makeStorage(smallSvg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -1420,8 +1703,8 @@ describe('generate (eager)', () => {
       </svg>`,
     );
     const { storage, uploads } = makeStorage(svg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const result = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -1442,8 +1725,8 @@ describe('generate (eager)', () => {
   test('no original → ResizeNoOriginalError', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1504,7 +1787,7 @@ describe('generate (eager)', () => {
   test('truthy but unpersisted original object → ResizeNoOriginalError before download', async () => {
     installApp();
     let downloadCalls = 0;
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const storage: ResizeStorage = {
       download: async () => {
         downloadCalls += 1;
@@ -1513,7 +1796,7 @@ describe('generate (eager)', () => {
       upload: async () => ({ key: 'unused' }),
       publicUrl: () => '',
     };
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1536,7 +1819,7 @@ describe('generate (eager)', () => {
 
   test('every requested variant fails → ResizeGenerateError', async () => {
     installApp();
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const storage: ResizeStorage = {
       download: async () => redPng,
       upload: async () => {
@@ -1544,7 +1827,7 @@ describe('generate (eager)', () => {
       },
       publicUrl: () => '',
     };
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1564,10 +1847,10 @@ describe('generate (eager)', () => {
   test('partial failure: no throw, failed > 0, created has the successes', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(null);
+    const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: {
         default: {
           variantSteps: [
@@ -1595,7 +1878,7 @@ describe('generate (eager)', () => {
   test('real ctx reaches beforeSteps and variantSteps', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     let beforeMarker: unknown;
     let variantMarker: unknown;
     const pipeline: Pipeline = {
@@ -1614,7 +1897,7 @@ describe('generate (eager)', () => {
     };
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: { photo: pipeline },
     });
     await r.generate({
@@ -1655,11 +1938,12 @@ describe('unknown pipeline', () => {
   test('a queued task for an unregistered pipeline fails before download; nothing is stored', async () => {
     installApp();
     const { storage, uploads, downloads } = countingStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
-    const { lockProvider, acquired } = makeLocks(true);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    const { locks, acquired } = makeLocks(true);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
       pipelines: { watermark: {} },
     });
     await assert.rejects(
@@ -1676,8 +1960,8 @@ describe('unknown pipeline', () => {
   test('generate() with an unregistered pipeline throws before download', async () => {
     installApp();
     const { storage, uploads, downloads } = countingStorage(redPng);
-    const { db, appendCalls } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1696,8 +1980,12 @@ describe('unknown pipeline', () => {
   test("'default' renders without being registered", async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db, pipelines: {} });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      pipelines: {},
+    });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -1748,10 +2036,11 @@ describe('animated sources', () => {
       encode: { formats: { gif: {}, png: {} } },
     });
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(task({ previews: formats.map(widthOnly) }));
 
@@ -1791,10 +2080,11 @@ describe('animated sources', () => {
   test('an animation above limits.animationFrames keeps only the first frames', async () => {
     installApp({ animated: true, limits: { animationFrames: 2 } });
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({ previews: [widthOnly('webp'), variant({ format: 'webp' })] }),
@@ -1811,8 +2101,8 @@ describe('animated sources', () => {
   test('animated: false (default) decodes only the first frame', async () => {
     installApp();
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 10 }],
@@ -1828,8 +2118,8 @@ describe('animated sources', () => {
     // libvips cannot rotate a multi-page image, so orientation wins over the animation.
     installApp({ animated: true });
     const { storage, uploads } = makeStorage(orientedAnimatedWebp);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ fit: true }],
@@ -1852,10 +2142,10 @@ describe('animated sources', () => {
       .png()
       .toBuffer();
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: {
         default: {
           variantSteps: [
@@ -1888,8 +2178,8 @@ describe('animated sources', () => {
     // 20×20 frames: one frame (400 px) fits 800, all three (1200 px) do not.
     installApp({ animated: true, limits: { sourcePixels: 800 } });
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 10 }],
@@ -1905,8 +2195,8 @@ describe('animated sources', () => {
   test('an animation over limits.sourcePixels is shortened to the frames that fit', async () => {
     installApp({ animated: true, limits: { sourcePixels: 800 } });
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 10 }],
@@ -1923,8 +2213,8 @@ describe('animated sources', () => {
   test('a single animation frame over limits.sourcePixels is still refused', async () => {
     installApp({ animated: true, limits: { sourcePixels: 300 } });
     const { storage, uploads } = makeStorage(animatedGif);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -1934,7 +2224,8 @@ describe('animated sources', () => {
         }),
       (err: unknown) =>
         err instanceof ResizeMediaError &&
-        err.code === 'RESIZE_SOURCE_TOO_LARGE',
+        err.code === 'RESIZE_SOURCE_TOO_LARGE' &&
+        err.retryable === false,
     );
     assert.equal(uploads.length, 0);
   });
@@ -1948,10 +2239,11 @@ describe('cover sizes', () => {
   test('width-only on a 1×100 source: the derived height is cropped to limits.resultDimension', async () => {
     installApp({ limits: { resultDimension: 200 } });
     const { storage, uploads } = makeStorage(tallPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -1973,8 +2265,8 @@ describe('cover sizes', () => {
   test('height-only on a 100×1 source: the derived width is cropped to limits.resultDimension', async () => {
     installApp({ limits: { resultDimension: 200 } });
     const { storage, uploads } = makeStorage(widePng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ height: 100 }],
@@ -1988,8 +2280,8 @@ describe('cover sizes', () => {
   test('width-only within the cap keeps the source aspect ratio', async () => {
     installApp();
     const { storage } = makeStorage(redPng); // 64×48
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 32 }],
@@ -2002,8 +2294,8 @@ describe('cover sizes', () => {
   test('a fractional size generates through generate()', async () => {
     installApp();
     const { storage } = makeStorage(bigPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 300.5, height: 200 }],
@@ -2018,10 +2310,11 @@ describe('cover sizes', () => {
   test('a fractional size generates through the queued path', async () => {
     installApp();
     const { storage } = makeStorage(bigPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     const size = { width: 300.5, height: 200 };
     await processTask(
@@ -2036,10 +2329,11 @@ describe('cover sizes', () => {
   test('an old task payload with fractional dimensions is rounded before sharp', async () => {
     installApp();
     const { storage } = makeStorage(bigPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -2068,8 +2362,8 @@ describe('cover sizes', () => {
       .png()
       .toBuffer();
     const { storage } = makeStorage(needle);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ fit: true }],
@@ -2097,8 +2391,8 @@ describe('unconfigured formats', () => {
         return alphaPng;
       },
     };
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -2121,10 +2415,11 @@ describe('unconfigured formats', () => {
   test('a queued variant with an unconfigured format fails alone and is logged', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(alphaPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () =>
@@ -2164,10 +2459,10 @@ describe('EXIF orientation quality', () => {
     resetAppInstance();
     installApp({ encode: { formats: { png: {} } } });
     const { storage, uploads } = makeStorage(source);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       ...(pipeline ? { pipelines: { default: pipeline } } : {}),
     });
     const { created } = await r.generate({
@@ -2256,10 +2551,10 @@ describe('EXIF orientation quality', () => {
     let seen: { width?: number; height?: number } = {};
     installApp({ encode: { formats: { png: {} } } });
     const { storage } = makeStorage(source);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: {
         default: {
           beforeSteps: [
@@ -2296,12 +2591,12 @@ describe('SVG raster size', () => {
       '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="100000"><rect width="1" height="100000" fill="red"/></svg>',
     );
     const { storage, uploads } = makeStorage(needleSvg);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     let steps = 0;
     const renders = countRenders();
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: {
         default: {
           beforeSteps: [
@@ -2323,7 +2618,8 @@ describe('SVG raster size', () => {
       }),
       (err: unknown) =>
         err instanceof ResizeMediaError &&
-        err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+        err.code === 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED' &&
+        err.retryable === false,
     );
     assert.equal(renders(), 0);
     assert.equal(steps, 0);
@@ -2333,8 +2629,8 @@ describe('SVG raster size', () => {
   test('a 1×5000 SVG renders cover and fit variants', async () => {
     installApp();
     const { storage } = makeStorage(tallSvg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -2356,8 +2652,8 @@ describe('SVG raster size', () => {
       '<svg xmlns="http://www.w3.org/2000/svg" width="40000" height="300"><rect width="40000" height="300" fill="red"/></svg>',
     );
     const { storage } = makeStorage(wideSvg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -2383,8 +2679,8 @@ describe('SVG raster size', () => {
       '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="40000"><rect width="1" height="40000" fill="red"/></svg>',
     );
     const { storage } = makeStorage(needleSvg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc({
         original: { storageRef: { key: 'uploads/x.svg' }, format: 'svg' },
@@ -2409,12 +2705,12 @@ describe('persist failure', () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
     const dbDown = new Error('db down');
-    const db = fakeDb({
+    const mediaStore = fakeMedia({
       appendPreviews: async () => {
         throw dbDown;
       },
     });
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -2435,30 +2731,29 @@ describe('persist failure', () => {
     }
   });
 
-  /** A database that stores the first preview, then fails (a write of one row at a time). */
+  /** A media store that stores the first preview, then fails (a write of one row at a time). */
   function failsAfterFirst(reload: () => Promise<MediaLike | null>) {
     const media = mediaDoc();
     const dbDown = new Error('db down after one row');
-    const db: ResizeDatabase = {
-      ...fakeDb(),
-      loadMedia: reload,
+    const mediaStore = fakeMedia({
+      load: reload,
       appendPreviews: async (_mediaId, previews) => {
         media.previews = [previews[0]];
         throw dbDown;
       },
-    };
-    return { db, media, dbDown };
+    });
+    return { mediaStore, media, dbDown };
   }
 
   test('a write that stopped part-way names only the uploads that are not stored', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
     const state: { media?: MediaLike } = {};
-    const { db, media, dbDown } = failsAfterFirst(
+    const { mediaStore, media, dbDown } = failsAfterFirst(
       async () => state.media ?? null,
     );
     state.media = media;
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -2487,10 +2782,10 @@ describe('persist failure', () => {
   test('a failing reload after a failed write names every upload', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db, dbDown } = failsAfterFirst(async () => {
+    const { mediaStore, dbDown } = failsAfterFirst(async () => {
       throw new Error('reload failed too');
     });
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(
       () =>
         r.generate({
@@ -2505,6 +2800,36 @@ describe('persist failure', () => {
     for (const upload of uploads) {
       assert.ok(String(entry[0]).includes(upload.key), upload.key);
     }
+  });
+
+  test('a MediaStore whose appendPreviews resolves undefined fails loudly', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const fired: Preview[] = [];
+    const r = new FrameworkResizer({
+      storage,
+      media: fakeMedia({
+        appendPreviews: async () => undefined as unknown as Preview[],
+      }),
+      hooks: {
+        onPreviewGenerated: (preview) => {
+          fired.push(preview);
+        },
+      },
+    });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: mediaDoc(),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['jpeg'],
+        }),
+      (e: unknown) =>
+        e instanceof ResizeSetupError &&
+        e.code === 'RESIZE_MEDIA_APPEND_RESULT_INVALID' &&
+        /must resolve with the previews it stored/.test(e.message),
+    );
+    assert.deepEqual(fired, [], 'no observer ran');
   });
 });
 
@@ -2535,8 +2860,8 @@ describe('SVG rendering', () => {
     installApp();
     const renders = countRenders();
     const { storage, uploads } = makeStorage(smallSvg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: svgDoc(),
       sizes: [{ width: 200, height: 200 }, { width: 50 }, { fit: true }],
@@ -2552,10 +2877,11 @@ describe('SVG rendering', () => {
     installApp();
     const renders = countRenders();
     const { storage, uploads } = makeStorage(smallSvg);
-    const { db, appendCalls } = makeDatabase(svgDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(svgDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({
@@ -2582,8 +2908,8 @@ describe('SVG rendering', () => {
     installApp({ limits: { processingTimeoutSeconds: 1 } });
     const spawn = mock.method(childProcess, 'spawn');
     const { storage, uploads } = makeStorage(heavySvg);
-    const { db, appendCalls } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore, appendCalls } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const started = Date.now();
     await assert.rejects(
       () =>
@@ -2595,7 +2921,8 @@ describe('SVG rendering', () => {
       (err: unknown) =>
         err instanceof ResizeMediaError &&
         err.code === 'RESIZE_SVG_RENDER_TIMEOUT' &&
-        err.mediaId === 'm1',
+        err.mediaId === 'm1' &&
+        err.retryable === false,
     );
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 3500, `settled after ${elapsed} ms`);
@@ -2613,17 +2940,19 @@ describe('SVG rendering', () => {
   }, async () => {
     installApp({ limits: { processingTimeoutSeconds: 1 } });
     const { storage, uploads } = makeStorage(heavySvg);
-    const { db, appendCalls } = makeDatabase(svgDoc());
-    const { lockProvider, acquired } = makeLocks(true);
+    const { mediaStore, appendCalls } = makeMediaStore(svgDoc());
+    const { locks, acquired } = makeLocks(true);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant(), fitVariant] })),
       (err: unknown) =>
         err instanceof ResizeMediaError &&
-        err.code === 'RESIZE_SVG_RENDER_TIMEOUT',
+        err.code === 'RESIZE_SVG_RENDER_TIMEOUT' &&
+        err.retryable === false,
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -2653,11 +2982,11 @@ describe('SVG rendering', () => {
         '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="10" height="10" fill="red"/><rect x="10" width="10" height="10" fill="blue"/></svg>',
       ),
     );
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const seen: Array<{ head: string; format?: string; width?: number }> = [];
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: {
         default: {
           beforeSteps: [
@@ -2702,8 +3031,8 @@ describe('SVG rendering', () => {
         '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="0.6"><rect width="300" height="0.6" fill="red"/><rect x="300" width="700" height="0.6" fill="blue"/></svg>',
       ),
     );
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: svgDoc(),
       sizes: [{ height: 5 }],
@@ -2727,8 +3056,8 @@ describe('SVG rendering', () => {
         '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="red"/></svg>',
       ),
     );
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: svgDoc(),
       sizes: [{ width: 620 }, { height: 25 }],
@@ -2847,8 +3176,8 @@ describe('SVG rendering', () => {
           `<svg xmlns="http://www.w3.org/2000/svg" ${attributes}><rect width="100%" height="100%" fill="red"/></svg>`,
         ),
       );
-      const { db } = makeDatabase(null);
-      const r = new FrameworkResizer({ storage, db });
+      const { mediaStore } = makeMediaStore(null);
+      const r = new FrameworkResizer({ storage, media: mediaStore });
       const { created, failed } = await r.generate({
         media: svgDoc(),
         sizes: [
@@ -2874,27 +3203,27 @@ describe('SVG rendering', () => {
 });
 
 // ---------------------------------------------------------------------------
-// One preview row per identity: the database reports what it stored
+// One preview row per identity: the media store reports what it stored
 // ---------------------------------------------------------------------------
 
 describe('one preview row per identity', () => {
   /**
-   * A database that stores only the previews `keep` accepts, as if another worker won the rest.
-   * `load` answers every loadMedia (the worker's first read, then its reloads).
+   * A media store that stores only the previews `keep` accepts, as if another worker won the
+   * rest. `load` answers every loadMedia (the worker's first read, then its reloads).
    */
-  function partialDb(
+  function partialMedia(
     load: () => MediaLike | null,
     keep: (p: Preview) => boolean,
   ) {
     const appended: Preview[][] = [];
-    const db: ResizeDatabase = {
-      ...fakeDb({ load: async () => load() }),
+    const mediaStore = fakeMedia({
+      load: async () => load(),
       appendPreviews: async (_mediaId, previews) => {
         appended.push(previews);
         return previews.filter(keep);
       },
-    };
-    return { db, appended };
+    });
+    return { mediaStore, appended };
   }
 
   // The webp row another worker stored first.
@@ -2918,10 +3247,11 @@ describe('one preview row per identity', () => {
   test('every generated preview carries its identity', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db, appendCalls } = makeDatabase(mediaDoc());
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
       pipelines: { watermark: {} },
     });
     await processTask(
@@ -2936,7 +3266,11 @@ describe('one preview row per identity', () => {
     ]);
 
     resetResizerForTests();
-    const r = new FrameworkResizer({ storage, db, name: 'listings' });
+    const r = new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      name: 'listings',
+    });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -2945,18 +3279,18 @@ describe('one preview row per identity', () => {
     assert.equal(created[0].identity, 'listings:default:20x20:webp:none');
   });
 
-  test('eager: rows the database left out are not created, not appended and logged once', async () => {
+  test('eager: rows the media store left out are not created, not appended and logged once', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
     // Eager generate never loads first: every read is the reload after the write.
-    const { db } = partialDb(
+    const { mediaStore } = partialMedia(
       () => mediaDoc({ previews: [otherWorkersWebp] }),
       (p) => p.format === 'jpeg',
     );
     const fired: Preview[] = [];
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       hooks: {
         onPreviewGenerated: (preview: unknown) => {
           fired.push(preview as Preview);
@@ -2995,13 +3329,14 @@ describe('one preview row per identity', () => {
   test('queued: an identity another worker stored first counts as covered', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db, appended } = partialDb(
+    const { mediaStore, appended } = partialMedia(
       racedMedia(),
       (p) => p.format === 'jpeg',
     );
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await processTask(
       task({ previews: [variant(), variant({ format: 'webp' })] }),
@@ -3013,13 +3348,14 @@ describe('one preview row per identity', () => {
   test('queued: a row left out that the reload does not show is not stored: the task is incomplete', async () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db } = partialDb(
+    const { mediaStore } = partialMedia(
       () => mediaDoc(),
       (p) => p.format === 'jpeg',
     );
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(makeLocks().lockProvider) },
+      media: mediaStore,
+      locks: makeLocks().locks,
     });
     await assert.rejects(
       () =>
@@ -3042,11 +3378,11 @@ describe('one preview row per identity', () => {
     const { logs } = installApp();
     const { storage, uploads } = makeStorage(redPng);
     // A driver resolves with an empty list when the media document is gone.
-    const { db } = partialDb(
+    const { mediaStore } = partialMedia(
       () => null,
       () => false,
     );
-    const r = new FrameworkResizer({ storage, db });
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -3067,21 +3403,6 @@ describe('one preview row per identity', () => {
       ),
     );
   });
-
-  test('a database that resolves with nothing stored every row', async () => {
-    installApp();
-    const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
-    const media = mediaDoc();
-    const { created } = await r.generate({
-      media,
-      sizes: [{ width: 20, height: 20 }],
-      formats: ['jpeg', 'webp'],
-    });
-    assert.equal(created.length, 2);
-    assert.equal(media.previews?.length, 2);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3093,8 +3414,8 @@ describe('a source smaller than the box', () => {
     installApp();
     assert.ok((await sharp(exifJpeg).metadata()).exif, 'fixture has EXIF');
     const { storage, uploads } = makeStorage(exifJpeg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created, failed } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 300, height: 300 }],
@@ -3129,11 +3450,11 @@ describe('a source smaller than the box', () => {
       .withExif({ IFD0: { Artist: 'Someone' } })
       .toBuffer();
     const { storage, uploads } = makeStorage(small);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     let steps = 0;
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: {
         default: {
           variantSteps: [
@@ -3180,8 +3501,8 @@ describe('a source smaller than the box', () => {
       .png()
       .toBuffer();
     const { storage } = makeStorage(source);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 200, height: 200 }],
@@ -3196,8 +3517,8 @@ describe('a source smaller than the box', () => {
   test('an image that is not scaled is not sharpened either', async () => {
     installApp({ encode: { formats: { png: {} } } });
     const { storage, uploads } = makeStorage(exifJpeg);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 300, height: 300 }],
@@ -3218,8 +3539,8 @@ describe('a source smaller than the box', () => {
       .png()
       .toBuffer();
     const { storage } = makeStorage(wide);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 300, height: 300 }],
@@ -3233,7 +3554,7 @@ describe('a source smaller than the box', () => {
 });
 
 // ---------------------------------------------------------------------------
-// runResizeWorker (07 · §11)
+// runResizeWorker
 // ---------------------------------------------------------------------------
 
 // Stop idle test queues deterministically after their queued work has been handled.
@@ -3286,7 +3607,7 @@ describe('runResizeWorker', () => {
     );
   });
 
-  test('default database + unregistered mediaModelName → throws before claiming', async () => {
+  test('default media store + unregistered mediaModelName → throws before claiming', async () => {
     setAppInstance({
       getConfig: () =>
         makeResizeConfig({
@@ -3307,7 +3628,7 @@ describe('runResizeWorker', () => {
     assert.deepEqual(claimedQueues, []);
   });
 
-  test('custom database verify() runs before claim, and its failure stops the worker', async () => {
+  test('custom media store verify() runs before claim, and its failure stops the worker', async () => {
     installApp({ worker: { enabled: true } });
     const events: string[] = [];
     const { tasks } = observedQueue(() => {
@@ -3317,15 +3638,16 @@ describe('runResizeWorker', () => {
     new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
-      db: fakeDb({
+      media: fakeMedia({
         // async: a rejected promise stops the worker only if verify() is awaited
         async verify() {
           events.push('verify');
-          throw new ResizeConfigError('custom database is misconfigured', {
+          throw new ResizeConfigError('custom media store is misconfigured', {
             code: 'CUSTOM_STORE_INVALID',
           });
         },
       }),
+      locks: memoryLocks(),
     });
     await assert.rejects(
       () => runResizeWorker(),
@@ -3338,11 +3660,12 @@ describe('runResizeWorker', () => {
     new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
-      db: fakeDb({
+      media: fakeMedia({
         async verify() {
           events.push('verify');
         },
       }),
+      locks: memoryLocks(),
     });
     await runResizeWorker();
     assert.deepEqual(events, ['verify', 'claim']);
@@ -3355,12 +3678,13 @@ describe('runResizeWorker', () => {
     new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
-      db: fakeDb({
+      media: fakeMedia({
         load: async () => {
           loads++;
           return null;
         },
       }),
+      locks: memoryLocks(),
     });
     await addTask(tasks, { previews: [variant()] });
     await runResizeWorker();
@@ -3370,12 +3694,17 @@ describe('runResizeWorker', () => {
 });
 
 describe('one worker serves every Resizer', () => {
-  function register(tasks: MemoryTaskQueue, name = 'default', db = fakeDb()) {
+  function register(
+    tasks: MemoryTaskQueue,
+    name = 'default',
+    media = fakeMedia(),
+  ) {
     return new FrameworkResizer({
       name,
       storage: makeStorage(redPng).storage,
       tasks,
-      db,
+      media,
+      locks: memoryLocks(),
     });
   }
 
@@ -3384,7 +3713,7 @@ describe('one worker serves every Resizer', () => {
     const { tasks, claimedQueues } = observedQueue();
     const loadedBy: string[] = [];
     const labelled = (label: string) =>
-      fakeDb({
+      fakeMedia({
         load: async () => {
           loadedBy.push(label);
           return null;
@@ -3486,18 +3815,29 @@ describe('one worker serves every Resizer', () => {
         );
       });
     register(sibling);
-    // Invalid timing (the worker lock outlives the lease), with verify() bypassed, so the
-    // failure surfaces inside the running loop rather than at startup.
-    const broken = new MemoryTaskQueue({
-      timing: { leaseMs: 1000, lockTtlMs: { dispatch: 1000, worker: 2000 } },
-    });
-    const r = register(broken, 'listings');
-    r.verify = async () => {};
+    // A failing claim is retried, but the loop logs it first, and the worker's logger is host
+    // code: one that throws fails this loop while it runs. This relies on that claim-error log line
+    // in Consumer.run being unguarded; if it is ever wrapped (e.g. in logNeverThrow), this test
+    // needs a new trigger, or it only times out.
+    const failing = new MemoryTaskQueue();
+    failing.claim = async () => {
+      throw new Error('queue unreachable');
+    };
+    register(failing, 'listings');
+    const logSinkDown = new Error('log sink down');
     await assert.rejects(
-      () => runWorker({ signal: new AbortController().signal }),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_LOCK_EXCEEDS_LEASE',
+      () =>
+        runWorker({
+          signal: new AbortController().signal,
+          logger: {
+            info() {},
+            warn() {},
+            error() {
+              throw logSinkDown;
+            },
+          },
+        }),
+      (err: unknown) => err === logSinkDown,
     );
     assert.equal(siblingAborted, true);
   });
@@ -3547,19 +3887,20 @@ describe('one worker serves every Resizer', () => {
     let loads = 0;
     new Resizer({
       storage: makeStorage(redPng).storage,
-      db: async () =>
-        fakeDb({
+      media: async () =>
+        fakeMedia({
           load: async () => {
             loads++;
             return null;
           },
         }),
+      locks: async () => memoryLocks(),
       tasks: async () => tasks,
     });
     await addTask(tasks);
     await runWorker({ signal: controller.signal });
     assert.deepEqual(claimedQueues, ['default', 'default']);
-    assert.equal(loads, 1); // the task reached the lazily loaded database
+    assert.equal(loads, 1); // the task reached the lazily loaded media store
     assert.equal(tasks.rows[0].status, 'completed');
   });
 
@@ -3576,24 +3917,23 @@ describe('one worker serves every Resizer', () => {
     );
   });
 
-  test('a task uses its owning database locks and the delivering queue lock TTL', async () => {
+  test('a task uses its owning Resizer locks and the delivering queue lock TTL', async () => {
     installApp();
     const own = makeLocks();
     const ttls: number[] = [];
-    register(
-      new MemoryTaskQueue(),
-      'default',
-      fakeDb({
-        load: async () => mediaDoc(),
-        locks: {
-          acquire: async (key, ttlMs) => {
-            ttls.push(ttlMs);
-            return own.lockProvider.acquire(key, ttlMs);
-          },
-          release: own.lockProvider.release,
+    new FrameworkResizer({
+      storage: makeStorage(redPng).storage,
+      tasks: new MemoryTaskQueue(),
+      media: fakeMedia({ load: async () => mediaDoc() }),
+      locks: {
+        acquire: async (key, owner, ttlMs) => {
+          ttls.push(ttlMs);
+          return own.locks.acquire(key, owner, ttlMs);
         },
-      }),
-    );
+        extend: own.locks.extend,
+        release: own.locks.release,
+      },
+    });
     await processTask(
       task({ previews: [variant()] }),
       undefined,
@@ -3601,7 +3941,7 @@ describe('one worker serves every Resizer', () => {
         timing: { lockTtlMs: { dispatch: 1000, worker: 2000 } },
       }),
     );
-    assert.deepEqual(own.acquired, [
+    assert.deepEqual(keysOf(own.acquired), [
       'resize_worker:m1:default:default:20x20:jpeg:none',
     ]);
     assert.deepEqual(ttls, [2000]);
@@ -3613,7 +3953,8 @@ describe('one worker serves every Resizer', () => {
     const { tasks, claimedQueues } = observedQueue(() => controller.abort());
     new Resizer({
       storage: makeStorage(redPng).storage,
-      db: fakeDb(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
       tasks,
       config: () => ({ formats: [] }) as never,
     });
@@ -3638,7 +3979,8 @@ describe('one worker serves every Resizer', () => {
     const boom = new Error('boom');
     new FrameworkResizer({
       storage: makeStorage(redPng).storage,
-      db: fakeDb(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
       tasks,
       hooks: {
         afterTaskComplete: () => {
@@ -3650,7 +3992,7 @@ describe('one worker serves every Resizer', () => {
       name: 'listings',
       storage: makeStorage(redPng).storage,
       tasks,
-      db: fakeDb({
+      media: fakeMedia({
         load: async (id) => {
           if (id === 'bad') {
             throw boom;
@@ -3658,6 +4000,7 @@ describe('one worker serves every Resizer', () => {
           return null;
         },
       }),
+      locks: memoryLocks(),
       hooks: {
         afterTaskComplete: () => {
           seen.push(['listings', 'completed']);
@@ -3697,7 +4040,33 @@ describe('one worker serves every Resizer', () => {
       !logs.error.some((l) => String(l[0]).includes('event handler failed')),
     );
     assert.equal(tasks.rows[0].status, 'pending');
-    assert.match(tasks.rows[0].error ?? '', /no Resizer named 'ghost'/);
+    assert.match(
+      tasks.rows[0].error ?? '',
+      /Resizer 'ghost' is not served by this worker/,
+    );
+  });
+
+  test('a Resizer without a lock store cannot process a queued task', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    let loads = 0;
+    // Eager only (no task queue, no locks), yet another Resizer's queue hands it a task.
+    new Resizer({
+      storage,
+      media: fakeMedia({
+        load: async () => {
+          loads++;
+          return mediaDoc();
+        },
+      }),
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
+    );
+    assert.equal(loads, 0);
+    assert.equal(uploads.length, 0);
   });
 
   test('a task for an unregistered Resizer fails with RESIZE_NO_RESIZER', async () => {
@@ -3710,7 +4079,7 @@ describe('one worker serves every Resizer', () => {
     );
   });
 
-  test('every Resizer verifies its database before the worker starts', async () => {
+  test('every Resizer verifies its media store before the worker starts', async () => {
     installApp();
     const controller = new AbortController();
     const { tasks, claimedQueues } = observedQueue(() => controller.abort());
@@ -3718,9 +4087,9 @@ describe('one worker serves every Resizer', () => {
     new FrameworkResizer({
       name: 'listings',
       storage: makeStorage(redPng).storage,
-      db: fakeDb({
+      media: fakeMedia({
         verify() {
-          throw new ResizeConfigError('listings database is misconfigured', {
+          throw new ResizeConfigError('listings media store is misconfigured', {
             code: 'LISTINGS_STORE_INVALID',
           });
         },
@@ -3762,8 +4131,8 @@ describe('scoped generation', () => {
   test('generate records the Resizer and pipeline on every created preview', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
-    const r = new FrameworkResizer({ storage, db });
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
     const { created } = await r.generate({
       media: mediaDoc(),
       sizes: [{ width: 20, height: 20 }],
@@ -3776,7 +4145,7 @@ describe('scoped generation', () => {
     const listings = new FrameworkResizer({
       name: 'listings',
       storage,
-      db,
+      media: mediaStore,
       pipelines: { watermark: {} },
     });
     const watermarked = await listings.generate({
@@ -3792,10 +4161,10 @@ describe('scoped generation', () => {
   test('a default preview does not stop generation for another pipeline', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
-    const { db } = makeDatabase(null);
+    const { mediaStore } = makeMediaStore(null);
     const r = new FrameworkResizer({
       storage,
-      db,
+      media: mediaStore,
       pipelines: { watermark: {} },
     });
     const media = mediaDoc({ previews: [cleanPreview] });
@@ -3819,15 +4188,16 @@ describe('scoped generation', () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const media = mediaDoc();
-    const { db } = makeDatabase(media);
-    const { lockProvider, acquired } = makeLocks(true);
+    const { mediaStore } = makeMediaStore(media);
+    const { locks, acquired } = makeLocks(true);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
       pipelines: { watermark: {} },
     });
     await processTask(task({ pipeline: 'watermark', previews: [variant()] }));
-    assert.ok(acquired.some((key) => key.includes(':watermark:')));
+    assert.ok(acquired.some(({ key }) => key.includes(':watermark:')));
   });
 
   test('a default preview does not count as coverage for a watermark task', async () => {
@@ -3835,12 +4205,13 @@ describe('scoped generation', () => {
     const { storage } = makeStorage(redPng);
     // The reloaded media has only the default rendering of the requested variant.
     const media = mediaDoc({ previews: [cleanPreview] });
-    const { db } = makeDatabase(media);
+    const { mediaStore } = makeMediaStore(media);
     // The worker lock for the watermark variant is held elsewhere, so nothing is generated.
-    const { lockProvider } = makeLocks(false);
+    const { locks } = makeLocks(false);
     new FrameworkResizer({
       storage,
-      db: { ...db, ...fakeLockMethods(lockProvider) },
+      media: mediaStore,
+      locks,
       pipelines: { watermark: {} },
     });
     await assert.rejects(
@@ -3860,7 +4231,8 @@ describe('runWorker (core)', () => {
     new FrameworkResizer({
       storage: makeStorage(redPng).storage,
       tasks,
-      db: fakeDb(),
+      media: fakeMedia(),
+      locks: memoryLocks(),
     });
     const logged: unknown[][] = [];
     await runWorker({
