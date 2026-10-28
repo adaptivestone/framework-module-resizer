@@ -158,7 +158,7 @@ test('a task in retry backoff blocks new tasks for its media and pipeline', asyn
 test('the SQS path holds the gate through the backoff and releases it on completion', async () => {
   const tasks = new PlainTaskQueue({
     timing: {
-      leaseMs: 1000,
+      leaseMs: 400,
       idlePollMs: 5,
       retryBackoffMs: { base: 500, max: 500 },
     },
@@ -195,11 +195,11 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   await read();
   assert.equal(tasks.rows.length, 1);
   await work(resizer, stop);
-  // After the retry was scheduled: held for the 500 ms backoff plus one 1000 ms lease, so more
-  // than the lease alone.
+  // After the retry was scheduled: held for the 500 ms backoff plus one 400 ms lease, so more
+  // than the 600 ms (a lease and a heartbeat) a running task holds it for.
   const { left } = atFailure;
   assert.ok(
-    left !== undefined && left >= 1400 && left <= 1500,
+    left !== undefined && left > 600 && left <= 900,
     `held for ${left} ms`,
   );
   assert.equal(atFailure.rows, 1, 'reads during the backoff queue nothing');

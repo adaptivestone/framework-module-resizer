@@ -913,7 +913,7 @@ describe('coordination', () => {
     assert.equal(eagerReads, 0);
   });
 
-  test('taskCoordinationOf gives the cooldown and the lock store, or the defaults without a task queue', async () => {
+  test('taskCoordinationOf gives the cooldown, the gate TTL and the lock store, or the defaults without a task queue', async () => {
     const locks = memoryLocks();
     const r = new Resizer({
       logger: silent,
@@ -921,7 +921,7 @@ describe('coordination', () => {
       media: fakeMedia(),
       locks,
       tasks: new MemoryTaskQueue(),
-      coordination: { cooldownMs: 30_000 },
+      coordination: { cooldownMs: 30_000, gateTtlMs: 90_000 },
     });
     assert.throws(
       () => taskCoordinationOf(r),
@@ -931,6 +931,7 @@ describe('coordination', () => {
     await r.ready();
     const own = taskCoordinationOf(r);
     assert.equal(own.cooldownMs, 30_000);
+    assert.equal(own.gateTtlMs, 90_000);
     assert.equal(own.locks, locks);
 
     const eager = new Resizer({
@@ -943,6 +944,7 @@ describe('coordination', () => {
     await eager.ready();
     assert.deepEqual(taskCoordinationOf(eager), {
       cooldownMs: defaultCoordination.cooldownMs,
+      gateTtlMs: defaultCoordination.gateTtlMs,
       locks: undefined,
     });
 
@@ -959,6 +961,7 @@ describe('coordination', () => {
     await broken.ready();
     const fallback = taskCoordinationOf(broken);
     assert.equal(fallback.cooldownMs, defaultCoordination.cooldownMs);
+    assert.equal(fallback.gateTtlMs, defaultCoordination.gateTtlMs);
     assert.equal(fallback.locks, locks);
   });
 });

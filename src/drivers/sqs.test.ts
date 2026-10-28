@@ -1108,7 +1108,11 @@ describe('Consumer with SqsTaskQueue', () => {
             throw new Error('handler boom');
           }
         },
-        coordinationOf: () => ({ cooldownMs: 600_000, locks }),
+        coordinationOf: () => ({
+          cooldownMs: 600_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
         onEvent: (event) => {
           const lock = locks.entry(key);
           seen.push({

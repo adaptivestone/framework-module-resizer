@@ -11,9 +11,13 @@ import type { CoordinationOptions } from './types.d.ts';
 /** The coordination policy with every value set. */
 export type Coordination = Required<CoordinationOptions>;
 
-/** What the worker needs for each task of a Resizer: its dead-letter cooldown and its lock store. */
+/**
+ * What the worker needs for each task of a Resizer: its dead-letter cooldown, how long a task
+ * given back keeps its gate lock (gateTtlMs, as a freshly queued task), and its lock store.
+ */
 export interface TaskCoordination {
   cooldownMs: number;
+  gateTtlMs: number;
   locks?: LockStore;
 }
 

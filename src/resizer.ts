@@ -181,6 +181,8 @@ export class Resizer {
       return {
         cooldownMs:
           resizer.#coordination?.cooldownMs ?? defaultCoordination.cooldownMs,
+        gateTtlMs:
+          resizer.#coordination?.gateTtlMs ?? defaultCoordination.gateTtlMs,
         locks: resizer.#locks,
       };
     };
@@ -619,8 +621,8 @@ export function tasksPartOf(resizer: Resizer): Promise<TaskQueue | undefined> {
 }
 
 /**
- * What the worker needs for each task of `resizer`: the `cooldownMs` of its validated
- * coordination (the default when it has no task queue it can use) and its lock store. Throws
+ * What the worker needs for each task of `resizer`: the `cooldownMs` and `gateTtlMs` of its
+ * validated coordination (the defaults when it has no task queue it can use) and its lock store. Throws
  * RESIZE_NOT_READY until ready() has built the services. Internal: the main entry does not export
  * it, and it may change in any release.
  * @internal
