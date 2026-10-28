@@ -482,10 +482,27 @@ interface IndexInfo {
 // MongoDB's NamespaceNotFound: listing the indexes of a collection that does not exist.
 const NAMESPACE_NOT_FOUND = 26;
 
+// Mongoose's connection states (Connection#readyState) the check tells apart.
+const CONNECTED = 1;
+const CONNECTING = 2;
+
+// The part of a Mongoose connection the index check reads.
+interface ConnectionLike {
+  readyState?: unknown;
+  asPromise?: () => Promise<unknown>;
+}
+
 /**
  * Reject unless the model's collection has the gate index: without it every add stores a task
  * (no index), or every add after a completed task is in flight with no id (a unique index without
  * the partial filter). A model that exposes no collection is not checked.
+ *
+ * The connection must be open, or opening (the check waits for it); a closed one rejects at once
+ * with RESIZE_MONGO_NOT_CONNECTED. The check then waits for the model's own `init()`: with
+ * Mongoose's `autoIndex` on (an API server), Mongoose is still building the declared indexes when
+ * the app boots, and listing them before that build ends would report the gate index missing on a
+ * fresh database. `init()` runs once per model, so this builds nothing that Mongoose would not
+ * build anyway, and with `autoIndex` off it builds nothing at all.
  */
 async function checkGateIndex(model: TaskModel): Promise<void> {
   const collection = model.collection;
@@ -493,17 +510,28 @@ async function checkGateIndex(model: TaskModel): Promise<void> {
     return;
   }
   const name = String(collection.collectionName ?? model.modelName ?? '');
-  const missing = (why: string) =>
+  const missing = (why: string, cause?: unknown) =>
     new ResizeSetupError(
       `resize: the ResizeTask collection '${name}' ${why}: the gate needs the index ${GATE_INDEX_SPEC} — create it through your migration process; the module never creates indexes`,
-      { code: 'RESIZE_MONGO_INDEX_MISSING' },
+      { code: 'RESIZE_MONGO_INDEX_MISSING', cause },
     );
+  await waitForConnection(model.db as ConnectionLike | undefined, name);
+  // Mongoose's own index build (autoIndex); a failed build (e.g. duplicate active rows) is the
+  // cause of a missing index, not an error of this check.
+  let buildError: unknown;
+  if (typeof model.init === 'function') {
+    try {
+      await model.init();
+    } catch (err) {
+      buildError = err;
+    }
+  }
   let indexes: IndexInfo[];
   try {
     indexes = await collection.indexes();
   } catch (err) {
     if ((err as { code?: unknown } | null)?.code === NAMESPACE_NOT_FOUND) {
-      throw missing('does not exist yet, so it has no gate index');
+      throw missing('does not exist yet, so it has no gate index', buildError);
     }
     throw err;
   }
@@ -529,7 +557,40 @@ async function checkGateIndex(model: TaskModel): Promise<void> {
     onGateKeys.length > 0
       ? `has an index on the gate keys ('${onGateKeys[0].name}') that is not unique or not partial on { active: true }`
       : 'has no gate index',
+    buildError,
   );
+}
+
+/**
+ * Resolve once the model's connection is open: at once when it is, after the initial connection
+ * when it is opening. A connection that is closed (never opened, or disconnected), or whose opening
+ * fails, rejects with RESIZE_MONGO_NOT_CONNECTED instead of a database call that would wait for
+ * Mongoose's buffer timeout. A model without a Mongoose connection is not checked.
+ */
+async function waitForConnection(
+  connection: ConnectionLike | undefined,
+  collection: string,
+): Promise<void> {
+  const state = connection?.readyState;
+  if (typeof state !== 'number' || state === CONNECTED) {
+    return;
+  }
+  const notConnected = (cause?: unknown) =>
+    new ResizeSetupError(
+      `resize: the connection of the ResizeTask collection '${collection}' is not open (Mongoose readyState ${state}); call verify() after the connection has opened (after Server.init() in a framework host)`,
+      { code: 'RESIZE_MONGO_NOT_CONNECTED', cause },
+    );
+  if (state === CONNECTING && typeof connection?.asPromise === 'function') {
+    try {
+      await connection.asPromise();
+    } catch (err) {
+      throw notConnected(err);
+    }
+    if (connection.readyState === CONNECTED) {
+      return;
+    }
+  }
+  throw notConnected();
 }
 
 // A duplicate key on the gate index: another task is in flight. A duplicate key on any other

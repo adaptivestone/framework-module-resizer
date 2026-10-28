@@ -543,6 +543,8 @@ describe('MongoTaskQueue setup', () => {
           autoIndex: false,
         }),
       );
+    // Mongoose's own init (it creates the collection) has run before the drop below.
+    await model.init();
     await model.collection.drop().catch(() => {});
     if (create) {
       await model.createCollection();
@@ -633,6 +635,95 @@ describe('MongoTaskQueue setup', () => {
       ],
     ]);
     await new MongoTaskQueue({ model }).verify();
+  });
+
+  /** The package's ResizeTask schema with its indexes declared, `autoIndex` as given. */
+  function declaredSchema(autoIndex: boolean) {
+    const schema = new mongoose.Schema(resizeTaskFields('File'), {
+      timestamps: true,
+      minimize: false,
+      autoIndex,
+    });
+    for (const [keys, options] of resizeTaskIndexes) {
+      schema.index(keys, options);
+    }
+    return schema;
+  }
+
+  test("with Mongoose's autoIndex on, verify right after the model is compiled waits for the index build (a fresh database)", async () => {
+    for (let i = 0; i < 5; i++) {
+      // A fresh database per round, as on the first boot of a new environment.
+      const fresh = await mongoose
+        .createConnection(server.getUri(), {
+          dbName: `resize_autoindex_${process.pid}_${i}`,
+        })
+        .asPromise();
+      try {
+        const model = fresh.model('ResizeTask', declaredSchema(true));
+        await new MongoTaskQueue({ model }).verify();
+      } finally {
+        await fresh.close();
+      }
+    }
+  });
+
+  test('with autoIndex off and the indexes only declared, verify rejects and builds nothing', async () => {
+    const off = await mongoose
+      .createConnection(server.getUri(), {
+        dbName: `resize_autoindex_off_${process.pid}`,
+      })
+      .asPromise();
+    try {
+      const model = off.model('ResizeTask', declaredSchema(false));
+      await rejectsIndexMissing(model, /has no gate index|does not exist yet/);
+      const indexes = await model.collection.indexes().catch(() => []);
+      assert.equal(indexes.length <= 1, true, 'only _id, or no collection');
+    } finally {
+      await off.close();
+    }
+  });
+
+  test('verify waits for a connection that is still opening', async () => {
+    const opening = mongoose.createConnection(server.getUri(), {
+      dbName: `resize_opening_${process.pid}`,
+    });
+    try {
+      assert.equal(opening.readyState, 2);
+      const model = opening.model('ResizeTask', declaredSchema(true));
+      await new MongoTaskQueue({ model }).verify();
+    } finally {
+      await opening.close();
+    }
+  });
+
+  test('verify rejects at once with RESIZE_MONGO_NOT_CONNECTED on a connection that is not open', async () => {
+    const notConnected = (error: unknown) =>
+      error instanceof ResizeSetupError &&
+      error.code === 'RESIZE_MONGO_NOT_CONNECTED' &&
+      /is not open/.test(error.message) &&
+      /call verify\(\) after the connection has opened \(after Server\.init\(\) in a framework host\)/.test(
+        error.message,
+      );
+    // Never opened.
+    const never = mongoose.createConnection();
+    const started = Date.now();
+    await assert.rejects(
+      new MongoTaskQueue({
+        model: never.model('ResizeTask', declaredSchema(false)),
+      }).verify(),
+      notConnected,
+    );
+    // Opened, then closed.
+    const closed = await mongoose
+      .createConnection(server.getUri(), {
+        dbName: `resize_closed_${process.pid}`,
+      })
+      .asPromise();
+    const model = closed.model('ResizeTask', declaredSchema(false));
+    await closed.close();
+    await assert.rejects(new MongoTaskQueue({ model }).verify(), notConnected);
+    // Not after Mongoose's 10 s buffer timeout.
+    assert.ok(Date.now() - started < 2000, `${Date.now() - started} ms`);
   });
 });
 
