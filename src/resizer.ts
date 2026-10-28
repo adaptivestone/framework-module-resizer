@@ -444,15 +444,17 @@ export class Resizer {
       throw locksRequired(this.name);
     }
     const source = this.#coordinationSource;
+    const timing = timingOf(tasks);
     const coordination = fillCoordination(
       typeof source === 'function' ? source() : source,
-      timingOf(tasks),
+      timing,
     );
     this.#coordination = coordination;
     return new Dispatcher({
       tasks,
       locks: this.#locks,
       coordination,
+      leaseMs: timing.leaseMs,
       name: this.name,
       logger: this.logger,
     });

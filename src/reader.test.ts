@@ -79,19 +79,23 @@ function makeTasks(
 
 function makeLocks(acquire: boolean | ((key: string) => boolean) = true) {
   const acquired: { key: string; ttl: number }[] = [];
+  const extended: { key: string; ttl: number }[] = [];
   const released: string[] = [];
   const locks: LockStore = {
     acquire: async (key, _owner, ttl) => {
       acquired.push({ key, ttl });
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
-    extend: async () => true,
+    extend: async (key, _owner, ttl) => {
+      extended.push({ key, ttl });
+      return true;
+    },
     release: async (key) => {
       released.push(key);
       return true;
     },
   };
-  return { locks, acquired, released };
+  return { locks, acquired, extended, released };
 }
 
 afterEach(() => {
@@ -146,6 +150,7 @@ describe('Reader', () => {
           tasks,
           locks: undefined, // a task queue that gates by task needs none
           coordination: defaultCoordination,
+          leaseMs: 60_000,
           name: 'default',
           logger: silent,
         }),
@@ -771,12 +776,12 @@ describe('resolve — enqueue wiring', () => {
     assert.equal(calls[0].mediaId, 'abc123');
   });
 
-  test('resolve does not throw when tasks.add throws; the gate lock is released', async () => {
+  test('resolve does not throw when tasks.add throws; the gate lock is shortened to one lease', async () => {
     installFakeApp();
     const { tasks } = makeTasks(() => {
       throw new Error('task queue down');
     }, new PlainTaskQueue());
-    const { locks, released } = makeLocks(true);
+    const { locks, extended, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
@@ -789,16 +794,20 @@ describe('resolve — enqueue wiring', () => {
       formats: ['jpeg'],
     });
     assert.equal(decision.missing.length, 1);
-    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
+    // The default lease: the queue may have stored the task before it threw.
+    assert.deepEqual(extended, [
+      { key: 'resize_gate:default:default:m1:default', ttl: 60_000 },
+    ]);
+    assert.deepEqual(released, []);
   });
 
-  test('resolve does not throw when the task queue cannot confirm the add; the gate lock is released', async () => {
+  test('resolve does not throw when the task queue cannot confirm the add; the gate lock is shortened to one lease', async () => {
     installFakeApp();
     const { tasks } = makeTasks(
       () => ({ status: 'unconfirmed' }),
       new PlainTaskQueue(),
     );
-    const { locks, released } = makeLocks(true);
+    const { locks, extended, released } = makeLocks(true);
     const r = new FrameworkResizer({
       storage: makeStorage(),
       tasks,
@@ -810,7 +819,10 @@ describe('resolve — enqueue wiring', () => {
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
-    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
+    assert.deepEqual(extended, [
+      { key: 'resize_gate:default:default:m1:default', ttl: 60_000 },
+    ]);
+    assert.deepEqual(released, []);
   });
 
   test('an original without a key leaves variants missing without enqueueing or locking', async () => {

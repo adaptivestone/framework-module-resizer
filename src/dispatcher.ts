@@ -2,15 +2,15 @@
 // missing variants of one media and pipeline into ONE task on one queue, behind one gate per
 // Resizer, media, pipeline and queue: while a task of theirs is queued, running, waiting for a
 // retry or cooling down after a dead-letter, no other task is queued for them. A request on
-// another queue is a separate task. A task queue with gatesByTask (the database
-// queue) keeps the gate itself, so one `add` is the whole dispatch, and it reports `in-flight`
-// while the gate is held. Beside a queue without it (SQS), the Dispatcher takes the gate lock with
-// a fresh owner for coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the
-// worker then holds that lock until the task ends. A task that is not added releases the gate lock
-// at once, so a later read can queue it. The read path never throws and counts only an added task;
-// prewarm accepts only what the new task, or the active one, holds. A Dispatcher needs only the
-// task queue, the lock store (beside a queue without gatesByTask), the coordination, its
-// Resizer's name and a logger.
+// another queue is a separate task. A task queue with gatesByTask (the database queue) keeps the
+// gate itself, so one `add` is the whole dispatch, and it reports `in-flight` while the gate is
+// held. Beside a queue without it (SQS), the Dispatcher takes the gate lock with a fresh owner for
+// coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the worker then holds
+// that lock until the task ends. When the queue does not say it stored the task, the lock is
+// shortened to one lease (see #dispatch). The read path never throws and counts only an added
+// task; prewarm accepts only what the new task, or the active one, holds. A Dispatcher needs only
+// the task queue, the lock store (beside a queue without gatesByTask), the coordination, the
+// queue's lease, its Resizer's name and a logger.
 import type { LockStore } from './contracts/locks.ts';
 import type {
   NewTask,
@@ -33,6 +33,9 @@ export interface DispatcherDeps {
   tasks: TaskQueue;
   locks: LockStore | undefined; // the gate locks, beside a task queue without gatesByTask
   coordination: Coordination; // the validated policy: a gate lock lasts gateTtlMs
+  // The task queue's lease (timingOf(tasks).leaseMs): how long a gate lock is kept when the queue
+  // may or may not have stored the task.
+  leaseMs: number;
   name: string; // the Resizer's name: part of every identity, gate key and task
   logger: ResizeLogger;
 }
@@ -250,15 +253,21 @@ export class Dispatcher {
   /**
    * One dispatch of `variants` (canonical, one per identity) for the request's media and pipeline.
    * On a queue with gatesByTask it is one `add`. Without it: acquire the gate lock with a fresh
-   * owner for gateTtlMs, then `add` the task carrying that owner, and release the lock unless the
-   * queue says it stored the task: an `added` result, even one with an unusable task id, keeps the
-   * lock (at worst it expires after gateTtlMs), so no second task can be queued. Never rejects.
+   * owner for gateTtlMs, then `add` the task carrying that owner. The lock, by outcome:
+   * - held by another request, or the acquire failed: this call never had it;
+   * - `added`, even with an unusable task id: kept for gateTtlMs (a worker extends it once it
+   *   claims the task), so no second task is queued;
+   * - anything else (`unconfirmed`, a throw, an invalid result, an `in-flight` that such a queue
+   *   never reports): the queue may still have stored the task (a lost response), so the lock is
+   *   shortened to one lease, not released. A stored task is claimed and its lock extended within
+   *   that lease; otherwise the lock lapses and a later read queues the task.
+   * Never rejects.
    */
   async #dispatch(
     req: DispatchRequest,
     variants: MissingPreview[],
   ): Promise<DispatchOutcome> {
-    const { tasks, locks, coordination, name } = this.#deps;
+    const { tasks, locks, coordination, leaseMs, name } = this.#deps;
     const task: NewTask = {
       resizer: name,
       queue: req.queue,
@@ -291,12 +300,13 @@ export class Dispatcher {
       outcome.status === 'added' ||
       (outcome.status === 'invalid' && outcome.stored);
     if (!stored) {
-      // No task holds the gate: open it now instead of when the lock expires.
+      // Maybe stored: keep the gate for one lease instead of opening it (see above). `false` (the
+      // lock is gone) changes nothing.
       try {
-        await locks.release(key, owner);
+        await locks.extend(key, owner, leaseMs);
       } catch (err) {
         this.#deps.logger.error(
-          `resize enqueue: failed to release the gate lock ${key}`,
+          `resize enqueue: failed to shorten the gate lock ${key} to one lease`,
           err,
         );
       }

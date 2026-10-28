@@ -82,6 +82,7 @@ function makeDispatcher(
     tasks?: TaskQueue;
     locks?: LockStore;
     coordination?: Coordination;
+    leaseMs?: number;
     name?: string;
   } = {},
 ) {
@@ -89,6 +90,7 @@ function makeDispatcher(
     tasks: opts.tasks ?? new MemoryTaskQueue(),
     locks: 'locks' in opts ? opts.locks : clockLocks(),
     coordination: opts.coordination ?? defaultCoordination,
+    leaseMs: opts.leaseMs ?? 60_000,
     name: opts.name ?? 'default',
     logger: recordingLogger,
   });
@@ -320,7 +322,9 @@ describe('a task queue without gatesByTask', () => {
     assert.deepEqual(errors, []);
   });
 
-  test('the gate lock is released when add throws, resolves unconfirmed or in-flight', async () => {
+  test('the gate lock is shortened to one lease, still owned by the dispatch, when add throws, resolves unconfirmed or in-flight, or an older result', async () => {
+    const now = 5_000;
+    const leaseMs = 30_000;
     const cases: [string, () => Promise<TaskAddResult>, number][] = [
       [
         'throws',
@@ -338,22 +342,51 @@ describe('a task queue without gatesByTask', () => {
       errors = [];
       const tasks = new PlainTaskQueue();
       tasks.add = add;
-      const { locks, calls } = recordingLocks();
-      const d = makeDispatcher({ tasks, locks });
+      // The queue may have stored the task although it did not say so (a lost response).
+      const { locks, calls } = recordingLocks(clockLocks(() => now));
+      const d = makeDispatcher({ tasks, locks, leaseMs });
       assert.equal(await d.enqueue(requestFor([v300])), 0, label);
-      assert.equal(locks.entry(GATE), undefined, label);
-      const [acquire, release] = calls;
+      const [acquire, extend] = calls;
       assert.deepEqual(
         calls.map(({ op, key }) => [op, key]),
         [
           ['acquire', GATE],
-          ['release', GATE],
+          ['extend', GATE],
         ],
         label,
       );
-      assert.equal(release.owner, acquire.owner, label);
+      assert.equal(extend.owner, acquire.owner, label);
+      assert.deepEqual(
+        locks.entry(GATE),
+        { owner: acquire.owner, expiresAt: now + leaseMs },
+        label,
+      );
+      // While it lasts, the media and pipeline get no other task.
+      tasks.add = PlainTaskQueue.prototype.add;
+      assert.equal(await d.enqueue(requestFor([v300])), 0, label);
+      assert.equal(tasks.rows.length, 0, label);
       assert.equal(errors.length, logged, label);
     }
+  });
+
+  test('a rejecting extend after an unconfirmed add is logged; the lock stays as acquired', async () => {
+    const now = 5_000;
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'unconfirmed' });
+    const base = clockLocks(() => now);
+    const locks: LockStore = {
+      ...base,
+      extend: async () => {
+        throw new Error('lock store down');
+      },
+    };
+    const coordination = { gateTtlMs: 123_456, cooldownMs: 1_000 };
+    const d = makeDispatcher({ tasks, locks, coordination });
+    assert.equal(await d.enqueue(requestFor([v300])), 0);
+    assert.equal(base.entry(GATE)?.expiresAt, now + coordination.gateTtlMs);
+    assert.ok(
+      errors.some(([message]) => /shorten the gate lock/.test(String(message))),
+    );
   });
 
   test('a held gate lock queues nothing; a rejecting acquire is logged and queues nothing', async () => {

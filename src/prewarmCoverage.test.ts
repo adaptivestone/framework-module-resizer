@@ -63,19 +63,23 @@ function locks(
   acquire: boolean | ((key: string) => boolean | Promise<boolean>) = true,
 ) {
   const acquired: string[] = [];
+  const extended: [string, number][] = [];
   const released: string[] = [];
   const lockStore: LockStore = {
     acquire: async (key) => {
       acquired.push(key);
       return typeof acquire === 'function' ? acquire(key) : acquire;
     },
-    extend: async () => true,
+    extend: async (key, _owner, ttlMs) => {
+      extended.push([key, ttlMs]);
+      return true;
+    },
     release: async (key) => {
       released.push(key);
       return true;
     },
   };
-  return { lockStore, acquired, released };
+  return { lockStore, acquired, extended, released };
 }
 
 // The add result of a queue whose active task of this media and pipeline holds the gate.
@@ -590,7 +594,7 @@ describe('prewarm — a task in flight, and the gate lock', () => {
     assert.deepEqual(result.issues[0].previews, [jpeg]);
   });
 
-  test('an add failure releases the gate lock and a later call can safely retry', async () => {
+  test('an add failure shortens the gate lock to one lease, and a later call can safely retry', async () => {
     let calls = 0;
     const { tasks } = makeTaskQueue({
       gates: false,
@@ -602,7 +606,7 @@ describe('prewarm — a task in flight, and the gate lock', () => {
         return { status: 'added', taskId: 'task-2' };
       },
     });
-    const { lockStore, released } = locks(true);
+    const { lockStore, extended, released } = locks(true);
     const r = makeResizer({
       storage,
       tasks,
@@ -617,7 +621,12 @@ describe('prewarm — a task in flight, and the gate lock', () => {
     const second = await r.prewarm(opts);
     assert.equal(first.status, 'incomplete');
     assert.equal(first.issues[0].code, 'RESIZE_ENQUEUE_QUEUE_FAILED');
-    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
+    // Kept for the default lease (the queue may have stored the task), never released.
+    assert.deepEqual(extended, [
+      ['resize_gate:default:default:m1:default', 60_000],
+    ]);
+    assert.deepEqual(released, []);
+    // This lock store grants every acquire, as one whose lock has lapsed would.
     assert.equal(second.status, 'accepted');
     assert.equal(second.tasks[0].taskId, 'task-2');
   });

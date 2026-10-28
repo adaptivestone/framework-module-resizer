@@ -508,7 +508,7 @@ describe('prewarm — a held gate lock queues nothing', () => {
 });
 
 describe('prewarm — queue and lock failures never throw', () => {
-  test('add throwing → nothing accepted, the gate lock released, no reject', async () => {
+  test('add throwing → nothing accepted, the gate lock shortened to one lease, no reject', async () => {
     installFakeApp();
     const { tasks } = makeTaskQueue(() => {
       throw new Error('task queue down');
@@ -525,7 +525,14 @@ describe('prewarm — queue and lock failures never throw', () => {
       formats: ['jpeg'],
     });
     assert.equal(accepted.length, 0);
-    assert.deepEqual(released, ['resize_gate:default:default:m1:default']);
+    assert.deepEqual(released, []);
+    // The default lease: a second prewarm finds the gate held until it lapses.
+    const again = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(again.issues[0].code, 'RESIZE_ENQUEUE_LOCK_CONTENDED');
   });
 
   test('a rejecting gate-lock acquire is caught → nothing accepted, logged', async () => {
