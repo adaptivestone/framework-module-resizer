@@ -179,9 +179,9 @@ export default {
 2. **A custom model-shaped `MongoMediaModel` must accept an update pipeline.** `replacePreviews`
    (which `invalidate` uses) calls `findOneAndUpdate` with an array update and
    `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`,
-   after casting the rows with the model's optional `castObject`. A `findOneAndUpdate` middleware
-   on the media model also sees that call, so it must accept an array update. A Mongoose model
-   accepts it as it is.
+   after casting the rows with the model's optional `castObject` (`storageRef` and `filters` are
+   stored as given (cast or not)). A `findOneAndUpdate` middleware on the media model also sees
+   that call, so it must accept an array update. A Mongoose model accepts it as it is.
 3. **`runResizeWorker({ configName })` is removed, together with `--config`.** Both are rejected
    with `RESIZE_CONFIG_REMOVED_KEY`: the worker reads `worker` and `queues` from
    `src/config/resize.ts`. A host whose Resizers read only named files adds a

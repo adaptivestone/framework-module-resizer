@@ -98,8 +98,9 @@ option, else the file's `queue`, else `'default'`, and `verify()` checks that th
 it); a `src/config/resize.ts` that exists is still read for its `coordination` (`worker` belongs to
 the worker process) and validated as a whole, so a broken `queues` or `worker` section there fails
 `verify()` while the Resizer's calls run in the degraded mode (see [Config
-reference](#config-reference)). Passing `coordination` in code too keeps the file from being read at
-all.
+reference](#config-reference)). Passing `coordination` in code too keeps its process-wide sections
+from being read: the default Resizer still reads the file for its own sections, and the worker
+process reads `worker` and `queues` from it.
 
 Add `...resizeMediaSchemaFragment` (from `…/framework.js`) to your media model's schema, then:
 
@@ -336,8 +337,9 @@ custom model-shaped `MongoMediaModel` must accept an update pipeline, and a `fin
 middleware on the media model also sees that call and must accept an array update. The rows are
 first cast with the model's `castObject` when it has one (Mongoose's `Model.castObject`: strict rows
 lose the keys they do not declare, loose rows (`strict: false`) keep them, and a value it cannot
-cast rejects with Mongoose's `ValidationError` before anything is written); without it they are
-written as given, minus their `undefined` top-level keys. `MongoMediaStore.verify()` fails with
+cast rejects with Mongoose's `ValidationError` before anything is written; `storageRef` and
+`filters` are stored as given (cast or not)); without it they are written as given, minus their
+`undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
 sub-documents without `identity`, `origin` or `encodeSig` (a mixed or plain `previews` array, or
 rows with `strict: false`, pass; `bytes` and `createdAt` are not checked), `MongoLockStore.verify()`
@@ -837,17 +839,18 @@ await ResizeTask.updateOne(
 - **Preview rows** carry, besides the fields `resolve()` reads, `bytes` (the encoded size),
   `createdAt` (when the row was stored), `origin` (a signature of the original it was made from:
   its storage ref and dimensions) and `encodeSig` (a signature of its format's encode settings,
-  the sharpen setting of its fit mode, its animation settings (for animated formats), the
-  result-dimension cap, the fit box (for fit rows) and the pipeline `version`). The worker and
-  `generate()` record them on every row from `0.3.0-rc.1`
-  on, and `resizeMediaSchemaFragment` declares them. The read path does not check them yet. Rows
+  the sharpen setting of its fit mode, its animation settings (for animated formats: `animated`,
+  `limits.animationFrames` and the pixel budget `min(limits.sourcePixels, limits.inputPixels)`,
+  which also caps the frames), the result-dimension cap, the fit box (for fit rows) and the
+  pipeline `version`). The worker and `generate()` record them on every row from `0.3.0-rc.1` on,
+  and `resizeMediaSchemaFragment` declares them. The read path does not check them yet. Rows
   written earlier have no `origin` or `encodeSig`: they are served for now, and a later release's
   freshness check will regenerate them, so plan the storage cost of rendering them again. Rows
   without an `identity` (written before 0.3.0) are never removed by `invalidate` or
   `replacePreviews`: delete their files yourself.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
-  `pipeline: null` or `''` matches nothing), in one media store write, and resolves with the
+  `pipeline: null` matches nothing), in one media store write, and resolves with the
   storage refs of the rows it removed. Delete those objects yourself: the module never deletes
   files, and never queues. It loads the media fresh, picks this Resizer's rows that carry an
   `identity` (rows without `resizer` or `pipeline` count as `'default'`; the pipeline need not be

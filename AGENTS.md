@@ -104,7 +104,8 @@ gets the full box its steps were written for. To hand the private original to it
    `queue`, else `'default'`); a `src/config/resize.ts` that exists is still read for its
    `coordination` and validated as a whole, so a broken `queues` or `worker` section there fails
    `verify()` while the Resizer's calls run in the degraded mode of step 4. Passing `coordination`
-   in code too keeps the file from being read at all.
+   in code too keeps its process-wide sections from being read: the default Resizer still reads
+   the file for its own sections, and the worker process reads `worker` and `queues` from it.
 
    Without the framework: `new Resizer({ storage, media, locks?, tasks?, coordination?, queueName? })` from
    the main entry (`locks` is required only beside a task queue without `gatesByTask`, such as
@@ -415,11 +416,12 @@ running for that media can store rows after it returns. A custom `MediaStore` mu
 without it: `RESIZE_MEDIA_REPLACE_MISSING`). A custom model-shaped `MongoMediaModel` must accept
 an update pipeline: `replacePreviews` calls `findOneAndUpdate` with an array update and
 `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`
-(after an optional `castObject`), and a `findOneAndUpdate` middleware on the media model sees
-that call too. Old rows: rows written before `0.3.0-rc.1` have no `origin` or `encodeSig`; they
-are served for now and will be regenerated once a later release's freshness check ships (plan
-the storage cost). Rows without an `identity` (written before 0.3.0) are never removed by
-`invalidate` or `replacePreviews`: the host deletes their files itself.
+(after an optional `castObject`; `storageRef` and `filters` are stored as given), and a
+`findOneAndUpdate` middleware on the media model sees that call too. Old rows: rows written before
+`0.3.0-rc.1` have no `origin` or `encodeSig`; they are served for now and will be regenerated once
+a later release's freshness check ships (plan the storage cost). Rows without an `identity`
+(written before 0.3.0) are never removed by `invalidate` or `replacePreviews`: the host deletes
+their files itself.
 
 Hooks are typed — register at construction (`hooks:`) or later via `getResizer().hook(name, fn)`.
 Waterfalls (read path, real `ctx`): `resolveSizes`, `beforeEnqueue`, `formatPublicUrls`.

@@ -119,11 +119,12 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   calls `findOneAndUpdate` with an array update and
   `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`,
   after casting the rows with the model's optional `castObject` (Mongoose's `Model.castObject`:
-  strict rows lose the keys they do not declare, loose rows (`strict: false`) keep them; a value
-  it cannot cast, such as `bytes: 'abc'`,
-  rejects with Mongoose's `ValidationError` before anything is written). Without `castObject` the
-  rows are written as given, minus their `undefined` top-level keys. A `findOneAndUpdate`
-  middleware on the media model also sees that call, so it must accept an array update.
+  strict rows lose the keys they do not declare, loose rows (`strict: false`) keep them;
+  `storageRef` and `filters` are stored as given (cast or not); a value it cannot cast, such as
+  `bytes: 'abc'`, rejects with Mongoose's `ValidationError` before anything is written). Without
+  `castObject` the rows are written as given, minus their `undefined` top-level keys. A
+  `findOneAndUpdate` middleware on the media model also sees that call, so it must accept an array
+  update.
 - **Strict media rows need `origin` and `encodeSig`.** A hand-written media schema that declares
   preview rows as strict sub-documents must declare `identity`, `origin` and `encodeSig` (each
   `{ type: String }`), or `MongoMediaStore.verify()` (so `resizer.verify()` and worker start)
@@ -650,7 +651,7 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   `prewarm()` do not queue the same failing work again until it ends.
 - `resizer.invalidate({ media, pipeline? })` (`InvalidateOpts`) removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
-  `pipeline: null` or `''` matches nothing), in one media store write (`replacePreviews`), and
+  `pipeline: null` matches nothing), in one media store write (`replacePreviews`), and
   resolves with the removed rows' storage refs for the host to delete. It loads the media fresh,
   drops the rows from the caller's `media.previews` too (when that array cannot be changed, it logs
   a warning and still resolves with the refs), never deletes files and never queues. It takes no
@@ -659,9 +660,11 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
 - Preview rows record `bytes` (the encoded size), `createdAt` (when the row was stored), `origin`
   (a signature of the original it was made from: its storage ref and dimensions) and `encodeSig`
   (a signature of its format's encode settings, the sharpen setting of its fit mode, its animation
-  settings (for animated formats), the result-dimension cap, the fit box (for fit rows) and the
-  pipeline version), from the worker and from
-  `generate()`; `resizeMediaSchemaFragment` declares them. The read path does not check them yet.
+  settings (for animated formats: `animated`, `limits.animationFrames` and the pixel budget
+  `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames), the
+  result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
+  from `generate()`; `resizeMediaSchemaFragment` declares them. The read path does not check them
+  yet.
 - `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it to mark the
   pipeline's stored previews as made with older settings. They are not regenerated yet. It is not
   validated, and `''` signs differently from an absent version.
