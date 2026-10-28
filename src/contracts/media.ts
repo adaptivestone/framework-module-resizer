@@ -43,10 +43,11 @@ export abstract class MediaStore {
    * always stored. Resolves with the rows it stored and the rows it removed, as plain objects; a
    * media that is gone gives { stored: [], removed: [] }. A row the store cannot store rejects the
    * call before anything is written (MongoMediaStore: a value its schema cannot cast, with
-   * Mongoose's ValidationError, which is not a ResizeError). It takes no dimensions: a caller that
-   * must backfill them uses appendPreviews(mediaId, [], dims), which writes them whether or not it
-   * stores a row. The rows MongoMediaStore writes here carry no sub-document `_id` (appended rows
-   * do); the module reads none.
+   * Mongoose's ValidationError, which is not a ResizeError; `storageRef` and `filters` are stored
+   * as given, cast or not). It takes no dimensions: a caller that must backfill them uses
+   * appendPreviews(mediaId, [], dims), which writes them whether or not it stores a row. The rows
+   * MongoMediaStore writes here carry no sub-document `_id` (appended rows do); the module reads
+   * none.
    */
   abstract replacePreviews(
     mediaId: string,

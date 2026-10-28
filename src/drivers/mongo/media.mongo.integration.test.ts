@@ -418,6 +418,103 @@ describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', 
     assert.equal(result.stored[0].encodeSig, '5bff549d897f4636');
   });
 
+  test('replacePreviews stores storageRef and filters as given when the rows declare them as strict-free sub-schemas', async () => {
+    // castObject returns only the declared paths at every depth, so a nested sub-schema would lose
+    // the undeclared keys of a storage ref (the driver's locator) and of the filters.
+    const model = mediaModelWith('NestedLooseReplaceMedia', [
+      new mongoose.Schema(
+        {
+          sizeKey: String,
+          identity: String,
+          origin: String,
+          encodeSig: String,
+          format: String,
+          contentType: String,
+          // `_id: false`: an appended single-nested sub-document would otherwise gain an `_id`.
+          storageRef: new mongoose.Schema(
+            { driver: String },
+            { strict: false, _id: false },
+          ),
+          filters: new mongoose.Schema(
+            { q: Number },
+            { strict: false, _id: false },
+          ),
+        },
+        { strict: false },
+      ),
+    ]);
+    const store = new MongoMediaStore({ model });
+    const id = String(
+      (
+        await model.create({
+          original: { storageRef: { path: 'o.png' }, format: 'png' },
+          previews: [],
+        })
+      )._id,
+    );
+    const shaped = (identity: string): Preview =>
+      ({
+        ...preview(identity),
+        storageRef: { driver: 'custom', key: 'preserve-me' },
+        filters: { q: 1, extra: 'x' },
+      }) as unknown as Preview;
+
+    await store.appendPreviews(id, [shaped(ID_A)]);
+    await store.replacePreviews(id, [], [shaped(ID_B)]);
+
+    const rows = ((await model.findById(id).lean()) as { previews: Preview[] })
+      .previews;
+    const appended = rows.find((row) => row.identity === ID_A);
+    const replaced = rows.find((row) => row.identity === ID_B);
+    assert.ok(appended && replaced);
+    assert.deepEqual(appended.storageRef, {
+      driver: 'custom',
+      key: 'preserve-me',
+    });
+    assert.deepEqual(replaced.storageRef, appended.storageRef);
+    assert.deepEqual(appended.filters, { q: 1, extra: 'x' });
+    assert.deepEqual(replaced.filters, appended.filters);
+  });
+
+  test('replacePreviews on strict rows stores a Mixed storageRef as given', async () => {
+    const model = mediaModelWith('StrictMixedReplaceMedia', [
+      new mongoose.Schema({
+        sizeKey: String,
+        identity: String,
+        origin: String,
+        encodeSig: String,
+        format: String,
+        contentType: String,
+        storageRef: { type: mongoose.Schema.Types.Mixed },
+      }),
+    ]);
+    const store = new MongoMediaStore({ model });
+    const id = String(
+      (
+        await model.create({
+          original: { storageRef: { path: 'o.png' }, format: 'png' },
+          previews: [],
+        })
+      )._id,
+    );
+    const storageRef = {
+      driver: 'custom',
+      key: 'preserve-me',
+      grouping: { namespace: 'users/42', empty: {} },
+    };
+
+    await store.replacePreviews(
+      id,
+      [],
+      [{ ...preview(ID_A), storageRef } as unknown as Preview],
+    );
+
+    const [stored] = (
+      (await model.findById(id).lean()) as { previews: Preview[] }
+    ).previews;
+    assert.deepEqual(stored.storageRef, storageRef);
+  });
+
   test('a row the strict schema cannot cast rejects with a ValidationError and leaves the document unchanged', async () => {
     const store = mediaStore();
     const mediaId = await newMedia([preview(ID_A, 'a1'), preview(ID_B, 'b1')]);

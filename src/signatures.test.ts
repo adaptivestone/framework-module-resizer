@@ -69,7 +69,7 @@ describe('encodeSignature', () => {
     );
     assert.equal(
       sha16(
-        '{"animated":{"animated":false,"animationFrames":64},"encode":{"effort":4,"quality":82},"flatten":null,"format":"webp","maxSize":{"height":1200,"width":2000},"resultDimension":5000,"sharpen":false,"version":null}',
+        '{"animated":{"animated":false,"animationFrames":64,"pixelBudget":50000000},"encode":{"effort":4,"quality":82},"flatten":null,"format":"webp","maxSize":{"height":1200,"width":2000},"resultDimension":5000,"sharpen":false,"version":null}',
       ),
       encodeSignature(c, { format: 'webp', fit: true }),
     );
@@ -83,11 +83,11 @@ describe('encodeSignature', () => {
     );
     assert.equal(
       encodeSignature(c, { format: 'webp', fit: false }),
-      '5bff549d897f4636',
+      '9a360524ab7ba00b',
     );
     assert.equal(
       encodeSignature(c, { format: 'webp', fit: true }),
-      '287c3af56c8b2a35',
+      'd1382a568c3270da',
     );
     assert.equal(
       encodeSignature(c, { format: 'avif', fit: false }),
@@ -100,15 +100,15 @@ describe('encodeSignature', () => {
     // gif has no encode entry: `encode` is {}.
     assert.equal(
       encodeSignature(c, { format: 'gif', fit: false }),
-      'a0113f7fe92058f1',
+      'a275d5cfd7116722',
     );
     assert.equal(
       encodeSignature(c, { format: 'gif', fit: true }),
-      'd73b43bfcd2f3b93',
+      '529aa100b4db0a2a',
     );
     assert.equal(
       encodeSignature(c, { format: 'webp', fit: false, version: 'v2' }),
-      'b8283c2b8050efb8',
+      '7ccee5bd2d5aa3dd',
     );
   });
 
@@ -119,7 +119,7 @@ describe('encodeSignature', () => {
     const quality70 = makeImageConfig({
       encode: { formats: { webp: { quality: 70 } } },
     });
-    assert.equal(encodeSignature(quality70, cover('webp')), '428c6aa9b8c3b733');
+    assert.equal(encodeSignature(quality70, cover('webp')), '3936af03d1b04d94');
     assert.equal(encodeSignature(quality70, cover('jpeg')), '83d53beb7e1f8872');
 
     // The same options with their keys in another order sign the same.
@@ -129,7 +129,7 @@ describe('encodeSignature', () => {
       'effort',
       'quality',
     ]);
-    assert.equal(encodeSignature(reordered, cover('webp')), '5bff549d897f4636');
+    assert.equal(encodeSignature(reordered, cover('webp')), '9a360524ab7ba00b');
 
     const flattenWebp = makeImageConfig({
       encode: { flatten: { formats: ['jpeg', 'webp'] } },
@@ -140,29 +140,29 @@ describe('encodeSignature', () => {
     );
     assert.equal(
       encodeSignature(flattenWebp, cover('webp')),
-      '56e84f45d6c5e06a',
+      '80adcd788ca1d6c4',
     );
 
     // `animated` counts for the animated formats only.
     const animated = makeImageConfig({ animated: true });
     assert.equal(encodeSignature(animated, cover('jpeg')), '83d53beb7e1f8872');
     assert.equal(encodeSignature(animated, cover('avif')), '620ba576b62ed200');
-    assert.equal(encodeSignature(animated, cover('webp')), '7700166d4996a056');
-    assert.equal(encodeSignature(animated, cover('gif')), '36b05b342b7c7982');
+    assert.equal(encodeSignature(animated, cover('webp')), '984ba2b2149a2dd7');
+    assert.equal(encodeSignature(animated, cover('gif')), 'b2db30509308f358');
 
     // So does the animation frame cap.
     const frames = makeImageConfig({ limits: { animationFrames: 32 } });
     assert.equal(encodeSignature(frames, cover('jpeg')), '83d53beb7e1f8872');
     assert.equal(encodeSignature(frames, fit('jpeg')), '5e71af5703629b0d');
     assert.equal(encodeSignature(frames, cover('avif')), '620ba576b62ed200');
-    assert.equal(encodeSignature(frames, cover('webp')), 'a65ee58d08542284');
-    assert.equal(encodeSignature(frames, fit('webp')), '6904dc4087be56d3');
-    assert.equal(encodeSignature(frames, cover('gif')), '956b62f8eb94e0db');
+    assert.equal(encodeSignature(frames, cover('webp')), '4f8d99b530e4e662');
+    assert.equal(encodeSignature(frames, fit('webp')), 'b32410ef228847cc');
+    assert.equal(encodeSignature(frames, cover('gif')), '54f2ff53458f6874');
 
     // `maxSize` counts for fit rows only.
     const maxSize = makeImageConfig({ maxSize: { width: 2400, height: 1600 } });
     assert.equal(encodeSignature(maxSize, cover('jpeg')), '83d53beb7e1f8872');
-    assert.equal(encodeSignature(maxSize, cover('webp')), '5bff549d897f4636');
+    assert.equal(encodeSignature(maxSize, cover('webp')), '9a360524ab7ba00b');
     assert.equal(encodeSignature(maxSize, fit('jpeg')), '422c6bae973f3d32');
 
     // A row signs only the sharpen half of its own fit mode: `sharpen.fit` changes fit rows only,
@@ -190,5 +190,61 @@ describe('encodeSignature', () => {
     const noSharpen = makeImageConfig({ encode: { sharpen: false } });
     assert.equal(encodeSignature(noSharpen, cover('jpeg')), 'b074fbe24e5e7f6f');
     assert.equal(encodeSignature(noSharpen, fit('jpeg')), '5e71af5703629b0d');
+  });
+
+  test('the pixel budget counts for animated formats only', () => {
+    const cover = (format: string) => ({ format, fit: false });
+    const base = makeImageConfig();
+    // The budget is min(limits.sourcePixels, limits.inputPixels): 50 000 000 on the defaults,
+    // where sourcePixels is the smaller one.
+    assert.equal(
+      Math.min(base.limits.sourcePixels, base.limits.inputPixels),
+      50_000_000,
+    );
+
+    // inputPixels below sourcePixels lowers the budget: animated rows change, jpeg does not.
+    const lowInput = makeImageConfig({ limits: { inputPixels: 40_000_000 } });
+    assert.equal(encodeSignature(lowInput, cover('jpeg')), '83d53beb7e1f8872');
+    assert.notEqual(
+      encodeSignature(lowInput, cover('webp')),
+      encodeSignature(base, cover('webp')),
+    );
+    assert.notEqual(
+      encodeSignature(lowInput, cover('gif')),
+      encodeSignature(base, cover('gif')),
+    );
+    assert.equal(encodeSignature(lowInput, cover('webp')), '0e6418299a0f3b3d');
+    assert.equal(encodeSignature(lowInput, cover('gif')), 'fb7a053a8c8523d3');
+
+    // inputPixels raised leaves the budget at sourcePixels: no row changes.
+    const highInput = makeImageConfig({ limits: { inputPixels: 300_000_000 } });
+    for (const format of ['jpeg', 'avif', 'webp', 'gif']) {
+      assert.equal(
+        encodeSignature(highInput, cover(format)),
+        encodeSignature(base, cover(format)),
+      );
+    }
+
+    // sourcePixels lowered lowers the budget too: animated rows change, jpeg does not.
+    const lowSource = makeImageConfig({ limits: { sourcePixels: 40_000_000 } });
+    assert.equal(encodeSignature(lowSource, cover('jpeg')), '83d53beb7e1f8872');
+    assert.notEqual(
+      encodeSignature(lowSource, cover('webp')),
+      encodeSignature(base, cover('webp')),
+    );
+    assert.notEqual(
+      encodeSignature(lowSource, cover('gif')),
+      encodeSignature(base, cover('gif')),
+    );
+
+    // Only the budget is signed, not the limit that set it: the same min signs the same.
+    assert.equal(
+      encodeSignature(lowSource, cover('webp')),
+      encodeSignature(lowInput, cover('webp')),
+    );
+    assert.equal(
+      encodeSignature(lowSource, cover('gif')),
+      encodeSignature(lowInput, cover('gif')),
+    );
   });
 });

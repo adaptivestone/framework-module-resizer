@@ -8,10 +8,10 @@ import { createHash } from 'node:crypto';
 import { canonicalizeFilterValue } from './images.ts';
 import type { ResizeConfig, StorageRef } from './types.d.ts';
 
-// The formats whose rows sign `config.animated` and `limits.animationFrames`. A deliberate frozen
-// copy of the formats isAnimatedFormat knows, not an import of it: this list is part of the recipe.
-// If Sharp later animates another format, isAnimatedFormat may grow, but the signatures already
-// stored for that format's rows must not change.
+// The formats whose rows sign `config.animated`, `limits.animationFrames` and the pixel budget. A
+// deliberate frozen copy of the formats isAnimatedFormat knows, not an import of it: this list is
+// part of the recipe. If Sharp later animates another format, isAnimatedFormat may grow, but the
+// signatures already stored for that format's rows must not change.
 const ANIMATED_FORMATS: readonly string[] = Object.freeze(['gif', 'webp']);
 
 /** The first 16 hex digits of the SHA-256 of `text`. */
@@ -44,8 +44,9 @@ export function previewOrigin(
  * The settings a preview of `row.format` was encoded with. Each input is signed only for the rows
  * it changes: the flatten background for flattened formats, `maxSize` for fit rows, the sharpen
  * flag of the row's own fit mode (`sharpen.fit` for fit rows, `sharpen.cover` for the others),
- * and `animated` with `limits.animationFrames` for animated formats. An input that does not apply
- * is signed as null, never left out.
+ * and, for animated formats, `animated` with `limits.animationFrames` and the pixel budget
+ * `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames rendered. An input
+ * that does not apply is signed as null, never left out.
  */
 export function encodeSignature(
   config: ResizeConfig,
@@ -68,6 +69,11 @@ export function encodeSignature(
         ? {
             animated: config.animated,
             animationFrames: config.limits.animationFrames,
+            // The budget that also caps the frames rendered (src/processor.ts).
+            pixelBudget: Math.min(
+              config.limits.sourcePixels,
+              config.limits.inputPixels,
+            ),
           }
         : null,
       version: version ?? null,

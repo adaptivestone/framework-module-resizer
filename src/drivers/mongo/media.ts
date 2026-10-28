@@ -140,6 +140,26 @@ function withUndeclaredKeys(cast: Preview[], rows: Preview[]): Preview[] {
   });
 }
 
+// Every cast row, strict or loose, gets back the `storageRef` and `filters` it was given. The
+// module treats both as opaque: the storage ref is the driver's locator (its keys, such as a
+// grouping namespace, are not the module's to drop), and the filters are canonicalised by the
+// module and part of the preview identity (a cast could change their types and break the identity
+// match on read). castObject keeps only the declared paths at every depth, so a schema that
+// declares either as a nested shape would otherwise store a part of it.
+function withOpaqueValues(cast: Preview[], rows: Preview[]): Preview[] {
+  return cast.map((castRow, i) => {
+    const row = rows[i];
+    if (!row) {
+      return castRow;
+    }
+    const restored = { ...castRow, storageRef: row.storageRef };
+    if (Object.hasOwn(row, 'filters')) {
+      restored.filters = row.filters;
+    }
+    return restored;
+  });
+}
+
 // The preview row paths verify() requires, each with what is lost when Mongoose strips it.
 const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
   ['identity', 'a preview rendered twice would be stored twice'],
@@ -249,9 +269,10 @@ export class MongoMediaStore extends MediaStore {
    * and of two concurrent replacements of one identity one row is left. The rows removed come from
    * the same write's pre-image, not from a read before it. Mongoose does not cast an update
    * pipeline, so the rows are cast to the schema first when the model can (strict rows lose the
-   * keys their schema does not declare, loose rows keep them, as with appendPreviews); a value
-   * that cannot be cast rejects with Mongoose's ValidationError before anything is written. The
-   * rows it writes carry no sub-document `_id` (appended rows do); the module reads none.
+   * keys their schema does not declare, loose rows keep them, as with appendPreviews; `storageRef`
+   * and `filters` are stored as given, cast or not); a value that cannot be cast rejects with
+   * Mongoose's ValidationError before anything is written. The rows it writes carry no
+   * sub-document `_id` (appended rows do); the module reads none.
    */
   async replacePreviews(
     mediaId: string,
@@ -266,7 +287,10 @@ export class MongoMediaStore extends MediaStore {
       const cast = Array.from(
         model.castObject({ previews: unique }).previews ?? [],
       ) as Preview[];
-      written = hasLooseRows(model) ? withUndeclaredKeys(cast, unique) : cast;
+      written = withOpaqueValues(
+        hasLooseRows(model) ? withUndeclaredKeys(cast, unique) : cast,
+        unique,
+      );
     }
     const remove = [
       ...new Set([
