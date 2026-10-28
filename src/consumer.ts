@@ -80,8 +80,9 @@ export interface ConsumerDeps {
 // (`gateOwner`).
 // The Consumer keeps that lock for as long as the task can still run: one lease when the task
 // starts and on every heartbeat, the backoff plus one lease after a retry, the cooldown after a
-// dead-letter; it releases the lock once the task is completed. A task given back, or one whose
-// lease was lost, leaves the lock to the task's next holder. Every call is best effort: `false`
+// dead-letter; it releases the lock once the task is completed. A task given back leaves the lock
+// to the task's next holder. Once a task's lease is known to be lost, the Consumer makes no call
+// for it at all: no terminal call, no gate call, no event. Every call is best effort: `false`
 // (the lock expired, or another request took it over) is ignored, a failure is logged, and neither
 // changes the task's outcome or its events.
 interface GateLock {
@@ -213,7 +214,12 @@ export class Consumer {
           } else if (gate && !ended && !extendPending) {
             extendPending = true;
             gateCalls = gateCalls
-              .then(() => this.#holdGate(task, gate, leaseMs))
+              // Not after the task ended, or once its lease is known to be lost.
+              .then(() =>
+                ended || leaseLost
+                  ? undefined
+                  : this.#holdGate(task, gate, leaseMs),
+              )
               .finally(() => {
                 extendPending = false;
               });
@@ -258,6 +264,20 @@ export class Consumer {
       signal.removeEventListener('abort', onShutdown);
     }
     ended = true;
+    if (leaseLost) {
+      // Another worker may hold the task now. Any write would be stale: SQS accepts the delete of
+      // an old receipt, and both deliveries share the gate owner, so a completion here would
+      // release the gate of the delivery that runs it now. So no terminal call, no gate call and
+      // no event: the task is left to its next delivery.
+      taskController.abort();
+      logNeverThrow(
+        logger,
+        `resize worker: task ${task.taskId} lost its lease — left to its next delivery`,
+        undefined,
+        'warn',
+      );
+      return;
+    }
     await gateCalls;
 
     if (timedOut) {
@@ -285,7 +305,7 @@ export class Consumer {
           err,
         );
       }
-    } else if (signal.aborted && !leaseLost && !notRetryable(handlerError)) {
+    } else if (signal.aborted && !notRetryable(handlerError)) {
       // Stopped by the shutdown, not by its own failure: not an attempt. A non-retryable error
       // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
       await this.#giveBackAtShutdown(task);

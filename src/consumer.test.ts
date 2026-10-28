@@ -802,7 +802,7 @@ describe('Consumer shutdown', () => {
     assert.deepEqual(tasks.releaseCalls, []);
   });
 
-  test('a task whose lease was lost before the shutdown is not released', async () => {
+  test('a task whose lease was lost before the shutdown is neither released nor failed', async () => {
     const tasks = new ReleasingTaskQueue({
       timing: {
         ...fastTiming,
@@ -842,8 +842,9 @@ describe('Consumer shutdown', () => {
       },
       logger: silent,
     });
+    // The lease was known to be lost: no terminal call at all, so the new holder keeps it.
     assert.deepEqual(tasks.releaseCalls, []);
-    assert.deepEqual(failCalls, ['task-1']); // fenced: the new holder keeps it
+    assert.deepEqual(failCalls, []);
     assert.deepEqual(events, []);
     assert.equal(tasks.rows[0].token, 'another-worker');
   });
@@ -1202,6 +1203,82 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     assert.deepEqual(events, []);
     assert.deepEqual(calls, [`extend ${key}`]);
   });
+
+  for (const outcome of ['resolves', 'rejects'] as const) {
+    test(`after a known lease loss a handler that ${outcome} leads to no terminal call, no gate call and no event`, async () => {
+      const base = clockLocks();
+      const lockCalls: string[] = [];
+      const locks: LockStore = {
+        acquire: (lockKey, owner, ttlMs) => {
+          lockCalls.push('acquire');
+          return base.acquire(lockKey, owner, ttlMs);
+        },
+        extend: (lockKey, owner, ttlMs) => {
+          lockCalls.push('extend');
+          return base.extend(lockKey, owner, ttlMs);
+        },
+        release: (lockKey, owner) => {
+          lockCalls.push('release');
+          return base.release(lockKey, owner);
+        },
+      };
+      const tasks = new PlainTaskQueue({ timing: gateTiming });
+      assert.equal(await base.acquire(key, 'g1', 60_000), true);
+      await tasks.add({ ...newTask(), gateOwner: 'g1' });
+      // The renewal says the lease is gone, although the stale lease would still accept a write
+      // (as SQS accepts the delete of an old receipt): only the Consumer can hold back.
+      tasks.renew = async () => false;
+      const terminal: string[] = [];
+      for (const op of ['complete', 'fail'] as const) {
+        const real = tasks[op].bind(tasks) as (
+          ...a: unknown[]
+        ) => Promise<boolean>;
+        tasks[op] = (async (...args: unknown[]) => {
+          terminal.push(op);
+          return real(...args);
+        }) as never;
+      }
+      const warned: unknown[][] = [];
+      let settled = false;
+      let atStart: { owner: string; expiresAt: number } | undefined;
+      const events = await runUntil(
+        tasks,
+        (_task, { signal }) =>
+          new Promise<void>((resolve, reject) => {
+            atStart = base.entry(key);
+            signal.addEventListener(
+              'abort',
+              () => {
+                settled = true;
+                if (outcome === 'resolves') {
+                  resolve();
+                } else {
+                  reject(new Error('lease lost'));
+                }
+              },
+              { once: true },
+            );
+          }),
+        () => settled && warned.length > 0,
+        {
+          coordinationOf: () => ({ cooldownMs: 30_000, locks }),
+          logger: { ...silent, warn: (...a: unknown[]) => warned.push(a) },
+        },
+      );
+      const lock = base.entry(key);
+      assert.deepEqual(terminal, []);
+      assert.deepEqual(lockCalls, ['extend'], 'only the extend at the start');
+      assert.equal(lock?.owner, 'g1');
+      assert.deepEqual(lock, atStart, 'the gate entry is as the start left it');
+      assert.equal(tasks.rows[0].status, 'processing');
+      assert.deepEqual(events, []);
+      assert.equal(warned.length, 1);
+      assert.match(
+        String(warned[0][0]),
+        /lost its lease — left to its next delivery/,
+      );
+    });
+  }
 
   test('a task given back at shutdown leaves it alone after the start', async () => {
     const { locks, calls } = recordingLocks();
