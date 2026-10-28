@@ -1301,8 +1301,9 @@ describe('the gate lock on a task queue without gatesByTask', () => {
   });
 
   test('a slow lock store gets one heartbeat extend at a time, and the release follows the task', async () => {
-    const latencyMs = 150; // each extend takes longer than a heartbeat (50 ms)
-    const handlerMs = 400;
+    // Each extend takes longer than a heartbeat (100 ms), and less than the gate bound (200 ms).
+    const latencyMs = 150;
+    const handlerMs = 600;
     const base = clockLocks();
     const calls: { op: 'extend' | 'release'; at: number }[] = [];
     const slow: LockStore = {
@@ -1321,7 +1322,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     const tasks = new PlainTaskQueue({
       timing: {
         ...fastTiming,
-        leaseMs: 100,
+        leaseMs: 200,
       },
     });
     assert.equal(await slow.acquire(key, 'g1', 1000), true);
@@ -1339,8 +1340,8 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     const extendCalls = calls.filter((call) => call.op === 'extend');
     // The extends run one after another and each takes latencyMs, so while the handler runs at
     // most handlerMs / latencyMs of them start after the start extend, and at most one more is
-    // pending when it ends: 1 + 400 / 150 + 1 ≈ 4.7, so never more than 5. One extend per
-    // heartbeat would make about 1 + 400 / 50 = 9.
+    // pending when it ends: 1 + 600 / 150 = 5 at most. One extend per heartbeat would make about
+    // 1 + 600 / 100 = 7.
     assert.ok(
       extendCalls.length >= 2 && extendCalls.length <= 5,
       `${extendCalls.length} extends`,
@@ -1352,6 +1353,165 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     const gapMs = release.at - handlerEnded;
     assert.ok(gapMs < 350, `released ${gapMs} ms after the handler ended`);
     assert.equal(base.entry(key), undefined);
+  });
+});
+
+describe('a lock store that never answers', () => {
+  // The gate bound is min(leaseMs, 30 s): 300 ms here.
+  const leaseMs = 300;
+  const hangingTiming = {
+    ...fastTiming,
+    leaseMs,
+    retryBackoffMs: { base: 60_000, max: 60_000 },
+  };
+
+  /** clockLocks whose extend never settles; acquire and release answer. */
+  function hangingExtend() {
+    const base = clockLocks();
+    let extends_ = 0;
+    const locks: LockStore = {
+      acquire: base.acquire,
+      extend: () => {
+        extends_ += 1;
+        return new Promise<boolean>(() => {});
+      },
+      release: base.release,
+    };
+    return { base, locks, extends: () => extends_ };
+  }
+
+  test('each task completes about one bound after its handler, and the loop keeps consuming', async () => {
+    const { base, locks, extends: extendCount } = hangingExtend();
+    const tasks = new PlainTaskQueue({ timing: hangingTiming });
+    for (const [mediaId, owner] of [
+      ['m1', 'g1'],
+      ['m2', 'g2'],
+    ]) {
+      const gate = gateKey('default', 'default', mediaId, 'default');
+      assert.equal(await base.acquire(gate, owner, 60_000), true);
+      await tasks.add({ ...newTask({ mediaId }), gateOwner: owner });
+    }
+    const handled: Record<string, number> = {};
+    const completed: Record<string, number> = {};
+    const errors: unknown[][] = [];
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async (task) => {
+          handled[task.mediaId] = Date.now();
+        },
+        onEvent: (event, task) => {
+          if (event === 'completed') {
+            completed[task.mediaId] = Date.now();
+          }
+          if (Object.keys(completed).length === 2) {
+            stop.abort();
+          }
+        },
+        coordinationOf: () => ({ cooldownMs: 30_000, locks }),
+        logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(
+      tasks.rows.map(({ status }) => status),
+      ['completed', 'completed'],
+    );
+    for (const mediaId of ['m1', 'm2']) {
+      // The start extend hangs; the end waits for it one bound at most, then releases.
+      const waited = completed[mediaId] - handled[mediaId];
+      assert.ok(
+        waited <= leaseMs + 150,
+        `${mediaId} completed ${waited} ms after its handler`,
+      );
+      assert.equal(
+        base.entry(gateKey('default', 'default', mediaId, 'default')),
+        undefined,
+        'released',
+      );
+    }
+    assert.ok(extendCount() >= 2);
+    assert.ok(
+      errors.some(([message]) =>
+        /extending the gate lock of task task-1 timed out/.test(
+          String(message),
+        ),
+      ),
+    );
+  });
+
+  test('the task timeout aborts the handler at once, while a gate call hangs', async () => {
+    const { locks } = hangingExtend();
+    const tasks = new PlainTaskQueue({
+      timing: { ...hangingTiming, taskTimeoutMs: 50 },
+    });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    let startedAt = 0;
+    let abortedAt = 0;
+    const events = await runUntil(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>(() => {
+          startedAt = Date.now();
+          signal.addEventListener('abort', () => {
+            abortedAt = Date.now();
+          });
+        }),
+      () => tasks.rows[0].status === 'pending' && tasks.rows[0].attempts === 1,
+      { coordinationOf: () => ({ cooldownMs: 30_000, locks }) },
+    );
+    // Aborted at the timeout (50 ms), not after the hanging start extend's bound (300 ms).
+    assert.ok(abortedAt > 0, 'the handler was aborted');
+    assert.ok(
+      abortedAt - startedAt < 250,
+      `aborted ${abortedAt - startedAt} ms after the start`,
+    );
+    assert.deepEqual(
+      events.map(({ event, error }) => [
+        event,
+        (error as { code?: string }).code,
+      ]),
+      [['failed', 'RESIZE_TASK_TIMEOUT']],
+    );
+  });
+
+  test('run() resolves within one bound after the shutdown', async () => {
+    const { locks } = hangingExtend();
+    const tasks = new ReleasingTaskQueue({ timing: hangingTiming });
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const stop = new AbortController();
+    let stoppedAt = 0;
+    const loop = consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => {
+        const stopped = stoppedByShutdown(task, opts);
+        // The deploy arrives while the start extend hangs.
+        setTimeout(() => {
+          stoppedAt = Date.now();
+          stop.abort();
+        }, 50);
+        return stopped;
+      },
+      coordinationOf: () => ({ cooldownMs: 30_000, locks }),
+      logger: silent,
+    });
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      await loop;
+    } finally {
+      clearTimeout(timer);
+    }
+    const tookMs = Date.now() - stoppedAt;
+    assert.ok(
+      tookMs <= leaseMs + 150,
+      `run() resolved ${tookMs} ms after the abort`,
+    );
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
   });
 });
 

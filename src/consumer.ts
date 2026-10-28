@@ -84,7 +84,9 @@ export interface ConsumerDeps {
 // to the task's next holder. Once a task's lease is known to be lost, the Consumer makes no call
 // for it at all: no terminal call, no gate call, no event. Every call is best effort: `false`
 // (the lock expired, or another request took it over) is ignored, a failure is logged, and neither
-// changes the task's outcome or its events.
+// changes the task's outcome or its events. A call that has not answered within the gate bound
+// (min(leaseMs, 30 s)) counts as failed, and a task's end waits for its gate calls for at most one
+// bound in all, so a hanging lock store never holds a task, the loop or the shutdown longer.
 interface GateLock {
   locks: LockStore;
   key: string;
@@ -95,11 +97,20 @@ interface GateLock {
 // database is not hit (and logged) by every worker every idlePollMs.
 const MAX_CLAIM_ERROR_BACKOFF = 10;
 
+// The longest wait for the lock store, whatever the lease: see GateLock.
+const MAX_GATE_WAIT_MS = 30_000;
+
+// A gate call that has not answered in time.
+const TIMED_OUT = Symbol('timed out');
+
 export class Consumer {
   readonly #deps: ConsumerDeps;
+  // How long one gate call, or all the gate calls at a task's end, may take (see GateLock).
+  readonly #gateWaitMs: number;
 
   constructor(deps: ConsumerDeps) {
     this.#deps = deps;
+    this.#gateWaitMs = Math.min(deps.timing.leaseMs, MAX_GATE_WAIT_MS);
   }
 
   /**
@@ -200,7 +211,8 @@ export class Consumer {
     // most of the lock's time. Each heartbeat that renewed the lease extends it again, until the
     // task ends. Gate calls run one after another, so the one made after the task lands last. A
     // heartbeat skips its extend while an earlier one is still pending, which serves as well: a
-    // slow lock store gets no backlog, and the task's end waits for at most that one call.
+    // slow lock store gets no backlog, and the task's end waits for at most that one call, and
+    // never longer than the gate bound.
     const gate = this.#gate(task, coordination);
     let ended = false;
     let extendPending = false;
@@ -264,6 +276,11 @@ export class Consumer {
       signal.removeEventListener('abort', onShutdown);
     }
     ended = true;
+    if (timedOut) {
+      // Abort at once: the handler must not wait behind a pending gate call. The detached handler
+      // is harmless: later writes are token-fenced, and previews it pushes are valid ones.
+      taskController.abort();
+    }
     if (leaseLost) {
       // Another worker may hold the task now. Any write would be stale: SQS accepts the delete of
       // an old receipt, and both deliveries share the gate owner, so a completion here would
@@ -278,12 +295,13 @@ export class Consumer {
       );
       return;
     }
-    await gateCalls;
+    // From here on every gate call of this task shares one deadline: the task's end, and with it
+    // the loop and the shutdown, waits for the lock store for at most one gate bound in all. A
+    // call made after the deadline is still sent, but its answer is not waited for.
+    const gateDeadline = Date.now() + this.#gateWaitMs;
+    await this.#within(gateCalls, gateDeadline);
 
     if (timedOut) {
-      // The detached handler is harmless: later writes are token-fenced, and previews it pushes
-      // are valid ones.
-      taskController.abort();
       await this.#finish(
         task,
         coordination,
@@ -291,11 +309,13 @@ export class Consumer {
           `resize worker: task ${task.taskId} exceeded taskTimeoutMs (${taskTimeoutMs}ms)`,
           { code: 'RESIZE_TASK_TIMEOUT' },
         ),
+        false,
+        gateDeadline,
       );
     } else if (ok) {
       try {
         if (await tasks.complete(task)) {
-          await this.#releaseGate(task, gate);
+          await this.#releaseGate(task, gate, gateDeadline);
           await this.#report('completed', task);
         }
       } catch (err) {
@@ -310,7 +330,7 @@ export class Consumer {
       // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
       await this.#giveBackAtShutdown(task);
     } else {
-      await this.#finish(task, coordination, handlerError);
+      await this.#finish(task, coordination, handlerError, false, gateDeadline);
     }
   }
 
@@ -334,13 +354,14 @@ export class Consumer {
   /**
    * Retry the task after its backoff, or dead-letter it (forced, not retryable, last attempt) with
    * its Resizer's cooldown. Its gate lock is then held until the retry is due plus one lease, or
-   * for the cooldown.
+   * for the cooldown; the gate call waits until `gateDeadline` at most.
    */
   async #finish(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
     error: unknown,
     forceDead = false,
+    gateDeadline = Date.now() + this.#gateWaitMs,
   ): Promise<void> {
     const { tasks, timing, logger } = this.#deps;
     const dead =
@@ -352,7 +373,7 @@ export class Consumer {
         const cooldownMs =
           coordination?.cooldownMs ?? defaultCoordination.cooldownMs;
         if (await tasks.fail(task, 'dead', message, { cooldownMs })) {
-          await this.#holdGate(task, gate, cooldownMs);
+          await this.#holdGate(task, gate, cooldownMs, gateDeadline);
           await this.#report('deadLettered', task, error);
         }
         return;
@@ -363,6 +384,7 @@ export class Consumer {
           task,
           gate,
           Math.max(0, retryAt.getTime() - Date.now()) + timing.leaseMs,
+          gateDeadline,
         );
         await this.#report('failed', task, error);
       }
@@ -395,42 +417,102 @@ export class Consumer {
     };
   }
 
-  /** Move the gate lock's expiry to `ttlMs` from now, when there is one. Never rejects. */
+  /**
+   * Move the gate lock's expiry to `ttlMs` from now, when there is one, waiting until `deadline`
+   * at most (default: one gate bound). Never rejects.
+   */
   async #holdGate(
     task: ClaimedTask,
     gate: GateLock | undefined,
     ttlMs: number,
+    deadline = Date.now() + this.#gateWaitMs,
   ): Promise<void> {
     if (!gate) {
       return;
     }
-    try {
-      await gate.locks.extend(gate.key, gate.owner, ttlMs);
-    } catch (err) {
-      logNeverThrow(
-        this.#deps.logger,
-        `resize worker: extending the gate lock of task ${task.taskId} failed`,
-        err,
-      );
-    }
+    await this.#gateCall(
+      task,
+      'extending',
+      () => gate.locks.extend(gate.key, gate.owner, ttlMs),
+      deadline,
+    );
   }
 
-  /** Release the gate lock, when there is one. Never rejects. */
+  /** Release the gate lock, when there is one, waiting until `deadline` at most. Never rejects. */
   async #releaseGate(
     task: ClaimedTask,
     gate: GateLock | undefined,
+    deadline: number,
   ): Promise<void> {
     if (!gate) {
       return;
     }
+    await this.#gateCall(
+      task,
+      'releasing',
+      () => gate.locks.release(gate.key, gate.owner),
+      deadline,
+    );
+  }
+
+  /**
+   * One lock store call for the gate lock of `task`, made at once. The Consumer waits for its
+   * answer until `deadline` (only for an answer already there, once that has passed); a call still
+   * pending then goes on without it. Resolves with the answer, or undefined when the call rejected
+   * or did not answer in time (both logged, as failed calls). Never rejects.
+   */
+  async #gateCall(
+    task: ClaimedTask,
+    action: 'extending' | 'releasing',
+    call: () => Promise<boolean>,
+    deadline: number,
+  ): Promise<boolean | undefined> {
+    const { logger } = this.#deps;
+    const what = `${action} the gate lock of task ${task.taskId}`;
+    // A rejection is logged whenever it comes, so a call the worker stopped waiting for never
+    // becomes an unhandled rejection.
+    const failed = (err: unknown) => {
+      logNeverThrow(logger, `resize worker: ${what} failed`, err);
+      return undefined;
+    };
+    let answer: Promise<boolean | undefined>;
     try {
-      await gate.locks.release(gate.key, gate.owner);
+      answer = Promise.resolve(call()).then((held) => held, failed);
     } catch (err) {
-      logNeverThrow(
-        this.#deps.logger,
-        `resize worker: releasing the gate lock of task ${task.taskId} failed`,
-        err,
+      return failed(err);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<typeof TIMED_OUT>((resolve) => {
+      timer = setTimeout(
+        () => resolve(TIMED_OUT),
+        Math.max(0, deadline - Date.now()),
       );
+    });
+    try {
+      const result = await Promise.race([answer, late]);
+      if (result === TIMED_OUT) {
+        logNeverThrow(
+          logger,
+          `resize worker: ${what} timed out (the lock store did not answer within ${this.#gateWaitMs} ms) — the worker goes on without it`,
+        );
+        return undefined;
+      }
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Wait for `calls` until `deadline` at most; whatever is still pending then goes on alone. */
+  async #within(calls: Promise<void>, deadline: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+    });
+    try {
+      await Promise.race([calls, late]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
