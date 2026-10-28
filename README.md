@@ -112,7 +112,12 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 1. Set `queue: { driver: 'database' }` in the config (tasks wait in the `ResizeTask` model), or
    `{ driver: 'sqs', queueUrl }`.
 2. Set `worker.enabled: true` in the config.
-3. Create the indexes through your migration process.
+3. Create the indexes through your migration process, before the worker starts: the framework CLI
+   that runs the worker turns Mongoose's `autoIndex` off, so the worker builds none and stops with
+   `RESIZE_MONGO_INDEX_MISSING` without the gate index, on a fresh database too. An API with
+   `autoIndex` on builds them, and its `verify()` waits for that build, but a migration that runs
+   before both is the order that always works, also when a new pipeline needs the worker deployed
+   before the API requests it.
 4. Run `npm run cli ResizeWorker` as a separate process.
 
 The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
@@ -308,9 +313,12 @@ exactly `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with
 a collection that does not exist yet has none). Before it reads them it waits for an opening
 connection and for the model's own `init()`: with Mongoose's `autoIndex` on (an API server),
 Mongoose is still building the declared indexes at boot, so the check waits for that build (a
-failed build is the cause of the missing-index error); with `autoIndex` off it builds nothing. A
-connection that is closed rejects at once with `RESIZE_MONGO_NOT_CONNECTED`. It never creates an
-index: create the gate index through your migration process. `MongoTaskQueue` sets `gatesByTask` and `claimFilters`: its rows are the gate (see
+failed build is the cause of the missing-index error); with `autoIndex` off (the framework CLI
+that runs the worker, and the models `mongoParts` registers) it builds nothing. A connection that
+is closed (never opened, or disconnected) rejects at once with `RESIZE_MONGO_NOT_CONNECTED`; one
+that is opening and fails rejects with it once the driver gives up (its
+`serverSelectionTimeoutMS`, 30 s by default), and the message names the driver's error. It never
+creates an index: create the gate index through your migration process. `MongoTaskQueue` sets `gatesByTask` and `claimFilters`: its rows are the gate (see
 [Coordination](#coordination)), and a claim takes only tasks of the Resizers the worker serves. Its
 `add()` counts a duplicate key as the gate only on the gate index; a duplicate key on another unique
 index of your model is logged, and the add is `unconfirmed`.
@@ -472,7 +480,7 @@ Resizer's [coordination](#coordination). The timing defaults are `defaultQueueOp
 | `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
 | `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
-| `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. Claim errors back off from it up to 10× |
+| `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. The claim index does not hold the Resizer, so a claim reads past every due task of a Resizer that no worker on the queue serves: give a Resizer that has no worker its own queue. Claim errors back off from it up to 10× |
 | `taskTimeoutMs` | `600000` | A longer task is failed |
 
 Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
@@ -569,7 +577,8 @@ file. Missing values take `defaultCoordination` from `…/config/resize.js` (the
 `CoordinationOptions`); an eager-only Resizer never reads it. Only the core validates it, when the
 Resizer sets up its task queue: a section that is not an object, or a value that is not a positive
 safe integer (ms), is `ResizeConfigError` `RESIZE_CONFIG_COORDINATION_INVALID` (the message names
-the key, or the value when the whole section is wrong); it degrades like a task queue that cannot
+the key, or the value when the whole section is wrong); `0` is rejected for both values (the
+minimum is 1 ms), so the cooldown cannot be turned off. It degrades like a task queue that cannot
 be used (see `ready()` under [Drivers](#drivers)), in a config file too, and a section set to
 `null` is invalid, not the defaults. No value depends on the queue's lease. Each dead-letter gets
 the `cooldownMs` of the task's own Resizer.
@@ -634,6 +643,27 @@ await ResizeTask.updateOne(
 - **Your app's responsibilities:** deleting media and their storage objects, access checks, the
   response shape, migrating legacy data, and domain image analysis such as face blurring (in
   pipeline steps).
+
+### `prewarm()` issues
+
+`prewarm()` never throws. A requested variant without a confirmed task is in `result.unconfirmed`,
+and `result.issues` says why, each issue with the variants it covers and `retryable`: whether
+calling `prewarm()` again can help without a change to the code, the config or the data.
+
+| `code` | When | `retryable` |
+|---|---|---|
+| `RESIZE_PIPELINE_UNKNOWN` | The pipeline (any name but `'default'`) is not registered on this Resizer; nothing is queued | `false` |
+| `RESIZE_FORMAT_NOT_CONFIGURED` | A requested format (in the call, or from a `beforeEnqueue` tap) has no `encode.formats` entry; it is never queued | `false` |
+| `RESIZE_ENQUEUE_NO_ORIGINAL` | The media has no `original.storageRef` | `false` |
+| `RESIZE_ENQUEUE_NO_QUEUE` | The Resizer has no task queue (eager only) | `false` |
+| `RESIZE_ENQUEUE_VARIANT_CONFLICT` | Different payloads share one preview identity, in the request (e.g. after a `beforeEnqueue` tap) or in the active task, so none of them can be confirmed | `false` |
+| `RESIZE_TASK_IN_FLIGHT` | A task queue with `gatesByTask` (Mongo): a task of this Resizer, media, pipeline and queue is active, or a dead one is cooling down, and does not hold these variants | `true`: call again after it ends |
+| `RESIZE_ENQUEUE_LOCK_CONTENDED` | A task queue without `gatesByTask` (SQS): the gate lock is held (a task queued, running or waiting for a retry, a dead task's cooldown, or the one-lease hold after an add the queue did not confirm); SQS cannot say which variants that task holds | `true`: call again after it ends |
+| `RESIZE_ENQUEUE_LOCK_FAILED` | A task queue without `gatesByTask`: acquiring the gate lock threw (logged) | `true` |
+| `RESIZE_ENQUEUE_QUEUE_FAILED` | `add()` threw (logged), e.g. an SQS send error, or a queue name the `SqsTaskQueue` has no URL for (`RESIZE_SQS_QUEUE_UNKNOWN`); the task may still be stored | `true` |
+| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue cannot say whether it stored the task (on Mongo a write error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`; `false` for a value in none of the shapes |
+| `RESIZE_ENQUEUE_CONFIRM_FAILED` | After an `in-flight` add, `findActive()` threw (logged), so what the active task holds is unknown | `true` |
+| `RESIZE_ENQUEUE_INTERNAL_ERROR` | An unexpected error (e.g. a media without an id, `RESIZE_MEDIA_NO_ID`), a Resizer that could not start (a part that did not load, an invalid config), or a task queue that cannot be used (the error `verify()` reports, e.g. `RESIZE_LOCKS_REQUIRED`); the message is the error's | `false` when the error is a `ResizeError` with `retryable: false`, or a `ResizeMediaError`, `ResizeConfigError` or `ResizeSetupError` (or a subclass); otherwise `true` |
 
 ## Development
 
