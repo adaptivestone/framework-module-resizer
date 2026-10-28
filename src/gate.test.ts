@@ -149,6 +149,8 @@ test('a task in retry backoff blocks new tasks for its media and pipeline', asyn
   await readsAtOnce(read, 10);
   assert.equal(tasks.rows.length, 1);
   assert.equal(tasks.rows[0].status, 'pending');
+  // In a real backoff: the retry is due about 60 s from now, not at once.
+  assert.ok(tasks.rows[0].availableAt - Date.now() > 59_000);
   assert.equal(tasks.added.length, 11, 'the 10 reads reached the queue');
 });
 
@@ -157,7 +159,7 @@ test('the SQS path holds the gate through the backoff and releases it on complet
     timing: {
       leaseMs: 1000,
       idlePollMs: 5,
-      retryBackoffMs: { base: 100, max: 100 },
+      retryBackoffMs: { base: 500, max: 500 },
     },
   });
   const locks = clockLocks();
@@ -192,10 +194,11 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   await read();
   assert.equal(tasks.rows.length, 1);
   await work(resizer, stop);
-  // After the retry was scheduled: held for the 100 ms backoff plus one 1000 ms lease.
+  // After the retry was scheduled: held for the 500 ms backoff plus one 1000 ms lease, so more
+  // than the lease alone.
   const { left } = atFailure;
   assert.ok(
-    left !== undefined && left >= 1000 && left <= 1100,
+    left !== undefined && left >= 1400 && left <= 1500,
     `held for ${left} ms`,
   );
   assert.equal(atFailure.rows, 1, 'reads during the backoff queue nothing');
@@ -203,4 +206,5 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   assert.equal(atCompletion.lock, null, 'the gate lock is released');
   assert.equal(atCompletion.rows, 2);
   assert.equal(tasks.rows[0].status, 'completed');
+  assert.equal(downloads, 2, 'the failed delivery, then its retry');
 });
