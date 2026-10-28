@@ -111,6 +111,9 @@ export class Dispatcher {
   #warnedInvalidAdd = false;
   // So is an `in-flight` without a task id from a queue that gates by task.
   #warnedIdlessInFlight = false;
+  // An `unconfirmed` add on the read path is logged once, then again only after an add was
+  // confirmed: a queue that cannot store tasks (e.g. an outdated model) would log every read.
+  #loggedUnconfirmed = false;
 
   constructor(deps: DispatcherDeps) {
     this.#deps = deps;
@@ -136,9 +139,12 @@ export class Dispatcher {
       case 'added':
         return variants.length;
       case 'unconfirmed':
-        logger.error(
-          `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it`,
-        );
+        if (!this.#loggedUnconfirmed) {
+          this.#loggedUnconfirmed = true;
+          logger.error(
+            `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it (further unconfirmed adds are not logged until one is confirmed)`,
+          );
+        }
         return 0;
       case 'add-failed':
         logger.error(
@@ -348,6 +354,9 @@ export class Dispatcher {
       return { status: 'add-failed', error };
     }
     if (isTaskAddResult(result)) {
+      if (result.status !== 'unconfirmed') {
+        this.#loggedUnconfirmed = false; // the queue confirms again: log the next one
+      }
       return result;
     }
     if (!this.#warnedInvalidAdd) {

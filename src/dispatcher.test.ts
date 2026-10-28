@@ -400,6 +400,28 @@ describe('a task queue without gatesByTask', () => {
     }
   });
 
+  test('an unconfirmed add on the read path is logged once, and again after an add was confirmed', async () => {
+    const tasks = new MemoryTaskQueue();
+    const realAdd = tasks.add.bind(tasks);
+    let confirm = false;
+    tasks.add = async (task) =>
+      confirm ? realAdd(task) : { status: 'unconfirmed' };
+    const d = makeDispatcher({ tasks });
+    const unconfirmedLines = () =>
+      errors.filter(([message]) =>
+        /did not confirm the task/.test(String(message)),
+      ).length;
+    for (let i = 0; i < 5; i++) {
+      assert.equal(await d.enqueue(requestFor([v300])), 0);
+    }
+    assert.equal(unconfirmedLines(), 1);
+    confirm = true;
+    assert.equal(await d.enqueue(requestFor([v300])), 1);
+    confirm = false;
+    assert.equal(await d.enqueue(requestFor([v300], { mediaId: 'm2' })), 0);
+    assert.equal(unconfirmedLines(), 2);
+  });
+
   test('the one-lease hold never exceeds gateTtlMs (a lease longer than the gate lock)', async () => {
     const now = 5_000;
     const tasks = new PlainTaskQueue();

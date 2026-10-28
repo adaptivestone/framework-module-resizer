@@ -453,7 +453,7 @@ describe('MongoTaskQueue setup', () => {
     }
   });
 
-  test('a model without active fails at first use, verify() or not: adds are unconfirmed and logged, and store nothing', async () => {
+  test('a model without active fails at first use, verify() or not: adds are unconfirmed, logged once, and store nothing', async () => {
     // An ejected model from before the gate: a strict schema would drop `active` from every
     // insert, so every add would store a task and the gate would be off.
     const { active: _active, ...fields } = resizeTaskFields('File');
@@ -473,14 +473,21 @@ describe('MongoTaskQueue setup', () => {
       Array.from({ length: 20 }, () => ({ status: 'unconfirmed' })),
     );
     assert.equal(await Ejected.countDocuments({}), 0);
-    assert.equal(errors.length, 20);
-    for (const [message, error] of errors) {
-      assert.match(String(message), /adding a task failed/);
-      assert.equal(
-        (error as { code?: unknown }).code,
-        'RESIZE_MONGO_MODEL_OUTDATED',
-      );
-    }
+    // One line for the model, not one per add.
+    assert.equal(errors.length, 1);
+    const [[message, error]] = errors;
+    assert.match(
+      String(message),
+      /outdated \(logged once\) — every add is unconfirmed until the model is fixed/,
+    );
+    assert.equal(
+      (error as { code?: unknown }).code,
+      'RESIZE_MONGO_MODEL_OUTDATED',
+    );
+    assert.deepEqual(await tasks.add(request({ mediaId })), {
+      status: 'unconfirmed',
+    });
+    assert.equal(errors.length, 1, 'still logged once');
     // Every other method rejects with it.
     const outdated = (error: unknown) =>
       error instanceof ResizeSetupError &&
@@ -496,6 +503,40 @@ describe('MongoTaskQueue setup', () => {
     await assert.rejects(tasks.complete(claimed), outdated);
     await assert.rejects(tasks.fail(claimed, 'dead', 'x'), outdated);
     await assert.rejects(tasks.findActive(claimed), outdated);
+  });
+
+  test('20 reads with an outdated model log one line from the queue and one from the read path', async () => {
+    const { cooldownUntil: _cooldownUntil, ...fields } =
+      resizeTaskFields('File');
+    const Ejected =
+      connection.models.EjectedWithoutCooldown ??
+      connection.model(
+        'EjectedWithoutCooldown',
+        new mongoose.Schema(fields, { timestamps: true, autoIndex: false }),
+      );
+    const { errors } = configureQueue(() => Ejected);
+    const resizer = new Resizer({
+      storage: fakeStorage,
+      config: makeImageConfig({ formats: ['webp'] }),
+      tasks,
+      media: fakeMedia(),
+      logger,
+    });
+    const media = { id: fid(), original: { storageRef: { key: 'o' } } };
+    for (let i = 0; i < 20; i++) {
+      await resizer.resolve({ media, sizes: [{ width: 10, height: 10 }] });
+    }
+    assert.equal(await Ejected.countDocuments({}), 0);
+    assert.deepEqual(
+      errors.map(([message]) =>
+        /the ResizeTask model is outdated/.test(String(message))
+          ? 'queue'
+          : /did not confirm the task/.test(String(message))
+            ? 'read path'
+            : String(message),
+      ),
+      ['queue', 'read path'],
+    );
   });
 
   test('the schema of a model is checked once, at its first use', async () => {

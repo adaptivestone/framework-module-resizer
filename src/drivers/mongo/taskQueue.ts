@@ -19,7 +19,7 @@ import {
   type TaskAddResult,
   TaskQueue,
 } from '../../contracts/taskQueue.ts';
-import { ResizeSetupError } from '../../errors.ts';
+import { ResizeError, ResizeSetupError } from '../../errors.ts';
 import { randomHex } from '../../helpers/random.ts';
 import type {
   EnqueueReceipt,
@@ -71,6 +71,8 @@ const WRITTEN_PATHS = [
 // The schema check of each model: its RESIZE_MONGO_MODEL_OUTDATED error, or null when the schema
 // has every written path (or the model exposes none). A model is checked once.
 const schemaErrors = new WeakMap<object, ResizeSetupError | null>();
+// The schema errors add() has logged: one line per model, not one per read.
+const loggedSchemaErrors = new WeakSet<object>();
 
 /** The model's RESIZE_MONGO_MODEL_OUTDATED error, or undefined when its schema is complete. */
 function schemaError(model: TaskModel): ResizeSetupError | undefined {
@@ -165,8 +167,8 @@ export class MongoTaskQueue extends TaskQueue {
   // At runtime a missing model is logged, not thrown: reads and prewarm never throw (verify()
   // reports it at boot). A model whose schema lacks a field this queue writes throws
   // RESIZE_MONGO_MODEL_OUTDATED on first use, whether or not verify() ran: a strict schema would
-  // drop the field silently (without `active` every add would store a task). add() logs it and
-  // resolves unconfirmed; every other method rejects with it.
+  // drop the field silently (without `active` every add would store a task). add() logs it once
+  // per model and resolves unconfirmed every time; every other method rejects with it.
   #model(): TaskModel | null {
     const model = this.#getModel();
     if (!model) {
@@ -221,6 +223,19 @@ export class MongoTaskQueue extends TaskQueue {
       // without an id.
       return { status: 'in-flight' };
     } catch (err) {
+      if (
+        ResizeError.isResizeError(err) &&
+        err.code === 'RESIZE_MONGO_MODEL_OUTDATED'
+      ) {
+        if (!loggedSchemaErrors.has(err)) {
+          loggedSchemaErrors.add(err);
+          this.#logger.error(
+            'resize mongo queue: the ResizeTask model is outdated (logged once) — every add is unconfirmed until the model is fixed',
+            err,
+          );
+        }
+        return { status: 'unconfirmed' };
+      }
       this.#logger.error(
         `resize mongo queue: adding a task failed for media ${task.mediaId}`,
         err,
