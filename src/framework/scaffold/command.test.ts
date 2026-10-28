@@ -453,21 +453,31 @@ describe('runScaffold — --check', () => {
     ['availableAt'],
     ['active'],
     ['cooldownUntil'],
+    ['startedAt'],
+    ['finishedAt'],
+    ['startedAt', 'finishedAt'],
     ['resizer', 'queue', 'availableAt', 'active', 'cooldownUntil'],
   ]) {
     test(`an ejected model missing ${fields.join(', ')} is drift even with its indexes intact`, async () => {
       await run(['--eject']);
-      let model = await read(MODEL);
+      const ejected = await read(MODEL);
+      let model = ejected;
       for (const field of fields) {
-        model = model.replace(
+        const without = model.replace(
           new RegExp(`^ {6}${field}: \\{[^\\n]+\\n`, 'm'),
           '',
         );
+        assert.notEqual(without, model, `the template declares ${field}`);
+        model = without;
       }
       await writeFile(join(root, MODEL), model);
       const { code, out } = await run(['--check']);
       assert.equal(code, 1);
       assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
+      assert.match(
+        out,
+        /an ejected BaseModel with resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields/,
+      );
       assert.match(
         out,
         /port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields \(and the gate index\)/,
@@ -482,7 +492,7 @@ describe('runScaffold — --check', () => {
     });
   }
 
-  test('--check reports an ejected model without startedAt or finishedAt as drift naming them; the --eject template passes', async () => {
+  test('the --eject template declares startedAt and finishedAt and passes --check', async () => {
     await run(['--eject']);
     const ejected = await read(MODEL);
     assert.match(ejected, /startedAt:\s*\{\s*type:\s*Date\s*\}/);
@@ -490,26 +500,6 @@ describe('runScaffold — --check', () => {
     const clean = await run(['--check']);
     assert.equal(clean.code, 0, clean.out);
     assert.doesNotMatch(clean.out, /drift/);
-
-    for (const field of ['startedAt', 'finishedAt']) {
-      const model = ejected.replace(
-        new RegExp(`^ {6}${field}: \\{[^\\n]+\\n`, 'm'),
-        '',
-      );
-      assert.notEqual(model, ejected, `the template declares ${field}`);
-      await writeFile(join(root, MODEL), model);
-      const { code, out } = await run(['--check']);
-      assert.equal(code, 1, out);
-      assert.match(out, /drift\s+src\/models\/ResizeTask\.ts/);
-      assert.match(
-        out,
-        /an ejected BaseModel with resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields/,
-      );
-      assert.match(
-        out,
-        /port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields \(and the gate index\)/,
-      );
-    }
   });
 
   test('an old model shim importing the removed subpath → exit 1 + drift', async () => {
@@ -643,6 +633,89 @@ describe('runScaffold — --check', () => {
       assert.equal(commented.code, 0, commented.out);
       assert.doesNotMatch(commented.out, /drift/);
     }
+  });
+
+  test('a queue entry nested in queues is no drift; only a top-level queue object is', async () => {
+    await run([]);
+    const config = (queues: string) =>
+      [
+        "import { defaultFrameworkResizeConfig, type FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';",
+        '',
+        'export default {',
+        '  ...defaultFrameworkResizeConfig,',
+        "  mediaModelName: 'File', // the host's media model { (a brace in a comment)",
+        "  storage: { driver: 'local', rootDir: './var/{media}', publicBaseUrl: '/media' },",
+        "  queue: 'queue',",
+        queues,
+        '} satisfies FrameworkResizeConfig;',
+        '',
+      ].join('\n');
+    for (const queues of [
+      "  queues: { queue: { driver: 'database' } },",
+      [
+        '  queues: {',
+        "    default: { driver: 'database' },",
+        "    queue: { driver: 'sqs', queueUrl: 'https://sqs.example/{q}' },",
+        '  },',
+      ].join('\n'),
+    ]) {
+      await writeFile(join(root, CONFIG), config(queues));
+      const { code, out } = await run(['--check']);
+      assert.equal(code, 0, out);
+      assert.match(out, /ok\s+src\/config\/resize\.ts/);
+    }
+    await writeFile(
+      join(root, CONFIG),
+      config("  queues: { queue: { driver: 'database' } },").replace(
+        "  queue: 'queue',",
+        "  queue: { driver: 'database' },",
+      ),
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 1, out);
+    assert.match(
+      out,
+      /drift\s+src\/config\/resize\.ts — uses the old config shape/,
+    );
+  });
+
+  test('an old-shape environment override is drift naming that file; a new-shape one passes', async () => {
+    await run([]);
+    const production = 'src/config/resize.production.ts';
+    await writeFile(
+      join(root, production),
+      [
+        "import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';",
+        '',
+        'export default {',
+        "  queue: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },",
+        '} satisfies Partial<FrameworkResizeConfig>;',
+        '',
+      ].join('\n'),
+    );
+    for (const flags of [['--check'], ['--check', '--eager']]) {
+      const { code, out } = await run(flags);
+      assert.equal(code, 1, out);
+      assert.match(out, /ok\s+src\/config\/resize\.ts/);
+      assert.match(
+        out,
+        /drift\s+src\/config\/resize\.production\.ts — uses the old config shape/,
+      );
+    }
+    await writeFile(
+      join(root, production),
+      [
+        "import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';",
+        '',
+        'export default {',
+        "  queues: { default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' } },",
+        '} satisfies Partial<FrameworkResizeConfig>;',
+        '',
+      ].join('\n'),
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 0, out);
+    assert.match(out, /ok\s+src\/config\/resize\.production\.ts/);
   });
 
   test('no line of either config template matches the old-shape check, comments included', async () => {

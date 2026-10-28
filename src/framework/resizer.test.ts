@@ -6,6 +6,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import sharp from 'sharp';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { LeasedTask } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
@@ -905,6 +906,27 @@ test("a file without queue uses 'default'; without a 'default' entry that is RES
   assert.deepEqual(decision, { ready: [], missing: [] });
 });
 
+test('a queues entry set to undefined (an environment file removing it) is not defined: a Resizer naming it is RESIZE_CONFIG_QUEUE_UNKNOWN', async () => {
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queues: { ...databaseQueues, bulk: undefined },
+    }),
+    resizeBulk: makeResizeConfig({ storage: localStorage, queue: 'bulk' }),
+  });
+  const r = new FrameworkResizer();
+  await r.ready();
+  assert.equal(r.queueName, 'default');
+  const bulk = new FrameworkResizer({ name: 'bulk', configName: 'resizeBulk' });
+  await assert.rejects(
+    () => bulk.ready(),
+    configError(
+      'RESIZE_CONFIG_QUEUE_UNKNOWN',
+      "Resizer 'bulk' queues to 'bulk', which `queues` in src/config/resize.ts does not define",
+    ),
+  );
+});
+
 test('without queues a Resizer is eager only; queue: false is eager only beside queues', async () => {
   installApp({ resize: makeResizeConfig({ storage: localStorage }) });
   const none = new FrameworkResizer();
@@ -997,6 +1019,69 @@ test('tasks from code never choose a lane from queues: an undefined queue name i
   });
   await coded.verify();
   assert.equal(coded.queueName, 'default');
+});
+
+test('with tasks in code, a broken process section is the degraded mode: stored previews are served, nothing is queued, generate() and invalidate() work, prewarm() and verify() report it', async () => {
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      worker: { enabled: 'yes' } as never,
+    }),
+  });
+  const red = await sharp({
+    create: { width: 32, height: 32, channels: 3, background: '#f00' },
+  })
+    .png()
+    .toBuffer();
+  const tasks = new MemoryTaskQueue();
+  const r = new FrameworkResizer({
+    storage: {
+      download: async () => red,
+      upload: async ({ key }) => ({ key }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia(),
+    tasks,
+  });
+  await r.ready();
+  const media = {
+    id: 'm1',
+    original: {
+      storageRef: { key: 'k' },
+      format: 'png',
+      width: 32,
+      height: 32,
+    },
+  };
+
+  const { created, failed } = await r.generate({
+    media,
+    sizes,
+    formats: ['webp'],
+  });
+  assert.equal(created.length, 1);
+  assert.equal(failed, 0);
+
+  const { decision } = await r.resolve({
+    media,
+    sizes: [...sizes, { width: 20, height: 20 }],
+    formats: ['webp'],
+  });
+  assert.equal(decision.ready.length, 1);
+  assert.equal(decision.missing.length, 1);
+  assert.deepEqual(tasks.added, []);
+  // prewarm() reports it; invalidate() works.
+  const warmed = await r.prewarm({ media, sizes: [{ width: 20, height: 20 }] });
+  assert.equal(warmed.status, 'incomplete');
+  assert.equal(warmed.issues[0]?.retryable, false);
+  assert.match(warmed.issues[0]?.message ?? '', /`worker\.enabled`/);
+  assert.deepEqual(tasks.added, []);
+  assert.deepEqual(await r.invalidate({ media }), []);
+
+  await assert.rejects(
+    r.verify(),
+    configError('RESIZE_CONFIG_INVALID', 'worker'),
+  );
 });
 
 test('a queueName option is readable before first use; a name from the file is RESIZE_NOT_READY until then', async () => {

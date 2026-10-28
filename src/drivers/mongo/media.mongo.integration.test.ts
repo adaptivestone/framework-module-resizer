@@ -374,6 +374,50 @@ describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', 
     assert.deepEqual(result, { stored: [stored], removed: [] });
   });
 
+  test('replacePreviews on loose rows (strict: false) keeps every key the row carries', async () => {
+    const model = mediaModelWith('LooseReplaceMedia', [
+      new mongoose.Schema(
+        { identity: String, sizeKey: String },
+        { strict: false },
+      ),
+    ]);
+    const store = new MongoMediaStore({ model });
+    assert.doesNotThrow(() => store.verify());
+    const id = String(
+      (
+        await model.create({
+          original: { storageRef: { path: 'o.png' }, format: 'png' },
+          previews: [],
+        })
+      )._id,
+    );
+    const rowsOf = async () =>
+      (
+        (await model.findById(id).lean()) as { previews: Preview[] }
+      ).previews.map(({ _id, ...row }: Preview & { _id?: unknown }) => row);
+    const row: Preview = {
+      ...preview(ID_A, 'loose'),
+      origin: '8c64760b02a9f12a',
+      encodeSig: '5bff549d897f4636',
+      bytes: 1234,
+      createdAt: new Date('2026-10-28T12:34:56.789Z'),
+    };
+
+    await store.appendPreviews(id, [row]);
+    const [appended] = await rowsOf();
+    assert.ok(appended.createdAt instanceof Date);
+    const replacement: Preview = { ...row, storageRef: { path: 'a9.webp' } };
+    const result = await store.replacePreviews(id, [ID_A], [replacement]);
+
+    const rows = await rowsOf();
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0], { ...appended, storageRef: { path: 'a9.webp' } });
+    assert.ok(rows[0].createdAt instanceof Date);
+    assert.equal(result.removed.length, 1);
+    assert.equal(result.stored.length, 1);
+    assert.equal(result.stored[0].encodeSig, '5bff549d897f4636');
+  });
+
   test('a row the strict schema cannot cast rejects with a ValidationError and leaves the document unchanged', async () => {
     const store = mediaStore();
     const mediaId = await newMedia([preview(ID_A, 'a1'), preview(ID_B, 'b1')]);
@@ -571,7 +615,7 @@ describe('MongoMediaStore: the preview metadata', () => {
       bytes: 1234,
       createdAt,
       origin: '8c64760b02a9f12a',
-      encodeSig: 'a1505869c88e3331',
+      encodeSig: '5bff549d897f4636',
     };
     assert.deepEqual(await store.appendPreviews(mediaId, [row]), [row]);
 
@@ -581,7 +625,7 @@ describe('MongoMediaStore: the preview metadata', () => {
     assert.ok(stored?.createdAt instanceof Date);
     assert.equal(stored.createdAt.getTime(), createdAt.getTime());
     assert.equal(stored.origin, '8c64760b02a9f12a');
-    assert.equal(stored.encodeSig, 'a1505869c88e3331');
+    assert.equal(stored.encodeSig, '5bff549d897f4636');
     const lean = await storedPreviews(mediaId);
     assert.ok(lean[0].createdAt instanceof Date);
   });

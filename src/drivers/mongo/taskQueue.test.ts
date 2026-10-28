@@ -2111,6 +2111,8 @@ describe('MongoTaskQueue task times', () => {
       await Strict.createCollection();
       await Strict.createIndexes();
     }
+    // A clean collection, whatever an earlier run of this test left in it.
+    await Strict.deleteMany({});
     const { errors } = configureQueue(() => Strict);
 
     await tasks.verify();

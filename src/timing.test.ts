@@ -60,7 +60,11 @@ describe('timingOf', () => {
         err instanceof ResizeConfigError &&
         err.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID' &&
         /leaseMs/.test(err.message) &&
-        /'default'/.test(err.message),
+        /'default'/.test(err.message) &&
+        // The error it rethrows is kept as the cause.
+        err.cause instanceof ResizeConfigError &&
+        err.cause.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID' &&
+        !/\(queue /.test(err.cause.message),
     );
   });
 

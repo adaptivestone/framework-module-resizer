@@ -45,7 +45,8 @@ export abstract class MediaStore {
    * call before anything is written (MongoMediaStore: a value its schema cannot cast, with
    * Mongoose's ValidationError, which is not a ResizeError). It takes no dimensions: a caller that
    * must backfill them uses appendPreviews(mediaId, [], dims), which writes them whether or not it
-   * stores a row.
+   * stores a row. The rows MongoMediaStore writes here carry no sub-document `_id` (appended rows
+   * do); the module reads none.
    */
   abstract replacePreviews(
     mediaId: string,

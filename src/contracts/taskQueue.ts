@@ -213,8 +213,9 @@ export abstract class TaskQueue {
 
   /**
    * Optional: the timing of the queue name `queue`; missing values use the defaults
-   * (defaultQueueOptions). The core reads it once per name, on that name's first use. A task
-   * queue with one timing for every name ignores the argument.
+   * (defaultQueueOptions). The core reads it once per name, once it is valid: an invalid timing is
+   * read again on that name's next use. A task queue with one timing for every name ignores the
+   * argument.
    */
   getTiming?(queue: string): Partial<QueueTimingOptions> | undefined;
 

@@ -97,6 +97,49 @@ interface SchemaLike {
   options: { strict?: unknown };
 }
 
+// The preview row schema of a media model: the sub-document schema of its `previews` array, or
+// undefined when the model exposes no schema or keeps `previews` as a mixed or plain array.
+function previewRowSchema(
+  model: MongoMediaModel,
+): Partial<SchemaLike> | undefined {
+  const schema = (model as { schema?: Partial<SchemaLike> }).schema;
+  if (typeof schema?.path !== 'function') {
+    return undefined;
+  }
+  const previews = schema.path('previews') as
+    | { instance?: string; schema?: Partial<SchemaLike> }
+    | undefined;
+  const rows = previews?.instance === 'Array' ? previews.schema : undefined;
+  return typeof rows?.path === 'function' ? rows : undefined;
+}
+
+// Whether a model's preview rows are declared with `strict: false`, read once per model: a schema
+// does not change once its model is compiled.
+const looseRowModels = new WeakMap<object, boolean>();
+
+function hasLooseRows(model: MongoMediaModel): boolean {
+  let loose = looseRowModels.get(model);
+  if (loose === undefined) {
+    loose = previewRowSchema(model)?.options?.strict === false;
+    looseRowModels.set(model, loose);
+  }
+  return loose;
+}
+
+// Loose rows keep every key, but castObject returns only the declared paths: put back each key
+// of the row that its cast lacks, so a replacement stores what an append would.
+function withUndeclaredKeys(cast: Preview[], rows: Preview[]): Preview[] {
+  return cast.map((castRow, i) => {
+    const merged: Record<string, unknown> = { ...castRow };
+    for (const [key, value] of Object.entries(rows[i] ?? {})) {
+      if (!Object.hasOwn(merged, key)) {
+        merged[key] = value;
+      }
+    }
+    return merged as unknown as Preview;
+  });
+}
+
 // The preview row paths verify() requires, each with what is lost when Mongoose strips it.
 const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
   ['identity', 'a preview rendered twice would be stored twice'],
@@ -135,15 +178,8 @@ export class MongoMediaStore extends MediaStore {
    */
   verify(): void {
     const model = this.mediaModel();
-    const schema = (model as { schema?: Partial<SchemaLike> }).schema;
-    if (typeof schema?.path !== 'function') {
-      return;
-    }
-    const previews = schema.path('previews') as
-      | { instance?: string; schema?: Partial<SchemaLike> }
-      | undefined;
-    const rows = previews?.instance === 'Array' ? previews.schema : undefined;
-    if (typeof rows?.path !== 'function' || rows.options?.strict === false) {
+    const rows = previewRowSchema(model);
+    if (!rows?.path || rows.options?.strict === false) {
       return;
     }
     const missing = REQUIRED_ROW_PATHS.filter(([path]) => !rows.path?.(path));
@@ -213,8 +249,9 @@ export class MongoMediaStore extends MediaStore {
    * and of two concurrent replacements of one identity one row is left. The rows removed come from
    * the same write's pre-image, not from a read before it. Mongoose does not cast an update
    * pipeline, so the rows are cast to the schema first when the model can (strict rows lose the
-   * keys their schema does not declare, as with appendPreviews); a value that cannot be cast
-   * rejects with Mongoose's ValidationError before anything is written.
+   * keys their schema does not declare, loose rows keep them, as with appendPreviews); a value
+   * that cannot be cast rejects with Mongoose's ValidationError before anything is written. The
+   * rows it writes carry no sub-document `_id` (appended rows do); the module reads none.
    */
   async replacePreviews(
     mediaId: string,
@@ -224,11 +261,13 @@ export class MongoMediaStore extends MediaStore {
     const model = this.mediaModel();
     const unique = uniqueRows(rows);
     // A copy: Mongoose casts into its own array type, and callers get plain arrays.
-    const written = model.castObject
-      ? (Array.from(
-          model.castObject({ previews: unique }).previews ?? [],
-        ) as Preview[])
-      : unique;
+    let written = unique;
+    if (model.castObject) {
+      const cast = Array.from(
+        model.castObject({ previews: unique }).previews ?? [],
+      ) as Preview[];
+      written = hasLooseRows(model) ? withUndeclaredKeys(cast, unique) : cast;
+    }
     const remove = [
       ...new Set([
         ...identities,

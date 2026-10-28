@@ -471,7 +471,7 @@ describe('a task queue without gatesByTask', () => {
 
   test('a call on a queue with invalid timing queues nothing and reports it as the own queue would', async () => {
     const tasks = new PlainTaskQueue({
-      queueTiming: { bulk: { leaseMs: 0 } },
+      queueTiming: { bulk: { leaseMs: 0 }, audit: { leaseMs: 0 } },
     });
     const locks = clockLocks();
     const d = makeDispatcher({
@@ -511,6 +511,11 @@ describe('a task queue without gatesByTask', () => {
       (errors[0][1] as Error).message,
       confirmed.timingError.message,
     );
+    // Another queue name with invalid timing is logged once too.
+    assert.equal(await d.enqueue(requestFor([v300], { queue: 'audit' })), 0);
+    assert.equal(await d.enqueue(requestFor([v300], { queue: 'audit' })), 0);
+    assert.equal(errors.length, 2);
+    assert.match(String(errors[1][0]), /'audit'/);
     // Nothing reached the task queue or the lock store.
     assert.deepEqual(tasks.added, []);
     assert.equal(
@@ -564,6 +569,18 @@ describe('a task queue without gatesByTask', () => {
     );
     assert.deepEqual(asked, []);
     assert.deepEqual(errors, []);
+  });
+
+  test('a servesQueue that answers undefined is not served, as verify() and the worker read it', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.servesQueue = (() => undefined) as never;
+    const d = makeDispatcher({ tasks });
+    assert.equal(await d.enqueue(requestFor([v300])), 0);
+    const confirmed = await d.enqueueConfirmed(requestFor([v300]));
+    assert.deepEqual(confirmed.accepted, []);
+    assert.equal(confirmed.issues[0]?.code, 'RESIZE_QUEUE_NOT_SERVED');
+    assert.deepEqual(tasks.added, []);
+    assert.equal(warnings.length, 1);
   });
 
   test('a rejecting extend after an unconfirmed add is logged; the lock stays as acquired', async () => {

@@ -59,61 +59,68 @@ describe('previewOrigin', () => {
 describe('encodeSignature', () => {
   test('encodeSignature vectors on the default config', () => {
     const c = makeImageConfig();
-    // The recipe itself, written out.
+    // The recipe itself, written out. A row signs the sharpen flag of its own fit mode (the default
+    // config sharpens cover rows only), and an animated format signs its animation settings.
     assert.equal(
       sha16(
-        '{"animated":null,"encode":{"chromaSubsampling":"4:2:0","mozjpeg":true,"quality":88},"flatten":"#ffffff","format":"jpeg","maxSize":null,"resultDimension":5000,"sharpen":{"cover":true,"fit":false},"version":null}',
+        '{"animated":null,"encode":{"chromaSubsampling":"4:2:0","mozjpeg":true,"quality":88},"flatten":"#ffffff","format":"jpeg","maxSize":null,"resultDimension":5000,"sharpen":true,"version":null}',
       ),
       encodeSignature(c, { format: 'jpeg', fit: false }),
     );
     assert.equal(
       sha16(
-        '{"animated":false,"encode":{"effort":4,"quality":82},"flatten":null,"format":"webp","maxSize":{"height":1200,"width":2000},"resultDimension":5000,"sharpen":{"cover":true,"fit":false},"version":null}',
+        '{"animated":{"animated":false,"animationFrames":64},"encode":{"effort":4,"quality":82},"flatten":null,"format":"webp","maxSize":{"height":1200,"width":2000},"resultDimension":5000,"sharpen":false,"version":null}',
       ),
       encodeSignature(c, { format: 'webp', fit: true }),
     );
     assert.equal(
       encodeSignature(c, { format: 'jpeg', fit: false }),
-      'c2e290f0d33595ae',
+      '83d53beb7e1f8872',
     );
     assert.equal(
       encodeSignature(c, { format: 'jpeg', fit: true }),
-      'a20802f7b8adab7b',
+      '5e71af5703629b0d',
     );
     assert.equal(
       encodeSignature(c, { format: 'webp', fit: false }),
-      'a1505869c88e3331',
+      '5bff549d897f4636',
     );
     assert.equal(
       encodeSignature(c, { format: 'webp', fit: true }),
-      'da2a7b4a2a82233e',
+      '287c3af56c8b2a35',
     );
     assert.equal(
       encodeSignature(c, { format: 'avif', fit: false }),
-      '2ff643ff6cb17b14',
+      '620ba576b62ed200',
     );
     assert.equal(
       encodeSignature(c, { format: 'avif', fit: true }),
-      '2c25efc6c41f5489',
+      '90689746d79697f5',
     );
     // gif has no encode entry: `encode` is {}.
     assert.equal(
       encodeSignature(c, { format: 'gif', fit: false }),
-      '4b5afbc181b0a5dc',
+      'a0113f7fe92058f1',
+    );
+    assert.equal(
+      encodeSignature(c, { format: 'gif', fit: true }),
+      'd73b43bfcd2f3b93',
     );
     assert.equal(
       encodeSignature(c, { format: 'webp', fit: false, version: 'v2' }),
-      'caa8e1b8ce43acc3',
+      'b8283c2b8050efb8',
     );
   });
 
   test('encodeSignature changes only for the rows an input affects', () => {
     const cover = (format: string) => ({ format, fit: false });
+    const fit = (format: string) => ({ format, fit: true });
 
     const quality70 = makeImageConfig({
       encode: { formats: { webp: { quality: 70 } } },
     });
-    assert.equal(encodeSignature(quality70, cover('webp')), 'cb56c7fdee932190');
+    assert.equal(encodeSignature(quality70, cover('webp')), '428c6aa9b8c3b733');
+    assert.equal(encodeSignature(quality70, cover('jpeg')), '83d53beb7e1f8872');
 
     // The same options with their keys in another order sign the same.
     const reordered = makeImageConfig();
@@ -122,37 +129,66 @@ describe('encodeSignature', () => {
       'effort',
       'quality',
     ]);
-    assert.equal(encodeSignature(reordered, cover('webp')), 'a1505869c88e3331');
+    assert.equal(encodeSignature(reordered, cover('webp')), '5bff549d897f4636');
 
     const flattenWebp = makeImageConfig({
       encode: { flatten: { formats: ['jpeg', 'webp'] } },
     });
     assert.equal(
       encodeSignature(flattenWebp, cover('jpeg')),
-      'c2e290f0d33595ae',
+      '83d53beb7e1f8872',
     );
     assert.equal(
       encodeSignature(flattenWebp, cover('webp')),
-      'ffd051bf0e215efb',
+      '56e84f45d6c5e06a',
     );
 
+    // `animated` counts for the animated formats only.
     const animated = makeImageConfig({ animated: true });
-    assert.equal(encodeSignature(animated, cover('jpeg')), 'c2e290f0d33595ae');
-    assert.equal(encodeSignature(animated, cover('avif')), '2ff643ff6cb17b14');
-    assert.equal(encodeSignature(animated, cover('webp')), '8087ac9f83544054');
-    assert.equal(encodeSignature(animated, cover('gif')), 'cdc6e9d0d37ea008');
+    assert.equal(encodeSignature(animated, cover('jpeg')), '83d53beb7e1f8872');
+    assert.equal(encodeSignature(animated, cover('avif')), '620ba576b62ed200');
+    assert.equal(encodeSignature(animated, cover('webp')), '7700166d4996a056');
+    assert.equal(encodeSignature(animated, cover('gif')), '36b05b342b7c7982');
 
+    // So does the animation frame cap.
+    const frames = makeImageConfig({ limits: { animationFrames: 32 } });
+    assert.equal(encodeSignature(frames, cover('jpeg')), '83d53beb7e1f8872');
+    assert.equal(encodeSignature(frames, fit('jpeg')), '5e71af5703629b0d');
+    assert.equal(encodeSignature(frames, cover('avif')), '620ba576b62ed200');
+    assert.equal(encodeSignature(frames, cover('webp')), 'a65ee58d08542284');
+    assert.equal(encodeSignature(frames, fit('webp')), '6904dc4087be56d3');
+    assert.equal(encodeSignature(frames, cover('gif')), '956b62f8eb94e0db');
+
+    // `maxSize` counts for fit rows only.
     const maxSize = makeImageConfig({ maxSize: { width: 2400, height: 1600 } });
-    assert.equal(encodeSignature(maxSize, cover('jpeg')), 'c2e290f0d33595ae');
-    assert.equal(
-      encodeSignature(maxSize, { format: 'jpeg', fit: true }),
-      'da288ee14dfbf632',
-    );
+    assert.equal(encodeSignature(maxSize, cover('jpeg')), '83d53beb7e1f8872');
+    assert.equal(encodeSignature(maxSize, cover('webp')), '5bff549d897f4636');
+    assert.equal(encodeSignature(maxSize, fit('jpeg')), '422c6bae973f3d32');
 
-    // The whole sharpen object counts for every row.
-    const sharpen = makeImageConfig({
+    // A row signs only the sharpen half of its own fit mode: `sharpen.fit` changes fit rows only,
+    // `sharpen.cover` cover rows only.
+    const sharpenFit = makeImageConfig({
       encode: { sharpen: { cover: true, fit: true } },
     });
-    assert.equal(encodeSignature(sharpen, cover('jpeg')), 'd49191720a3eb059');
+    assert.equal(
+      encodeSignature(sharpenFit, cover('jpeg')),
+      '83d53beb7e1f8872',
+    );
+    assert.equal(encodeSignature(sharpenFit, fit('jpeg')), '16860bd35329345d');
+    const sharpenCover = makeImageConfig({
+      encode: { sharpen: { cover: false, fit: false } },
+    });
+    assert.equal(
+      encodeSignature(sharpenCover, cover('jpeg')),
+      'b074fbe24e5e7f6f',
+    );
+    assert.equal(
+      encodeSignature(sharpenCover, fit('jpeg')),
+      '5e71af5703629b0d',
+    );
+    // `sharpen: false` sharpens no row, as { cover: false, fit: false } does: they sign the same.
+    const noSharpen = makeImageConfig({ encode: { sharpen: false } });
+    assert.equal(encodeSignature(noSharpen, cover('jpeg')), 'b074fbe24e5e7f6f');
+    assert.equal(encodeSignature(noSharpen, fit('jpeg')), '5e71af5703629b0d');
   });
 });

@@ -86,6 +86,7 @@ function fillNamedTiming(
       throw new ResizeConfigError(`${err.message} (queue '${queue}')`, {
         code: err.code,
         retryable: err.retryable,
+        cause: err,
       });
     }
     throw err;

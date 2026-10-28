@@ -323,6 +323,16 @@ describe('config split: core validation vs framework loading', () => {
     });
     assert.deepEqual([...resolved.queues.keys()], ['default', 'bulk']);
     assert.equal(resolved.queues.get('default')?.backend, 'database');
+    // An environment file removes an entry by setting it to undefined: the framework's merge
+    // keeps the key, and the entry counts as not defined.
+    assert.deepEqual(
+      [
+        ...resolveProcessConfig({
+          queues: { default: { driver: 'database' }, bulk: undefined },
+        }).queues.keys(),
+      ],
+      ['default'],
+    );
     assert.equal(
       resolved.queues.get('bulk')?.backend,
       'sqs:[null,null,null,10]',
@@ -484,6 +494,9 @@ describe('config split: core validation vs framework loading', () => {
       [{ sharpConcurrency: 1.5 }, '`worker.sharpConcurrency`'],
       [{ sharpCache: 1 }, '`worker.sharpCache`'],
       [true, '`worker`'],
+      // A misspelled key would otherwise keep its default silently.
+      [{ sharpConcurency: 8 }, '`worker.sharpConcurency`'],
+      [{ enabled: true, extra: false }, '`worker.extra`'],
     ] as const) {
       assert.throws(
         () => resolveProcessConfig({ worker }),

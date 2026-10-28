@@ -233,7 +233,11 @@ export function resolveProcessConfig(raw: unknown): ResolvedProcessConfig {
   return result;
 }
 
-/** The `queues` map: every entry needs a driver; an SQS entry needs its own queueUrl. */
+/**
+ * The `queues` map: every entry needs a driver; an SQS entry needs its own queueUrl. An entry set
+ * to undefined is not defined: the framework's merge keeps the key of an environment file that
+ * removes a queue that way.
+ */
 function resolveQueues(
   value: unknown,
   where: string,
@@ -250,6 +254,9 @@ function resolveQueues(
   // An SQS queue URL → the entry that uses it.
   const urls = new Map<string, string>();
   for (const [name, entry] of Object.entries(value)) {
+    if (entry === undefined) {
+      continue;
+    }
     if (name.trim().length === 0) {
       throw invalid(
         `\`queues\` in ${where} has a blank queue name — name each queue, e.g. queues: { default: { driver: 'database' } }`,
@@ -332,6 +339,15 @@ function resolveWorker(value: unknown, where: string): FrameworkWorkerConfig {
       `\`worker.concurrency\` in ${where} is no longer supported — move the value to the top-level \`concurrency\``,
     );
   }
+  // A misspelled key would otherwise leave its setting at the default without a word.
+  const unknown = Object.keys(value).find(
+    (key) => !WORKER_KEYS.includes(key) && value[key] !== undefined,
+  );
+  if (unknown !== undefined) {
+    throw invalid(
+      `\`worker.${unknown}\` in ${where} is not a worker setting — the worker section takes ${WORKER_KEYS.join(', ')}`,
+    );
+  }
   const worker: Record<string, unknown> = { ...defaultWorkerOptions };
   for (const key of WORKER_KEYS) {
     if (value[key] !== undefined) {
@@ -363,7 +379,8 @@ export function getResizeConfig(
 }
 
 // For a missing file the framework returns a new {} and logs a warning on every call, so the empty
-// result is kept per app, which is then not asked again.
+// result is kept per app, which is then not asked again. A resize.ts that exports {} and is filled
+// later through app.updateConfig keeps that empty result too: an accepted edge case.
 const missingProcessFile = new WeakMap<object, ResolvedProcessConfig>();
 
 /** The process-wide sections of the app's src/config/resize.ts, validated. */

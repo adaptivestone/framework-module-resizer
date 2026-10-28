@@ -84,7 +84,7 @@ export function parseSizeKey(key: string): ParsedSizeKey {
 // Escape the `|` (pair separator) and `:` (key/value separator) so a filter key/value that
 // contains them cannot forge a boundary — otherwise `{ a: '1|b:2' }` collides with
 // `{ a: 1, b: 2 }` (same identity → cache confusion + row shadowing). Backslash is escaped
-// FIRST so the escapes we then add for `|`/`:` are not themselves re-escaped. (03 · §7 review fix)
+// FIRST so the escapes we then add for `|`/`:` are not themselves re-escaped.
 function escapeFilterPart(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/:/g, '\\:');
 }
@@ -94,7 +94,9 @@ function escapeFilterPart(s: string): string {
  *
  * Runtime Mongo `Mixed` fields can contain richer values than the public flat
  * filter type. This is shared by queued task payloads and preview identities so
- * they cannot disagree about equivalent nested filter objects.
+ * they cannot disagree about equivalent nested filter objects. It is also part of
+ * the frozen `origin`/`encodeSig` recipe (src/signatures.ts): changing it changes
+ * every stored signature.
  */
 export function canonicalizeFilterValue(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -151,11 +153,11 @@ export function getFilterSig(filters?: Filters): string {
 }
 
 /**
- * The media id, by the precedence `media.id ?? String(media._id)` (02 · §5). THROWS a named error
+ * The media id, by the precedence `media.id ?? String(media._id)`. THROWS a named error
  * when neither is present — a media with no id cannot be identified, enqueued, or persisted, and
  * `String(undefined)` would silently produce the literal `'undefined'` as a lock/queue key. Eager
  * `generate` surfaces this to the host; `resolve`/`prewarm` let their never-throw wrapper log it +
- * return the safe value. (04 · papercut)
+ * return the safe value.
  */
 export function requireMediaId(media: MediaLike): string {
   const id = media.id ?? (media._id != null ? String(media._id) : undefined);

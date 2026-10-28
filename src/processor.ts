@@ -30,6 +30,7 @@ import {
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
 import { rasterizeSvg } from './helpers/svgRaster.ts';
@@ -306,7 +307,8 @@ export class Processor {
     }
     // Off the caller's in-memory doc too, so a same-request resolve() does not serve the rows. The
     // store has already removed them, so an array that cannot be changed (a frozen one, say) is
-    // only logged: the refs are the host's only record of the removed objects.
+    // only logged, and through logNeverThrow, so a throwing logger cannot lose them either: the
+    // refs are the host's only record of the removed objects.
     try {
       const previews = opts.media.previews;
       if (Array.isArray(previews)) {
@@ -318,9 +320,11 @@ export class Processor {
         }
       }
     } catch (err) {
-      logger.warn(
+      logNeverThrow(
+        logger,
         `resize: invalidate removed previews of media ${mediaId} from the media store but could not take them off the caller's media.previews, so a same-request resolve() may still serve them`,
         err,
+        'warn',
       );
     }
     return result.removed.map((row) => row.storageRef);

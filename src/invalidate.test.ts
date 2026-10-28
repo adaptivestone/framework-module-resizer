@@ -268,6 +268,38 @@ describe('invalidate', () => {
     assert.equal(warnings.length, 1);
     assert.match(String(warnings[0][0]), /\bmedia m1\b/);
     assert.doesNotMatch(String(warnings[0][0]), /\n/);
+    assert.ok(warnings[0][1] instanceof TypeError);
+  });
+
+  test('a logger that throws on that warning still lets invalidate resolve with the refs', async () => {
+    const { store, replace, media, stored } = seeded();
+    Object.freeze(media.previews);
+    const consoleWarn = mock.method(console, 'warn', () => {});
+    const r = new Resizer({
+      logger: {
+        info() {},
+        error() {},
+        warn() {
+          throw new Error('logger down');
+        },
+      },
+      storage,
+      media: store,
+      pipelines: { wm: {} },
+    });
+
+    const refs = await r.invalidate({ media, pipeline: 'wm' });
+
+    assert.deepEqual(refs, [w1().storageRef]);
+    assert.equal(replace.mock.callCount(), 1);
+    assert.deepEqual(refsOf(stored()), refsOf([d1(), d2(), l1(), x0()]));
+    // The warning falls back to the console.
+    assert.equal(consoleWarn.mock.callCount(), 1);
+    assert.match(
+      String(consoleWarn.mock.calls[0].arguments[0]),
+      /\bmedia m1\b/,
+    );
+    assert.ok(consoleWarn.mock.calls[0].arguments[1] instanceof TypeError);
   });
 
   test('invalidate works on an eager-only Resizer and for an unregistered pipeline', async () => {

@@ -332,7 +332,8 @@ export class Dispatcher {
     variants: MissingPreview[],
   ): Promise<DispatchOutcome> {
     const { tasks, locks, coordination, name } = this.#deps;
-    if (tasks.servesQueue?.(req.queue) === false) {
+    // Read as verify() and the worker read it: any answer but a truthy one is not served.
+    if (tasks.servesQueue && !tasks.servesQueue(req.queue)) {
       return { status: 'not-served' };
     }
     let timing: QueueTiming;
