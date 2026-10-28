@@ -9,7 +9,8 @@
 /**
  * The gate lock of one Resizer, queue, media and pipeline on a task queue without gatesByTask:
  * while it is held, no other task is queued for them. Its owner travels with the task as
- * `gateOwner`.
+ * `gateOwner`. Each part is URI-encoded, so a `:` inside a name or an id cannot make two of them
+ * share a key.
  */
 export function gateKey(
   resizer: string,
@@ -17,5 +18,5 @@ export function gateKey(
   mediaId: string,
   pipeline: string,
 ): string {
-  return `resize_gate:${resizer}:${queue}:${mediaId}:${pipeline}`;
+  return `resize_gate:${[resizer, queue, mediaId, pipeline].map(encodeURIComponent).join(':')}`;
 }

@@ -10,6 +10,7 @@ import {
   noQueueResult,
 } from './dispatcher.ts';
 import { canonicalizeVariants } from './images.ts';
+import { gateKey } from './lockKeys.ts';
 import {
   type ClockLocks,
   clockLocks,
@@ -468,6 +469,34 @@ describe('a task queue without gatesByTask', () => {
       errors.filter((e) => /TaskAddResult/.test(String(e[0]))).length,
       2,
     );
+  });
+
+  test('gate keys cannot collide: each part is URI-encoded', async () => {
+    assert.notEqual(
+      gateKey('a:x', 'q', 'y', 'default'),
+      gateKey('a', 'q', 'x:y', 'default'),
+    );
+    assert.equal(
+      gateKey('a:x', 'q', 'm 1', 'default'),
+      'resize_gate:a%3Ax:q:m%201:default',
+    );
+    assert.equal(gateKey('default', 'default', 'm1', 'default'), GATE);
+    // Through the Dispatcher: Resizer 'a:x' with media 'y', and Resizer 'a' with media 'x:y'.
+    const tasks = new PlainTaskQueue();
+    const locks = clockLocks();
+    assert.equal(
+      await makeDispatcher({ tasks, locks, name: 'a:x' }).enqueue(
+        requestFor([v300], { mediaId: 'y' }),
+      ),
+      1,
+    );
+    assert.equal(
+      await makeDispatcher({ tasks, locks, name: 'a' }).enqueue(
+        requestFor([v300], { mediaId: 'x:y' }),
+      ),
+      1,
+    );
+    assert.equal(tasks.rows.length, 2);
   });
 
   test('gate keys are separate per Resizer, pipeline and queue', async () => {
