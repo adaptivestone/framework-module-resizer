@@ -31,8 +31,6 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeStorage',
   'parseSizeKey',
   'resetResizerForTests',
-  'resizeMediaPaths',
-  'resizeMediaSchemaFragment',
   'runWorker',
   'TaskQueue',
 ];
@@ -99,11 +97,6 @@ describe('public API surface (src/index.ts)', () => {
     }
   });
 
-  test('the schema fragment is a real plain object', () => {
-    assert.equal(typeof api.resizeMediaSchemaFragment, 'object');
-    assert.deepEqual(api.resizeMediaPaths, ['original', 'previews']);
-  });
-
   test('a pure helper actually works through the re-export', () => {
     assert.equal(api.getSizeKey({ width: 320, height: 200 }), '320x200');
     assert.equal(api.getSizeKey({ fit: true }), 'fit');
@@ -117,6 +110,24 @@ describe('public API surface (src/index.ts)', () => {
         `${name} must NOT be exported from the main entry`,
       );
     }
+  });
+});
+
+// The media schema fragment is Mongoose schema syntax, so it lives with the Mongo driver; the
+// framework adapter re-exports the same objects for framework hosts.
+describe('moved exports', () => {
+  test('…/drivers/mongo.js and …/framework.js export the one fragment; the main entry does not', async () => {
+    const mongo = await import('./drivers/mongo/index.ts');
+    const framework = await import('./framework/index.ts');
+    assert.equal(typeof mongo.resizeMediaSchemaFragment, 'object');
+    assert.strictEqual(
+      framework.resizeMediaSchemaFragment,
+      mongo.resizeMediaSchemaFragment,
+    );
+    assert.strictEqual(framework.resizeMediaPaths, mongo.resizeMediaPaths);
+    assert.deepEqual(mongo.resizeMediaPaths, ['original', 'previews']);
+    assert.equal('resizeMediaSchemaFragment' in api, false);
+    assert.equal('resizeMediaPaths' in api, false);
   });
 });
 

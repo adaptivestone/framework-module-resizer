@@ -1,6 +1,6 @@
-// Test-only: the loop tests' one-call form of a Consumer. It runs `queue` on `tasks` with the
-// queue's own timing, events from `onEvent`, and console unless a logger is given. `resizers` and
-// `coordinationOf` go to the Consumer as they are.
+// Test-only: the loop tests' one-call form of a Consumer. It runs `queue` on `tasks` with that
+// queue name's own timing, events from `onEvent`, and console unless a logger is given.
+// `resizers` and `coordinationOf` go to the Consumer as they are.
 import { Consumer, type ConsumerDeps } from '../consumer.ts';
 import type { TaskEventHandler, TaskQueue } from '../contracts/taskQueue.ts';
 import { timingOf } from '../timing.ts';
@@ -21,7 +21,7 @@ export async function consume(
 ): Promise<void> {
   await new Consumer({
     tasks,
-    timing: timingOf(tasks),
+    timing: timingOf(tasks, opts.queue),
     handle: opts.handle,
     events: opts.onEvent,
     logger: opts.logger ?? console,

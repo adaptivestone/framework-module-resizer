@@ -60,4 +60,33 @@ describe('AGENTS.md drift guard (the doc ships with the package — it must not 
       );
     }
   });
+
+  test('every value imported from …/framework.js or …/drivers/mongo.js in snippets is a real export of that entry', async () => {
+    const doc = await readAgents();
+    const entries: Record<string, Record<string, unknown>> = {
+      '/framework.js': await import('./framework/index.ts'),
+      '/drivers/mongo.js': await import('./drivers/mongo/index.ts'),
+    };
+    const imports = [
+      ...doc.matchAll(
+        /import\s*\{([^}]*)\}\s*from\s*'@adaptivestone\/framework-module-resize(\/framework\.js|\/drivers\/mongo\.js)'/g,
+      ),
+    ].flatMap((m) =>
+      m[1]
+        .split(',')
+        .map((n) => n.trim())
+        .filter((n) => n.length > 0 && !n.startsWith('type '))
+        .map((name) => ({ name, subpath: m[2] })),
+    );
+    assert.ok(
+      imports.length >= 2,
+      'AGENTS.md should import from …/framework.js or …/drivers/mongo.js in snippets',
+    );
+    for (const { name, subpath } of imports) {
+      assert.ok(
+        name in entries[subpath],
+        `AGENTS.md imports a name ${subpath} does not export: ${name}`,
+      );
+    }
+  });
 });

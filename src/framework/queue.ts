@@ -1,169 +1,122 @@
-// The framework adapter's task queues: one per backend in the process. FrameworkResizers whose
-// config selects the 'database' driver share the app's one MongoTaskQueue over its ResizeTask
-// model, and those that select the same SQS queue share one SqsTaskQueue, so the worker runs one
-// consume loop per backend. Timing belongs to the backend: it comes from the config of every
-// Resizer that uses it, and those must agree.
+// The framework adapter's task queues: one per backend in the process. Every `queues` entry of
+// src/config/resize.ts is a queue name. The entries on one backend (every 'database' entry, or the
+// 'sqs' entries with the same connection settings) share one task queue object, so the worker runs
+// one consume loop for it, and each name keeps its own timing. A task queue serves only the names
+// of its own backend: a call that names a queue on another backend is refused by the core.
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
-import { ResizeConfigError } from '../errors.ts';
 import { onResetResizerForTests } from '../resizer.ts';
-import type { FrameworkQueueConfig, QueueTimingOptions } from '../types.d.ts';
+import type {
+  QueueConfig,
+  QueueTimingOptions,
+  SqsQueueConfig,
+} from '../types.d.ts';
 import { appLogger, getApp } from './app.ts';
-import type { ResolvedFrameworkConfig } from './config.ts';
-
-/** A config that may select a shared backend: a FrameworkResizer's. */
-export interface QueueUser {
-  source: string; // the config as messages name it, e.g. src/config/resize.ts
-  read: () => ResolvedFrameworkConfig;
-  // The shared backend this config's tasks wait on (see backendKey), or undefined for none.
-  backend: (config: ResolvedFrameworkConfig) => string | undefined;
-}
-
-/** The backend key of the app's ResizeTask queue. */
-export const DATABASE_BACKEND = 'database';
-
-const queueUsers = new Set<QueueUser>();
-const backendQueues = new Map<string, TaskQueue>();
-let appQueue: MongoTaskQueue | undefined;
-
-onResetResizerForTests(() => {
-  queueUsers.clear();
-  backendQueues.clear();
-  appQueue = undefined;
-});
-
-/** Register a config whose timing a shared backend must agree with. */
-export function addQueueUser(user: QueueUser): void {
-  queueUsers.add(user);
-}
-
-/** The shared backend a config's `queue` section selects: its key, or undefined for none. */
-export function backendKey(
-  queue: FrameworkQueueConfig | false,
-): string | undefined {
-  if (queue === false) {
-    return undefined;
-  }
-  if (queue.driver !== 'sqs') {
-    return DATABASE_BACKEND;
-  }
-  // One SQS backend per set of queue settings; the order of the named queues does not matter.
-  const { queueUrl, queues, deadLetterQueueUrl, region, endpoint } = queue;
-  const named = Object.entries(queues ?? {}).sort(([a], [b]) =>
-    a < b ? -1 : 1,
-  );
-  return `sqs:${JSON.stringify([queueUrl, named, deadLetterQueueUrl ?? null, region ?? null, endpoint ?? null])}`;
-}
+import type { ResolvedProcessConfig, ResolvedQueue } from './config.ts';
+import { importDriver } from './peers.ts';
 
 // SqsTaskQueue's long poll when `waitTimeSeconds` is not set. Keep in step with the driver's own
 // default (`this.#opts.waitTimeSeconds ?? 10` in SqsTaskQueue.claim, src/drivers/sqs.ts), which is
 // not imported here: that module loads the optional AWS SDK.
 const SQS_DEFAULT_WAIT_TIME_SECONDS = 10;
 
-// What the configs sharing a backend must agree on: the timing, and the effective SQS long poll.
-function queueSettings(
-  config: ResolvedFrameworkConfig,
-): Record<string, unknown> {
-  const { queue, timing } = config;
-  return queue !== false && queue.driver === 'sqs'
-    ? {
-        ...timing,
-        waitTimeSeconds: queue.waitTimeSeconds ?? SQS_DEFAULT_WAIT_TIME_SECONDS,
-      }
-    : { ...timing };
+// The file the queues are defined in, as configFile('resize') in ./config.ts names it (that module
+// imports this one, so it is not imported back).
+const QUEUES_FILE =
+  'src/config/resize.ts (or its resize.<NODE_ENV>.ts override)';
+
+/**
+ * The backend a `queues` entry's tasks wait in: 'database' for every database entry (the app's
+ * ResizeTask model); for SQS, one per region, endpoint, dead-letter queue and effective long poll,
+ * the settings one SqsTaskQueue holds for all its names.
+ */
+export function backendKey(section: QueueConfig): string {
+  if (section.driver !== 'sqs') {
+    return 'database';
+  }
+  const { region, endpoint, deadLetterQueueUrl, waitTimeSeconds } = section;
+  return `sqs:${JSON.stringify([region ?? null, endpoint ?? null, deadLetterQueueUrl ?? null, waitTimeSeconds ?? SQS_DEFAULT_WAIT_TIME_SECONDS])}`;
 }
 
-function sameValue(a: unknown, b: unknown): boolean {
-  if (
-    typeof a !== 'object' ||
-    a === null ||
-    typeof b !== 'object' ||
-    b === null
-  ) {
-    return Object.is(a, b);
+// The task queue of each backend, per app. A build that failed is forgotten, so the next call
+// retries it.
+let built = new WeakMap<object, Map<string, Promise<TaskQueue>>>();
+
+onResetResizerForTests(() => {
+  built = new WeakMap();
+});
+
+/**
+ * The task queue of `queue`'s backend, built once per process (per app) for every name on that
+ * backend, each with its own timing from `processConfig`. The SQS driver is imported only when an
+ * SQS backend is built (RESIZE_PEER_MISSING when @aws-sdk/client-sqs is not installed).
+ */
+export function taskQueueOf(
+  queue: ResolvedQueue,
+  processConfig: ResolvedProcessConfig,
+): Promise<TaskQueue> {
+  const app = getApp();
+  let byBackend = built.get(app);
+  if (!byBackend) {
+    byBackend = new Map();
+    built.set(app, byBackend);
   }
-  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  return [...keys].every((key) =>
-    sameValue(
-      (a as Record<string, unknown>)[key],
-      (b as Record<string, unknown>)[key],
-    ),
+  const queues = byBackend;
+  const existing = queues.get(queue.backend);
+  if (existing) {
+    return existing;
+  }
+  const building = buildTaskQueue(queue, processConfig);
+  queues.set(queue.backend, building);
+  building.catch(() => {
+    if (queues.get(queue.backend) === building) {
+      queues.delete(queue.backend);
+    }
+  });
+  return building;
+}
+
+async function buildTaskQueue(
+  queue: ResolvedQueue,
+  processConfig: ResolvedProcessConfig,
+): Promise<TaskQueue> {
+  const { backend, section } = queue;
+  const names = [...processConfig.queues.values()].filter(
+    (entry) => entry.backend === backend,
   );
-}
-
-/**
- * The timing of the shared backend `key`: the timing of every config that uses it, which must
- * agree (ResizeConfigError RESIZE_CONFIG_QUEUE_TIMING_CONFLICT otherwise). A config that cannot be
- * read is skipped here: its own Resizer reports it. No config: the defaults.
- */
-export function backendTiming(key: string): Partial<QueueTimingOptions> {
-  let first:
-    | {
-        source: string;
-        settings: Record<string, unknown>;
-        timing: QueueTimingOptions;
-      }
-    | undefined;
-  for (const user of queueUsers) {
-    let config: ResolvedFrameworkConfig;
-    try {
-      config = user.read();
-    } catch {
-      continue;
-    }
-    if (user.backend(config) !== key) {
-      continue;
-    }
-    const settings = queueSettings(config);
-    if (!first) {
-      first = { source: user.source, settings, timing: config.timing };
-      continue;
-    }
-    const reference = first.settings;
-    const differ = [
-      ...new Set([...Object.keys(reference), ...Object.keys(settings)]),
-    ].filter((name) => !sameValue(reference[name], settings[name]));
-    if (differ.length > 0) {
-      throw new ResizeConfigError(
-        `resize config: ${first.source} and ${user.source} use the same task queue but set different ${differ.join(', ')} — one task queue has one timing, so set the same values in both`,
-        { code: 'RESIZE_CONFIG_QUEUE_TIMING_CONFLICT' },
-      );
-    }
+  // Each name's own timing; the core reads it on that name's first use.
+  const getTiming = (name: string): Partial<QueueTimingOptions> | undefined => {
+    const entry = processConfig.queues.get(name);
+    return entry?.backend === backend ? entry.timing : undefined;
+  };
+  if (section.driver !== 'sqs') {
+    return new MongoTaskQueue({
+      getModel: () => getApp().getModel('ResizeTask'),
+      queues: names.map((entry) => entry.name),
+      getTiming,
+      logger: appLogger,
+    });
   }
-  return first?.timing ?? {};
-}
-
-/** Check the shared backend `user` selects, if any: throws on a timing conflict. */
-export function checkQueueUser(user: QueueUser): void {
-  const key = user.backend(user.read());
-  if (key !== undefined) {
-    backendTiming(key);
-  }
-}
-
-/**
- * The task queue of the shared backend `key`, built once per process. The timing is checked on
- * every call, so each Resizer that loads the queue sees a conflict.
- */
-export function sharedQueue(
-  key: string,
-  build: (timing: Partial<QueueTimingOptions>) => TaskQueue,
-): TaskQueue {
-  const timing = backendTiming(key);
-  let tasks = backendQueues.get(key);
-  if (!tasks) {
-    tasks = build(timing);
-    backendQueues.set(key, tasks);
-  }
-  return tasks;
-}
-
-/** The process's one MongoTaskQueue over the app's ResizeTask model. */
-export function appTaskQueue(): MongoTaskQueue {
-  appQueue ??= new MongoTaskQueue({
-    getModel: () => getApp().getModel('ResizeTask'),
-    getTiming: () => backendTiming(DATABASE_BACKEND),
+  const { SqsTaskQueue } = await importDriver(
+    () => import('../drivers/sqs.ts'),
+    'sqs',
+    ['@aws-sdk/client-sqs'],
+    `\`queues.${queue.name}\` in ${QUEUES_FILE}`,
+  );
+  // The connection settings are the same for every name on this backend (they make its key).
+  const { deadLetterQueueUrl, waitTimeSeconds, region, endpoint } = section;
+  return new SqsTaskQueue({
+    queues: Object.fromEntries(
+      names.map((entry) => [
+        entry.name,
+        (entry.section as SqsQueueConfig).queueUrl,
+      ]),
+    ),
+    ...(deadLetterQueueUrl ? { deadLetterQueueUrl } : {}),
+    ...(waitTimeSeconds === undefined ? {} : { waitTimeSeconds }),
+    ...(region ? { region } : {}),
+    ...(endpoint ? { endpoint } : {}),
+    getTiming,
     logger: appLogger,
   });
-  return appQueue;
 }

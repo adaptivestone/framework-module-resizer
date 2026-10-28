@@ -1,4 +1,4 @@
-// S3 storage driver (05 · §10.5) — SHIPPED, optional peer deps. A class that keeps its
+// S3 storage driver — SHIPPED, optional peer deps. A class that keeps its
 // bucket/URL options in a `#private` field (engine-enforced, not a compile-time convention, so a
 // JS host cannot read the bucket config off the instance) and constructs (and memoizes) ONE
 // `S3Client` on first
@@ -6,9 +6,9 @@
 // no I/O — the read path calls it). Credentials are NEVER options — they resolve via the
 // standard AWS provider chain.
 //
-// SUBPATH-ONLY ENTRY, STATIC SDK IMPORTS (05 · §10.5): `@aws-sdk/client-s3` and
+// SUBPATH-ONLY ENTRY, STATIC SDK IMPORTS: `@aws-sdk/client-s3` and
 // `@aws-sdk/s3-request-presigner` are imported plainly at the top of this module. This is safe
-// precisely because this driver is NOT re-exported from the main package entry (02 · §6) —
+// precisely because this driver is NOT re-exported from the main package entry —
 // hosts import `@adaptivestone/framework-module-resize/drivers/s3.js` directly, so the optional
 // peers are resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the
 // host's own import line at bootstrap (no dynamic import(), no lazy loaders).

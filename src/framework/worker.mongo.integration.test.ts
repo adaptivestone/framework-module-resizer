@@ -16,9 +16,9 @@ import mongoose from 'mongoose';
 import sharp from 'sharp';
 import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
+import { resizeMediaSchemaFragment } from '../drivers/mongo/mediaFragment.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { resizeMediaSchemaFragment } from '../mediaFragment.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { fakeMedia } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
@@ -78,6 +78,9 @@ const testQueue = {
   idlePollMs: 20,
 };
 
+// src/config/resize.ts's one database queue, with the test timing.
+const testQueues = { default: { driver: 'database' as const, ...testQueue } };
+
 // A fake app over the real task and lock models. `configs` overrides config files by name;
 // `models` adds models (e.g. the media model) to ResizeTask and Lock.
 function installApp(
@@ -98,8 +101,10 @@ function installApp(
       opts.configs?.[name] ??
       makeResizeConfig({
         formats: ['webp'],
-        worker: { enabled: true },
-        queue: testQueue,
+        // Only src/config/resize.ts holds the process-wide sections.
+        ...(name === 'resize'
+          ? { worker: { enabled: true }, queues: testQueues }
+          : {}),
       }),
     getModel: (name: string) => models[name] ?? false,
     logger: { info() {}, warn() {}, error() {} },
@@ -273,7 +278,8 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
           rootDir: join(root, 'public'),
           publicBaseUrl: '/media',
         },
-        queue: { driver: 'database', ...testQueue },
+        queue: 'default',
+        queues: testQueues,
       }),
     },
     models: { File },
@@ -325,11 +331,11 @@ test('a FrameworkResizer wired only by its config file runs through runResizeWor
 test('two Resizers wired by their config files share one task queue: one task at a time, each with its own Resizer', async () => {
   await taskModel.deleteMany({});
   const File = fileModel();
-  const queue = { driver: 'database', ...testQueue };
   installApp({
     configs: {
-      resize: makeResizeConfig({ formats: ['webp'], queue }),
-      resizeListings: makeResizeConfig({ formats: ['webp'], queue }),
+      resize: makeResizeConfig({ formats: ['webp'], queues: testQueues }),
+      // No `queue`: the default queue, which resize.ts defines.
+      resizeListings: makeResizeConfig({ formats: ['webp'] }),
     },
     models: { File },
   });

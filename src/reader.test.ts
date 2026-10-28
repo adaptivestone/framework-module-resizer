@@ -31,6 +31,7 @@ import {
   makeImageConfig,
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
+import { timingOf } from './timing.ts';
 import type { MediaLike, ResizeLogger, StorageRef } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -130,7 +131,7 @@ function readerDeps(dispatcher: Dispatcher | undefined): ReaderDeps {
     },
     logger: silent,
     name: 'default',
-    queue: 'default',
+    queueName: 'default',
   };
 }
 
@@ -156,7 +157,7 @@ describe('Reader', () => {
           tasks,
           locks: undefined, // a task queue that gates by task needs none
           coordination: defaultCoordination,
-          leaseMs: 60_000,
+          timingOf: (queue) => timingOf(tasks, queue),
           name: 'default',
           logger: silent,
         }),
@@ -191,6 +192,50 @@ describe('Reader', () => {
       ).status,
       'accepted',
     );
+  });
+
+  test('resolve on such a queue logs once per queue name and returns its decision', async () => {
+    // A task queue that serves only 'default'.
+    const tasks = new MemoryTaskQueue({ queues: ['default'] });
+    const warnings: unknown[][] = [];
+    const logged: unknown[][] = [];
+    const logger: ResizeLogger = {
+      info() {},
+      warn: (...a: unknown[]) => warnings.push(a),
+      error: (...a: unknown[]) => logged.push(a),
+    };
+    const deps = readerDeps(
+      new Dispatcher({
+        tasks,
+        locks: undefined,
+        coordination: defaultCoordination,
+        timingOf: (queue) => timingOf(tasks, queue),
+        name: 'default',
+        logger,
+      }),
+    );
+    deps.logger = logger;
+    const reader = new Reader(deps);
+    const sizes = [
+      { width: 10, height: 10 },
+      { width: 20, height: 20 },
+    ];
+    for (const queue of ['bulk', 'bulk', 'other']) {
+      const { decision } = await reader.resolve({ media, sizes, queue });
+      assert.deepEqual(
+        decision.ready.map((e) => e.url),
+        ['https://cdn/p'],
+      );
+      assert.deepEqual(
+        decision.missing.map((v) => v.sizeKey),
+        ['20x20'],
+      );
+    }
+    assert.equal(warnings.length, 2);
+    assert.match(String(warnings[0][0]), /cannot queue to 'bulk'/);
+    assert.match(String(warnings[1][0]), /cannot queue to 'other'/);
+    assert.deepEqual(logged, []);
+    assert.deepEqual(tasks.added, []);
   });
 
   test('a Reader without a Dispatcher (eager only) reports RESIZE_ENQUEUE_NO_QUEUE from prewarm', async () => {
@@ -728,7 +773,7 @@ describe('resolve — enqueue wiring', () => {
     );
   });
 
-  test('sends the Resizer name and its queue, or the per-call queue', async () => {
+  test('sends the Resizer name and its queueName, or the per-call queue', async () => {
     installFakeApp();
     const { tasks, calls } = makeTasks();
     const { locks } = makeLocks(true);
@@ -738,7 +783,7 @@ describe('resolve — enqueue wiring', () => {
       media: fakeMedia(),
       locks,
       name: 'listings',
-      queue: 'interactive',
+      queueName: 'interactive',
     });
     const media: MediaLike = {
       id: 'm1',
@@ -1609,5 +1654,59 @@ describe('pipelines are part of preview identity', () => {
     const result = await r.resolve({ media, sizes, formats: ['webp'] });
     assert.equal(result.decision.ready.length, 0);
     assert.equal(result.decision.missing.length, 1);
+  });
+});
+
+describe('rows written before previews recorded their metadata', () => {
+  test('rows without bytes, createdAt, origin or encodeSig are served, and nothing is queued', async () => {
+    const tasks = new MemoryTaskQueue();
+    const reader = new Reader(
+      readerDeps(
+        new Dispatcher({
+          tasks,
+          locks: undefined, // a task queue that gates by task needs none
+          coordination: defaultCoordination,
+          timingOf: (queue) => timingOf(tasks, queue),
+          name: 'default',
+          logger: silent,
+        }),
+      ),
+    );
+    // One row with its identity, one from before rows carried an identity.
+    const media: MediaLike = {
+      id: 'm1',
+      original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+      previews: [
+        {
+          storageRef: { key: 'cover' },
+          identity: 'default:default:10x10:webp:none',
+          resizer: 'default',
+          pipeline: 'default',
+          sizeKey: '10x10',
+          requestedWidth: 10,
+          requestedHeight: 10,
+          actualWidth: 10,
+          actualHeight: 10,
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+        {
+          storageRef: { key: 'fit' },
+          sizeKey: 'fit',
+          format: 'webp',
+          contentType: 'image/webp',
+          fit: true,
+        },
+      ],
+    };
+    const sizes = [{ width: 10, height: 10 }, { fit: true }];
+    const { decision } = await reader.resolve({ media, sizes });
+    assert.deepEqual(
+      decision.ready.map((e) => e.url),
+      ['https://cdn/cover', 'https://cdn/fit'],
+    );
+    assert.deepEqual(decision.missing, []);
+    assert.equal((await reader.prewarm({ media, sizes })).status, 'ready');
+    assert.deepEqual(tasks.added, []);
   });
 });

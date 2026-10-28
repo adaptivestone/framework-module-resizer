@@ -42,8 +42,6 @@ const expected = [
   'getSizeKey',
   'isCatalogCovered',
   'parseSizeKey',
-  'resizeMediaPaths',
-  'resizeMediaSchemaFragment',
   'ResizeError',
   'ResizeSetupError',
   'ResizeConfigError',
@@ -126,6 +124,8 @@ const safe = [
   ['/drivers/mongo.js', 'MongoLockStore'],
   ['/drivers/mongo.js', 'MongoTaskQueue'],
   ['/drivers/mongo.js', 'createResizeModels'],
+  ['/drivers/mongo.js', 'resizeMediaSchemaFragment'],
+  ['/drivers/mongo.js', 'resizeMediaPaths'],
   ['/drivers/fs.js', 'LocalFsStorage'],
   ['/framework.js', 'FrameworkMediaStore'],
   ['/framework.js', 'FrameworkLockStore'],
@@ -134,6 +134,10 @@ const safe = [
   ['/framework.js', 'ResizeWorker'],
   ['/framework.js', 'FrameworkResizer'],
   ['/framework.js', 'runResizeWorker'],
+  ['/framework.js', 'resizeMediaSchemaFragment'],
+  ['/framework.js', 'resizeMediaPaths'],
+  ['/framework.js', 'defaultFrameworkResizeConfig'],
+  ['/framework.js', 'defaultWorkerOptions'],
 ];
 for (const [sub, exp] of safe) {
   const m = await import(PKG + sub);
@@ -148,6 +152,10 @@ const expectedFramework = [
   'FrameworkResizer',
   'ResizeTaskModel',
   'ResizeWorker',
+  'defaultFrameworkResizeConfig',
+  'defaultWorkerOptions',
+  'resizeMediaPaths',
+  'resizeMediaSchemaFragment',
   'runResizeWorker',
 ];
 assert.deepEqual(
@@ -187,6 +195,7 @@ const resizer = new mod.Resizer({
   media: {
     loadMedia: async () => null,
     appendPreviews: async (_id, previews) => previews,
+    replacePreviews: async () => ({ stored: [], removed: [] }),
   },
 });
 assert.equal(resizer.name, 'default');
@@ -196,6 +205,7 @@ const fs = await import(PKG + '/drivers/fs.js');
 class MemoryMedia extends mod.MediaStore {
   async loadMedia() { return null; }
   async appendPreviews(_id, previews) { return previews; }
+  async replacePreviews() { return { stored: [], removed: [] }; }
 }
 class MemoryLocks extends mod.LockStore {
   async acquire() { return true; }
@@ -246,50 +256,107 @@ console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classe
 // installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
 const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
 import {
+  type InvalidateOpts,
   LockStore,
   MediaStore,
   type Preview,
+  type QueueConfig,
+  type ReplacedPreviews,
+  type StorageRef,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
+  defaultFrameworkResizeConfig,
+  defaultWorkerOptions,
   FrameworkLockStore,
   FrameworkMediaStore,
   FrameworkResizer,
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
 import ResizeTaskModel from '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js';
-import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';
 
 // The scaffold imports the defining model file so framework codegen can detect its ancestor.
 class ResizeTask extends ResizeTaskModel {}
 void ResizeTask;
 
-// The scaffolded config with its commented-out worker line enabled must stay a complete config.
+// The scaffolded config with its worker switched on must stay a complete config.
 const hostConfig = {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  queue: { driver: 'database' },
-  worker: { ...defaultFrameworkResizeConfig.worker, enabled: true },
+  queue: 'default',
+  queues: { default: { driver: 'database' } },
+  worker: { ...defaultWorkerOptions, enabled: true },
+} satisfies FrameworkResizeConfig;
+// A second Resizer's own file: its queue is a name defined in resize.ts.
+const listingsConfig = {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'Listing',
+  storage: { driver: 'local', rootDir: './var/listings', publicBaseUrl: '/listings' },
+  queue: 'bulk',
 } satisfies FrameworkResizeConfig;
 // An environment file switching both drivers.
 const productionConfig = {
   storage: { driver: 's3', bucketPublic: 'cdn', bucketPrivate: 'originals' },
-  queue: { driver: 'sqs', queueUrl: 'https://sqs.example/resize', maxAttempts: 3 },
+  queues: {
+    default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize', maxAttempts: 3 },
+  },
 } satisfies Partial<FrameworkResizeConfig>;
+// A resize.ts with only the process-wide sections (no default Resizer).
+const processOnlyConfig = {
+  queues: { bulk: { driver: 'database' } },
+  worker: { ...defaultWorkerOptions, enabled: true },
+} satisfies Partial<FrameworkResizeConfig>;
+// An environment file that only switches the worker on: the other keys take their defaults.
+const workerOnlyConfig = {
+  worker: { enabled: true },
+} satisfies Partial<FrameworkResizeConfig>;
+const bulkQueue: QueueConfig = { driver: 'database', leaseMs: 120_000 };
 // The scaffolded construction site (never called here: it would register a Resizer).
 const construct = () => new FrameworkResizer({ pipelines: { default: {} } });
-void [hostConfig, productionConfig, construct];
+void [
+  hostConfig,
+  listingsConfig,
+  productionConfig,
+  processOnlyConfig,
+  workerOnlyConfig,
+  bulkQueue,
+  construct,
+];
 import {
   MongoLockStore,
   MongoMediaStore,
   MongoTaskQueue,
   mongoParts,
+  resizeMediaPaths,
+  resizeMediaSchemaFragment,
 } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
+import mongoose from 'mongoose';
+
+// A host media model's schema spreads the fragment next to its own fields; the declarations keep
+// the literal leaf types a typed schema needs.
+const mediaSchema: {
+  name: { type: StringConstructor };
+  original: { storageRef: { type: 'Mixed' }; width: { type: NumberConstructor } };
+  previews: readonly { identity: { type: StringConstructor } }[];
+} = { name: { type: String }, ...resizeMediaSchemaFragment };
+const mediaPaths: readonly ['original', 'previews'] = resizeMediaPaths;
+// A typed Mongoose model of such a schema is a media model, castObject included (never called
+// here: compiling it is the check).
+const typedMediaStore = () => {
+  const File = mongoose.model(
+    'File',
+    new mongoose.Schema({ name: { type: String }, ...resizeMediaSchemaFragment }, { minimize: false }),
+  );
+  return [new MongoMediaStore({ model: File }), mongoParts(mongoose.connection, { mediaModel: File })];
+};
 
 class MemoryMedia extends MediaStore {
   async loadMedia(): Promise<null> { return null; }
   async appendPreviews(_id: string, previews: Preview[]): Promise<Preview[]> { return previews; }
+  async replacePreviews(_id: string, _identities: string[], rows: Preview[]): Promise<ReplacedPreviews> {
+    return { stored: rows, removed: [] };
+  }
 }
 class MemoryLocks extends LockStore {
   async acquire(): Promise<boolean> { return true; }
@@ -302,6 +369,7 @@ const locks: LockStore = new MemoryLocks();
 const plainMedia: MediaStore = {
   loadMedia: async () => null,
   appendPreviews: async (_id, previews) => previews,
+  replacePreviews: async () => ({ stored: [], removed: [] }),
 };
 // A core construction site (never called here: it would register a Resizer).
 const core = () =>
@@ -310,15 +378,22 @@ const core = () =>
     media: plainMedia,
     locks,
   });
+// Removing a media's previews of one pipeline resolves with the storage refs for the host to delete.
+const invalidateOpts: InvalidateOpts = { media: { id: 'm1' }, pipeline: 'watermark' };
+const invalidated = (): Promise<StorageRef[]> => core().invalidate(invalidateOpts);
 void [
   media,
   core,
+  invalidated,
   FrameworkMediaStore,
   FrameworkLockStore,
   MongoMediaStore,
   MongoLockStore,
   MongoTaskQueue,
   mongoParts,
+  mediaSchema,
+  mediaPaths,
+  typedMediaStore,
 ];
 
 type Equal<A, B> =

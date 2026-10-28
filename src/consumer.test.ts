@@ -166,7 +166,7 @@ describe('Consumer', () => {
     const events: TaskEvent[] = [];
     await new Consumer({
       tasks,
-      timing: timingOf(tasks),
+      timing: timingOf(tasks, 'default'),
       handle: async () => {
         stop.abort();
       },
@@ -879,7 +879,7 @@ describe('a task the Consumer does not accept', () => {
     try {
       await new Consumer({
         tasks,
-        timing: timingOf(tasks),
+        timing: timingOf(tasks, 'default'),
         accepts: (task) => {
           seen.push(task);
           return false;
@@ -946,7 +946,7 @@ describe('a task the Consumer does not accept', () => {
     const stop = new AbortController();
     await new Consumer({
       tasks,
-      timing: timingOf(tasks),
+      timing: timingOf(tasks, 'default'),
       accepts: () => true,
       handle: async () => {
         stop.abort();
@@ -1377,7 +1377,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     try {
       await new Consumer({
         tasks: replaced,
-        timing: timingOf(replaced),
+        timing: timingOf(replaced, 'default'),
         accepts: () => {
           stop.abort();
           return false;
@@ -1526,7 +1526,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
     let firstStarted = false;
     const first = new Consumer({
       tasks: dying,
-      timing: timingOf(tasks),
+      timing: timingOf(tasks, 'default'),
       handle: (_task, { signal }) => {
         firstStarted = true;
         return new Promise<void>((_resolve, reject) => {
@@ -2262,7 +2262,7 @@ test('claim receives the served Resizer names', async () => {
   };
   await new Consumer({
     tasks,
-    timing: timingOf(tasks),
+    timing: timingOf(tasks, 'default'),
     resizers: ['a', 'b'],
     handle: async () => {},
     logger: silent,
@@ -2292,7 +2292,7 @@ test('a throwing logger never stops the loop or fails a task', async (t) => {
   try {
     await new Consumer({
       tasks,
-      timing: timingOf(tasks),
+      timing: timingOf(tasks, 'default'),
       handle: async () => {
         stop.abort();
       },
@@ -2315,6 +2315,7 @@ describe('backoffMs', () => {
       new MemoryTaskQueue({
         timing: { retryBackoffMs: { base: 100, max: 350 } },
       }),
+      'default',
     );
     assert.deepEqual(
       [1, 2, 3, 4].map((n) => backoffMs(n, timing)),

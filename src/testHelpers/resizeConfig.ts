@@ -1,6 +1,5 @@
-import defaultResizeConfig, {
-  defaultFrameworkResizeConfig,
-} from '../config/resize.ts';
+import defaultResizeConfig from '../config/resize.ts';
+import { defaultFrameworkResizeConfig } from '../framework/defaults.ts';
 import type {
   DeepPartial,
   FrameworkResizeConfig,
@@ -28,7 +27,11 @@ function merge(base: unknown, override: unknown): unknown {
   return override === undefined ? base : override;
 }
 
-/** Test-only: a framework config file (framework defaults + mediaModelName 'File') with overrides. */
+/**
+ * Test-only: a Resizer's framework config file (the framework defaults and mediaModelName 'File')
+ * with overrides. It holds no process-wide section, so any Resizer's file can be one; a test that
+ * stands for src/config/resize.ts adds `queues`, `worker` or `coordination` through `override`.
+ */
 export function makeResizeConfig(
   override: DeepPartial<FrameworkResizeConfig> = {},
 ): FrameworkResizeConfig & ResizeConfig {

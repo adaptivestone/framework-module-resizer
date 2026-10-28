@@ -205,11 +205,19 @@ export abstract class TaskQueue {
     queue: string;
   }): Promise<EnqueueReceipt[]>;
 
-  /** Optional: whether `queue` can be consumed here (default: every queue). */
+  /**
+   * Optional: whether the queue name `queue` can be used here. Omit it to serve every name;
+   * return false for a name this queue cannot carry.
+   */
   servesQueue?(queue: string): boolean;
 
-  /** Optional: this queue's timing; missing values use the defaults (defaultQueueOptions). */
-  getTiming?(): Partial<QueueTimingOptions>;
+  /**
+   * Optional: the timing of the queue name `queue`; missing values use the defaults
+   * (defaultQueueOptions). The core reads it once per name, once it is valid: an invalid timing is
+   * read again on that name's next use. A task queue with one timing for every name ignores the
+   * argument.
+   */
+  getTiming?(queue: string): Partial<QueueTimingOptions> | undefined;
 
   /** Optional startup check: throw when the queue cannot work (e.g. its model is not registered). */
   verify?(): void | Promise<void>;

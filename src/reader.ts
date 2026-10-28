@@ -42,7 +42,7 @@ export interface ReaderDeps {
   storage: ResizeStorage;
   logger: ResizeLogger;
   name: string; // the Resizer's name: part of every preview identity
-  queue: string; // the Resizer's default queue for missing variants
+  queueName: string; // the Resizer's queue for missing variants, unless a call names its own
 }
 
 /** Serves the stored previews of one Resizer and requests the missing ones. Never throws. */
@@ -200,7 +200,7 @@ export class Reader {
               mediaId,
               pipeline,
               previews: decision.missing,
-              queue: opts.queue ?? this.#deps.queue,
+              queue: opts.queue ?? this.#deps.queueName,
             });
           } catch (err) {
             // enqueue is internally guarded and should never reach here; belt-and-suspenders.
@@ -391,11 +391,20 @@ export class Reader {
         mediaId,
         pipeline,
         previews: required,
-        queue: opts.queue ?? this.#deps.queue,
+        queue: opts.queue ?? this.#deps.queueName,
       };
       const attempt = dispatcher
         ? await dispatcher.enqueueConfirmed(request)
         : noQueueResult(required);
+      if ('timingError' in attempt) {
+        // The call's queue has invalid timing: reported as for a task queue that cannot be used.
+        return finish({
+          ...prewarmFailure(attempt.timingError, required),
+          requested,
+          ready,
+          notRequired,
+        });
+      }
       return finish({
         status: attempt.unconfirmed.length > 0 ? 'incomplete' : 'accepted',
         requested,

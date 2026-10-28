@@ -16,4 +16,9 @@ export type VariantStep = (
 export interface Pipeline {
   beforeSteps?: BeforeStep[]; // async; run ONCE on the original buffer, before any resize
   variantSteps?: VariantStep[]; // run PER variant, after resize, before encode
+  /**
+   * Part of each preview's encodeSig: bump it to mark this pipeline's stored previews as made with
+   * older settings (they are not regenerated yet).
+   */
+  version?: string;
 }

@@ -1,25 +1,25 @@
 // FrameworkResizer: a Resizer wired from the framework app. The core takes every part explicitly;
-// this subclass builds them from the Resizer's config file, so a framework host's src/resizer.ts
-// holds only behaviour (pipelines, hooks):
-// - config: the file's image settings;
-// - media: FrameworkMediaStore (the app's media model, `mediaModelName` in the file);
+// this subclass builds them from the config files, so a framework host's src/resizer.ts holds only
+// behaviour (pipelines, hooks):
+// - config: the image settings of the Resizer's file (`configName`, default 'resize');
+// - media: FrameworkMediaStore (the app's media model, `mediaModelName` in that file);
+// - storage: that file's `storage` section ('local' or 's3');
+// - queueName and tasks: that file's `queue` names one of the `queues` in src/config/resize.ts (no
+//   `queue`: 'default' when there are queues, else eager only; false: eager only); the task queue
+//   is the one of that queue's backend, shared by every Resizer on it (see ./queue.ts);
 // - locks: FrameworkLockStore (the framework's own Lock model) beside a task queue without
-//   gatesByTask (the 'sqs' driver), for its gate locks; none beside the database queue, which
-//   keeps the gate in its task rows, and none for an eager-only Resizer;
-// - storage: the file's `storage` section ('local' or 's3');
-// - tasks: the file's `queue` section ('database', 'sqs', or false / missing for eager only);
-// - coordination: the file's `coordination` section, which the core validates;
+//   gatesByTask (SQS), for its gate locks; none beside the database queue, which keeps the gate in
+//   its task rows, and none for an eager-only Resizer;
+// - coordination: `coordination` in src/config/resize.ts, which the core validates;
 // - logger and events: the app's.
-// Options win over the config file. Nothing is read from the app until first use, and the AWS
-// drivers (optional peers) are imported only when the config selects them. The task queues this
-// builds are shared per backend (see ./queue.ts): Resizers whose config selects the same backend
-// get the same queue object, so the worker runs one loop for it, and their timing must agree.
+// Options win over the config files. Nothing is read from the app until first use, and the AWS
+// drivers (optional peers) are imported only when the config selects them.
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
-import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
+import { ResizeConfigError } from '../errors.ts';
 import { Resizer, type ResizerOptions } from '../resizer.ts';
 import type {
   CoordinationOptions,
@@ -29,22 +29,19 @@ import type {
 } from '../types.d.ts';
 import { appEvents, appLogger } from './app.ts';
 import {
+  type ConfigSource,
+  getProcessConfig,
   getResizeConfig,
   type ResolvedFrameworkConfig,
+  type ResolvedProcessConfig,
+  type ResolvedQueue,
   resolveFrameworkConfig,
+  sourceName,
 } from './config.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
-import {
-  addQueueUser,
-  appTaskQueue,
-  backendKey,
-  backendTiming,
-  checkQueueUser,
-  DATABASE_BACKEND,
-  type QueueUser,
-  sharedQueue,
-} from './queue.ts';
+import { importDriver } from './peers.ts';
+import { taskQueueOf } from './queue.ts';
 
 export interface FrameworkResizerOptions
   extends Omit<
@@ -57,35 +54,38 @@ export interface FrameworkResizerOptions
     | 'coordination'
     | 'logger'
     | 'events'
+    | 'queueName'
   > {
   configName?: string; // the config file this Resizer reads; default 'resize'
+  // The queue name of this Resizer's tasks, readable at once; default: the config file's `queue`
+  // ('default' when it has none).
+  queueName?: string;
   config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
   storage?: ResizeStorage; // default: built from the config's `storage`
   media?: MediaStore; // default: FrameworkMediaStore over the config's `mediaModelName`
   // default: FrameworkLockStore (the framework's Lock model) beside a task queue without
   // gatesByTask (SQS); none beside the database queue or without a task queue
   locks?: LockStore;
-  // default: built from the config's `queue`; `false` = eager only, whatever the config says
+  // default: the task queue of the Resizer's queue in `queues` of src/config/resize.ts; `false` =
+  // eager only, whatever the config says. Given here, the queue is not chosen from `queues`, but a
+  // src/config/resize.ts that exists is still validated whole when `coordination` is read from it.
   tasks?: TaskQueue | false;
-  coordination?: CoordinationOptions; // default: the config's `coordination`
+  coordination?: CoordinationOptions; // default: `coordination` in src/config/resize.ts
   logger?: ResizeLogger; // default: the app logger
   events?: ResizeEventBus; // default: the app event bus
 }
 
 /**
- * A Resizer wired from the framework app and its config file. Import `src/resizer.ts` anywhere,
+ * A Resizer wired from the framework app and its config files. Import `src/resizer.ts` anywhere,
  * even before the framework is initialized: the config, models and drivers are read on first use.
  * Call `await resizer.verify()` after `Server.init()` to check everything at boot.
  */
 export class FrameworkResizer extends Resizer {
-  // This Resizer's config as a user of a shared task queue; unset with an explicit `tasks` or
-  // `tasks: false`.
-  readonly #queueUser: QueueUser | undefined;
-
   constructor(opts: FrameworkResizerOptions = {}) {
     const {
-      configName,
+      configName = 'resize',
       config: explicitConfig,
+      queueName,
       storage,
       media,
       locks,
@@ -95,19 +95,41 @@ export class FrameworkResizer extends Resizer {
       events,
       ...rest
     } = opts;
+    const source: ConfigSource = {
+      configName,
+      explicit: explicitConfig !== undefined,
+    };
     // An explicit config is validated now; a config file is read on first use.
     const explicit = explicitConfig
-      ? resolveFrameworkConfig(explicitConfig, configName)
+      ? resolveFrameworkConfig(explicitConfig, source)
       : undefined;
     const read = (): ResolvedFrameworkConfig =>
       explicit ?? getResizeConfig(configName);
-    const file = `src/config/${configName ?? 'resize'}.ts`;
-    // The task queue from the config, built once for the `tasks` part and the default `locks`
-    // part: the parts load in parallel, so the lock store waits for the same build. A failed
-    // build is forgotten, so the next call retries it.
+    const where = sourceName(source);
+    // The queue this Resizer's tasks go to, chosen on first use and kept once chosen; a choice
+    // that fails (e.g. a name `queues` does not define) is made again on the next call.
+    let lane: Lane | undefined;
+    const readLane = (): Lane => {
+      lane ??= chooseLane({
+        resizer: rest.name ?? 'default',
+        where,
+        option: queueName,
+        file: read().queue,
+        fromCode: tasks !== undefined,
+      });
+      return lane;
+    };
+    // The task queue of that queue, built once for the `tasks` part and the default `locks` part:
+    // the parts load in parallel, so the lock store waits for the same build. A failed build is
+    // forgotten, so the next call retries it.
     let building: Promise<TaskQueue | undefined> | undefined;
     const configQueue = (): Promise<TaskQueue | undefined> => {
-      building ??= buildQueue(read(), file).catch((err: unknown) => {
+      building ??= (async () => {
+        const { entry, processConfig } = readLane();
+        return entry && processConfig
+          ? taskQueueOf(entry, processConfig)
+          : undefined;
+      })().catch((err: unknown) => {
         building = undefined;
         throw err;
       });
@@ -118,7 +140,7 @@ export class FrameworkResizer extends Resizer {
       config: explicit ? explicit.image : () => read().image,
       logger: logger ?? appLogger,
       events: events ?? appEvents,
-      storage: storage ?? (() => buildStorage(read(), file)),
+      storage: storage ?? (() => buildStorage(read(), where)),
       media:
         media ??
         new FrameworkMediaStore(
@@ -126,6 +148,8 @@ export class FrameworkResizer extends Resizer {
             ? { config: explicitConfig, configName }
             : { configName },
         ),
+      // A name given in code is readable at once; one from the file once the Resizer is used.
+      queueName: queueName ?? (() => readLane().queueName),
       // Only a task queue without gatesByTask takes gate locks, so only then does verify() need
       // the framework Lock model.
       locks:
@@ -141,36 +165,68 @@ export class FrameworkResizer extends Resizer {
       // it is).
       coordination:
         coordination ??
-        (explicit
-          ? explicit.coordination
-          : () => {
-              const own = read().coordination;
-              return own === undefined ? {} : own;
-            }),
+        (() => {
+          const own = getProcessConfig().coordination;
+          return own === undefined ? {} : own;
+        }),
     });
-    // Registered once constructed (a rejected name or config registers nothing).
-    if (tasks === undefined) {
-      this.#queueUser = {
-        source: explicit
-          ? `the config passed to new FrameworkResizer({ name: '${this.name}' })`
-          : file,
-        read,
-        backend: (config) => backendKey(config.queue),
-      };
-      addQueueUser(this.#queueUser);
-    }
   }
+}
 
-  /**
-   * The core checks, then the timing of the shared task queue again: a Resizer constructed after
-   * this one loaded its queue is compared here too.
-   */
-  async verify(): Promise<void> {
-    await super.verify();
-    if (this.#queueUser) {
-      checkQueueUser(this.#queueUser);
-    }
+/** The queue a Resizer's tasks go to: its name, and the `queues` entry to build the task queue for. */
+interface Lane {
+  queueName: string;
+  // undefined: no task queue from the config (eager only, or the task queue was given in code)
+  entry: ResolvedQueue | undefined;
+  processConfig: ResolvedProcessConfig | undefined;
+}
+
+/**
+ * Choose the queue of a Resizer from the `queueName` option (`option`), else its file's `queue`
+ * (`file`). With a task queue in code (`fromCode`), the lane is not looked up in `queues`: the name
+ * is the option, the file's name, or 'default' (`coordination` may still read and validate
+ * src/config/resize.ts as a whole). Otherwise false is eager only; no name is 'default' when
+ * src/config/resize.ts defines queues, and eager only when it defines none; a name it does not
+ * define is RESIZE_CONFIG_QUEUE_UNKNOWN.
+ */
+function chooseLane(opts: {
+  resizer: string; // the Resizer's name, for the message
+  where: string; // its config, for the message
+  option: string | undefined;
+  file: string | false | undefined;
+  fromCode: boolean;
+}): Lane {
+  const { resizer, where, option, file, fromCode } = opts;
+  if (fromCode) {
+    const queueName = option ?? (typeof file === 'string' ? file : 'default');
+    return { queueName, entry: undefined, processConfig: undefined };
   }
+  const name = option ?? file;
+  if (name === false) {
+    return { queueName: 'default', entry: undefined, processConfig: undefined };
+  }
+  const processConfig = getProcessConfig();
+  if (name === undefined && processConfig.queues.size === 0) {
+    return { queueName: 'default', entry: undefined, processConfig: undefined };
+  }
+  const queueName = name ?? 'default';
+  const entry = processConfig.queues.get(queueName);
+  if (!entry) {
+    const implied =
+      name === undefined
+        ? ` (the default when ${where} sets no \`queue\`)`
+        : '';
+    // The option wins over the file, so a name from it is fixed in the code.
+    const fix =
+      option === undefined
+        ? 'set `queue` to a defined name, or queue: false for eager only'
+        : 'set `queueName` to a defined name, or pass tasks: false for eager only';
+    throw new ResizeConfigError(
+      `resize config: Resizer '${resizer}' queues to '${queueName}'${implied}, which \`queues\` in src/config/resize.ts does not define — add queues.${queueName}, ${fix}`,
+      { code: 'RESIZE_CONFIG_QUEUE_UNKNOWN' },
+    );
+  }
+  return { queueName, entry, processConfig };
 }
 
 /** The lock store for the gate locks of `tasks`: needed only beside a queue without gatesByTask. */
@@ -178,42 +234,14 @@ function gateLockStore(tasks: TaskQueue | undefined): LockStore | undefined {
   return tasks && !tasks.gatesByTask ? new FrameworkLockStore() : undefined;
 }
 
-async function importDriver<T>(
-  load: () => Promise<T>,
-  driver: string,
-  peers: string[],
-  file: string,
-): Promise<T> {
-  try {
-    return await load();
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      'code' in err &&
-      (err.code === 'ERR_MODULE_NOT_FOUND' || err.code === 'MODULE_NOT_FOUND')
-    ) {
-      const missing = /^Cannot find (?:package|module) ['"]([^'"]+)['"]/.exec(
-        err.message,
-      )?.[1];
-      if (missing && peers.includes(missing)) {
-        throw new ResizeSetupError(
-          `resize config: the '${driver}' driver selected in ${file} requires missing optional peer \`${missing}\` — install ${peers.join(' ')}`,
-          { code: 'RESIZE_PEER_MISSING', cause: err },
-        );
-      }
-    }
-    throw err;
-  }
-}
-
 async function buildStorage(
   config: ResolvedFrameworkConfig,
-  file: string,
+  where: string,
 ): Promise<ResizeStorage> {
   const { storage } = config;
   if (!storage) {
     throw new ResizeConfigError(
-      `resize config: \`storage\` is missing — set storage: { driver: 'local', rootDir, publicBaseUrl } (or driver 's3') in ${file}, or pass \`storage\` to new FrameworkResizer()`,
+      `resize config: \`storage\` is missing — set storage: { driver: 'local', rootDir, publicBaseUrl } (or driver 's3') in ${where}, or pass \`storage\` to new FrameworkResizer()`,
       { code: 'RESIZE_CONFIG_STORAGE_MISSING' },
     );
   }
@@ -239,7 +267,7 @@ async function buildStorage(
     () => import('../drivers/s3.ts'),
     's3',
     ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'],
-    file,
+    where,
   );
   return new S3Storage(
     Object.fromEntries(
@@ -253,45 +281,4 @@ async function buildStorage(
       }).filter(([, value]) => value !== undefined),
     ) as { bucketPublic: string },
   );
-}
-
-async function buildQueue(
-  config: ResolvedFrameworkConfig,
-  file: string,
-): Promise<TaskQueue | undefined> {
-  const { queue } = config;
-  if (queue === false) {
-    return undefined;
-  }
-  if (queue.driver === 'sqs') {
-    const { SqsTaskQueue } = await importDriver(
-      () => import('../drivers/sqs.ts'),
-      'sqs',
-      ['@aws-sdk/client-sqs'],
-      file,
-    );
-    // One SqsTaskQueue per SQS queue in the process, with the timing its configs agree on.
-    return sharedQueue(
-      backendKey(queue) as string,
-      (timing) =>
-        new SqsTaskQueue({
-          queueUrl: queue.queueUrl,
-          ...(queue.queues ? { queues: queue.queues } : {}),
-          ...(queue.deadLetterQueueUrl
-            ? { deadLetterQueueUrl: queue.deadLetterQueueUrl }
-            : {}),
-          ...(queue.waitTimeSeconds === undefined
-            ? {}
-            : { waitTimeSeconds: queue.waitTimeSeconds }),
-          ...(queue.region ? { region: queue.region } : {}),
-          ...(queue.endpoint ? { endpoint: queue.endpoint } : {}),
-          timing,
-          logger: appLogger,
-        }),
-    );
-  }
-  // 'database': the app's one task queue over its ResizeTask model. The core reads a queue's
-  // timing once; check it here so every Resizer sees a conflict on its own first use.
-  backendTiming(DATABASE_BACKEND);
-  return appTaskQueue();
 }

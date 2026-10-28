@@ -3,7 +3,8 @@
 //   - generate()    = the core for eager `resizer.generate`
 // The steps (download once → metadata guards → an SVG rendered once to a raster → beforeSteps
 // once, after an orientation normalize → decode once + bounded per-variant resize/encode/upload →
-// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers.
+// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers,
+// and invalidate() removes stored previews for `resizer.invalidate` (one media store write).
 // It takes no locks: the queue leases a task to one worker at a time, the lease token fences the
 // task's writes, and the media store keeps one row per preview identity when an expired lease lets
 // two workers render the same variant. It takes its parts explicitly and knows no Resizer. sharp
@@ -17,7 +18,7 @@ import sharp, {
 } from 'sharp';
 import type { Catalog } from './catalog.ts';
 import type { ObserverName } from './contracts/hooks.ts';
-import type { MediaStore } from './contracts/media.ts';
+import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
 import {
@@ -29,6 +30,7 @@ import {
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
 import { rasterizeSvg } from './helpers/svgRaster.ts';
@@ -36,12 +38,15 @@ import type { HookBus } from './hooks.ts';
 import {
   calculateResizedDimensions,
   coverDimensions,
+  previewScope,
   requireMediaId,
 } from './images.ts';
 import type { PipelineRegistry } from './pipelines.ts';
+import { encodeSignature, previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
   GenerateResult,
+  InvalidateOpts,
   MediaLike,
   MissingPreview,
   Preview,
@@ -49,6 +54,7 @@ import type {
   ResizeConfig,
   ResizeLogger,
   SizeInput,
+  StorageRef,
 } from './types.d.ts';
 
 /** Normalize a driver download / beforeStep result to a Node Buffer for the next sharp(). */
@@ -71,6 +77,28 @@ function requirePipeline(
       { code: 'RESIZE_PIPELINE_UNKNOWN' },
     );
   }
+}
+
+/**
+ * A media store written before replacePreviews existed cannot remove rows. invalidate() and the
+ * Resizer's verify() check it, with one message.
+ */
+export function requireReplacePreviews(media: MediaStore): void {
+  if (typeof media.replacePreviews !== 'function') {
+    throw new ResizeSetupError(
+      'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
+      { code: 'RESIZE_MEDIA_REPLACE_MISSING' },
+    );
+  }
+}
+
+/** A replacePreviews result the core can read: an object with the two lists of rows. */
+function isReplacedPreviews(result: unknown): result is ReplacedPreviews {
+  if (typeof result !== 'object' || result === null) {
+    return false;
+  }
+  const { stored, removed } = result as Partial<ReplacedPreviews>;
+  return Array.isArray(stored) && Array.isArray(removed);
 }
 
 /** A per-call argument names an unconfigured format: a wiring error at the call site. */
@@ -161,7 +189,7 @@ export interface ProcessorDeps {
 
 /**
  * Renders the previews of one Resizer: eagerly for a caller, or for one queued task. Also fires
- * the task observers.
+ * the task observers and removes stored previews.
  */
 export class Processor {
   readonly #deps: ProcessorDeps;
@@ -235,6 +263,71 @@ export class Processor {
     }
 
     return { created: generated, failed: failedCount };
+  }
+
+  /**
+   * Remove this Resizer's stored previews of a media, of one pipeline or of all, in one media store
+   * write, and resolve with the storage refs of the rows it removed. The rows are picked from the
+   * media as the store holds it, and only rows with a stored identity are removed: the store
+   * removes rows by it, and a row stored before rows carried one has none. The pipeline need not
+   * be registered, so the rows of a renamed pipeline can still be removed.
+   */
+  async invalidate(opts: InvalidateOpts): Promise<StorageRef[]> {
+    const { logger, media: mediaStore, name } = this.#deps;
+    const mediaId = requireMediaId(opts.media);
+    const media = await mediaStore.loadMedia(mediaId);
+    if (!media) {
+      return [];
+    }
+    const identities = new Set<string>();
+    for (const row of media.previews ?? []) {
+      const scope = previewScope(row);
+      if (
+        typeof row.identity === 'string' &&
+        scope.resizer === name &&
+        (opts.pipeline === undefined || scope.pipeline === opts.pipeline)
+      ) {
+        identities.add(row.identity);
+      }
+    }
+    if (identities.size === 0) {
+      return [];
+    }
+    requireReplacePreviews(mediaStore);
+    const result: unknown = await mediaStore.replacePreviews(
+      mediaId,
+      [...identities],
+      [],
+    );
+    if (!isReplacedPreviews(result)) {
+      throw new ResizeSetupError(
+        "resize: the media store's replacePreviews resolved with something other than { stored, removed } — resolve with the rows it stored and removed ([] when none)",
+        { code: 'RESIZE_MEDIA_REPLACE_RESULT_INVALID' },
+      );
+    }
+    // Off the caller's in-memory doc too, so a same-request resolve() does not serve the rows. The
+    // store has already removed them, so an array that cannot be changed (a frozen one, say) is
+    // only logged, and through logNeverThrow, so a throwing logger cannot lose them either: the
+    // refs are the host's only record of the removed objects.
+    try {
+      const previews = opts.media.previews;
+      if (Array.isArray(previews)) {
+        for (let i = previews.length - 1; i >= 0; i -= 1) {
+          const identity = previews[i]?.identity;
+          if (typeof identity === 'string' && identities.has(identity)) {
+            previews.splice(i, 1);
+          }
+        }
+      }
+    } catch (err) {
+      logNeverThrow(
+        logger,
+        `resize: invalidate removed previews of media ${mediaId} from the media store but could not take them off the caller's media.previews, so a same-request resolve() may still serve them`,
+        err,
+        'warn',
+      );
+    }
+    return result.removed.map((row) => row.storageRef);
   }
 
   /**
@@ -432,6 +525,16 @@ export class Processor {
       config.limits.sourcePixels,
       config.limits.inputPixels,
     );
+
+    // The dimensions the media holds: the stored pair, or, when the original never recorded it,
+    // the measured display size (which the persist below backfills). Every row's origin is signed
+    // with them, persisted or not, so the rows of one original always share one origin.
+    const storedDims =
+      original.width !== undefined && original.height !== undefined
+        ? { width: original.width, height: original.height }
+        : undefined;
+    const mediaDims = storedDims ?? { width: dispW, height: dispH };
+    const origin = previewOrigin(original.storageRef, mediaDims);
 
     const pipeline = pipelines.get(pipelineName);
     // A preview keeps the animation only in an animated format and only without variantSteps: a
@@ -747,6 +850,14 @@ export class Processor {
           // One frame: an animated output reports the height of all frames stacked.
           actualWidth: info.width,
           actualHeight: info.pageHeight ?? info.height,
+          bytes: data.length,
+          createdAt: new Date(),
+          origin,
+          encodeSig: encodeSignature(config, {
+            format: v.format,
+            fit: v.fit === true,
+            version: pipeline.version,
+          }),
         };
         if (v.filters) {
           preview.filters = v.filters;
@@ -779,10 +890,7 @@ export class Processor {
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
     // never carried dims), then fire onPreviewGenerated per pushed preview (ctx {}).
     if (persist && generated.length > 0) {
-      const backfillDims =
-        original.width === undefined || original.height === undefined
-          ? { width: dispW, height: dispH }
-          : undefined;
+      const backfillDims = storedDims === undefined ? mediaDims : undefined;
       // What the media store holds now, read once after a failed or partial write: the identities
       // stored on the media, null when the media is gone, undefined when the reload failed too.
       const recordedIdentities = async (): Promise<

@@ -54,7 +54,7 @@ function makeTaskQueue(
     complete: (task) => memory.complete(task),
     fail: (task, next, error) => memory.fail(task, next, error),
     findActive: overrides.findActive ?? ((query) => memory.findActive(query)),
-    getTiming: () => memory.getTiming(),
+    getTiming: (queue) => memory.getTiming(queue),
   };
   return { tasks, added };
 }
@@ -94,7 +94,7 @@ function makeResizer(
     tasks?: TaskQueue;
     lockStore?: LockStore;
     name?: string;
-    queue?: string;
+    queueName?: string;
     hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
     pipelines?: ConstructorParameters<typeof Resizer>[0]['pipelines'];
   } = {},
@@ -107,7 +107,7 @@ function makeResizer(
     config: makeImageConfig(),
     logger,
     name: options.name,
-    queue: options.queue,
+    queueName: options.queueName,
     hooks: options.hooks,
     pipelines: options.pipelines,
   });
@@ -152,7 +152,7 @@ describe('prewarm — explicit coverage', () => {
     assert.deepEqual(result.tasks, [{ taskId: 'task-1', previews: calls[0] }]);
   });
 
-  test('added tasks record the Resizer name and queue; after an in-flight add, findActive uses the Resizer, media, and pipeline scope', async () => {
+  test('added tasks record the Resizer name and queueName; after an in-flight add, findActive uses the Resizer, media, and pipeline scope', async () => {
     const added: { resizer: string; queue: string }[] = [];
     const looked: { resizer: string; mediaId: string; pipeline: string }[] = [];
     const { tasks } = makeTaskQueue({
@@ -172,7 +172,7 @@ describe('prewarm — explicit coverage', () => {
       storage,
       tasks,
       name: 'listings',
-      queue: 'interactive',
+      queueName: 'interactive',
     });
     const media = {
       id: 'm1',

@@ -7,8 +7,14 @@ import type {
   TaskAddResult,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+import { gateKey } from './lockKeys.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
-import { fakeMedia, memoryLocks, PlainTaskQueue } from './testHelpers/fakes.ts';
+import {
+  clockLocks,
+  fakeMedia,
+  memoryLocks,
+  PlainTaskQueue,
+} from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
@@ -64,7 +70,7 @@ function makeTaskQueue(behavior?: (task: NewTask) => TaskAddResult) {
     renew: (task, leaseMs) => memory.renew(task, leaseMs),
     complete: (task) => memory.complete(task),
     fail: (task, next, error) => memory.fail(task, next, error),
-    getTiming: () => memory.getTiming(),
+    getTiming: (queue) => memory.getTiming(queue),
   };
   return { tasks, calls };
 }
@@ -94,7 +100,7 @@ function makeResizer(
     tasks?: TaskQueue;
     lockStore?: LockStore;
     name?: string;
-    queue?: string;
+    queueName?: string;
     hooks?: ConstructorParameters<typeof Resizer>[0]['hooks'];
     pipelines?: ConstructorParameters<typeof Resizer>[0]['pipelines'];
   } = {},
@@ -107,7 +113,7 @@ function makeResizer(
     config: makeImageConfig(),
     logger: currentLogger,
     name: options.name,
-    queue: options.queue,
+    queueName: options.queueName,
     hooks: options.hooks,
     pipelines: options.pipelines,
   });
@@ -184,7 +190,7 @@ describe('prewarm — happy path', () => {
 });
 
 describe('prewarm — queue', () => {
-  test('without queue sends resizer.queue; with queue sends that queue', async () => {
+  test('without queue sends resizer.queueName; with queue sends that queue', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
     const { lockStore } = makeLocks(true);
@@ -193,7 +199,7 @@ describe('prewarm — queue', () => {
       tasks,
       lockStore,
       name: 'listings',
-      queue: 'interactive',
+      queueName: 'interactive',
     });
     const original = { storageRef: { key: 'orig.jpg' } };
     await r.prewarm({
@@ -218,7 +224,7 @@ describe('prewarm — queue', () => {
     );
   });
 
-  test('a Resizer without a queue option sends "default"', async () => {
+  test('a Resizer without a queueName option sends "default"', async () => {
     installFakeApp();
     const { tasks, calls } = makeTaskQueue();
     const { lockStore } = makeLocks(true);
@@ -234,6 +240,108 @@ describe('prewarm — queue', () => {
     });
     assert.equal(calls[0].resizer, 'default');
     assert.equal(calls[0].queue, 'default');
+  });
+
+  test('prewarm on a queue the task queue does not serve reports RESIZE_QUEUE_NOT_SERVED and queues nothing', async () => {
+    installFakeApp();
+    const tasks = new PlainTaskQueue({ queues: ['default'] });
+    const locks = clockLocks();
+    const r = makeResizer({ tasks, lockStore: locks });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [
+        { width: 300, height: 300 },
+        { width: 100, height: 100 },
+      ],
+      formats: ['jpeg'],
+      queue: 'bulk',
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(result.unconfirmed, result.requested);
+    assert.equal(result.requested.length, 2);
+    assert.deepEqual(result.accepted, []);
+    assert.deepEqual(result.tasks, []);
+    assert.deepEqual(result.issues, [
+      {
+        code: 'RESIZE_QUEUE_NOT_SERVED',
+        message:
+          "cannot queue to 'bulk': its task queue does not serve that queue (an unknown queue name, or a queue on another backend; one Resizer cannot use two backends yet)",
+        retryable: false,
+        previews: result.requested,
+      },
+    ]);
+    assert.equal(tasks.added.length, 0);
+    assert.equal(
+      locks.entry(gateKey('default', 'bulk', 'm1', 'default')),
+      undefined,
+    );
+    // The Resizer's own queue still queues.
+    const own = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(own.status, 'accepted');
+    assert.equal(tasks.added.length, 1);
+  });
+
+  test('prewarm on a queue with invalid timing reports RESIZE_ENQUEUE_INTERNAL_ERROR, as for its own queue, and queues nothing', async () => {
+    installFakeApp();
+    const tasks = new PlainTaskQueue({
+      queueTiming: { bulk: { leaseMs: 0 } },
+    });
+    const locks = clockLocks();
+    const r = makeResizer({ tasks, lockStore: locks });
+    const media: MediaLike = {
+      id: 'm1',
+      original: { storageRef: { key: 'orig.jpg' } },
+      previews: [
+        {
+          storageRef: { key: 'p' },
+          sizeKey: '100x100',
+          format: 'jpeg',
+          contentType: 'image/jpeg',
+          resizer: 'default',
+          pipeline: 'default',
+        },
+      ],
+    };
+    const result = await r.prewarm({
+      media,
+      sizes: [
+        { width: 300, height: 300 },
+        { width: 100, height: 100 },
+      ],
+      formats: ['jpeg'],
+      queue: 'bulk',
+    });
+    assert.equal(result.status, 'incomplete');
+    assert.deepEqual(
+      result.ready.map((v) => v.sizeKey),
+      ['100x100'],
+    );
+    assert.deepEqual(
+      result.unconfirmed.map((v) => v.sizeKey),
+      ['300x300'],
+    );
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
+    assert.equal(result.issues[0].retryable, false);
+    assert.match(result.issues[0].message, /leaseMs/);
+    assert.deepEqual(result.issues[0].previews, result.unconfirmed);
+    assert.equal(tasks.added.length, 0);
+    assert.equal(
+      locks.entry(gateKey('default', 'bulk', 'm1', 'default')),
+      undefined,
+    );
+    // The Resizer's own queue still queues.
+    const own = await r.prewarm({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(own.status, 'accepted');
+    assert.equal(tasks.added.length, 1);
   });
 });
 

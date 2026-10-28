@@ -32,12 +32,15 @@ async function failedDriverImport(
           return nextResolve(specifier, context);
         },
       });
-      const config = makeResizeConfig({
-        storage: ${driver === 's3' ? "{ driver: 's3', bucketPublic: 'cdn' }" : "{ driver: 'local', rootDir: './media', publicBaseUrl: '/media' }"},
-        queue: ${driver === 'sqs' ? "{ driver: 'sqs', queueUrl: 'https://sqs.example/resize' }" : 'false'},
-      });
+      // S3 is the Resizer's own storage; an SQS queue is defined in src/config/resize.ts.
+      const configs = {
+        resize: ${driver === 'sqs' ? "{ queues: { default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' } } }" : '{}'},
+        resizeListings: makeResizeConfig({
+          storage: ${driver === 's3' ? "{ driver: 's3', bucketPublic: 'cdn' }" : "{ driver: 'local', rootDir: './media', publicBaseUrl: '/media' }"},
+        }),
+      };
       setAppInstance({
-        getConfig: () => config,
+        getConfig: (name) => configs[name] ?? {},
         logger: { info() {}, warn() {}, error() {} },
       });
       const resizer = new FrameworkResizer({ configName: 'resizeListings' });
@@ -58,9 +61,17 @@ async function failedDriverImport(
   return JSON.parse(stdout);
 }
 
-for (const [driver, peers] of [
-  ['s3', ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner']],
-  ['sqs', ['@aws-sdk/client-sqs']],
+for (const [driver, peers, selectedIn] of [
+  [
+    's3',
+    ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'],
+    /in src\/config\/resizeListings\.ts \(or its resizeListings\.<NODE_ENV>\.ts override\)/,
+  ],
+  [
+    'sqs',
+    ['@aws-sdk/client-sqs'],
+    /`queues\.default` in src\/config\/resize\.ts \(or its resize\.<NODE_ENV>\.ts override\)/,
+  ],
 ] as const) {
   for (const peer of peers) {
     test(`${driver}: missing ${peer} names the config and installation remedy`, async () => {
@@ -68,7 +79,7 @@ for (const [driver, peers] of [
       assert.equal(error.setupError, true);
       assert.equal(error.code, 'RESIZE_PEER_MISSING');
       assert.equal(error.sameCause, true);
-      assert.match(error.message, /src\/config\/resizeListings\.ts/);
+      assert.match(error.message, selectedIn);
       assert.ok(error.message.includes(`'${driver}'`));
       assert.match(error.message, /install/);
       for (const required of peers) {

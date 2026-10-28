@@ -11,10 +11,10 @@ import defaultResizeConfig from '../../config/resize.ts';
 import type { MediaStore } from '../../contracts/media.ts';
 import type { ResizeStorage } from '../../contracts/storage.ts';
 import { Resizer, resetResizerForTests } from '../../index.ts';
-import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { runWorker } from '../../worker.ts';
 import { mongoParts } from './index.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 
 const png = await sharp({
   create: { width: 64, height: 48, channels: 3, background: '#3366cc' },
@@ -170,4 +170,90 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
   assert.equal(decision.ready.length, 1);
   const task = await ResizeTask.findOne({}).lean();
   assert.equal(task?.status, 'completed');
+});
+
+test('invalidate on MongoDB removes one pipeline in one write; the next resolve queues it again', async () => {
+  resetAppInstance();
+  const updates: boolean[] = [];
+  const schema = new mongoose.Schema(
+    { ...resizeMediaSchemaFragment },
+    { minimize: false },
+  );
+  schema.pre(
+    'findOneAndUpdate',
+    function (this: mongoose.Query<unknown, unknown>) {
+      updates.push(Array.isArray(this.getUpdate()));
+    },
+  );
+  const File = connection.model('InvalidateFile', schema);
+  const parts = mongoParts(connection, {
+    mediaModel: File,
+    timing: { idlePollMs: 20, leaseMs: 5000 },
+    logger: silent,
+  });
+  const { ResizeTask } = connection.models;
+  await Promise.all([File.init(), ResizeTask.createIndexes()]);
+
+  const resizer = new Resizer({
+    name: 'invalidating',
+    config: { ...defaultResizeConfig, formats: ['webp'] },
+    logger: silent,
+    storage: memoryStorage(),
+    pipelines: { wm: {} },
+    ...parts,
+  });
+  const original = await resizer.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  const file = await File.create({ original, previews: [] });
+  const sizes = [
+    { width: 16, height: 16 },
+    { width: 8, height: 8 },
+  ];
+  const { created: defaults } = await resizer.generate({ media: file, sizes });
+  const { created: watermarked } = await resizer.generate({
+    media: file,
+    sizes,
+    pipeline: 'wm',
+  });
+  assert.equal(defaults.length, 2);
+  assert.equal(watermarked.length, 2);
+  updates.length = 0;
+
+  const refs = await resizer.invalidate({ media: file, pipeline: 'wm' });
+
+  assert.deepEqual(
+    refs,
+    watermarked.map((row) => row.storageRef),
+  );
+  // One write, an update pipeline.
+  assert.deepEqual(updates, [true]);
+  const kept = (
+    (await File.findById(file.id).lean()) as unknown as { previews: Preview[] }
+  ).previews;
+  assert.deepEqual(
+    kept.map((row) => [row.pipeline, row.storageRef]),
+    defaults.map((row) => ['default', row.storageRef]),
+  );
+
+  // The in-memory media lost the rows too, so a same-request read queues the pipeline again.
+  const { decision } = await resizer.resolve({
+    media: file as unknown as MediaLike,
+    sizes,
+    pipeline: 'wm',
+  });
+  assert.deepEqual(decision.ready, []);
+  assert.deepEqual(
+    decision.missing.map((variant) => [variant.sizeKey, variant.format]),
+    [
+      ['16x16', 'webp'],
+      ['8x8', 'webp'],
+    ],
+  );
+  const tasks = await ResizeTask.find({ fileId: file._id }).lean();
+  assert.deepEqual(
+    tasks.map((task) => [task.resizer, task.pipeline, task.previews.length]),
+    [['invalidating', 'wm', 2]],
+  );
 });

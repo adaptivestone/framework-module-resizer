@@ -1,14 +1,18 @@
 // MongoMediaStore against a real MongoDB: one stored preview row per preview identity, however
-// many workers render it, the startup check for a media model without that field, and the
-// `model` / `getModel` options.
+// many workers render it, rows swapped by identity in one write, the preview metadata a row
+// records, the startup check for a media model without those fields, and the `model` / `getModel`
+// options.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
+import { types } from 'node:util';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeSetupError } from '../../errors.ts';
-import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
+import { encodeSignature, previewOrigin } from '../../signatures.ts';
+import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
 import type { Preview } from '../../types.d.ts';
 import { MongoMediaStore, type MongoMediaStoreOptions } from './index.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 
 let server: MongoMemoryServer;
 let connection: mongoose.Connection;
@@ -254,6 +258,358 @@ describe('MongoMediaStore.appendPreviews: one row per preview identity', () => {
   });
 });
 
+// The paths under `value` that hold null (an undefined written through an update pipeline would).
+function nullPaths(value: unknown, path = ''): string[] {
+  if (value === null) {
+    return [path];
+  }
+  if (
+    typeof value !== 'object' ||
+    value instanceof Date ||
+    value instanceof mongoose.Types.ObjectId
+  ) {
+    return [];
+  }
+  return Object.entries(value).flatMap(([key, inner]) =>
+    nullPaths(inner, path ? `${path}.${key}` : key),
+  );
+}
+
+describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', () => {
+  test('replacePreviews swaps rows by identity in one write and returns what it removed, as plain objects', async () => {
+    const seen: Array<{ pipeline: boolean; result: unknown }> = [];
+    const schema = new mongoose.Schema(
+      { ...resizeMediaSchemaFragment },
+      { minimize: false },
+    );
+    schema.post(
+      'findOneAndUpdate',
+      function (this: mongoose.Query<unknown, unknown>, result: unknown) {
+        seen.push({ pipeline: Array.isArray(this.getUpdate()), result });
+      },
+    );
+    const Hooked =
+      connection.models.ReplaceHookedMedia ??
+      connection.model('ReplaceHookedMedia', schema);
+    const store = new MongoMediaStore({ model: Hooked });
+    const doc = await Hooked.create({
+      original: { storageRef: { path: 'o.png' }, format: 'png' },
+      previews: [
+        preview(undefined, 'x0'),
+        preview(ID_A, 'a1'),
+        preview(ID_B, 'b1'),
+      ],
+    });
+    const mediaId = String(doc._id);
+    const createdAt = new Date('2026-10-28T12:00:00.000Z');
+    const next: Preview = { ...preview(ID_A, 'a9'), createdAt };
+
+    const result = await store.replacePreviews(mediaId, ['zzz'], [next]);
+
+    assert.deepEqual(
+      result.removed.map((row) => [row.identity, row.storageRef]),
+      [[ID_A, { path: 'a1.webp' }]],
+    );
+    assert.equal(Object.getPrototypeOf(result.removed[0]), Object.prototype);
+    assert.deepEqual(result.stored, [next]);
+    assert.equal(types.isProxy(result.stored), false);
+    assert.equal(Object.getPrototypeOf(result.stored[0]), Object.prototype);
+    // One write, an update pipeline, whose result is the pre-image projected on `previews`.
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].pipeline, true);
+    assert.deepEqual(Object.keys(seen[0].result as object).sort(), [
+      '_id',
+      'previews',
+    ]);
+    assert.equal(
+      (seen[0].result as { previews: unknown[] }).previews.length,
+      3,
+    );
+
+    const rows = (
+      (await Hooked.findById(mediaId).lean()) as { previews: Preview[] }
+    ).previews;
+    assert.deepEqual(
+      rows.map((row) => row.storageRef),
+      [{ path: 'x0.webp' }, { path: 'b1.webp' }, { path: 'a9.webp' }],
+    );
+    assert.ok(rows[2].createdAt instanceof Date);
+    assert.equal(rows[2].createdAt.getTime(), createdAt.getTime());
+    assert.deepEqual(nullPaths(rows), []);
+  });
+
+  test('replacePreviews stores what appendPreviews would on a strict schema', async () => {
+    const { origin: _origin, ...rowFields } =
+      resizeMediaSchemaFragment.previews[0];
+    const model = mediaModelWith('NoOriginReplaceMedia', [rowFields]);
+    const store = new MongoMediaStore({ model });
+    const create = async () =>
+      String(
+        (
+          await model.create({
+            original: { storageRef: { path: 'o.png' }, format: 'png' },
+            previews: [],
+          })
+        )._id,
+      );
+    const rowsOf = async (id: string) =>
+      (
+        (await model.findById(id).lean()) as { previews: Preview[] }
+      ).previews.map(({ _id, ...row }: Preview & { _id?: unknown }) => row);
+    const row = {
+      ...preview(ID_A, 'strict'),
+      origin: '8c64760b02a9f12a',
+      bytes: '12',
+    } as unknown as Preview;
+    const appended = await create();
+    const replaced = await create();
+
+    await store.appendPreviews(appended, [row]);
+    const result = await store.replacePreviews(replaced, [], [row]);
+
+    const [stored] = await rowsOf(replaced);
+    assert.deepEqual(await rowsOf(replaced), await rowsOf(appended));
+    assert.equal(Object.hasOwn(stored, 'origin'), false);
+    assert.equal(stored.bytes, 12);
+    assert.deepEqual(result, { stored: [stored], removed: [] });
+  });
+
+  test('replacePreviews on loose rows (strict: false) keeps every key the row carries', async () => {
+    const model = mediaModelWith('LooseReplaceMedia', [
+      new mongoose.Schema(
+        { identity: String, sizeKey: String },
+        { strict: false },
+      ),
+    ]);
+    const store = new MongoMediaStore({ model });
+    assert.doesNotThrow(() => store.verify());
+    const id = String(
+      (
+        await model.create({
+          original: { storageRef: { path: 'o.png' }, format: 'png' },
+          previews: [],
+        })
+      )._id,
+    );
+    const rowsOf = async () =>
+      (
+        (await model.findById(id).lean()) as { previews: Preview[] }
+      ).previews.map(({ _id, ...row }: Preview & { _id?: unknown }) => row);
+    const row: Preview = {
+      ...preview(ID_A, 'loose'),
+      origin: '8c64760b02a9f12a',
+      encodeSig: '5bff549d897f4636',
+      bytes: 1234,
+      createdAt: new Date('2026-10-28T12:34:56.789Z'),
+    };
+
+    await store.appendPreviews(id, [row]);
+    const [appended] = await rowsOf();
+    assert.ok(appended.createdAt instanceof Date);
+    const replacement: Preview = { ...row, storageRef: { path: 'a9.webp' } };
+    const result = await store.replacePreviews(id, [ID_A], [replacement]);
+
+    const rows = await rowsOf();
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0], { ...appended, storageRef: { path: 'a9.webp' } });
+    assert.ok(rows[0].createdAt instanceof Date);
+    assert.equal(result.removed.length, 1);
+    assert.equal(result.stored.length, 1);
+    assert.equal(result.stored[0].encodeSig, '5bff549d897f4636');
+  });
+
+  test('replacePreviews stores storageRef and filters as given when the rows declare them as strict-free sub-schemas', async () => {
+    // castObject returns only the declared paths at every depth, so a nested sub-schema would lose
+    // the undeclared keys of a storage ref (the driver's locator) and of the filters.
+    const model = mediaModelWith('NestedLooseReplaceMedia', [
+      new mongoose.Schema(
+        {
+          sizeKey: String,
+          identity: String,
+          origin: String,
+          encodeSig: String,
+          format: String,
+          contentType: String,
+          // `_id: false`: an appended single-nested sub-document would otherwise gain an `_id`.
+          storageRef: new mongoose.Schema(
+            { driver: String },
+            { strict: false, _id: false },
+          ),
+          filters: new mongoose.Schema(
+            { q: Number },
+            { strict: false, _id: false },
+          ),
+        },
+        { strict: false },
+      ),
+    ]);
+    const store = new MongoMediaStore({ model });
+    const id = String(
+      (
+        await model.create({
+          original: { storageRef: { path: 'o.png' }, format: 'png' },
+          previews: [],
+        })
+      )._id,
+    );
+    const shaped = (identity: string): Preview =>
+      ({
+        ...preview(identity),
+        storageRef: { driver: 'custom', key: 'preserve-me' },
+        filters: { q: 1, extra: 'x' },
+      }) as unknown as Preview;
+
+    await store.appendPreviews(id, [shaped(ID_A)]);
+    await store.replacePreviews(id, [], [shaped(ID_B)]);
+
+    const rows = ((await model.findById(id).lean()) as { previews: Preview[] })
+      .previews;
+    const appended = rows.find((row) => row.identity === ID_A);
+    const replaced = rows.find((row) => row.identity === ID_B);
+    assert.ok(appended && replaced);
+    assert.deepEqual(appended.storageRef, {
+      driver: 'custom',
+      key: 'preserve-me',
+    });
+    assert.deepEqual(replaced.storageRef, appended.storageRef);
+    assert.deepEqual(appended.filters, { q: 1, extra: 'x' });
+    assert.deepEqual(replaced.filters, appended.filters);
+  });
+
+  test('replacePreviews on strict rows stores a Mixed storageRef as given', async () => {
+    const model = mediaModelWith('StrictMixedReplaceMedia', [
+      new mongoose.Schema({
+        sizeKey: String,
+        identity: String,
+        origin: String,
+        encodeSig: String,
+        format: String,
+        contentType: String,
+        storageRef: { type: mongoose.Schema.Types.Mixed },
+      }),
+    ]);
+    const store = new MongoMediaStore({ model });
+    const id = String(
+      (
+        await model.create({
+          original: { storageRef: { path: 'o.png' }, format: 'png' },
+          previews: [],
+        })
+      )._id,
+    );
+    const storageRef = {
+      driver: 'custom',
+      key: 'preserve-me',
+      grouping: { namespace: 'users/42', empty: {} },
+    };
+
+    await store.replacePreviews(
+      id,
+      [],
+      [{ ...preview(ID_A), storageRef } as unknown as Preview],
+    );
+
+    const [stored] = (
+      (await model.findById(id).lean()) as { previews: Preview[] }
+    ).previews;
+    assert.deepEqual(stored.storageRef, storageRef);
+  });
+
+  test('a row the strict schema cannot cast rejects with a ValidationError and leaves the document unchanged', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia([preview(ID_A, 'a1'), preview(ID_B, 'b1')]);
+    const before = await storedPreviews(mediaId);
+    const uncastable = {
+      ...preview('default:default:8x8:webp:', 'bad'),
+      bytes: 'abc',
+    } as unknown as Preview;
+
+    await assert.rejects(
+      () => store.replacePreviews(mediaId, [ID_A], [uncastable]),
+      (err: unknown) => err instanceof Error && err.name === 'ValidationError',
+    );
+    assert.deepEqual(await storedPreviews(mediaId), before);
+  });
+
+  test('replacePreviews with empty rows only removes', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia([
+      preview(undefined, 'x0'),
+      preview(ID_A, 'a1'),
+      preview(ID_B, 'b1'),
+    ]);
+
+    const result = await store.replacePreviews(mediaId, [ID_A, ID_B], []);
+
+    assert.deepEqual(result.stored, []);
+    assert.deepEqual(
+      result.removed.map((row) => row.storageRef),
+      [{ path: 'a1.webp' }, { path: 'b1.webp' }],
+    );
+    assert.deepEqual(
+      (await storedPreviews(mediaId)).map((row) => row.storageRef),
+      [{ path: 'x0.webp' }],
+    );
+  });
+
+  test('replacePreviews on a media that is gone resolves with two empty lists', async () => {
+    const gone = String(new mongoose.Types.ObjectId());
+    assert.deepEqual(
+      await mediaStore().replacePreviews(gone, [ID_A], [preview(ID_B)]),
+      { stored: [], removed: [] },
+    );
+    assert.equal(await Media().findById(gone), null);
+  });
+
+  test('concurrent replacePreviews of one identity leave one row', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia([preview(ID_A, 'a1'), preview(ID_B, 'b1')]);
+    const [first, second] = await Promise.all([
+      store.replacePreviews(mediaId, [], [preview(ID_A, 'first')]),
+      store.replacePreviews(mediaId, [], [preview(ID_A, 'second')]),
+    ]);
+
+    const rows = await storedPreviews(mediaId);
+    const aRows = rows.filter((row) => row.identity === ID_A);
+    assert.equal(aRows.length, 1);
+    assert.equal(rows.length, 2);
+    // Either order is valid: the write that ran last removed the other one's row, and the write
+    // that ran first removed the original.
+    const lastIsFirst =
+      (aRows[0].storageRef as { path: string }).path === 'first.webp';
+    const [last, earlier] = lastIsFirst ? [first, second] : [second, first];
+    assert.deepEqual(
+      last.stored.map((row) => row.storageRef),
+      [aRows[0].storageRef],
+    );
+    assert.deepEqual(
+      last.removed.map((row) => row.storageRef),
+      earlier.stored.map((row) => row.storageRef),
+    );
+    assert.deepEqual(
+      earlier.removed.map((row) => row.storageRef),
+      [{ path: 'a1.webp' }],
+    );
+  });
+
+  test('an identity that starts with $ is matched as a string, never read as a field path', async () => {
+    const store = mediaStore();
+    const odd = '$resizer:default:16x16:webp:';
+    const mediaId = await newMedia([preview(odd, 'odd'), preview(ID_A, 'a1')]);
+
+    const result = await store.replacePreviews(mediaId, [odd], []);
+
+    assert.deepEqual(
+      result.removed.map((row) => row.identity),
+      [odd],
+    );
+    assert.deepEqual(
+      (await storedPreviews(mediaId)).map((row) => row.identity),
+      [ID_A],
+    );
+  });
+});
+
 describe('MongoMediaStore.verify(): the media model must store preview identities', () => {
   test('a media model without previews.identity is a setup error', () => {
     const store = new MongoMediaStore({ model: OutdatedMedia() });
@@ -343,6 +699,132 @@ describe('MongoMediaStore.verify(): the media model must store preview identitie
       findOneAndUpdate: async () => null,
     };
     assert.doesNotThrow(() => new MongoMediaStore({ model: shaped }).verify());
+  });
+});
+
+describe('MongoMediaStore: the preview metadata', () => {
+  test('the fragment stores the four fields; createdAt comes back as a Date', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia();
+    const createdAt = new Date('2026-10-28T12:34:56.789Z');
+    const row: Preview = {
+      ...preview(ID_A, 'with-metadata'),
+      bytes: 1234,
+      createdAt,
+      origin: '8c64760b02a9f12a',
+      encodeSig: '5bff549d897f4636',
+    };
+    assert.deepEqual(await store.appendPreviews(mediaId, [row]), [row]);
+
+    const loaded = await store.loadMedia(mediaId);
+    const stored = loaded?.previews?.[0];
+    assert.equal(stored?.bytes, 1234);
+    assert.ok(stored?.createdAt instanceof Date);
+    assert.equal(stored.createdAt.getTime(), createdAt.getTime());
+    assert.equal(stored.origin, '8c64760b02a9f12a');
+    assert.equal(stored.encodeSig, '5bff549d897f4636');
+    const lean = await storedPreviews(mediaId);
+    assert.ok(lean[0].createdAt instanceof Date);
+  });
+
+  test("origin recomputed from a loaded media equals the stored row's", async () => {
+    const store = mediaStore();
+    const storageRef = { key: 'originals/x.jpg', meta: {} };
+    const doc = await Media().create({
+      original: { storageRef, format: 'jpeg', width: 4000, height: 3000 },
+      previews: [],
+    });
+    const mediaId = String(doc._id);
+    const origin = previewOrigin(storageRef, { width: 4000, height: 3000 });
+    const row: Preview = {
+      ...preview(ID_A, 'recomputed'),
+      origin,
+      encodeSig: encodeSignature(makeImageConfig(), {
+        format: 'webp',
+        fit: false,
+      }),
+    };
+    await store.appendPreviews(mediaId, [row]);
+
+    const loaded = await store.loadMedia(mediaId);
+    const original = loaded?.original;
+    assert.ok(original);
+    // minimize: false keeps the empty object, so the ref signs the same after a round trip.
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(original.storageRef)),
+      storageRef,
+    );
+    assert.equal(
+      previewOrigin(original.storageRef, {
+        width: original.width as number,
+        height: original.height as number,
+      }),
+      loaded?.previews?.[0]?.origin,
+    );
+  });
+
+  test('strict preview rows without origin or encodeSig are RESIZE_MONGO_MEDIA_MODEL_OUTDATED naming them', () => {
+    const {
+      origin: _origin,
+      encodeSig: _encodeSig,
+      ...rowFields
+    } = resizeMediaSchemaFragment.previews[0];
+    const store = new MongoMediaStore({
+      model: mediaModelWith('NoSignatureMedia', [rowFields]),
+    });
+    assert.throws(
+      () => store.verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes("'NoSignatureMedia'") &&
+        err.message.includes('previews.origin') &&
+        err.message.includes('previews.encodeSig') &&
+        !err.message.includes('previews.identity') &&
+        err.message.includes('resizeMediaSchemaFragment'),
+    );
+
+    const { encodeSig: _sig, ...withoutSig } =
+      resizeMediaSchemaFragment.previews[0];
+    assert.throws(
+      () =>
+        new MongoMediaStore({
+          model: mediaModelWith('NoEncodeSigMedia', [withoutSig]),
+        }).verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes('previews.encodeSig') &&
+        !err.message.includes('previews.origin'),
+    );
+
+    // Every missing path is named in one message.
+    assert.throws(
+      () =>
+        new MongoMediaStore({
+          model: mediaModelWith('BareRowsMedia', [
+            new mongoose.Schema({ sizeKey: String }),
+          ]),
+        }).verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes('previews.identity') &&
+        err.message.includes('previews.origin') &&
+        err.message.includes('previews.encodeSig'),
+    );
+
+    // bytes and createdAt are not checked.
+    const {
+      bytes: _bytes,
+      createdAt: _createdAt,
+      ...withoutSizeAndTime
+    } = resizeMediaSchemaFragment.previews[0];
+    assert.doesNotThrow(() =>
+      new MongoMediaStore({
+        model: mediaModelWith('NoBytesMedia', [withoutSizeAndTime]),
+      }).verify(),
+    );
   });
 });
 

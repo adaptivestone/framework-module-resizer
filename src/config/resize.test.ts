@@ -6,9 +6,13 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
 import {
+  type ConfigSource,
+  getProcessConfig,
   getResizeConfig,
   resolveFrameworkConfig,
+  resolveProcessConfig,
 } from '../framework/config.ts';
+import { defaultWorkerOptions } from '../framework/defaults.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import {
   makeImageConfig,
@@ -16,9 +20,7 @@ import {
 } from '../testHelpers/resizeConfig.ts';
 import defaultResizeConfig, {
   defaultCoordination,
-  defaultFrameworkResizeConfig,
   defaultQueueOptions,
-  defaultWorkerOptions,
 } from './resize.ts';
 
 function install(config: unknown) {
@@ -32,6 +34,28 @@ function install(config: unknown) {
 
 afterEach(resetAppInstance);
 
+// How each kind of file is named in messages: the framework merges the environment file first.
+const OVERRIDE = '(or its resize.<NODE_ENV>.ts override)';
+const LISTINGS_FILE =
+  'src/config/resizeListings.ts (or its resizeListings.<NODE_ENV>.ts override)';
+const RESIZE_TS: ConfigSource = { configName: 'resize', explicit: false };
+const LISTINGS_TS: ConfigSource = {
+  configName: 'resizeListings',
+  explicit: false,
+};
+const EXPLICIT: ConfigSource = { configName: 'resize', explicit: true };
+
+const configError =
+  (code: string, ...parts: Array<string | RegExp>) =>
+  (err: unknown) =>
+    err instanceof ResizeConfigError &&
+    err.code === code &&
+    parts.every((part) =>
+      typeof part === 'string'
+        ? err.message.includes(part)
+        : part.test(err.message),
+    );
+
 describe('getResizeConfig', () => {
   test('ships the canonical host defaults without assuming a media model', () => {
     assert.equal('mediaModelName' in defaultResizeConfig, false);
@@ -44,31 +68,35 @@ describe('getResizeConfig', () => {
       'gif',
       'svg',
     ]);
-    // The core config holds image settings only; the framework defaults add the worker section.
-    // Storage and the queue are the host's choice: no defaults (no queue = eager only).
+    // The core config holds image settings only. Storage and the queue are the host's choice:
+    // no defaults (no queue = eager only).
     assert.equal('queue' in defaultResizeConfig, false);
     assert.equal('worker' in defaultResizeConfig, false);
     assert.equal(defaultResizeConfig.concurrency, 4);
-    assert.equal(defaultFrameworkResizeConfig.worker.enabled, false);
-    assert.equal('queue' in defaultFrameworkResizeConfig, false);
-    assert.equal('storage' in defaultFrameworkResizeConfig, false);
   });
 
   test('returns the final framework config without merging another defaults object', () => {
     const config = makeResizeConfig({
       formats: ['webp'],
       storage: { driver: 'local', rootDir: './m', publicBaseUrl: '/m' },
-      queue: { driver: 'database', maxAttempts: 3 },
+      queue: 'default',
+      queues: { default: { driver: 'database', maxAttempts: 3 } },
     });
     install(config);
     const resolved = getResizeConfig();
     assert.strictEqual(getResizeConfig(), resolved);
     assert.strictEqual(resolved.image.formats, config.formats);
     assert.strictEqual(resolved.storage, config.storage);
-    assert.strictEqual(resolved.queue, config.queue);
-    assert.equal(resolved.timing.maxAttempts, 3);
-    assert.equal(resolved.timing.leaseMs, defaultQueueOptions.leaseMs);
+    assert.equal(resolved.queue, 'default');
     assert.deepEqual(resolved.image.formats, ['webp']);
+    const processConfig = getProcessConfig();
+    assert.strictEqual(getProcessConfig(), processConfig);
+    const entry = processConfig.queues.get('default');
+    assert.strictEqual(entry?.section, config.queues?.default);
+    assert.equal(entry?.name, 'default');
+    assert.equal(entry?.backend, 'database');
+    assert.equal(entry?.timing.maxAttempts, 3);
+    assert.equal(entry?.timing.leaseMs, defaultQueueOptions.leaseMs);
   });
 
   test('validates one cached framework config object once', () => {
@@ -143,17 +171,14 @@ describe('getResizeConfig', () => {
     }
   });
 
-  test('rejects invalid upload limits and queue lease invariants', () => {
-    for (const config of [
-      makeResizeConfig({ upload: { maxBytes: 0 } }),
-      makeResizeConfig({ queue: { leaseMs: 0 } }),
-    ]) {
-      install(config);
-      assert.throws(
-        () => getResizeConfig(),
-        (error: unknown) => error instanceof ResizeConfigError,
-      );
-    }
+  test('rejects invalid upload limits', () => {
+    install(makeResizeConfig({ upload: { maxBytes: 0 } }));
+    assert.throws(
+      () => getResizeConfig(),
+      (error: unknown) =>
+        error instanceof ResizeConfigError &&
+        error.code === 'RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID',
+    );
   });
 
   test('rejects 0.2.x keys that would otherwise be ignored silently', () => {
@@ -181,20 +206,20 @@ describe('getResizeConfig', () => {
     }
   });
 
-  test('rejects worker.concurrency and names the config file and replacement', () => {
+  test('rejects worker.concurrency and names src/config/resize.ts and the replacement', () => {
     for (const value of [8, undefined]) {
       install({
         ...makeResizeConfig(),
         worker: { ...defaultWorkerOptions, concurrency: value },
       });
       assert.throws(
-        () => getResizeConfig('resizeListings'),
-        (error: unknown) =>
-          error instanceof ResizeConfigError &&
-          error.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
-          error.message.includes('`worker.concurrency`') &&
-          error.message.includes('src/config/resizeListings.ts') &&
-          error.message.includes('top-level `concurrency`'),
+        () => getProcessConfig(),
+        configError(
+          'RESIZE_CONFIG_REMOVED_KEY',
+          '`worker.concurrency`',
+          `src/config/resize.ts ${OVERRIDE}`,
+          'top-level `concurrency`',
+        ),
       );
     }
   });
@@ -242,48 +267,322 @@ describe('config split: core validation vs framework loading', () => {
     assert.doesNotThrow(() => validateResizeConfig(makeImageConfig()));
   });
 
-  test('the core rejects queue and worker settings: they belong to the transport and worker', () => {
-    for (const key of ['queue', 'worker']) {
+  test("the core config's removed queue and worker keys point framework hosts at src/config/resize.ts", () => {
+    for (const [key, hint] of [
+      [
+        'queue',
+        'framework hosts define each queue in `queues` of src/config/resize.ts',
+      ],
+      ['worker', 'framework hosts keep `worker` in src/config/resize.ts'],
+    ]) {
       assert.throws(
         () => validateResizeConfig({ ...makeImageConfig(), [key]: {} }),
-        (err: unknown) =>
-          err instanceof ResizeConfigError &&
-          err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
-          err.message.includes(`\`${key}\``),
+        configError('RESIZE_CONFIG_REMOVED_KEY', `\`${key}\``, hint),
       );
     }
   });
 
-  test('a framework config file may omit storage, queue and worker; the defaults apply', () => {
-    const { worker: _w, ...file } = makeResizeConfig();
-    install(file);
+  test('a framework config file may omit storage, queue, queues and worker; the defaults apply', () => {
+    install(makeResizeConfig());
     assert.equal(getResizeConfig().storage, undefined);
-    assert.equal(getResizeConfig().queue, false); // eager only
-    assert.deepEqual(getResizeConfig().timing, defaultQueueOptions);
-    assert.strictEqual(getResizeConfig().worker, defaultWorkerOptions);
+    assert.equal(getResizeConfig().queue, undefined);
+    const processConfig = getProcessConfig();
+    assert.equal(processConfig.queues.size, 0); // no queues: eager only
+    assert.deepEqual(processConfig.worker, defaultWorkerOptions);
+    assert.equal(processConfig.coordination, undefined);
   });
 
-  test('queue.lockTtlMs in a config file is RESIZE_CONFIG_REMOVED_KEY naming the file and coordination', () => {
-    for (const value of [{ failed: 600_000 }, undefined]) {
-      install(
-        makeResizeConfig({
-          queue: { driver: 'database', lockTtlMs: value } as never,
-        }),
-      );
+  test('queues entries need a driver; an SQS entry needs queueUrl', () => {
+    const noDriver = `\`queues.bulk\` in src/config/resize.ts ${OVERRIDE} needs driver 'database' or 'sqs'`;
+    for (const [queues, ...parts] of [
+      [{ bulk: {} }, noDriver],
+      [{ bulk: { driver: 'redis' } }, noDriver],
+      [{ bulk: 'database' }, noDriver],
+      [{ bulk: null }, noDriver],
+      [{ bulk: { driver: 'sqs' } }, '`queues.bulk.queueUrl`', 'required'],
+      [
+        { bulk: { driver: 'sqs', queueUrl: '' } },
+        '`queues.bulk.queueUrl`',
+        'required',
+      ],
+      [[{ driver: 'database' }], '`queues`', 'must be an object'],
+      ['database', '`queues`', 'must be an object'],
+      [{ ' ': { driver: 'database' } }, '`queues`', 'blank'],
+    ] as Array<[unknown, ...string[]]>) {
       assert.throws(
-        () => getResizeConfig('resizeListings'),
-        (err: unknown) =>
-          err instanceof ResizeConfigError &&
-          err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
-          err.message.includes('`queue.lockTtlMs`') &&
-          err.message.includes('src/config/resizeListings.ts') &&
-          err.message.includes('coordination in the same file') &&
-          err.message.includes('lockTtlMs.failed → cooldownMs') &&
-          err.message.includes('lockTtlMs.dispatch → gateTtlMs') &&
-          err.message.includes('drop lockTtlMs.worker'),
+        () => resolveProcessConfig({ queues }),
+        configError('RESIZE_CONFIG_INVALID', ...parts),
+        JSON.stringify(queues),
+      );
+    }
+    const resolved = resolveProcessConfig({
+      queues: {
+        default: { driver: 'database' },
+        bulk: { driver: 'sqs', queueUrl: 'https://sqs.example/bulk' },
+      },
+    });
+    assert.deepEqual([...resolved.queues.keys()], ['default', 'bulk']);
+    assert.equal(resolved.queues.get('default')?.backend, 'database');
+    // An environment file removes an entry by setting it to undefined: the framework's merge
+    // keeps the key, and the entry counts as not defined.
+    assert.deepEqual(
+      [
+        ...resolveProcessConfig({
+          queues: { default: { driver: 'database' }, bulk: undefined },
+        }).queues.keys(),
+      ],
+      ['default'],
+    );
+    assert.equal(
+      resolved.queues.get('bulk')?.backend,
+      'sqs:[null,null,null,10]',
+    );
+  });
+
+  test('queues.<name>.lockTtlMs and queues.<name>.queues are RESIZE_CONFIG_REMOVED_KEY naming the entry', () => {
+    for (const value of [{ failed: 600_000 }, undefined]) {
+      assert.throws(
+        () =>
+          resolveProcessConfig({
+            queues: { bulk: { driver: 'database', lockTtlMs: value } },
+          }),
+        configError(
+          'RESIZE_CONFIG_REMOVED_KEY',
+          '`queues.bulk.lockTtlMs`',
+          `src/config/resize.ts ${OVERRIDE}`,
+          'coordination in the same file',
+          'lockTtlMs.failed → cooldownMs',
+          'lockTtlMs.dispatch → gateTtlMs',
+          'drop lockTtlMs.worker',
+        ),
         JSON.stringify(value),
       );
     }
+    assert.throws(
+      () =>
+        resolveProcessConfig({
+          queues: {
+            default: {
+              driver: 'sqs',
+              queueUrl: 'https://sqs.example/resize',
+              queues: { bulk: 'https://sqs.example/bulk' },
+            },
+          },
+        }),
+      configError(
+        'RESIZE_CONFIG_REMOVED_KEY',
+        '`queues.default.queues`',
+        `src/config/resize.ts ${OVERRIDE}`,
+        'its own entry',
+      ),
+    );
+  });
+
+  test("a queue entry's invalid timing names the entry and keeps the timing code", () => {
+    let error: unknown;
+    try {
+      resolveProcessConfig({
+        queues: {
+          default: { driver: 'database' },
+          bulk: { driver: 'database', leaseMs: 0 },
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    assert.ok(
+      configError(
+        'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+        /queues\.bulk/,
+        `src/config/resize.ts ${OVERRIDE}`,
+        'leaseMs must be a positive safe integer',
+      )(error),
+      String(error),
+    );
+    const cause = (error as Error).cause;
+    assert.ok(
+      cause instanceof ResizeConfigError &&
+        cause.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    );
+    assert.throws(
+      () =>
+        resolveProcessConfig({
+          queues: { slow: { driver: 'database', maxAttempts: 0 } },
+        }),
+      configError('RESIZE_CONFIG_QUEUE_INVALID', /queues\.slow/),
+    );
+  });
+
+  test('two SQS entries with one queueUrl are RESIZE_CONFIG_INVALID', () => {
+    assert.throws(
+      () =>
+        resolveProcessConfig({
+          queues: {
+            default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+            bulk: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+          },
+        }),
+      configError(
+        'RESIZE_CONFIG_INVALID',
+        '`queues.default`',
+        '`queues.bulk`',
+        'https://sqs.example/resize',
+      ),
+    );
+  });
+
+  test('resize.ts with only process-wide sections resolves without mediaModelName', () => {
+    install({
+      queues: { bulk: { driver: 'database' } },
+      worker: { ...defaultWorkerOptions, enabled: true },
+      coordination: { cooldownMs: 1000 },
+    });
+    const resolved = getProcessConfig();
+    assert.deepEqual([...resolved.queues.keys()], ['bulk']);
+    assert.equal(resolved.worker.enabled, true);
+    assert.deepEqual(resolved.coordination, { cooldownMs: 1000 });
+  });
+
+  test('a missing resize.ts means no queues, the default worker and no coordination, and is asked for once', () => {
+    // The framework returns a new {} for a missing file and logs a warning on every request.
+    const app = () => {
+      const asked: string[] = [];
+      setAppInstance({
+        getConfig: (name: string) => {
+          asked.push(name);
+          return {};
+        },
+        getModel: () => ({}),
+        logger: { info() {}, warn() {}, error() {} },
+      } as never);
+      return asked;
+    };
+    const asked = app();
+    const first = getProcessConfig();
+    assert.strictEqual(getProcessConfig(), first);
+    getProcessConfig();
+    assert.deepEqual(asked, ['resize']);
+    assert.equal(first.queues.size, 0);
+    assert.deepEqual(first.worker, defaultWorkerOptions);
+    assert.equal(first.coordination, undefined);
+    // Remembered per app: another app instance is asked again.
+    resetAppInstance();
+    const again = app();
+    getProcessConfig();
+    getProcessConfig();
+    assert.deepEqual(again, ['resize']);
+  });
+
+  test('a partial worker section fills from defaultWorkerOptions; a wrong type is RESIZE_CONFIG_INVALID', () => {
+    assert.deepEqual(
+      resolveProcessConfig({ worker: { enabled: true } }).worker,
+      {
+        enabled: true,
+        sharpConcurrency: 1,
+        sharpCache: false,
+      },
+    );
+    assert.deepEqual(
+      resolveProcessConfig({
+        worker: { sharpConcurrency: 4, sharpCache: undefined },
+      }).worker,
+      { enabled: false, sharpConcurrency: 4, sharpCache: false },
+    );
+    for (const [worker, key] of [
+      [{ enabled: 'yes' }, '`worker.enabled`'],
+      [{ sharpConcurrency: 0 }, '`worker.sharpConcurrency`'],
+      [{ sharpConcurrency: 1.5 }, '`worker.sharpConcurrency`'],
+      [{ sharpCache: 1 }, '`worker.sharpCache`'],
+      [true, '`worker`'],
+      // A misspelled key would otherwise keep its default silently.
+      [{ sharpConcurency: 8 }, '`worker.sharpConcurency`'],
+      [{ enabled: true, extra: false }, '`worker.extra`'],
+    ] as const) {
+      assert.throws(
+        () => resolveProcessConfig({ worker }),
+        configError(
+          'RESIZE_CONFIG_INVALID',
+          key,
+          `src/config/resize.ts ${OVERRIDE}`,
+        ),
+        JSON.stringify(worker),
+      );
+    }
+  });
+
+  test('queues, worker or coordination in another file, or in an explicit config, is RESIZE_CONFIG_INVALID naming the key and the override', () => {
+    for (const [key, value] of [
+      ['queues', { default: { driver: 'database' } }],
+      ['worker', { enabled: true }],
+      ['coordination', { cooldownMs: 1000 }],
+    ] as const) {
+      const raw = { ...makeResizeConfig(), [key]: value };
+      assert.throws(
+        () => resolveFrameworkConfig(raw, LISTINGS_TS),
+        configError(
+          'RESIZE_CONFIG_INVALID',
+          `\`${key}\` in ${LISTINGS_FILE} is process-wide: it is read only from src/config/resize.ts`,
+        ),
+        key,
+      );
+      assert.throws(
+        () => resolveFrameworkConfig(raw, EXPLICIT),
+        configError(
+          'RESIZE_CONFIG_INVALID',
+          `\`${key}\` in the config passed to new FrameworkResizer() is process-wide: it is read only from src/config/resize.ts`,
+        ),
+        key,
+      );
+      // src/config/resize.ts holds them: the per-Resizer reading skips them.
+      const resolved = resolveFrameworkConfig(raw, RESIZE_TS);
+      assert.equal(key in resolved.image, false, key);
+    }
+  });
+
+  test("a Resizer file's queue must be a name or false", () => {
+    for (const queue of [undefined, false, 'default', 'bulk']) {
+      assert.equal(
+        resolveFrameworkConfig({ ...makeResizeConfig(), queue }, LISTINGS_TS)
+          .queue,
+        queue,
+      );
+    }
+    for (const queue of [3, true, '', '  ', null, ['default']]) {
+      assert.throws(
+        () =>
+          resolveFrameworkConfig({ ...makeResizeConfig(), queue }, LISTINGS_TS),
+        configError('RESIZE_CONFIG_INVALID', `\`queue\` in ${LISTINGS_FILE}`),
+        JSON.stringify(queue),
+      );
+    }
+  });
+
+  test('a queue object, in any file, is RESIZE_CONFIG_REMOVED_KEY pointing at queues in src/config/resize.ts', () => {
+    const oldShape = { ...makeResizeConfig(), queue: { driver: 'database' } };
+    const newShape =
+      "is now a queue name — define the queue once in src/config/resize.ts as queues: { default: { driver: 'database', …timing } } and set queue: 'default' (or queue: false for eager only)";
+    for (const [source, file] of [
+      [RESIZE_TS, `src/config/resize.ts ${OVERRIDE}`],
+      [LISTINGS_TS, `${LISTINGS_FILE}`],
+      [EXPLICIT, 'the config passed to new FrameworkResizer()'],
+    ] as const) {
+      assert.throws(
+        () => resolveFrameworkConfig(oldShape, source),
+        configError(
+          'RESIZE_CONFIG_REMOVED_KEY',
+          `resize config: \`queue\` in ${file} ${newShape}`,
+        ),
+        file,
+      );
+    }
+    // The process-wide reading catches it too, so the worker does at start.
+    assert.throws(
+      () => resolveProcessConfig(oldShape),
+      configError(
+        'RESIZE_CONFIG_REMOVED_KEY',
+        `\`queue\` in src/config/resize.ts ${OVERRIDE} ${newShape}`,
+      ),
+    );
   });
 
   test('defaultQueueOptions has no lockTtlMs', () => {
@@ -297,66 +596,73 @@ describe('config split: core validation vs framework loading', () => {
     ]);
   });
 
-  test('defaultFrameworkResizeConfig carries the coordination defaults', () => {
-    assert.deepEqual(
-      defaultFrameworkResizeConfig.coordination,
-      defaultCoordination,
-    );
+  test('…/config/resize.js holds only the core defaults', async () => {
+    const mod = await import('./resize.ts');
+    assert.deepEqual(Object.keys(mod).sort(), [
+      'default',
+      'defaultCoordination',
+      'defaultQueueOptions',
+    ]);
     assert.deepEqual(defaultCoordination, {
       gateTtlMs: 600_000,
       cooldownMs: 600_000,
     });
   });
 
-  test("a config file's coordination is passed on unvalidated, outside the image config", () => {
-    const resolved = resolveFrameworkConfig({
-      ...makeResizeConfig(),
-      coordination: { gateTtlMs: 0 },
+  test('defaultFrameworkResizeConfig is the per-Resizer defaults: the image settings, no process-wide section', async () => {
+    const framework = await import('../framework/index.ts');
+    assert.deepEqual(
+      framework.defaultFrameworkResizeConfig,
+      defaultResizeConfig,
+    );
+    for (const key of [
+      'worker',
+      'coordination',
+      'queue',
+      'queues',
+      'storage',
+    ]) {
+      assert.equal(key in framework.defaultFrameworkResizeConfig, false, key);
+    }
+    assert.deepEqual(framework.defaultWorkerOptions, {
+      enabled: false,
+      sharpConcurrency: 1,
+      sharpCache: false,
     });
-    assert.deepEqual(resolved.coordination, { gateTtlMs: 0 });
-    assert.equal('coordination' in resolved.image, false);
-    const { coordination: _omit, ...withoutSection } = makeResizeConfig();
+  });
+
+  test("resize.ts's coordination is passed on unvalidated, outside the image config", () => {
+    const raw = { ...makeResizeConfig(), coordination: { gateTtlMs: 0 } };
+    assert.deepEqual(resolveProcessConfig(raw).coordination, { gateTtlMs: 0 });
     assert.equal(
-      resolveFrameworkConfig(withoutSection).coordination,
+      'coordination' in resolveFrameworkConfig(raw, RESIZE_TS).image,
+      false,
+    );
+    assert.equal(
+      resolveProcessConfig(makeResizeConfig()).coordination,
       undefined,
     );
   });
 
-  test('queue: false is eager only, and invalid queue timing is a config error', () => {
+  test('queue: false is eager only', () => {
     install(makeResizeConfig({ queue: false }));
     assert.equal(getResizeConfig().queue, false);
-    resetAppInstance();
-    install(makeResizeConfig({ queue: { maxAttempts: 0 } }));
-    assert.throws(
-      () => getResizeConfig(),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_QUEUE_INVALID',
-    );
   });
 
   test('sees app.updateConfig()-style changes to the same config object', () => {
-    const config = makeResizeConfig();
+    const config = makeResizeConfig({ worker: { enabled: false } });
     install(config);
     assert.equal(getResizeConfig().mediaModelName, 'File');
-    assert.equal(getResizeConfig().worker.enabled, false);
+    assert.equal(getProcessConfig().worker.enabled, false);
     // The framework's updateConfig() assigns into the cached object.
     Object.assign(config, {
       mediaModelName: 'Media',
       worker: { ...config.worker, enabled: true },
+      queues: { default: { driver: 'database' } },
     });
     assert.equal(getResizeConfig().mediaModelName, 'Media');
-    assert.equal(getResizeConfig().worker.enabled, true);
-  });
-
-  test('an invalid worker section is a config error', () => {
-    install(makeResizeConfig({ worker: { sharpConcurrency: 0 } }));
-    assert.throws(
-      () => getResizeConfig(),
-      (err: unknown) =>
-        err instanceof ResizeConfigError &&
-        err.code === 'RESIZE_CONFIG_INVALID',
-    );
+    assert.equal(getProcessConfig().worker.enabled, true);
+    assert.deepEqual([...getProcessConfig().queues.keys()], ['default']);
   });
 
   test('core validation does not read the framework app', async () => {

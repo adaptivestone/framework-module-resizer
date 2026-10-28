@@ -35,6 +35,7 @@ import { getSizeKey, toMissingPreview } from './images.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { Processor, type ProcessorDeps } from './processor.ts';
 import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
+import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
@@ -3432,7 +3433,11 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.deepEqual(claimedQueues, []);
     assert.ok(
-      logs.info.some((l) => String(l[0]).includes('worker.enabled=true')),
+      logs.info.some((l) =>
+        String(l[0]).includes(
+          'set worker: { enabled: true } in src/config/resize.ts',
+        ),
+      ),
     );
   });
 
@@ -4057,5 +4062,267 @@ describe('runWorker (core)', () => {
     });
     assert.deepEqual(claimedQueues, ['bulk']);
     assert.ok(logged.some((l) => String(l[0]).includes('stopped')));
+  });
+});
+
+describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
+  /** A Processor on the default formats whose storage records every upload. */
+  function rowDeps(
+    fixture: Buffer,
+    over: { pipelines?: PipelineRegistry; media?: MediaStore } = {},
+  ) {
+    const { storage, uploads } = makeStorage(fixture);
+    const config = makeImageConfig();
+    const appendCalls: Array<{
+      previews: Preview[];
+      backfillDims?: { width: number; height: number };
+    }> = [];
+    const deps: ProcessorDeps = {
+      catalog: new Catalog({ config }),
+      media:
+        over.media ??
+        fakeMedia({
+          appendPreviews: async (_mediaId, previews, backfillDims) => {
+            appendCalls.push({ previews, backfillDims });
+            return previews;
+          },
+        }),
+      storage,
+      pipelines: over.pipelines ?? new PipelineRegistry(),
+      hooks: new HookBus({ logger: silent }),
+      config,
+      logger: silent,
+      name: 'default',
+    };
+    return { deps, config, uploads, appendCalls };
+  }
+
+  test('generate writes bytes, createdAt, origin and encodeSig on every row', async () => {
+    const { deps, config, uploads, appendCalls } = rowDeps(redPng);
+    const media = mediaDoc({
+      original: { storageRef: { key: 'uploads/orig' }, width: 64, height: 48 },
+    });
+    const before = Date.now();
+    const { created } = await new Processor(deps).generate({
+      media,
+      sizes: [{ width: 20, height: 20 }, { fit: true }],
+      formats: ['jpeg', 'webp'],
+    });
+    const after = Date.now();
+    assert.equal(created.length, 4);
+    assert.deepEqual(appendCalls[0].previews, created);
+    for (const row of created) {
+      const upload = uploads.find(
+        (u) => u.key === (row.storageRef as { key: string }).key,
+      );
+      assert.ok(upload, `the row points at its upload: ${row.identity}`);
+      assert.equal(row.bytes, upload.body.length);
+      assert.ok(row.createdAt instanceof Date);
+      assert.ok(
+        row.createdAt.getTime() >= before && row.createdAt.getTime() <= after,
+      );
+      assert.equal(
+        row.origin,
+        previewOrigin({ key: 'uploads/orig' }, { width: 64, height: 48 }),
+      );
+      assert.equal(
+        row.encodeSig,
+        encodeSignature(config, {
+          format: row.format,
+          fit: row.fit === true,
+          version: undefined,
+        }),
+      );
+    }
+    // A fit row and a cover row of one format sign differently (maxSize counts for fit only).
+    const sigs = new Set(created.map((row) => row.encodeSig));
+    assert.equal(sigs.size, 4);
+  });
+
+  test('origin uses the measured dimensions when the original lacks them, with persist on or off', async () => {
+    // orientedJpeg is stored 64×48 with EXIF orientation 6: displayed 48×64.
+    const measured = previewOrigin(
+      { key: 'uploads/orig' },
+      { width: 48, height: 64 },
+    );
+    assert.notEqual(
+      measured,
+      previewOrigin({ key: 'uploads/orig' }, { width: 64, height: 48 }),
+    );
+    const sizes = [{ width: 10, height: 10 }];
+
+    const unstored = rowDeps(orientedJpeg);
+    const { created: raw } = await new Processor(unstored.deps).generate({
+      media: mediaDoc(),
+      sizes,
+      formats: ['jpeg'],
+      persist: false,
+    });
+    assert.equal(raw[0].origin, measured);
+    assert.equal(unstored.appendCalls.length, 0);
+
+    const stored = rowDeps(orientedJpeg);
+    const { created } = await new Processor(stored.deps).generate({
+      media: mediaDoc(),
+      sizes,
+      formats: ['jpeg'],
+    });
+    assert.equal(created[0].origin, measured);
+    assert.deepEqual(stored.appendCalls[0].backfillDims, {
+      width: 48,
+      height: 64,
+    });
+
+    const appended: Preview[] = [];
+    const queued = rowDeps(orientedJpeg, {
+      media: fakeMedia({
+        load: async () => mediaDoc(),
+        appendPreviews: async (_mediaId, previews) => {
+          appended.push(...previews);
+          return previews;
+        },
+      }),
+    });
+    await new Processor(queued.deps).processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '10x10',
+            requestedWidth: 10,
+            requestedHeight: 10,
+          }),
+        ],
+      }),
+    );
+    assert.equal(appended.length, 1);
+    assert.equal(appended[0].origin, measured);
+    assert.equal(appended[0].encodeSig, raw[0].encodeSig);
+  });
+
+  test('origin signs the stored dimensions, not the measured pair, when the original has them', async () => {
+    // orientedJpeg measures 48×64 (EXIF orientation 6); the media stores 64×48 for it.
+    const ref = { key: 'uploads/orig' };
+    const stored = previewOrigin(ref, { width: 64, height: 48 });
+    const measured = previewOrigin(ref, { width: 48, height: 64 });
+    assert.notEqual(stored, measured);
+    const media = () =>
+      mediaDoc({ original: { storageRef: ref, width: 64, height: 48 } });
+    const sizes = [{ width: 10, height: 10 }];
+
+    const eager = rowDeps(orientedJpeg);
+    const { created } = await new Processor(eager.deps).generate({
+      media: media(),
+      sizes,
+      formats: ['jpeg'],
+    });
+    assert.equal(created[0].origin, stored);
+    assert.notEqual(created[0].origin, measured);
+    assert.equal(eager.appendCalls.length, 1);
+    assert.equal(eager.appendCalls[0].backfillDims, undefined);
+
+    const appendCalls: Array<{
+      previews: Preview[];
+      backfillDims?: { width: number; height: number };
+    }> = [];
+    const queued = rowDeps(orientedJpeg, {
+      media: fakeMedia({
+        load: async () => media(),
+        appendPreviews: async (_mediaId, previews, backfillDims) => {
+          appendCalls.push({ previews, backfillDims });
+          return previews;
+        },
+      }),
+    });
+    await new Processor(queued.deps).processTask(
+      task({
+        previews: [
+          variant({
+            sizeKey: '10x10',
+            requestedWidth: 10,
+            requestedHeight: 10,
+          }),
+        ],
+      }),
+    );
+    assert.equal(appendCalls.length, 1);
+    assert.equal(appendCalls[0].previews[0].origin, stored);
+    assert.notEqual(appendCalls[0].previews[0].origin, measured);
+    assert.equal(appendCalls[0].backfillDims, undefined);
+  });
+
+  test("a pipeline's version reaches encodeSig", async () => {
+    const { deps, config } = rowDeps(redPng, {
+      pipelines: new PipelineRegistry({ wm: { version: 'v2' } }),
+    });
+    const processor = new Processor(deps);
+    const { created } = await processor.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['webp'],
+      pipeline: 'wm',
+    });
+    assert.equal(
+      created[0].encodeSig,
+      encodeSignature(config, { format: 'webp', fit: false, version: 'v2' }),
+    );
+    const { created: plain } = await processor.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 20, height: 20 }],
+      formats: ['webp'],
+    });
+    assert.equal(
+      plain[0].encodeSig,
+      encodeSignature(config, { format: 'webp', fit: false }),
+    );
+    assert.notEqual(created[0].encodeSig, plain[0].encodeSig);
+  });
+
+  test('a task treats rows written before this version as stored and renders nothing for them', async () => {
+    // Rows from before previews recorded bytes, createdAt, origin and encodeSig: one with its
+    // identity, one from before rows carried an identity.
+    const oldRows: Preview[] = [
+      {
+        storageRef: { key: 'previews/old-cover.jpeg' },
+        identity: 'default:default:20x20:jpeg:none',
+        resizer: 'default',
+        pipeline: 'default',
+        sizeKey: '20x20',
+        requestedWidth: 20,
+        requestedHeight: 20,
+        actualWidth: 20,
+        actualHeight: 20,
+        format: 'jpeg',
+        contentType: 'image/jpeg',
+      },
+      {
+        storageRef: { key: 'previews/old-fit.jpeg' },
+        sizeKey: 'fit',
+        format: 'jpeg',
+        contentType: 'image/jpeg',
+        fit: true,
+      },
+    ];
+    let downloads = 0;
+    const appendCalls: Preview[][] = [];
+    const { deps, uploads } = rowDeps(redPng, {
+      media: fakeMedia({
+        load: async () => mediaDoc({ previews: oldRows }),
+        appendPreviews: async (_mediaId, previews) => {
+          appendCalls.push(previews);
+          return previews;
+        },
+      }),
+    });
+    const download = deps.storage.download;
+    deps.storage.download = async (ref) => {
+      downloads += 1;
+      return download(ref);
+    };
+    await new Processor(deps).processTask(
+      task({ previews: [variant(), fitVariant] }),
+    );
+    assert.equal(downloads, 0);
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
   });
 });

@@ -19,7 +19,7 @@ export type {
   WaterfallName,
 } from './contracts/hooks.ts';
 export { LockStore } from './contracts/locks.ts';
-export { MediaStore } from './contracts/media.ts';
+export { MediaStore, type ReplacedPreviews } from './contracts/media.ts';
 export type {
   BeforeStep,
   Pipeline,
@@ -60,11 +60,6 @@ export {
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
-// --- optional `as const` media schema fragment the host spreads into File/Media ---
-export {
-  resizeMediaPaths,
-  resizeMediaSchemaFragment,
-} from './mediaFragment.ts';
 // --- core: the Resizer + named lookup (constructor-wired; one per name) ---
 // `resetResizerForTests` is a TEST-ONLY escape hatch for host test suites.
 export type { ResizerOptions } from './resizer.ts';
@@ -74,7 +69,7 @@ export {
   resetResizerForTests,
 } from './resizer.ts';
 // --- data shapes and options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts,
-// CoordinationOptions, …) ---
+// InvalidateOpts, CoordinationOptions, …) ---
 export type * from './types.d.ts';
 // --- the framework-free worker (framework hosts run `runResizeWorker` from …/framework.js) ---
 export type { RunWorkerOptions } from './worker.ts';

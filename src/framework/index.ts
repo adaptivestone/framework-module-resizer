@@ -4,15 +4,23 @@
 //   import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
 //   export const resizer = new FrameworkResizer({ pipelines, hooks }); // the rest is config
 
+export {
+  resizeMediaPaths,
+  resizeMediaSchemaFragment,
+} from '../drivers/mongo/mediaFragment.ts';
 export type {
-  FrameworkDatabaseQueueConfig,
+  DatabaseQueueConfig,
   FrameworkLocalStorageConfig,
-  FrameworkQueueConfig,
   FrameworkResizeConfig,
   FrameworkS3StorageConfig,
-  FrameworkSqsQueueConfig,
   FrameworkStorageConfig,
+  QueueConfig,
+  SqsQueueConfig,
 } from '../types.d.ts';
+export {
+  defaultFrameworkResizeConfig,
+  defaultWorkerOptions,
+} from './defaults.ts';
 export { FrameworkLockStore } from './locks.ts';
 export {
   FrameworkMediaStore,

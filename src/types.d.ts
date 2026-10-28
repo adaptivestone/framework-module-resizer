@@ -73,8 +73,9 @@ export interface Preview {
   identity?: string;
   resizer?: string; // Resizer that generated it; absent → 'default'
   pipeline?: string; // pipeline that generated it; absent → 'default'
-  sizeKey: string; // canonical size key — see 03 · Identity
-  filters?: Filters; // part of identity — see 03 · Identity
+  // canonical size key; part of the preview identity (resizer:pipeline:sizeKey:format:filterSig)
+  sizeKey: string;
+  filters?: Filters; // part of the preview identity, as its filter signature
   requestedWidth?: number;
   requestedHeight?: number;
   actualWidth?: number;
@@ -82,6 +83,15 @@ export interface Preview {
   format: PreviewFormat;
   contentType: string;
   fit?: boolean; // true = uncropped "full"/contain variant (the `fit` token)
+  // Recorded on every row from this release on; absent on rows written before.
+  /** The encoded preview's size in bytes. */
+  bytes?: number;
+  /** When the preview was stored. */
+  createdAt?: Date;
+  /** A signature of the original it was made from (its storage ref and dimensions). */
+  origin?: string;
+  /** A signature of its format's encode settings and the pipeline version. */
+  encodeSig?: string;
 }
 
 export interface MediaLike {
@@ -147,6 +157,7 @@ export interface EnqueueIssue {
     | 'RESIZE_TASK_IN_FLIGHT' // a task of this media, pipeline and queue is active or cooling down
     | 'RESIZE_PIPELINE_UNKNOWN' // the pipeline is not registered on this Resizer
     | 'RESIZE_FORMAT_NOT_CONFIGURED' // a requested format has no encode.formats entry
+    | 'RESIZE_QUEUE_NOT_SERVED' // the task queue does not serve the call's queue name
     | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)
   message: string;
   retryable: boolean;
@@ -198,7 +209,7 @@ export interface ResolveOpts {
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // threaded to the read-path hooks
   enqueueMissing?: boolean; // default true when a task queue is set, false otherwise
-  queue?: string; // queue for missing variants; default resizer.queue
+  queue?: string; // queue for missing variants; default resizer.queueName
 }
 
 export interface PrewarmOpts {
@@ -207,7 +218,7 @@ export interface PrewarmOpts {
   pipeline?: string; // selects a registered pipeline; default 'default'
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
-  queue?: string; // queue for missing variants; default resizer.queue
+  queue?: string; // queue for missing variants; default resizer.queueName
 }
 
 // Options for eager `generate`.
@@ -225,6 +236,12 @@ export interface GenerateOpts {
 export interface GenerateResult {
   created: Preview[];
   failed: number;
+}
+
+// Options for `invalidate`: which of this Resizer's stored previews of a media to remove.
+export interface InvalidateOpts {
+  media: MediaLike;
+  pipeline?: string; // only its rows; default: every pipeline of this Resizer
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +285,9 @@ export interface ResizeConfig {
   concurrency: number;
 }
 
-// Queue timing: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the framework
-// config file's `queue` section feeds the framework's queue). How long locks last is not timing:
-// that is the Resizer's `coordination` (CoordinationOptions).
+// Queue timing: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; in a framework host,
+// each entry of `queues` in src/config/resize.ts sets its own queue's). How long locks last is not
+// timing: that is the Resizer's `coordination` (CoordinationOptions).
 export interface QueueTimingOptions {
   leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
   retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
@@ -280,7 +297,7 @@ export interface QueueTimingOptions {
 }
 
 // How a Resizer with a task queue coordinates its queued work, in ms
-// (`new Resizer({ coordination })`, or the framework config file's `coordination` section). Missing
+// (`new Resizer({ coordination })`, or `coordination` in a framework host's src/config/resize.ts). Missing
 // values take the defaults (defaultCoordination); only the core validates them, when the Resizer
 // sets up its task queue. An eager-only Resizer never reads them.
 export interface CoordinationOptions {
@@ -293,7 +310,7 @@ export interface CoordinationOptions {
   cooldownMs?: number;
 }
 
-// The framework worker command's settings (the config file's `worker` section).
+// The framework worker command's settings (`worker` in src/config/resize.ts).
 export interface FrameworkWorkerConfig {
   enabled: boolean; // default false — permits `npm run cli ResizeWorker` to run
   sharpConcurrency: number; // default 1 — sharp.concurrency()
@@ -321,33 +338,46 @@ export type FrameworkStorageConfig =
   | FrameworkLocalStorageConfig
   | FrameworkS3StorageConfig;
 
-// Where a FrameworkResizer's tasks wait: the config file's `queue` section, with the queue's
-// timing (any QueueTimingOptions key; the rest default).
-export interface FrameworkDatabaseQueueConfig
-  extends Partial<QueueTimingOptions> {
-  driver?: 'database'; // the app's queue over its ResizeTask model (default driver)
+/**
+ * One named queue: where its tasks wait, and that queue's timing (any QueueTimingOptions key; the
+ * rest default). A framework host defines each queue once, in `queues` of src/config/resize.ts.
+ */
+export type QueueConfig = DatabaseQueueConfig | SqsQueueConfig;
+/** A queue whose tasks wait in the app's ResizeTask model, with that queue's timing. */
+export interface DatabaseQueueConfig extends Partial<QueueTimingOptions> {
+  /** The app's queue over its ResizeTask model. */
+  driver: 'database';
 }
-export interface FrameworkSqsQueueConfig extends Partial<QueueTimingOptions> {
-  driver: 'sqs'; // SqsTaskQueue (needs @aws-sdk/client-sqs)
-  queueUrl: string; // the 'default' queue
-  queues?: Record<string, string>; // other named queues → URLs
+/** A queue whose tasks wait in its own SQS queue, with that queue's timing. */
+export interface SqsQueueConfig extends Partial<QueueTimingOptions> {
+  /** SqsTaskQueue (needs @aws-sdk/client-sqs). */
+  driver: 'sqs';
+  /** This queue's own SQS queue. */
+  queueUrl: string;
   deadLetterQueueUrl?: string;
-  waitTimeSeconds?: number; // long poll per claim; default 10
+  /** Long poll per claim; default 10. */
+  waitTimeSeconds?: number;
   region?: string;
   endpoint?: string;
 }
-export type FrameworkQueueConfig =
-  | FrameworkDatabaseQueueConfig
-  | FrameworkSqsQueueConfig;
 
-// The config file a framework host writes (`src/config/resize.ts`, or another file per Resizer).
-// The image settings go to the Resizer; FrameworkResizer builds the rest: the media model, the
-// storage, the task queue and the worker command's settings. resize.<NODE_ENV>.ts overrides any
-// of them per environment.
+// A config file a framework host writes: `src/config/resize.ts`, or another Resizer's file
+// (`configName`). The image settings, `mediaModelName`, `storage` and `queue` belong to that
+// Resizer. `queues`, `worker` and `coordination` are process-wide: the adapter reads them only from
+// src/config/resize.ts and rejects them in any other file. resize.<NODE_ENV>.ts overrides any of
+// them per environment.
 export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   storage?: FrameworkStorageConfig; // required unless the code passes `storage`
-  queue?: FrameworkQueueConfig | false; // missing or false: eager only (no task queue)
-  coordination?: CoordinationOptions; // default: defaultCoordination; read only beside a queue
-  worker?: FrameworkWorkerConfig; // default: defaultWorkerOptions
+  /**
+   * The queue name of this Resizer's tasks (a key of `queues`), or false for eager only. Missing:
+   * 'default' when `queues` has entries, else eager only.
+   */
+  queue?: string | false;
+  /** Process-wide: every queue, by name. */
+  queues?: Record<string, QueueConfig>;
+  /** Process-wide; a missing key takes defaultWorkerOptions. */
+  worker?: Partial<FrameworkWorkerConfig>;
+  /** Process-wide; default: defaultCoordination. */
+  coordination?: CoordinationOptions;
 }

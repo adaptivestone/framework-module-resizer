@@ -37,18 +37,25 @@ export interface MongoTaskQueueOptions {
   // The ResizeTask model, or a getter called on each use (for a model registered later).
   model?: TaskModel;
   getModel?: () => TaskModel;
-  // Queue timing (lease, retries, polling, task timeout); missing values use defaultQueueOptions.
+  // Queue timing (lease, retries, polling, task timeout) of every queue name; missing values use
+  // defaultQueueOptions.
   timing?: Partial<QueueTimingOptions>;
-  // The same, read on first use (the framework adapter reads it from its config file).
-  getTiming?: () => Partial<QueueTimingOptions>;
+  // One queue name's timing, read on that name's first use (the framework adapter reads it from
+  // its config file); when it gives none, `timing` applies.
+  getTiming?: (queue: string) => Partial<QueueTimingOptions> | undefined;
+  // The queue names this queue serves (servesQueue); default: every name. Claims are unchanged: a
+  // worker claims the tasks of the queue name it was started for.
+  queues?: readonly string[];
   logger?: ResizeLogger; // default: console
 }
 
-// The schema paths this queue writes. Mongoose strict mode silently drops a path its schema lacks:
-// a model ejected before tasks carried a Resizer and queue would file every task under Resizer
-// 'default' on queue 'default'; one without availableAt would lose every retry time; one without
-// active would turn the gate off (every add would store a task); one without cooldownUntil would
-// end every dead task's cooldown at once.
+// The schema paths the gate and the lease need. Mongoose strict mode silently drops a path its
+// schema lacks: a model ejected before tasks carried a Resizer and queue would file every task
+// under Resizer 'default' on queue 'default'; one without availableAt would lose every retry time;
+// one without active would turn the gate off (every add would store a task); one without
+// cooldownUntil would end every dead task's cooldown at once. The queue also writes startedAt and
+// finishedAt, which are not listed: nothing reads them, so a model without them only loses the
+// times, while a missing listed path makes every add unconfirmed.
 const WRITTEN_PATHS = [
   'fileId',
   'resizer',
@@ -128,20 +135,31 @@ export class MongoTaskQueue extends TaskQueue {
   readonly gatesByTask = true;
   readonly claimFilters = true;
   readonly #getModel: () => TaskModel;
-  readonly #getTiming: () => Partial<QueueTimingOptions>;
+  readonly #timing: Partial<QueueTimingOptions> | undefined;
+  readonly #getTiming:
+    | ((queue: string) => Partial<QueueTimingOptions> | undefined)
+    | undefined;
+  readonly #queues: readonly string[] | undefined;
   readonly #logger: ResizeLogger;
 
   constructor(opts: MongoTaskQueueOptions) {
     super();
     // A model that does not resolve is reported by verify() at boot and logged at runtime.
     this.#getModel = modelGetter<TaskModel>(opts, 'MongoTaskQueue');
-    const { timing, getTiming } = opts;
-    this.#getTiming = getTiming ?? (() => timing ?? {});
+    this.#timing = opts.timing;
+    this.#getTiming = opts.getTiming;
+    this.#queues = opts.queues;
     this.#logger = opts.logger ?? console;
   }
 
-  getTiming(): Partial<QueueTimingOptions> {
-    return this.#getTiming();
+  /** The names in `queues`; every name without that option. */
+  servesQueue(queue: string): boolean {
+    return this.#queues?.includes(queue) ?? true;
+  }
+
+  /** The `getTiming` option's timing for `queue`, else `timing`. */
+  getTiming(queue: string): Partial<QueueTimingOptions> {
+    return this.#getTiming?.(queue) ?? this.#timing ?? {};
   }
 
   /**
@@ -285,6 +303,7 @@ export class MongoTaskQueue extends TaskQueue {
           leaseToken: randomHex(),
           leaseExpiresAt: leaseEnd,
           availableAt: leaseEnd,
+          startedAt: now, // this delivery's start
         },
         $inc: { attempts: 1 },
       },
@@ -302,13 +321,20 @@ export class MongoTaskQueue extends TaskQueue {
 
   // Done: the task stops being the gate, so the next add() stores a new task.
   async complete(task: ClaimedTask): Promise<boolean> {
+    const completedAt = new Date();
     return this.#fenced(task, {
-      $set: { status: 'completed', completedAt: new Date(), active: false },
+      $set: {
+        status: 'completed',
+        completedAt,
+        finishedAt: completedAt,
+        active: false,
+      },
     });
   }
 
   // A retry keeps the gate. A dead task keeps it for `opts.cooldownMs` (none by default): until
-  // then add() reports it in flight, and after that the next add() takes it over.
+  // then add() reports it in flight, and after that the next add() takes it over. Only a dead
+  // task is finished; a retry leaves startedAt and finishedAt as they are.
   async fail(
     task: ClaimedTask,
     next: { retryAt: Date } | 'dead',
@@ -321,6 +347,7 @@ export class MongoTaskQueue extends TaskQueue {
         $set: {
           status: 'dead',
           deadAt,
+          finishedAt: deadAt,
           error,
           cooldownUntil: new Date(deadAt.getTime() + (opts?.cooldownMs ?? 0)),
         },
@@ -337,7 +364,7 @@ export class MongoTaskQueue extends TaskQueue {
     });
   }
 
-  // Due at once, and the claim's attempt taken back. The task keeps the gate.
+  // Due at once, and the claim's attempt taken back. The task keeps the gate and its times.
   async release(task: ClaimedTask): Promise<boolean> {
     return this.#fenced(task, {
       $set: {

@@ -17,6 +17,7 @@ import {
   MemoryTaskQueue,
   PlainTaskQueue,
 } from './testHelpers/fakes.ts';
+import { fillTiming, type QueueTiming, timingOf } from './timing.ts';
 import type { MissingPreview, ResizeLogger } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ function makeDispatcher(
     tasks?: TaskQueue;
     locks?: LockStore;
     coordination?: Coordination;
-    leaseMs?: number;
+    timingOf?: (queue: string) => QueueTiming;
     name?: string;
   } = {},
 ) {
@@ -95,7 +96,7 @@ function makeDispatcher(
     tasks: opts.tasks ?? new MemoryTaskQueue(),
     locks: 'locks' in opts ? opts.locks : clockLocks(),
     coordination: opts.coordination ?? defaultCoordination,
-    leaseMs: opts.leaseMs ?? 60_000,
+    timingOf: opts.timingOf ?? (() => fillTiming({})),
     name: opts.name ?? 'default',
     logger: recordingLogger,
   });
@@ -375,7 +376,11 @@ describe('a task queue without gatesByTask', () => {
       tasks.add = add;
       // The queue may have stored the task although it did not say so (a lost response).
       const { locks, calls } = recordingLocks(clockLocks(() => now));
-      const d = makeDispatcher({ tasks, locks, leaseMs });
+      const d = makeDispatcher({
+        tasks,
+        locks,
+        timingOf: () => fillTiming({ leaseMs }),
+      });
       assert.equal(await d.enqueue(requestFor([v300])), 0, label);
       const [acquire, extend] = calls;
       assert.deepEqual(
@@ -430,11 +435,152 @@ describe('a task queue without gatesByTask', () => {
     const d = makeDispatcher({
       tasks,
       locks,
-      leaseMs: 60_000,
+      timingOf: () => fillTiming({ leaseMs: 60_000 }),
       coordination: { gateTtlMs: 10_000, cooldownMs: 1_000 },
     });
     assert.equal(await d.enqueue(requestFor([v300])), 0);
     assert.equal(locks.entry(GATE)?.expiresAt, now + 10_000);
+  });
+
+  test("an unconfirmed add keeps the gate lock for the lease of the call's lane", async () => {
+    const tasks = new PlainTaskQueue({
+      queueTiming: { bulk: { leaseMs: 120_000 } },
+    });
+    tasks.add = async () => ({ status: 'unconfirmed' });
+    const locks = clockLocks(() => 0);
+    const d = makeDispatcher({
+      tasks,
+      locks,
+      coordination: { gateTtlMs: 600_000, cooldownMs: 1_000 },
+      timingOf: (queue) => timingOf(tasks, queue),
+    });
+    assert.equal(await d.enqueue(requestFor([v300], { queue: 'bulk' })), 0);
+    assert.equal(
+      locks.entry(gateKey('default', 'bulk', 'm1', 'default'))?.expiresAt,
+      120_000,
+    );
+    assert.equal(
+      await d.enqueue(requestFor([v300], { mediaId: 'm2', queue: 'default' })),
+      0,
+    );
+    assert.equal(
+      locks.entry(gateKey('default', 'default', 'm2', 'default'))?.expiresAt,
+      60_000,
+    );
+  });
+
+  test('a call on a queue with invalid timing queues nothing and reports it as the own queue would', async () => {
+    const tasks = new PlainTaskQueue({
+      queueTiming: { bulk: { leaseMs: 0 }, audit: { leaseMs: 0 } },
+    });
+    const locks = clockLocks();
+    const d = makeDispatcher({
+      tasks,
+      locks,
+      timingOf: (queue) => timingOf(tasks, queue),
+    });
+    const bulk = requestFor([v300, v600], { queue: 'bulk' });
+    // prewarm: every variant unconfirmed, no issue of its own; the error goes back to the Reader,
+    // which reports it as it reports an own queue whose timing is invalid.
+    const confirmed = await d.enqueueConfirmed(bulk);
+    assert.deepEqual(
+      { ...confirmed, timingError: undefined },
+      {
+        accepted: [],
+        unconfirmed: [v300, v600],
+        tasks: [],
+        issues: [],
+        timingError: undefined,
+      },
+    );
+    assert.ok(
+      confirmed.timingError instanceof Error &&
+        /leaseMs/.test(confirmed.timingError.message) &&
+        /queue 'bulk'/.test(confirmed.timingError.message),
+    );
+    // The read path logs the error once per queue name, at error.
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(
+      await d.enqueue(requestFor([v300], { mediaId: 'm2', queue: 'bulk' })),
+      0,
+    );
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0][0]), /'bulk'/);
+    // Invalid timing is never cached, so each call reads it again and meets a new error.
+    assert.equal(
+      (errors[0][1] as Error).message,
+      confirmed.timingError.message,
+    );
+    // Another queue name with invalid timing is logged once too.
+    assert.equal(await d.enqueue(requestFor([v300], { queue: 'audit' })), 0);
+    assert.equal(await d.enqueue(requestFor([v300], { queue: 'audit' })), 0);
+    assert.equal(errors.length, 2);
+    assert.match(String(errors[1][0]), /'audit'/);
+    // Nothing reached the task queue or the lock store.
+    assert.deepEqual(tasks.added, []);
+    assert.equal(
+      locks.entry(gateKey('default', 'bulk', 'm1', 'default')),
+      undefined,
+    );
+    // The default lane still queues.
+    const own = await d.enqueueConfirmed(requestFor([v300]));
+    assert.deepEqual(own.accepted, [v300]);
+    assert.equal('timingError' in own, false);
+    assert.equal(tasks.added.length, 1);
+  });
+
+  test('a call on a queue the task queue does not serve queues nothing and never reads its timing', async () => {
+    const tasks = new PlainTaskQueue({ queues: ['default'] });
+    const asked: string[] = [];
+    const locks = clockLocks();
+    const d = makeDispatcher({
+      tasks,
+      locks,
+      timingOf: (queue) => {
+        asked.push(queue);
+        return timingOf(tasks, queue);
+      },
+    });
+    const bulk = requestFor([v300, v600], { queue: 'bulk' });
+    const message =
+      "cannot queue to 'bulk': its task queue does not serve that queue (an unknown queue name, or a queue on another backend; one Resizer cannot use two backends yet)";
+    assert.deepEqual(await d.enqueueConfirmed(bulk), {
+      accepted: [],
+      unconfirmed: [v300, v600],
+      tasks: [],
+      issues: [
+        {
+          code: 'RESIZE_QUEUE_NOT_SERVED',
+          message,
+          retryable: false,
+          previews: [v300, v600],
+        },
+      ],
+    });
+    // The read path warns once per queue name.
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(warnings.length, 1);
+    assert.ok(String(warnings[0][0]).includes(message));
+    assert.deepEqual(tasks.added, []);
+    assert.equal(
+      locks.entry(gateKey('default', 'bulk', 'm1', 'default')),
+      undefined,
+    );
+    assert.deepEqual(asked, []);
+    assert.deepEqual(errors, []);
+  });
+
+  test('a servesQueue that answers undefined is not served, as verify() and the worker read it', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.servesQueue = (() => undefined) as never;
+    const d = makeDispatcher({ tasks });
+    assert.equal(await d.enqueue(requestFor([v300])), 0);
+    const confirmed = await d.enqueueConfirmed(requestFor([v300]));
+    assert.deepEqual(confirmed.accepted, []);
+    assert.equal(confirmed.issues[0]?.code, 'RESIZE_QUEUE_NOT_SERVED');
+    assert.deepEqual(tasks.added, []);
+    assert.equal(warnings.length, 1);
   });
 
   test('a rejecting extend after an unconfirmed add is logged; the lock stays as acquired', async () => {

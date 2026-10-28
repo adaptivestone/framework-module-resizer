@@ -22,7 +22,10 @@ export class FrameworkMediaStore extends MongoMediaStore {
         const name =
           opts.modelName ??
           (opts.config
-            ? resolveFrameworkConfig(opts.config, opts.configName)
+            ? resolveFrameworkConfig(opts.config, {
+                configName: opts.configName ?? 'resize',
+                explicit: true,
+              })
             : getResizeConfig(opts.configName)
           ).mediaModelName;
         const model = getApp().getModel(name);

@@ -38,10 +38,18 @@ Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
 Bump with `npm version <patch|minor|major>` (updates `package.json` + creates the git tag — see
 §4), or edit `version` by hand and tag manually.
 
-> **Check `version` first.** For 0.3.0 no bump is needed: `package.json` already holds `0.3.0`
-> and `CHANGELOG.md` has the `# 0.3.0` heading, so tag the release commit by hand. In general,
-> compare `version` with `npm view @adaptivestone/framework-module-resize version`; if it is
-> already ahead, do not run `npm version` on top of it (that would skip a version).
+**Prereleases.** A breaking minor may ship as release candidates first: `X.Y.0-rc.N`, starting
+at `rc.1` (`npm version X.Y.0-rc.1 --no-git-tag-version`, then tag by hand, §4). Each rc is
+published with the npm tag `next` (§3), so `latest` stays on the last stable release until the
+final `X.Y.0`. 0.3.0 ships this way: `0.3.0-rc.1` holds every host-facing shape, `0.3.0-rc.2` the
+new pipeline-step signature, later rcs internal changes only. All of them stay under the one
+`# 0.3.0` heading of `CHANGELOG.md` (its **Prereleases** note says what each rc holds); the
+final `0.3.0` is a bump from the last rc with no new heading.
+
+> **Check `version` first.** Compare `version` with
+> `npm view @adaptivestone/framework-module-resize versions --json` (every version, rcs
+> included; `npm view … version` shows only `latest`). If `package.json` is already ahead, do not
+> run `npm version` on top of it (that would skip a version); tag the release commit by hand.
 
 **Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
 heading, with `**Breaking changes**` / `**Features**` / `**Fixes**` / `**Internal**` groups —
@@ -66,6 +74,19 @@ Subsequent publishes need no flag (access is sticky once set on the registry):
 npm publish
 ```
 
+A **prerelease** (`X.Y.Z-rc.N`) is published with the `next` dist-tag, so `latest` stays on the
+last stable release and a plain `npm i @adaptivestone/framework-module-resize` never picks it up
+(hosts opt in with `@next`):
+
+```bash
+npm publish --tag next
+npm dist-tag ls @adaptivestone/framework-module-resize   # latest = last stable, next = the rc
+```
+
+The final release is a plain `npm publish` (it moves `latest`). Leaving `next` on the last rc is
+harmless; point it at the final release with `npm dist-tag add
+@adaptivestone/framework-module-resize@X.Y.Z next` if you want `@next` to stay the newest.
+
 `prepublishOnly` runs `npm run build` automatically, so `dist/` is always rebuilt from source at
 publish time; `files: ["dist", "AGENTS.md"]` (plus the auto-included `README.md` + `LICENSE`) is
 all that ships.
@@ -76,7 +97,7 @@ all that ships.
 
 ## 4. Git tag convention
 
-Tag the release commit `vX.Y.Z`.
+Tag the release commit `vX.Y.Z`, and a release candidate `vX.Y.Z-rc.N` (e.g. `v0.3.0-rc.1`).
 
 > **Note:** the sibling repos tag **without** the `v` prefix (`framework` uses `5.3.1`,
 > `framework-module-email` uses `2.0.0`). This repo's existing tags are mixed: `v0.1.0` has the
@@ -109,24 +130,35 @@ gh release create vX.Y.Z --title "X.Y.Z" \
   --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d')
 ```
 
+For a release candidate, mark the GitHub Release as a prerelease and take the body from the
+`# X.Y.0` section it belongs to (rcs have no heading of their own):
+
+```bash
+gh release create vX.Y.0-rc.N --prerelease --title "X.Y.0-rc.N" \
+  --notes-file <(sed -n '/^# X.Y.0$/,/^# /p' CHANGELOG.md | sed '1d;$d')
+```
+
 ## 5. Manual post-publish verification — try in a real host backend
 
 _Placeholder — the one check the automated smoke can't do: wire the published package into an
 actual framework host and run it against real infra._
 
-- [ ] In a real `@adaptivestone/framework` host: `npm i @adaptivestone/framework-module-resize`,
-      run `npx resize-scaffold`, and in `src/config/resize.ts` set `mediaModelName`, `storage`
-      (S3), `queue: { driver: 'database' }` and `worker.enabled: true`. `src/resizer.ts` stays
+- [ ] In a real `@adaptivestone/framework` host: `npm i @adaptivestone/framework-module-resize`
+      (`@next` for a release candidate), run `npx resize-scaffold`, and in `src/config/resize.ts`
+      set `mediaModelName` and `storage` (S3), keep `queue: 'default'` and
+      `queues: { default: { driver: 'database' } }`, and set `worker: { enabled: true }`.
+      `src/resizer.ts` stays
       `new FrameworkResizer({ pipelines })`. Create the `ResizeTask` indexes through the host's
       migration, and call `await resizer.verify()` after `server.init()`.
 - [ ] `npx resize-scaffold --check` passes, and `npm run gen` (the framework's AST codegen) types
       `getModel('ResizeTask')` through the scaffolded shim.
 - [ ] Boot the server, upload an image, confirm a `resolve()` read queues the missing variants and
       `npm run cli ResizeWorker` generates and persists the previews (database queue + S3
-      storage). If the host uses SQS, repeat with `queue: { driver: 'sqs', … }`.
+      storage). If the host uses SQS, repeat with
+      `queues: { default: { driver: 'sqs', queueUrl, … } }`.
 - [ ] Stop the worker during a task (SIGTERM): the task goes back to `pending` and the next
       worker finishes it.
-- [ ] Confirm eager mode (`generate()`, no `queue` in the config) on a host scaffolded with
+- [ ] Confirm eager mode (`generate()`, no `queue` or `queues` in the config) on a host scaffolded with
       `--eager`; `npx resize-scaffold --check --eager` passes.
 
 ## Notes

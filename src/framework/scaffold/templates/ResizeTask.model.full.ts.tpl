@@ -56,7 +56,8 @@ export default class ResizeTask extends BaseModel {
         enum: ['pending', 'processing', 'completed', 'dead'],
         default: 'pending',
       },
-      // Capped by the queue's maxAttempts (config `queue.maxAttempts`), then dead-lettered.
+      // Capped by the queue's maxAttempts (`queues.<name>.maxAttempts` in src/config/resize.ts),
+      // then dead-lettered.
       attempts: { type: Number, default: 0 },
       // When the task may next be claimed: now for a new or released task, the retry time after
       // a failure, the end of the lease while a worker holds it. Claims take the earliest.
@@ -66,6 +67,10 @@ export default class ResizeTask extends BaseModel {
       leaseExpiresAt: { type: Date }, // the current lease ends; null while the task waits
       completedAt: { type: Date },
       deadAt: { type: Date },
+      // When the latest delivery started (every claim sets it), and when the task completed or
+      // was dead-lettered. For inspection only: the worker never reads them.
+      startedAt: { type: Date },
+      finishedAt: { type: Date },
       error: { type: String },
       // 👉 Add your custom fields here, e.g.  myField: { type: String },
     } as const;

@@ -105,6 +105,18 @@ describe('ResizeTaskModel.modelSchema — spec/08 §12 fields', () => {
       assert.ok(k in s, `missing field ${k}`);
     }
   });
+
+  test('the package model declares startedAt and finishedAt', () => {
+    const s = ResizeTaskModel.modelSchema;
+    // A Date each, with no default: a new task has neither time.
+    assert.equal(s.startedAt.type, Date);
+    assert.equal('default' in s.startedAt, false);
+    assert.equal(s.finishedAt.type, Date);
+    assert.equal('default' in s.finishedAt, false);
+    const schema = new mongoose.Schema(ResizeTaskModel.modelSchema);
+    assert.equal(schema.path('startedAt')?.instance, 'Date');
+    assert.equal(schema.path('finishedAt')?.instance, 'Date');
+  });
 });
 
 describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => {

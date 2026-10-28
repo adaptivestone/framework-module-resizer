@@ -73,6 +73,42 @@ test('fakeMedia keeps one row per identity and resolves with the stored rows', a
   assert.deepEqual(previews.get('m2'), [a]);
 });
 
+test("fakeMedia's replacePreviews follows the contract", async () => {
+  const legacy = preview(undefined, 'x0');
+  const a1 = preview('a', 'a1');
+  const b1 = preview('b', 'b1');
+  const previews = new Map([['m1', [legacy, a1, b1]]]);
+  const media = fakeMedia({ previews });
+  const a9 = preview('a', 'a9');
+
+  // The rows' own identities are replaced too; of two rows with one identity the first is stored.
+  assert.deepEqual(
+    await media.replacePreviews('m1', ['zzz'], [a9, preview('a', 'a-repeat')]),
+    { stored: [a9], removed: [a1] },
+  );
+  assert.deepEqual(previews.get('m1'), [legacy, b1, a9]);
+  // No rows: it only removes; a row without an identity is never removed.
+  assert.deepEqual(await media.replacePreviews('m1', ['a', 'b'], []), {
+    stored: [],
+    removed: [b1, a9],
+  });
+  assert.deepEqual(previews.get('m1'), [legacy]);
+
+  // A replacePreviews part replaces the default.
+  const calls: unknown[][] = [];
+  const custom = fakeMedia({
+    replacePreviews: async (...args) => {
+      calls.push(args);
+      return { stored: [], removed: [] };
+    },
+  });
+  assert.deepEqual(await custom.replacePreviews('m2', ['a'], [a9]), {
+    stored: [],
+    removed: [],
+  });
+  assert.deepEqual(calls, [['m2', ['a'], [a9]]]);
+});
+
 test('fakeMedia treats seeded previews as already stored', async () => {
   const seeded = preview('a', 'other-worker');
   const media = fakeMedia({ previews: new Map([['m1', [seeded]]]) });
@@ -249,6 +285,33 @@ test('PlainTaskQueue stores every add and declares no gate, no claim filter and 
     resizers: ['listings'],
   });
   assert.equal(claimed?.resizer, 'default');
+});
+
+test('the in-memory task queues record every claim, serve their listed names and read timing per name', async () => {
+  for (const Queue of [MemoryTaskQueue, PlainTaskQueue]) {
+    const timing = { leaseMs: 90_000 };
+    const tasks = new Queue({
+      timing,
+      queueTiming: { bulk: { leaseMs: 30_000 } },
+      queues: ['default', 'bulk'],
+    });
+    assert.equal(tasks.servesQueue('default'), true);
+    assert.equal(tasks.servesQueue('bulk'), true);
+    assert.equal(tasks.servesQueue('other'), false);
+    assert.deepEqual(tasks.getTiming('bulk'), { leaseMs: 30_000 });
+    assert.equal(tasks.getTiming('default'), timing);
+    await tasks.add(newTask({ queue: 'bulk' }));
+    assert.equal(await tasks.claim('default', 1000), null);
+    assert.equal((await tasks.claim('bulk', 30_000))?.queue, 'bulk');
+    assert.deepEqual(tasks.claims, [
+      { queue: 'default', leaseMs: 1000 },
+      { queue: 'bulk', leaseMs: 30_000 },
+    ]);
+  }
+  // Without a list every name is served; without timing every name has none of its own.
+  const plain = new PlainTaskQueue();
+  assert.equal(plain.servesQueue('anything'), true);
+  assert.deepEqual(plain.getTiming('default'), {});
 });
 
 test('clockLocks expires locks, lets them be taken over, and checks owners', async () => {

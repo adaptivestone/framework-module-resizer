@@ -546,6 +546,30 @@ describe('ports', () => {
     );
   });
 
+  test('verify() rejects a media store without replacePreviews', async () => {
+    let storeVerified = 0;
+    // A custom store written before replacePreviews existed.
+    const media = {
+      loadMedia: async () => null,
+      appendPreviews: async (_id: string, previews: unknown[]) => previews,
+      verify: () => {
+        storeVerified += 1;
+      },
+    } as unknown as MediaStore;
+    const r = new Resizer({ logger: silent, storage, media });
+    await r.ready();
+    await assert.rejects(
+      () => r.verify(),
+      (e: unknown) =>
+        e instanceof ResizeSetupError &&
+        e.code === 'RESIZE_MEDIA_REPLACE_MISSING' &&
+        e.message ===
+          'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
+    );
+    // Checked after the store's own verify().
+    assert.equal(storeVerified, 1);
+  });
+
   test('a task queue with gatesByTask needs no locks; one without is RESIZE_LOCKS_REQUIRED from verify()', async () => {
     const gating = new Resizer({
       logger: silent,
@@ -961,6 +985,118 @@ describe('coordination', () => {
   });
 });
 
+describe('queueName', () => {
+  const silent = { info() {}, warn() {}, error() {} };
+  const queued = (opts: Partial<ResizerOptions> = {}) =>
+    new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      ...opts,
+    });
+  const cold = {
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [],
+  };
+  const sizes = [{ width: 10, height: 10 }];
+
+  test('queueName defaults to default and names the queue of every task', async () => {
+    const own = new MemoryTaskQueue();
+    const plain = queued({ tasks: own });
+    assert.equal(plain.queueName, 'default');
+    await plain.resolve({ media: cold, sizes });
+    assert.equal(own.added[0].queue, 'default');
+    const bulkTasks = new MemoryTaskQueue();
+    const bulk = queued({ name: 'b', queueName: 'bulk', tasks: bulkTasks });
+    await bulk.resolve({ media: cold, sizes });
+    await bulk.prewarm({ media: { ...cold, id: 'm2' }, sizes });
+    assert.deepEqual(
+      bulkTasks.added.map((task) => task.queue),
+      ['bulk', 'bulk'],
+    );
+  });
+
+  test('a string queueName is readable at once; a function is read on first use', async () => {
+    assert.equal(queued({ queueName: 'bulk' }).queueName, 'bulk');
+    let calls = 0;
+    const tasks = new MemoryTaskQueue();
+    const lazy = queued({
+      name: 'lazy',
+      tasks,
+      queueName: () => {
+        calls += 1;
+        return 'bulk';
+      },
+    });
+    assert.throws(
+      () => lazy.queueName,
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_NOT_READY' &&
+        /queueName/.test(err.message),
+    );
+    assert.equal(calls, 0);
+    await lazy.ready();
+    assert.equal(lazy.queueName, 'bulk');
+    await lazy.resolve({ media: cold, sizes });
+    await lazy.ready();
+    assert.equal(calls, 1);
+    assert.equal(tasks.added[0].queue, 'bulk');
+  });
+
+  test('the old queue option is RESIZE_QUEUE_INVALID naming queueName', () => {
+    for (const make of [
+      () => queued({ queue: 'bulk' } as never),
+      () => new FrameworkResizer({ ...baseOpts(), queue: 'bulk' } as never),
+    ]) {
+      assert.throws(
+        make,
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_QUEUE_INVALID' &&
+          /`queue` is now `queueName`/.test(err.message),
+      );
+    }
+    // A rejected construction never claims the name.
+    assert.equal(queued().queueName, 'default');
+  });
+
+  test('an empty queueName is RESIZE_QUEUE_INVALID', async () => {
+    for (const queueName of ['', '  ', 42]) {
+      assert.throws(
+        () => queued({ queueName } as never),
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_QUEUE_INVALID' &&
+          /`queueName` must be a non-empty string/.test(err.message),
+      );
+    }
+    assert.throws(
+      () => new FrameworkResizer({ ...baseOpts(), queueName: '' }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_INVALID',
+    );
+    // A function's result is checked on first use: ready() rejects, and the next call asks again.
+    let name = '';
+    const lazy = queued({ name: 'lazy', queueName: () => name });
+    for (const call of [() => lazy.ready(), () => lazy.verify()]) {
+      await assert.rejects(
+        call,
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_QUEUE_INVALID' &&
+          /`queueName` must be a non-empty string/.test(err.message),
+      );
+    }
+    name = 'bulk';
+    await lazy.ready();
+    assert.equal(lazy.queueName, 'bulk');
+  });
+});
+
 describe('Resizer registry', () => {
   test('a second Resizer with the same name throws a clear error', () => {
     new FrameworkResizer(baseOpts());
@@ -1031,25 +1167,6 @@ describe('Resizer registry', () => {
       tasks,
     });
     assert.equal(listings.tasks, tasks);
-  });
-
-  test('queue defaults to "default" and can be set per Resizer', () => {
-    const media = new FrameworkResizer(baseOpts());
-    const bulk = new FrameworkResizer({
-      ...baseOpts(),
-      name: 'bulk',
-      queue: 'bulk',
-    });
-    assert.equal(media.queue, 'default');
-    assert.equal(bulk.queue, 'bulk');
-  });
-
-  test('an empty queue name is rejected', () => {
-    assert.throws(
-      () => new FrameworkResizer({ ...baseOpts(), queue: '' }),
-      (err: unknown) =>
-        err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_INVALID',
-    );
   });
 
   test('listResizers() returns every registered Resizer in construction order', () => {

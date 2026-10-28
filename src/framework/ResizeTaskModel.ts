@@ -48,6 +48,6 @@ export default class ResizeTaskModel extends BaseModel {
   }
 }
 
-// = GetModelTypeFromClass<typeof ResizeTaskModel> (02 · §6): the fully-typed model
+// = GetModelTypeFromClass<typeof ResizeTaskModel>: the fully-typed model
 // (inherited modelSchema statics included; `filters` typed as Filters via TsTypeOverride).
 export type TResizeTask = GetModelTypeFromClass<typeof ResizeTaskModel>;

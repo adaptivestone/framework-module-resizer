@@ -7,10 +7,12 @@
 // held. Beside a queue without it (SQS), the Dispatcher takes the gate lock with a fresh owner for
 // coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the worker then holds
 // that lock until the task ends. When the queue does not say it stored the task, the lock is
-// shortened to one lease, or gateTtlMs when that is shorter (see #dispatch). The read path never
-// throws and counts only an added task; prewarm accepts only what the new task, or the active one,
-// holds. A Dispatcher needs only the task queue, the lock store (beside a queue without gatesByTask), the coordination, the
-// queue's lease, its Resizer's name and a logger.
+// shortened to one lease of the call's queue, or gateTtlMs when that is shorter (see #dispatch).
+// A call on a queue name the task queue does not serve, or whose timing is invalid, queues
+// nothing. The read path never throws and counts only an added task; prewarm accepts only what the
+// new task, or the active one, holds. A Dispatcher needs only the task queue, the lock store
+// (beside a queue without gatesByTask), the coordination, the timing of each queue name, its
+// Resizer's name and a logger.
 import type { LockStore } from './contracts/locks.ts';
 import type {
   NewTask,
@@ -22,6 +24,7 @@ import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { gateKey } from './lockKeys.ts';
+import type { QueueTiming } from './timing.ts';
 import type {
   EnqueueIssue,
   EnqueueReceipt,
@@ -34,9 +37,10 @@ export interface DispatcherDeps {
   tasks: TaskQueue;
   locks: LockStore | undefined; // the gate locks, beside a task queue without gatesByTask
   coordination: Coordination; // the validated policy: a gate lock lasts gateTtlMs
-  // The task queue's lease (timingOf(tasks).leaseMs): how long a gate lock is kept when the queue
-  // may or may not have stored the task (never longer than gateTtlMs).
-  leaseMs: number;
+  // The timing of a queue name (timingOf(tasks, queue)); throws when it is invalid. Its lease is
+  // how long a call's gate lock is kept when the queue may or may not have stored the task (never
+  // longer than gateTtlMs).
+  timingOf: (queue: string) => QueueTiming;
   name: string; // the Resizer's name: part of every identity, gate key and task
   logger: ResizeLogger;
 }
@@ -54,6 +58,9 @@ export interface ConfirmedEnqueueResult {
   unconfirmed: MissingPreview[];
   tasks: EnqueueReceipt[];
   issues: EnqueueIssue[];
+  // Set only when the timing of the request's queue is invalid: nothing was queued, and the caller
+  // reports this error as it reports a task queue that cannot be used.
+  timingError?: unknown;
 }
 
 /** Prewarm without a task queue (an eager-only Resizer): nothing is queued, and no retry helps. */
@@ -79,12 +86,18 @@ export function noQueueResult(
 /** What one dispatch did: the add result, or why nothing was added. */
 type DispatchOutcome =
   | TaskAddResult
+  | { status: 'not-served' } // the task queue does not serve the request's queue
+  | { status: 'timing-invalid'; error: unknown } // the request's queue has invalid timing
   | { status: 'add-failed'; error: unknown } // `add` threw
   | { status: 'gate-held' } // another request holds the gate lock
   | { status: 'gate-failed'; error: unknown } // the gate lock could not be acquired
   // `add` resolved something that is not a TaskAddResult; `stored`: its status still says
   // 'added' (e.g. with an empty task id), so the queue may hold the task.
   | { status: 'invalid'; stored: boolean };
+
+/** Why a call on `queue` queues nothing when the task queue does not serve that name. */
+const notServed = (queue: string): string =>
+  `cannot queue to '${queue}': its task queue does not serve that queue (an unknown queue name, or a queue on another backend; one Resizer cannot use two backends yet)`;
 
 const TASK_ADD_RESULT =
   "TaskAddResult ({ status: 'added', taskId } | { status: 'in-flight', taskId? } | { status: 'unconfirmed' })";
@@ -114,6 +127,10 @@ export class Dispatcher {
   // An `unconfirmed` add on the read path is logged once, then again only after an add was
   // confirmed: a queue that cannot store tasks (e.g. an outdated model) would log every read.
   #loggedUnconfirmed = false;
+  // The queue names a read found not served, or with invalid timing: each is logged once, since
+  // every later read on that name meets the same answer.
+  readonly #loggedNotServed = new Set<string>();
+  readonly #loggedTimingInvalid = new Set<string>();
 
   constructor(deps: DispatcherDeps) {
     this.#deps = deps;
@@ -123,7 +140,9 @@ export class Dispatcher {
    * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead): queue the missing
    * variants, one per identity, as one task. Returns the number of variants in the task it added;
    * 0 when nothing was added: a task of this media, pipeline and queue is in flight, its gate lock
-   * is held, or the add or the lock failed (logged). resolve() ignores the count. Never throws.
+   * is held, the add or the lock failed (logged), or the task queue does not serve the queue or
+   * its timing is invalid (logged once per queue name). resolve() ignores the count. Never throws,
+   * unless the task queue's own servesQueue throws.
    */
   async enqueue(req: DispatchRequest): Promise<number> {
     const { logger } = this.#deps;
@@ -138,6 +157,27 @@ export class Dispatcher {
     switch (outcome.status) {
       case 'added':
         return variants.length;
+      case 'not-served':
+        if (!this.#loggedNotServed.has(req.queue)) {
+          this.#loggedNotServed.add(req.queue);
+          logNeverThrow(
+            logger,
+            `resize enqueue: Resizer '${this.#deps.name}' ${notServed(req.queue)} — nothing is queued (logged once per queue name)`,
+            undefined,
+            'warn',
+          );
+        }
+        return 0;
+      case 'timing-invalid':
+        if (!this.#loggedTimingInvalid.has(req.queue)) {
+          this.#loggedTimingInvalid.add(req.queue);
+          logNeverThrow(
+            logger,
+            `resize enqueue: Resizer '${this.#deps.name}' cannot queue to '${req.queue}': its timing is invalid — nothing is queued (logged once per queue name)`,
+            outcome.error,
+          );
+        }
+        return 0;
       case 'unconfirmed':
         if (!this.#loggedUnconfirmed) {
           this.#loggedUnconfirmed = true;
@@ -215,6 +255,17 @@ export class Dispatcher {
           tasks: [{ taskId: outcome.taskId, previews: requested }],
           issues,
         };
+      case 'not-served':
+        return none('RESIZE_QUEUE_NOT_SERVED', notServed(req.queue), false);
+      case 'timing-invalid':
+        // No issue here: the caller reports the error as for a task queue that cannot be used.
+        return {
+          accepted: [],
+          unconfirmed: [...requested, ...conflicts],
+          tasks: [],
+          issues: [],
+          timingError: outcome.error,
+        };
       case 'in-flight':
         return this.#confirmActive(req, requested, conflicts, issues);
       case 'unconfirmed':
@@ -261,7 +312,9 @@ export class Dispatcher {
 
   /**
    * One dispatch of `variants` (canonical, one per identity) for the request's media, pipeline and
-   * queue.
+   * queue. First the queue name: one the task queue does not serve is `not-served`, and only then
+   * is its timing read, so a name that is not served never enters the timing cache; invalid timing
+   * is `timing-invalid`. Neither takes a lock or calls `add`.
    * On a queue with gatesByTask it is one `add`. Without it: acquire the gate lock with a fresh
    * owner for gateTtlMs, then `add` the task carrying that owner. The lock, by outcome:
    * - held by another request, or the acquire failed: this call never had it;
@@ -269,16 +322,26 @@ export class Dispatcher {
    *   claims the task), so no second task is queued;
    * - anything else (`unconfirmed`, a throw, an invalid result, an `in-flight` that such a queue
    *   never reports): the queue may still have stored the task (a lost response), so the lock is
-   *   shortened to one lease, not released, and never kept longer than an added task's
-   *   (min(leaseMs, gateTtlMs)). A stored task is claimed and its lock extended within that time;
-   *   otherwise the lock lapses and a later read queues the task.
-   * Never rejects.
+   *   shortened to one lease of the request's queue, not released, and never kept longer than an
+   *   added task's (min(leaseMs, gateTtlMs)). A stored task is claimed and its lock extended within
+   *   that time; otherwise the lock lapses and a later read queues the task.
+   * Never rejects, unless the task queue's own servesQueue throws.
    */
   async #dispatch(
     req: DispatchRequest,
     variants: MissingPreview[],
   ): Promise<DispatchOutcome> {
-    const { tasks, locks, coordination, leaseMs, name } = this.#deps;
+    const { tasks, locks, coordination, name } = this.#deps;
+    // Read as verify() and the worker read it: any answer but a truthy one is not served.
+    if (tasks.servesQueue && !tasks.servesQueue(req.queue)) {
+      return { status: 'not-served' };
+    }
+    let timing: QueueTiming;
+    try {
+      timing = this.#deps.timingOf(req.queue);
+    } catch (error) {
+      return { status: 'timing-invalid', error };
+    }
     const task: NewTask = {
       resizer: name,
       queue: req.queue,
@@ -333,7 +396,7 @@ export class Dispatcher {
         await locks.extend(
           key,
           owner,
-          Math.min(leaseMs, coordination.gateTtlMs),
+          Math.min(timing.leaseMs, coordination.gateTtlMs),
         );
       } catch (err) {
         logNeverThrow(
