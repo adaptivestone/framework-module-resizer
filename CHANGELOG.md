@@ -181,9 +181,10 @@
   `@adaptivestone/framework-module-resize/framework.js`. `new FrameworkResizer({ pipelines, hooks
   })` (a `Resizer` subclass) builds every part from the config file on first use: the image
   settings, `storage`, the task queue (the scaffolded `ResizeTask` model for the database queue),
-  `FrameworkMediaStore` (the app's media model), beside an SQS queue `FrameworkLockStore` (the
-  framework `Lock` model, which also stores each lock's owner; the two replace the pre-release
-  `FrameworkDatabase`), and the app logger and events. Options win over the config (`storage`,
+  `FrameworkMediaStore` (the app's media model), beside a task queue without `gatesByTask` (the
+  SQS driver, or a custom queue without the flag) `FrameworkLockStore` (the framework `Lock` model,
+  which also stores each lock's owner; the two replace the pre-release `FrameworkDatabase`), and
+  the app logger and events. Options win over the config (`storage`,
   `media`, `locks`, `tasks` — a `TaskQueue` or `false` —, `coordination`, `config`, `configName`,
   `logger`, `events`). The main entry no longer
   exports `ResizeWorker`, `ResizeTaskModel`, `runResizeWorker` or the `TResizeTask` type.
@@ -338,10 +339,10 @@
   `RESIZE_CONFIG_REMOVED_KEY`. Set `coordination` with `new Resizer({ coordination })`,
   `new FrameworkResizer({ coordination })` or a config file's `coordination` section
   (`defaultFrameworkResizeConfig` holds the defaults). Only the core validates it, when the Resizer
-  sets up its task queue: `RESIZE_CONFIG_COORDINATION_INVALID` (the message names the key) or
-  `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE` (`gateTtlMs` below the queue's `leaseMs`); either degrades
-  like a task queue that cannot be used, in a config file too. Each dead-letter gets the cooldown
-  of the task's own Resizer.
+  sets up its task queue: `RESIZE_CONFIG_COORDINATION_INVALID` (the message names the key, or the
+  value when the whole section is wrong) or `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE` (`gateTtlMs`
+  below the queue's `leaseMs`); either degrades like a task queue that cannot be used, in a config
+  file too. Each dead-letter gets the cooldown of the task's own Resizer.
 - `locks` is optional beside a task queue with `gatesByTask`. Only a queue without it
   (`SqsTaskQueue`, most custom queues) needs one, for one gate lock per Resizer, media and
   pipeline, `resize_gate:<resizer>:<mediaId>:<pipeline>`, whose random owner travels with the task
@@ -349,11 +350,13 @@
   when the task starts and on every heartbeat (to one lease), after a failed attempt (to the retry
   time plus one lease) and after a dead-letter (to `cooldownMs`), and releases it on completion.
   `mongoParts` still returns `locks`. `FrameworkResizer` builds `FrameworkLockStore` on first use,
-  and only beside an SQS queue, so a database-queue app needs no framework `Lock` model; reading
+  and only beside a task queue without `gatesByTask` (the SQS driver, or a custom queue without
+  the flag), so a database-queue app needs no framework `Lock` model; reading
   `resizer.locks` before `ready()` is `RESIZE_NOT_READY`, as for the other parts.
 - The worker filters claims by the Resizers it serves (see the worker above).
-- Task events and observers carry `attempts`: `LeasedTask.attempts` counts the task's deliveries,
-  this one included (1 on the first).
+- Task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
+  `onTaskDeadLettered`) receive the task with `attempts`: `LeasedTask.attempts` counts the task's
+  deliveries, this one included (1 on the first).
 - Codes: new `RESIZE_TASK_IN_FLIGHT`, `RESIZE_CONFIG_COORDINATION_INVALID` and
   `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`; `RESIZE_CONFIG_LOCK_EXCEEDS_LEASE` and the pre-release
   `RESIZE_CONFIG_QUEUE_LOCK_TTL_INVALID` are gone.
@@ -361,8 +364,12 @@
   finished or been drained. Task rows from before the gate have no `active` and are not gates, so
   during a rolling deploy a read can queue a second task for such a media. The next `add()` takes
   over a row that a worker from before the gate completed or dead-lettered (such a worker leaves
-  it active and sets no cooldown). Create the gate index before the new API and workers start,
-  and drop the `{ fileId, pipeline, requestKey }` index when convenient: new rows never enter it.
+  it active and sets no cooldown). Indexes, in this order: create the gate index
+  `{ resizer: 1, fileId: 1, pipeline: 1 }` (unique, partial on `active: true`) BEFORE the new API
+  and workers start (without it every `add()` stores a task, duplicate active rows build up, and
+  the unique index build then fails with E11000 until those tasks complete); create the claim
+  index `{ queue: 1, status: 1, availableAt: 1 }` before or together with the new workers; then
+  drop the `{ fileId, pipeline, requestKey }` index when convenient: new rows never enter it.
   On SQS an older worker ignores `gateOwner`, so the gate lock of a task it ran expires only after
   `gateTtlMs`. A host whose `queue.leaseMs` is above 600000 must set `coordination.gateTtlMs` to
   at least the lease, or its task queue degrades with `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`.
@@ -420,7 +427,8 @@
   `previews.identity`) and `MongoLockStore.verify()` the lock model (including `owner`);
   `FrameworkMediaStore` checks that `mediaModelName` names a registered model and
   `FrameworkLockStore` that the framework `Lock` model exists. A `FrameworkResizer` builds a lock
-  store only beside an SQS queue, so only such a Resizer needs the `Lock` model.
+  store only beside a task queue without `gatesByTask` (the SQS driver, or a custom queue without
+  the flag), so only such a Resizer needs the `Lock` model.
 - Worker shutdown gives the stopped task back. The variants in progress finish and are saved, and
   the task returns to the queue with no `onTaskFailed` / `onTaskDeadLettered` event and no
   backoff, through the new optional `TaskQueue.release(task)`; a `ResizeError` with
@@ -483,8 +491,8 @@
   regions (`cn-…`) use the `amazonaws.com.cn` domain in both URL forms.
 - `S3Storage` uploads `image/svg+xml` objects with `ContentDisposition: attachment`.
 - Filters with an own `__proto__` key (as `JSON.parse` creates) keep their own preview identity.
-- One read or pre-warm takes at most one lock (the gate lock, beside SQS) instead of a dispatch
-  lock per variant, one after another.
+- One read or pre-warm takes at most one lock (the gate lock, beside a task queue without
+  `gatesByTask`) instead of a dispatch lock per variant, one after another.
 - `package.json` points to the right repository (`adaptivestone/framework-module-resizer`).
 
 **Internal**

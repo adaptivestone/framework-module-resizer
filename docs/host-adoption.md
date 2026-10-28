@@ -35,13 +35,15 @@ the enclosing schema's options.
   `src/resizer.ts`, and move `storage` and `queue` into `src/config/resize.ts`
   (`queue: { driver: 'database' }` for background generation). Move
   `worker.concurrency` to the top-level `concurrency`.
-- Create the `ResizeTask` indexes through the host's migration. The gate index,
-  unique on `{ resizer: 1, fileId: 1, pipeline: 1 }` with
-  `partialFilterExpression: { active: true }`, keeps one active task per Resizer,
-  media and pipeline: create it before the new API and workers start. Create the
-  claim index `{ queue: 1, status: 1, availableAt: 1 }` before or together with
-  the new workers, then drop the old lease index (`{ status: 1, createdAt: 1 }`, or
-  `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). Drop the
+- Create the `ResizeTask` indexes through the host's migration, in this order.
+  Create the gate index `{ resizer: 1, fileId: 1, pipeline: 1 }` (unique, partial
+  on `active: true`), which keeps one active task per Resizer, media and pipeline,
+  BEFORE the new API and workers start: without it every `add()` stores a task,
+  duplicate active rows build up, and the unique index build then fails with
+  E11000 until those tasks complete. Create the claim index
+  `{ queue: 1, status: 1, availableAt: 1 }` before or together with the new
+  workers, then drop the old lease index (`{ status: 1, createdAt: 1 }`, or
+  `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build). Then drop the
   `{ fileId, pipeline, requestKey }` index when convenient: new rows never enter
   it. Backfilling `availableAt` is optional: rows without it still wait for the
   retry time or lease end stored in `leaseExpiresAt`.

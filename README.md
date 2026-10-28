@@ -71,9 +71,10 @@ export const resizer = new FrameworkResizer({ pipelines: { default: {} } });
 ```
 
 `FrameworkResizer` builds every part from the config file on first use: the image settings, the
-storage, the task queue, the media store (`FrameworkMediaStore`, over the app's media model),
-beside an SQS queue the lock store (`FrameworkLockStore`, the framework's `Lock` model; the
-database queue needs none), and the app logger and events. Import `src/resizer.ts` wherever you
+storage, the task queue, the media store (`FrameworkMediaStore`, over the app's media model), the
+lock store beside a task queue without `gatesByTask` (`FrameworkLockStore`, the framework's `Lock`
+model, for the SQS driver or a custom queue without the flag; the database queue needs none), and
+the app logger and events. Import `src/resizer.ts` wherever you
 need it; a normal static import is fine. To fail at boot on a bad config, call
 `await resizer.verify()` after `await server.init()`. Switch to S3 per environment in
 `resize.production.ts`:
@@ -182,7 +183,8 @@ serve it loads only the task queue, and it rejects the same way when that task q
 loaded, since it may be a shared one. Resizers built only in other processes cannot be checked:
 construct every Resizer in the worker process too. Each task runs with the Resizer named in it and
 that Resizer's [coordination](#coordination), so a dead-letter gets that Resizer's `cooldownMs`.
-Task events and observers receive the task with its `attempts` (its deliveries, this one included).
+The task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
+`onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included).
 `logger` receives the worker loop's own messages, failed gate lock calls included; a logger that
 throws never stops the loop. Framework hosts run `npm run cli ResizeWorker`, which serves the
 Resizers that `src/resizer.ts` constructs.
@@ -217,8 +219,9 @@ dead-lettering, the gate lock of a task queue without `gatesByTask`, and events)
 behaves the same; adapters only implement atomic operations. Drivers receive no `app` argument;
 each one uses its own clients. `FrameworkResizer` builds `FrameworkMediaStore` (the app's media
 model) and uses the scaffolded `ResizeTask` model as its database queue; it builds
-`FrameworkLockStore` (the framework's own `Lock` model) on first use, and only beside an SQS queue,
-so an app on the database queue needs no `Lock` model. Any part may also be a function (sync or
+`FrameworkLockStore` (the framework's own `Lock` model) on first use, and only beside a task queue
+without `gatesByTask` (the SQS driver, or a custom queue without the flag), so an app on the
+database queue needs no `Lock` model. Any part may also be a function (sync or
 async), called once on first use: `new Resizer({ storage: async () => …, media, locks, tasks })`.
 `await resizer.ready()` loads them; the Resizer's own methods and the worker do it for you. After
 loading, `ready()` validates the image config (a config given as a function is read here), then
@@ -513,11 +516,11 @@ file. Missing values take `defaultCoordination` from `…/config/resize.js` (the
 `CoordinationOptions`); an eager-only Resizer never reads it. Only the core validates it, when the
 Resizer sets up its task queue: a section that is not an object, or a value that is not a positive
 safe integer (ms), is `ResizeConfigError` `RESIZE_CONFIG_COORDINATION_INVALID` (the message names
-the key), and a `gateTtlMs` below the task queue's `leaseMs` is
-`RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`. Either degrades like a task queue that cannot be used (see
-`ready()` under [Drivers](#drivers)), in a config file too, so a host whose `leaseMs` is above
-`600000` must raise `gateTtlMs` with it. Each dead-letter gets the `cooldownMs` of the task's own
-Resizer.
+the key, or the value when the whole section is wrong), and a `gateTtlMs` below the task queue's
+`leaseMs` is `RESIZE_CONFIG_GATE_TTL_BELOW_LEASE`. Either degrades like a task queue that cannot
+be used (see `ready()` under [Drivers](#drivers)), in a config file too, so a host whose `leaseMs`
+is above `600000` must raise `gateTtlMs` with it. Each dead-letter gets the `cooldownMs` of the
+task's own Resizer.
 
 ## Operations
 
