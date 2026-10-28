@@ -546,6 +546,30 @@ describe('ports', () => {
     );
   });
 
+  test('verify() rejects a media store without replacePreviews', async () => {
+    let storeVerified = 0;
+    // A custom store written before replacePreviews existed.
+    const media = {
+      loadMedia: async () => null,
+      appendPreviews: async (_id: string, previews: unknown[]) => previews,
+      verify: () => {
+        storeVerified += 1;
+      },
+    } as unknown as MediaStore;
+    const r = new Resizer({ logger: silent, storage, media });
+    await r.ready();
+    await assert.rejects(
+      () => r.verify(),
+      (e: unknown) =>
+        e instanceof ResizeSetupError &&
+        e.code === 'RESIZE_MEDIA_REPLACE_MISSING' &&
+        e.message ===
+          'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
+    );
+    // Checked after the store's own verify().
+    assert.equal(storeVerified, 1);
+  });
+
   test('a task queue with gatesByTask needs no locks; one without is RESIZE_LOCKS_REQUIRED from verify()', async () => {
     const gating = new Resizer({
       logger: silent,

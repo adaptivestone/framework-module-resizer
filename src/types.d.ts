@@ -237,6 +237,12 @@ export interface GenerateResult {
   failed: number;
 }
 
+// Options for `invalidate`: which of this Resizer's stored previews of a media to remove.
+export interface InvalidateOpts {
+  media: MediaLike;
+  pipeline?: string; // only its rows; default: every pipeline of this Resizer
+}
+
 // ---------------------------------------------------------------------------
 // Config (the framework returns the fully resolved value from app.getConfig('resize'))
 //

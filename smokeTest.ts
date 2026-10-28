@@ -256,11 +256,13 @@ console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classe
 // installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
 const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
 import {
+  type InvalidateOpts,
   LockStore,
   MediaStore,
   type Preview,
   type QueueConfig,
   type ReplacedPreviews,
+  type StorageRef,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
@@ -376,9 +378,13 @@ const core = () =>
     media: plainMedia,
     locks,
   });
+// Removing a media's previews of one pipeline resolves with the storage refs for the host to delete.
+const invalidateOpts: InvalidateOpts = { media: { id: 'm1' }, pipeline: 'watermark' };
+const invalidated = (): Promise<StorageRef[]> => core().invalidate(invalidateOpts);
 void [
   media,
   core,
+  invalidated,
   FrameworkMediaStore,
   FrameworkLockStore,
   MongoMediaStore,

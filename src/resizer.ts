@@ -24,7 +24,7 @@ import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { PipelineRegistry } from './pipelines.ts';
-import { Processor } from './processor.ts';
+import { Processor, requireReplacePreviews } from './processor.ts';
 import { prewarmFailure, Reader } from './reader.ts';
 import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
@@ -33,6 +33,7 @@ import type {
   CoordinationOptions,
   GenerateOpts,
   GenerateResult,
+  InvalidateOpts,
   LazyPart,
   Original,
   PrewarmOpts,
@@ -42,6 +43,7 @@ import type {
   ResizeEventBus,
   ResizeLogger,
   ResolveOpts,
+  StorageRef,
   UploadOriginalOpts,
 } from './types.d.ts';
 import { Uploader } from './uploader.ts';
@@ -528,11 +530,11 @@ export class Resizer {
   /**
    * Optional startup check: load the drivers and resolve and validate the config (see ready());
    * check that a task queue can be used (a lock store beside one without gatesByTask, its timing
-   * and the coordination); run the media store's and the lock store's verify(); check the task
-   * queue (its own verify(), and that it serves this Resizer's queueName). Framework hosts call it
-   * after `Server.init()` to fail at boot instead of at the first upload or read; it is the one
-   * call that rejects for a task queue that cannot be used (the read path degrades instead). The
-   * worker runs it for every Resizer before leasing.
+   * and the coordination); run the media store's verify() and check it has replacePreviews; run
+   * the lock store's verify(); check the task queue (its own verify(), and that it serves this
+   * Resizer's queueName). Framework hosts call it after `Server.init()` to fail at boot instead of
+   * at the first upload or read; it is the one call that rejects for a task queue that cannot be
+   * used (the read path degrades instead). The worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
     // ready() resolves while the task queue cannot be used; verify() rejects with the reason.
@@ -541,6 +543,7 @@ export class Resizer {
       throw this.#queueFailure.error;
     }
     await this.media.verify?.();
+    requireReplacePreviews(this.media);
     await this.locks?.verify?.();
     if (this.tasks) {
       await this.tasks.verify?.();
@@ -616,6 +619,16 @@ export class Resizer {
    */
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
     return (await this.#services()).processor.generate(opts);
+  }
+
+  /**
+   * Remove this Resizer's stored previews of `media` (one pipeline, or all) and resolve with their
+   * storage refs, for the host to delete. It takes no gate: a task running for this media can
+   * still store rows after it returns, and a row stored between its read and its write with a new
+   * identity stays; the refs are exactly the rows the write removed.
+   */
+  async invalidate(opts: InvalidateOpts): Promise<StorageRef[]> {
+    return (await this.#services()).processor.invalidate(opts);
   }
 
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */

@@ -3,7 +3,8 @@
 //   - generate()    = the core for eager `resizer.generate`
 // The steps (download once → metadata guards → an SVG rendered once to a raster → beforeSteps
 // once, after an orientation normalize → decode once + bounded per-variant resize/encode/upload →
-// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers.
+// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers,
+// and invalidate() removes stored previews for `resizer.invalidate` (one media store write).
 // It takes no locks: the queue leases a task to one worker at a time, the lease token fences the
 // task's writes, and the media store keeps one row per preview identity when an expired lease lets
 // two workers render the same variant. It takes its parts explicitly and knows no Resizer. sharp
@@ -17,7 +18,7 @@ import sharp, {
 } from 'sharp';
 import type { Catalog } from './catalog.ts';
 import type { ObserverName } from './contracts/hooks.ts';
-import type { MediaStore } from './contracts/media.ts';
+import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
 import {
@@ -36,6 +37,7 @@ import type { HookBus } from './hooks.ts';
 import {
   calculateResizedDimensions,
   coverDimensions,
+  previewScope,
   requireMediaId,
 } from './images.ts';
 import type { PipelineRegistry } from './pipelines.ts';
@@ -43,6 +45,7 @@ import { encodeSignature, previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
   GenerateResult,
+  InvalidateOpts,
   MediaLike,
   MissingPreview,
   Preview,
@@ -50,6 +53,7 @@ import type {
   ResizeConfig,
   ResizeLogger,
   SizeInput,
+  StorageRef,
 } from './types.d.ts';
 
 /** Normalize a driver download / beforeStep result to a Node Buffer for the next sharp(). */
@@ -72,6 +76,28 @@ function requirePipeline(
       { code: 'RESIZE_PIPELINE_UNKNOWN' },
     );
   }
+}
+
+/**
+ * A media store written before replacePreviews existed cannot remove rows. invalidate() and the
+ * Resizer's verify() check it, with one message.
+ */
+export function requireReplacePreviews(media: MediaStore): void {
+  if (typeof media.replacePreviews !== 'function') {
+    throw new ResizeSetupError(
+      'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
+      { code: 'RESIZE_MEDIA_REPLACE_MISSING' },
+    );
+  }
+}
+
+/** A replacePreviews result the core can read: an object with the two lists of rows. */
+function isReplacedPreviews(result: unknown): result is ReplacedPreviews {
+  if (typeof result !== 'object' || result === null) {
+    return false;
+  }
+  const { stored, removed } = result as Partial<ReplacedPreviews>;
+  return Array.isArray(stored) && Array.isArray(removed);
 }
 
 /** A per-call argument names an unconfigured format: a wiring error at the call site. */
@@ -162,7 +188,7 @@ export interface ProcessorDeps {
 
 /**
  * Renders the previews of one Resizer: eagerly for a caller, or for one queued task. Also fires
- * the task observers.
+ * the task observers and removes stored previews.
  */
 export class Processor {
   readonly #deps: ProcessorDeps;
@@ -236,6 +262,59 @@ export class Processor {
     }
 
     return { created: generated, failed: failedCount };
+  }
+
+  /**
+   * Remove this Resizer's stored previews of a media, of one pipeline or of all, in one media store
+   * write, and resolve with the storage refs of the rows it removed. The rows are picked from the
+   * media as the store holds it, and only rows with a stored identity are removed: the store
+   * removes rows by it, and a row stored before rows carried one has none. The pipeline need not
+   * be registered, so the rows of a renamed pipeline can still be removed.
+   */
+  async invalidate(opts: InvalidateOpts): Promise<StorageRef[]> {
+    const { media: mediaStore, name } = this.#deps;
+    const mediaId = requireMediaId(opts.media);
+    const media = await mediaStore.loadMedia(mediaId);
+    if (!media) {
+      return [];
+    }
+    const identities = new Set<string>();
+    for (const row of media.previews ?? []) {
+      const scope = previewScope(row);
+      if (
+        typeof row.identity === 'string' &&
+        scope.resizer === name &&
+        (opts.pipeline === undefined || scope.pipeline === opts.pipeline)
+      ) {
+        identities.add(row.identity);
+      }
+    }
+    if (identities.size === 0) {
+      return [];
+    }
+    requireReplacePreviews(mediaStore);
+    const result: unknown = await mediaStore.replacePreviews(
+      mediaId,
+      [...identities],
+      [],
+    );
+    if (!isReplacedPreviews(result)) {
+      throw new ResizeSetupError(
+        "resize: the media store's replacePreviews resolved with something other than { stored, removed } — resolve with the rows it stored and removed ([] when none)",
+        { code: 'RESIZE_MEDIA_REPLACE_RESULT_INVALID' },
+      );
+    }
+    // Off the caller's in-memory doc too, so a same-request resolve() does not serve the rows.
+    const previews = opts.media.previews;
+    if (Array.isArray(previews)) {
+      for (let i = previews.length - 1; i >= 0; i -= 1) {
+        const identity = previews[i]?.identity;
+        if (typeof identity === 'string' && identities.has(identity)) {
+          previews.splice(i, 1);
+        }
+      }
+    }
+    return result.removed.map((row) => row.storageRef);
   }
 
   /**

@@ -69,7 +69,7 @@ export {
   resetResizerForTests,
 } from './resizer.ts';
 // --- data shapes and options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts,
-// CoordinationOptions, …) ---
+// InvalidateOpts, CoordinationOptions, …) ---
 export type * from './types.d.ts';
 // --- the framework-free worker (framework hosts run `runResizeWorker` from …/framework.js) ---
 export type { RunWorkerOptions } from './worker.ts';
