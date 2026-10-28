@@ -1656,3 +1656,57 @@ describe('pipelines are part of preview identity', () => {
     assert.equal(result.decision.missing.length, 1);
   });
 });
+
+describe('rows written before previews recorded their metadata', () => {
+  test('rows without bytes, createdAt, origin or encodeSig are served, and nothing is queued', async () => {
+    const tasks = new MemoryTaskQueue();
+    const reader = new Reader(
+      readerDeps(
+        new Dispatcher({
+          tasks,
+          locks: undefined, // a task queue that gates by task needs none
+          coordination: defaultCoordination,
+          timingOf: (queue) => timingOf(tasks, queue),
+          name: 'default',
+          logger: silent,
+        }),
+      ),
+    );
+    // One row with its identity, one from before rows carried an identity.
+    const media: MediaLike = {
+      id: 'm1',
+      original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+      previews: [
+        {
+          storageRef: { key: 'cover' },
+          identity: 'default:default:10x10:webp:none',
+          resizer: 'default',
+          pipeline: 'default',
+          sizeKey: '10x10',
+          requestedWidth: 10,
+          requestedHeight: 10,
+          actualWidth: 10,
+          actualHeight: 10,
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+        {
+          storageRef: { key: 'fit' },
+          sizeKey: 'fit',
+          format: 'webp',
+          contentType: 'image/webp',
+          fit: true,
+        },
+      ],
+    };
+    const sizes = [{ width: 10, height: 10 }, { fit: true }];
+    const { decision } = await reader.resolve({ media, sizes });
+    assert.deepEqual(
+      decision.ready.map((e) => e.url),
+      ['https://cdn/cover', 'https://cdn/fit'],
+    );
+    assert.deepEqual(decision.missing, []);
+    assert.equal((await reader.prewarm({ media, sizes })).status, 'ready');
+    assert.deepEqual(tasks.added, []);
+  });
+});

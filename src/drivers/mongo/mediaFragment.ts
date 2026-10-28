@@ -6,14 +6,14 @@
 //
 // PLAIN POJO — NO imports at all (especially NO `mongoose` and NO
 // `@adaptivestone/framework`, keeping 01 · §15/§16): only global constructors
-// (String/Number/Boolean) and the 'Mixed' string alias. Where Mongoose infers loosely
+// (String/Number/Boolean/Date) and the 'Mixed' string alias. Where Mongoose infers loosely
 // (Mixed / subdoc arrays) the HOST layers the framework's TsTypeOverride<Original> /
 // TsTypeOverride<Preview[]> for exact field types — see the usage note below.
 //
 // Opt-in, scaffolded as a commented example: hosts may have a media model of their own.
 //
-// Usage (exactly as spec/08 §12):
-//   import { resizeMediaSchemaFragment } from '@adaptivestone/framework-module-resize';
+// Usage in a framework host (without the framework, import it from …/drivers/mongo.js):
+//   import { resizeMediaSchemaFragment } from '@adaptivestone/framework-module-resize/framework.js';
 //   class File extends BaseModel {
 //     static get modelSchema() {
 //       return { ...existingFields, ...resizeMediaSchemaFragment } as const;
@@ -54,6 +54,13 @@ export const resizeMediaSchemaFragment = {
       format: { type: String },
       contentType: { type: String },
       fit: { type: Boolean },
+      // The encoded preview's size and when it was stored.
+      bytes: { type: Number },
+      createdAt: { type: Date },
+      // Signatures of the original and the encode settings the preview was made from, so a
+      // preview that no longer matches them can be told apart. Strict mode would strip them.
+      origin: { type: String },
+      encodeSig: { type: String },
     },
   ],
 } as const;

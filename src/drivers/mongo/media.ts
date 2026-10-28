@@ -37,6 +37,16 @@ interface SchemaLike {
   options: { strict?: unknown };
 }
 
+// The preview row paths verify() requires, each with what is lost when Mongoose strips it.
+const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
+  ['identity', 'a preview rendered twice would be stored twice'],
+  ['origin', 'a preview would not record the original it was made from'],
+  [
+    'encodeSig',
+    'a preview would not record the encode settings it was made with',
+  ],
+];
+
 export class MongoMediaStore extends MediaStore {
   readonly #model: () => MongoMediaModel;
 
@@ -56,10 +66,12 @@ export class MongoMediaStore extends MediaStore {
   }
 
   /**
-   * Startup check: the media model must resolve, and its preview rows must keep `identity`. Only
-   * rows declared as sub-documents with a strict shape lose it (Mongoose strict mode strips an
-   * undeclared field from every row, and every worker that renders a variant would then add its
-   * own row); a mixed or plain array, or rows with `strict: false`, keep any field.
+   * Startup check: the media model must resolve, and its preview rows must keep `identity`,
+   * `origin` and `encodeSig`. Only rows declared as sub-documents with a strict shape lose them
+   * (Mongoose strict mode strips an undeclared field from every row: without `identity` every
+   * worker that renders a variant would add its own row, and without the signatures no row could
+   * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
+   * field. `bytes` and `createdAt` are informational and not checked.
    */
   verify(): void {
     const model = this.mediaModel();
@@ -71,13 +83,19 @@ export class MongoMediaStore extends MediaStore {
       | { instance?: string; schema?: Partial<SchemaLike> }
       | undefined;
     const rows = previews?.instance === 'Array' ? previews.schema : undefined;
-    if (
-      typeof rows?.path === 'function' &&
-      rows.options?.strict !== false &&
-      !rows.path('identity')
-    ) {
+    if (typeof rows?.path !== 'function' || rows.options?.strict === false) {
+      return;
+    }
+    const missing = REQUIRED_ROW_PATHS.filter(([path]) => !rows.path?.(path));
+    if (missing.length > 0) {
+      const fields = missing.map(([path]) => `previews.${path}`);
+      const named =
+        fields.length > 1
+          ? `${fields.slice(0, -1).join(', ')} and ${fields.at(-1)} fields`
+          : `${fields[0]} field`;
+      const lost = missing.map(([, why]) => why).join('; ');
       throw new ResizeSetupError(
-        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no previews.identity field, so Mongoose would drop it and a preview rendered twice would be stored twice — spread the current resizeMediaSchemaFragment into the media model's schema`,
+        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no ${named}, so Mongoose would drop ${missing.length > 1 ? 'them' : 'it'} and ${lost} — spread the current resizeMediaSchemaFragment into the media model's schema`,
         { code: 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' },
       );
     }

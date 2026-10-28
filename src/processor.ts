@@ -39,6 +39,7 @@ import {
   requireMediaId,
 } from './images.ts';
 import type { PipelineRegistry } from './pipelines.ts';
+import { encodeSignature, previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
   GenerateResult,
@@ -433,6 +434,16 @@ export class Processor {
       config.limits.inputPixels,
     );
 
+    // The dimensions the media holds: the stored pair, or, when the original never recorded it,
+    // the measured display size (which the persist below backfills). Every row's origin is signed
+    // with them, persisted or not, so the rows of one original always share one origin.
+    const storedDims =
+      original.width !== undefined && original.height !== undefined
+        ? { width: original.width, height: original.height }
+        : undefined;
+    const mediaDims = storedDims ?? { width: dispW, height: dispH };
+    const origin = previewOrigin(original.storageRef, mediaDims);
+
     const pipeline = pipelines.get(pipelineName);
     // A preview keeps the animation only in an animated format and only without variantSteps: a
     // step sees every frame stacked into one tall image, so a composited watermark would land on
@@ -747,6 +758,14 @@ export class Processor {
           // One frame: an animated output reports the height of all frames stacked.
           actualWidth: info.width,
           actualHeight: info.pageHeight ?? info.height,
+          bytes: data.length,
+          createdAt: new Date(),
+          origin,
+          encodeSig: encodeSignature(config, {
+            format: v.format,
+            fit: v.fit === true,
+            version: pipeline.version,
+          }),
         };
         if (v.filters) {
           preview.filters = v.filters;
@@ -779,10 +798,7 @@ export class Processor {
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
     // never carried dims), then fire onPreviewGenerated per pushed preview (ctx {}).
     if (persist && generated.length > 0) {
-      const backfillDims =
-        original.width === undefined || original.height === undefined
-          ? { width: dispW, height: dispH }
-          : undefined;
+      const backfillDims = storedDims === undefined ? mediaDims : undefined;
       // What the media store holds now, read once after a failed or partial write: the identities
       // stored on the media, null when the media is gone, undefined when the reload failed too.
       const recordedIdentities = async (): Promise<

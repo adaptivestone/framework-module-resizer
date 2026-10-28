@@ -1,11 +1,13 @@
 // MongoMediaStore against a real MongoDB: one stored preview row per preview identity, however
-// many workers render it, the startup check for a media model without that field, and the
-// `model` / `getModel` options.
+// many workers render it, the preview metadata a row records, the startup check for a media model
+// without those fields, and the `model` / `getModel` options.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeSetupError } from '../../errors.ts';
+import { encodeSignature, previewOrigin } from '../../signatures.ts';
+import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
 import type { Preview } from '../../types.d.ts';
 import { MongoMediaStore, type MongoMediaStoreOptions } from './index.ts';
 import { resizeMediaSchemaFragment } from './mediaFragment.ts';
@@ -343,6 +345,132 @@ describe('MongoMediaStore.verify(): the media model must store preview identitie
       findOneAndUpdate: async () => null,
     };
     assert.doesNotThrow(() => new MongoMediaStore({ model: shaped }).verify());
+  });
+});
+
+describe('MongoMediaStore: the preview metadata', () => {
+  test('the fragment stores the four fields; createdAt comes back as a Date', async () => {
+    const store = mediaStore();
+    const mediaId = await newMedia();
+    const createdAt = new Date('2026-10-28T12:34:56.789Z');
+    const row: Preview = {
+      ...preview(ID_A, 'with-metadata'),
+      bytes: 1234,
+      createdAt,
+      origin: '8c64760b02a9f12a',
+      encodeSig: 'a1505869c88e3331',
+    };
+    assert.deepEqual(await store.appendPreviews(mediaId, [row]), [row]);
+
+    const loaded = await store.loadMedia(mediaId);
+    const stored = loaded?.previews?.[0];
+    assert.equal(stored?.bytes, 1234);
+    assert.ok(stored?.createdAt instanceof Date);
+    assert.equal(stored.createdAt.getTime(), createdAt.getTime());
+    assert.equal(stored.origin, '8c64760b02a9f12a');
+    assert.equal(stored.encodeSig, 'a1505869c88e3331');
+    const lean = await storedPreviews(mediaId);
+    assert.ok(lean[0].createdAt instanceof Date);
+  });
+
+  test("origin recomputed from a loaded media equals the stored row's", async () => {
+    const store = mediaStore();
+    const storageRef = { key: 'originals/x.jpg', meta: {} };
+    const doc = await Media().create({
+      original: { storageRef, format: 'jpeg', width: 4000, height: 3000 },
+      previews: [],
+    });
+    const mediaId = String(doc._id);
+    const origin = previewOrigin(storageRef, { width: 4000, height: 3000 });
+    const row: Preview = {
+      ...preview(ID_A, 'recomputed'),
+      origin,
+      encodeSig: encodeSignature(makeImageConfig(), {
+        format: 'webp',
+        fit: false,
+      }),
+    };
+    await store.appendPreviews(mediaId, [row]);
+
+    const loaded = await store.loadMedia(mediaId);
+    const original = loaded?.original;
+    assert.ok(original);
+    // minimize: false keeps the empty object, so the ref signs the same after a round trip.
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(original.storageRef)),
+      storageRef,
+    );
+    assert.equal(
+      previewOrigin(original.storageRef, {
+        width: original.width as number,
+        height: original.height as number,
+      }),
+      loaded?.previews?.[0]?.origin,
+    );
+  });
+
+  test('strict preview rows without origin or encodeSig are RESIZE_MONGO_MEDIA_MODEL_OUTDATED naming them', () => {
+    const {
+      origin: _origin,
+      encodeSig: _encodeSig,
+      ...rowFields
+    } = resizeMediaSchemaFragment.previews[0];
+    const store = new MongoMediaStore({
+      model: mediaModelWith('NoSignatureMedia', [rowFields]),
+    });
+    assert.throws(
+      () => store.verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes("'NoSignatureMedia'") &&
+        err.message.includes('previews.origin') &&
+        err.message.includes('previews.encodeSig') &&
+        !err.message.includes('previews.identity') &&
+        err.message.includes('resizeMediaSchemaFragment'),
+    );
+
+    const { encodeSig: _sig, ...withoutSig } =
+      resizeMediaSchemaFragment.previews[0];
+    assert.throws(
+      () =>
+        new MongoMediaStore({
+          model: mediaModelWith('NoEncodeSigMedia', [withoutSig]),
+        }).verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes('previews.encodeSig') &&
+        !err.message.includes('previews.origin'),
+    );
+
+    // Every missing path is named in one message.
+    assert.throws(
+      () =>
+        new MongoMediaStore({
+          model: mediaModelWith('BareRowsMedia', [
+            new mongoose.Schema({ sizeKey: String }),
+          ]),
+        }).verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes('previews.identity') &&
+        err.message.includes('previews.origin') &&
+        err.message.includes('previews.encodeSig'),
+    );
+
+    // bytes and createdAt are not checked.
+    const {
+      bytes: _bytes,
+      createdAt: _createdAt,
+      ...withoutSizeAndTime
+    } = resizeMediaSchemaFragment.previews[0];
+    assert.doesNotThrow(() =>
+      new MongoMediaStore({
+        model: mediaModelWith('NoBytesMedia', [withoutSizeAndTime]),
+      }).verify(),
+    );
   });
 });
 

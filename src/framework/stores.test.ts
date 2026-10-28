@@ -214,8 +214,28 @@ describe('FrameworkMediaStore.verify: the media schema', () => {
     );
   });
 
-  test('a media model with previews.identity, or without a schema, passes', () => {
+  test('a media model with strict rows without origin or encodeSig is a setup error naming them', () => {
     installApp(withRows('File', { identity: { type: String } }));
+    assert.throws(
+      () => mediaStore.verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes("'File'") &&
+        err.message.includes('previews.origin') &&
+        err.message.includes('previews.encodeSig') &&
+        !err.message.includes('previews.identity'),
+    );
+  });
+
+  test('a media model with previews.identity, origin and encodeSig, or without a schema, passes', () => {
+    installApp(
+      withRows('File', {
+        identity: { type: String },
+        origin: { type: String },
+        encodeSig: { type: String },
+      }),
+    );
     assert.doesNotThrow(() => mediaStore.verify());
     resetAppInstance();
     installApp({ findById: async () => null });
