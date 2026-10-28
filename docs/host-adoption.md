@@ -27,7 +27,7 @@ survive persistence. Framework `BaseModel` already supplies this default; direct
 Mongoose schemas must set it explicitly. The field fragment alone cannot configure
 the enclosing schema's options.
 
-## Other changes a host must make for this version
+## Other changes a host must make for 0.3.0
 
 `CHANGELOG.md` (`# 0.3.0`) has the details.
 
@@ -109,7 +109,7 @@ the enclosing schema's options.
   been drained. Task rows from before the gate have no `active` field and are not
   gates, so during a rolling deploy a read can queue a second task for such a media.
   The next `add()` takes over a row that a worker from before the gate completed or
-  dead-lettered. There are no dispatch or worker locks any more: the only lock is the
+  dead-lettered (such a worker leaves it active and sets no cooldown). There are no dispatch or worker locks any more: the only lock is the
   gate lock of a task queue without `gatesByTask` (SQS), which lasts
   `coordination.gateTtlMs` until a worker extends it. An older SQS worker ignores
   the lock's owner, so the gate lock of a task it ran expires only after
