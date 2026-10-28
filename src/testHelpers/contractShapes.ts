@@ -1,6 +1,7 @@
 // Compiled by `npm run types:check` (tsconfig.test-helpers.json), never run. It pins the promise
 // that each driver contract is an abstract class, yet a plain object of the same shape still
 // type-checks as that contract. A contract change that breaks plain objects fails CI here.
+import type { SourceDecoder } from '../contracts/decoder.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
@@ -95,4 +96,18 @@ export const falseGate: TaskQueue = {
   renew: async () => true,
   complete: async () => true,
   fail: async () => true,
+};
+
+export const decoder: SourceDecoder = {
+  formats: ['pdf'],
+  inspect: async () => ({
+    format: 'pdf',
+    contentType: 'application/pdf',
+    width: 1,
+    height: 1,
+  }),
+  render: async () => ({
+    data: Buffer.alloc(3),
+    info: { width: 1, height: 1, channels: 3 },
+  }),
 };

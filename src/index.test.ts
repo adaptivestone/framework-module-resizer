@@ -30,6 +30,7 @@ const EXPECTED_VALUE_EXPORTS = [
   'MediaStore',
   'ResizeStorage',
   'parseSizeKey',
+  'SourceDecoder',
   'resetResizerForTests',
   'runWorker',
   'TaskQueue',
@@ -69,6 +70,7 @@ describe('public API surface (src/index.ts)', () => {
       'MediaStore',
       'LockStore',
       'TaskQueue',
+      'SourceDecoder',
     ]) {
       const v = asRecord[name];
       assert.equal(typeof v, 'function', `${name} should be a class/function`);

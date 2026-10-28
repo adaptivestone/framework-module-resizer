@@ -3,6 +3,7 @@
 //   reachable from src/index.ts and fail if it reaches the framework, the framework adapter, the
 //   ResizeTask model or the CLI command;
 // - drivers import only contracts, errors, helpers, types and other drivers, never core code;
+// - decoders likewise import only contracts, errors, helpers, types and other decoders;
 // - helpers and contracts are leaves: they import only each other, errors and types;
 // - resizer.ts is the composition root: only the entry points (index.ts, worker.ts) and the
 //   framework adapter import it, and nothing it reaches imports it back, not even as a type;
@@ -121,6 +122,26 @@ test('drivers import only contracts, errors, helpers, types and other drivers', 
     'sanity check: the listing does see the drivers',
   );
   const offending = drivers.flatMap((f) =>
+    localImports(f, { types: true })
+      .filter((t) => !allowed(t))
+      .map((t) => `${f} → ${t}`),
+  );
+  assert.deepEqual(offending, []);
+});
+
+test('decoders import only contracts, errors, helpers, types and other decoders', () => {
+  const allowed = (t: string) =>
+    t.startsWith('contracts/') ||
+    t === 'errors.ts' ||
+    t.startsWith('helpers/') ||
+    t === 'types.d.ts' ||
+    t.startsWith('decoders/');
+  const decoders = sourceFiles().filter((f) => f.startsWith('decoders/'));
+  assert.ok(
+    decoders.includes('decoders/sharp.ts'),
+    'sanity check: the listing does see the decoders',
+  );
+  const offending = decoders.flatMap((f) =>
     localImports(f, { types: true })
       .filter((t) => !allowed(t))
       .map((t) => `${f} → ${t}`),

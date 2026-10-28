@@ -56,6 +56,7 @@ const expected = [
   'LockStore',
   'MediaStore',
   'ResizeStorage',
+  'SourceDecoder',
   'TaskQueue',
   'resetResizerForTests',
   'runWorker',
