@@ -751,6 +751,32 @@ describe('MongoTaskQueue setup', () => {
     }
   });
 
+  test('verify rejects with RESIZE_MONGO_NOT_CONNECTED when the connection fails to open, naming the driver error', async () => {
+    // Nothing listens on port 1; the driver gives up after its server selection timeout.
+    const failing = mongoose.createConnection('mongodb://127.0.0.1:1/resize', {
+      serverSelectionTimeoutMS: 200,
+    });
+    const started = Date.now();
+    try {
+      await assert.rejects(
+        new MongoTaskQueue({
+          model: failing.model('ResizeTask', declaredSchema(false)),
+        }).verify(),
+        (error: unknown) =>
+          error instanceof ResizeSetupError &&
+          error.code === 'RESIZE_MONGO_NOT_CONNECTED' &&
+          /failed to open \(MongooseServerSelectionError: /.test(
+            error.message,
+          ) &&
+          !/readyState/.test(error.message) &&
+          error.cause !== undefined,
+      );
+      assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    } finally {
+      await failing.close().catch(() => {});
+    }
+  });
+
   test('verify rejects at once with RESIZE_MONGO_NOT_CONNECTED on a connection that is not open', async () => {
     const notConnected = (error: unknown) =>
       error instanceof ResizeSetupError &&

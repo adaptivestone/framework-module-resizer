@@ -40,7 +40,8 @@ the enclosing schema's options.
   partial on `active: true`), which keeps one active task per Resizer, media,
   pipeline and queue, BEFORE the new API and workers start: `resizer.verify()` and
   worker start reject with `RESIZE_MONGO_INDEX_MISSING` until it exists (with
-  Mongoose's `autoIndex` on, `verify()` first waits for that build), and
+  Mongoose's `autoIndex` on, `verify()` first waits for that build; it needs an
+  open or opening connection, else `RESIZE_MONGO_NOT_CONNECTED`), and
   without it every `add()` stores a task, duplicate active rows build up, and the
   unique index build then fails with E11000 until those rows are no longer active
   (completed, or dead and taken over or expired). Create the claim index

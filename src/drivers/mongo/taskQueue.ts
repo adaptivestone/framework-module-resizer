@@ -584,34 +584,54 @@ async function checkGateIndex(model: TaskModel): Promise<void> {
 
 /**
  * Resolve once the model's connection is open: at once when it is, after the initial connection
- * when it is opening. A connection that is closed (never opened, or disconnected), or whose opening
- * fails, rejects with RESIZE_MONGO_NOT_CONNECTED instead of a database call that would wait for
- * Mongoose's buffer timeout. A model without a Mongoose connection is not checked.
+ * when it is opening. A connection that is closed (never opened, or disconnected) rejects at once
+ * with RESIZE_MONGO_NOT_CONNECTED, instead of a database call that would wait for Mongoose's
+ * buffer timeout; one whose opening fails rejects with it when the driver gives up (its
+ * `serverSelectionTimeoutMS`), naming the driver's error. A model without a Mongoose connection is
+ * not checked.
  */
 async function waitForConnection(
   connection: ConnectionLike | undefined,
   collection: string,
 ): Promise<void> {
-  const state = connection?.readyState;
-  if (typeof state !== 'number' || state === CONNECTED) {
+  if (
+    typeof connection?.readyState !== 'number' ||
+    connection.readyState === CONNECTED
+  ) {
     return;
   }
-  const notConnected = (cause?: unknown) =>
-    new ResizeSetupError(
-      `resize: the connection of the ResizeTask collection '${collection}' is not open (Mongoose readyState ${state}); call verify() after the connection has opened (after Server.init() in a framework host)`,
-      { code: 'RESIZE_MONGO_NOT_CONNECTED', cause },
-    );
-  if (state === CONNECTING && typeof connection?.asPromise === 'function') {
+  const hint =
+    'call verify() after the connection has opened (after Server.init() in a framework host)';
+  if (
+    connection.readyState === CONNECTING &&
+    typeof connection.asPromise === 'function'
+  ) {
     try {
       await connection.asPromise();
     } catch (err) {
-      throw notConnected(err);
+      throw new ResizeSetupError(
+        `resize: the connection of the ResizeTask collection '${collection}' failed to open (${describeError(err)}); ${hint}`,
+        { code: 'RESIZE_MONGO_NOT_CONNECTED', cause: err },
+      );
     }
-    if (connection.readyState === CONNECTED) {
+    // Read again: the state has changed while the opening was awaited.
+    if ((connection.readyState as unknown) === CONNECTED) {
       return;
     }
   }
-  throw notConnected();
+  throw new ResizeSetupError(
+    `resize: the connection of the ResizeTask collection '${collection}' is not open (Mongoose readyState ${String(connection.readyState)}); ${hint}`,
+    { code: 'RESIZE_MONGO_NOT_CONNECTED' },
+  );
+}
+
+/** `name: message` of an error, for a message that names it; anything else as a string. */
+function describeError(err: unknown): string {
+  if (typeof err === 'object' && err !== null && 'message' in err) {
+    const { name, message } = err as { name?: unknown; message?: unknown };
+    return `${typeof name === 'string' ? name : 'Error'}: ${String(message)}`;
+  }
+  return String(err);
 }
 
 // A duplicate key on the gate index: another task is in flight. A duplicate key on any other
