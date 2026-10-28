@@ -206,8 +206,8 @@ export abstract class TaskQueue {
   }): Promise<EnqueueReceipt[]>;
 
   /**
-   * Optional: whether the queue name `queue` can be used here. A task queue without a list of
-   * names serves every name, and so does one without this method.
+   * Optional: whether the queue name `queue` can be used here. Omit it to serve every name;
+   * return false for a name this queue cannot carry.
    */
   servesQueue?(queue: string): boolean;
 

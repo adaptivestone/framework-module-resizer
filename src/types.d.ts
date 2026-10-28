@@ -147,6 +147,7 @@ export interface EnqueueIssue {
     | 'RESIZE_TASK_IN_FLIGHT' // a task of this media, pipeline and queue is active or cooling down
     | 'RESIZE_PIPELINE_UNKNOWN' // the pipeline is not registered on this Resizer
     | 'RESIZE_FORMAT_NOT_CONFIGURED' // a requested format has no encode.formats entry
+    | 'RESIZE_QUEUE_NOT_SERVED' // the task queue does not serve the call's queue name
     | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)
   message: string;
   retryable: boolean;
@@ -198,7 +199,7 @@ export interface ResolveOpts {
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // threaded to the read-path hooks
   enqueueMissing?: boolean; // default true when a task queue is set, false otherwise
-  queue?: string; // queue for missing variants; default resizer.queue
+  queue?: string; // queue for missing variants; default resizer.queueName
 }
 
 export interface PrewarmOpts {
@@ -207,7 +208,7 @@ export interface PrewarmOpts {
   pipeline?: string; // selects a registered pipeline; default 'default'
   formats?: PreviewFormat[]; // default = config.formats
   ctx?: Record<string, unknown>; // reaches the read-path waterfalls only (worker ctx stays {})
-  queue?: string; // queue for missing variants; default resizer.queue
+  queue?: string; // queue for missing variants; default resizer.queueName
 }
 
 // Options for eager `generate`.

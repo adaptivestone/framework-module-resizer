@@ -114,7 +114,7 @@ export class SqsTaskQueue extends TaskQueue {
   #urlOf(queue: string): string | undefined {
     const queues = this.#opts.queues ?? {};
     const named = Object.hasOwn(queues, queue) ? queues[queue] : undefined;
-    return queue === 'default' ? (this.#opts.queueUrl ?? named) : named;
+    return queue === 'default' ? this.#opts.queueUrl || named : named;
   }
 
   // The URL for a named queue. An unknown name is a wiring error, reported before any send or

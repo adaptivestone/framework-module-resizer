@@ -774,7 +774,7 @@ test('two Resizers on two names of one task queue: each lane is claimed by its o
   const a = queuedResizer('a', tasks);
   const b = new Resizer({
     name: 'b',
-    queue: 'bulk',
+    queueName: 'bulk',
     config: makeImageConfig({ formats: ['webp'] }),
     logger: silent,
     storage: {

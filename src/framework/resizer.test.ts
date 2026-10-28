@@ -628,19 +628,21 @@ test('verify() fails at boot when the ResizeTask model is not registered', async
   );
 });
 
-test('verify() fails when the task queue does not serve the Resizer queue', async () => {
+test('verify() fails when the task queue does not serve the Resizer queueName', async () => {
   installApp();
   const tasks = new MemoryTaskQueue();
   Object.assign(tasks, { servesQueue: (queue: string) => queue === 'default' });
   const r = new FrameworkResizer({
     storage,
-    queue: 'bulk',
+    queueName: 'bulk',
     tasks,
   });
   await assert.rejects(
     () => r.verify(),
     (err: unknown) =>
-      err instanceof ResizeSetupError && err.code === 'RESIZE_QUEUE_NOT_SERVED',
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_QUEUE_NOT_SERVED' &&
+      /'bulk' \(its `queueName`\)/.test(err.message),
   );
 });
 

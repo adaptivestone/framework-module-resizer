@@ -57,8 +57,10 @@ export interface FrameworkResizerOptions
     | 'coordination'
     | 'logger'
     | 'events'
+    | 'queueName'
   > {
   configName?: string; // the config file this Resizer reads; default 'resize'
+  queueName?: string; // the queue name of this Resizer's tasks; default 'default'
   config?: FrameworkResizeConfig; // an explicit config instead of reading `configName`
   storage?: ResizeStorage; // default: built from the config's `storage`
   media?: MediaStore; // default: FrameworkMediaStore over the config's `mediaModelName`

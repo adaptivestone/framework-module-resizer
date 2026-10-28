@@ -1214,6 +1214,15 @@ describe('SqsTaskQueue options', () => {
         err instanceof ResizeSetupError &&
         err.code === 'RESIZE_SQS_QUEUE_UNKNOWN',
     );
+    // An empty queueUrl beside queues.default: that entry serves 'default'.
+    assert.equal(
+      new SqsTaskQueue({
+        queueUrl: '',
+        queues: { default: DEFAULT_URL },
+        client,
+      }).servesQueue('default'),
+      true,
+    );
     // queueUrl, when set, is the default queue's URL.
     const both = new SqsTaskQueue({
       queueUrl: 'https://q/url',

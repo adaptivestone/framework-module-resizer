@@ -147,7 +147,7 @@ interface Row {
 export interface RowQueueOptions {
   /** The timing of every queue name. */
   timing?: Partial<QueueTimingOptions>;
-  /** Per queue name, over `timing`. */
+  /** Per queue name; when it gives none, `timing` applies. */
   queueTiming?: Record<string, Partial<QueueTimingOptions>>;
   /** The queue names served; default: every name. */
   queues?: readonly string[];
