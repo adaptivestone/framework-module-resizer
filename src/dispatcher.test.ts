@@ -400,6 +400,21 @@ describe('a task queue without gatesByTask', () => {
     }
   });
 
+  test('the one-lease hold never exceeds gateTtlMs (a lease longer than the gate lock)', async () => {
+    const now = 5_000;
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'unconfirmed' });
+    const locks = clockLocks(() => now);
+    const d = makeDispatcher({
+      tasks,
+      locks,
+      leaseMs: 60_000,
+      coordination: { gateTtlMs: 10_000, cooldownMs: 1_000 },
+    });
+    assert.equal(await d.enqueue(requestFor([v300])), 0);
+    assert.equal(locks.entry(GATE)?.expiresAt, now + 10_000);
+  });
+
   test('a rejecting extend after an unconfirmed add is logged; the lock stays as acquired', async () => {
     const now = 5_000;
     const tasks = new PlainTaskQueue();

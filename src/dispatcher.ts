@@ -7,7 +7,7 @@
 // held. Beside a queue without it (SQS), the Dispatcher takes the gate lock with a fresh owner for
 // coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the worker then holds
 // that lock until the task ends. When the queue does not say it stored the task, the lock is
-// shortened to one lease (see #dispatch). The read path never throws and counts only an added
+// shortened to one lease, or gateTtlMs when that is shorter (see #dispatch). The read path never throws and counts only an added
 // task; prewarm accepts only what the new task, or the active one, holds. A Dispatcher needs only
 // the task queue, the lock store (beside a queue without gatesByTask), the coordination, the
 // queue's lease, its Resizer's name and a logger.
@@ -35,7 +35,7 @@ export interface DispatcherDeps {
   locks: LockStore | undefined; // the gate locks, beside a task queue without gatesByTask
   coordination: Coordination; // the validated policy: a gate lock lasts gateTtlMs
   // The task queue's lease (timingOf(tasks).leaseMs): how long a gate lock is kept when the queue
-  // may or may not have stored the task.
+  // may or may not have stored the task (never longer than gateTtlMs).
   leaseMs: number;
   name: string; // the Resizer's name: part of every identity, gate key and task
   logger: ResizeLogger;
@@ -262,8 +262,9 @@ export class Dispatcher {
    *   claims the task), so no second task is queued;
    * - anything else (`unconfirmed`, a throw, an invalid result, an `in-flight` that such a queue
    *   never reports): the queue may still have stored the task (a lost response), so the lock is
-   *   shortened to one lease, not released. A stored task is claimed and its lock extended within
-   *   that lease; otherwise the lock lapses and a later read queues the task.
+   *   shortened to one lease, not released, and never kept longer than an added task's
+   *   (min(leaseMs, gateTtlMs)). A stored task is claimed and its lock extended within that time;
+   *   otherwise the lock lapses and a later read queues the task.
    * Never rejects.
    */
   async #dispatch(
@@ -322,9 +323,14 @@ export class Dispatcher {
       // Maybe stored: keep the gate for one lease instead of opening it (see above). `false` (the
       // lock is gone) changes nothing.
       try {
-        await locks.extend(key, owner, leaseMs);
+        await locks.extend(
+          key,
+          owner,
+          Math.min(leaseMs, coordination.gateTtlMs),
+        );
       } catch (err) {
-        this.#deps.logger.error(
+        logNeverThrow(
+          this.#deps.logger,
           `resize enqueue: failed to shorten the gate lock ${key} to one lease`,
           err,
         );
