@@ -269,9 +269,9 @@ export interface ResizeConfig {
   concurrency: number;
 }
 
-// Queue timing: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; the framework
-// config file's `queue` section feeds the framework's queue). How long locks last is not timing:
-// that is the Resizer's `coordination` (CoordinationOptions).
+// Queue timing: a task queue's timing (MongoTaskQueue / SqsTaskQueue `timing`; in a framework host,
+// each entry of `queues` in src/config/resize.ts sets its own queue's). How long locks last is not
+// timing: that is the Resizer's `coordination` (CoordinationOptions).
 export interface QueueTimingOptions {
   leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
   retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
@@ -281,7 +281,7 @@ export interface QueueTimingOptions {
 }
 
 // How a Resizer with a task queue coordinates its queued work, in ms
-// (`new Resizer({ coordination })`, or the framework config file's `coordination` section). Missing
+// (`new Resizer({ coordination })`, or `coordination` in a framework host's src/config/resize.ts). Missing
 // values take the defaults (defaultCoordination); only the core validates them, when the Resizer
 // sets up its task queue. An eager-only Resizer never reads them.
 export interface CoordinationOptions {
@@ -294,7 +294,7 @@ export interface CoordinationOptions {
   cooldownMs?: number;
 }
 
-// The framework worker command's settings (the config file's `worker` section).
+// The framework worker command's settings (`worker` in src/config/resize.ts).
 export interface FrameworkWorkerConfig {
   enabled: boolean; // default false — permits `npm run cli ResizeWorker` to run
   sharpConcurrency: number; // default 1 — sharp.concurrency()
@@ -322,33 +322,33 @@ export type FrameworkStorageConfig =
   | FrameworkLocalStorageConfig
   | FrameworkS3StorageConfig;
 
-// Where a FrameworkResizer's tasks wait: the config file's `queue` section, with the queue's
-// timing (any QueueTimingOptions key; the rest default).
-export interface FrameworkDatabaseQueueConfig
-  extends Partial<QueueTimingOptions> {
-  driver?: 'database'; // the app's queue over its ResizeTask model (default driver)
+// One named queue: where its tasks wait, and that queue's timing (any QueueTimingOptions key; the
+// rest default). A framework host defines each queue once, in `queues` of src/config/resize.ts.
+export interface DatabaseQueueConfig extends Partial<QueueTimingOptions> {
+  driver: 'database'; // the app's queue over its ResizeTask model
 }
-export interface FrameworkSqsQueueConfig extends Partial<QueueTimingOptions> {
+export interface SqsQueueConfig extends Partial<QueueTimingOptions> {
   driver: 'sqs'; // SqsTaskQueue (needs @aws-sdk/client-sqs)
-  queueUrl: string; // the 'default' queue
-  queues?: Record<string, string>; // other named queues → URLs
+  queueUrl: string; // this queue's own SQS queue
   deadLetterQueueUrl?: string;
   waitTimeSeconds?: number; // long poll per claim; default 10
   region?: string;
   endpoint?: string;
 }
-export type FrameworkQueueConfig =
-  | FrameworkDatabaseQueueConfig
-  | FrameworkSqsQueueConfig;
+export type QueueConfig = DatabaseQueueConfig | SqsQueueConfig;
 
-// The config file a framework host writes (`src/config/resize.ts`, or another file per Resizer).
-// The image settings go to the Resizer; FrameworkResizer builds the rest: the media model, the
-// storage, the task queue and the worker command's settings. resize.<NODE_ENV>.ts overrides any
-// of them per environment.
+// A config file a framework host writes: `src/config/resize.ts`, or another Resizer's file
+// (`configName`). The image settings, `mediaModelName`, `storage` and `queue` belong to that
+// Resizer. `queues`, `worker` and `coordination` are process-wide: the adapter reads them only from
+// src/config/resize.ts and rejects them in any other file. resize.<NODE_ENV>.ts overrides any of
+// them per environment.
 export interface FrameworkResizeConfig extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
   storage?: FrameworkStorageConfig; // required unless the code passes `storage`
-  queue?: FrameworkQueueConfig | false; // missing or false: eager only (no task queue)
-  coordination?: CoordinationOptions; // default: defaultCoordination; read only beside a queue
-  worker?: FrameworkWorkerConfig; // default: defaultWorkerOptions
+  // The queue name of this Resizer's tasks (a key of `queues`), or false for eager only. Missing:
+  // 'default' when `queues` has entries, else eager only.
+  queue?: string | false;
+  queues?: Record<string, QueueConfig>; // process-wide: every queue, by name
+  worker?: Partial<FrameworkWorkerConfig>; // process-wide; a missing key takes defaultWorkerOptions
+  coordination?: CoordinationOptions; // process-wide; default: defaultCoordination
 }

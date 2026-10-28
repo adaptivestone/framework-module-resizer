@@ -257,6 +257,7 @@ import {
   LockStore,
   MediaStore,
   type Preview,
+  type QueueConfig,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
 import {
@@ -278,17 +279,45 @@ const hostConfig = {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  queue: { driver: 'database' },
+  queue: 'default',
+  queues: { default: { driver: 'database' } },
   worker: { ...defaultWorkerOptions, enabled: true },
+} satisfies FrameworkResizeConfig;
+// A second Resizer's own file: its queue is a name defined in resize.ts.
+const listingsConfig = {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'Listing',
+  storage: { driver: 'local', rootDir: './var/listings', publicBaseUrl: '/listings' },
+  queue: 'bulk',
 } satisfies FrameworkResizeConfig;
 // An environment file switching both drivers.
 const productionConfig = {
   storage: { driver: 's3', bucketPublic: 'cdn', bucketPrivate: 'originals' },
-  queue: { driver: 'sqs', queueUrl: 'https://sqs.example/resize', maxAttempts: 3 },
+  queues: {
+    default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize', maxAttempts: 3 },
+  },
 } satisfies Partial<FrameworkResizeConfig>;
+// A resize.ts with only the process-wide sections (no default Resizer).
+const processOnlyConfig = {
+  queues: { bulk: { driver: 'database' } },
+  worker: { ...defaultWorkerOptions, enabled: true },
+} satisfies Partial<FrameworkResizeConfig>;
+// An environment file that only switches the worker on: the other keys take their defaults.
+const workerOnlyConfig = {
+  worker: { enabled: true },
+} satisfies Partial<FrameworkResizeConfig>;
+const bulkQueue: QueueConfig = { driver: 'database', leaseMs: 120_000 };
 // The scaffolded construction site (never called here: it would register a Resizer).
 const construct = () => new FrameworkResizer({ pipelines: { default: {} } });
-void [hostConfig, productionConfig, construct];
+void [
+  hostConfig,
+  listingsConfig,
+  productionConfig,
+  processOnlyConfig,
+  workerOnlyConfig,
+  bulkQueue,
+  construct,
+];
 import {
   MongoLockStore,
   MongoMediaStore,

@@ -1,49 +1,106 @@
-// Loads a Resizer's config file from the framework app. Each Resizer may read its own file
-// (`configName`, default 'resize'); the framework has already merged resize.<NODE_ENV>.ts over it.
-// The file holds the image settings (passed to the Resizer) plus what only this adapter reads:
-// `mediaModelName`, `storage`, `queue` (the task queue and its timing) and `worker` (the worker
-// command). Its `coordination` section goes to the Resizer as it is: the core validates it.
-import { ResizeConfigError } from '../errors.ts';
+// Loads the framework config files; the framework has already merged each file's
+// <name>.<NODE_ENV>.ts over it. Every Resizer reads its own file (`configName`, default 'resize'),
+// which holds what belongs to that Resizer: the image settings (passed to the Resizer),
+// `mediaModelName`, `storage` and `queue` (the name of the queue its tasks go to). What belongs to
+// the process is read only from src/config/resize.ts and rejected in any other file: `queues`
+// (every queue, by name, with its timing), `worker` (the worker command's settings) and
+// `coordination` (passed to every Resizer as it is: the core validates it).
+import { ResizeConfigError, ResizeError } from '../errors.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
 import { fillTiming, LOCK_TTL_MOVES } from '../timing.ts';
 import type {
   CoordinationOptions,
-  FrameworkQueueConfig,
   FrameworkResizeConfig,
   FrameworkStorageConfig,
   FrameworkWorkerConfig,
+  QueueConfig,
   QueueTimingOptions,
   ResizeConfig,
 } from '../types.d.ts';
 import { getApp } from './app.ts';
 import { defaultWorkerOptions } from './defaults.ts';
+import { backendKey } from './queue.ts';
 
-/** A validated framework config file, split by who reads each part. */
+/** Where a Resizer's config comes from: a config file, or the `config` option. */
+export interface ConfigSource {
+  configName: string; // the config file, e.g. 'resize' for src/config/resize.ts
+  explicit: boolean; // true: the FrameworkResizer / FrameworkMediaStore `config` option
+}
+
+/** A Resizer's validated config, split by who reads each part. */
 export interface ResolvedFrameworkConfig {
   image: ResizeConfig; // the Resizer's config
   mediaModelName: string;
   storage: FrameworkStorageConfig | undefined; // the file's `storage`, if any
-  queue: FrameworkQueueConfig | false; // the file's `queue`; false when missing (eager only)
-  timing: QueueTimingOptions; // the queue's timing, with the defaults filled in
-  // The file's `coordination`, unvalidated: the Resizer validates it when it sets up its task
-  // queue.
+  // The name of the queue the Resizer's tasks go to; false: eager only; undefined: not set.
+  queue: string | false | undefined;
+}
+
+/** One `queues` entry of src/config/resize.ts, validated. */
+export interface ResolvedQueue {
+  name: string;
+  section: QueueConfig; // the entry as the file holds it
+  timing: QueueTimingOptions; // its timing keys over the defaults
+  backend: string; // backendKey(section): the entries with one key share one task queue
+}
+
+/** The process-wide sections of src/config/resize.ts, validated. */
+export interface ResolvedProcessConfig {
+  queues: ReadonlyMap<string, ResolvedQueue>; // in the file's order; empty: no queues
+  worker: FrameworkWorkerConfig; // the file's `worker` over defaultWorkerOptions
+  // Unvalidated: the core validates it when a Resizer sets up its task queue.
   coordination: CoordinationOptions | undefined;
-  worker: FrameworkWorkerConfig; // the file's `worker`, or the defaults
 }
 
 const STORAGE_DRIVERS = ['local', 's3'];
-const QUEUE_DRIVERS = [undefined, 'database', 'sqs'];
+const QUEUE_DRIVERS = ['database', 'sqs'];
+const PROCESS_WIDE = ['queues', 'worker', 'coordination'] as const;
+const WORKER_KEYS = Object.keys(defaultWorkerOptions);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+const isPositiveSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
+const invalid = (message: string): ResizeConfigError =>
+  new ResizeConfigError(`resize config: ${message}`, {
+    code: 'RESIZE_CONFIG_INVALID',
+  });
+
+const removed = (message: string): ResizeConfigError =>
+  new ResizeConfigError(`resize config: ${message}`, {
+    code: 'RESIZE_CONFIG_REMOVED_KEY',
+  });
+
+/**
+ * The config file `configName` as messages name it. The framework merges the file's
+ * <name>.<NODE_ENV>.ts over it before this module reads it, so a wrong value may come from either.
+ */
+export function configFile(configName: string): string {
+  return `src/config/${configName}.ts (or its ${configName}.<NODE_ENV>.ts override)`;
+}
+
+/** A Resizer's config as messages name it: its file, or the `config` option. */
+export function sourceName(source: ConfigSource): string {
+  return source.explicit
+    ? 'the config passed to new FrameworkResizer()'
+    : configFile(source.configName);
+}
+
+// A `queue` object is the 0.2 shape, where each file carried its own task queue.
+const queueMoved = (where: string): ResizeConfigError =>
+  removed(
+    `\`queue\` in ${where} is now a queue name — define the queue once in src/config/resize.ts as queues: { default: { driver: 'database', …timing } } and set queue: 'default' (or queue: false for eager only)`,
+  );
+
 // The framework returns the same cached object on every getConfig call, so each file is split and
 // validated once. But `app.updateConfig()` assigns new values into that same object, so a cached
 // result is reused only while every top-level value is still the same one.
-const resolved = new WeakMap<
-  object,
-  { result: ResolvedFrameworkConfig; values: Map<string, unknown> }
->();
+interface Cached<T> {
+  result: T;
+  values: Map<string, unknown>;
+}
 
 const sameValues = (raw: object, values: Map<string, unknown>): boolean => {
   const keys = Object.keys(raw);
@@ -57,111 +114,271 @@ const sameValues = (raw: object, values: Map<string, unknown>): boolean => {
   );
 };
 
-/** Split and validate a framework config object (a config file's value). */
+// One object may be read as several sources (e.g. as a file and as an explicit config), and each
+// reading checks other keys, so a result is kept per source.
+const resolvedFiles = new WeakMap<
+  object,
+  Map<string, Cached<ResolvedFrameworkConfig>>
+>();
+const resolvedProcess = new WeakMap<object, Cached<ResolvedProcessConfig>>();
+
+/** Split and validate a Resizer's config (a config file's value, or the `config` option). */
 export function resolveFrameworkConfig(
   raw: unknown,
-  configName = 'resize',
+  source: ConfigSource,
 ): ResolvedFrameworkConfig {
+  const key = `${source.explicit ? 'option' : 'file'}:${source.configName}`;
   if (isRecord(raw)) {
-    const cached = resolved.get(raw);
+    const cached = resolvedFiles.get(raw)?.get(key);
     if (cached && sameValues(raw, cached.values)) {
       return cached.result;
     }
   }
   if (!isRecord(raw)) {
-    throw new ResizeConfigError(
-      `resize config: src/config/${configName}.ts must export an object`,
-      { code: 'RESIZE_CONFIG_INVALID' },
+    throw invalid(
+      source.explicit
+        ? 'the config passed to new FrameworkResizer() must be an object'
+        : `src/config/${source.configName}.ts must export an object`,
     );
   }
-  // `coordination` is taken out before the image config is validated, and passed on as it is.
-  const { mediaModelName, storage, queue, worker, coordination, ...image } =
-    raw;
+  // The process-wide sections are never image settings: they are taken out before the image
+  // config is validated (which would reject `worker`), and checked below.
+  const {
+    mediaModelName,
+    storage,
+    queue,
+    queues: _queues,
+    worker: _worker,
+    coordination: _coordination,
+    ...image
+  } = raw;
   if (
     typeof mediaModelName !== 'string' ||
     mediaModelName.trim().length === 0
   ) {
     throw new ResizeConfigError(
-      `resize config: \`mediaModelName\` is required — set it in the host src/config/${configName}.ts`,
+      `resize config: \`mediaModelName\` is required — set it in the host src/config/${source.configName}.ts`,
       { code: 'RESIZE_CONFIG_MEDIA_MODEL_MISSING' },
     );
   }
-  const file = `src/config/${configName}.ts`;
+  const where = sourceName(source);
   if (
     storage !== undefined &&
     !(isRecord(storage) && STORAGE_DRIVERS.includes(storage.driver as string))
   ) {
-    throw new ResizeConfigError(
-      `resize config: \`storage\` in ${file} needs driver 'local' or 's3'`,
-      { code: 'RESIZE_CONFIG_INVALID' },
-    );
+    throw invalid(`\`storage\` in ${where} needs driver 'local' or 's3'`);
+  }
+  if (isRecord(queue)) {
+    throw queueMoved(where);
   }
   if (
     queue !== undefined &&
     queue !== false &&
-    !(isRecord(queue) && QUEUE_DRIVERS.includes(queue.driver as string))
+    !(typeof queue === 'string' && queue.trim().length > 0)
   ) {
-    throw new ResizeConfigError(
-      `resize config: \`queue\` in ${file} must be false or have driver 'database' or 'sqs'`,
-      { code: 'RESIZE_CONFIG_INVALID' },
+    throw invalid(
+      `\`queue\` in ${where} must be a queue name (a key of \`queues\` in src/config/resize.ts) or false for eager only`,
     );
   }
-  if (
-    isRecord(queue) &&
-    queue.driver === 'sqs' &&
-    (typeof queue.queueUrl !== 'string' || queue.queueUrl.length === 0)
-  ) {
-    throw new ResizeConfigError(
-      `resize config: \`queue.queueUrl\` in ${file} is required for the 'sqs' driver`,
-      { code: 'RESIZE_CONFIG_INVALID' },
-    );
-  }
-  // Checked before fillTiming, which rejects it too, but without naming the file.
-  if (isRecord(queue) && Object.hasOwn(queue, 'lockTtlMs')) {
-    throw new ResizeConfigError(
-      `resize config: \`queue.lockTtlMs\` in ${file} is no longer supported — set coordination in the same file instead: { gateTtlMs, cooldownMs } (${LOCK_TTL_MOVES})`,
-      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
-    );
-  }
-  const timing = fillTiming(isRecord(queue) ? queue : {});
-  const workerOptions = worker ?? defaultWorkerOptions;
-  if (isRecord(workerOptions) && Object.hasOwn(workerOptions, 'concurrency')) {
-    throw new ResizeConfigError(
-      `resize config: \`worker.concurrency\` in ${file} is no longer supported — move the value to the top-level \`concurrency\``,
-      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
-    );
-  }
-  if (
-    !isRecord(workerOptions) ||
-    typeof workerOptions.enabled !== 'boolean' ||
-    typeof workerOptions.sharpCache !== 'boolean' ||
-    typeof workerOptions.sharpConcurrency !== 'number' ||
-    !Number.isSafeInteger(workerOptions.sharpConcurrency) ||
-    workerOptions.sharpConcurrency <= 0
-  ) {
-    throw new ResizeConfigError(
-      `resize config: \`worker\` in ${file} needs enabled (boolean), sharpConcurrency (positive integer) and sharpCache (boolean)`,
-      { code: 'RESIZE_CONFIG_INVALID' },
-    );
+  // src/config/resize.ts holds them as a file; anywhere else they would be ignored silently.
+  if (source.explicit || source.configName !== 'resize') {
+    for (const section of PROCESS_WIDE) {
+      if (raw[section] !== undefined) {
+        throw invalid(
+          `\`${section}\` in ${where} is process-wide: it is read only from src/config/resize.ts`,
+        );
+      }
+    }
   }
   const result: ResolvedFrameworkConfig = {
     image: validateResizeConfig(image),
     mediaModelName,
     storage: storage as FrameworkStorageConfig | undefined,
-    queue: isRecord(queue) ? (queue as unknown as FrameworkQueueConfig) : false,
-    timing,
-    coordination: coordination as CoordinationOptions | undefined,
-    worker: workerOptions as unknown as FrameworkWorkerConfig,
+    queue: queue as string | false | undefined,
   };
-  resolved.set(raw, { result, values: new Map(Object.entries(raw)) });
+  let bySource = resolvedFiles.get(raw);
+  if (!bySource) {
+    bySource = new Map();
+    resolvedFiles.set(raw, bySource);
+  }
+  bySource.set(key, { result, values: new Map(Object.entries(raw)) });
   return result;
 }
 
-/** The app's config file `configName`, validated and split. */
+/**
+ * Validate the process-wide sections of src/config/resize.ts (its value): `queues`, `worker` and
+ * `coordination`. Every other key is ignored, `mediaModelName` too: a resize.ts may hold only these.
+ */
+export function resolveProcessConfig(raw: unknown): ResolvedProcessConfig {
+  if (isRecord(raw)) {
+    const cached = resolvedProcess.get(raw);
+    if (cached && sameValues(raw, cached.values)) {
+      return cached.result;
+    }
+  }
+  if (!isRecord(raw)) {
+    throw invalid('src/config/resize.ts must export an object');
+  }
+  const where = configFile('resize');
+  // Caught here too, so that worker start, which reads only this, reports the old shape.
+  if (isRecord(raw.queue)) {
+    throw queueMoved(where);
+  }
+  const result: ResolvedProcessConfig = {
+    queues: resolveQueues(raw.queues, where),
+    worker: resolveWorker(raw.worker, where),
+    coordination: raw.coordination as CoordinationOptions | undefined,
+  };
+  resolvedProcess.set(raw, { result, values: new Map(Object.entries(raw)) });
+  return result;
+}
+
+/** The `queues` map: every entry needs a driver; an SQS entry needs its own queueUrl. */
+function resolveQueues(
+  value: unknown,
+  where: string,
+): ReadonlyMap<string, ResolvedQueue> {
+  const queues = new Map<string, ResolvedQueue>();
+  if (value === undefined) {
+    return queues;
+  }
+  if (!isRecord(value)) {
+    throw invalid(
+      `\`queues\` in ${where} must be an object of queue names, e.g. queues: { default: { driver: 'database' } }`,
+    );
+  }
+  // An SQS queue URL → the entry that uses it.
+  const urls = new Map<string, string>();
+  for (const [name, entry] of Object.entries(value)) {
+    if (name.trim().length === 0) {
+      throw invalid(
+        `\`queues\` in ${where} has a blank queue name — name each queue, e.g. queues: { default: { driver: 'database' } }`,
+      );
+    }
+    // Checked before fillTiming, which rejects lockTtlMs too, but without naming the entry.
+    if (isRecord(entry) && Object.hasOwn(entry, 'lockTtlMs')) {
+      throw removed(
+        `\`queues.${name}.lockTtlMs\` in ${where} is no longer supported — set coordination in the same file instead: { gateTtlMs, cooldownMs } (${LOCK_TTL_MOVES})`,
+      );
+    }
+    if (isRecord(entry) && Object.hasOwn(entry, 'queues')) {
+      throw removed(
+        `\`queues.${name}.queues\` in ${where} is no longer supported — give each SQS queue its own entry in \`queues\`, e.g. bulk: { driver: 'sqs', queueUrl: '…' }`,
+      );
+    }
+    if (!isRecord(entry) || !QUEUE_DRIVERS.includes(entry.driver as string)) {
+      throw invalid(
+        `\`queues.${name}\` in ${where} needs driver 'database' or 'sqs'`,
+      );
+    }
+    if (entry.driver === 'sqs') {
+      const url = entry.queueUrl;
+      if (typeof url !== 'string' || url.length === 0) {
+        throw invalid(
+          `\`queues.${name}.queueUrl\` in ${where} is required for the 'sqs' driver`,
+        );
+      }
+      // One SQS queue would carry the tasks of both names, and each name's worker would take them.
+      const other = urls.get(url);
+      if (other !== undefined) {
+        throw invalid(
+          `\`queues.${other}\` and \`queues.${name}\` in ${where} have the same queueUrl ${url} — give each queue name its own SQS queue`,
+        );
+      }
+      urls.set(url, name);
+    }
+    const section = entry as unknown as QueueConfig;
+    queues.set(name, {
+      name,
+      section,
+      timing: entryTiming(section, name, where),
+      backend: backendKey(section),
+    });
+  }
+  return queues;
+}
+
+/** An entry's timing; an invalid one keeps its code and names the entry. */
+function entryTiming(
+  section: QueueConfig,
+  name: string,
+  where: string,
+): QueueTimingOptions {
+  try {
+    return fillTiming(section);
+  } catch (err) {
+    if (ResizeError.isResizeError(err)) {
+      throw new ResizeConfigError(
+        `resize config: \`queues.${name}\` in ${where}: ${err.message.replace(/^resize queue options: /, '')}`,
+        { code: err.code, retryable: err.retryable, cause: err },
+      );
+    }
+    throw err;
+  }
+}
+
+/** The `worker` section over defaultWorkerOptions: a missing key takes its default. */
+function resolveWorker(value: unknown, where: string): FrameworkWorkerConfig {
+  if (value === undefined) {
+    return { ...defaultWorkerOptions };
+  }
+  if (!isRecord(value)) {
+    throw invalid(
+      `\`worker\` in ${where} must be an object: { enabled, sharpConcurrency, sharpCache }`,
+    );
+  }
+  if (Object.hasOwn(value, 'concurrency')) {
+    throw removed(
+      `\`worker.concurrency\` in ${where} is no longer supported — move the value to the top-level \`concurrency\``,
+    );
+  }
+  const worker: Record<string, unknown> = { ...defaultWorkerOptions };
+  for (const key of WORKER_KEYS) {
+    if (value[key] !== undefined) {
+      worker[key] = value[key];
+    }
+  }
+  if (typeof worker.enabled !== 'boolean') {
+    throw invalid(`\`worker.enabled\` in ${where} must be a boolean`);
+  }
+  if (!isPositiveSafeInteger(worker.sharpConcurrency)) {
+    throw invalid(
+      `\`worker.sharpConcurrency\` in ${where} must be a positive integer`,
+    );
+  }
+  if (typeof worker.sharpCache !== 'boolean') {
+    throw invalid(`\`worker.sharpCache\` in ${where} must be a boolean`);
+  }
+  return worker as unknown as FrameworkWorkerConfig;
+}
+
+/** The app's config file `configName` (default 'resize'), validated and split. */
 export function getResizeConfig(
   configName = 'resize',
 ): ResolvedFrameworkConfig {
-  return resolveFrameworkConfig(getApp().getConfig(configName), configName);
+  return resolveFrameworkConfig(getApp().getConfig(configName), {
+    configName,
+    explicit: false,
+  });
+}
+
+// For a missing file the framework returns a new {} and logs a warning on every call, so the empty
+// result is kept per app, which is then not asked again.
+const missingProcessFile = new WeakMap<object, ResolvedProcessConfig>();
+
+/** The process-wide sections of the app's src/config/resize.ts, validated. */
+export function getProcessConfig(): ResolvedProcessConfig {
+  const app = getApp();
+  const kept = missingProcessFile.get(app);
+  if (kept) {
+    return kept;
+  }
+  const raw = app.getConfig('resize');
+  const result = resolveProcessConfig(raw);
+  if (isRecord(raw) && Object.keys(raw).length === 0) {
+    missingProcessFile.set(app, result);
+  }
+  return result;
 }
 
 export type { FrameworkResizeConfig };

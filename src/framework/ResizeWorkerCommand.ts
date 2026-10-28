@@ -4,6 +4,7 @@
 // every command as `new Command(app, commands, args)` and reads the statics below before/after;
 // matching that shape (constructor args + `static description` + `static isShouldInitModels`) is
 // all it needs. Hosts register it through the scaffolded src/commands/ResizeWorker.ts and launch `npm run cli ResizeWorker`.
+import { ResizeConfigError } from '../errors.ts';
 import { runResizeWorker } from './worker.ts';
 
 export default class ResizeWorker {
@@ -42,10 +43,11 @@ export default class ResizeWorker {
         description:
           "Queue to consume (default 'default'). Tasks on other queues are left for their own workers.",
       },
+      // Still declared, so that the parser accepts it and run() names the fix.
       config: {
         type: 'string',
         description:
-          "Config file name whose 'worker' section the process uses (default 'resize').",
+          'Removed: the worker reads `worker` and `queues` from src/config/resize.ts.',
       },
     } as const;
   }
@@ -53,10 +55,13 @@ export default class ResizeWorker {
   async run(): Promise<boolean> {
     const { queue, config } =
       (this.args as { queue?: string; config?: string } | undefined) ?? {};
-    await runResizeWorker({
-      ...(queue === undefined ? {} : { queue }),
-      ...(config === undefined ? {} : { configName: config }),
-    });
+    if (config !== undefined) {
+      throw new ResizeConfigError(
+        'resize worker: `--config` is removed — the worker reads `worker` and `queues` from src/config/resize.ts',
+        { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+      );
+    }
+    await runResizeWorker(queue === undefined ? {} : { queue });
     return true;
   }
 }

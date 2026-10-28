@@ -9,13 +9,13 @@ export {
   resizeMediaSchemaFragment,
 } from '../drivers/mongo/mediaFragment.ts';
 export type {
-  FrameworkDatabaseQueueConfig,
+  DatabaseQueueConfig,
   FrameworkLocalStorageConfig,
-  FrameworkQueueConfig,
   FrameworkResizeConfig,
   FrameworkS3StorageConfig,
-  FrameworkSqsQueueConfig,
   FrameworkStorageConfig,
+  QueueConfig,
+  SqsQueueConfig,
 } from '../types.d.ts';
 export {
   defaultFrameworkResizeConfig,

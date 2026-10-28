@@ -1,20 +1,21 @@
 // The framework's worker entry (the `ResizeWorker` CLI command runs it). It adds what the core
-// worker leaves to the host: the `worker.enabled` switch and Sharp tuning from the app config,
-// graceful shutdown on SIGTERM/SIGINT, and the app logger.
+// worker leaves to the host: the `worker.enabled` switch and Sharp tuning from `worker` in
+// src/config/resize.ts (process-wide: whatever files the process's Resizers read), graceful
+// shutdown on SIGTERM/SIGINT, and the app logger.
 import { ResizeSetupError } from '../errors.ts';
 import { listResizers } from '../resizer.ts';
 import { runWorker } from '../worker.ts';
 import { getApp } from './app.ts';
-import { getResizeConfig } from './config.ts';
+import { getProcessConfig } from './config.ts';
 
 export async function runResizeWorker(
-  opts: { queue?: string; configName?: string } = {},
+  opts: { queue?: string } = {},
 ): Promise<void> {
   const app = getApp();
-  const { worker } = getResizeConfig(opts.configName);
+  const { worker } = getProcessConfig();
   if (worker.enabled === false) {
     app.logger.info(
-      `resize worker disabled — set config.worker.enabled=true in the host src/config/${opts.configName ?? 'resize'}.ts to run it`,
+      'resize worker disabled — set worker: { enabled: true } in src/config/resize.ts (or its resize.<NODE_ENV>.ts override) to run it',
     );
     return;
   }

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { afterEach, test } from 'node:test';
+import { promisify } from 'node:util';
 import {
   resetAppInstance,
   setAppInstance,
@@ -24,12 +26,15 @@ import {
 } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
-import { runWorker } from '../worker.ts';
+import type { QueueConfig } from '../types.d.ts';
+import { getProcessConfig } from './config.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
-import { appTaskQueue } from './queue.ts';
+import { backendKey, taskQueueOf } from './queue.ts';
 import { FrameworkResizer } from './resizer.ts';
 import { runResizeWorker } from './worker.ts';
+
+const runNode = promisify(execFile);
 
 const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -42,6 +47,17 @@ const localStorage = {
   rootDir: './var/media',
   publicBaseUrl: '/media',
 };
+
+// The queue the scaffold defines: one database queue named 'default'.
+const databaseQueues = { default: { driver: 'database' as const } };
+
+const OVERRIDE = '(or its resize.<NODE_ENV>.ts override)';
+
+const sizes = [{ width: 10, height: 10 }];
+const withOriginal = () => ({
+  id: 'm1',
+  original: { storageRef: { key: 'k' } },
+});
 
 function installApp(configs: Record<string, unknown> = {}) {
   const asked: string[] = [];
@@ -62,6 +78,13 @@ function installApp(configs: Record<string, unknown> = {}) {
   } as never);
   return { asked, logger, events };
 }
+
+const configError =
+  (code: string, ...parts: string[]) =>
+  (err: unknown) =>
+    err instanceof ResizeConfigError &&
+    err.code === code &&
+    parts.every((part) => err.message.includes(part));
 
 afterEach(() => {
   resetResizerForTests();
@@ -84,7 +107,7 @@ test('fills config, logger, events and the media store from the app; an eager-on
   assert.deepEqual(r.config.formats, ['jpeg', 'webp', 'avif']);
   assert.ok(r.media instanceof FrameworkMediaStore);
   await r.ready();
-  assert.equal(r.tasks, undefined); // no `queue` section: eager only
+  assert.equal(r.tasks, undefined); // no `queues`: eager only
   assert.equal(r.locks, undefined);
   await r.media.loadMedia('m1');
   assert.deepEqual(asked, ['File']);
@@ -178,31 +201,25 @@ test('a missing storage section is a config error at verify(), and resolve() sti
       err.code === 'RESIZE_CONFIG_STORAGE_MISSING' &&
       err.message.includes('src/config/resize.ts'),
   );
-  const { decision } = await r.resolve({
-    media: { id: 'm1', original: { storageRef: { key: 'k' } } },
-    sizes: [{ width: 10, height: 10 }],
-  });
+  const { decision } = await r.resolve({ media: withOriginal(), sizes });
   assert.deepEqual(decision, { ready: [], missing: [] });
   assert.ok(errors.length >= 1);
   await assert.rejects(
-    () =>
-      r.generate({
-        media: { id: 'm1', original: { storageRef: { key: 'k' } } },
-        sizes: [{ width: 10, height: 10 }],
-      }),
+    () => r.generate({ media: withOriginal(), sizes }),
     (err: unknown) =>
       err instanceof ResizeConfigError &&
       err.code === 'RESIZE_CONFIG_STORAGE_MISSING',
   );
 });
 
-test("queue { driver: 'database' } uses the app's ResizeTask queue and no lock store, so verify() needs no framework Lock model", async () => {
+test("a 'database' queue uses the app's ResizeTask queue and no lock store, so verify() needs no framework Lock model", async () => {
   const asked: string[] = [];
   setAppInstance({
     getConfig: () =>
       makeResizeConfig({
         storage: localStorage,
-        queue: { driver: 'database' },
+        queue: 'default',
+        queues: databaseQueues,
       }),
     getModel: (name: string) => {
       asked.push(name);
@@ -213,19 +230,28 @@ test("queue { driver: 'database' } uses the app's ResizeTask queue and no lock s
   const r = new FrameworkResizer();
   await r.verify();
   assert.ok(r.tasks instanceof MongoTaskQueue);
-  assert.equal(r.tasks, appTaskQueue());
+  const processConfig = getProcessConfig();
+  assert.equal(
+    r.tasks,
+    await taskQueueOf(
+      processConfig.queues.get('default') as never,
+      processConfig,
+    ),
+  );
   assert.equal(r.locks, undefined);
   assert.equal(asked.includes('Lock'), false);
 });
 
-test("queue { driver: 'sqs' } takes its gate locks in the framework Lock model, which verify() requires", async () => {
+test("an 'sqs' queue takes its gate locks in the framework Lock model, which verify() requires", async () => {
   const calls: unknown[][] = [];
   let lockModel: unknown;
   setAppInstance({
     getConfig: () =>
       makeResizeConfig({
         storage: localStorage,
-        queue: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+        queues: {
+          default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+        },
       }),
     getModel: (name: string) => {
       if (name !== 'Lock') {
@@ -272,33 +298,25 @@ test("queue { driver: 'sqs' } takes its gate locks in the framework Lock model, 
 });
 
 test('the tasks and locks parts share one queue build; a failed build is retried by the next call', async () => {
-  // Two config files on the database queue; the second one's timing disagrees at first, so the
-  // queue build of the first Resizer rejects with a timing conflict.
-  let listingsQueue: Record<string, unknown> = {
-    driver: 'database',
-    maxAttempts: 7,
-  };
-  setAppInstance({
-    getConfig: (name: string) =>
-      makeResizeConfig({
-        storage: localStorage,
-        queue:
-          name === 'resizeListings' ? listingsQueue : { driver: 'database' },
-      }),
-    getModel: () => ({ findById: async () => null }),
-    logger: { info() {}, warn() {}, error() {} },
-  } as never);
+  // The file names a queue resize.ts does not define yet, so the first build rejects.
+  const file = makeResizeConfig({
+    storage: localStorage,
+    queue: 'bulk',
+    queues: databaseQueues,
+  });
+  installApp({ resize: file });
   const r = new FrameworkResizer();
-  new FrameworkResizer({ name: 'listings', configName: 'resizeListings' });
   await assert.rejects(
     () => r.ready(),
-    (err: unknown) =>
-      err instanceof ResizeConfigError &&
-      err.code === 'RESIZE_CONFIG_QUEUE_TIMING_CONFLICT',
+    configError('RESIZE_CONFIG_QUEUE_UNKNOWN', "queues to 'bulk'"),
   );
-  listingsQueue = { driver: 'database' };
+  // What app.updateConfig() does: a new value assigned into the same object.
+  Object.assign(file, {
+    queues: { ...databaseQueues, bulk: { driver: 'database' } },
+  });
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
+  assert.equal(r.queueName, 'bulk');
   assert.equal(r.locks, undefined);
 });
 
@@ -317,12 +335,15 @@ test('a task queue passed in code gets the framework lock store only when it has
   );
 });
 
-test("a queue section without a driver is the app's ResizeTask queue; its timing fills the defaults", async () => {
+test("a 'database' entry's timing fills the defaults", async () => {
   installApp({
-    resizeListings: makeResizeConfig({
-      storage: localStorage,
-      queue: { leaseMs: 1234, idlePollMs: 50 },
-    }),
+    // A resize.ts with only the process-wide sections, beside another Resizer's file.
+    resize: {
+      queues: {
+        default: { driver: 'database', leaseMs: 1234, idlePollMs: 50 },
+      },
+    },
+    resizeListings: makeResizeConfig({ storage: localStorage }),
   });
   const r = new FrameworkResizer({ configName: 'resizeListings' });
   await r.ready();
@@ -332,17 +353,26 @@ test("a queue section without a driver is the app's ResizeTask queue; its timing
   assert.equal(timingOf(r.tasks, 'default').maxAttempts, 5);
 });
 
-test("queue { driver: 'sqs' } builds an SqsTaskQueue with the config's URLs and timing", async () => {
+test("'sqs' entries build one SqsTaskQueue with their URLs, and each name keeps its timing", async () => {
+  const connection = {
+    deadLetterQueueUrl: 'https://sqs.example/dead',
+    region: 'eu-west-1',
+  };
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: {
-        driver: 'sqs',
-        queueUrl: 'https://sqs.example/resize',
-        queues: { bulk: 'https://sqs.example/bulk' },
-        deadLetterQueueUrl: 'https://sqs.example/dead',
-        region: 'eu-west-1',
-        maxAttempts: 3,
+      queues: {
+        default: {
+          driver: 'sqs',
+          queueUrl: 'https://sqs.example/resize',
+          maxAttempts: 3,
+          ...connection,
+        },
+        bulk: {
+          driver: 'sqs',
+          queueUrl: 'https://sqs.example/bulk',
+          ...connection,
+        },
       },
     }),
   });
@@ -353,14 +383,18 @@ test("queue { driver: 'sqs' } builds an SqsTaskQueue with the config's URLs and 
   assert.equal(r.tasks.servesQueue('bulk'), true);
   assert.equal(r.tasks.servesQueue('other'), false);
   assert.equal(timingOf(r.tasks, 'default').maxAttempts, 3);
+  assert.equal(timingOf(r.tasks, 'bulk').maxAttempts, 5);
   assert.ok(r.locks instanceof FrameworkLockStore); // locks stay in the framework Lock model
 });
 
-test('invalid storage or queue sections are config errors', async () => {
+test('invalid storage or queues sections are config errors', async () => {
   for (const [override, message] of [
     [{ storage: { driver: 'ftp' } }, /storage.*'local' or 's3'/],
-    [{ queue: { driver: 'redis' } }, /queue.*'database' or 'sqs'/],
-    [{ queue: { driver: 'sqs' } }, /queueUrl.*required/],
+    [
+      { queues: { default: { driver: 'redis' } } },
+      /queues\.default.*'database' or 'sqs'/,
+    ],
+    [{ queues: { default: { driver: 'sqs' } } }, /queueUrl.*required/],
   ] as const) {
     installApp({ resize: { ...makeResizeConfig(), ...override } });
     const r = new FrameworkResizer({ storage });
@@ -400,7 +434,8 @@ test('explicit options win over the config file', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'database' },
+      queue: 'default',
+      queues: databaseQueues,
     }),
   });
   const logger = { info() {}, warn() {}, error() {} };
@@ -427,11 +462,12 @@ test('explicit options win over the config file', async () => {
   assert.equal(r.tasks, tasks);
 });
 
-test('tasks: false is eager only, even when the config has a queue', async () => {
+test('tasks: false is eager only, even when resize.ts defines queues', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'database' },
+      queue: 'default',
+      queues: databaseQueues,
     }),
   });
   const r = new FrameworkResizer({ tasks: false });
@@ -445,7 +481,8 @@ test('tasks: false builds no lock store, so verify() needs no framework Lock mod
     getConfig: () =>
       makeResizeConfig({
         storage: localStorage,
-        queue: { driver: 'database' },
+        queue: 'default',
+        queues: databaseQueues,
       }),
     getModel: (name: string) => {
       asked.push(name);
@@ -465,53 +502,77 @@ test('tasks: false builds no lock store, so verify() needs no framework Lock mod
   );
 });
 
-test('an explicit config also feeds the database queue timing', async () => {
-  installApp();
+test("an explicit config names its queue; the queue's timing comes from resize.ts", async () => {
+  installApp({
+    resize: { queues: { bulk: { driver: 'database', leaseMs: 4000 } } },
+  });
   const r = new FrameworkResizer({
-    config: makeResizeConfig({
-      storage: localStorage,
-      queue: { leaseMs: 4000 },
-    }),
+    config: makeResizeConfig({ storage: localStorage, queue: 'bulk' }),
   });
   await r.ready();
   assert.ok(r.tasks instanceof MongoTaskQueue);
-  assert.equal(timingOf(r.tasks, 'default').leaseMs, 4000);
+  assert.equal(r.queueName, 'bulk');
+  assert.equal(timingOf(r.tasks, 'bulk').leaseMs, 4000);
 });
 
-test("the config file's coordination reaches the Resizer, and the option wins", async () => {
-  const file = makeResizeConfig({
-    storage: localStorage,
-    queue: { driver: 'database' },
-    coordination: { cooldownMs: 1234 },
+test("resize.ts's coordination reaches every Resizer; the option wins", async () => {
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queue: 'default',
+      queues: databaseQueues,
+      coordination: { cooldownMs: 1234 },
+    }),
+    resizeListings: makeResizeConfig({ storage: localStorage }),
   });
-  installApp({ resize: file });
   const fromFile = new FrameworkResizer();
-  await fromFile.ready();
-  assert.equal(taskCoordinationOf(fromFile).cooldownMs, 1234);
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+  });
+  const own = new FrameworkResizer({
+    name: 'own',
+    tasks: new MemoryTaskQueue(),
+  });
   const fromOption = new FrameworkResizer({
     name: 'option',
     coordination: { cooldownMs: 99 },
   });
-  await fromOption.ready();
-  assert.equal(taskCoordinationOf(fromOption).cooldownMs, 99);
-  // An explicit config carries its own section.
-  const explicit = new FrameworkResizer({
-    name: 'explicit',
-    config: makeResizeConfig({
-      storage: localStorage,
-      queue: { driver: 'database' },
-      coordination: { cooldownMs: 77 },
-    }),
-  });
-  await explicit.ready();
-  assert.equal(taskCoordinationOf(explicit).cooldownMs, 77);
+  for (const [resizer, cooldownMs] of [
+    [fromFile, 1234],
+    [listings, 1234],
+    [own, 1234],
+    [fromOption, 99],
+  ] as const) {
+    await resizer.ready();
+    assert.equal(
+      taskCoordinationOf(resizer).cooldownMs,
+      cooldownMs,
+      resizer.name,
+    );
+  }
+  // An explicit config is a per-Resizer config: it cannot carry the section.
+  assert.throws(
+    () =>
+      new FrameworkResizer({
+        name: 'explicit',
+        config: makeResizeConfig({
+          storage: localStorage,
+          coordination: { cooldownMs: 77 },
+        }),
+      }),
+    configError(
+      'RESIZE_CONFIG_INVALID',
+      '`coordination` in the config passed to new FrameworkResizer() is process-wide',
+    ),
+  );
 });
 
-test("a config file's coordination: null is validated, not read as the defaults", async () => {
+test("resize.ts's coordination: null is validated, not read as the defaults", async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'database' },
+      queues: databaseQueues,
       coordination: null as never,
     }),
   });
@@ -530,7 +591,8 @@ test('a broken config file fails as itself, before the task queue is set up: not
     resize: makeResizeConfig({
       mediaModelName: '',
       storage: localStorage,
-      queue: { driver: 'database' },
+      queue: 'default',
+      queues: databaseQueues,
     }),
   });
   const errors: unknown[][] = [];
@@ -583,7 +645,7 @@ test('nothing is read from the app until first use', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { leaseMs: 4321 },
+      queues: { default: { driver: 'database', leaseMs: 4321 } },
     }),
   });
   await r.ready();
@@ -613,7 +675,7 @@ test('verify() fails at boot when the ResizeTask model is not registered', async
     getConfig: () =>
       makeResizeConfig({
         storage: localStorage,
-        queue: { driver: 'database' },
+        queues: databaseQueues,
       }),
     getModel: (name: string) =>
       name === 'ResizeTask' ? false : { findById: async () => null },
@@ -649,290 +711,360 @@ test('verify() fails when the task queue does not serve the Resizer queueName', 
 test('prewarm reports a config error as a non-retryable issue', async () => {
   installApp({ resize: { mediaModelName: 'File', upload: null } });
   const r = new FrameworkResizer({ storage, tasks: new MemoryTaskQueue() });
-  const result = await r.prewarm({
-    media: { id: 'm1', original: { storageRef: { key: 'k' } } },
-    sizes: [{ width: 10, height: 10 }],
-  });
+  const result = await r.prewarm({ media: withOriginal(), sizes });
   assert.equal(result.status, 'incomplete');
   assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
   assert.equal(result.issues[0].retryable, false);
 });
 
-// --- one task queue per backend -------------------------------------------------------------
+// --- named queues in src/config/resize.ts: one task queue per backend ----------------------
 
-const conflictBetween =
-  (files: string[], keys: string[], same: string[] = []) =>
-  (err: unknown) =>
-    err instanceof ResizeConfigError &&
-    err.code === 'RESIZE_CONFIG_QUEUE_TIMING_CONFLICT' &&
-    files.every((file) => err.message.includes(file)) &&
-    keys.every((key) => err.message.includes(key)) &&
-    same.every((key) => !err.message.includes(key));
-
-test('Resizers with default wiring share one database task queue', async () => {
+test('two Resizers on two database queue names share one task queue; each name keeps its timing and lane', async () => {
   installApp({
     resize: makeResizeConfig({
       storage: localStorage,
-      queue: { driver: 'database' },
+      queues: {
+        default: { driver: 'database' },
+        bulk: { driver: 'database', leaseMs: 30_000 },
+      },
     }),
-    resizeListings: makeResizeConfig({
-      storage: localStorage,
-      formats: ['webp'],
-      queue: {},
-    }),
+    listings: makeResizeConfig({ storage: localStorage, queue: 'bulk' }),
   });
-  const media = new FrameworkResizer();
-  const listings = new FrameworkResizer({
-    name: 'listings',
-    configName: 'resizeListings',
-  });
-  await Promise.all([media.ready(), listings.ready()]);
-  assert.ok(media.tasks instanceof MongoTaskQueue);
-  assert.notEqual(media.media, listings.media); // each Resizer keeps its own media model and config
-  assert.equal(listings.tasks, media.tasks);
+  const a = new FrameworkResizer();
+  const b = new FrameworkResizer({ name: 'listings', configName: 'listings' });
+  await a.ready();
+  await b.ready();
+  assert.ok(a.tasks instanceof MongoTaskQueue);
+  assert.equal(a.tasks, b.tasks);
+  assert.notEqual(a.media, b.media); // each Resizer keeps its own media model and config
+  assert.equal(a.queueName, 'default');
+  assert.equal(b.queueName, 'bulk');
+  assert.equal(a.tasks.servesQueue('default'), true);
+  assert.equal(a.tasks.servesQueue('bulk'), true);
+  assert.equal(a.tasks.servesQueue('nope'), false);
+  assert.equal(timingOf(a.tasks, 'bulk').leaseMs, 30_000);
+  assert.equal(timingOf(a.tasks, 'default').leaseMs, 60_000);
+  await a.verify();
+  await b.verify();
 });
 
-test('config files sharing a task queue with different timing conflict on first use, in verify() and at worker start', async () => {
-  resetAppInstance();
-  // Construction reads nothing, so it cannot see the conflict (and must not throw).
-  const media = new FrameworkResizer();
-  const listings = new FrameworkResizer({
-    name: 'listings',
-    configName: 'resizeListings',
-  });
-  installApp({
-    resize: makeResizeConfig({
-      storage: localStorage,
-      worker: { enabled: true },
-      queue: {
-        maxAttempts: 3,
-        idlePollMs: 50,
-        retryBackoffMs: { base: 50, max: 500 },
-      },
-    }),
-    resizeListings: makeResizeConfig({
-      storage: localStorage,
-      formats: ['webp'], // image settings may differ
-      queue: {
-        driver: 'database',
-        maxAttempts: 7,
-        idlePollMs: 50,
-        retryBackoffMs: { max: 500, base: 50 }, // same values, other key order
-        taskTimeoutMs: 1000,
-      },
-    }),
-  });
-  const conflict = conflictBetween(
-    ['src/config/resize.ts', 'src/config/resizeListings.ts'],
-    ['maxAttempts', 'taskTimeoutMs'],
-    ['idlePollMs', 'retryBackoffMs'],
-  );
-  await assert.rejects(() => media.verify(), conflict);
-  await assert.rejects(() => listings.verify(), conflict);
-  await assert.rejects(
-    () =>
-      media.generate({
-        media: { id: 'm1', original: { storageRef: { key: 'k' } } },
+// In a child process with the SQS SDK made missing, so importing the SQS driver would show.
+test('prewarm({ queue }) naming a queue on another backend reports RESIZE_QUEUE_NOT_SERVED and touches no queue', async () => {
+  const href = (path: string) =>
+    JSON.stringify(new URL(path, import.meta.url).href);
+  const { stdout } = await runNode(process.execPath, [
+    '--experimental-strip-types',
+    '--input-type=module',
+    '-e',
+    `
+      import { registerHooks } from 'node:module';
+      import { setAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
+      import { FrameworkResizer } from ${href('./resizer.ts')};
+      import { makeResizeConfig } from ${href('../testHelpers/resizeConfig.ts')};
+      const sqsDriver = [];
+      registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (specifier === '@aws-sdk/client-sqs') {
+            throw Object.assign(new Error("Cannot find package '@aws-sdk/client-sqs' imported from driver"), { code: 'ERR_MODULE_NOT_FOUND' });
+          }
+          const resolved = nextResolve(specifier, context);
+          if (resolved.url.endsWith('/drivers/sqs.ts')) {
+            sqsDriver.push(resolved.url);
+          }
+          return resolved;
+        },
+      });
+      const configs = {
+        resize: makeResizeConfig({
+          storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+          queues: {
+            default: { driver: 'database' },
+            bulk: { driver: 'sqs', queueUrl: 'https://sqs.example/bulk' },
+          },
+        }),
+      };
+      const models = [];
+      setAppInstance({
+        getConfig: (name) => configs[name] ?? {},
+        getModel: (name) => {
+          models.push(name);
+          return { findById: async () => null };
+        },
+        logger: { info() {}, warn() {}, error() {} },
+      });
+      const resizer = new FrameworkResizer();
+      const result = await resizer.prewarm({
+        media: { id: 'm1', original: { storageRef: { key: 'k' }, format: 'png' } },
         sizes: [{ width: 10, height: 10 }],
-      }),
-    conflict,
-  );
-  await assert.rejects(() => runResizeWorker(), conflict);
-  await assert.rejects(
-    () => runWorker({ signal: AbortSignal.abort() }),
-    conflict,
-  );
+        queue: 'bulk',
+      });
+      console.log(JSON.stringify({
+        status: result.status,
+        requested: result.requested.length,
+        unconfirmed: result.unconfirmed.length,
+        tasks: result.tasks.length,
+        issues: result.issues.map(({ code, retryable }) => ({ code, retryable })),
+        queue: resizer.tasks.constructor.name,
+        models,
+        sqsDriver,
+      }));
+    `,
+  ]);
+  const seen = JSON.parse(stdout);
+  assert.equal(seen.status, 'incomplete');
+  assert.ok(seen.requested > 0);
+  assert.equal(seen.unconfirmed, seen.requested);
+  assert.equal(seen.tasks, 0);
+  assert.deepEqual(seen.issues, [
+    { code: 'RESIZE_QUEUE_NOT_SERVED', retryable: false },
+  ]);
+  assert.equal(seen.queue, 'MongoTaskQueue'); // the Resizer's own queue, 'default'
+  assert.equal(seen.models.includes('ResizeTask'), false);
+  assert.deepEqual(seen.sqsDriver, []); // so no RESIZE_PEER_MISSING either
 });
 
-test('two config files with the same timing share the queue and its timing', async () => {
-  const queue = {
-    maxAttempts: 3,
-    leaseMs: 5000,
+test('an old-shape queue section fails first use, verify() and worker start with RESIZE_CONFIG_REMOVED_KEY; resolve() still never throws', async () => {
+  const { logger } = installApp({
+    resize: {
+      ...makeResizeConfig({ storage: localStorage }),
+      queue: { driver: 'database' },
+    },
+    resizeListings: makeResizeConfig({ storage: localStorage }),
+  });
+  logger.error = () => {};
+  const removed = (err: unknown) =>
+    err instanceof ResizeConfigError &&
+    err.code === 'RESIZE_CONFIG_REMOVED_KEY' &&
+    /queues: \{ default: \{ driver: 'database'/.test(err.message) &&
+    /queue: 'default'/.test(err.message);
+  const r = new FrameworkResizer();
+  await assert.rejects(() => r.ready(), removed);
+  await assert.rejects(() => r.verify(), removed);
+  const { decision } = await r.resolve({ media: withOriginal(), sizes });
+  assert.deepEqual(decision, { ready: [], missing: [] });
+  // Another Resizer's queue is looked up in resize.ts, so it fails as well.
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+  });
+  await assert.rejects(() => listings.verify(), removed);
+  await assert.rejects(() => runResizeWorker(), removed);
+});
+
+test("a file without queue uses 'default'; without a 'default' entry that is RESIZE_CONFIG_QUEUE_UNKNOWN", async () => {
+  installApp({
+    resize: makeResizeConfig({ storage: localStorage, queues: databaseQueues }),
+    resizeListings: makeResizeConfig({ storage: localStorage, queue: 'nope' }),
+  });
+  const r = new FrameworkResizer();
+  await r.ready();
+  assert.equal(r.queueName, 'default');
+  assert.ok(r.tasks instanceof MongoTaskQueue);
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+  });
+  await assert.rejects(
+    () => listings.ready(),
+    configError(
+      'RESIZE_CONFIG_QUEUE_UNKNOWN',
+      "resize config: Resizer 'listings' queues to 'nope', which `queues` in src/config/resize.ts does not define — add queues.nope, set `queue` to a defined name, or queue: false for eager only",
+    ),
+  );
+  resetResizerForTests();
+  resetAppInstance();
+
+  const { logger } = installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queues: { bulk: { driver: 'database' } },
+    }),
+  });
+  logger.error = () => {};
+  const implied = new FrameworkResizer();
+  await assert.rejects(
+    () => implied.verify(),
+    configError(
+      'RESIZE_CONFIG_QUEUE_UNKNOWN',
+      `resize config: Resizer 'default' queues to 'default' (the default when src/config/resize.ts ${OVERRIDE} sets no \`queue\`), which \`queues\` in src/config/resize.ts does not define — add queues.default, set \`queue\` to a defined name, or queue: false for eager only`,
+    ),
+  );
+  const { decision } = await implied.resolve({ media: withOriginal(), sizes });
+  assert.deepEqual(decision, { ready: [], missing: [] });
+});
+
+test('without queues a Resizer is eager only; queue: false is eager only beside queues', async () => {
+  installApp({ resize: makeResizeConfig({ storage: localStorage }) });
+  const none = new FrameworkResizer();
+  await none.verify();
+  assert.equal(none.tasks, undefined);
+  assert.equal(none.locks, undefined);
+  assert.equal(none.queueName, 'default');
+  resetResizerForTests();
+  resetAppInstance();
+
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queue: false,
+      queues: databaseQueues,
+    }),
+    resizeListings: makeResizeConfig({ storage: localStorage }),
+  });
+  const off = new FrameworkResizer();
+  await off.verify();
+  assert.equal(off.tasks, undefined);
+  assert.equal(off.locks, undefined);
+  assert.equal(off.queueName, 'default');
+  // queue: false belongs to its own file: a Resizer whose file sets no queue still queues.
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+  });
+  await listings.verify();
+  assert.ok(listings.tasks instanceof MongoTaskQueue);
+});
+
+test('tasks from code never read queues: an undefined queue name in the file is no error', async () => {
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queue: 'nope',
+      queues: databaseQueues,
+    }),
+  });
+  const tasks = new MemoryTaskQueue();
+  const own = new FrameworkResizer({ tasks });
+  await own.verify();
+  assert.equal(own.queueName, 'nope');
+  assert.equal(own.tasks, tasks);
+  const eager = new FrameworkResizer({ name: 'eager', tasks: false });
+  await eager.verify();
+  assert.equal(eager.queueName, 'nope');
+  assert.equal(eager.tasks, undefined);
+  resetResizerForTests();
+  resetAppInstance();
+
+  // Not even a broken queues section is read (the coordination comes from code too).
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queue: false,
+      queues: { default: { driver: 'redis' } } as never,
+    }),
+  });
+  const coded = new FrameworkResizer({
+    tasks: new MemoryTaskQueue(),
+    coordination: {},
+  });
+  await coded.verify();
+  assert.equal(coded.queueName, 'default');
+});
+
+test('a queueName option is readable before first use; a name from the file is RESIZE_NOT_READY until then', async () => {
+  resetAppInstance();
+  const byOption = new FrameworkResizer({ queueName: 'bulk' });
+  assert.equal(byOption.queueName, 'bulk'); // no app yet
+  const byFile = new FrameworkResizer({ name: 'file' });
+  assert.throws(
+    () => byFile.queueName,
+    (err: unknown) =>
+      err instanceof ResizeSetupError && err.code === 'RESIZE_NOT_READY',
+  );
+  installApp({
+    resize: makeResizeConfig({
+      storage: localStorage,
+      queue: 'bulk',
+      queues: { ...databaseQueues, bulk: { driver: 'database' } },
+    }),
+  });
+  await byFile.ready();
+  assert.equal(byFile.queueName, 'bulk');
+  await byOption.ready();
+  assert.equal(byOption.queueName, 'bulk');
+  assert.equal(byOption.tasks, byFile.tasks);
+});
+
+test('SQS entries with the same connection settings share one SqsTaskQueue; a different dead-letter queue is another backend', async () => {
+  const connection = {
+    driver: 'sqs' as const,
+    region: 'eu-west-1',
+    deadLetterQueueUrl: 'https://sqs.example/dead',
+  };
+  const queues: Record<string, QueueConfig> = {
+    default: { ...connection, queueUrl: 'https://sqs.example/resize' },
+    // The driver's default long poll, written out: the same backend.
+    bulk: {
+      ...connection,
+      queueUrl: 'https://sqs.example/bulk',
+      waitTimeSeconds: 10,
+    },
+    audit: {
+      ...connection,
+      queueUrl: 'https://sqs.example/audit',
+      deadLetterQueueUrl: 'https://sqs.example/dead-audit',
+    },
   };
   installApp({
-    resize: makeResizeConfig({ storage: localStorage, queue }),
-    resizeListings: makeResizeConfig({
-      storage: localStorage,
-      formats: ['webp'],
-      queue: { driver: 'database', ...queue },
-    }),
+    resize: makeResizeConfig({ storage: localStorage, queues }),
+    resizeBulk: makeResizeConfig({ storage: localStorage, queue: 'bulk' }),
+    resizeAudit: makeResizeConfig({ storage: localStorage, queue: 'audit' }),
   });
+  assert.equal(backendKey(queues.default), backendKey(queues.bulk));
+  assert.notEqual(backendKey(queues.default), backendKey(queues.audit));
   const media = new FrameworkResizer();
-  const listings = new FrameworkResizer({
-    name: 'listings',
-    configName: 'resizeListings',
+  const bulk = new FrameworkResizer({ name: 'bulk', configName: 'resizeBulk' });
+  const audit = new FrameworkResizer({
+    name: 'audit',
+    configName: 'resizeAudit',
   });
-  await media.verify();
-  await listings.verify();
-  assert.ok(media.tasks);
-  assert.equal(timingOf(media.tasks, 'default').maxAttempts, 3);
-  assert.equal(timingOf(media.tasks, 'default').leaseMs, 5000);
-});
-
-test('timing is compared only between configs that use the same task queue', async () => {
-  const withQueue = (queue: unknown) =>
-    makeResizeConfig({ storage: localStorage, queue: queue as never });
-  installApp({
-    resize: withQueue({ maxAttempts: 3 }),
-    resizeEager: withQueue({ maxAttempts: 4 }), // tasks: false in code
-    resizeOwn: withQueue({ maxAttempts: 5 }), // explicit tasks in code
-    resizeSqs: withQueue({
-      driver: 'sqs',
-      queueUrl: 'https://sqs.example/resize',
-      maxAttempts: 6,
-    }),
-    resizeOff: withQueue(false),
-  });
-  const own = new MemoryTaskQueue();
-  const media = new FrameworkResizer();
-  const eager = new FrameworkResizer({
-    name: 'eager',
-    configName: 'resizeEager',
-    tasks: false,
-  });
-  const explicit = new FrameworkResizer({
-    name: 'own',
-    configName: 'resizeOwn',
-    tasks: own,
-  });
-  const sqs = new FrameworkResizer({ name: 'sqs', configName: 'resizeSqs' });
-  const off = new FrameworkResizer({ name: 'off', configName: 'resizeOff' });
-  for (const r of [media, eager, explicit, sqs, off]) {
-    await r.verify();
-  }
-  assert.ok(media.tasks instanceof MongoTaskQueue);
-  assert.equal(timingOf(media.tasks, 'default').maxAttempts, 3);
-  assert.equal(eager.tasks, undefined);
-  assert.equal(off.tasks, undefined);
-  assert.equal(explicit.tasks, own); // an explicit queue is never shared or replaced
-  assert.ok(sqs.tasks instanceof SqsTaskQueue);
-  assert.equal(timingOf(sqs.tasks, 'default').maxAttempts, 6);
-});
-
-test('configs that select the same SQS queue share one SqsTaskQueue; another queue gets its own', async () => {
-  const sqs = (queue: Record<string, unknown>) =>
-    makeResizeConfig({
-      storage: localStorage,
-      queue: {
-        driver: 'sqs',
-        queueUrl: 'https://sqs.example/resize',
-        region: 'eu-west-1',
-        deadLetterQueueUrl: 'https://sqs.example/dead',
-        ...queue,
-      } as never,
-    });
-  installApp({
-    resize: sqs({
-      queues: {
-        bulk: 'https://sqs.example/bulk',
-        slow: 'https://sqs.example/slow',
-      },
-    }),
-    resizeListings: sqs({
-      queues: {
-        slow: 'https://sqs.example/slow',
-        bulk: 'https://sqs.example/bulk',
-      },
-    }),
-    resizeOther: sqs({ queueUrl: 'https://sqs.example/other' }),
-    resizeRegion: sqs({
-      queues: {
-        bulk: 'https://sqs.example/bulk',
-        slow: 'https://sqs.example/slow',
-      },
-      region: 'us-east-1',
-    }),
-  });
-  const media = new FrameworkResizer();
-  const listings = new FrameworkResizer({
-    name: 'listings',
-    configName: 'resizeListings',
-  });
-  const other = new FrameworkResizer({
-    name: 'other',
-    configName: 'resizeOther',
-  });
-  const region = new FrameworkResizer({
-    name: 'region',
-    configName: 'resizeRegion',
-  });
-  await Promise.all([media, listings, other, region].map((r) => r.ready()));
+  await Promise.all([media, bulk, audit].map((r) => r.ready()));
   assert.ok(media.tasks instanceof SqsTaskQueue);
-  assert.equal(listings.tasks, media.tasks);
-  assert.ok(other.tasks instanceof SqsTaskQueue);
-  assert.notEqual(other.tasks, media.tasks);
-  assert.notEqual(region.tasks, media.tasks);
+  assert.equal(bulk.tasks, media.tasks);
+  assert.ok(audit.tasks instanceof SqsTaskQueue);
+  assert.notEqual(audit.tasks, media.tasks);
+  assert.equal(media.tasks.servesQueue('bulk'), true);
+  assert.equal(media.tasks.servesQueue('audit'), false);
+  assert.equal(audit.tasks.servesQueue('audit'), true);
+  assert.equal(audit.tasks.servesQueue('default'), false);
 });
 
-test('configs that share an SQS queue with different timing conflict', async () => {
-  const sqs = (queue: Record<string, unknown>) =>
-    makeResizeConfig({
-      storage: localStorage,
-      worker: { enabled: true },
-      queue: {
-        driver: 'sqs',
-        queueUrl: 'https://sqs.example/resize',
-        ...queue,
-      } as never,
-    });
-  installApp({
-    resize: sqs({ maxAttempts: 3, waitTimeSeconds: 10 }),
-    resizeListings: sqs({ maxAttempts: 3, waitTimeSeconds: 20 }),
-  });
-  const media = new FrameworkResizer();
-  const listings = new FrameworkResizer({
-    name: 'listings',
-    configName: 'resizeListings',
-  });
-  const conflict = conflictBetween(
-    ['src/config/resize.ts', 'src/config/resizeListings.ts'],
-    ['waitTimeSeconds'],
-    ['maxAttempts'],
+test('backendKey: one database backend; SQS by region, endpoint, dead-letter queue and effective long poll', () => {
+  assert.equal(backendKey({ driver: 'database', leaseMs: 1 }), 'database');
+  const sqs = { driver: 'sqs' as const, queueUrl: 'https://sqs.example/a' };
+  assert.equal(backendKey(sqs), 'sqs:[null,null,null,10]');
+  assert.equal(
+    backendKey({
+      ...sqs,
+      queueUrl: 'https://sqs.example/b',
+      maxAttempts: 3,
+      waitTimeSeconds: 10,
+    }),
+    backendKey(sqs),
   );
-  await assert.rejects(() => listings.verify(), conflict);
-  await assert.rejects(() => media.verify(), conflict);
-  await assert.rejects(() => runResizeWorker(), conflict);
+  assert.equal(
+    backendKey({
+      ...sqs,
+      region: 'eu-west-1',
+      endpoint: 'http://localhost:4566',
+      deadLetterQueueUrl: 'https://sqs.example/dead',
+      waitTimeSeconds: 20,
+    }),
+    'sqs:["eu-west-1","http://localhost:4566","https://sqs.example/dead",20]',
+  );
 });
 
-test("an omitted SQS waitTimeSeconds equals the driver's default, so it is no conflict", async () => {
-  const sqs = (queue: Record<string, unknown>) =>
-    makeResizeConfig({
-      storage: localStorage,
-      queue: {
-        driver: 'sqs',
-        queueUrl: 'https://sqs.example/resize',
-        ...queue,
-      } as never,
-    });
-  installApp({
-    resize: sqs({}),
-    resizeListings: sqs({ waitTimeSeconds: 10 }),
+test('resetResizerForTests forgets the per-backend task queues', async () => {
+  const file = makeResizeConfig({
+    storage: localStorage,
+    queues: {
+      default: { driver: 'database', maxAttempts: 3 },
+      sqs: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+    },
   });
-  const media = new FrameworkResizer();
-  const listings = new FrameworkResizer({
-    name: 'listings',
-    configName: 'resizeListings',
-  });
-  await media.verify();
-  await listings.verify();
-  assert.ok(media.tasks instanceof SqsTaskQueue);
-  assert.equal(listings.tasks, media.tasks);
-});
-
-test('resetResizerForTests forgets the shared task queues and the configs that used them', async () => {
   installApp({
-    resize: makeResizeConfig({
-      storage: localStorage,
-      queue: { maxAttempts: 3 },
-    }),
-    resizeListings: makeResizeConfig({
-      storage: localStorage,
-      queue: { maxAttempts: 4 },
-    }),
-    resizeSqs: makeResizeConfig({
-      storage: localStorage,
-      queue: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
-    }),
+    resize: file,
+    resizeSqs: makeResizeConfig({ storage: localStorage, queue: 'sqs' }),
   });
   const first = new FrameworkResizer();
   const firstSqs = new FrameworkResizer({
@@ -944,8 +1076,14 @@ test('resetResizerForTests forgets the shared task queues and the configs that u
   assert.equal(timingOf(first.tasks, 'default').maxAttempts, 3);
 
   resetResizerForTests();
-  // A forgotten Resizer's config no longer takes part, and the queues are new objects.
-  const next = new FrameworkResizer({ configName: 'resizeListings' });
+  // The same app with a changed file: the queues are new objects built from it.
+  Object.assign(file, {
+    queues: {
+      default: { driver: 'database', maxAttempts: 4 },
+      sqs: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+    },
+  });
+  const next = new FrameworkResizer();
   const nextSqs = new FrameworkResizer({
     name: 'sqs',
     configName: 'resizeSqs',
@@ -955,5 +1093,6 @@ test('resetResizerForTests forgets the shared task queues and the configs that u
   assert.ok(next.tasks);
   assert.notEqual(next.tasks, first.tasks);
   assert.equal(timingOf(next.tasks, 'default').maxAttempts, 4);
+  assert.ok(nextSqs.tasks instanceof SqsTaskQueue);
   assert.notEqual(nextSqs.tasks, firstSqs.tasks);
 });

@@ -16,7 +16,7 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import defaultResizeConfig from '../../config/resize.ts';
-import { getResizeConfig } from '../config.ts';
+import { getProcessConfig, getResizeConfig } from '../config.ts';
 import {
   defaultFrameworkResizeConfig,
   defaultWorkerOptions,
@@ -107,23 +107,49 @@ describe('runScaffold — default run', () => {
         `${name} is imported from …/framework.js`,
       );
     }
+    assert.equal(
+      configSource.match(/from '@adaptivestone\/framework-module-resize\//g)
+        ?.length,
+      1,
+      'one import, from …/framework.js',
+    );
     assert.doesNotMatch(configSource, /config\/resize\.js/);
-    assert.match(configSource, /\.\.\.defaultFrameworkResizeConfig/);
     assert.match(
       configSource,
       /^ {2}worker: \{ \.\.\.defaultWorkerOptions, enabled: false \},$/m,
     );
     assert.match(configSource, /enabled: true[^\n]*`npm run cli ResizeWorker`/);
-    assert.match(configSource, /satisfies FrameworkResizeConfig/);
     assert.match(configSource, /storage: \{ driver: 'local'/);
-    assert.match(configSource, /^ {2}queue: \{ driver: 'database' \},$/m);
+    assert.match(configSource, /^ {2}queue: 'default',/m);
+    assert.match(
+      configSource,
+      /^ {2}queues: \{ default: \{ driver: 'database' \} \},/m,
+    );
     assert.match(
       configSource,
       /indexes[\s\S]+migration process; the module never creates them/,
     );
+    // The per-Resizer sections first, then the process-wide ones, in this order.
+    let at = -1;
+    for (const part of [
+      '...defaultFrameworkResizeConfig,',
+      "mediaModelName: 'File'",
+      "storage: { driver: 'local'",
+      "queue: 'default',",
+      '// process-wide sections, read only from this file',
+      "queues: { default: { driver: 'database' } },",
+      "// or { driver: 'sqs', queueUrl: '…' }",
+      '// coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 }',
+      'worker: { ...defaultWorkerOptions, enabled: false },',
+      '} satisfies FrameworkResizeConfig;',
+      'a resize.ts that holds only the process-wide sections (no default Resizer) writes `satisfies Partial<FrameworkResizeConfig>`',
+    ]) {
+      const next = configSource.indexOf(part, at + 1);
+      assert.ok(next > at, `${part} comes next`);
+      at = next;
+    }
 
-    assert.match(configSource, /mediaModelName: 'File'/);
-    // The template's effective config, mirrored here so it is checked by the resolver.
+    // The template's effective config, mirrored here so it is checked by the resolvers.
     const scaffoldedConfig = {
       ...defaultFrameworkResizeConfig,
       mediaModelName: 'File',
@@ -132,11 +158,11 @@ describe('runScaffold — default run', () => {
         rootDir: './var/media',
         publicBaseUrl: '/media',
       },
-      queue: { driver: 'database' as const },
+      queue: 'default',
+      queues: { default: { driver: 'database' as const } },
       worker: { ...defaultWorkerOptions, enabled: false },
     };
     assert.deepEqual(scaffoldedConfig.formats, ['jpeg', 'webp', 'avif']);
-    assert.equal(scaffoldedConfig.worker.enabled, false);
     assert.deepEqual(scaffoldedConfig.encode.formats.tiff, undefined);
 
     setAppInstance({
@@ -146,10 +172,14 @@ describe('runScaffold — default run', () => {
     } as never);
     const resolved = getResizeConfig();
     assert.equal(resolved.mediaModelName, 'File');
-    assert.strictEqual(resolved.queue, scaffoldedConfig.queue);
+    assert.equal(resolved.queue, 'default');
     assert.strictEqual(resolved.storage, scaffoldedConfig.storage);
-    assert.strictEqual(resolved.worker, scaffoldedConfig.worker);
     assert.strictEqual(resolved.image.encode, scaffoldedConfig.encode);
+    const processConfig = getProcessConfig();
+    assert.deepEqual([...processConfig.queues.keys()], ['default']);
+    assert.equal(processConfig.queues.get('default')?.backend, 'database');
+    assert.deepEqual(processConfig.worker, scaffoldedConfig.worker);
+    assert.equal(processConfig.coordination, undefined);
   });
 
   test('auto-creates missing directories', async () => {
@@ -176,12 +206,22 @@ describe('runScaffold — default run', () => {
     );
   });
 
-  test('next steps explain the queue and worker switch required to run the worker', async () => {
+  test('next steps explain the queues and the worker switch required to run the worker', async () => {
     const { out } = await run([]);
-    assert.match(out, /queue: \{ driver: 'database' \}/);
+    assert.match(out, /`queues`/);
     assert.match(out, /'sqs'/);
-    assert.match(out, /worker\.enabled: true/);
+    assert.match(out, /worker\.enabled/);
+    assert.match(
+      out,
+      /worker: \{ enabled: true \} in src\/config\/resize\.ts or an environment file/,
+    );
     assert.match(out, /for the worker to run/);
+  });
+
+  test('the usage text names queues and worker.enabled', async () => {
+    const { out } = await run(['--help']);
+    assert.match(out, /`queues`/);
+    assert.match(out, /worker\.enabled/);
   });
 });
 
@@ -310,11 +350,16 @@ describe('runScaffold — --eager', () => {
     assert.match(resizer, /new FrameworkResizer\(\{/);
     const configSource = await read(CONFIG);
     assert.match(configSource, /storage: \{ driver: 'local'[^}]*publicBaseUrl/);
-    assert.doesNotMatch(configSource, /^\s*queue:/m, 'eager: no task queue');
+    assert.doesNotMatch(configSource, /^\s*queues?:/m, 'eager: no task queue');
     assert.match(configSource, /Eager mode: no task queue/);
     assert.match(
       configSource,
-      /^import \{ defaultFrameworkResizeConfig \} from '@adaptivestone\/framework-module-resize\/framework\.js';$/m,
+      /without --eager[\s\S]+add queues: \{ default: \{ driver: 'database' \} \}/,
+      'the closing comment says how to add the queue',
+    );
+    assert.match(
+      configSource,
+      /^import \{\n {2}defaultFrameworkResizeConfig,\n {2}type FrameworkResizeConfig,\n\} from '@adaptivestone\/framework-module-resize\/framework\.js';$/m,
     );
     assert.doesNotMatch(configSource, /config\/resize\.js/);
     assert.doesNotMatch(
@@ -480,6 +525,98 @@ describe('runScaffold — --check', () => {
     );
     const { code } = await run(['--check']);
     assert.equal(code, 0);
+  });
+
+  test('--check reports an old-shape config as drift with the migration hint', async () => {
+    await run([]);
+    // What resize-scaffold wrote before 0.3.0.
+    const oldConfig = [
+      "import type { FrameworkResizeConfig } from '@adaptivestone/framework-module-resize/framework.js';",
+      "import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';",
+      '',
+      'export default {',
+      '  ...defaultFrameworkResizeConfig,',
+      "  mediaModelName: 'File',",
+      "  queue: { driver: 'database' },",
+      '} satisfies FrameworkResizeConfig;',
+      '',
+    ].join('\n');
+    const newImport = oldConfig.replace(
+      'framework-module-resize/config/resize.js',
+      'framework-module-resize/framework.js',
+    );
+    for (const [label, content] of [
+      ['the old import and a queue object', oldConfig],
+      ['a queue object', newImport],
+      ['a queue object, spaced', newImport.replace('queue: {', 'queue :{')],
+      [
+        'the old import, wrapped',
+        oldConfig
+          .replace("queue: { driver: 'database' }", "queue: 'default'")
+          .replace(
+            'import { defaultFrameworkResizeConfig } from',
+            'import {\n  defaultFrameworkResizeConfig,\n} from',
+          ),
+      ],
+    ]) {
+      await writeFile(join(root, CONFIG), content);
+      for (const flags of [['--check'], ['--check', '--eager']]) {
+        const { code, out } = await run(flags);
+        assert.equal(code, 1, `${label} ${flags.join(' ')}`);
+        assert.match(
+          out,
+          /drift\s+src\/config\/resize\.ts — uses the old config shape/,
+          label,
+        );
+        assert.ok(
+          out.includes(
+            "define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run resize-scaffold and copy your settings back",
+          ),
+          label,
+        );
+      }
+      assert.equal(
+        await read(CONFIG),
+        content,
+        '--check never rewrites the config',
+      );
+    }
+  });
+
+  test('a fresh scaffold passes --check; a commented-out old line is no drift', async () => {
+    for (const flags of [[], ['--eager']]) {
+      await rm(join(root, 'src'), { recursive: true, force: true });
+      await run([...flags, '--agents', 'skip']);
+      const fresh = await run(['--check', ...flags]);
+      assert.equal(fresh.code, 0, fresh.out);
+      assert.match(fresh.out, /ok\s+src\/config\/resize\.ts/);
+      const config = (await read(CONFIG)).replace(
+        'export default {',
+        [
+          "// import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js';",
+          'export default {',
+          "  // queue: { driver: 'database' },",
+          "    //queue:{ driver: 'sqs', queueUrl: '…' },",
+        ].join('\n'),
+      );
+      await writeFile(join(root, CONFIG), config);
+      const commented = await run(['--check', ...flags]);
+      assert.equal(commented.code, 0, commented.out);
+      assert.doesNotMatch(commented.out, /drift/);
+    }
+  });
+
+  test('no line of either config template matches the old-shape check, comments included', async () => {
+    for (const name of ['resize.config.ts.tpl', 'resize.config.eager.ts.tpl']) {
+      const source = await readFile(
+        new URL(`./templates/${name}`, import.meta.url),
+        'utf8',
+      );
+      for (const line of source.split('\n')) {
+        assert.doesNotMatch(line, /\bqueue\s*:\s*\{/, `${name}: ${line}`);
+        assert.doesNotMatch(line, /config\/resize\.js/, `${name}: ${line}`);
+      }
+    }
   });
 
   test('never creates files (empty root → exit 1, nothing written)', async () => {

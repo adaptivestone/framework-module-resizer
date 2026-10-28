@@ -3432,7 +3432,11 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.deepEqual(claimedQueues, []);
     assert.ok(
-      logs.info.some((l) => String(l[0]).includes('worker.enabled=true')),
+      logs.info.some((l) =>
+        String(l[0]).includes(
+          'set worker: { enabled: true } in src/config/resize.ts',
+        ),
+      ),
     );
   });
 

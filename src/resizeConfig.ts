@@ -25,9 +25,9 @@ const REMOVED_KEYS: Record<string, string> = {
   // Moved out of the image config: queue timing is a task-queue option, and `worker.concurrency`
   // is the top-level `concurrency`.
   queue:
-    'the task queue timing (e.g. new MongoTaskQueue({ model, timing: { leaseMs } }) or mongoParts(connection, { mediaModel, timing })); framework hosts keep `queue` in the config file',
+    'the task queue timing (e.g. new MongoTaskQueue({ model, timing: { leaseMs } }) or mongoParts(connection, { mediaModel, timing })); framework hosts define each queue in `queues` of src/config/resize.ts',
   worker:
-    '`concurrency`, and runWorker({ sharp }) for Sharp tuning; framework hosts keep `worker` in the config file',
+    '`concurrency`, and runWorker({ sharp }) for Sharp tuning; framework hosts keep `worker` in src/config/resize.ts',
 };
 
 /** Validate the complete framework-resolved config before it is consumed. */
@@ -171,7 +171,7 @@ function validateRequiredResizeConfigFields(
 }
 
 /**
- * Validate queue timing (a task queue's timing, and the framework config file's `queue` section).
+ * Validate queue timing (a task queue's timing, and each `queues` entry of a framework host).
  */
 export function validateQueueTiming(
   queue: unknown,

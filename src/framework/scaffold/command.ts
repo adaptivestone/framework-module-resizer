@@ -53,6 +53,20 @@ const COMMAND_MARKERS = [
   '../resizer',
 ];
 
+// The config shape before 0.3.0, which this version rejects: a `queue` object in each file, and
+// the defaults imported from …/config/resize.js. Commented-out lines are not checked.
+const OLD_CONFIG_SHAPE = [
+  /\bqueue\s*:\s*\{/,
+  /\bimport\s*\{[^}]*\bdefaultFrameworkResizeConfig\b[^}]*\}\s*from\s*['"]@adaptivestone\/framework-module-resize\/config\/resize\.js['"]/,
+];
+
+/** `content` without its `//` comment lines. */
+const withoutLineComments = (content: string): string =>
+  content
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('//'))
+    .join('\n');
+
 // --agents pointer: make the shipped AGENTS.md discoverable from the host's own agent file.
 // Append-only + marker-idempotent — the scaffold NEVER rewrites host-authored content.
 const AGENTS_MODES = ['agents', 'claude', 'print', 'skip'] as const;
@@ -95,7 +109,8 @@ async function fileExists(abs: string): Promise<boolean> {
 
 /**
  * The files a run emits, given the flags. Eager mode drops the model + command shims and the
- * config's queue; the construction site is the same in both modes (the config holds the drivers).
+ * config's `queue`, `queues` and `worker`; the construction site is the same in both modes (the
+ * config holds the drivers).
  */
 function planFiles(opts: { eject: boolean; eager: boolean }): FileSpec[] {
   const resizer: FileSpec = { target: RESIZER, template: 'resizer.ts.tpl' };
@@ -149,7 +164,8 @@ async function writeFiles(
 
 interface CheckItem {
   target: string;
-  // Content validator; omit → existence-only (config is meant to diverge, so it is not diffed).
+  // Content validator; omit → existence-only. The config is meant to diverge, so it is not
+  // diffed: it is checked only for the old shape.
   validate?: (content: string) => boolean;
   hint?: string; // printed after a drift line
 }
@@ -179,7 +195,14 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
       },
     );
   }
-  items.push({ target: CONFIG }); // existence only
+  items.push({
+    target: CONFIG,
+    validate: (c) => {
+      const code = withoutLineComments(c);
+      return !OLD_CONFIG_SHAPE.some((pattern) => pattern.test(code));
+    },
+    hint: "uses the old config shape — define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run resize-scaffold and copy your settings back",
+  });
 
   let failed = false;
   for (const item of items) {
@@ -244,11 +267,13 @@ Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — new FrameworkResizer({ pipelines, hooks })
   src/models/ResizeTask.ts  thin shim: class ResizeTask extends ResizeTaskModel {}
   src/commands/ResizeWorker.ts  imports src/resizer.ts and re-exports the module's worker command
-  src/config/resize.ts      media model, storage, queue and overrides (framework merges environment files)
+  src/config/resize.ts      media model, storage, the queue name, \`queues\`, \`worker\` (worker.enabled)
+                            and overrides (framework merges environment files)
 
 Options:
   --check      verify the shims exist + reference the module (and the worker command imports
-               src/resizer.ts); exit 1 on missing/drift (no writes)
+               src/resizer.ts, and src/config/resize.ts is not in the old shape: no \`queue\`
+               object); exit 1 on missing/drift (no writes)
   --eject      write the FULL editable model instead of the shim (custom fields/indexes)
   --eager      eager-mode hosts: emit only src/resizer.ts + src/config/resize.ts (local storage, no queue)
   --force      overwrite existing files (default: never overwrite)
@@ -340,7 +365,10 @@ export async function runScaffold(
       'need the Resizer (a static import is fine). The ResizeWorker command imports it too.',
     );
     console.log(
-      "Set queue: { driver: 'database' } (or 'sqs') and worker.enabled: true in src/config/resize.ts for the worker to run.",
+      "`queues` in src/config/resize.ts defines the 'default' queue (driver 'database', or 'sqs');",
+    );
+    console.log(
+      'set worker.enabled — worker: { enabled: true } in src/config/resize.ts or an environment file — for the worker to run.',
     );
   }
   return code;

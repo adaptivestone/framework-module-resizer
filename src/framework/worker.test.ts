@@ -6,7 +6,9 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import defaultResizeConfig from '../config/resize.ts';
 import { resetResizerForTests } from '../resizer.ts';
+import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { defaultWorkerOptions } from './defaults.ts';
+import { FrameworkResizer } from './resizer.ts';
 import { runResizeWorker } from './worker.ts';
 
 const installApp = (enabled: boolean) => {
@@ -34,22 +36,27 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
   });
 
-  test('the disabled message names the config file the worker read', async () => {
+  test('the worker reads worker from resize.ts, whatever file its Resizers read', async () => {
     const lines: string[] = [];
+    const asked: string[] = [];
     setAppInstance({
-      getConfig: () => ({
-        ...defaultResizeConfig,
-        mediaModelName: 'File',
-        worker: { ...defaultWorkerOptions, enabled: false },
-      }),
+      getConfig: (name: string) => {
+        asked.push(name);
+        return name === 'resize'
+          ? { worker: { enabled: false } }
+          : // Never read: a Resizer's own file holds no worker section.
+            makeResizeConfig({ worker: { enabled: true } });
+      },
       getModel: () => undefined,
       logger: { info: (m: string) => lines.push(m), warn() {}, error() {} },
     } as never);
-    await runResizeWorker({ configName: 'resizeListings' });
-    assert.match(lines.join('\n'), /src\/config\/resizeListings\.ts/);
-    lines.length = 0;
+    new FrameworkResizer({ name: 'listings', configName: 'resizeListings' });
     await runResizeWorker();
-    assert.match(lines.join('\n'), /src\/config\/resize\.ts/);
+    assert.deepEqual(asked, ['resize']);
+    assert.match(
+      lines.join('\n'),
+      /resize worker disabled — set worker: \{ enabled: true \} in src\/config\/resize\.ts \(or its resize\.<NODE_ENV>\.ts override\)/,
+    );
   });
 
   test('names the command fix when the worker process built no Resizer', async () => {

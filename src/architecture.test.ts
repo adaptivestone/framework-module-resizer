@@ -17,6 +17,7 @@ const CORE_FILES = sourceFiles().filter(
 );
 const GLOBAL_LOOKUPS = new Set([
   'getApp',
+  'getProcessConfig',
   'getResizeConfig',
   'getResizer',
   'listResizers',
