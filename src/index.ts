@@ -60,11 +60,6 @@ export {
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
-// --- optional `as const` media schema fragment the host spreads into File/Media ---
-export {
-  resizeMediaPaths,
-  resizeMediaSchemaFragment,
-} from './mediaFragment.ts';
 // --- core: the Resizer + named lookup (constructor-wired; one per name) ---
 // `resetResizerForTests` is a TEST-ONLY escape hatch for host test suites.
 export type { ResizerOptions } from './resizer.ts';

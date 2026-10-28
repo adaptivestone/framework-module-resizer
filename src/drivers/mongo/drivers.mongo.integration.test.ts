@@ -4,7 +4,6 @@ import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
 import { timingOf } from '../../timing.ts';
 import {
   createResizeModels,
@@ -14,6 +13,7 @@ import {
   mongoParts,
   resizeLockFields,
 } from './index.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 
 let server: MongoMemoryServer;
 let connection: mongoose.Connection;

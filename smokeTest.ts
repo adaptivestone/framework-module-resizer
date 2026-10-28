@@ -42,8 +42,6 @@ const expected = [
   'getSizeKey',
   'isCatalogCovered',
   'parseSizeKey',
-  'resizeMediaPaths',
-  'resizeMediaSchemaFragment',
   'ResizeError',
   'ResizeSetupError',
   'ResizeConfigError',
@@ -126,6 +124,8 @@ const safe = [
   ['/drivers/mongo.js', 'MongoLockStore'],
   ['/drivers/mongo.js', 'MongoTaskQueue'],
   ['/drivers/mongo.js', 'createResizeModels'],
+  ['/drivers/mongo.js', 'resizeMediaSchemaFragment'],
+  ['/drivers/mongo.js', 'resizeMediaPaths'],
   ['/drivers/fs.js', 'LocalFsStorage'],
   ['/framework.js', 'FrameworkMediaStore'],
   ['/framework.js', 'FrameworkLockStore'],
@@ -134,6 +134,8 @@ const safe = [
   ['/framework.js', 'ResizeWorker'],
   ['/framework.js', 'FrameworkResizer'],
   ['/framework.js', 'runResizeWorker'],
+  ['/framework.js', 'resizeMediaSchemaFragment'],
+  ['/framework.js', 'resizeMediaPaths'],
 ];
 for (const [sub, exp] of safe) {
   const m = await import(PKG + sub);
@@ -148,6 +150,8 @@ const expectedFramework = [
   'FrameworkResizer',
   'ResizeTaskModel',
   'ResizeWorker',
+  'resizeMediaPaths',
+  'resizeMediaSchemaFragment',
   'runResizeWorker',
 ];
 assert.deepEqual(
@@ -285,7 +289,18 @@ import {
   MongoMediaStore,
   MongoTaskQueue,
   mongoParts,
+  resizeMediaPaths,
+  resizeMediaSchemaFragment,
 } from '@adaptivestone/framework-module-resize/drivers/mongo.js';
+
+// A host media model's schema spreads the fragment next to its own fields; the declarations keep
+// the literal leaf types a typed schema needs.
+const mediaSchema: {
+  name: { type: StringConstructor };
+  original: { storageRef: { type: 'Mixed' }; width: { type: NumberConstructor } };
+  previews: readonly { identity: { type: StringConstructor } }[];
+} = { name: { type: String }, ...resizeMediaSchemaFragment };
+const mediaPaths: readonly ['original', 'previews'] = resizeMediaPaths;
 
 class MemoryMedia extends MediaStore {
   async loadMedia(): Promise<null> { return null; }
@@ -319,6 +334,8 @@ void [
   MongoLockStore,
   MongoTaskQueue,
   mongoParts,
+  mediaSchema,
+  mediaPaths,
 ];
 
 type Equal<A, B> =

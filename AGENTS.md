@@ -166,7 +166,7 @@ gets the full box its steps were written for. To hand the private original to it
    instead of hand-writing those fields (single source of truth for schema + types):
 
    ```ts
-   import { resizeMediaSchemaFragment } from '@adaptivestone/framework-module-resize';
+   import { resizeMediaSchemaFragment } from '@adaptivestone/framework-module-resize/framework.js';
    // in the model:
    // static get modelSchema() { return { ...ownFields, ...resizeMediaSchemaFragment } as const; }
    ```
@@ -344,7 +344,7 @@ try {
 Listing queries:
 
 ```ts
-import { resizeMediaPaths } from '@adaptivestone/framework-module-resize';
+import { resizeMediaPaths } from '@adaptivestone/framework-module-resize/framework.js';
 File.find().select(['mediaType', ...resizeMediaPaths]);
 ```
 

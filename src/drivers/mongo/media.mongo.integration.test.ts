@@ -6,9 +6,9 @@ import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeSetupError } from '../../errors.ts';
-import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
 import type { Preview } from '../../types.d.ts';
 import { MongoMediaStore, type MongoMediaStoreOptions } from './index.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 
 let server: MongoMemoryServer;
 let connection: mongoose.Connection;

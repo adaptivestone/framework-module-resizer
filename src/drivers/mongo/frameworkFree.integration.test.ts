@@ -11,10 +11,10 @@ import defaultResizeConfig from '../../config/resize.ts';
 import type { MediaStore } from '../../contracts/media.ts';
 import type { ResizeStorage } from '../../contracts/storage.ts';
 import { Resizer, resetResizerForTests } from '../../index.ts';
-import { resizeMediaSchemaFragment } from '../../mediaFragment.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { runWorker } from '../../worker.ts';
 import { mongoParts } from './index.ts';
+import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 
 const png = await sharp({
   create: { width: 64, height: 48, channels: 3, background: '#3366cc' },
