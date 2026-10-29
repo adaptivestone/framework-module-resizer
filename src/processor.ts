@@ -135,28 +135,46 @@ function lacksMediaId(err: unknown): err is ResizeMediaError {
   return (
     ResizeError.isResizeError(err) &&
     hasErrorClass(err, MEDIA_ERROR) &&
-    (err as { mediaId?: unknown }).mediaId === undefined
+    fieldOf(err, 'mediaId') === undefined
   );
 }
 
 /**
  * The media error, naming its media. The error itself gets the media id (and its message the id),
  * so its class, private state and methods stay as they are. An error that cannot take it (frozen,
- * sealed, a read-only field) is wrapped instead: a plain ResizeMediaError with its code and
- * `retryable`, and the error as its cause.
+ * sealed, a read-only field, a host setter or getter that throws) is wrapped instead: a plain
+ * ResizeMediaError with its code and `retryable`, and the error as its cause.
  */
 function withMediaId(err: ResizeMediaError, mediaId: string): ResizeMediaError {
-  const message = `${err.message} (media ${mediaId})`;
-  if (Reflect.set(err, 'mediaId', mediaId) && err.mediaId === mediaId) {
-    Reflect.set(err, 'message', message);
-    return err;
+  try {
+    if (Reflect.set(err, 'mediaId', mediaId) && err.mediaId === mediaId) {
+      Reflect.set(err, 'message', `${err.message} (media ${mediaId})`);
+      return err;
+    }
+  } catch {
+    // The host's own accessor threw: the error is wrapped below, whatever it was.
   }
-  return new ResizeMediaError(message, {
-    mediaId,
-    code: err.code,
-    retryable: err.retryable,
-    cause: err,
-  });
+  const message = fieldOf(err, 'message');
+  const code = fieldOf(err, 'code');
+  const retryable = fieldOf(err, 'retryable');
+  return new ResizeMediaError(
+    `${typeof message === 'string' ? message : 'resize: the decoder refused the source'} (media ${mediaId})`,
+    {
+      mediaId,
+      ...(typeof code === 'string' ? { code } : {}),
+      ...(typeof retryable === 'boolean' ? { retryable } : {}),
+      cause: err,
+    },
+  );
+}
+
+/** A field of a host error, or undefined when reading it throws. */
+function fieldOf(err: object, key: string): unknown {
+  try {
+    return Reflect.get(err, key);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

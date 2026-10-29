@@ -220,13 +220,17 @@ test('render with an aborted signal starts no process and fails as an aborted re
 });
 
 test('svgRasterDensity picks a density whose rendered sides fit the pixel budget', async () => {
-  const opts = { inputPixels: 1000, timeoutSeconds: 5 };
-  for (const [width, height, pixelBudget, largestScale] of [
-    [10, 11, 150, 2],
-    [10, 10, 213, 3],
-    [10, 10, 100, 1],
+  const opts = { timeoutSeconds: 5 };
+  // [markup width, markup height, estimated width, estimated height, budget, scale]. The last two
+  // rows give a 10.4-pixel SVG whose natural size is estimated low (10) or right (10.4).
+  for (const [svgW, svgH, width, height, pixelBudget, largestScale] of [
+    [10, 11, 10, 11, 150, 2],
+    [10, 10, 10, 10, 213, 3],
+    [10, 10, 10, 10, 100, 1],
+    [10.4, 10.4, 10, 10, 841, 3],
+    [10.4, 10.4, 10.4, 10.4, 420, 3],
   ]) {
-    const svg = sizedSvg(width, height);
+    const svg = sizedSvg(svgW, svgH);
     const density = await svgRasterDensity(svg, width, height, {
       ...opts,
       pixelBudget,

@@ -26,7 +26,6 @@ async function densityFor(
 ): Promise<number> {
   const density = await svgRasterDensity(bytes, width, height, {
     pixelBudget: Math.min(limits.sourcePixels, limits.inputPixels),
-    inputPixels: limits.inputPixels,
     timeoutSeconds: limits.processingTimeoutSeconds,
     largestScale,
   });

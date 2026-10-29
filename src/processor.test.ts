@@ -1091,6 +1091,18 @@ describe('decoding the source', () => {
       limits: { sourcePixels: 213 },
       width: 30,
     },
+    {
+      name: '10.4×10.4 at sourcePixels 420',
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10.4" height="10.4"><rect width="10.4" height="10.4" fill="red"/></svg>',
+      limits: { sourcePixels: 420, inputPixels: 1000 },
+      width: 30,
+    },
+    {
+      name: '10.4×10.4 at sourcePixels 841',
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10.4" height="10.4"><rect width="10.4" height="10.4" fill="red"/></svg>',
+      limits: { sourcePixels: 841, inputPixels: 1000 },
+      width: 30,
+    },
   ]) {
     test(`an SVG whose rounded raster would pass the pixel budget renders within it (${name}), eager and queued`, async () => {
       const recording = new RecordingDecoder(new SvgDecoder());
@@ -1227,6 +1239,44 @@ describe('decoding the source', () => {
         assert.equal(err.cause, frozen);
         assert.match(err.message, /host: frozen refusal \(media m1\)/);
         assert.equal(frozen.mediaId, undefined);
+        return true;
+      },
+    );
+  });
+
+  test('a media error whose mediaId setter throws becomes a plain ResizeMediaError with it as cause', async () => {
+    class HostGuardedError extends ResizeMediaError {}
+    const guarded = new HostGuardedError('host: guarded refusal', {
+      code: 'HOST_GUARDED',
+      retryable: false,
+    });
+    Object.defineProperty(guarded, 'mediaId', {
+      configurable: true,
+      get: () => undefined,
+      set: () => {
+        throw new Error('host: mediaId is set by the host only');
+      },
+    });
+    const recording = new RecordingDecoder(new SharpDecoder());
+    recording.rejectWith = guarded;
+    const { deps, media } = decodeDeps(redPng, {
+      decoders: createDecoderSet([recording]),
+    });
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => {
+        assert.notEqual(err, guarded);
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.name, 'ResizeMediaError');
+        assert.equal(err.mediaId, 'm1');
+        assert.equal(err.code, 'HOST_GUARDED');
+        assert.equal(err.retryable, false);
+        assert.equal(err.cause, guarded);
+        assert.match(err.message, /host: guarded refusal \(media m1\)/);
+        assert.equal(guarded.message, 'host: guarded refusal');
         return true;
       },
     );
