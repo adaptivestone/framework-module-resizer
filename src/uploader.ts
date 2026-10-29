@@ -1,12 +1,14 @@
-// Stores an original as uploaded. Sharp only reads its metadata to check the upload rules; the
-// bytes go to storage unchanged. It needs only the storage and the image config; it creates no
-// media, queues no work and logs nothing.
-import sharp, { type Metadata } from 'sharp';
+// Stores an original as uploaded. The decoders measure it (format, size, frames) to check the
+// upload rules; the bytes go to storage unchanged. It needs only the storage, the decoders and the
+// image config; it creates no media, queues no work and logs nothing.
 import type { ResizeStorage } from './contracts/storage.ts';
-import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
-import { isAvifBuffer } from './helpers/imageFormat.ts';
+import type { DecoderSet, IdentifiedSource } from './decoderSet.ts';
+import {
+  ResizeError,
+  ResizeOriginalError,
+  ResizeStorageError,
+} from './errors.ts';
 import { randomHex } from './helpers/random.ts';
-import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
 import type {
   Original,
   OriginalFormat,
@@ -15,132 +17,94 @@ import type {
   UploadOriginalOpts,
 } from './types.d.ts';
 
-interface PreparedOriginal {
+interface IdentifiedOriginal {
   format: OriginalFormat;
   contentType: string;
   extension: string;
-  width?: number;
-  height?: number;
+  width: number;
+  height: number;
 }
 
-function originalStorageInfo(format: string): {
-  contentType: string;
-  extension: string;
-} {
-  return {
-    contentType: format === 'svg' ? 'image/svg+xml' : `image/${format}`,
-    extension: format === 'jpeg' ? 'jpg' : format,
-  };
-}
+/** The upload codes of the decoder codes that say what is wrong with the original. */
+const ORIGINAL_CODES = new Map([
+  ['RESIZE_SOURCE_FORMAT_UNSUPPORTED', 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED'],
+  ['RESIZE_SOURCE_METADATA_MISSING', 'RESIZE_ORIGINAL_METADATA_MISSING'],
+  // The SVG decoder checks limits.sourcePixels itself, before its density probe.
+  ['RESIZE_SOURCE_TOO_LARGE', 'RESIZE_ORIGINAL_TOO_MANY_PIXELS'],
+]);
 
 function asBuffer(body: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(body) ? body : Buffer.from(body);
 }
 
-function displayDimensions(metadata: Metadata): {
-  width?: number;
-  height?: number;
-} {
-  if (metadata.width === undefined || metadata.height === undefined) {
-    return {};
-  }
-  const height = metadata.pageHeight ?? metadata.height;
-  return (metadata.orientation ?? 1) >= 5
-    ? { width: height, height: metadata.width }
-    : { width: metadata.width, height };
-}
-
-async function prepareOriginal(
-  body: Buffer,
-  config: ResizeConfig,
-): Promise<PreparedOriginal> {
-  let metadata: Metadata;
-  try {
-    metadata = await sharp(body, {
-      limitInputPixels: config.limits.inputPixels,
-      animated: true,
-    })
-      .timeout({ seconds: config.limits.processingTimeoutSeconds })
-      .metadata();
-  } catch (cause) {
-    throw new ResizeOriginalError(
+/**
+ * What a decoder rejected the original with, as an upload error. A setup or config error is a
+ * wiring bug, not an invalid original, and passes through unchanged; the class is told by the brand
+ * and the name, so an error from a duplicate copy of the package counts too.
+ */
+function originalError(cause: unknown): ResizeError {
+  if (!ResizeError.isResizeError(cause)) {
+    return new ResizeOriginalError(
       'resize uploadOriginal: bytes are not a supported image',
       { code: 'RESIZE_ORIGINAL_INVALID', cause },
     );
   }
+  if (cause.name === 'ResizeSetupError' || cause.name === 'ResizeConfigError') {
+    return cause;
+  }
+  const code = ORIGINAL_CODES.get(cause.code);
+  return code === undefined
+    ? new ResizeOriginalError(cause.message, {
+        code: cause.code,
+        retryable: cause.retryable,
+        cause,
+      })
+    : new ResizeOriginalError(cause.message, { code, cause });
+}
 
-  if (!metadata.format) {
-    throw new ResizeOriginalError(
-      'resize uploadOriginal: Sharp did not identify the image format',
-      { code: 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED' },
-    );
+async function identifyOriginal(
+  decoders: DecoderSet,
+  body: Buffer,
+  config: ResizeConfig,
+): Promise<IdentifiedOriginal> {
+  let identified: IdentifiedSource;
+  try {
+    identified = await decoders.identify(body, config.limits);
+  } catch (cause) {
+    throw originalError(cause);
   }
-  const format: OriginalFormat =
-    metadata.format === 'heif' && isAvifBuffer(body) ? 'avif' : metadata.format;
-  if (metadata.width === undefined || metadata.height === undefined) {
+  const { info } = identified;
+  const pages = info.pages ?? 1;
+  if (info.width * info.height * pages > config.limits.sourcePixels) {
     throw new ResizeOriginalError(
-      'resize uploadOriginal: image metadata is missing width/height',
-      { code: 'RESIZE_ORIGINAL_METADATA_MISSING' },
-    );
-  }
-  const pages = metadata.pages ?? 1;
-  // animated:true reports a stacked height; count each frame only once.
-  const frameHeight = metadata.pageHeight ?? metadata.height;
-  if (metadata.width * frameHeight * pages > config.limits.sourcePixels) {
-    throw new ResizeOriginalError(
-      `resize uploadOriginal: image ${metadata.width}x${frameHeight}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
+      `resize uploadOriginal: image ${info.width}x${info.height}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
       { code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' },
     );
   }
-  if (format === 'svg') {
-    let density: number | undefined;
-    try {
-      const natural = await svgNaturalSize(
-        body,
-        metadata.width,
-        metadata.height,
-        config.limits.inputPixels,
-        config.limits.processingTimeoutSeconds,
-      );
-      density = await svgRasterDensity(body, natural.width, natural.height, {
-        pixelBudget: Math.min(
-          config.limits.sourcePixels,
-          config.limits.inputPixels,
-        ),
-        inputPixels: config.limits.inputPixels,
-        timeoutSeconds: config.limits.processingTimeoutSeconds,
-      });
-    } catch (cause) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: SVG dimensions could not be inspected',
-        { code: 'RESIZE_ORIGINAL_INVALID', cause },
-      );
-    }
-    if (density === undefined) {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: SVG dimensions cannot be rasterized within the renderer limits',
-        { code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED', retryable: false },
-      );
-    }
-  }
   return {
-    format,
-    ...originalStorageInfo(format),
-    ...displayDimensions(metadata),
+    format: info.format,
+    contentType: info.contentType,
+    extension: info.format === 'jpeg' ? 'jpg' : info.format,
+    // A vector source may report a fractional natural size.
+    width: Math.max(1, Math.round(info.width)),
+    height: Math.max(1, Math.round(info.height)),
   };
 }
 
 export interface UploaderDeps {
   storage: ResizeStorage;
+  decoders: DecoderSet;
   config: ResizeConfig;
 }
 
 export class Uploader {
   readonly #storage: ResizeStorage;
+  readonly #decoders: DecoderSet;
   readonly #config: ResizeConfig;
 
   constructor(deps: UploaderDeps) {
     this.#storage = deps.storage;
+    this.#decoders = deps.decoders;
     this.#config = deps.config;
   }
 
@@ -174,7 +138,7 @@ export class Uploader {
         { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
       );
     }
-    const prepared = await prepareOriginal(body, config);
+    const prepared = await identifyOriginal(this.#decoders, body, config);
     if (!config.upload.formats.includes(prepared.format)) {
       throw new ResizeOriginalError(
         `resize uploadOriginal: format ${prepared.format} is disabled by upload.formats`,
@@ -214,8 +178,8 @@ export class Uploader {
       format: prepared.format,
       contentType: prepared.contentType,
       size: body.byteLength,
-      ...(prepared.width !== undefined ? { width: prepared.width } : {}),
-      ...(prepared.height !== undefined ? { height: prepared.height } : {}),
+      width: prepared.width,
+      height: prepared.height,
     };
   }
 }

@@ -204,7 +204,6 @@ test('only the allowed shipped files import sharp', () => {
     'helpers/svgRasterChild.ts',
     'raster.ts',
     'render.ts',
-    'uploader.ts', // until the Uploader measures through the decoders
     'worker.ts', // sharp.concurrency and sharp.cache
   ];
   const importers = sourceFiles().filter((f) =>

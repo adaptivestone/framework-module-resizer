@@ -409,7 +409,11 @@ export class Resizer {
       const catalog = new Catalog({ config });
       this.#builtServices = {
         catalog,
-        uploader: new Uploader({ storage, config }),
+        uploader: new Uploader({
+          storage,
+          decoders: this.#decoders,
+          config,
+        }),
         reader: this.#buildReader(catalog),
         processor: new Processor({
           catalog,

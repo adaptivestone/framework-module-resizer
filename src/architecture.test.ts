@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { sourceFiles } from './testHelpers/imports.ts';
+import { localImports, sourceFiles } from './testHelpers/imports.ts';
 
 const CORE_FILES = sourceFiles().filter(
   (f) =>
@@ -142,4 +142,25 @@ test('generatePreviews is gone', () => {
 
 test('the Processor has no SVG branch', () => {
   assert.equal(read('processor.ts').includes("'svg'"), false);
+});
+
+// SVG markup is untrusted: only the SVG decoder measures and renders it, so no other file reaches
+// the SVG helpers.
+test('only the SVG decoder imports the SVG helpers', () => {
+  const helpers = ['helpers/svgDimensions.ts', 'helpers/svgRaster.ts'];
+  const svgImports = localImports('decoders/svg.ts', { types: true });
+  assert.ok(
+    helpers.every((h) => svgImports.includes(h)),
+    'sanity check: the listing does see decoders/svg.ts importing the SVG helpers',
+  );
+  assert.deepEqual(
+    sourceFiles()
+      .filter((f) => f !== 'decoders/svg.ts')
+      .flatMap((f) =>
+        localImports(f, { types: true })
+          .filter((t) => helpers.includes(t))
+          .map((t) => `${f} → ${t}`),
+      ),
+    [],
+  );
 });
