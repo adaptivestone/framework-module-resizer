@@ -145,6 +145,20 @@ export async function readRaster(img: Sharp): Promise<Raster> {
 
 /** Reads a Sharp-based beforeStep's result back as a one-frame sRGB raster. */
 export async function sharpToRaster(img: Sharp): Promise<Raster> {
+  // The input's own frames, before any resize: stacked frames (a page height below the height)
+  // were loaded, whatever size the output has. A still opened with a page count, or one page of an
+  // animation, has no page height below its height (ruling: one frame is one frame).
+  const input = await img.metadata();
+  if (
+    input.pageHeight !== undefined &&
+    input.height !== undefined &&
+    input.height > input.pageHeight
+  ) {
+    throw new ResizeSetupError(
+      `resize: a beforeStep must return one frame, not ${Math.round(input.height / input.pageHeight)} stacked frames`,
+      { code: 'RESIZE_PIPELINE_STEP_INVALID' },
+    );
+  }
   const { raster, problem, stalePageHeight } = await rawOutput(
     img.toColorspace('srgb'),
   );

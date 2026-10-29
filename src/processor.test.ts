@@ -1164,6 +1164,74 @@ describe('decoding the source', () => {
     assert.equal(uploads.length, 0);
   });
 
+  test('a host media error with private state is annotated in place: the same object, its methods working', async () => {
+    class HostPageError extends ResizeMediaError {
+      readonly #detail: string;
+      constructor(detail: string) {
+        super('host: page unreadable', {
+          code: 'HOST_PAGE',
+          retryable: false,
+        });
+        this.#detail = detail;
+      }
+      detail(): string {
+        return this.#detail;
+      }
+    }
+    const thrown = new HostPageError('page 3 is encrypted');
+    const recording = new RecordingDecoder(new SharpDecoder());
+    recording.rejectWith = thrown;
+    const { deps, media } = decodeDeps(redPng, {
+      decoders: createDecoderSet([recording]),
+    });
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => {
+        assert.equal(err, thrown);
+        assert.equal(thrown.detail(), 'page 3 is encrypted');
+        assert.equal(thrown.mediaId, 'm1');
+        assert.equal(thrown.name, 'HostPageError');
+        assert.match(thrown.message, /host: page unreadable \(media m1\)/);
+        return true;
+      },
+    );
+  });
+
+  test('a frozen media error from a decoder becomes a plain ResizeMediaError with it as cause', async () => {
+    const frozen = Object.freeze(
+      new ResizeMediaError('host: frozen refusal', {
+        code: 'HOST_FROZEN',
+        retryable: false,
+      }),
+    );
+    const recording = new RecordingDecoder(new SharpDecoder());
+    recording.rejectWith = frozen;
+    const { deps, media } = decodeDeps(redPng, {
+      decoders: createDecoderSet([recording]),
+    });
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => {
+        assert.notEqual(err, frozen);
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.name, 'ResizeMediaError');
+        assert.equal(err.mediaId, 'm1');
+        assert.equal(err.code, 'HOST_FROZEN');
+        assert.equal(err.retryable, false);
+        assert.equal(err.cause, frozen);
+        assert.match(err.message, /host: frozen refusal \(media m1\)/);
+        assert.equal(frozen.mediaId, undefined);
+        return true;
+      },
+    );
+  });
+
   test("a host decoder's ResizeMediaError subclass keeps its class and name, and gains the media id", async () => {
     class HostDecodeError extends ResizeMediaError {}
     const recording = new RecordingDecoder(new SharpDecoder());
@@ -1187,7 +1255,7 @@ describe('decoding the source', () => {
         assert.equal(err.retryable, false);
         assert.equal(ResizeError.isResizeError(err), true);
         assert.match(err.message, /host: page is encrypted \(media m1\)/);
-        assert.equal(err.cause, recording.rejectWith);
+        assert.equal(err, recording.rejectWith);
         return true;
       },
     );
@@ -1224,6 +1292,24 @@ describe('decoding the source', () => {
     assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
     assert.equal(err.mediaId, 'm1');
     assert.match(err.message, /\(media m1\)$/);
+  });
+
+  test('JPEG bytes stored as png render as jpeg, with a warning naming both formats', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(plainJpeg, {
+      logger,
+      original: { format: 'png' },
+    });
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.equal(created.length, 1);
+    assert.equal(logs.warn.length, 1);
+    assert.match(
+      String(logs.warn[0][0]),
+      /media m1 is stored as 'png' but its bytes are 'jpeg' \(its decoder read another of its formats\); rendering it as 'jpeg'/,
+    );
   });
 
   test('a host decoder that lists the stored format and refuses: the warning names the decoders, not two equal formats', async () => {

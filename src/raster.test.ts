@@ -171,3 +171,27 @@ test('rasterToSharp rejects a value that is not a Raster with RESIZE_PIPELINE_ST
     },
   );
 });
+
+test('sharpToRaster rejects stacked frames resized to the old page height', async () => {
+  const stacked: Raster = {
+    data: Buffer.alloc(20 * 20 * 3 * 3),
+    info: { width: 20, height: 20, channels: 3, frames: 3 },
+  };
+  await assert.rejects(
+    sharpToRaster(rasterToSharp(stacked).resize(10, 20)),
+    (err) => {
+      assert.ok(ResizeError.isResizeError(err));
+      assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
+      assert.match((err as Error).message, /one frame/);
+      return true;
+    },
+  );
+});
+
+test('sharpToRaster accepts the first page of an animation opened without its other frames', async () => {
+  const gif = await threeFrameGif();
+  const first = await sharpToRaster(sharp(gif));
+  assert.equal(first.info.width, 20);
+  assert.equal(first.info.height, 20);
+  assert.equal(first.info.frames, undefined);
+});

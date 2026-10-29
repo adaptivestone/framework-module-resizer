@@ -115,6 +115,20 @@ test('a stored format picks its decoder first, without asking the others', async
   assert.equal(other.calls, 0);
 });
 
+test('a stored format whose decoder reads the bytes as another of its formats reports the mismatch', async () => {
+  const raster = fake(['png', 'jpeg'], { format: 'jpeg' });
+  const other = fake(['gif'], 'accept');
+  const result = await new DecoderSet([raster, other]).identify(
+    bytes,
+    limits,
+    'png',
+  );
+  assert.equal(result.decoder, raster);
+  assert.equal(result.info.format, 'jpeg');
+  assert.deepEqual(result.mismatch, { stored: 'png', reason: 'other-format' });
+  assert.equal(other.calls, 0);
+});
+
 test('a stored format no decoder lists falls back to the probe and reports the mismatch', async () => {
   const second = fake(['jpeg'], 'accept');
   const result = await new DecoderSet([

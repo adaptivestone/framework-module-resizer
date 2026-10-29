@@ -15,10 +15,14 @@ export interface IdentifiedSource {
   decoder: SourceDecoder;
   info: SourceInfo;
   /**
-   * Set when a stored format was given and the probe chose the decoder: no decoder lists the
-   * stored format (`unlisted`), or the decoder that lists it refused the bytes (`refused`).
+   * Set when a stored format was given and the bytes are not simply that format: no decoder lists
+   * the stored format (`unlisted`), the decoder that lists it refused the bytes (`refused`), or
+   * that decoder read them as another of its formats (`other-format`).
    */
-  mismatch?: { stored: string; reason: 'unlisted' | 'refused' };
+  mismatch?: {
+    stored: string;
+    reason: 'unlisted' | 'refused' | 'other-format';
+  };
 }
 
 /** A decoder saying "these bytes are not my format": the next decoder is asked. */
@@ -101,10 +105,14 @@ export class DecoderSet {
     let refusal: unknown;
     if (listed !== undefined) {
       try {
-        return {
-          decoder: listed,
-          info: await inspectChecked(listed, bytes, limits),
-        };
+        const info = await inspectChecked(listed, bytes, limits);
+        return info.format === storedFormat
+          ? { decoder: listed, info }
+          : {
+              decoder: listed,
+              info,
+              mismatch: { stored: storedFormat, reason: 'other-format' },
+            };
       } catch (err) {
         if (!isRefusal(err)) {
           throw err;

@@ -35,6 +35,7 @@ import {
   ResizeStorageError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
+import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import type { HookBus } from './hooks.ts';
@@ -127,25 +128,35 @@ function formatNotConfiguredError(formats: string[]): ResizeSetupError {
   );
 }
 
+const MEDIA_ERROR: ReadonlySet<string> = new Set(['ResizeMediaError']);
+
+/** A module media error (or a subclass of one, told by name) that does not know its media yet. */
+function lacksMediaId(err: unknown): err is ResizeMediaError {
+  return (
+    ResizeError.isResizeError(err) &&
+    hasErrorClass(err, MEDIA_ERROR) &&
+    (err as { mediaId?: unknown }).mediaId === undefined
+  );
+}
+
 /**
- * A copy of a media error that names its media: the same prototype (so its class, `name`, code,
- * `retryable` and the host's own fields stay), the media id added, and the error itself as cause.
+ * The media error, naming its media. The error itself gets the media id (and its message the id),
+ * so its class, private state and methods stay as they are. An error that cannot take it (frozen,
+ * sealed, a read-only field) is wrapped instead: a plain ResizeMediaError with its code and
+ * `retryable`, and the error as its cause.
  */
-function withMediaId(err: ResizeError, mediaId: string): ResizeError {
-  const copy: ResizeError = Object.create(Object.getPrototypeOf(err));
-  const value = (v: unknown, enumerable: boolean): PropertyDescriptor => ({
-    value: v,
-    writable: true,
-    configurable: true,
-    enumerable,
+function withMediaId(err: ResizeMediaError, mediaId: string): ResizeMediaError {
+  const message = `${err.message} (media ${mediaId})`;
+  if (Reflect.set(err, 'mediaId', mediaId) && err.mediaId === mediaId) {
+    Reflect.set(err, 'message', message);
+    return err;
+  }
+  return new ResizeMediaError(message, {
+    mediaId,
+    code: err.code,
+    retryable: err.retryable,
+    cause: err,
   });
-  Object.defineProperties(copy, {
-    ...Object.getOwnPropertyDescriptors(err),
-    message: value(`${err.message} (media ${mediaId})`, false),
-    mediaId: value(mediaId, true),
-    cause: value(err, false),
-  });
-  return copy;
 }
 
 /**
@@ -154,10 +165,10 @@ function withMediaId(err: ResizeError, mediaId: string): ResizeError {
  * is RESIZE_SOURCE_DECODE_FAILED with the original error as its cause (retried).
  */
 function sourceError(err: unknown, mediaId: string): unknown {
+  if (lacksMediaId(err)) {
+    return withMediaId(err, mediaId);
+  }
   if (ResizeError.isResizeError(err)) {
-    if ('mediaId' in err && err.mediaId === undefined) {
-      return withMediaId(err, mediaId);
-    }
     return err;
   }
   const message = err instanceof Error ? err.message : String(err);
@@ -208,7 +219,9 @@ async function loadSource(
       const why =
         mismatch.reason === 'unlisted'
           ? 'no decoder lists the stored format'
-          : 'its decoder refused the bytes';
+          : mismatch.reason === 'refused'
+            ? 'its decoder refused the bytes'
+            : 'its decoder read another of its formats';
       logger.warn(
         `resize worker: media ${mediaId} is stored as '${mismatch.stored}' but its bytes are '${info.format}' (${why}); rendering it as '${info.format}'`,
       );
@@ -798,11 +811,7 @@ export class Processor {
         // A media error from the pixel work (an SVG output) does not know its media: add it.
         logger.error(
           `resize worker: variant ${plan.identity} failed for media ${mediaId}`,
-          ResizeError.isResizeError(err) &&
-            'mediaId' in err &&
-            err.mediaId === undefined
-            ? withMediaId(err, mediaId)
-            : err,
+          lacksMediaId(err) ? withMediaId(err, mediaId) : err,
         );
         failedCount += 1;
       }
