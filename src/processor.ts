@@ -3,7 +3,9 @@
 //   - generate()    = the core for eager `resizer.generate`
 // The steps (download once → metadata guards → an SVG rendered once to a raster → beforeSteps
 // once, after an orientation normalize → decode once + bounded per-variant resize/encode/upload →
-// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers,
+// one appendPreviews) live in #generatePreviews(); the persist step and its reconciliation of
+// what the media store kept are a PreviewRecorder's (previewRecorder.ts), and the Processor fires
+// onPreviewGenerated over the rows it kept. The Processor also fires the task observers,
 // and invalidate() removes stored previews for `resizer.invalidate` (one media store write).
 // It takes no locks: the queue leases a task to one worker at a time, the lease token fences the
 // task's writes, and the media store keeps one row per preview identity when an expired lease lets
@@ -42,6 +44,7 @@ import {
   requireMediaId,
 } from './images.ts';
 import type { PipelineRegistry } from './pipelines.ts';
+import { PreviewRecorder } from './previewRecorder.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
@@ -132,19 +135,6 @@ function withoutVisibleLoss(img: Sharp, format: string | undefined): Sharp {
   }
 }
 
-/** Uploaded locators for a log line; an opaque ref that JSON cannot encode is still named. */
-function describeRefs(previews: Preview[]): string {
-  return previews
-    .map((preview) => {
-      try {
-        return JSON.stringify(preview.storageRef) ?? String(preview.storageRef);
-      } catch {
-        return String(preview.storageRef);
-      }
-    })
-    .join(', ');
-}
-
 // The observer each task event fires.
 const OBSERVER: Record<TaskEvent, ObserverName> = {
   completed: 'afterTaskComplete',
@@ -193,9 +183,15 @@ export interface ProcessorDeps {
  */
 export class Processor {
   readonly #deps: ProcessorDeps;
+  readonly #recorder: PreviewRecorder;
 
   constructor(deps: ProcessorDeps) {
     this.#deps = deps;
+    this.#recorder = new PreviewRecorder({
+      catalog: deps.catalog,
+      media: deps.media,
+      logger: deps.logger,
+    });
   }
 
   /**
@@ -448,16 +444,8 @@ export class Processor {
       persist,
       signal,
     } = args;
-    const {
-      catalog,
-      config,
-      hooks,
-      logger,
-      media: mediaStore,
-      name,
-      pipelines,
-      storage,
-    } = this.#deps;
+    const { catalog, config, hooks, logger, name, pipelines, storage } =
+      this.#deps;
 
     // Before any download or decode, in both modes; the queue retries it like any failure.
     requirePipeline(pipelines, name, pipelineName);
@@ -888,79 +876,18 @@ export class Processor {
     await runBounded(pending, config.concurrency, signal, processVariant);
 
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
-    // never carried dims), then fire onPreviewGenerated per pushed preview (ctx {}).
+    // never carried dims; previewRecorder.ts), then fire onPreviewGenerated per stored preview
+    // (ctx {}).
     if (persist && generated.length > 0) {
       const backfillDims = storedDims === undefined ? mediaDims : undefined;
-      // What the media store holds now, read once after a failed or partial write: the identities
-      // stored on the media, null when the media is gone, undefined when the reload failed too.
-      const recordedIdentities = async (): Promise<
-        Set<string> | null | undefined
-      > => {
-        try {
-          const reloaded = await mediaStore.loadMedia(mediaId);
-          return reloaded ? catalog.storedIdentities(reloaded, scope) : null;
-        } catch {
-          return undefined;
-        }
-      };
-      const stored = await mediaStore
-        .appendPreviews(mediaId, generated, backfillDims)
-        .catch(async (err: unknown) => {
-          // The write may have stopped part-way (a driver can store one row at a time). Name
-          // only the uploads no row points at, so an operator can find (or delete) them; a file
-          // a stored row references is never offered.
-          const recorded = await recordedIdentities();
-          const unrecorded = recorded
-            ? generated.filter((p) => !recorded.has(scopedIdentity(p)))
-            : generated;
-          logger.error(
-            `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${generated.length} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
-            err,
-          );
-          throw err;
-        });
-      // A store written to the old contract resolves with nothing. Read as the rows it stored,
-      // that would mean every preview was left out (reported as another worker's,
-      // `created: []`), so fail loudly instead, before any observer runs.
-      if (!Array.isArray(stored)) {
-        throw new ResizeSetupError(
-          `resize: MediaStore.appendPreviews must resolve with the previews it stored ([] when none were); for media ${mediaId} it resolved with ${String(stored)}`,
-          { code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID' },
-        );
-      }
-      // The media store keeps one row per identity and resolves with the rows it stored. The
-      // reload says why a row was left out: the media is gone, or another worker stored the same
-      // identity first (covered, not a failure).
-      const kept = catalog.storedIdentities({ previews: stored }, scope);
-      const leftOut = generated.filter((p) => !kept.has(scopedIdentity(p)));
-      if (leftOut.length > 0) {
-        generated = generated.filter((p) => kept.has(scopedIdentity(p)));
-        const recorded = await recordedIdentities();
-        if (recorded === null) {
-          logger.warn(
-            `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
-          );
-        } else {
-          // A failed reload trusts the store's answer: the rows are another worker's.
-          const duplicates = recorded
-            ? leftOut.filter((p) => recorded.has(scopedIdentity(p)))
-            : leftOut;
-          const lost = recorded
-            ? leftOut.filter((p) => !recorded.has(scopedIdentity(p)))
-            : [];
-          if (duplicates.length > 0) {
-            logger.warn(
-              `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
-            );
-            alreadyStored.push(...duplicates.map(scopedIdentity));
-          }
-          if (lost.length > 0) {
-            logger.error(
-              `resize: the media store left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
-            );
-          }
-        }
-      }
+      const recorded = await this.#recorder.record(
+        mediaId,
+        scope,
+        generated,
+        backfillDims,
+      );
+      generated = recorded.stored;
+      alreadyStored.push(...recorded.alreadyStored);
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
       }
