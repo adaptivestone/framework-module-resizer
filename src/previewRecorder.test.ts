@@ -75,7 +75,7 @@ test('a store that resolves undefined is RESIZE_MEDIA_APPEND_RESULT_INVALID', as
   const media = fakeMedia({
     appendPreviews: (async () => undefined) as never,
   });
-  const { logger } = recordingLogger();
+  const { logger, logs } = recordingLogger();
   const recorder = new PreviewRecorder({
     catalog: new Catalog({ config: makeImageConfig() }),
     media,
@@ -86,4 +86,6 @@ test('a store that resolves undefined is RESIZE_MEDIA_APPEND_RESULT_INVALID', as
     (err: unknown) =>
       (err as { code?: string }).code === 'RESIZE_MEDIA_APPEND_RESULT_INVALID',
   );
+  // The caller reports the rejection; the recorder itself logs nothing for it.
+  assert.deepEqual(logs, { info: [], warn: [], error: [] });
 });

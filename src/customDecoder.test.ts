@@ -312,3 +312,59 @@ test("verify() runs each decoder's verify()", async () => {
   await assert.rejects(resizer.verify(), (err: unknown) => err === boom);
   assert.equal(verified, 1);
 });
+
+test('uploadOriginal asks a host decoder for a built-in format before the built-in one', async () => {
+  const builtIn = new SharpDecoder();
+  let asked = 0;
+  const ownPng: SourceDecoder = {
+    formats: ['png'],
+    async inspect(bytes, limits) {
+      asked += 1;
+      const info = await builtIn.inspect(bytes, limits);
+      return { ...info, contentType: 'image/x-test-png' };
+    },
+    render: (bytes, box, opts) => builtIn.render(bytes, box, opts),
+  };
+  const png = await sharp({
+    create: { width: 8, height: 6, channels: 3, background: '#0f0' },
+  })
+    .png()
+    .toBuffer();
+  const resizer = new Resizer({
+    storage: memoryStorage().storage,
+    media: fakeMedia(),
+    config: makeImageConfig(),
+    logger: silent,
+    decoders: [ownPng],
+  });
+  const original = await resizer.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  assert.equal(asked, 1);
+  assert.equal(original.contentType, 'image/x-test-png');
+  assert.equal(original.format, 'png');
+});
+
+test("verify() runs the decoders' verify() after the media store's and the lock store's", async () => {
+  const order: string[] = [];
+  const pdf = new TestPdfDecoder();
+  const resizer = new Resizer({
+    storage: memoryStorage().storage,
+    media: Object.assign(fakeMedia(), {
+      verify: async () => void order.push('media'),
+    }),
+    locks: {
+      acquire: async () => true,
+      extend: async () => true,
+      release: async () => true,
+      verify: async () => void order.push('locks'),
+    },
+    logger: silent,
+    decoders: [
+      Object.assign(pdf, { verify: async () => void order.push('decoder') }),
+    ],
+  });
+  await resizer.verify();
+  assert.deepEqual(order, ['media', 'locks', 'decoder']);
+});

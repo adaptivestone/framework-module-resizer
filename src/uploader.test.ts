@@ -288,6 +288,24 @@ describe('uploadOriginal — through the decoders', () => {
     assert.equal(uploads.length + broken.uploads.length, 0);
   });
 
+  test("a host's subclass of ResizeSetupError from a decoder reaches the caller unchanged", async () => {
+    class HostWiringError extends ResizeSetupError {}
+    const setup = new HostWiringError('the host decoder has no licence key', {
+      code: 'HOST_WIRING',
+    });
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: setup })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err === setup &&
+        (err as Error).name === 'HostWiringError' &&
+        !(err instanceof ResizeOriginalError),
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('bytes every decoder refuses are RESIZE_ORIGINAL_FORMAT_UNSUPPORTED', async () => {
     const refusal = new ResizeMediaError('not a pdf', {
       code: 'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
@@ -377,8 +395,20 @@ describe('uploadOriginal — raster bytes and metadata', () => {
       const r = new FrameworkResizer({ storage });
       await assert.rejects(r.uploadOriginal({ body, visibility: 'public' }), {
         code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
+        message: /image 10x10x2f exceeds limits\.sourcePixels \(199\)/,
       });
       assert.equal(uploads.length, 0);
+    });
+
+    test(`${format} animation is measured one frame at a time against limits.inputPixels`, async () => {
+      // One 10×10 frame (100 px) fits 150; the stack (200 px) is bounded at render, by the plan.
+      installApp({ limits: { inputPixels: 150 } });
+      const { storage, uploads } = recordingStorage();
+      const r = new FrameworkResizer({ storage });
+      const original = await r.uploadOriginal({ body, visibility: 'public' });
+      assert.equal(original.width, 10);
+      assert.equal(original.height, 10);
+      assert.equal(uploads.length, 1);
     });
   }
 

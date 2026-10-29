@@ -543,10 +543,11 @@ export class Resizer {
    * Optional startup check: load the drivers and resolve and validate the config (see ready());
    * check that a task queue can be used (a lock store beside one without gatesByTask, its timing
    * and the coordination); run the media store's verify() and check it has replacePreviews; run
-   * the lock store's verify(), then each decoder's optional verify(); check the task queue (its own verify(), and that it serves this
-   * Resizer's queueName). Framework hosts call it after `Server.init()` to fail at boot instead of
-   * at the first upload or read; it is the one call that rejects for a task queue that cannot be
-   * used (the read path degrades instead). The worker runs it for every Resizer before leasing.
+   * the lock store's verify(), then each decoder's optional verify(); check the task queue (its
+   * own verify(), and that it serves this Resizer's queueName). Framework hosts call it after
+   * `Server.init()` to fail at boot instead of at the first upload or read; it is the one call
+   * that rejects for a task queue that cannot be used (the read path degrades instead). The
+   * worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
     // ready() resolves while the task queue cannot be used; verify() rejects with the reason.

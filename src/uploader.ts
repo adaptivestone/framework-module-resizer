@@ -8,6 +8,7 @@ import {
   ResizeOriginalError,
   ResizeStorageError,
 } from './errors.ts';
+import { hasErrorClass } from './helpers/errorClass.ts';
 import { randomHex } from './helpers/random.ts';
 import type {
   Original,
@@ -37,10 +38,16 @@ function asBuffer(body: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(body) ? body : Buffer.from(body);
 }
 
+/** The classes of a wiring bug, not an invalid original (a host's subclass of one counts too). */
+const WIRING_ERRORS: ReadonlySet<string> = new Set([
+  'ResizeSetupError',
+  'ResizeConfigError',
+]);
+
 /**
  * What a decoder rejected the original with, as an upload error. A setup or config error is a
  * wiring bug, not an invalid original, and passes through unchanged; the class is told by the brand
- * and the name, so an error from a duplicate copy of the package counts too.
+ * and the class names, so an error from a duplicate copy of the package counts too.
  */
 function originalError(cause: unknown): ResizeError {
   if (!ResizeError.isResizeError(cause)) {
@@ -49,7 +56,7 @@ function originalError(cause: unknown): ResizeError {
       { code: 'RESIZE_ORIGINAL_INVALID', cause },
     );
   }
-  if (cause.name === 'ResizeSetupError' || cause.name === 'ResizeConfigError') {
+  if (hasErrorClass(cause, WIRING_ERRORS)) {
     return cause;
   }
   const code = ORIGINAL_CODES.get(cause.code);
@@ -138,32 +145,32 @@ export class Uploader {
         { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
       );
     }
-    const prepared = await identifyOriginal(this.#decoders, body, config);
-    if (!config.upload.formats.includes(prepared.format)) {
+    const measured = await identifyOriginal(this.#decoders, body, config);
+    if (!config.upload.formats.includes(measured.format)) {
       throw new ResizeOriginalError(
-        `resize uploadOriginal: format ${prepared.format} is disabled by upload.formats`,
+        `resize uploadOriginal: format ${measured.format} is disabled by upload.formats`,
         { code: 'RESIZE_ORIGINAL_FORMAT_DISABLED' },
       );
     }
-    if (prepared.format === 'svg' && opts.visibility === 'public') {
+    if (measured.format === 'svg' && opts.visibility === 'public') {
       throw new ResizeOriginalError(
         'resize uploadOriginal: SVG originals must be stored privately',
         { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
       );
     }
-    const key = `originals/${randomHex()}.${prepared.extension}`;
+    const key = `originals/${randomHex()}.${measured.extension}`;
     let ref: StorageRef;
     try {
       ref = await this.#storage.upload({
         key,
         body,
-        contentType: prepared.contentType,
+        contentType: measured.contentType,
         visibility: opts.visibility,
         ...(opts.namespace === undefined ? {} : { namespace: opts.namespace }),
       });
     } catch (cause) {
       throw new ResizeStorageError(
-        `resize uploadOriginal: storage upload failed for ${prepared.format} original`,
+        `resize uploadOriginal: storage upload failed for ${measured.format} original`,
         { code: 'RESIZE_ORIGINAL_UPLOAD_FAILED', cause },
       );
     }
@@ -175,11 +182,11 @@ export class Uploader {
     }
     return {
       storageRef: ref,
-      format: prepared.format,
-      contentType: prepared.contentType,
+      format: measured.format,
+      contentType: measured.contentType,
       size: body.byteLength,
-      width: prepared.width,
-      height: prepared.height,
+      width: measured.width,
+      height: measured.height,
     };
   }
 }

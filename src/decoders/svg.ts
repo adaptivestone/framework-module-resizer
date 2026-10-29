@@ -59,7 +59,8 @@ export class SvgDecoder extends SourceDecoder {
         { code: 'RESIZE_SOURCE_METADATA_MISSING', retryable: false },
       );
     }
-    // The pixel count comes first: the density probe below may render the header again.
+    // The pixel count comes first: the density probe below reads the header again (more
+    // metadata() calls at other densities, no render).
     if (meta.width * meta.height > limits.sourcePixels) {
       throw new ResizeMediaError(
         `resize: SVG ${meta.width}x${meta.height} exceeds limits.sourcePixels (${limits.sourcePixels})`,
@@ -88,7 +89,14 @@ export class SvgDecoder extends SourceDecoder {
     box: DecodeBox,
     opts: RenderOptions,
   ): Promise<Raster> {
-    const { limits, source } = opts;
+    const { limits, source, signal } = opts;
+    // An aborted task skips the density probe; the error is the one the render itself gives.
+    if (signal?.aborted) {
+      throw new ResizeMediaError(
+        'resize: SVG rendering failed: aborted before it started (the abort signal fired)',
+        { code: 'RESIZE_SVG_RENDER_FAILED', cause: signal.reason },
+      );
+    }
     // Never below the natural size: a smaller box is made by the core's resize.
     const largestScale = Math.max(
       1,
@@ -107,7 +115,7 @@ export class SvgDecoder extends SourceDecoder {
       density,
       limitInputPixels: limits.inputPixels,
       timeoutMs: limits.processingTimeoutSeconds * 1000,
-      signal: opts.signal,
+      signal,
     });
     // Decoding the PNG in-process is safe: the markup was rendered in the child.
     const { data, info } = await sharp(png, {

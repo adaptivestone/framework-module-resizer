@@ -19,11 +19,10 @@ import sharp, {
 } from 'sharp';
 import { Catalog } from '../src/catalog.ts';
 import defaultResizeConfig from '../src/config/resize.ts';
-import type { ResizeStorage } from '../src/contracts/storage.ts';
 import { runBounded } from '../src/helpers/concurrency.ts';
 import { calculateResizedDimensions, coverDimensions } from '../src/images.ts';
+import { Resizer, type ResizeStorage } from '../src/index.ts';
 import { planRules, planVariants, type SizePlan } from '../src/plan.ts';
-import { Resizer } from '../src/resizer.ts';
 import { fakeMedia } from '../src/testHelpers/fakes.ts';
 import type {
   PreviewFormat,
@@ -52,10 +51,12 @@ const singleThread = args.includes('--single-thread');
 const rssArg = args.find((a) => a.startsWith('--rss='));
 const roundsArg = args.find((a) => !a.startsWith('--'));
 const parsedRounds = roundsArg === undefined ? MIN_ROUNDS : Number(roundsArg);
-const rounds =
-  Number.isInteger(parsedRounds) && parsedRounds > MIN_ROUNDS
-    ? parsedRounds
-    : MIN_ROUNDS;
+if (!Number.isInteger(parsedRounds) || parsedRounds < 1) {
+  throw new Error(
+    `bench: rounds must be a positive integer, not '${roundsArg}' (at least ${MIN_ROUNDS} are run)`,
+  );
+}
+const rounds = Math.max(parsedRounds, MIN_ROUNDS);
 const concurrency = singleThread ? 1 : 4;
 
 sharp.cache(false);
@@ -322,27 +323,37 @@ const loadavg = (): string =>
 
 type Entry = { name: string; run: () => Promise<unknown> };
 
-/** Runs every entry once per round, the order rotating each round; returns the timings by name. */
+/**
+ * Runs every entry once per round, in a fresh shuffled order each round (seeded, so runs are
+ * comparable), so no entry always follows the same neighbour; returns the timings by name.
+ */
 async function runRounds(
   entries: Entry[],
   count: number,
 ): Promise<Map<string, Timing[]>> {
   const timings = new Map<string, Timing[]>(entries.map((e) => [e.name, []]));
+  const random = seeded(7919);
   for (let round = 0; round < count; round++) {
-    for (let k = 0; k < entries.length; k++) {
-      const entry = entries[(round + k) % entries.length];
+    const order = [...entries];
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    for (const entry of order) {
       timings.get(entry.name)?.push(await timed(entry.run));
     }
   }
   return timings;
 }
 
-const RSS_PATHS = ['1', '2', '3', '3+beforeStep'] as const;
+// `source` builds the source and runs nothing: the floor every other row includes.
+const RSS_PATHS = ['source', '1', '2', '3', '3+beforeStep'] as const;
 
 /** Child mode: run one path twice on the gate set and print the peak RSS (KiB). */
 async function rssChild(path: string): Promise<void> {
   const buf = await makeSource();
   const runs: Record<string, () => Promise<unknown>> = {
+    source: async () => buf.length,
     '1': () => oldPerVariant(buf, GATE_FORMATS),
     '2': () => oldOncePerSize(buf, GATE_FORMATS),
   };
@@ -456,7 +467,9 @@ async function main(): Promise<void> {
     );
   }
 
-  console.log('\npeak RSS (own process, the gate set run twice):');
+  console.log(
+    '\npeak RSS (own process, the gate set run twice; every row includes the source row):',
+  );
   for (const path of RSS_PATHS) {
     console.log(`  path ${path.padEnd(13)} ${measureRss(path)}`);
   }

@@ -161,3 +161,59 @@ test('a render over limits.processingTimeoutSeconds is RESIZE_SVG_RENDER_TIMEOUT
     },
   );
 });
+
+test('render takes the larger scale of a box that is not proportional to the source', async () => {
+  const decoder = new SvgDecoder();
+  const source = await decoder.inspect(smallSvg, limits);
+  // 20×10 into 200×400: the height needs ×40, so the raster is 800×400.
+  const raster = await decoder.render(
+    smallSvg,
+    { width: 200, height: 400 },
+    { limits, source, frames: 1 },
+  );
+  assert.deepEqual(raster.info, { width: 800, height: 400, channels: 4 });
+});
+
+test('render refuses a source without a raster pixel on a side with RESIZE_SVG_DIMENSIONS_UNSUPPORTED', async () => {
+  const svg = sizedSvg(1, 100000);
+  await assert.rejects(
+    new SvgDecoder().render(
+      svg,
+      { width: 1, height: 100000 },
+      {
+        limits,
+        source: {
+          format: 'svg',
+          contentType: 'image/svg+xml',
+          width: 1,
+          height: 100000,
+          vector: true,
+        },
+        frames: 1,
+      },
+    ),
+    nonRetryable('RESIZE_SVG_DIMENSIONS_UNSUPPORTED'),
+  );
+});
+
+test('render with an aborted signal starts no process and fails as an aborted render', async () => {
+  const decoder = new SvgDecoder();
+  const source = await decoder.inspect(smallSvg, limits);
+  const spawn = mock.method(childProcess, 'spawn');
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(
+    decoder.render(
+      smallSvg,
+      { width: 20, height: 10 },
+      { limits, source, frames: 1, signal: aborted.signal },
+    ),
+    (err) => {
+      assert.ok(ResizeError.isResizeError(err));
+      assert.equal(err.code, 'RESIZE_SVG_RENDER_FAILED');
+      assert.match((err as Error).message, /aborted before it started/);
+      return true;
+    },
+  );
+  assert.equal(spawn.mock.callCount(), 0);
+});
