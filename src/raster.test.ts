@@ -9,6 +9,7 @@ import {
   checkRaster,
   rasterProblem,
   rasterToSharp,
+  readRaster,
   sharpToRaster,
 } from './raster.ts';
 
@@ -114,4 +115,59 @@ test('sharpToRaster rejects a multi-page image with RESIZE_PIPELINE_STEP_INVALID
     .toBuffer();
   const still = await sharpToRaster(sharp(png, { pages: 3 }));
   assert.deepEqual(still.info, { width: 8, height: 8, channels: 3 });
+});
+
+test('sharpToRaster rejects pixels Sharp describes with a stale page height', async () => {
+  // Sharp keeps the page height of a raw 3-frame input after a resize: 5 rows over a page of 20.
+  const stacked: Raster = {
+    data: Buffer.alloc(20 * 20 * 3 * 3),
+    info: { width: 20, height: 20, channels: 3, frames: 3 },
+  };
+  await assert.rejects(
+    sharpToRaster(rasterToSharp(stacked).resize(10, 5)),
+    (err) => {
+      assert.ok(ResizeError.isResizeError(err));
+      assert.equal(err.name, 'ResizeSetupError');
+      assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
+      return true;
+    },
+  );
+});
+
+test('readRaster reads stacked frames back as frames, and one frame when the page height does not divide the height', async () => {
+  const two: Raster = {
+    data: Buffer.concat([
+      solid(6, 4, [255, 0, 0]).data,
+      solid(6, 4, [0, 0, 255]).data,
+    ]),
+    info: { width: 6, height: 4, channels: 3, frames: 2 },
+  };
+  const back = await readRaster(rasterToSharp(two));
+  assert.deepEqual(back.info, { width: 6, height: 4, channels: 3, frames: 2 });
+  assert.equal(back.data.length, 6 * 4 * 3 * 2);
+
+  // A stale page height of 4 over a height of 6 is not a frame count: one frame of 6 rows.
+  const stale = await readRaster(
+    sharp(Buffer.alloc(6 * 12 * 3), {
+      raw: { width: 6, height: 12, channels: 3, pageHeight: 4 },
+    }).resize(6, 6, { fit: 'fill' }),
+  );
+  assert.deepEqual(stale.info, { width: 6, height: 6, channels: 3 });
+  assert.equal(stale.data.length, 6 * 6 * 3);
+});
+
+test('rasterToSharp rejects a value that is not a Raster with RESIZE_PIPELINE_STEP_INVALID', () => {
+  assert.throws(
+    () =>
+      rasterToSharp({
+        data: Buffer.alloc(10),
+        info: { width: 10, height: 10, channels: 3 },
+      }),
+    (err) => {
+      assert.ok(ResizeError.isResizeError(err));
+      assert.equal(err.name, 'ResizeSetupError');
+      assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
+      return true;
+    },
+  );
 });

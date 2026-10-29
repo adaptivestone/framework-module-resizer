@@ -127,6 +127,27 @@ function formatNotConfiguredError(formats: string[]): ResizeSetupError {
 }
 
 /**
+ * A copy of a media error that names its media: the same prototype (so its class, `name`, code,
+ * `retryable` and the host's own fields stay), the media id added, and the error itself as cause.
+ */
+function withMediaId(err: ResizeError, mediaId: string): ResizeError {
+  const copy: ResizeError = Object.create(Object.getPrototypeOf(err));
+  const value = (v: unknown, enumerable: boolean): PropertyDescriptor => ({
+    value: v,
+    writable: true,
+    configurable: true,
+    enumerable,
+  });
+  Object.defineProperties(copy, {
+    ...Object.getOwnPropertyDescriptors(err),
+    message: value(`${err.message} (media ${mediaId})`, false),
+    mediaId: value(mediaId, true),
+    cause: value(err, false),
+  });
+  return copy;
+}
+
+/**
  * A decode failure as the task reports it: a module error that does not know its media gets the
  * media id (the decoders do not know it), any other module error stays as it is, and anything else
  * is RESIZE_SOURCE_DECODE_FAILED with the original error as its cause (retried).
@@ -134,12 +155,7 @@ function formatNotConfiguredError(formats: string[]): ResizeSetupError {
 function sourceError(err: unknown, mediaId: string): unknown {
   if (ResizeError.isResizeError(err)) {
     if ('mediaId' in err && err.mediaId === undefined) {
-      return new ResizeMediaError(`${err.message} (media ${mediaId})`, {
-        mediaId,
-        code: err.code,
-        retryable: err.retryable,
-        cause: err,
-      });
+      return withMediaId(err, mediaId);
     }
     return err;
   }
@@ -182,13 +198,20 @@ async function loadSource(
   }
   const { decoder, info, mismatch } = identified;
   if (mismatch !== undefined) {
-    const why =
-      mismatch.reason === 'unlisted'
-        ? 'no decoder lists the stored format'
-        : 'its decoder refused the bytes';
-    logger.warn(
-      `resize worker: media ${mediaId} is stored as '${mismatch.stored}' but its bytes are '${info.format}' (${why}); rendering it as '${info.format}'`,
-    );
+    if (info.format === mismatch.stored) {
+      // A host decoder lists a built-in format and refused these bytes; a later decoder read them.
+      logger.warn(
+        `resize worker: media ${mediaId} is stored as '${mismatch.stored}'; the first decoder listing '${mismatch.stored}' refused these bytes, and another decoder read them`,
+      );
+    } else {
+      const why =
+        mismatch.reason === 'unlisted'
+          ? 'no decoder lists the stored format'
+          : 'its decoder refused the bytes';
+      logger.warn(
+        `resize worker: media ${mediaId} is stored as '${mismatch.stored}' but its bytes are '${info.format}' (${why}); rendering it as '${info.format}'`,
+      );
+    }
   }
   if (info.width * info.height > limits.sourcePixels) {
     throw new ResizeMediaError(
@@ -199,7 +222,7 @@ async function loadSource(
   return { bytes, decoder, info };
 }
 
-/** The decoder's raster at `box`, checked and in straight alpha. */
+/** The decoder's raster at `box`, checked (shape and pixel budget), in straight alpha. */
 async function decodeSource(
   source: LoadedSource,
   box: DecodeBox,
@@ -210,6 +233,16 @@ async function decodeSource(
     const raster = await source.decoder.render(source.bytes, box, opts);
     // A broken raster is the decoder's contract error: sourceError passes it on unchanged.
     checkRaster(raster);
+    // A decoder that ignores its box or decodes more frames than asked must not hand the core more
+    // pixels than the budget the plan was made for.
+    const { width, height, frames = 1 } = raster.info;
+    const budget = Math.min(opts.limits.sourcePixels, opts.limits.inputPixels);
+    if (width * height * frames > budget) {
+      throw new ResizeMediaError(
+        `resize: the decoder returned ${width}×${height}×${frames} pixels, over the pixel budget (${budget}) for media ${mediaId}`,
+        { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+      );
+    }
     return await straightAlpha(raster, opts.limits);
   } catch (err) {
     throw sourceError(err, mediaId);
@@ -620,7 +653,7 @@ export class Processor {
       return { generated, failedCount, alreadyStored };
     }
 
-    const source = await loadSource(
+    let source: LoadedSource | undefined = await loadSource(
       { storage, decoders, limits, logger },
       original,
       mediaId,
@@ -659,13 +692,15 @@ export class Processor {
       },
       mediaId,
     );
+    // The encoded original is not read again: drop it before the pixel work.
+    source = undefined;
 
     if (beforeSteps.length > 0) {
       const rendered = {
         width: raster.info.width,
         height: raster.info.height,
       };
-      const stepping = runBeforeSteps(
+      let stepping: Promise<Raster> | undefined = runBeforeSteps(
         raster,
         beforeSteps,
         { media, source: info, ctx },
@@ -675,6 +710,9 @@ export class Processor {
       // it is freed as soon as the first step resolves.
       raster = undefined;
       raster = await stepping;
+      // A settled promise keeps its value, and the suspended frame keeps the promise: drop it, so
+      // the full-size step result is freed once reduceToBox below has replaced it.
+      stepping = undefined;
       const { width, height } = raster.info;
       if (width * height > Math.min(limits.sourcePixels, limits.inputPixels)) {
         throw new ResizeMediaError(
@@ -753,9 +791,14 @@ export class Processor {
         );
       } catch (err) {
         // One bad variant must not fail the whole task; the caller decides what the failures mean.
+        // A media error from the pixel work (an SVG output) does not know its media: add it.
         logger.error(
           `resize worker: variant ${plan.identity} failed for media ${mediaId}`,
-          err,
+          ResizeError.isResizeError(err) &&
+            'mediaId' in err &&
+            err.mediaId === undefined
+            ? withMediaId(err, mediaId)
+            : err,
         );
         failedCount += 1;
       }

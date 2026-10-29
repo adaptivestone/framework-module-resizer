@@ -455,3 +455,68 @@ test('a step result that is not a one-frame Raster is RESIZE_PIPELINE_STEP_INVAL
     );
   }
 });
+
+test('renderSize resizes a two-frame raster per frame and reads both frames back', async () => {
+  const two = solid(12, 8, [255, 0, 0], [0, 0, 255]);
+  two.info.frames = 2;
+  const out = await renderSize(two, sizePlan(6, 4, 'fill', true), limits);
+  assert.deepEqual(out.info, { width: 6, height: 4, channels: 3, frames: 2 });
+  assert.equal(out.data.length, 6 * 4 * 3 * 2);
+  assertNear(pixelAt(out, 3, 2, 0), [255, 0, 0]);
+  assertNear(pixelAt(out, 3, 2, 1), [0, 0, 255]);
+});
+
+test('renderSize sharpens a size marked sharpen', async () => {
+  // A hard edge: sharpening overshoots next to it, a plain resize does not.
+  const edge = solid(40, 40, [100, 100, 100]);
+  for (let y = 0; y < 40; y++) {
+    for (let x = 20; x < 40; x++) {
+      edge.data.set([160, 160, 160], (y * 40 + x) * 3);
+    }
+  }
+  const plain = await renderSize(edge, sizePlan(20, 20), limits);
+  const sharp20 = await renderSize(
+    edge,
+    { ...sizePlan(20, 20), key: '20x20:fill:s:', sharpen: true },
+    limits,
+  );
+  assert.equal(sharp20.info.width, 20);
+  assert.notDeepEqual(sharp20.data, plain.data);
+});
+
+test('encodeVariant gives every frame a delay when the raster lists fewer delays than frames', async () => {
+  const size = sizePlan(10, 10, 'fill', true);
+  const sized = await renderSize(threeFrames(), size, limits);
+  sized.info.delay = [70];
+  for (const format of ['gif', 'webp']) {
+    const encoded = await encodeVariant(
+      sized,
+      variantPlan(size, format),
+      encodeOptions(),
+    );
+    const meta = await sharp(encoded.data, { animated: true }).metadata();
+    assert.equal(meta.pages, 3, format);
+    assert.deepEqual(meta.delay, [70, 70, 70], format);
+  }
+});
+
+test('straightAlpha converts a premultiplied animation frame by frame and keeps its timing', async () => {
+  const marked = solid(8, 4, [50, 25, 100, 128], [25, 50, 0, 128]);
+  marked.info = {
+    width: 8,
+    height: 4,
+    channels: 4,
+    frames: 2,
+    delay: [40, 80],
+    loop: 2,
+    premultiplied: true,
+  };
+  const straight = await straightAlpha(marked, limits);
+  assert.equal(straight.info.frames, 2);
+  assert.equal(straight.info.height, 4);
+  assert.deepEqual(straight.info.delay, [40, 80]);
+  assert.equal(straight.info.loop, 2);
+  assert.equal(straight.info.premultiplied, undefined);
+  assertNear(pixelAt(straight, 0, 0, 0), [100, 50, 200, 128]);
+  assertNear(pixelAt(straight, 0, 0, 1), [50, 100, 0, 128]);
+});

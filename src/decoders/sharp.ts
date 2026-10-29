@@ -31,10 +31,9 @@ export class SharpDecoder extends SourceDecoder {
 
   async inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
     // Sharp's own error (bytes it cannot read, the pixel limit, the timeout) is rethrown as it is.
-    const meta = await sharp(bytes, {
-      limitInputPixels: limits.inputPixels,
-      animated: true,
-    })
+    // The first frame only: the input limit applies to one frame, and the header still reports the
+    // page count and timing. How many frames are decoded is bounded at render, by the plan.
+    const meta = await sharp(bytes, { limitInputPixels: limits.inputPixels })
       .timeout({ seconds: limits.processingTimeoutSeconds })
       .metadata();
     const format =
@@ -51,12 +50,10 @@ export class SharpDecoder extends SourceDecoder {
         { code: 'RESIZE_SOURCE_METADATA_MISSING', retryable: false },
       );
     }
-    // With `animated: true` Sharp reports the frames stacked; one frame is `pageHeight` high.
-    const frameHeight = meta.pageHeight ?? meta.height;
     const orientation = meta.orientation ?? 1;
     // EXIF orientations 5–8 turn the image by 90°: the display size swaps the sides.
     const [width, height] =
-      orientation >= 5 ? [frameHeight, meta.width] : [meta.width, frameHeight];
+      orientation >= 5 ? [meta.height, meta.width] : [meta.width, meta.height];
     const pages = meta.pages ?? 1;
     return {
       format,
@@ -97,19 +94,29 @@ export class SharpDecoder extends SourceDecoder {
       .raw({ depth: 'uchar' })
       .timeout(timeout)
       .toBuffer({ resolveWithObject: true });
-    // Raw pixels carry no animation timing: read it from the source for the encoder.
+    // Raw pixels carry no animation timing: read it from the header for the encoder, over the
+    // frames decoded, never the whole stack.
     const timing =
       frames > 1
-        ? sharp(bytes, { limitInputPixels: limits.inputPixels, animated: true })
+        ? sharp(bytes, { limitInputPixels: limits.inputPixels, pages: frames })
             .timeout(timeout)
             .metadata()
         : undefined;
     const [{ data, info }, meta] = await Promise.all([rendering, timing]);
-    // The frame count comes from the pixels themselves: Sharp echoes the requested `pages` in
-    // `info.pages` even when the loader read a single frame, but sets `pageHeight` only on a
-    // stacked multi-frame result.
-    const frameHeight = info.pageHeight ?? info.height;
-    const count = info.height / frameHeight;
+    // The frame count comes from the pixels themselves, by the rule of `readRaster` in
+    // src/raster.ts (which decoders do not import): Sharp echoes the requested `pages` in
+    // `info.pages` even when the loader read a single frame, and the page height is a frame height
+    // only when it is below the height and divides it. The Processor checks the bytes against the
+    // result (`checkRaster`, RESIZE_DECODER_INVALID).
+    const { pageHeight } = info;
+    const count =
+      pageHeight !== undefined &&
+      pageHeight > 0 &&
+      pageHeight < info.height &&
+      info.height % pageHeight === 0
+        ? info.height / pageHeight
+        : 1;
+    const frameHeight = info.height / count;
     // Sharp's `premultiplied` flag is never copied: after a resize it reports true on raw output
     // whose bytes are straight alpha.
     const rasterInfo: RasterInfo = {

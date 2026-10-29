@@ -9,11 +9,13 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, mock, test } from 'node:test';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import sharp from 'sharp';
+import sharp, { type Sharp } from 'sharp';
 import { Catalog } from './catalog.ts';
 import {
   type DecodeBox,
@@ -54,6 +56,7 @@ import {
   memoryLocks,
   PlainTaskQueue,
 } from './testHelpers/fakes.ts';
+import { fakePdf, TestPdfDecoder } from './testHelpers/pdfDecoder.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -915,6 +918,187 @@ describe('decoding the source', () => {
       },
     );
     assert.equal(uploads.length, 0);
+  });
+
+  test('rendered pixels are not limited by limits.inputPixels: a variantSteps box enlarges a small source', async () => {
+    const small = await sharp({
+      create: { width: 20, height: 20, channels: 3, background: '#20a040' },
+    })
+      .png()
+      .toBuffer();
+    const { deps, media } = decodeDeps(small, {
+      config: { limits: { inputPixels: 2000 } },
+      pipeline: { variantSteps: [(img) => img] },
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 50 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 1);
+    assert.deepEqual(
+      [created[0].actualWidth, created[0].actualHeight],
+      [50, 50],
+    );
+  });
+
+  test('the beforeSteps result is released once reduced: no upload keeps it alive', async () => {
+    v8.setFlagsFromString('--expose-gc');
+    const gc = vm.runInNewContext('gc') as () => void;
+    let stepOutput: WeakRef<Buffer> | undefined;
+    const copying: BeforeStep = async (r) => {
+      const data = Buffer.from(r.data);
+      stepOutput = new WeakRef(data);
+      return { data, info: { ...r.info } };
+    };
+    const { deps, media } = decodeDeps(png600, {
+      pipeline: { beforeSteps: [copying] },
+    });
+    const alive: boolean[] = [];
+    const inner = deps.storage;
+    deps.storage = {
+      download: (ref) => inner.download(ref),
+      publicUrl: (ref) => inner.publicUrl(ref),
+      upload: async (input) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        gc();
+        await new Promise((resolve) => setImmediate(resolve));
+        gc();
+        alive.push(stepOutput?.deref() !== undefined);
+        return inner.upload(input);
+      },
+    };
+    const { created, failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 60 }, { width: 40, height: 40 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 2);
+    assert.ok(stepOutput, 'the step ran');
+    assert.deepEqual(alive, [false, false]);
+  });
+
+  test('a decoder raster over the pixel budget is refused with RESIZE_SOURCE_TOO_LARGE and the media id', async () => {
+    const pdf = new RecordingDecoder(new TestPdfDecoder());
+    // A decoder that ignores its box: 100×100 against a 5000-pixel budget.
+    pdf.returns = {
+      data: Buffer.alloc(100 * 100 * 3),
+      info: { width: 100, height: 100, channels: 3 },
+    };
+    const { deps, uploads, media } = decodeDeps(fakePdf(40, 40, [9, 9, 9]), {
+      config: { limits: { inputPixels: 5000 } },
+      decoders: createDecoderSet([pdf]),
+      original: { format: 'pdf' },
+    });
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test("a host decoder's ResizeMediaError subclass keeps its class and name, and gains the media id", async () => {
+    class HostDecodeError extends ResizeMediaError {}
+    const recording = new RecordingDecoder(new SharpDecoder());
+    recording.rejectWith = new HostDecodeError('host: page is encrypted', {
+      code: 'HOST_ENCRYPTED',
+      retryable: false,
+    });
+    const { deps, media } = decodeDeps(redPng, {
+      decoders: createDecoderSet([recording]),
+    });
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof HostDecodeError);
+        assert.equal((err as Error).name, 'HostDecodeError');
+        assert.equal(err.mediaId, 'm1');
+        assert.equal(err.code, 'HOST_ENCRYPTED');
+        assert.equal(err.retryable, false);
+        assert.equal(ResizeError.isResizeError(err), true);
+        assert.match(err.message, /host: page is encrypted \(media m1\)/);
+        assert.equal(err.cause, recording.rejectWith);
+        return true;
+      },
+    );
+  });
+
+  test('an SVG preview output fails its variant with RESIZE_SVG_PUBLIC_PREVIEW naming the media', async () => {
+    // A variantStep whose encoder reports SVG output (Sharp writes none; a custom step could).
+    const svgOutput = {
+      toFormat: () => ({
+        timeout: () => ({
+          toBuffer: async () => ({
+            data: Buffer.from('<svg/>'),
+            info: { format: 'svg', width: 20, height: 20 },
+          }),
+        }),
+      }),
+    };
+    const { logger, logs } = recordingLogger();
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      logger,
+      pipeline: { variantSteps: [() => svgOutput as unknown as Sharp] },
+    });
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => err instanceof ResizeGenerateError,
+    );
+    assert.equal(uploads.length, 0);
+    const [message, err] = logs.error[0];
+    assert.match(String(message), /variant .* failed for media m1/);
+    assert.ok(err instanceof ResizeMediaError);
+    assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
+    assert.equal(err.mediaId, 'm1');
+    assert.match(err.message, /\(media m1\)$/);
+  });
+
+  test('a host decoder that lists the stored format and refuses: the warning names the decoders, not two equal formats', async () => {
+    class RefusingJpeg extends SourceDecoder {
+      readonly formats = ['jpeg'];
+      async inspect(): Promise<SourceInfo> {
+        throw new ResizeMediaError('host: not mine', {
+          code: 'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
+          retryable: false,
+        });
+      }
+      async render(): Promise<Raster> {
+        throw new Error('never rendered');
+      }
+    }
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(plainJpeg, {
+      decoders: createDecoderSet([new RefusingJpeg()]),
+      logger,
+      original: { format: 'jpeg' },
+    });
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.equal(created.length, 1);
+    assert.equal(logs.warn.length, 1);
+    const message = String(logs.warn[0][0]);
+    assert.doesNotMatch(message, /but its bytes are/);
+    assert.match(
+      message,
+      /stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder read them/,
+    );
   });
 });
 
@@ -2477,6 +2661,53 @@ describe('animated sources', () => {
     assert.equal(failed, 0);
     assert.equal(created[0].actualHeight, 10);
     assert.deepEqual(await framesOf(uploads[0].body), {
+      pages: 2,
+      frameHeight: 10,
+    });
+  });
+
+  test('an animated preview larger than the source keeps only the frames that fit the budget at its size', async () => {
+    // The source's three 20×20 frames (1200 px) fit 1300, but at 25×25 (625 px a frame) only two do.
+    installApp({ animated: true, limits: { sourcePixels: 1300 } });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
+    const { created, failed } = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 25 }],
+      formats: ['webp'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created[0].actualWidth, 25);
+    assert.equal(created[0].actualHeight, 25);
+    assert.deepEqual(await framesOf(uploads[0].body), {
+      pages: Math.floor(1300 / (25 * 25)),
+      frameHeight: 25,
+    });
+  });
+
+  test('a stored animation over limits.inputPixels renders a still from its first frame and an animation from the frames that fit', async () => {
+    // One 20×20 frame (400 px) fits 800; the three stacked (1200 px) do not.
+    installApp({ animated: true, limits: { inputPixels: 800 } });
+    const { storage, uploads } = makeStorage(animatedGif);
+    const { mediaStore } = makeMediaStore(null);
+    const r = new FrameworkResizer({ storage, media: mediaStore });
+    const still = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 10 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(still.failed, 0);
+    assert.equal(still.created[0].actualWidth, 10);
+    assert.equal((await framesOf(uploads[0].body)).pages, 1);
+
+    const animated = await r.generate({
+      media: mediaDoc(),
+      sizes: [{ width: 10 }],
+      formats: ['webp'],
+    });
+    assert.equal(animated.failed, 0);
+    assert.deepEqual(await framesOf(uploads[1].body), {
       pages: 2,
       frameHeight: 10,
     });

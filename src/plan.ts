@@ -215,6 +215,7 @@ export function decodeBox(
   opts: { atLeastOwnSize: boolean },
 ): DecodeBox {
   const { width: w, height: h } = info;
+  // With no plan (the Processor never asks) the scale stays 0 and the box is the smallest, 1×1.
   let scale = 0;
   for (const { size } of plans) {
     scale = Math.max(scale, size.width / w, size.height / h);
@@ -232,23 +233,32 @@ export function decodeBox(
 
 /**
  * Frames to decode: 1 unless a plan is animated; then the source's own count, up to
- * limits.animationFrames and to what fits the pixel budget (every decoded frame counts).
+ * limits.animationFrames and to what fits the pixel budget. Every frame is held at the larger of
+ * the source's size and the largest animated size (an animation is stacked at its preview size,
+ * which a width-only size can enlarge), so no stack the render holds exceeds the budget.
  */
 export function framesToDecode(
   info: SourceInfo,
   plans: readonly VariantPlan[],
   limits: ResizeLimits,
 ): number {
-  if (!plans.some((p) => p.size.animated)) {
+  let framePixels = 0;
+  for (const { size } of plans) {
+    if (size.animated) {
+      framePixels = Math.max(framePixels, size.width * size.height);
+    }
+  }
+  if (framePixels === 0) {
     return 1;
   }
+  framePixels = Math.max(framePixels, info.width * info.height);
   const budget = Math.min(limits.sourcePixels, limits.inputPixels);
   return Math.max(
     1,
     Math.min(
       info.pages ?? 1,
       limits.animationFrames,
-      Math.floor(budget / (info.width * info.height)),
+      Math.floor(budget / framePixels),
     ),
   );
 }

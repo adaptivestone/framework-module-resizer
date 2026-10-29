@@ -31,7 +31,7 @@ export async function straightAlpha(
   }
   // Sharp unpremultiplies raw input marked premultiplied on output, with no other operation.
   const { data, info } = await readRaster(
-    sharp(raster.data, rasterInput(raster, limits)).timeout(timeout(limits)),
+    sharp(raster.data, rasterInput(raster)).timeout(timeout(limits)),
   );
   const { delay, loop } = raster.info;
   return {
@@ -127,7 +127,7 @@ export async function reduceToBox(
     return frame;
   }
   return readRaster(
-    sharp(frame.data, rasterInput(frame, limits))
+    sharp(frame.data, rasterInput(frame))
       .resize(box.width, box.height, { fit: 'outside' })
       .toColorspace('srgb')
       .timeout(timeout(limits)),
@@ -140,7 +140,7 @@ function resizeFrame(
   size: SizePlan,
   limits: ResizeLimits,
 ): Promise<Raster> {
-  let img = sharp(frame.data, rasterInput(frame, limits))
+  let img = sharp(frame.data, rasterInput(frame))
     .resize(size.width, size.height, {
       fit: size.mode === 'cover' ? 'cover' : 'fill',
       position: 'center',
@@ -175,24 +175,35 @@ export async function renderSize(
     return resizeFrame(source, size, limits);
   }
   // Sharp does not resize a raw multi-page image per frame (the page height goes stale), so each
-  // frame is resized on its own, one at a time, and the results are stacked again.
+  // frame is resized on its own, one at a time, and copied into one stack allocated once: the
+  // frames are held once, never as a list plus a joined copy. The plan bounds the frames so the
+  // stack fits the pixel budget at this size.
   const frameBytes = width * height * channels;
-  const resized: Raster[] = [];
-  for (let i = 0; i < frames; i++) {
-    const frame: Raster = {
-      data: source.data.subarray(i * frameBytes, (i + 1) * frameBytes),
-      info: { width, height, channels },
-    };
-    resized.push(await resizeFrame(frame, size, limits));
+  const frameAt = (i: number): Raster => ({
+    data: source.data.subarray(i * frameBytes, (i + 1) * frameBytes),
+    info: { width, height, channels },
+  });
+  const first = await resizeFrame(frameAt(0), size, limits);
+  const outBytes = first.data.length;
+  const stack = Buffer.allocUnsafe(frames * outBytes);
+  first.data.copy(stack, 0);
+  for (let i = 1; i < frames; i++) {
+    const { data } = await resizeFrame(frameAt(i), size, limits);
+    if (data.length !== outBytes) {
+      throw new ResizeSetupError(
+        `resize: frame ${i} resized to ${data.length} bytes, not ${outBytes} like the first frame`,
+      );
+    }
+    data.copy(stack, i * outBytes);
   }
-  const info: RasterInfo = { ...resized[0].info, frames };
+  const info: RasterInfo = { ...first.info, frames };
   if (delay !== undefined) {
     info.delay = delay;
   }
   if (loop !== undefined) {
     info.loop = loop;
   }
-  return { data: Buffer.concat(resized.map((r) => r.data)), info };
+  return { data: stack, info };
 }
 
 /** The sized rasters of one task: one render per size key, dropped after its last variant. */
@@ -271,6 +282,17 @@ export interface EncodedVariant {
   height: number;
 }
 
+/**
+ * One delay per frame: a shorter list repeats its last delay (the GIF encoder writes 0 for a frame
+ * without one, which plays it as fast as the viewer can), a longer one is cut.
+ */
+function delayPerFrame(delay: readonly number[], frames: number): number[] {
+  return Array.from(
+    { length: frames },
+    (_, i) => delay[Math.min(i, delay.length - 1)],
+  );
+}
+
 /** One preview file: variantSteps on the sized pixels, the alpha flatten, then the encoder. */
 export async function encodeVariant(
   sized: Raster,
@@ -280,7 +302,7 @@ export async function encodeVariant(
   const { format } = plan.variant;
   const source = isAnimatedFormat(format) ? sized : firstFrame(sized);
   const { channels, frames = 1, delay, loop } = source.info;
-  let img = sharp(source.data, rasterInput(source, opts.limits));
+  let img = sharp(source.data, rasterInput(source));
   for (const step of opts.variantSteps) {
     img = await step(img, { variant: plan.variant, ctx: opts.ctx });
   }
@@ -295,7 +317,9 @@ export async function encodeVariant(
   const timing =
     frames > 1
       ? {
-          ...(delay !== undefined ? { delay } : {}),
+          ...(delay !== undefined && delay.length > 0
+            ? { delay: delayPerFrame(delay, frames) }
+            : {}),
           ...(loop !== undefined ? { loop } : {}),
         }
       : {};

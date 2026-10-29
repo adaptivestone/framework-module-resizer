@@ -326,3 +326,94 @@ test('frames are 1 unless a plan animates, then bounded by pages, animationFrame
   assert.equal(stillPlans[0].size.animated, false);
   assert.equal(framesToDecode(many, stillPlans, limits), 1);
 });
+
+test('the frame budget is divided by the larger of the source and the largest animated size', () => {
+  const on = rules({ animated: true });
+  const limits = {
+    ...makeImageConfig().limits,
+    animationFrames: 64,
+    sourcePixels: 50_000_000,
+    inputPixels: 50_000_000,
+  };
+  const src = info(100, 100, { pages: 64, animated: true });
+  // A width-only size enlarges: 3000×3000 per frame.
+  const large = planVariants(src, [size(3000, undefined, 'webp')], on);
+  assert.equal(large[0].size.animated, true);
+  assert.equal(large[0].size.width, 3000);
+  assert.equal(large[0].size.height, 3000);
+  assert.equal(framesToDecode(src, large, limits), 5);
+
+  // A size no larger than the source: the source's own pixels count, capped by animationFrames.
+  const small = planVariants(src, [size(100, 100, 'webp')], on);
+  assert.equal(framesToDecode(src, small, limits), 64);
+
+  // A still size of the same task does not count: only animated sizes hold a stack.
+  const mixed = planVariants(
+    src,
+    [size(100, 100, 'webp'), size(4000, undefined, 'jpeg')],
+    on,
+  );
+  assert.equal(mixed[1].size.animated, false);
+  assert.equal(framesToDecode(src, mixed, limits), 64);
+});
+
+test('frames are capped by animationFrames and by the inputPixels side of the budget', () => {
+  const on = rules({ animated: true });
+  const src = info(100, 100, { pages: 100, animated: true });
+  const plans = planVariants(src, [size(10, 10, 'webp')], on);
+  const base = makeImageConfig().limits;
+  assert.equal(framesToDecode(src, plans, { ...base, animationFrames: 7 }), 7);
+  assert.equal(
+    framesToDecode(src, plans, {
+      ...base,
+      animationFrames: 64,
+      sourcePixels: 50_000_000,
+      inputPixels: 4 * 100 * 100,
+    }),
+    4,
+  );
+});
+
+test('the decode box rounds a float product down to the exact side', () => {
+  const src = info(100, 100);
+  const plans = planVariants(
+    src,
+    [size(7, 7)],
+    rules({}, { variantSteps: [step] }),
+  );
+  assert.deepEqual(decodeBox(src, plans, { atLeastOwnSize: false }), {
+    width: 7,
+    height: 7,
+  });
+});
+
+test('a size key that names no side and is not fit is the source at its own size', () => {
+  const src = info(640, 480);
+  assert.deepEqual(one(src, { sizeKey: 'none', format: 'jpeg' }), {
+    width: 640,
+    height: 480,
+    mode: 'fill',
+    sharpen: true,
+  });
+});
+
+test('equal sides with a different mode are separate size plans', () => {
+  const src = info(400, 200);
+  // A fit inside maxSize keeps 400×200 (fill); a 400×200 cover box is the same area, cover-cropped.
+  const [byFit, byCover] = planVariants(
+    src,
+    [fit(), size(400, 200)],
+    rules({}, { variantSteps: [step] }),
+  );
+  assert.equal(byFit.size.width, byCover.size.width);
+  assert.equal(byFit.size.height, byCover.size.height);
+  assert.notEqual(byFit.size.mode, byCover.size.mode);
+  assert.notEqual(byFit.size.key, byCover.size.key);
+});
+
+test('the decode box of an empty plan list is the smallest box', () => {
+  assert.deepEqual(decodeBox(info(100, 80), [], { atLeastOwnSize: false }), {
+    width: 1,
+    height: 1,
+  });
+});

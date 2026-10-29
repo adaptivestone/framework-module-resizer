@@ -298,3 +298,24 @@ test('render converts a P3-tagged JPEG to sRGB as one Sharp pipeline does', asyn
     .toBuffer({ resolveWithObject: true });
   assertNear(pixelAt(raster, 10, 10), pixelAt(reference, 10, 10));
 });
+
+test('inspect checks one frame of an animation against limits.inputPixels, not the whole stack', async () => {
+  // One 20×20 frame is 400 px; the three stacked are 1200.
+  const small = { ...limits, inputPixels: 800 };
+  const decoder = new SharpDecoder();
+  const info = await decoder.inspect(animatedGif, small);
+  assert.equal(info.width, 20);
+  assert.equal(info.height, 20);
+  assert.equal(info.pages, 3);
+  assert.equal(info.animated, true);
+
+  const raster = await decoder.render(
+    animatedGif,
+    { width: 20, height: 20 },
+    { limits: small, source: info, frames: 2 },
+  );
+  assert.equal(raster.info.frames, 2);
+  assert.deepEqual(raster.info.delay, [100, 200]);
+  assert.equal(raster.info.loop, 3);
+  assert.equal(raster.data.length, 20 * 20 * raster.info.channels * 2);
+});

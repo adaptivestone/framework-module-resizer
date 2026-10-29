@@ -4,7 +4,6 @@
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
 import type { Raster, RasterInfo } from './contracts/decoder.ts';
 import { ResizeSetupError } from './errors.ts';
-import type { ResizeLimits } from './types.d.ts';
 
 const isPositiveInteger = (n: unknown): n is number =>
   typeof n === 'number' && Number.isInteger(n) && n > 0;
@@ -61,52 +60,106 @@ function rawOptions(raster: Raster): NonNullable<SharpOptions['raw']> {
   };
 }
 
-/** The input options for `sharp(raster.data, …)` inside the core, under `limits.inputPixels`. */
-export function rasterInput(
-  raster: Raster,
-  limits: ResizeLimits,
-): SharpOptions {
-  return { raw: rawOptions(raster), limitInputPixels: limits.inputPixels };
+/**
+ * The input options for `sharp(raster.data, …)` inside the core. The pixels are already in memory
+ * (decoded, or rendered by the core itself), so the raster's own size is the input limit:
+ * `limits.inputPixels` guards untrusted bytes, and the decoders apply it to those.
+ */
+export function rasterInput(raster: Raster): SharpOptions {
+  const { width, height, frames = 1 } = raster.info;
+  return { raw: rawOptions(raster), limitInputPixels: width * height * frames };
 }
 
 /**
- * Sharp over the raster's pixels, for a Sharp-based beforeStep. The raster is already in memory,
- * so its own size is the input limit.
+ * Sharp over the raster's pixels, for a Sharp-based beforeStep. A value that is not a Raster is
+ * refused here, before Sharp reads it as raw bytes of the wrong size.
  */
 export function rasterToSharp(raster: Raster): Sharp {
-  const { width, height, frames = 1 } = raster.info;
-  return sharp(raster.data, {
-    raw: rawOptions(raster),
-    limitInputPixels: width * height * frames,
-  });
+  const problem = rasterProblem(raster);
+  if (problem !== undefined) {
+    throw new ResizeSetupError(
+      `resize: rasterToSharp was given something that is not a Raster: ${problem}`,
+      { code: 'RESIZE_PIPELINE_STEP_INVALID' },
+    );
+  }
+  return sharp(raster.data, rasterInput(raster));
 }
 
 /**
- * The 8-bit raw output of `img` as a raster (no timing). Sharp's `premultiplied` flag is never
- * copied: after a resize it reports true on raw output whose bytes are straight alpha. The frame
- * count comes from the pixels: Sharp echoes a requested page count in `info.pages` even when the
- * loader read one frame, but sets `pageHeight` below the height only on stacked frames.
+ * Sharp's raw output as a raster, why its description does not match its bytes, and whether a page
+ * height was left over from a multi-page input that was resized as one image.
  */
-export async function readRaster(img: Sharp): Promise<Raster> {
+async function rawOutput(img: Sharp): Promise<{
+  raster: Raster;
+  problem: string | undefined;
+  stalePageHeight: number | undefined;
+}> {
   const { data, info } = await img
     .raw({ depth: 'uchar' })
     .toBuffer({ resolveWithObject: true });
-  const frameHeight = info.pageHeight ?? info.height;
-  const frames = info.height / frameHeight;
+  // The page height is a frame height only when it is below the height and divides it: Sharp keeps
+  // a stale page height after resizing a raw multi-frame input, and echoes a requested page count
+  // in `info.pages` even when the loader read one frame.
+  const { pageHeight } = info;
+  const frames =
+    pageHeight !== undefined &&
+    pageHeight > 0 &&
+    pageHeight < info.height &&
+    info.height % pageHeight === 0
+      ? info.height / pageHeight
+      : 1;
   const rasterInfo: RasterInfo = {
     width: info.width,
-    height: frameHeight,
+    height: info.height / frames,
     channels: info.channels,
   };
   if (frames > 1) {
     rasterInfo.frames = frames;
   }
-  return { data, info: rasterInfo };
+  return {
+    raster: { data, info: rasterInfo },
+    problem: rasterProblem({ data, info: rasterInfo }),
+    stalePageHeight:
+      frames === 1 && pageHeight !== undefined && pageHeight !== info.height
+        ? pageHeight
+        : undefined,
+  };
+}
+
+/**
+ * The 8-bit raw output of `img` as a raster (no timing). Sharp's `premultiplied` flag is never
+ * copied: after a resize it reports true on raw output whose bytes are straight alpha. Rejects
+ * output whose bytes do not match its size and frame count, rather than return an inconsistent
+ * raster. `SharpDecoder.render` reads frames by the same rule (decoders do not import this file);
+ * the Processor checks its raster with `checkRaster`.
+ */
+export async function readRaster(img: Sharp): Promise<Raster> {
+  const { raster, problem } = await rawOutput(img);
+  if (problem !== undefined) {
+    throw new ResizeSetupError(
+      `resize: Sharp described its raw output inconsistently: ${problem}`,
+    );
+  }
+  return raster;
 }
 
 /** Reads a Sharp-based beforeStep's result back as a one-frame sRGB raster. */
 export async function sharpToRaster(img: Sharp): Promise<Raster> {
-  const raster = await readRaster(img.toColorspace('srgb'));
+  const { raster, problem, stalePageHeight } = await rawOutput(
+    img.toColorspace('srgb'),
+  );
+  if (stalePageHeight !== undefined) {
+    throw new ResizeSetupError(
+      `resize: a beforeStep must return one frame, not a multi-page image resized as one (a page height of ${stalePageHeight} over ${raster.info.height} rows)`,
+      { code: 'RESIZE_PIPELINE_STEP_INVALID' },
+    );
+  }
+  if (problem !== undefined) {
+    throw new ResizeSetupError(
+      `resize: a beforeStep returned pixels Sharp could not describe consistently: ${problem}`,
+      { code: 'RESIZE_PIPELINE_STEP_INVALID' },
+    );
+  }
   if ((raster.info.frames ?? 1) > 1) {
     throw new ResizeSetupError(
       `resize: a beforeStep must return one frame, not ${raster.info.frames}`,
