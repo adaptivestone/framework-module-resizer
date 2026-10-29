@@ -97,7 +97,8 @@ gets the full box its steps were written for. To hand the private original to it
    anywhere, even before `Server.init()`. Options win over the config: `storage` (e.g. an
    `S3Storage` with the host's own `client`), `media`, `locks`, `tasks` (a `TaskQueue`, or
    `false` = eager only), `coordination`, `logger`, `events`, `config`, `configName`, `queueName`
-   (the queue name, a key of `queues`), `name`. `resizer.queue` is gone: read `resizer.queueName`.
+   (the queue name, a key of `queues`), `name`, `decoders` (extra source kinds, see below).
+   `resizer.queue` is gone: read `resizer.queueName`.
    A `queueName` option is readable at once; a name from the config file only after
    `await resizer.ready()` or the first call (`RESIZE_NOT_READY` before). A `tasks` queue in code
    skips only the choice of the queue from `queues` (the name is `queueName`, else the file's
@@ -107,10 +108,10 @@ gets the full box its steps were written for. To hand the private original to it
    in code too keeps its process-wide sections from being read: the default Resizer still reads
    the file for its own sections, and the worker process reads `worker` and `queues` from it.
 
-   Without the framework: `new Resizer({ storage, media, locks?, tasks?, coordination?, queueName? })` from
-   the main entry (`locks` is required only beside a task queue without `gatesByTask`, such as
-   `SqsTaskQueue`, which takes one gate lock per media, pipeline and queue: `verify()` rejects
-   without it; `MongoTaskQueue` needs none), with
+   Without the framework: `new Resizer({ storage, media, locks?, tasks?, coordination?,
+   queueName?, decoders? })` from the main entry (`locks` is required only beside a task queue
+   without `gatesByTask`, such as `SqsTaskQueue`, which takes one gate lock per media, pipeline
+   and queue: `verify()` rejects without it; `MongoTaskQueue` needs none), with
    `@adaptivestone/framework-module-resize/drivers/mongo.js` → `...mongoParts(connection, {
    mediaModel, timing? })` (`{ media, locks, tasks }`: the host media model, and locks and the task
    queue on the package's `ResizeLock` / `ResizeTask` models; also `MongoMediaStore`,
@@ -120,9 +121,15 @@ gets the full box its steps were written for. To hand the private original to it
    `SqsTaskQueue`. Any part may be a function (sync or async) called once on first use. A custom
    driver extends the exported abstract class (`ResizeStorage`, `MediaStore`, `LockStore`,
    `TaskQueue`) or is any object of the same shape — no `app` parameter; a driver closes over its
-   own client. `MediaStore.appendPreviews` resolves with the previews it stored, and the REQUIRED
-   `MediaStore.replacePreviews` swaps rows by identity in one write (see Use); `LockStore` locks
-   carry an owner (`release(key, owner)` is a compare-and-delete). The core owns the queue logic
+   own client. A custom decoder (`decoders: [new PdfDecoder()]`, asked before the built-in Sharp
+   and SVG decoders; pass it in every process) extends `SourceDecoder`: `formats` (the
+   `original.format` ids it reads), `inspect(bytes, limits)` (identify and measure, never render;
+   bytes of another format reject with `RESIZE_SOURCE_FORMAT_UNSUPPORTED`), `render(bytes, box,
+   opts)` (an upright 8-bit sRGB `Raster`, profile applied, at least `box` where its limits allow)
+   and optional `verify()`; see the README `Decoders` section. `MediaStore.appendPreviews`
+   resolves with the previews it stored, and the REQUIRED `MediaStore.replacePreviews` swaps rows
+   by identity in one write (see Use); `LockStore` locks carry an owner (`release(key, owner)` is
+   a compare-and-delete). The core owns the queue logic
    (worker loop, retries, dead-letters, the gate lock, events); a `TaskQueue` only implements
    atomic `add` / `claim` / `renew` / `complete` / `fail`. `add` resolves with a `TaskAddResult`
    (`added`, `in-flight` or `unconfirmed`); the optional flags `gatesByTask` (the queue keeps at
@@ -283,17 +290,19 @@ const original = await getResizer().uploadOriginal({
 });
 ```
 
-The format and dimensions come from `sharp().metadata()` for raster images and SVG. Input
-bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) as a private original. SVG
-sizes are reported by Sharp, including sizes derived from `viewBox`; unreadable or unsized SVG
-is rejected. SVG dimensions that cannot retain a pixel on each side within the renderer's side
-limit are rejected before storage with `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` (for example,
-`1×100000`). Already stored sources with those dimensions are dead-lettered on their first
-delivery. The module does not sanitize SVG markup. The worker renders an SVG once per task,
-before any pipeline step, into a PNG, in a separate Node process, at the largest size the
-requested previews need; `beforeSteps` receive that PNG (never SVG markup), and every format is
-made from it. The render is killed after `limits.processingTimeoutSeconds`
-(`RESIZE_SVG_RENDER_TIMEOUT`, dead-lettered at once) or when the task aborts; a crashed render is
+The format and dimensions come from the decoders' `inspect` (Sharp's metadata for raster images
+and SVG). Input bytes are stored unchanged; SVG stays `.svg` (`image/svg+xml`) as a private
+original. SVG sizes are reported by Sharp, including sizes derived from `viewBox` (a fractional
+natural size is stored rounded, at least 1 px a side); unreadable or unsized SVG is rejected.
+SVG dimensions that cannot retain a pixel on each side within the renderer's side limit are
+rejected before storage with `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` (for example, `1×100000`).
+Already stored sources with those dimensions are dead-lettered on their first delivery. The module
+does not sanitize SVG markup. The worker renders an SVG once per task, before any pipeline step,
+in a separate Node process, at the largest size the requested previews need (with `beforeSteps`,
+at least its natural size); `beforeSteps` receive the rendered pixels as a `Raster` (never SVG
+markup), and every format is made from them. The render is killed after
+`limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`, dead-lettered at once) or when
+the task aborts; a crashed render is
 `RESIZE_SVG_RENDER_FAILED` (retried). A render that cannot start is `ResizeSetupError`
 `RESIZE_SVG_RENDER_UNAVAILABLE`: the host must allow child processes (Node's permission model:
 `--allow-child-process`) and ship `svgRasterChild.js` next to `svgRaster.js` (watch out when
@@ -375,9 +384,11 @@ can help). The worker reads `retryable` on the error that fails the task, when i
 `ResizeError` — including one from a duplicate copy of the package; errors from other libraries
 are retried. It dead-letters the task at once when it is `false`; an error inside one variant
 (`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with the
-retryable `RESIZE_WORKER_INCOMPLETE`. Use `ResizeError.isResizeError(err)` rather than
-`instanceof` when the error may cross a package boundary — duplicate copies of the package break
-`instanceof` but not the symbol brand.
+retryable `RESIZE_WORKER_INCOMPLETE`. A source that cannot be decoded is a `ResizeMediaError`
+(`RESIZE_SOURCE_DECODE_FAILED`, retryable, with the engine's error as `cause`, or the decoder's
+own code), so the catch below routes it to `badRequest`. Use `ResizeError.isResizeError(err)`
+rather than `instanceof` when the error may cross a package boundary — duplicate copies of the
+package break `instanceof` but not the symbol brand.
 
 ```ts
 import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
@@ -428,10 +439,17 @@ Waterfalls (read path, real `ctx`): `resolveSizes`, `beforeEnqueue`, `formatPubl
 Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFailed`,
 `onTaskDeadLettered`; the three task observers (`afterTaskComplete`, `onTaskFailed`,
 `onTaskDeadLettered`) receive the task with `attempts` (its deliveries, 1 on the first).
-Pipelines: `beforeSteps` run once on the source buffer;
-`variantSteps` run per variant after resize, before encode. An optional pipeline `version`
-(string) is part of each preview row's `encodeSig`: bump it when a step's output changes (stored
-previews are not regenerated yet).
+Pipelines: `beforeSteps` run once on the decoded first frame, as a `Raster` in and a `Raster` out
+(`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
+pixels, not a library object, so the engine stays replaceable); `variantSteps` run on each size's
+pixels as a Sharp instance, before encode. An optional pipeline `version` (string) is part of
+each preview row's `encodeSig`: bump it when a step's output changes (stored previews are not
+regenerated yet).
+
+```ts
+import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
+// beforeSteps: [async (r) => sharpToRaster(rasterToSharp(r).blur(5))]
+```
 
 ## Rules (violations cause real incidents)
 
@@ -450,6 +468,11 @@ previews are not regenerated yet).
   `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants).
+- A `beforeStep` receives and returns a one-frame `Raster`, never a Sharp object or a `Buffer`;
+  wrap Sharp work with `rasterToSharp` / `sharpToRaster`. For a raster source it sees the upright
+  original at its own size; for a vector source (SVG) the pixels can be larger, so multiply
+  coordinates stored in the source's units by `meta.scale`. A pipeline with `beforeSteps` (or
+  `variantSteps`) renders the first frame of an animation only.
 - Register every pipeline in `src/resizer.ts`, so the API and the worker both have it
   (`resizer.hasPipeline(name)` checks). An unregistered name (anything but `'default'`) never
   renders: `resolve()` serves only previews already stored for it and queues nothing, `prewarm()`
@@ -465,8 +488,12 @@ previews are not regenerated yet).
   `encode.formats` key is never generated: `resolve()` leaves it out of `decision.missing`,
   `prewarm()` reports it in `unconfirmed` with the non-retryable issue
   `RESIZE_FORMAT_NOT_CONFIGURED`, and `generate()` throws `ResizeSetupError` with that code.
+- `original.format` should be the decoder's id (`jpeg`, `png`, `svg`, …; not `jpg` or a MIME
+  type), as `uploadOriginal()` returns it. The worker tries that decoder first; a mismatch is
+  logged as a warning and the bytes are probed, so the preview still renders: fix the record.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
-  `metadata()` inspection for raster images and SVG only; it never emits transformed bytes.
+  the decoders' `inspect()` (Sharp's `metadata()` for raster images and SVG); it never emits
+  transformed bytes.
 - The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
   must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`
   (`--check --eager` for an eager host, which has no model or command to check). Right after an
@@ -516,6 +543,13 @@ previews are not regenerated yet).
 | previews written before `0.3.0-rc.1` (no `origin` / `encodeSig`), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are served for now and will be regenerated once a later release's freshness check ships (plan the storage cost); rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews` — delete their files yourself |
 | `RESIZE_MONGO_LOCK_MODEL_OUTDATED` from `verify()` or at worker start | the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
+| `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
+| `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (dead-lettered at once), or `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` from `uploadOriginal()` | every decoder refused the bytes: no decoder of this process reads that format — add a decoder for it, or reject the file |
+| worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes; the preview renders — fix the record to the decoder's id (`jpeg`) |
+| `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source; the error's `cause` says why — retried, then dead-lettered |
+| `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
+| `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
+| Sharp's `Input file is missing` from a `beforeStep` | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
 | a variant stays missing for ~10 min after its task was dead-lettered | `coordination.cooldownMs` (default 600000): the dead task holds the gate of its media, pipeline and queue until the cooldown ends, so reads queue nothing and `prewarm()` reports `RESIZE_TASK_IN_FLIGHT` (SQS: `RESIZE_ENQUEUE_LOCK_CONTENDED`) — fix the cause in the logs first |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoMediaStore()` / `new MongoLockStore()` / `new MongoTaskQueue()` needs exactly one of `model` or `getModel` — or use `mongoParts(connection, { mediaModel })` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
