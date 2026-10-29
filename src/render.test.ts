@@ -314,6 +314,21 @@ test('SizedRasters renders each size once for the variants that share it, and dr
   assert.equal((await again).info.width, 10);
 });
 
+test('SizedRasters.clear drops the base raster and every sized one, released or not', async () => {
+  const small = sizePlan(10, 5);
+  const large = sizePlan(16, 8);
+  const sized = new SizedRasters(
+    solid(20, 10, [10, 20, 30]),
+    [variantPlan(small, 'jpeg'), variantPlan(large, 'jpeg')],
+    limits,
+  );
+  await sized.get(small);
+  sized.clear();
+  // Neither the cached size nor the base raster is left to render from.
+  await assert.rejects(sized.get(small), ResizeSetupError);
+  await assert.rejects(sized.get(large), ResizeSetupError);
+});
+
 /** The meta runBeforeSteps passes on (without the scale it adds per step). */
 function stepMeta(source: Partial<SourceInfo> = {}) {
   return {

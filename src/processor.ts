@@ -458,7 +458,7 @@ export class Processor {
     opts: { signal?: AbortSignal } = {},
   ): Promise<void> {
     const { catalog, logger, media: mediaStore, name } = this.#deps;
-    // ctx does NOT cross the queue — the worker's pipeline steps depend on media/metadata.
+    // ctx does NOT cross the queue — the worker's pipeline steps depend on media/source.
     const ctx: Record<string, unknown> = {};
 
     // Load the media doc. A deleted media row is a logged no-op success (the queue completes it),
@@ -634,9 +634,10 @@ export class Processor {
       original.width !== undefined && original.height !== undefined
         ? { width: original.width, height: original.height }
         : undefined;
+    // At least one pixel a side, as the plan rounds sides: a vector source may be fractional.
     const mediaDims = storedDims ?? {
-      width: Math.round(info.width),
-      height: Math.round(info.height),
+      width: Math.max(1, Math.round(info.width)),
+      height: Math.max(1, Math.round(info.height)),
     };
     const origin = previewOrigin(original.storageRef, mediaDims);
 
@@ -702,7 +703,10 @@ export class Processor {
       );
     }
 
+    // From here only `sized` holds the raster; it is cleared once the variants are done, so the
+    // persist and the observers below do not keep the pixels alive.
     const sized = new SizedRasters(raster, plans, limits);
+    raster = undefined;
     const encodeOptions = {
       variantSteps: pipeline.variantSteps ?? [],
       ctx,
@@ -711,11 +715,18 @@ export class Processor {
     };
     const renderVariant = async (plan: VariantPlan): Promise<void> => {
       try {
-        const encoded = await encodeVariant(
-          await sized.get(plan.size),
-          plan,
-          encodeOptions,
-        );
+        let encoded: EncodedVariant;
+        try {
+          encoded = await encodeVariant(
+            await sized.get(plan.size),
+            plan,
+            encodeOptions,
+          );
+        } finally {
+          // Released after the encode, not after the upload: the last variant of a size does not
+          // keep its sized raster during the upload.
+          sized.release(plan.size);
+        }
         const ref = await storage.upload({
           key: `previews/${randomHex()}.${encoded.format}`,
           body: encoded.data,
@@ -747,8 +758,6 @@ export class Processor {
           err,
         );
         failedCount += 1;
-      } finally {
-        sized.release(plan.size);
       }
     };
 
@@ -756,6 +765,7 @@ export class Processor {
     // variants stop launching new ones if the lease was lost (best-effort — correctness holds via
     // the fencing token).
     await runBounded(plans, config.concurrency, signal, renderVariant);
+    sized.clear();
 
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
     // never carried dims; previewRecorder.ts), then fire onPreviewGenerated per stored preview

@@ -2780,12 +2780,16 @@ describe('EXIF orientation quality', () => {
     return scores;
   }
 
-  test('orientation 6 without beforeSteps: same dims and pixels as rotating first, no added loss', async () => {
+  test('orientations 6 and 1 without beforeSteps: display-oriented sizes, and every preview matches the full decode', async () => {
     const rotated = await score(await texturedJpeg(6));
     const upright = await score(await texturedJpeg(1));
     assert.deepEqual(
       [...rotated].map(([key, s]) => `${key}=${s.dims}`).sort(),
       ['100w=100x150', '100x120=100x120', 'fit=200x300'],
+    );
+    assert.deepEqual(
+      [...upright].map(([key, s]) => `${key}=${s.dims}`).sort(),
+      ['100w=100x67', '100x120=100x120', 'fit=300x200'],
     );
     for (const [orientation, scores] of [
       [6, rotated],
@@ -2812,7 +2816,11 @@ describe('EXIF orientation quality', () => {
       ],
     });
     assert.deepEqual(seen, { width: 200, height: 300 });
-    assert.equal(scores.size, 3);
+    assert.deepEqual([...scores].map(([key, s]) => `${key}=${s.dims}`).sort(), [
+      '100w=100x150',
+      '100x120=100x120',
+      'fit=200x300',
+    ]);
     for (const [key, { psnr: db }] of scores) {
       // A default-quality JPEG round trip of this texture scores about 35 dB.
       assert.ok(db >= 50, `${key}: ${db.toFixed(2)} dB vs the full decode`);

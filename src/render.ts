@@ -197,7 +197,7 @@ export async function renderSize(
 
 /** The sized rasters of one task: one render per size key, dropped after its last variant. */
 export class SizedRasters {
-  readonly #raster: Raster;
+  #raster: Raster | undefined;
   readonly #limits: ResizeLimits;
   /** Variants not yet released, per size key. */
   readonly #pending = new Map<string, number>();
@@ -220,6 +220,13 @@ export class SizedRasters {
   get(size: SizePlan): Promise<Raster> {
     let rendered = this.#rendered.get(size.key);
     if (rendered === undefined) {
+      if (this.#raster === undefined) {
+        return Promise.reject(
+          new ResizeSetupError(
+            'resize: a size was requested after the sized rasters of the task were cleared',
+          ),
+        );
+      }
       rendered = renderSize(this.#raster, size, this.#limits);
       this.#rendered.set(size.key, rendered);
     }
@@ -235,6 +242,16 @@ export class SizedRasters {
     }
     this.#pending.delete(size.key);
     this.#rendered.delete(size.key);
+  }
+
+  /**
+   * The task's variants are done: drop the base raster and every sized one, including those of
+   * variants that never ran (an aborted task), so nothing after the render keeps the pixels.
+   */
+  clear(): void {
+    this.#raster = undefined;
+    this.#pending.clear();
+    this.#rendered.clear();
   }
 }
 
