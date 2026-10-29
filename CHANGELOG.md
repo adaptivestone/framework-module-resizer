@@ -204,14 +204,15 @@ later release that puts the image engine behind a port.
   error, for example) with the retryable `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED`, the
   original error as its `cause`.
 - **The worker reads `original.format`** to pick the decoder to try first. A format that no
-  decoder lists, one whose decoder refuses the bytes, or one whose decoder reads them as another of
-  its formats (JPEG bytes stored as `png`) is logged as a warning
+  decoder lists, or one whose decoder refuses the bytes, is logged as a warning
   (`resize worker: media <id> is stored as '<stored>' but its bytes are '<format>' (<why>);
   rendering it as '<format>'`; when a host decoder lists the stored format, refuses the bytes and
   a later decoder reads them as that format, `… the first decoder listing '<stored>' refused these
   bytes, and another decoder read them`) and the bytes are probed through the other decoders, so a
-  record with an alias (`jpg`) or a MIME type still renders. Store the decoder's id (`jpeg`, `png`,
-  `svg`, …), as `uploadOriginal()` returns it.
+  record with an alias (`jpg`) or a MIME type still renders. A format whose decoder reads the bytes
+  as another of its formats (JPEG bytes stored as `png`) is logged with the same warning and
+  rendered by that decoder as what it is; no other decoder is asked. Store the decoder's id
+  (`jpeg`, `png`, `svg`, …), as `uploadOriginal()` returns it.
 - **`RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` means "no decoder reads these bytes".** It meant "Sharp
   named no format". It fires when Sharp identifies a format that no decoder lists (a libvips build
   with extra loaders), or when every decoder refuses the bytes. Bytes Sharp cannot read at all
