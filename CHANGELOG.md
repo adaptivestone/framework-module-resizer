@@ -221,13 +221,12 @@ later release that puts the image engine behind a port.
   `resize:`. A stored SVG's `width` and `height` are its natural size rounded, at least 1. The
   `RESIZE_ORIGINAL_TOO_MANY_PIXELS` message for an EXIF-rotated original prints its display
   (upright) sides. The codes are unchanged.
-- **Worker memory and rounding.** With `beforeSteps`, the worker decodes the source at its own
-  size and holds it as raw pixels plus the step's result: about 2 × width × height × 4 bytes, up to
-  about 400 MB at the default `limits.sourcePixels`; an animation holds frames × box × channels
-  bytes.
-  Size worker containers for `limits.sourcePixels`. Preview sizes are computed from the source's
-  display dimensions and rounded once per side, so a preview side can differ by one pixel from
-  what Sharp derived before.
+- **Worker memory and rounding.** With `beforeSteps`, the worker decodes the source at least at
+  its own size and holds it as raw pixels plus the step's result: about 2 × width × height × 4
+  bytes, up to about 400 MB at the default `limits.sourcePixels`; an animation holds frames × box ×
+  channels bytes. Size worker containers for `limits.sourcePixels`. Preview sizes are computed from
+  the source's display dimensions and rounded once per side, so a preview side can differ by one
+  pixel from what Sharp derived before.
 - Persisted locators are nested, driver-owned refs: `original.storageRef` and
   `previews[].storageRef` replace the flat `key`/`bucket` fields, and `StorageRef` is now an
   opaque JSON value. No reader or migration for old resize records is included; update host
@@ -680,8 +679,9 @@ later release that puts the image engine behind a port.
   its timing and the coordination, its `verify()`, and that it serves the Resizer's queue). It is
   the one call that rejects for a task queue that cannot be used.
 - `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
-  and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
-  `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
+  and returns typed metadata. Format and dimensions come from the decoders' `inspect` (Sharp's
+  metadata for raster images and SVG); new `upload.maxBytes`, `upload.formats` and
+  `limits.processingTimeoutSeconds` bound accepted inputs.
 - One task per media, pipeline and queue, whatever variants the reads ask for (the gate, above): a
   cold media read by 1000 requests at once gets one task, on Mongo and on SQS. The module does not
   create indexes; prepare the gate index through the host's migration or lifecycle before
@@ -747,8 +747,8 @@ later release that puts the image engine behind a port.
   `verify()`. `new Resizer({ decoders })` (and `new FrameworkResizer({ decoders })`) adds decoders,
   asked before the built-in Sharp and SVG decoders. `uploadOriginal()`, the worker and
   `generate()` read every source through them, so a new source kind (a PDF, a camera raw format)
-  needs only a decoder. New types: `SourceInfo`, `Raster`, `RasterInfo`, `DecodeBox`,
-  `RenderOptions` and `ResizeLimits`. See "Decoders" in `README.md`.
+  needs only a decoder and its format in `upload.formats`. New types: `SourceInfo`, `Raster`,
+  `RasterInfo`, `DecodeBox`, `RenderOptions` and `ResizeLimits`. See "Decoders" in `README.md`.
 - **Raster helpers.** `rasterToSharp(raster)` and `sharpToRaster(img)` (main entry) wrap a
   Sharp-based `beforeStep`, and its `meta.scale` maps coordinates in the source's units onto the
   raster the step receives.
@@ -786,12 +786,11 @@ later release that puts the image engine behind a port.
 - `animated: true` works. WebP and GIF previews keep the animation, up to
   `limits.animationFrames` frames, for a pipeline without `beforeSteps` or `variantSteps`; every
   other format, and every preview of a pipeline with steps (a watermark would land on one frame),
-  gets the
-  first frame instead of all frames stacked into one tall image. `actualWidth` / `actualHeight`
-  are the size of one frame. `limits.sourcePixels` applies to one frame, and an animation with
-  more frames than `limits.sourcePixels` or `limits.inputPixels` allow is shortened to the frames
-  that fit instead of failing. An animation with an EXIF orientation is rendered from its first
-  frame.
+  gets the first frame instead of all frames stacked into one tall image. `actualWidth` /
+  `actualHeight` are the size of one frame. `limits.sourcePixels` applies to one frame, and an
+  animation with more frames than `limits.sourcePixels` or `limits.inputPixels` allow is shortened
+  to the frames that fit instead of failing. An animation with an EXIF orientation is rendered from
+  its first frame.
 - No output side of a width-only or height-only size exceeds `limits.resultDimension`: when the
   side derived from the aspect ratio would, the image is cropped to the cap.
 - Fractional size dimensions are rounded in the size key, the task and the stored preview; a

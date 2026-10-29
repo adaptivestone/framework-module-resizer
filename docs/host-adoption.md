@@ -374,6 +374,7 @@ export default {
   decoder's error, or with the retryable `RESIZE_SOURCE_DECODE_FAILED`.
 - New source kinds come as decoders: `new FrameworkResizer({ decoders })` (or
   `new Resizer({ decoders })`) takes `SourceDecoder` objects, asked before the
-  built-in Sharp and SVG decoders; pass them in every process (API and worker).
-  See "Decoders" in `README.md`. `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means
+  built-in Sharp and SVG decoders; pass them in every process (API and worker),
+  and add their formats to `upload.formats` (else `uploadOriginal()` throws
+  `RESIZE_ORIGINAL_FORMAT_DISABLED`). See "Decoders" in `README.md`. `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means
   that no decoder reads the uploaded bytes.

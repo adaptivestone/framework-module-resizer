@@ -600,9 +600,13 @@ object, because the image engine is replaceable. A Sharp-based step stays one li
 helpers from the main entry:
 
 ```ts
-import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
+import {
+  type BeforeStep,
+  rasterToSharp,
+  sharpToRaster,
+} from '@adaptivestone/framework-module-resize';
 
-const blur = async (r) => sharpToRaster(rasterToSharp(r).blur(5));
+const blur: BeforeStep = async (r) => sharpToRaster(rasterToSharp(r).blur(5));
 // pipelines: { photo: { beforeSteps: [blur] } }
 ```
 
@@ -900,13 +904,13 @@ the `cooldownMs` of the task's own Resizer.
     the model).
 - **Worker memory:** a worker holds the decoded source as raw pixels, decoded once per task at
   the largest box the requested previews need. An animation holds frames × box × channels bytes.
-  With `beforeSteps` the source is decoded at its own size, and the peak is about
+  With `beforeSteps` the source is decoded at least at its own size, and the peak is about
   2 × width × height × 4 bytes (a step's input and its result): up to about 400 MB at the default
   `limits.sourcePixels` (50,000,000). Size worker containers for `limits.sourcePixels`. The pixel
-  limit after `beforeSteps` (`min(limits.sourcePixels, limits.inputPixels)`) is checked on the
-  dimensions of the raster a step returned, so a step that grows the image has already allocated
-  it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`, `retryable: false`). Steps
-  are host code.
+  limit after `beforeSteps` (`min(limits.sourcePixels, limits.inputPixels)`) is checked once, on
+  the dimensions of the raster the last step returned, so a step that grows the image has already
+  allocated it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`,
+  `retryable: false`). Steps are host code.
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that
   already exist, and the media store keeps one row per preview identity, so a repeat never
   duplicates them. A task completes only when every requested

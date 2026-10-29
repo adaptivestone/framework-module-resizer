@@ -122,14 +122,15 @@ gets the full box its steps were written for. To hand the private original to it
    driver extends the exported abstract class (`ResizeStorage`, `MediaStore`, `LockStore`,
    `TaskQueue`) or is any object of the same shape — no `app` parameter; a driver closes over its
    own client. A custom decoder (`decoders: [new PdfDecoder()]`, asked before the built-in Sharp
-   and SVG decoders; pass it in every process) extends `SourceDecoder`: `formats` (the
-   `original.format` ids it reads), `inspect(bytes, limits)` (identify and measure, never render;
-   bytes of another format reject with `RESIZE_SOURCE_FORMAT_UNSUPPORTED`), `render(bytes, box,
-   opts)` (an upright 8-bit sRGB `Raster`, profile applied, at least `box` where its limits allow)
-   and optional `verify()`; see the README `Decoders` section. `MediaStore.appendPreviews`
-   resolves with the previews it stored, and the REQUIRED `MediaStore.replacePreviews` swaps rows
-   by identity in one write (see Use); `LockStore` locks carry an owner (`release(key, owner)` is
-   a compare-and-delete). The core owns the queue logic
+   and SVG decoders; pass it in every process, and add its format to `upload.formats`, else
+   `uploadOriginal()` throws `RESIZE_ORIGINAL_FORMAT_DISABLED`) extends `SourceDecoder`: `formats`
+   (the `original.format` ids it reads), `inspect(bytes, limits)` (identify and measure, never
+   render; bytes of another format reject with `RESIZE_SOURCE_FORMAT_UNSUPPORTED`),
+   `render(bytes, box, opts)` (an upright 8-bit sRGB `Raster`, profile applied, at least `box`
+   where its limits allow) and optional `verify()`; see the README `Decoders` section.
+   `MediaStore.appendPreviews` resolves with the previews it stored, and the REQUIRED
+   `MediaStore.replacePreviews` swaps rows by identity in one write (see Use); `LockStore` locks
+   carry an owner (`release(key, owner)` is a compare-and-delete). The core owns the queue logic
    (worker loop, retries, dead-letters, the gate lock, events); a `TaskQueue` only implements
    atomic `add` / `claim` / `renew` / `complete` / `fail`. `add` resolves with a `TaskAddResult`
    (`added`, `in-flight` or `unconfirmed`); the optional flags `gatesByTask` (the queue keeps at
@@ -302,11 +303,10 @@ in a separate Node process, at the largest size the requested previews need (wit
 at least its natural size); `beforeSteps` receive the rendered pixels as a `Raster` (never SVG
 markup), and every format is made from them. The render is killed after
 `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`, dead-lettered at once) or when
-the task aborts; a crashed render is
-`RESIZE_SVG_RENDER_FAILED` (retried). A render that cannot start is `ResizeSetupError`
-`RESIZE_SVG_RENDER_UNAVAILABLE`: the host must allow child processes (Node's permission model:
-`--allow-child-process`) and ship `svgRasterChild.js` next to `svgRaster.js` (watch out when
-bundling). Eager `generate()` throws all three.
+the task aborts; a crashed render is `RESIZE_SVG_RENDER_FAILED` (retried). A render that cannot
+start is `ResizeSetupError` `RESIZE_SVG_RENDER_UNAVAILABLE`: the host must allow child processes
+(Node's permission model: `--allow-child-process`) and ship `svgRasterChild.js` next to
+`svgRaster.js` (watch out when bundling). Eager `generate()` throws all three.
 
 Persist every original privately, then call the same `prewarm()` path for
 raster and SVG. The worker creates the requested Sharp previews for both. SVG is an input
@@ -384,11 +384,12 @@ can help). The worker reads `retryable` on the error that fails the task, when i
 `ResizeError` — including one from a duplicate copy of the package; errors from other libraries
 are retried. It dead-letters the task at once when it is `false`; an error inside one variant
 (`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with the
-retryable `RESIZE_WORKER_INCOMPLETE`. A source that cannot be decoded is a `ResizeMediaError`
-(`RESIZE_SOURCE_DECODE_FAILED`, retryable, with the engine's error as `cause`, or the decoder's
-own code), so the catch below routes it to `badRequest`. Use `ResizeError.isResizeError(err)`
-rather than `instanceof` when the error may cross a package boundary — duplicate copies of the
-package break `instanceof` but not the symbol brand.
+retryable `RESIZE_WORKER_INCOMPLETE`. A source that cannot be decoded is a `ResizeError`
+(usually a `ResizeMediaError`: `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the engine's error
+as `cause`, or the decoder's own code; a missing or broken decoder is a `ResizeSetupError`), so
+the catch below still routes it to `badRequest`. Use `ResizeError.isResizeError(err)` rather than
+`instanceof` when the error may cross a package boundary — duplicate copies of the package break
+`instanceof` but not the symbol brand.
 
 ```ts
 import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
