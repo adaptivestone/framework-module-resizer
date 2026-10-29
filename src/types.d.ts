@@ -254,6 +254,15 @@ export interface InvalidateOpts {
 // module never changes.
 // ---------------------------------------------------------------------------
 
+// Decode/decompression-bomb guards (`ResizeConfig.limits`). Every decoder receives them.
+export interface ResizeLimits {
+  inputPixels: number; // default 268402689 — sharp limitInputPixels (decoder bomb guard)
+  sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)
+  resultDimension: number; // default 5000 — clamp on the cover branch
+  animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
+  processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
+}
+
 export interface ResizeConfig {
   formats: PreviewFormat[]; // generated output formats, e.g. ['jpeg','webp','avif']
   upload: {
@@ -272,13 +281,7 @@ export interface ResizeConfig {
   };
 
   // Decode/decompression-bomb guards.
-  limits: {
-    inputPixels: number; // default 268402689 — sharp limitInputPixels (decoder bomb guard)
-    sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)
-    resultDimension: number; // default 5000 — clamp on the cover branch
-    animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
-    processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
-  };
+  limits: ResizeLimits;
 
   // Variants processed in parallel per queued task or generate() call. Default 4; keep
   // concurrency × the worker's Sharp concurrency ≈ CPU cores.

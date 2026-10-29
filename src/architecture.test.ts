@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { sourceFiles } from './testHelpers/imports.ts';
+import { localImports, sourceFiles } from './testHelpers/imports.ts';
 
 const CORE_FILES = sourceFiles().filter(
   (f) =>
@@ -127,6 +127,49 @@ test('lock settings are validated only in the core', () => {
         f !== 'coordination.ts' &&
         /RESIZE_CONFIG_COORDINATION_INVALID/.test(read(f)),
     ),
+    [],
+  );
+});
+
+// The Processor renders through the decoder port and the plan: the single Sharp path that rendered
+// every variant is gone, and no source kind gets a branch of its own.
+test('generatePreviews is gone', () => {
+  assert.deepEqual(
+    sourceFiles().filter((f) => read(f).includes('generatePreviews')),
+    [],
+  );
+});
+
+test('the Processor has no SVG branch', () => {
+  assert.equal(read('processor.ts').includes("'svg'"), false);
+});
+
+// SVG markup is untrusted: only the SVG decoder measures and renders it, so no other file reaches
+// the SVG helpers.
+test('only the SVG decoder imports the SVG helpers', () => {
+  const helpers = ['helpers/svgDimensions.ts', 'helpers/svgRaster.ts'];
+  const svgImports = localImports('decoders/svg.ts', { types: true });
+  assert.ok(
+    helpers.every((h) => svgImports.includes(h)),
+    'sanity check: the listing does see decoders/svg.ts importing the SVG helpers',
+  );
+  assert.deepEqual(
+    sourceFiles()
+      .filter((f) => f !== 'decoders/svg.ts')
+      .flatMap((f) =>
+        localImports(f, { types: true })
+          .filter((t) => helpers.includes(t))
+          .map((t) => `${f} → ${t}`),
+      ),
+    [],
+  );
+});
+
+// A new source kind is a decoder the host passes in `decoders`: no shipped file names a format the
+// package does not read. The test-only PDF decoder (testHelpers/pdfDecoder.ts) proves it.
+test('no shipped file names the pdf format', () => {
+  assert.deepEqual(
+    sourceFiles().filter((f) => /['"`]pdf['"`]/.test(read(f))),
     [],
   );
 });

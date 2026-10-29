@@ -8,9 +8,16 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
+import type { Raster, SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import type { ResizeStorage, StorageUploadArgs } from './contracts/storage.ts';
+import { createDecoderSet, DecoderSet } from './decoderSet.ts';
 import { LocalFsStorage } from './drivers/fs.ts';
-import { ResizeOriginalError, ResizeStorageError } from './errors.ts';
+import {
+  ResizeMediaError,
+  ResizeOriginalError,
+  ResizeSetupError,
+  ResizeStorageError,
+} from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
 import { MemoryTaskQueue } from './testHelpers/fakes.ts';
@@ -104,7 +111,7 @@ afterEach(() => {
   resetAppInstance();
 });
 
-test('an Uploader stores an original with only storage and config', async () => {
+test('an Uploader stores an original with only storage, decoders and config', async () => {
   const uploads: StorageUploadArgs[] = [];
   const storage: ResizeStorage = {
     download: async () => Buffer.alloc(0),
@@ -116,6 +123,7 @@ test('an Uploader stores an original with only storage and config', async () => 
   };
   const original = await new Uploader({
     storage,
+    decoders: createDecoderSet(),
     config: makeImageConfig(),
   }).upload({ body: png64x48, visibility: 'private' });
   assert.match(uploads[0].key, /^originals\/[0-9a-f]{32}\.png$/);
@@ -128,6 +136,238 @@ test('an Uploader stores an original with only storage and config', async () => 
     },
     { format: 'png', contentType: 'image/png', width: 64, height: 48 },
   );
+});
+
+/** A plain-object decoder listing `formats` whose inspect resolves with `info` or rejects with `error`. */
+function fakeDecoder(
+  formats: string[],
+  behaviour: { info: SourceInfo } | { error: unknown },
+): SourceDecoder {
+  return {
+    formats,
+    async inspect(): Promise<SourceInfo> {
+      if ('error' in behaviour) {
+        throw behaviour.error;
+      }
+      return behaviour.info;
+    },
+    async render(): Promise<Raster> {
+      throw new Error('render is not part of these tests');
+    },
+  };
+}
+
+const pdfInfo: SourceInfo = {
+  format: 'pdf',
+  contentType: 'application/pdf',
+  width: 120.4,
+  height: 80.6,
+};
+
+/** An Uploader over `decoders` with recording storage; `upload.formats` adds 'pdf'. */
+function uploaderWith(decoders: DecoderSet) {
+  const { storage, uploads } = recordingStorage();
+  const uploader = new Uploader({
+    storage,
+    decoders,
+    config: makeImageConfig({ upload: { formats: ['png', 'pdf'] } }),
+  });
+  return { uploader, uploads };
+}
+
+const somePdf = Buffer.from('%PDF-1.7 not really');
+
+describe('uploadOriginal — through the decoders', () => {
+  test('the format, content type and extension come from the decoder that reads the bytes', async () => {
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { info: pdfInfo })]),
+    );
+    const original = await uploader.upload({
+      body: somePdf,
+      visibility: 'private',
+    });
+    assert.match(uploads[0].key, /^originals\/[0-9a-f]{32}\.pdf$/);
+    assert.equal(uploads[0].contentType, 'application/pdf');
+    assert.deepEqual(
+      {
+        format: original.format,
+        contentType: original.contentType,
+        width: original.width,
+        height: original.height,
+      },
+      {
+        format: 'pdf',
+        contentType: 'application/pdf',
+        width: 120,
+        height: 81,
+      },
+    );
+  });
+
+  test('a format a decoder identifies but upload.formats lacks is RESIZE_ORIGINAL_FORMAT_DISABLED', async () => {
+    const { storage, uploads } = recordingStorage();
+    const uploader = new Uploader({
+      storage,
+      decoders: new DecoderSet([fakeDecoder(['pdf'], { info: pdfInfo })]),
+      config: makeImageConfig({ upload: { formats: ['png'] } }),
+    });
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err instanceof ResizeOriginalError &&
+        err.code === 'RESIZE_ORIGINAL_FORMAT_DISABLED',
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test("a decoder's own ResizeError reaches the caller as a ResizeOriginalError with its code and retryable", async () => {
+    const cause = new ResizeMediaError('the test decoder refuses', {
+      code: 'TEST_CODE',
+      retryable: false,
+    });
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: cause })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err instanceof ResizeOriginalError &&
+        err.code === 'TEST_CODE' &&
+        err.retryable === false &&
+        err.message === 'the test decoder refuses' &&
+        err.cause === cause,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test("a decoder's other error is RESIZE_ORIGINAL_INVALID with the cause", async () => {
+    const cause = new Error('the engine crashed');
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: cause })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err instanceof ResizeOriginalError &&
+        err.code === 'RESIZE_ORIGINAL_INVALID' &&
+        err.retryable === true &&
+        /bytes are not a supported image/.test(err.message) &&
+        err.cause === cause,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('a setup error from a decoder reaches the caller unchanged', async () => {
+    const setup = new ResizeSetupError('the test decoder is not wired', {
+      code: 'TEST_SETUP',
+    });
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: setup })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err === setup &&
+        (err as Error).name === 'ResizeSetupError' &&
+        !(err instanceof ResizeOriginalError),
+    );
+    const broken = uploaderWith(
+      new DecoderSet([
+        fakeDecoder(['pdf'], {
+          info: { ...pdfInfo, format: 'not-listed' },
+        }),
+      ]),
+    );
+    await assert.rejects(
+      broken.uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        (err as Error).name === 'ResizeSetupError' &&
+        (err as ResizeSetupError).code === 'RESIZE_DECODER_INVALID' &&
+        !(err instanceof ResizeOriginalError),
+    );
+    assert.equal(uploads.length + broken.uploads.length, 0);
+  });
+
+  test("a host's subclass of ResizeSetupError from a decoder reaches the caller unchanged", async () => {
+    class HostWiringError extends ResizeSetupError {}
+    const setup = new HostWiringError('the host decoder has no licence key', {
+      code: 'HOST_WIRING',
+    });
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: setup })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err === setup &&
+        (err as Error).name === 'HostWiringError' &&
+        !(err instanceof ResizeOriginalError),
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('bytes every decoder refuses are RESIZE_ORIGINAL_FORMAT_UNSUPPORTED', async () => {
+    const refusal = new ResizeMediaError('not a pdf', {
+      code: 'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
+      retryable: false,
+    });
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: refusal })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err instanceof ResizeOriginalError &&
+        err.code === 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED' &&
+        err.retryable === true &&
+        ResizeOriginalError.isResizeError(err.cause) &&
+        err.cause.code === 'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test("a decoder's RESIZE_SOURCE_METADATA_MISSING is RESIZE_ORIGINAL_METADATA_MISSING", async () => {
+    const cause = new ResizeMediaError('no width/height', {
+      code: 'RESIZE_SOURCE_METADATA_MISSING',
+      retryable: false,
+    });
+    const { uploader, uploads } = uploaderWith(
+      new DecoderSet([fakeDecoder(['pdf'], { error: cause })]),
+    );
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: unknown) =>
+        err instanceof ResizeOriginalError &&
+        err.code === 'RESIZE_ORIGINAL_METADATA_MISSING' &&
+        err.retryable === true &&
+        err.cause === cause,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('an SVG over the pixel limit and the side limit reports RESIZE_ORIGINAL_TOO_MANY_PIXELS, as today', async () => {
+    const { storage, uploads } = recordingStorage();
+    const uploader = new Uploader({
+      storage,
+      decoders: createDecoderSet(),
+      config: makeImageConfig({ limits: { sourcePixels: 1000 } }),
+    });
+    await assert.rejects(
+      uploader.upload({
+        body: Buffer.from(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="100000"/>',
+        ),
+        visibility: 'private',
+      }),
+      (err: unknown) =>
+        err instanceof ResizeOriginalError &&
+        err.code === 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' &&
+        err.retryable === true &&
+        ResizeOriginalError.isResizeError(err.cause) &&
+        err.cause.code === 'RESIZE_SOURCE_TOO_LARGE',
+    );
+    assert.equal(uploads.length, 0);
+  });
 });
 
 describe('uploadOriginal — raster bytes and metadata', () => {
@@ -155,8 +395,20 @@ describe('uploadOriginal — raster bytes and metadata', () => {
       const r = new FrameworkResizer({ storage });
       await assert.rejects(r.uploadOriginal({ body, visibility: 'public' }), {
         code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
+        message: /image 10x10x2f exceeds limits\.sourcePixels \(199\)/,
       });
       assert.equal(uploads.length, 0);
+    });
+
+    test(`${format} animation is measured one frame at a time against limits.inputPixels`, async () => {
+      // One 10×10 frame (100 px) fits 150; the stack (200 px) is bounded at render, by the plan.
+      installApp({ limits: { inputPixels: 150 } });
+      const { storage, uploads } = recordingStorage();
+      const r = new FrameworkResizer({ storage });
+      const original = await r.uploadOriginal({ body, visibility: 'public' });
+      assert.equal(original.width, 10);
+      assert.equal(original.height, 10);
+      assert.equal(uploads.length, 1);
     });
   }
 

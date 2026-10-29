@@ -12,6 +12,11 @@ Host adoption checklist (implementation belongs in the host repository):
 - Media mapping helpers must pass nested refs to the module. Any handling of legacy
   host data is the host's responsibility; the module supplies no old-record reader
   or migration.
+- `original.format` should be the decoder's id (`jpeg`, `png`, `svg`, …; not `jpg`
+  or a MIME type), as `uploadOriginal()` returns it. The worker tries that decoder
+  first; a value no decoder lists, or one whose decoder refuses the bytes, is logged
+  as a warning and the bytes are probed, so a legacy record with a guessed format
+  still renders. Fix the record to silence the warning.
 - Media models must use `resizeMediaSchemaFragment` (from `…/framework.js`, or from
   `…/drivers/mongo.js` without the framework) and update presence checks and
   conditional writes that previously relied on flat `original.key` fields.
@@ -37,9 +42,10 @@ npm i @adaptivestone/framework-module-resize@next
 ```
 
 `0.3.0-rc.1` holds every host-facing shape of 0.3.0: the config, the option and type names, the
-import paths, the preview fields and `invalidate`. `0.3.0-rc.2` changes the pipeline-step
-signature (see [Coming in `0.3.0-rc.2`](#coming-in-030-rc2)); later release candidates change
-nothing a host sees. `CHANGELOG.md` (`# 0.3.0`) has the details of everything below.
+import paths, the preview fields and `invalidate`. `0.3.0-rc.2` changes the `beforeSteps`
+signature and adds decoders (see [Changed in `0.3.0-rc.2`](#changed-in-030-rc2)); later release
+candidates change nothing a host sees. `CHANGELOG.md` (`# 0.3.0`) has the details of everything
+below.
 
 ## Named queues: from `queue: { … }` to `queues`
 
@@ -290,10 +296,11 @@ export default {
   `storage.signedUrl(original.storageRef, ttlSeconds)`. For a pipeline without
   `variantSteps`, a small raster original now gets a normal preview at its own
   size, made by the worker.
-- SVG `beforeSteps` now receive the rendered PNG, not SVG markup. The render runs
-  in a child process: a host under Node's permission model needs
-  `--allow-child-process`, and a bundle must keep `svgRasterChild.js` next to
-  `svgRaster.js` (otherwise `RESIZE_SVG_RENDER_UNAVAILABLE`).
+- SVG originals are rendered in a child process, never as markup in a pipeline
+  step (`beforeSteps` receive the rendered pixels, see
+  [Changed in `0.3.0-rc.2`](#changed-in-030-rc2)): a host under Node's permission
+  model needs `--allow-child-process`, and a bundle must keep `svgRasterChild.js`
+  next to `svgRaster.js` (otherwise `RESIZE_SVG_RENDER_UNAVAILABLE`).
 - Without the framework, call `mongoParts(connection, { mediaModel })` once per process and
   spread the same parts into every Resizer (each call makes its own task queue, with one timing
   for every name). The pre-release database part is split in two: `media` (the media store) and
@@ -331,8 +338,52 @@ export default {
 - Register every pipeline in `src/resizer.ts`, and deploy the worker before the API
   requests a new or renamed pipeline: an unregistered pipeline is never rendered.
 
-## Coming in `0.3.0-rc.2`
+## Changed in `0.3.0-rc.2`
 
-In `0.3.0-rc.2`, both `beforeSteps` and `variantSteps` will receive and return a `Raster` (raw
-pixels plus their info), with the helpers `rasterToSharp` and `sharpToRaster`, because the image
-engine becomes replaceable. Hosts that write steps now should expect that signature.
+- `beforeSteps` receive and return a `Raster`, for every source kind:
+  `(raster, { media, source, scale, ctx }) => Raster`. `raster` is the decoded
+  first frame (`{ data, info }`: raw 8-bit sRGB pixels, upright), and a step
+  resolves with one frame. The image engine becomes replaceable, so host steps see
+  pixels, not a library object. Wrap a Sharp step with the helpers from the main
+  entry:
+
+  ```ts
+  import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
+
+  beforeSteps: [async (buf) => sharp(buf).blur(5).toBuffer()], // before
+  beforeSteps: [async (r) => sharpToRaster(rasterToSharp(r).blur(5))], // now
+  ```
+
+  An old step fails inside its own `sharp(buf)` call with Sharp's plain `Error`
+  "Input file is missing" (retried, then dead-lettered; thrown as-is by eager
+  `generate()`). A step that resolves with anything but a one-frame `Raster` (a
+  `Buffer`, a Sharp instance) fails with `RESIZE_PIPELINE_STEP_INVALID`. For a
+  raster source a step sees the upright original at its own size; for a vector
+  source (SVG) the pixels can be larger, so multiply coordinates stored in the
+  source's units by `meta.scale`.
+- `variantSteps` keep their Sharp instance, now over each size's pixels:
+  `metadata()` reports the preview (`format: 'raw'`, no EXIF, ICC profile, density
+  or orientation; `hasAlpha` as the sized pixels have it), a step's `resize()`
+  resizes the preview, and operations Sharp used to apply before its resize (such
+  as `trim()`) now apply to the preview. Their raster form waits for a later
+  release.
+- With `animated: true`, an animation keeps its frames only for a pipeline with
+  neither `beforeSteps` nor `variantSteps`; `beforeSteps` receive its first frame.
+- With `beforeSteps`, a worker holds the decoded source as raw pixels plus a step's
+  result, about 2 × width × height × 4 bytes (up to about 400 MB at the default
+  `limits.sourcePixels`): size worker containers for it. Each size is held raw
+  too, up to `concurrency` sizes at once. An animated size holds frames × size
+  pixels × channels bytes, with the frames cut to fit
+  `min(limits.sourcePixels, limits.inputPixels)` at the larger of the source's
+  and the size's pixels.
+- `limits.inputPixels` now guards only the bytes a decoder reads (one frame of an
+  animation), not the pixels the module renders itself.
+- A source that cannot be decoded fails the task (and `generate()`) with the
+  decoder's error, or with the retryable `RESIZE_SOURCE_DECODE_FAILED`.
+- New source kinds come as decoders: `new FrameworkResizer({ decoders })` (or
+  `new Resizer({ decoders })`) takes `SourceDecoder` objects, asked before the
+  built-in Sharp and SVG decoders; pass them in every process (API and worker),
+  and add their formats to `upload.formats` (else `uploadOriginal()` throws
+  `RESIZE_ORIGINAL_FORMAT_DISABLED`). See "Decoders" in `README.md`.
+  `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means that no decoder reads the
+  uploaded bytes.

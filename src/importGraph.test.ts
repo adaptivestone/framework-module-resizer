@@ -3,6 +3,9 @@
 //   reachable from src/index.ts and fail if it reaches the framework, the framework adapter, the
 //   ResizeTask model or the CLI command;
 // - drivers import only contracts, errors, helpers, types and other drivers, never core code;
+// - decoders likewise import only contracts, errors, helpers, types and other decoders;
+// - plan.ts (the pure size plan) reaches no sharp at runtime and imports no port but the decoder
+//   and pipeline types;
 // - helpers and contracts are leaves: they import only each other, errors and types;
 // - resizer.ts is the composition root: only the entry points (index.ts, worker.ts) and the
 //   framework adapter import it, and nothing it reaches imports it back, not even as a type;
@@ -126,6 +129,89 @@ test('drivers import only contracts, errors, helpers, types and other drivers', 
       .map((t) => `${f} → ${t}`),
   );
   assert.deepEqual(offending, []);
+});
+
+test('decoders import only contracts, errors, helpers, types and other decoders', () => {
+  const allowed = (t: string) =>
+    t.startsWith('contracts/') ||
+    t === 'errors.ts' ||
+    t.startsWith('helpers/') ||
+    t === 'types.d.ts' ||
+    t.startsWith('decoders/');
+  const decoders = sourceFiles().filter((f) => f.startsWith('decoders/'));
+  assert.ok(
+    decoders.includes('decoders/sharp.ts'),
+    'sanity check: the listing does see the decoders',
+  );
+  const offending = decoders.flatMap((f) =>
+    localImports(f, { types: true })
+      .filter((t) => !allowed(t))
+      .map((t) => `${f} → ${t}`),
+  );
+  assert.deepEqual(offending, []);
+});
+
+test('plan.ts reaches no sharp at runtime and imports no contract but the decoder and pipeline types', () => {
+  const { bare } = walk('plan.ts');
+  assert.deepEqual(
+    [...bare.entries()]
+      .filter(([spec]) => spec === 'sharp' || spec.startsWith('sharp/'))
+      .map(([, chain]) => chain.join(' → ')),
+    [],
+  );
+  const contracts = localImports('plan.ts', { types: true }).filter((t) =>
+    t.startsWith('contracts/'),
+  );
+  assert.ok(
+    contracts.includes('contracts/decoder.ts'),
+    "sanity check: the listing does see plan.ts's contracts",
+  );
+  const allowed = ['contracts/decoder.ts', 'contracts/pipeline.ts'];
+  assert.deepEqual(
+    contracts.filter((t) => !allowed.includes(t)).map((t) => `plan.ts → ${t}`),
+    [],
+  );
+});
+
+test('plan.ts, raster.ts and render.ts reach no storage, media, task-queue or lock contract', () => {
+  const ports = [
+    'contracts/storage.ts',
+    'contracts/media.ts',
+    'contracts/taskQueue.ts',
+    'contracts/locks.ts',
+  ];
+  assert.ok(
+    walk('render.ts', { types: true }).files.has('contracts/pipeline.ts'),
+    'sanity check: the walk does reach the contracts render.ts uses',
+  );
+  for (const entry of ['plan.ts', 'raster.ts', 'render.ts']) {
+    const { files } = walk(entry, { types: true });
+    assert.deepEqual(
+      [...files.entries()]
+        .filter(([f]) => ports.includes(f))
+        .map(([, chain]) => chain.join(' → ')),
+      [],
+    );
+  }
+});
+
+test('only the allowed shipped files import sharp', () => {
+  const allowed = [
+    'contracts/pipeline.ts', // the Sharp type of variantSteps
+    'decoders/sharp.ts',
+    'decoders/svg.ts',
+    'helpers/svgDimensions.ts',
+    'helpers/svgRasterChild.ts',
+    'raster.ts',
+    'render.ts',
+    'worker.ts', // sharp.concurrency and sharp.cache
+  ];
+  const importers = sourceFiles().filter((f) =>
+    importSpecifiers(readFileSync(resolve(SRC, f), 'utf8'), {
+      types: true,
+    }).includes('sharp'),
+  );
+  assert.deepEqual(importers.sort(), allowed);
 });
 
 test('helpers and contracts import only helpers, contracts, errors and types', () => {

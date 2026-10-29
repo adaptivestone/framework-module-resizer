@@ -8,6 +8,7 @@
 // builds every part from the app's config file.
 import { Catalog } from './catalog.ts';
 import defaultResizeConfig, { defaultCoordination } from './config/resize.ts';
+import type { SourceDecoder } from './contracts/decoder.ts';
 import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
@@ -19,6 +20,7 @@ import {
   fillCoordination,
   type TaskCoordination,
 } from './coordination.ts';
+import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
@@ -82,6 +84,7 @@ export interface ResizerOptions {
   // from its config file).
   queueName?: string | (() => string);
   pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
+  decoders?: SourceDecoder[]; // asked before the built-in Sharp and SVG decoders; FrameworkResizer passes it through
   // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
   hooks?: HookTaps;
 }
@@ -174,6 +177,8 @@ export class Resizer {
   readonly #loadingParts = new Map<PartName, Promise<void>>();
   readonly #pipelines: PipelineRegistry;
   readonly #hooks: HookBus;
+  // The decoders that read originals, built once: the Processor renders every task through them.
+  readonly #decoders: DecoderSet;
   #builtServices: Services | undefined;
   // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
   #dispatcher: Dispatcher | undefined;
@@ -274,6 +279,8 @@ export class Resizer {
       this.#loadedParts.add('tasks');
     }
     this.#pipelines = new PipelineRegistry(opts.pipelines);
+    // The host's decoders are checked here (RESIZE_DECODER_INVALID), before the name is registered.
+    this.#decoders = createDecoderSet(opts.decoders);
     this.#hooks = new HookBus({
       logger: this.logger,
       events: opts.events,
@@ -405,12 +412,17 @@ export class Resizer {
       const catalog = new Catalog({ config });
       this.#builtServices = {
         catalog,
-        uploader: new Uploader({ storage, config }),
+        uploader: new Uploader({
+          storage,
+          decoders: this.#decoders,
+          config,
+        }),
         reader: this.#buildReader(catalog),
         processor: new Processor({
           catalog,
           media,
           storage,
+          decoders: this.#decoders,
           pipelines: this.#pipelines,
           hooks: this.#hooks,
           config,
@@ -531,10 +543,11 @@ export class Resizer {
    * Optional startup check: load the drivers and resolve and validate the config (see ready());
    * check that a task queue can be used (a lock store beside one without gatesByTask, its timing
    * and the coordination); run the media store's verify() and check it has replacePreviews; run
-   * the lock store's verify(); check the task queue (its own verify(), and that it serves this
-   * Resizer's queueName). Framework hosts call it after `Server.init()` to fail at boot instead of
-   * at the first upload or read; it is the one call that rejects for a task queue that cannot be
-   * used (the read path degrades instead). The worker runs it for every Resizer before leasing.
+   * the lock store's verify(), then each decoder's optional verify(); check the task queue (its
+   * own verify(), and that it serves this Resizer's queueName). Framework hosts call it after
+   * `Server.init()` to fail at boot instead of at the first upload or read; it is the one call
+   * that rejects for a task queue that cannot be used (the read path degrades instead). The
+   * worker runs it for every Resizer before leasing.
    */
   async verify(): Promise<void> {
     // ready() resolves while the task queue cannot be used; verify() rejects with the reason.
@@ -545,6 +558,7 @@ export class Resizer {
     await this.media.verify?.();
     requireReplacePreviews(this.media);
     await this.locks?.verify?.();
+    await this.#decoders.verify();
     if (this.tasks) {
       await this.tasks.verify?.();
       if (this.tasks.servesQueue && !this.tasks.servesQueue(this.queueName)) {
@@ -612,8 +626,9 @@ export class Resizer {
    * Eager mode — generate at upload, within this call. It uses no task queue, worker or locks, so
    * it also works on a Resizer whose task queue cannot be used. Delegates to the
    * Processor (src/processor.ts): resolveSizes waterfall with the caller's REAL ctx → expand
-   * sizes × formats, skipping identities already in media.previews (idempotent) → download once →
-   * beforeSteps once → per-variant resize/encode/upload (bounded by config.concurrency, NO locks).
+   * sizes × formats, skipping identities already in media.previews (idempotent) → download and
+   * decode once → beforeSteps once → one resize per size, then encode/upload per variant (bounded
+   * by config.concurrency, NO locks).
    * `persist !== false` → one media.appendPreviews (+ display-dim backfill); else the previews are
    * returned unstored.
    */

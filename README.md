@@ -236,7 +236,7 @@ Resizers that `src/resizer.ts` constructs.
 
 | Import | Contents |
 |---|---|
-| `@adaptivestone/framework-module-resize` | `Resizer`, `getResizer`, `resetResizerForTests`, `runWorker`, the contracts (`ResizeStorage`, `MediaStore`, `LockStore`, `TaskQueue`), helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`), errors, types (among them `InvalidateOpts`, `ReplacedPreviews` and the queue entry types `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`) |
+| `@adaptivestone/framework-module-resize` | `Resizer`, `getResizer`, `resetResizerForTests`, `runWorker`, the contracts (`ResizeStorage`, `MediaStore`, `LockStore`, `TaskQueue`, `SourceDecoder`), helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `rasterToSharp`, `sharpToRaster`), errors, types (among them `InvalidateOpts`, `ReplacedPreviews`, the queue entry types `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`, and the decoder types `SourceInfo`, `Raster`, `RasterInfo`, `DecodeBox`, `RenderOptions`, `ResizeLimits`) |
 | `…/config/resize.js` | The framework-free core defaults: the default core config (default export), `defaultQueueOptions`, `defaultCoordination` |
 | `…/drivers/fs.js` | `LocalFsStorage` |
 | `…/drivers/s3.js` | `S3Storage` |
@@ -505,6 +505,72 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     once per name, on that name's first use. A queue with one timing for every name ignores the
     argument. Also optionally `verify()`.
 
+### Decoders
+
+A decoder turns the stored bytes of one source kind into pixels: `uploadOriginal()` measures an
+original only through the decoders, and the worker and `generate()` render every source through
+them. The built-in decoders read every format the installed Sharp reads from a buffer (except SVG
+and `raw`), and SVG (rendered in a separate process). To add a source kind, pass decoders to the
+Resizer: `new Resizer({ decoders: [new PdfDecoder()] })` (or `new FrameworkResizer({ decoders })`).
+They are asked first, in order, before the built-in Sharp and SVG decoders, so a host decoder can
+also take over a built-in format. Pass the same decoders in every process that uploads or
+generates previews (API and worker). An entry that is not a decoder (a non-empty `formats` list of
+format ids, and `inspect` and `render` functions) is `ResizeSetupError` `RESIZE_DECODER_INVALID`
+at construction.
+
+A decoder extends `SourceDecoder`, or is any object of the same shape (the core never checks
+`instanceof`), and closes over its own engine (no `app` parameter):
+
+- `formats`: the format ids it reads, as stored in `original.format` (e.g. `['pdf']`).
+- `inspect(bytes, limits)` resolves with a `SourceInfo`: `format` (one of its `formats`),
+  `contentType`, the upright display `width` and `height` of one frame, and optionally `pages`,
+  `animated` and `vector` (no own size: the own-size rule is off, and the box may exceed the
+  natural size). It identifies and measures, reads only what that needs and never renders. Bytes
+  that are not its format reject quickly with a `ResizeMediaError` whose code is
+  `RESIZE_SOURCE_FORMAT_UNSUPPORTED`: the next decoder is asked. Any other rejection is final for
+  those bytes. A result that breaks the contract (a format it does not list, no `contentType`, a
+  size that is not positive) is `RESIZE_DECODER_INVALID`.
+- `render(bytes, box, opts)` resolves with a `Raster` (`{ data, info }`): an upright 8-bit raster,
+  colour-converted to sRGB with the embedded profile and carrying no profile, with `opts.frames`
+  frames (one when the decoder cannot animate), at least `box` on both sides where the decoder's
+  limits allow. The core resizes it to each exact size either way, and a raster source smaller
+  than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
+  its engine can. A raster whose `data` length does not match its `info` is
+  `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
+  `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
+  (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
+  `generate()`, as the same object with the media id set on it; one that cannot take it (frozen)
+  is wrapped in a plain `ResizeMediaError` with the media id, its code and `retryable`, and itself
+  as `cause`.
+- Optionally `verify()`: awaited by `resizer.verify()` and at worker start; throw there when the
+  decoder cannot work (e.g. a missing engine).
+
+**Which decoder reads a source.** At upload the decoders are asked in order, and the first that
+accepts the bytes measures them: its `format` is stored as `original.format` and its
+`contentType` as `original.contentType`. `upload.formats` must list that format
+(`RESIZE_ORIGINAL_FORMAT_DISABLED` otherwise). Bytes that every decoder refuses are
+`RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`; bytes Sharp cannot read at all stay `RESIZE_ORIGINAL_INVALID`.
+In the worker and `generate()`, the stored `original.format` picks the decoder to try first. A
+format that no decoder lists, or one whose decoder refuses the bytes, is logged as a warning, and
+the bytes are probed through the other decoders; a format whose decoder reads the bytes as another
+of its formats (JPEG bytes stored as `png`) is logged too, and rendered as what it is:
+
+```text
+resize worker: media <id> is stored as 'jpg' but its bytes are 'jpeg' (no decoder lists the stored format); rendering it as 'jpeg'
+```
+
+(`its decoder refused the bytes` for the second case, `its decoder read another of its formats`
+for the third; when a host decoder lists the stored format,
+refuses the bytes and a later decoder reads them as that same format, the warning says
+`… is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder
+read them`). So `original.format` should be the
+decoder's id: `jpeg`, not `jpg` or `image/jpeg`; fix such a record to silence the warning. When no
+decoder lists the stored format and none reads the bytes, the source fails with the retryable
+`ResizeSetupError` `RESIZE_DECODER_MISSING`: a process without the decoder that record needs (pass
+it in `decoders` in every process). When the stored format's decoder refuses the bytes (or the
+media has no stored format) and every other decoder refuses them too, it fails with
+`ResizeMediaError` `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (`retryable: false`: dead-lettered at once).
+
 ## Config reference
 
 The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
@@ -516,16 +582,16 @@ created; a config function (the framework adapter passes one) on first use (`rea
 |---|---|---|
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
-| `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes |
+| `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
-| `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `variantSteps`; other formats, pipelines with variant steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
+| `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
-| `limits.inputPixels` | `268402689` | Sharp decoder limit |
+| `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
 | `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
-| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit `sourcePixels` and `inputPixels` |
+| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -535,6 +601,43 @@ preview row's `encodeSig` (see [Operations](#operations)): bump it when a step's
 mark the pipeline's stored previews as made with older settings. They are not regenerated yet; a
 later release's freshness check will regenerate them. It is not validated, and `''` signs
 differently from an absent version.
+
+A `beforeStep` is `(raster, { media, source, scale, ctx }) => Raster` (or a promise of one). It
+runs once per task, before any resize, on the decoded first frame as a `Raster` (`{ data, info }`:
+raw 8-bit sRGB pixels, upright, with `info.width`, `info.height` and `info.channels`), and resolves
+with one frame of pixels, which replaces the current raster. Steps see pixels, not a library
+object, because the image engine is replaceable. A Sharp-based step stays one line with the
+helpers from the main entry:
+
+```ts
+import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
+
+const pipelines = {
+  photo: {
+    beforeSteps: [
+      // async (r) => sharpToRaster(rasterToSharp(r).blur(5)), // e.g. blur plates: a Raster in, a Raster out
+    ],
+  },
+};
+```
+
+`source` is the decoder's `SourceInfo` for the original. For a raster source the step sees the
+upright original at its own size; a vector source (SVG) is rendered at least at its natural size
+and can be larger, so multiply coordinates stored in the source's units by `scale` (the width of
+the raster the step receives divided by `source.width`). When a step changes the size, every
+variant is planned from its result. A step that resolves with anything that is not a one-frame
+`Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its `info`)
+fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does `sharpToRaster` given a
+multi-page image. A `variantStep` is `(img, { variant, ctx }) => Sharp` (or a promise of one): it
+runs per variant, after the resize and before the encode, on a Sharp instance over that size's
+pixels, so `metadata()` reports the preview's size (with `format: 'raw'`, no EXIF, ICC profile,
+density or orientation, and `hasAlpha` as the sized pixels have it), a `resize()` resizes the
+preview, and operations Sharp used to apply before its resize (such as `trim()`) apply to the
+preview.
+
+**Rounding.** Preview sizes are computed from the source's display dimensions and rounded once
+per side, so a preview side can differ by one pixel from what Sharp derived in earlier releases,
+or from a host's own rounding.
 
 **Queue name.** `queueName` (`new Resizer({ queueName })` or `new FrameworkResizer({ queueName })`,
 default `'default'`; a `FrameworkResizer` without it takes its file's `queue`) names the queue of the
@@ -788,8 +891,9 @@ the `cooldownMs` of the task's own Resizer.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`, default `true`): no
-    retry can help. The module sets it on every `ResizeSecurityError` and on five codes: the
-    media has no original (`RESIZE_NO_ORIGINAL`), the source has no dimensions or exceeds the
+    retry can help. The module sets it on every `ResizeSecurityError` and on six codes: the
+    media has no original (`RESIZE_NO_ORIGINAL`), no decoder reads the source's bytes
+    (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source has no dimensions or exceeds the
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), or an SVG render ran past
@@ -797,8 +901,11 @@ the `cooldownMs` of the task's own Resizer.
     `retryable` on the error that fails the task, when it is a `ResizeError` — including one from
     a duplicate copy of the package (it checks the `isResizeError` brand, not the class); errors
     from other libraries are retried, whatever fields they carry. A `ResizeError` from
-    `loadMedia`, `storage.download`, the source and SVG checks, the SVG render, `beforeSteps` or
-    `appendPreviews` with `retryable: false` dead-letters the task at once. An
+    `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` or
+    `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot
+    be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
+    `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED` when that error is not a `ResizeError`
+    (Sharp's own, for example; it is the `cause`). An
     error inside one variant (`variantSteps`, encoding, `storage.upload`) fails only that
     variant: it is logged, and the task fails with the retryable
     `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only, then dead-lettered after
@@ -808,6 +915,20 @@ the `cooldownMs` of the task's own Resizer.
     [Coordination](#coordination)).
   - Completed rows expire after 24 h and dead rows after ~30 days (the `expireAfterSeconds` in
     the model).
+- **Worker memory:** a worker holds the decoded source as raw pixels, decoded once per task at
+  the largest box the requested previews need. Each size is then held raw too, up to
+  `concurrency` sizes at once, each up to `limits.resultDimension`² pixels. An animated size holds
+  frames × size pixels × channels bytes; the frames are cut so that frames × the larger of the
+  source's and the size's pixels stays within the pixel budget
+  `min(limits.sourcePixels, limits.inputPixels)`. With `beforeSteps` the source is decoded at
+  least at its own size, and the peak is about 2 × width × height × 4 bytes (a step's input and
+  its result): up to about 400 MB at the default `limits.sourcePixels` (50,000,000); the step's
+  result is released once the sizes are made from it. Size worker containers for
+  `limits.sourcePixels`. The pixel
+  limit after `beforeSteps` (`min(limits.sourcePixels, limits.inputPixels)`) is checked once, on
+  the dimensions of the raster the last step returned, so a step that grows the image has already
+  allocated it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`,
+  `retryable: false`). Steps are host code.
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that
   already exist, and the media store keeps one row per preview identity, so a repeat never
   duplicates them. A task completes only when every requested
@@ -841,7 +962,8 @@ await ResizeTask.updateOne(
   its storage ref and dimensions) and `encodeSig` (a signature of its format's encode settings,
   the sharpen setting of its fit mode, its animation settings (for animated formats: `animated`,
   `limits.animationFrames` and the pixel budget `min(limits.sourcePixels, limits.inputPixels)`,
-  which also caps the frames), the result-dimension cap, the fit box (for fit rows) and the
+  which also caps the frames at the larger of the source's and the preview's size), the
+  result-dimension cap, the fit box (for fit rows) and the
   pipeline `version`). The worker and `generate()` record them on every row from `0.3.0-rc.1` on,
   and `resizeMediaSchemaFragment` declares them. The read path does not check them yet. Rows
   written earlier have no `origin` or `encodeSig`: they are served for now, and a later release's
@@ -903,6 +1025,10 @@ fails): fix the logged cause before you retry.
 need no framework app. Framework-adapter tests install a fake app with `setAppInstance()`.
 `src/importGraph.test.ts` fails if the main entry ever reaches framework code. Before a release,
 run `npm run build` and `npm run smoke`.
+`node --experimental-strip-types bench/renderOnce.ts [rounds] [--single-thread]` benchmarks the
+render path (3 sizes × JPEG and WebP from one 24 MP JPEG) against a "resize once per size"
+baseline, with an A/A control, and exits 0 (PASS: within 5% of the baseline in wall and CPU
+time), 1 (FAIL) or 2 (INCONCLUSIVE: the machine was too noisy to judge).
 
 ## License
 

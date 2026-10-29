@@ -1,27 +1,33 @@
-// The resize core: ONE sharp pipeline shared by both generation modes, owned by `Processor`:
+// The resize core, owned by `Processor`, shared by both generation modes:
 //   - processTask() = the core for one queued task, run by the worker
 //   - generate()    = the core for eager `resizer.generate`
-// The steps (download once → metadata guards → an SVG rendered once to a raster → beforeSteps
-// once, after an orientation normalize → decode once + bounded per-variant resize/encode/upload →
-// one appendPreviews) live in #generatePreviews(). The Processor also fires the task observers,
-// and invalidate() removes stored previews for `resizer.invalidate` (one media store write).
-// It takes no locks: the queue leases a task to one worker at a time, the lease token fences the
-// task's writes, and the media store keeps one row per preview identity when an expired lease lets
-// two workers render the same variant. It takes its parts explicitly and knows no Resizer. sharp
-// is a hard dep; this is the only module that resizes or encodes (SVG rendering runs in a child
-// process: helpers/svgRaster.ts).
-import sharp, {
-  type FormatEnum,
-  type Metadata,
-  type OutputOptions,
-  type Sharp,
-} from 'sharp';
+// #renderPending() renders the variants not stored yet: download the original once; a decoder
+// identifies its bytes and renders them ONCE, at the largest box the plan needs; beforeSteps run
+// once on that raster, which is then reduced to the box of the plan made from their result; each
+// exact size is resized once and each format encoded from it, then uploaded (bounded by
+// config.concurrency); one PreviewRecorder write stores the rows, and onPreviewGenerated fires over
+// the rows it kept. The sizes come from the pure plan (plan.ts), the pixel work from render.ts, and
+// a source kind needs only a decoder: the Processor itself imports no image engine. It also fires
+// the task observers, and invalidate() removes stored previews for `resizer.invalidate` (one media
+// store write). It takes no locks: the queue leases a task to one worker at a time, the lease token
+// fences the task's writes, and the media store keeps one row per preview identity when an expired
+// lease lets two workers render the same variant. It takes its parts explicitly and knows no
+// Resizer.
 import type { Catalog } from './catalog.ts';
+import type {
+  DecodeBox,
+  Raster,
+  RenderOptions,
+  SourceDecoder,
+  SourceInfo,
+} from './contracts/decoder.ts';
 import type { ObserverName } from './contracts/hooks.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
+import type { DecoderSet, IdentifiedSource } from './decoderSet.ts';
 import {
+  ResizeError,
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
@@ -29,19 +35,30 @@ import {
   ResizeStorageError,
 } from './errors.ts';
 import { runBounded } from './helpers/concurrency.ts';
-import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
+import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
-import { svgNaturalSize, svgRasterDensity } from './helpers/svgDimensions.ts';
-import { rasterizeSvg } from './helpers/svgRaster.ts';
 import type { HookBus } from './hooks.ts';
-import {
-  calculateResizedDimensions,
-  coverDimensions,
-  previewScope,
-  requireMediaId,
-} from './images.ts';
+import { previewScope, requireMediaId } from './images.ts';
 import type { PipelineRegistry } from './pipelines.ts';
+import {
+  decodeBox,
+  framesToDecode,
+  groupBySize,
+  planRules,
+  planVariants,
+  type VariantPlan,
+} from './plan.ts';
+import { PreviewRecorder } from './previewRecorder.ts';
+import { checkRaster } from './raster.ts';
+import {
+  type EncodedVariant,
+  encodeVariant,
+  reduceToBox,
+  runBeforeSteps,
+  SizedRasters,
+  straightAlpha,
+} from './render.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
@@ -49,15 +66,17 @@ import type {
   InvalidateOpts,
   MediaLike,
   MissingPreview,
+  Original,
   Preview,
   PreviewScope,
   ResizeConfig,
+  ResizeLimits,
   ResizeLogger,
   SizeInput,
   StorageRef,
 } from './types.d.ts';
 
-/** Normalize a driver download / beforeStep result to a Node Buffer for the next sharp(). */
+/** Normalize a driver download to a Node Buffer for the decoder. */
 const asBuffer = (b: Buffer | Uint8Array): Buffer =>
   Buffer.isBuffer(b) ? b : Buffer.from(b);
 
@@ -109,40 +128,196 @@ function formatNotConfiguredError(formats: string[]): ResizeSetupError {
   );
 }
 
+const MEDIA_ERROR: ReadonlySet<string> = new Set(['ResizeMediaError']);
+
+/** A module media error (or a subclass of one, told by name) that does not know its media yet. */
+function lacksMediaId(err: unknown): err is ResizeMediaError {
+  return (
+    ResizeError.isResizeError(err) &&
+    hasErrorClass(err, MEDIA_ERROR) &&
+    fieldOf(err, 'mediaId') === undefined
+  );
+}
+
 /**
- * Encode an orientation-normalized original in its own format without visible loss. Sharp's
- * defaults are lossy for some formats (JPEG quality 80 with 4:2:0, TIFF with JPEG compression),
- * and every variant is made from this buffer. The buffer is an in-memory intermediate, so encode
- * time matters more than size: WebP uses quality 95 at the lowest effort (lossless WebP of a
- * 49 MP photo took 16.5 s and 63 MB on one thread, close to the processing timeout), and the
- * lossless AVIF path uses the lowest effort too.
+ * The media error, naming its media. The error itself gets the media id (and its message the id),
+ * so its class, private state and methods stay as they are. An error that cannot take it (frozen,
+ * sealed, a read-only field, a host setter or getter that throws) is wrapped instead: a plain
+ * ResizeMediaError with its code and `retryable`, and the error as its cause.
  */
-function withoutVisibleLoss(img: Sharp, format: string | undefined): Sharp {
-  switch (format) {
-    case 'jpeg':
-      return img.jpeg({ quality: 100, chromaSubsampling: '4:4:4' });
-    case 'webp':
-      return img.webp({ quality: 95, effort: 0 });
-    case 'heif': // AVIF reports its HEIF container
-      return img.heif({ compression: 'av1', lossless: true, effort: 0 });
-    case 'tiff':
-      return img.tiff({ compression: 'lzw' });
-    default:
-      return img; // PNG and GIF are lossless at Sharp's defaults
+function withMediaId(err: ResizeMediaError, mediaId: string): ResizeMediaError {
+  try {
+    if (Reflect.set(err, 'mediaId', mediaId) && err.mediaId === mediaId) {
+      Reflect.set(err, 'message', `${err.message} (media ${mediaId})`);
+      return err;
+    }
+  } catch {
+    // The host's own accessor threw: the error is wrapped below, whatever it was.
+  }
+  const message = fieldOf(err, 'message');
+  const code = fieldOf(err, 'code');
+  const retryable = fieldOf(err, 'retryable');
+  return new ResizeMediaError(
+    `${typeof message === 'string' ? message : 'resize: the decoder refused the source'} (media ${mediaId})`,
+    {
+      mediaId,
+      ...(typeof code === 'string' ? { code } : {}),
+      ...(typeof retryable === 'boolean' ? { retryable } : {}),
+      cause: err,
+    },
+  );
+}
+
+/** A field of a host error, or undefined when reading it throws. */
+function fieldOf(err: object, key: string): unknown {
+  try {
+    return Reflect.get(err, key);
+  } catch {
+    return undefined;
   }
 }
 
-/** Uploaded locators for a log line; an opaque ref that JSON cannot encode is still named. */
-function describeRefs(previews: Preview[]): string {
-  return previews
-    .map((preview) => {
-      try {
-        return JSON.stringify(preview.storageRef) ?? String(preview.storageRef);
-      } catch {
-        return String(preview.storageRef);
-      }
-    })
-    .join(', ');
+/**
+ * A decode failure as the task reports it: a module error that does not know its media gets the
+ * media id (the decoders do not know it), any other module error stays as it is, and anything else
+ * is RESIZE_SOURCE_DECODE_FAILED with the original error as its cause (retried).
+ */
+function sourceError(err: unknown, mediaId: string): unknown {
+  if (lacksMediaId(err)) {
+    return withMediaId(err, mediaId);
+  }
+  if (ResizeError.isResizeError(err)) {
+    return err;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new ResizeMediaError(
+    `resize: decoding the source failed for media ${mediaId}: ${message}`,
+    { mediaId, code: 'RESIZE_SOURCE_DECODE_FAILED', cause: err },
+  );
+}
+
+/** The original's bytes, the decoder that reads them, and what it measured. */
+interface LoadedSource {
+  bytes: Buffer;
+  decoder: SourceDecoder;
+  info: SourceInfo;
+}
+
+/**
+ * Download the original once and identify its bytes. The detected format is the truth: a stored
+ * format that does not match is logged once and the bytes are rendered as what they are. One frame
+ * must fit `limits.sourcePixels`; how many frames are decoded is bounded by the plan.
+ */
+async function loadSource(
+  parts: {
+    storage: ResizeStorage;
+    decoders: DecoderSet;
+    limits: ResizeLimits;
+    logger: ResizeLogger;
+  },
+  original: Original,
+  mediaId: string,
+): Promise<LoadedSource> {
+  const { storage, decoders, limits, logger } = parts;
+  const bytes = asBuffer(await storage.download(original.storageRef));
+  let identified: IdentifiedSource;
+  try {
+    identified = await decoders.identify(bytes, limits, original.format);
+  } catch (err) {
+    throw sourceError(err, mediaId);
+  }
+  const { decoder, info, mismatch } = identified;
+  if (mismatch !== undefined) {
+    if (info.format === mismatch.stored) {
+      // A host decoder lists a built-in format and refused these bytes; a later decoder read them.
+      logger.warn(
+        `resize worker: media ${mediaId} is stored as '${mismatch.stored}'; the first decoder listing '${mismatch.stored}' refused these bytes, and another decoder read them`,
+      );
+    } else {
+      const why =
+        mismatch.reason === 'unlisted'
+          ? 'no decoder lists the stored format'
+          : mismatch.reason === 'refused'
+            ? 'its decoder refused the bytes'
+            : 'its decoder read another of its formats';
+      logger.warn(
+        `resize worker: media ${mediaId} is stored as '${mismatch.stored}' but its bytes are '${info.format}' (${why}); rendering it as '${info.format}'`,
+      );
+    }
+  }
+  if (info.width * info.height > limits.sourcePixels) {
+    throw new ResizeMediaError(
+      `resize: source ${info.width}×${info.height} exceeds limits.sourcePixels (${limits.sourcePixels}) for media ${mediaId}`,
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+    );
+  }
+  return { bytes, decoder, info };
+}
+
+/** The decoder's raster at `box`, checked (shape and pixel budget), in straight alpha. */
+async function decodeSource(
+  source: LoadedSource,
+  box: DecodeBox,
+  opts: RenderOptions,
+  mediaId: string,
+): Promise<Raster> {
+  try {
+    const raster = await source.decoder.render(source.bytes, box, opts);
+    // A broken raster is the decoder's contract error: sourceError passes it on unchanged.
+    checkRaster(raster);
+    // A decoder that ignores its box or decodes more frames than asked must not hand the core more
+    // pixels than the budget the plan was made for.
+    const { width, height, frames = 1 } = raster.info;
+    const budget = Math.min(opts.limits.sourcePixels, opts.limits.inputPixels);
+    if (width * height * frames > budget) {
+      throw new ResizeMediaError(
+        `resize: the decoder returned ${width}×${height}×${frames} pixels, over the pixel budget (${budget}) for media ${mediaId}`,
+        { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+      );
+    }
+    return await straightAlpha(raster, opts.limits);
+  } catch (err) {
+    throw sourceError(err, mediaId);
+  }
+}
+
+/** The stored row of one encoded and uploaded variant. */
+function previewRow(
+  plan: VariantPlan,
+  encoded: EncodedVariant,
+  storageRef: StorageRef,
+  stamp: { scope: PreviewScope; origin: string; encodeSig: string },
+): Preview {
+  const v = plan.variant;
+  const row: Preview = {
+    storageRef,
+    identity: plan.identity,
+    resizer: stamp.scope.resizer,
+    pipeline: stamp.scope.pipeline,
+    sizeKey: v.sizeKey,
+    format: v.format,
+    contentType: encoded.contentType,
+    // One frame: the encoder reports an animation's frame height.
+    actualWidth: encoded.width,
+    actualHeight: encoded.height,
+    bytes: encoded.data.length,
+    createdAt: new Date(),
+    origin: stamp.origin,
+    encodeSig: stamp.encodeSig,
+  };
+  if (v.filters) {
+    row.filters = v.filters;
+  }
+  if (v.requestedWidth !== undefined) {
+    row.requestedWidth = Math.round(v.requestedWidth);
+  }
+  if (v.requestedHeight !== undefined) {
+    row.requestedHeight = Math.round(v.requestedHeight);
+  }
+  if (v.fit) {
+    row.fit = true;
+  }
+  return row;
 }
 
 // The observer each task event fires.
@@ -154,11 +329,11 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 
 // ---------------------------------------------------------------------------
 // The shared core. Both modes expand their inputs into a `requested` MissingPreview[] and call
-// #generatePreviews. `persist` toggles the single appendPreviews + onPreviewGenerated firing
+// #renderPending. `persist` toggles the single appendPreviews + onPreviewGenerated firing
 // (eager `persist:false` returns raw).
 // ---------------------------------------------------------------------------
 
-interface GenerateCoreArgs {
+interface RenderPendingArgs {
   media: MediaLike;
   mediaId: string;
   requested: MissingPreview[];
@@ -168,7 +343,7 @@ interface GenerateCoreArgs {
   signal?: AbortSignal;
 }
 
-interface GenerateCoreResult {
+interface RenderPendingResult {
   // Previews this call stored (or, with persist:false, produced).
   generated: Preview[];
   failedCount: number;
@@ -180,6 +355,7 @@ export interface ProcessorDeps {
   catalog: Catalog;
   media: MediaStore;
   storage: ResizeStorage;
+  decoders: DecoderSet; // reads the originals: one decode per task
   pipelines: PipelineRegistry;
   hooks: HookBus;
   config: ResizeConfig;
@@ -193,9 +369,15 @@ export interface ProcessorDeps {
  */
 export class Processor {
   readonly #deps: ProcessorDeps;
+  readonly #recorder: PreviewRecorder;
 
   constructor(deps: ProcessorDeps) {
     this.#deps = deps;
+    this.#recorder = new PreviewRecorder({
+      catalog: deps.catalog,
+      media: deps.media,
+      logger: deps.logger,
+    });
   }
 
   /**
@@ -239,7 +421,7 @@ export class Processor {
     });
 
     const persist = opts.persist !== false;
-    const { generated, failedCount } = await this.#generatePreviews({
+    const { generated, failedCount } = await this.#renderPending({
       media,
       mediaId,
       requested,
@@ -341,7 +523,7 @@ export class Processor {
     opts: { signal?: AbortSignal } = {},
   ): Promise<void> {
     const { catalog, logger, media: mediaStore, name } = this.#deps;
-    // ctx does NOT cross the queue — the worker's pipeline steps depend on media/metadata.
+    // ctx does NOT cross the queue — the worker's pipeline steps depend on media/source.
     const ctx: Record<string, unknown> = {};
 
     // Load the media doc. A deleted media row is a logged no-op success (the queue completes it),
@@ -367,8 +549,8 @@ export class Processor {
       }
     }
     const requested = [...requestedByIdentity.values()];
-    const { generated, failedCount, alreadyStored } =
-      await this.#generatePreviews({
+    const { generated, failedCount, alreadyStored } = await this.#renderPending(
+      {
         media,
         mediaId: task.mediaId,
         requested,
@@ -376,12 +558,13 @@ export class Processor {
         ctx,
         persist: true,
         signal: opts.signal,
-      });
+      },
+    );
 
     // A queued task is complete only when every requested identity is now persisted. Re-read once
     // so the rows of a concurrent worker running the same task (after an expired lease) count: a
     // variant that failed here may be stored there. Our own generated rows are included too:
-    // appendPreviews returned successfully before #generatePreviews returned, and so are the
+    // appendPreviews returned successfully before #renderPending returned, and so are the
     // identities the media store reported as already stored by another worker.
     const refreshed = await mediaStore.loadMedia(task.mediaId);
     if (!refreshed) {
@@ -438,7 +621,7 @@ export class Processor {
     }
   }
 
-  async #generatePreviews(args: GenerateCoreArgs): Promise<GenerateCoreResult> {
+  async #renderPending(args: RenderPendingArgs): Promise<RenderPendingResult> {
     const {
       media,
       mediaId,
@@ -451,13 +634,14 @@ export class Processor {
     const {
       catalog,
       config,
+      decoders,
       hooks,
       logger,
-      media: mediaStore,
       name,
       pipelines,
       storage,
     } = this.#deps;
+    const { limits } = config;
 
     // Before any download or decode, in both modes; the queue retries it like any failure.
     requirePipeline(pipelines, name, pipelineName);
@@ -481,486 +665,202 @@ export class Processor {
     // Existing-preview set (the DB check that makes re-runs idempotent). Stored previews keep
     // their own scope, so another pipeline's rendering never counts as done here.
     const scope: PreviewScope = { resizer: name, pipeline: pipelineName };
-    // The identity of a requested variant or a generated row (both belong to `scope`).
-    const scopedIdentity = (v: MissingPreview | Preview): string =>
-      catalog.identity(scope, v);
     const existing = catalog.storedIdentities(media, scope);
-    const pending = requested.filter((v) => !existing.has(scopedIdentity(v)));
-    // Everything requested is already stored: no download.
+    const notStored = requested.filter(
+      (v) => !existing.has(catalog.identity(scope, v)),
+    );
+    // A task payload can name any format; only configured encoders run. Every other variant fails
+    // alone, before any download.
+    const { configured: pending, unconfigured } =
+      catalog.splitConfigured(notStored);
+    for (const v of unconfigured) {
+      logger.error(
+        `resize worker: variant ${catalog.identity(scope, v)} failed for media ${mediaId}`,
+        formatNotConfiguredError([v.format]),
+      );
+      failedCount += 1;
+    }
+    // Everything requested is already stored or cannot be encoded: no download.
     if (pending.length === 0) {
       return { generated, failedCount, alreadyStored };
     }
 
-    // Download the original ONCE.
-    let buf = asBuffer(await storage.download(original.storageRef));
-
-    // Metadata + decode-bomb guards. EVERY worker sharp() call carries limitInputPixels, so an
-    // oversized-for-inputPixels source is rejected consistently at this first probe rather than
-    // slipping through to a per-variant decode.
-    const origMeta = await sharp(buf, {
-      limitInputPixels: config.limits.inputPixels,
-    })
-      .timeout({ seconds: config.limits.processingTimeoutSeconds })
-      .metadata();
-    if (origMeta.width === undefined || origMeta.height === undefined) {
-      throw new ResizeMediaError(
-        `resize: source metadata missing width/height for media ${mediaId} — cannot size safely`,
-        { mediaId, code: 'RESIZE_SOURCE_METADATA_MISSING', retryable: false },
-      );
-    }
-    const orientation = origMeta.orientation ?? 1;
-    // DISPLAY dims: EXIF 5–8 swap width/height, so the stored dims are wrong for rotated photos.
-    const [dispW, dispH] =
-      orientation >= 5
-        ? [origMeta.height, origMeta.width]
-        : [origMeta.width, origMeta.height];
-    // One frame must fit; how many frames are decoded is bounded below.
-    if (origMeta.width * origMeta.height > config.limits.sourcePixels) {
-      throw new ResizeMediaError(
-        `resize: source ${origMeta.width}×${origMeta.height} exceeds limits.sourcePixels (${config.limits.sourcePixels}) for media ${mediaId}`,
-        { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
-      );
-    }
-    const pixelBudget = Math.min(
-      config.limits.sourcePixels,
-      config.limits.inputPixels,
+    let source: LoadedSource | undefined = await loadSource(
+      { storage, decoders, limits, logger },
+      original,
+      mediaId,
     );
+    const { info } = source;
 
     // The dimensions the media holds: the stored pair, or, when the original never recorded it,
-    // the measured display size (which the persist below backfills). Every row's origin is signed
-    // with them, persisted or not, so the rows of one original always share one origin.
+    // the decoded source's display size (which the persist below backfills). Every row's origin is
+    // signed with them, persisted or not, so the rows of one original always share one origin.
     const storedDims =
       original.width !== undefined && original.height !== undefined
         ? { width: original.width, height: original.height }
         : undefined;
-    const mediaDims = storedDims ?? { width: dispW, height: dispH };
+    // At least one pixel a side, as the plan rounds sides: a vector source may be fractional.
+    const mediaDims = storedDims ?? {
+      width: Math.max(1, Math.round(info.width)),
+      height: Math.max(1, Math.round(info.height)),
+    };
     const origin = previewOrigin(original.storageRef, mediaDims);
 
     const pipeline = pipelines.get(pipelineName);
-    // A preview keeps the animation only in an animated format and only without variantSteps: a
-    // step sees every frame stacked into one tall image, so a composited watermark would land on
-    // a single frame. Everything else is rendered from the first frame.
-    const animates =
-      config.animated &&
-      (pipeline.variantSteps ?? []).length === 0 &&
-      requested.some((v) => isAnimatedFormat(v.format));
-    // Frames to decode: the source's own count (asking for more pages than exist fails the
-    // decode), up to limits.animationFrames and to what fits the pixel budget (Sharp counts every
-    // decoded frame against limitInputPixels). libvips cannot rotate a multi-page image, so an
-    // animation that carries an EXIF orientation is rendered from its first frame.
-    const framesOf = (
-      meta: Metadata,
-      frameW: number,
-      frameH: number,
-    ): number =>
-      animates && (meta.orientation ?? 1) <= 1
-        ? Math.max(
-            1,
-            Math.min(
-              meta.pages ?? 1,
-              config.limits.animationFrames,
-              Math.floor(pixelBudget / (frameW * frameH)),
-            ),
-          )
-        : 1;
-
-    // An SVG is rendered ONCE, before anything else touches it, in a child process with a hard
-    // time limit, to a lossless raster at the largest scale the pending variants need (capped by
-    // the pixel budget and librsvg's side limit). From then on it is a regular image: beforeSteps
-    // receive the PNG, never SVG markup they could render in-process without a time limit.
-    // procW/procH stay the SVG's own size (fit sizes are computed from it and never exceed it);
-    // svgAspect is its real aspect ratio, for derived sides and the cap decision.
-    const fromSvg = origMeta.format === 'svg';
-    let svgAspect: number | undefined;
-    if (fromSvg) {
-      const natural = await svgNaturalSize(
-        buf,
-        dispW,
-        dispH,
-        config.limits.inputPixels,
-        config.limits.processingTimeoutSeconds,
-      );
-      svgAspect = natural.width / natural.height;
-      const largestScale = Math.max(
-        1,
-        ...pending
-          .filter((variant) => !variant.fit)
-          .map((variant) =>
-            Math.max(
-              (variant.requestedWidth ?? 0) / natural.width,
-              (variant.requestedHeight ?? 0) / natural.height,
-            ),
-          ),
-      );
-      const density = await svgRasterDensity(
-        buf,
-        natural.width,
-        natural.height,
-        {
-          pixelBudget,
-          inputPixels: config.limits.inputPixels,
-          timeoutSeconds: config.limits.processingTimeoutSeconds,
-          largestScale,
-        },
-      );
-      if (density === undefined) {
-        throw new ResizeMediaError(
-          `resize: SVG dimensions cannot be rasterized within the renderer limits for media ${mediaId}`,
-          {
-            mediaId,
-            code: 'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-            retryable: false,
-          },
-        );
-      }
-      buf = await rasterizeSvg(buf, {
-        density,
-        limitInputPixels: config.limits.inputPixels,
-        timeoutMs: config.limits.processingTimeoutSeconds * 1000,
-        signal,
-        mediaId,
-      });
-    }
-
-    // beforeSteps — the ordered, awaited chain, ONCE, over display-orientation pixels.
-    // Without steps the original is used as downloaded: each variant's `.rotate()` applies the
-    // EXIF orientation, so nothing is re-encoded before the variants are made.
     const beforeSteps = pipeline.beforeSteps ?? [];
-    let procMeta = fromSvg
-      ? await sharp(buf, { limitInputPixels: config.limits.inputPixels })
-          .timeout({ seconds: config.limits.processingTimeoutSeconds })
-          .metadata()
-      : origMeta;
-    let procW = dispW;
-    let procH = dispH;
-    // The SVG sizing rules above apply while the pixels are the SVG's own raster.
-    let svgSizing = fromSvg;
-    if (beforeSteps.length > 0) {
-      // Normalize orientation ONCE so every step sees DISPLAY-orientation pixels (and a step that
-      // round-trips sharp() cannot re-strip a live EXIF orientation and desync the result),
-      // re-encoded in the same format without visible loss.
-      let stepMeta = procMeta;
-      if (orientation > 1) {
-        buf = await withoutVisibleLoss(
-          sharp(buf, {
-            failOn: 'none',
-            limitInputPixels: config.limits.inputPixels,
-          }).rotate(),
-          origMeta.format,
-        )
-          .timeout({ seconds: config.limits.processingTimeoutSeconds })
-          .toBuffer();
-        stepMeta = await sharp(buf, {
-          limitInputPixels: config.limits.inputPixels,
-        }).metadata();
-      }
-      for (const step of beforeSteps) {
-        buf = asBuffer(await step(buf, { media, metadata: stepMeta, ctx }));
-      }
+    const rules = planRules(config, scope, pipeline);
+    let plans = planVariants(info, pending, rules);
 
-      // Post-beforeSteps metadata. Buffer is already display-oriented → NO swap logic here.
-      const after = await sharp(buf, {
-        limitInputPixels: config.limits.inputPixels,
-      })
-        .timeout({ seconds: config.limits.processingTimeoutSeconds })
-        .metadata();
-      if (
-        !fromSvg ||
-        after.width !== procMeta.width ||
-        after.height !== procMeta.height
-      ) {
-        // A step that resized the SVG's raster made a new image: from here it is sized by its
-        // own pixels, like any raster.
-        svgSizing = false;
-        svgAspect = undefined;
-        procW = after.width ?? dispW;
-        procH = after.height ?? dispH;
+    // ONE decode per task, at the largest box the plan needs; with beforeSteps at least the
+    // source's own size, so the steps see the whole source.
+    let raster: Raster | undefined = await decodeSource(
+      source,
+      decodeBox(info, plans, { atLeastOwnSize: beforeSteps.length > 0 }),
+      {
+        limits,
+        signal,
+        source: info,
+        frames: framesToDecode(info, plans, limits),
+      },
+      mediaId,
+    );
+    // The encoded original is not read again: drop it before the pixel work.
+    source = undefined;
+
+    if (beforeSteps.length > 0) {
+      const rendered = {
+        width: raster.info.width,
+        height: raster.info.height,
+      };
+      let stepping: Promise<Raster> | undefined = runBeforeSteps(
+        raster,
+        beforeSteps,
+        { media, source: info, ctx },
+        limits,
+      );
+      // While the steps run, runBeforeSteps holds the only reference to the decoded raster, so
+      // it is freed as soon as the first step resolves.
+      raster = undefined;
+      raster = await stepping;
+      // A settled promise keeps its value, and the suspended frame keeps the promise: drop it, so
+      // the full-size step result is freed once reduceToBox below has replaced it.
+      stepping = undefined;
+      const { width, height } = raster.info;
+      if (width * height > Math.min(limits.sourcePixels, limits.inputPixels)) {
+        throw new ResizeMediaError(
+          `resize: processed source exceeds pixel limits for media ${mediaId}`,
+          { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+        );
       }
-      procMeta = after;
-    }
-    if (procW * procH > pixelBudget) {
-      throw new ResizeMediaError(
-        `resize: processed source exceeds pixel limits for media ${mediaId}`,
-        { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+      // A step that changed the size made a new image: every variant is planned from its pixels.
+      let planned = info;
+      if (width !== rendered.width || height !== rendered.height) {
+        planned = {
+          ...info,
+          width,
+          height,
+          pages: 1,
+          animated: false,
+          vector: false,
+        };
+        plans = planVariants(planned, pending, rules);
+      }
+      // The sizes are rendered from the plan's box, not each from the full-size raster.
+      raster = await reduceToBox(
+        raster,
+        decodeBox(planned, plans, { atLeastOwnSize: false }),
+        limits,
       );
     }
 
-    // Decode ONCE per kind; clone the base per variant so the decode is shared. Formats that
-    // cannot hold an animation decode only the first frame (otherwise Sharp stacks every frame
-    // into one tall image).
-    const decode = (pages: number): Sharp =>
-      sharp(buf, {
-        failOn: 'none',
-        sequentialRead: true,
-        limitInputPixels: config.limits.inputPixels,
-        pages,
-      });
-    const frames = framesOf(procMeta, procW, procH);
-    const base = decode(1);
-    const animatedBase = frames > 1 ? decode(frames) : undefined;
-
-    const processVariant = async (v: MissingPreview): Promise<void> => {
-      const identity = scopedIdentity(v);
+    // From here only `sized` holds the raster; it is cleared once the variants are done, so the
+    // persist and the observers below do not keep the pixels alive.
+    const sized = new SizedRasters(raster, plans, limits);
+    raster = undefined;
+    const encodeOptions = {
+      variantSteps: pipeline.variantSteps ?? [],
+      ctx,
+      encode: config.encode,
+      limits,
+    };
+    // Each variant's stored row, by plan; read back in request order after the pool.
+    const rows = new Map<VariantPlan, Preview>();
+    const renderVariant = async (plan: VariantPlan): Promise<void> => {
       try {
-        // A task payload can name any format; only configured encoders run (no sharp work here).
-        const { dropped } = catalog.configuredFormats([v.format]);
-        if (dropped.length > 0) {
-          throw formatNotConfiguredError(dropped);
-        }
-        // Fit: capped to config.maxSize by calculateResizedDimensions. Cover: requested sides
-        // rounded and capped to limits.resultDimension, a derived side included. For an SVG the
-        // cap decision uses its real aspect ratio (a 1000×0.6 SVG reads as 1000×1).
-        let { width, height } = v.fit
-          ? calculateResizedDimensions(
-              procW,
-              procH,
-              undefined,
-              undefined,
-              true,
-              config.maxSize,
-            )
-          : svgAspect !== undefined
-            ? coverDimensions(
-                svgAspect,
-                1,
-                v.requestedWidth,
-                v.requestedHeight,
-                config.limits.resultDimension,
-              )
-            : coverDimensions(
-                procW,
-                procH,
-                v.requestedWidth,
-                v.requestedHeight,
-                config.limits.resultDimension,
-              );
-        // An SVG's width-only or height-only size under the cap: the other side from the SVG's
-        // real aspect ratio, and the raster resized to exactly that box (no crop).
-        const svgDerived =
-          svgAspect !== undefined &&
-          !v.fit &&
-          (width === undefined) !== (height === undefined);
-        if (svgDerived && svgAspect !== undefined) {
-          if (width !== undefined) {
-            height = Math.max(1, Math.round(width / svgAspect));
-          } else if (height !== undefined) {
-            width = Math.max(1, Math.round(height * svgAspect));
-          }
-        }
-
-        // A raster source that fits inside the requested WxH box is the whole image at its own
-        // size: no upscaling and no cropping (only the resultDimension cap may scale it down); the
-        // encode strips metadata. Only without variantSteps: a pipeline's steps keep the full box
-        // they were written for (a 200×50 watermark cannot be composited onto 150×150).
-        const ownSize =
-          !svgSizing &&
-          !v.fit &&
-          (pipeline.variantSteps ?? []).length === 0 &&
-          v.requestedWidth !== undefined &&
-          v.requestedHeight !== undefined &&
-          procW <= Math.round(v.requestedWidth) &&
-          procH <= Math.round(v.requestedHeight);
-        // Not sharpened when nothing was scaled.
-        const unscaled =
-          ownSize &&
-          (width === undefined || procW <= width) &&
-          (height === undefined || procH <= height);
-
-        // Clone the shared decode; `.rotate()` on EVERY branch applies the EXIF orientation;
-        // normalize the working colorspace BEFORE variantSteps so composited overlay colors are
-        // predictable. An SVG raster is filled into the exact box computed from the SVG itself
-        // (its rounded raster aspect ratio would shift an `inside` resize by a pixel).
-        const animate =
-          animatedBase !== undefined && isAnimatedFormat(v.format);
-        let img = (animate ? animatedBase : base)
-          .clone()
-          .rotate()
-          .resize(
-            width,
-            height,
-            (v.fit && svgSizing) || svgDerived
-              ? { fit: 'fill' }
-              : v.fit || ownSize
-                ? { fit: 'inside', withoutEnlargement: true }
-                : { fit: 'cover', position: 'center' },
-          )
-          .toColorspace('srgb');
-        const s = config.encode.sharpen;
-        const sharpenOn = s && !unscaled && (v.fit ? s.fit : s.cover);
-        if (sharpenOn) {
-          img = img.sharpen();
-        }
-        for (const step of pipeline.variantSteps ?? []) {
-          img = await step(img, { variant: v, ctx });
-        }
-        if (
-          procMeta.hasAlpha &&
-          config.encode.flatten.formats.includes(v.format)
-        ) {
-          img = img.flatten({ background: config.encode.flatten.background });
-        }
-
-        const encodeOptions = config.encode.formats[v.format] ?? {};
-        img = img.toFormat(
-          v.format as keyof FormatEnum,
-          encodeOptions as OutputOptions,
-        );
-
-        const { data, info } = await img
-          .timeout({ seconds: config.limits.processingTimeoutSeconds })
-          .toBuffer({ resolveWithObject: true });
-        // Sharp reports AVIF output through its HEIF container id and does not expose
-        // compression on OutputInfo. Inspect the produced ISO BMFF brands so configured
-        // `heif: { compression: 'av1' }` receives the correct MIME type and extension too.
-        const outputFormat =
-          info.format === 'heif' && isAvifBuffer(data) ? 'avif' : info.format;
-        if (outputFormat === 'svg') {
-          throw new ResizeMediaError(
-            `resize: SVG cannot be published as a preview for media ${mediaId}`,
-            { mediaId, code: 'RESIZE_SVG_PUBLIC_PREVIEW' },
+        let encoded: EncodedVariant;
+        try {
+          encoded = await encodeVariant(
+            await sized.get(plan.size),
+            plan,
+            encodeOptions,
           );
+        } finally {
+          // Released after the encode, not after the upload: the last variant of a size does not
+          // keep its sized raster during the upload.
+          sized.release(plan.size);
         }
-        const contentType = `image/${outputFormat}`;
-        const key = `previews/${randomHex()}.${outputFormat}`;
         const ref = await storage.upload({
-          key,
-          body: data,
-          contentType,
+          key: `previews/${randomHex()}.${encoded.format}`,
+          body: encoded.data,
+          contentType: encoded.contentType,
           visibility: 'public',
           parentRef: original.storageRef,
         });
-
         if (ref == null) {
           throw new ResizeStorageError(
             'resize: storage returned an invalid preview locator',
-            {
-              code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID',
-            },
+            { code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID' },
           );
         }
-
-        const preview: Preview = {
-          storageRef: ref,
-          identity,
-          resizer: name,
-          pipeline: pipelineName,
-          sizeKey: v.sizeKey,
-          format: v.format,
-          contentType,
-          // One frame: an animated output reports the height of all frames stacked.
-          actualWidth: info.width,
-          actualHeight: info.pageHeight ?? info.height,
-          bytes: data.length,
-          createdAt: new Date(),
-          origin,
-          encodeSig: encodeSignature(config, {
-            format: v.format,
-            fit: v.fit === true,
-            version: pipeline.version,
+        rows.set(
+          plan,
+          previewRow(plan, encoded, ref, {
+            scope,
+            origin,
+            encodeSig: encodeSignature(config, {
+              format: plan.variant.format,
+              fit: plan.variant.fit === true,
+              version: pipeline.version,
+            }),
           }),
-        };
-        if (v.filters) {
-          preview.filters = v.filters;
-        }
-        if (v.requestedWidth !== undefined) {
-          preview.requestedWidth = Math.round(v.requestedWidth);
-        }
-        if (v.requestedHeight !== undefined) {
-          preview.requestedHeight = Math.round(v.requestedHeight);
-        }
-        if (v.fit) {
-          preview.fit = true;
-        }
-        generated.push(preview);
+        );
       } catch (err) {
         // One bad variant must not fail the whole task; the caller decides what the failures mean.
+        // A media error from the pixel work (an SVG output) does not know its media: add it.
         logger.error(
-          `resize worker: variant ${identity} failed for media ${mediaId}`,
-          err,
+          `resize worker: variant ${plan.identity} failed for media ${mediaId}`,
+          lacksMediaId(err) ? withMediaId(err, mediaId) : err,
         );
         failedCount += 1;
       }
     };
 
-    // Bounded pool over the variants not stored yet (NOT unbounded Promise.all); between variants
-    // stop launching new ones if the lease was lost (best-effort — correctness holds via the
-    // fencing token).
-    await runBounded(pending, config.concurrency, signal, processVariant);
+    // Bounded pool over the variants (NOT unbounded Promise.all), each size's variants together,
+    // so at most `concurrency` sized rasters are held at once; between variants stop launching new
+    // ones if the lease was lost (best-effort — correctness holds via the fencing token).
+    await runBounded(
+      groupBySize(plans),
+      config.concurrency,
+      signal,
+      renderVariant,
+    );
+    sized.clear();
+    // The rows in request order, whatever order the pool finished them in.
+    generated = plans.flatMap((plan) => rows.get(plan) ?? []);
 
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
-    // never carried dims), then fire onPreviewGenerated per pushed preview (ctx {}).
+    // never carried dims; previewRecorder.ts), then fire onPreviewGenerated per stored preview
+    // (ctx {}).
     if (persist && generated.length > 0) {
       const backfillDims = storedDims === undefined ? mediaDims : undefined;
-      // What the media store holds now, read once after a failed or partial write: the identities
-      // stored on the media, null when the media is gone, undefined when the reload failed too.
-      const recordedIdentities = async (): Promise<
-        Set<string> | null | undefined
-      > => {
-        try {
-          const reloaded = await mediaStore.loadMedia(mediaId);
-          return reloaded ? catalog.storedIdentities(reloaded, scope) : null;
-        } catch {
-          return undefined;
-        }
-      };
-      const stored = await mediaStore
-        .appendPreviews(mediaId, generated, backfillDims)
-        .catch(async (err: unknown) => {
-          // The write may have stopped part-way (a driver can store one row at a time). Name
-          // only the uploads no row points at, so an operator can find (or delete) them; a file
-          // a stored row references is never offered.
-          const recorded = await recordedIdentities();
-          const unrecorded = recorded
-            ? generated.filter((p) => !recorded.has(scopedIdentity(p)))
-            : generated;
-          logger.error(
-            `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${generated.length} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
-            err,
-          );
-          throw err;
-        });
-      // A store written to the old contract resolves with nothing. Read as the rows it stored,
-      // that would mean every preview was left out (reported as another worker's,
-      // `created: []`), so fail loudly instead, before any observer runs.
-      if (!Array.isArray(stored)) {
-        throw new ResizeSetupError(
-          `resize: MediaStore.appendPreviews must resolve with the previews it stored ([] when none were); for media ${mediaId} it resolved with ${String(stored)}`,
-          { code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID' },
-        );
-      }
-      // The media store keeps one row per identity and resolves with the rows it stored. The
-      // reload says why a row was left out: the media is gone, or another worker stored the same
-      // identity first (covered, not a failure).
-      const kept = catalog.storedIdentities({ previews: stored }, scope);
-      const leftOut = generated.filter((p) => !kept.has(scopedIdentity(p)));
-      if (leftOut.length > 0) {
-        generated = generated.filter((p) => kept.has(scopedIdentity(p)));
-        const recorded = await recordedIdentities();
-        if (recorded === null) {
-          logger.warn(
-            `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
-          );
-        } else {
-          // A failed reload trusts the store's answer: the rows are another worker's.
-          const duplicates = recorded
-            ? leftOut.filter((p) => recorded.has(scopedIdentity(p)))
-            : leftOut;
-          const lost = recorded
-            ? leftOut.filter((p) => !recorded.has(scopedIdentity(p)))
-            : [];
-          if (duplicates.length > 0) {
-            logger.warn(
-              `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
-            );
-            alreadyStored.push(...duplicates.map(scopedIdentity));
-          }
-          if (lost.length > 0) {
-            logger.error(
-              `resize: the media store left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
-            );
-          }
-        }
-      }
+      const recorded = await this.#recorder.record(
+        mediaId,
+        scope,
+        generated,
+        backfillDims,
+      );
+      generated = recorded.stored;
+      alreadyStored.push(...recorded.alreadyStored);
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
       }

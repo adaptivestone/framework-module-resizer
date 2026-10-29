@@ -14,6 +14,7 @@ import {
   noQueueResult,
 } from './dispatcher.ts';
 import { ResizeError } from './errors.ts';
+import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import type { HookBus } from './hooks.ts';
 import { getSizeKey, requireMediaId, toMissingPreview } from './images.ts';
@@ -447,25 +448,9 @@ function notRetryableOnPrewarm(err: unknown): boolean {
   if (!ResizeError.isResizeError(err)) {
     return false;
   }
-  if (err.retryable === false || NOT_RETRYABLE_ON_PREWARM.has(err.name)) {
-    return true;
-  }
-  try {
-    for (
-      let proto: unknown = Object.getPrototypeOf(err);
-      proto !== null && proto !== Object.prototype;
-      proto = Object.getPrototypeOf(proto)
-    ) {
-      const name = (proto as { constructor?: { name?: unknown } }).constructor
-        ?.name;
-      if (typeof name === 'string' && NOT_RETRYABLE_ON_PREWARM.has(name)) {
-        return true;
-      }
-    }
-  } catch {
-    // A prototype chain that cannot be read: no class advice, the error stays retryable.
-  }
-  return false;
+  return (
+    err.retryable === false || hasErrorClass(err, NOT_RETRYABLE_ON_PREWARM)
+  );
 }
 
 /**

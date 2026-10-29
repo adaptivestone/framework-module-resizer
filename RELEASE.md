@@ -42,7 +42,7 @@ Bump with `npm version <patch|minor|major>` (updates `package.json` + creates th
 at `rc.1` (`npm version X.Y.0-rc.1 --no-git-tag-version`, then tag by hand, §4). Each rc is
 published with the npm tag `next` (§3), so `latest` stays on the last stable release until the
 final `X.Y.0`. 0.3.0 ships this way: `0.3.0-rc.1` holds every host-facing shape, `0.3.0-rc.2` the
-new pipeline-step signature, later rcs internal changes only. All of them stay under the one
+`beforeSteps` signature and the decoder port, later rcs internal changes only. All of them stay under the one
 `# 0.3.0` heading of `CHANGELOG.md` (its **Prereleases** note says what each rc holds); the
 final `0.3.0` is a bump from the last rc with no new heading.
 

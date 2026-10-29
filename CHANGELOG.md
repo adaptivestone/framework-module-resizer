@@ -6,12 +6,14 @@
 - `0.3.0-rc.1`: the host-facing shapes of this release: the config (`queues`, `queue` as a name,
   the process-wide `worker` and `coordination`), the option and type names, the import paths, the
   preview fields and `invalidate`. Integrate against these.
-- `0.3.0-rc.2`: the new pipeline-step signature (below).
+- `0.3.0-rc.2`: the `beforeSteps` signature (a `Raster` in and a `Raster` out, with the helpers
+  `rasterToSharp` and `sharpToRaster`), decoders (`SourceDecoder` and the `decoders` option) and
+  their error codes (below).
 - Later release candidates: internal changes that need no host change.
 
-In `0.3.0-rc.2`, both `beforeSteps` and `variantSteps` will receive and return a `Raster` (raw
-pixels plus their info), with the helpers `rasterToSharp` and `sharpToRaster`, because the image
-engine becomes replaceable. Hosts that write steps now should expect that signature.
+`variantSteps` keep their Sharp instance in `0.3.0-rc.2`, now over each size's pixels (operations
+Sharp used to apply before its resize now apply to the preview). Their raster form waits for a
+later release that puts the image engine behind a port.
 
 **Breaking changes**
 
@@ -168,6 +170,86 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   served for now, and will be regenerated once a later release's freshness check ships, so plan
   the storage cost of rendering them again. Rows without an `identity` (written before 0.3.0) are
   never removed by `invalidate` or `replacePreviews`: the host deletes their files itself.
+- **`beforeSteps` take and return a `Raster`.** `BeforeStep` is now
+  `(raster, { media, source, scale, ctx }) => Raster` (or a promise of one), for every source
+  kind: `raster` is the decoded first frame (`{ data, info }`: raw 8-bit sRGB pixels, upright), and
+  the step resolves with one frame. The image engine becomes replaceable, so host steps see pixels,
+  not a library object. `source` is the decoder's `SourceInfo`, and `scale` is the width of the
+  raster the step receives divided by `source.width`: for a raster source the step sees the upright
+  original at its own size; for a vector source (SVG) the pixels can be larger, so multiply
+  coordinates stored in the source's units by it. Migration, with both helpers imported from the
+  main entry:
+
+  ```ts
+  beforeSteps: [async (buf) => sharp(buf).blur(5).toBuffer()], // before
+  beforeSteps: [async (r) => sharpToRaster(rasterToSharp(r).blur(5))], // now
+  ```
+
+  An old step fails inside its own `sharp(buf)` call, because Sharp reads the `Raster` object as
+  options: it rejects with Sharp's plain `Error` "Input file is missing" (retried, then
+  dead-lettered; thrown as-is by eager `generate()`), not with `RESIZE_PIPELINE_STEP_INVALID`,
+  which a step gets when it resolves with something that is not a one-frame `Raster` (a `Buffer`,
+  a Sharp instance, a raster whose `data` length does not match its `info`).
+- **`variantSteps` receive the sized pixels.** They keep their Sharp instance, now over the raw
+  pixels of the preview's exact size: `metadata()` reports the preview (with `format: 'raw'`, no
+  EXIF, ICC profile, density or orientation, and `hasAlpha` as the sized pixels have it), a step's
+  `resize()` resizes the preview, and operations Sharp used to apply before its resize (such as
+  `trim()`) now apply to the preview.
+- **Animation needs a pipeline without `beforeSteps`.** With `animated: true`, WebP and GIF
+  previews keep an animation's frames only for a pipeline with neither `beforeSteps` nor
+  `variantSteps`; `beforeSteps` receive the first frame, and every preview of their pipeline is a
+  still image.
+- **A decode failure fails the task.** A source that cannot be decoded fails the task, or
+  `generate()`, with the decoder's error when it is a `ResizeError`, and otherwise (Sharp's own
+  error, for example) with the retryable `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED`, the
+  original error as its `cause`.
+- **The worker reads `original.format`** to pick the decoder to try first. A format that no
+  decoder lists, or one whose decoder refuses the bytes, is logged as a warning
+  (`resize worker: media <id> is stored as '<stored>' but its bytes are '<format>' (<why>);
+  rendering it as '<format>'`; when a host decoder lists the stored format, refuses the bytes and
+  a later decoder reads them as that format, `… the first decoder listing '<stored>' refused these
+  bytes, and another decoder read them`) and the bytes are probed through the other decoders, so a
+  record with an alias (`jpg`) or a MIME type still renders. A format whose decoder reads the bytes
+  as another of its formats (JPEG bytes stored as `png`) is logged with the same warning and
+  rendered by that decoder as what it is; no other decoder is asked. Store the decoder's id
+  (`jpeg`, `png`, `svg`, …), as `uploadOriginal()` returns it.
+- **`RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` means "no decoder reads these bytes".** It meant "Sharp
+  named no format". It fires when Sharp identifies a format that no decoder lists (a libvips build
+  with extra loaders), or when every decoder refuses the bytes. Bytes Sharp cannot read at all
+  stay `RESIZE_ORIGINAL_INVALID`.
+- **Upload messages.** `uploadOriginal()` reports a refused or unmeasurable original with the
+  decoder's message (`RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`, `RESIZE_ORIGINAL_METADATA_MISSING`), and
+  an SVG over `limits.sourcePixels` with the SVG decoder's message
+  (`RESIZE_ORIGINAL_TOO_MANY_PIXELS`). An SVG whose size cannot be inspected is
+  `RESIZE_ORIGINAL_INVALID` with the generic "bytes are not a supported image" message and the
+  helper's error as its `cause`. The `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` message starts with
+  `resize:`. A stored SVG's `width` and `height` are its natural size rounded, at least 1. The
+  `RESIZE_ORIGINAL_TOO_MANY_PIXELS` message for an EXIF-rotated original prints its display
+  (upright) sides. The codes are unchanged.
+- **Worker memory and rounding.** With `beforeSteps`, the worker decodes the source at least at
+  its own size and holds it as raw pixels plus the step's result: about 2 × width × height × 4
+  bytes, up to about 400 MB at the default `limits.sourcePixels`; the result is released once the
+  sizes are made from it. Each size is held raw too, up to `concurrency` sizes at once, each up to
+  `limits.resultDimension`² pixels. An animated size holds frames × size pixels × channels bytes,
+  with the frames cut so that frames × the larger of the source's and the size's pixels stays
+  within `min(limits.sourcePixels, limits.inputPixels)`. Size worker containers for
+  `limits.sourcePixels`. Preview sizes are computed from
+  the source's display dimensions and rounded once per side, so a preview side can differ by one
+  pixel from what Sharp derived before.
+- **Pixel limits.** Pixels the module renders itself are no longer limited by
+  `limits.inputPixels`, which now guards only the bytes a decoder reads: a `variantSteps` box that
+  enlarges a small source renders instead of failing Sharp's input limit. The Sharp decoder
+  inspects the first frame of an animation, so the input limit applies to one frame (a stored
+  animation whose stack exceeds `limits.inputPixels` renders its stills and the frames that fit);
+  `uploadOriginal()` still rejects an original whose width × height × frames exceeds
+  `limits.sourcePixels` (`RESIZE_ORIGINAL_TOO_MANY_PIXELS`). The animation stack is bounded by the
+  pixel budget at the preview's size: a width-only size that enlarges an animation keeps fewer
+  frames. A decoder's raster over `min(limits.sourcePixels, limits.inputPixels)` fails the task
+  with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`). `sharpToRaster` checks
+  the pixels it reads back and refuses stacked input frames, whatever size they are resized to
+  (`RESIZE_PIPELINE_STEP_INVALID`), and so does `rasterToSharp` given a value that is not a
+  `Raster`. The worker sets the media id on a decoder's own `ResizeMediaError` (or subclass), so
+  the same object reaches the task and `generate()`; a frozen one is wrapped, with it as `cause`.
 - Persisted locators are nested, driver-owned refs: `original.storageRef` and
   `previews[].storageRef` replace the flat `key`/`bucket` fields, and `StorageRef` is now an
   opaque JSON value. No reader or migration for old resize records is included; update host
@@ -180,9 +262,10 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   `bucketPrivate` differs from `bucketPublic`; `LocalFsStorage` keeps private files under
   `privateRootDir` (default `<rootDir>-private`).
 - SVG is an input format only. `uploadOriginal()` stores SVG privately and rejects public SVG
-  uploads. The worker renders an SVG once per task, before any pipeline step, into a PNG, in a
-  separate Node process, at the largest size the requested previews need; `beforeSteps` receive
-  that PNG, never SVG markup, and every format is made from it. The render is killed after
+  uploads. The worker renders an SVG once per task, before any pipeline step, in a separate Node
+  process, at the largest size the requested previews need (with `beforeSteps`, at least its
+  natural size); `beforeSteps` receive the rendered pixels as a `Raster`, never SVG markup, and
+  every format is made from them. The render is killed after
   `limits.processingTimeoutSeconds` (`ResizeMediaError` `RESIZE_SVG_RENDER_TIMEOUT`, the task is
   dead-lettered at once) or when the task is aborted; a render process that crashes or produces no
   image is `RESIZE_SVG_RENDER_FAILED` (retried). A render that cannot start is `ResizeSetupError`
@@ -414,12 +497,13 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   task whose error has `retryable: false` is dead-lettered on its first failure. It is `false` by
   default on `ResizeNoOriginalError` and `ResizeSecurityError` (a security refusal while reading
   the original is no longer retried), and `RESIZE_SOURCE_TOO_LARGE`,
-  `RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` and
+  `RESIZE_SOURCE_FORMAT_UNSUPPORTED`, `RESIZE_SOURCE_METADATA_MISSING`,
+  `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` and
   `RESIZE_SVG_RENDER_TIMEOUT` set it. The worker reads `retryable` on the error that fails the
   task, when it is a `ResizeError` — including one from a duplicate copy of the package (the
   `isResizeError` brand, not the class); errors from other libraries are retried, whatever
   fields they carry (an AWS SDK v2 4xx has its own `retryable`). That covers errors from
-  `loadMedia`, `storage.download`, the source and SVG checks, the SVG render, `beforeSteps` and
+  `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` and
   `appendPreviews`. An error inside one variant (`variantSteps`, encoding, `storage.upload`) fails
   only that variant, and the task fails with the retryable `RESIZE_WORKER_INCOMPLETE` (retried for
   the missing variants only).
@@ -618,8 +702,9 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   its timing and the coordination, its `verify()`, and that it serves the Resizer's queue). It is
   the one call that rejects for a task queue that cannot be used.
 - `resizer.uploadOriginal({ body, visibility, namespace? })` stores the original bytes unchanged
-  and returns typed metadata. Format and dimensions come from `sharp().metadata()`; new
-  `upload.maxBytes`, `upload.formats` and `limits.processingTimeoutSeconds` bound accepted inputs.
+  and returns typed metadata. Format and dimensions come from the decoders' `inspect` (Sharp's
+  metadata for raster images and SVG); new `upload.maxBytes`, `upload.formats` and
+  `limits.processingTimeoutSeconds` bound accepted inputs.
 - One task per media, pipeline and queue, whatever variants the reads ask for (the gate, above): a
   cold media read by 1000 requests at once gets one task, on Mongo and on SQS. The module does not
   create indexes; prepare the gate index through the host's migration or lifecycle before
@@ -661,8 +746,8 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   (a signature of the original it was made from: its storage ref and dimensions) and `encodeSig`
   (a signature of its format's encode settings, the sharpen setting of its fit mode, its animation
   settings (for animated formats: `animated`, `limits.animationFrames` and the pixel budget
-  `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames), the
-  result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
+  `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames at the larger of
+  the source's and the preview's size), the result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
   from `generate()`; `resizeMediaSchemaFragment` declares them. The read path does not check them
   yet.
 - `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it to mark the
@@ -679,6 +764,26 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   name used only per call is checked by its first `prewarm()` (every variant `unconfirmed`, one
   non-retryable `RESIZE_ENQUEUE_INTERNAL_ERROR` issue with the timing error) or `resolve()` (logged
   once per queue name), and by the worker of its queue.
+- **Decoders.** `SourceDecoder` (main entry) is the contract of one source kind: `formats`,
+  `inspect(bytes, limits)` (identify and measure, never render), `render(bytes, box, opts)` (an
+  upright 8-bit sRGB `Raster`, at least the box where the decoder's limits allow) and an optional
+  `verify()`. `new Resizer({ decoders })` (and `new FrameworkResizer({ decoders })`) adds decoders,
+  asked before the built-in Sharp and SVG decoders. `uploadOriginal()`, the worker and
+  `generate()` read every source through them, so a new source kind (a PDF, a camera raw format)
+  needs only a decoder and its format in `upload.formats`. New types: `SourceInfo`, `Raster`,
+  `RasterInfo`, `DecodeBox`, `RenderOptions` and `ResizeLimits`. See "Decoders" in `README.md`.
+- **Raster helpers.** `rasterToSharp(raster)` and `sharpToRaster(img)` (main entry) wrap a
+  Sharp-based `beforeStep`, and its `meta.scale` maps coordinates in the source's units onto the
+  raster the step receives.
+- New error codes: `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (`ResizeMediaError`, `retryable: false`: a
+  decoder refuses bytes that are not its format, or every decoder refuses them),
+  `RESIZE_DECODER_MISSING` (`ResizeSetupError`, retryable: no decoder in this process lists the
+  stored format and none reads the bytes), `RESIZE_DECODER_INVALID` (`ResizeSetupError`: a
+  `decoders` entry is not a decoder, or a decoder broke the contract),
+  `RESIZE_PIPELINE_STEP_INVALID` (`ResizeSetupError`, retryable: a `beforeStep` resolved with
+  something that is not a one-frame `Raster`, or `sharpToRaster` got a multi-page image) and
+  `RESIZE_SOURCE_DECODE_FAILED` (`ResizeMediaError`, retryable: decoding failed with an error that
+  is not a `ResizeError`, kept as its `cause`).
 
 **Fixes**
 
@@ -702,20 +807,19 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   drop: every delivery then counted as attempt 1, so a failing task was never dead-lettered. It
   now also warns once when SQS returns no `ApproximateReceiveCount`.
 - `animated: true` works. WebP and GIF previews keep the animation, up to
-  `limits.animationFrames` frames, for a pipeline without `variantSteps`; every other format, and
-  every preview of a pipeline with variant steps (a watermark would land on one frame), gets the
-  first frame instead of all frames stacked into one tall image. `actualWidth` / `actualHeight`
-  are the size of one frame. `limits.sourcePixels` applies to one frame, and an animation with
-  more frames than `limits.sourcePixels` or `limits.inputPixels` allow is shortened to the frames
-  that fit instead of failing. An animation with an EXIF orientation is rendered from its first
-  frame.
+  `limits.animationFrames` frames, for a pipeline without `beforeSteps` or `variantSteps`; every
+  other format, and every preview of a pipeline with steps (a watermark would land on one frame),
+  gets the first frame instead of all frames stacked into one tall image. `actualWidth` /
+  `actualHeight` are the size of one frame. `limits.sourcePixels` applies to one frame, and an
+  animation with more frames than `limits.sourcePixels` or `limits.inputPixels` allow is shortened
+  to the frames that fit instead of failing. An animation with an EXIF orientation is rendered from
+  its first frame.
 - No output side of a width-only or height-only size exceeds `limits.resultDimension`: when the
   side derived from the aspect ratio would, the image is cropped to the cap.
 - Fractional size dimensions are rounded in the size key, the task and the stored preview; a
   dimension that rounds to 0 is ignored; a `fit` result is at least 1 px per side.
-- An EXIF-rotated original is no longer re-encoded before resizing when the pipeline has no
-  `beforeSteps` (no quality loss, faster). With `beforeSteps`, the steps still get upright pixels,
-  re-encoded in the same format without visible loss.
+- An EXIF-rotated original is no longer re-encoded before resizing (no quality loss, faster);
+  `beforeSteps` receive its upright pixels as a `Raster`.
 - Very long or thin SVG originals render instead of failing at librsvg's size limit.
 - When recording previews fails after their upload, the error log names the uploaded files that
   no stored row points to (and only those).
@@ -738,6 +842,14 @@ engine becomes replaceable. Hosts that write steps now should expect that signat
   processor and the worker loop) receive only the ports they use, never the Resizer. Import-graph
   tests keep `drivers/**` to contracts, errors, helpers, types and other drivers; only entry points
   import `resizer.ts`, and nothing it reaches imports it back.
+- One decode per task, at the largest box the requested previews need (with `beforeSteps`, at
+  least the source's own size), and one resize per size; each format is encoded from that size's
+  pixels, and a size's pixels are released after its last encode. The pure plan (`planVariants`),
+  `renderSize`, `encodeVariant` and `PreviewRecorder` replace `#generatePreviews`. The Uploader
+  and the Processor import no image engine: a guard test holds the list of shipped files that
+  import Sharp (the decoders and their SVG helpers, the raster helpers, the renderer, the worker
+  and the `variantSteps` type).
+- A benchmark of the render path, `bench/renderOnce.ts` (see "Development" in `README.md`).
 
 # 0.2.1
 

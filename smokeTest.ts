@@ -56,9 +56,12 @@ const expected = [
   'LockStore',
   'MediaStore',
   'ResizeStorage',
+  'SourceDecoder',
   'TaskQueue',
   'resetResizerForTests',
   'runWorker',
+  'rasterToSharp',
+  'sharpToRaster',
 ];
 for (const name of expected) {
   assert.ok(name in mod, 'main entry missing export: ' + name);

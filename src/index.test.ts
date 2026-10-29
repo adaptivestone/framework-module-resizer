@@ -30,8 +30,11 @@ const EXPECTED_VALUE_EXPORTS = [
   'MediaStore',
   'ResizeStorage',
   'parseSizeKey',
+  'rasterToSharp',
+  'SourceDecoder',
   'resetResizerForTests',
   'runWorker',
+  'sharpToRaster',
   'TaskQueue',
 ];
 
@@ -69,6 +72,7 @@ describe('public API surface (src/index.ts)', () => {
       'MediaStore',
       'LockStore',
       'TaskQueue',
+      'SourceDecoder',
     ]) {
       const v = asRecord[name];
       assert.equal(typeof v, 'function', `${name} should be a class/function`);
@@ -88,6 +92,8 @@ describe('public API surface (src/index.ts)', () => {
       'parseSizeKey',
       'formatPictureUrls',
       'isCatalogCovered',
+      'rasterToSharp',
+      'sharpToRaster',
     ]) {
       assert.equal(
         typeof asRecord[name],
