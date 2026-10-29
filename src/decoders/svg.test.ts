@@ -4,6 +4,7 @@ import childProcess from 'node:child_process';
 import { afterEach, mock, test } from 'node:test';
 import sharp from 'sharp';
 import { ResizeError } from '../errors.ts';
+import { svgRasterDensity } from '../helpers/svgDimensions.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import { SvgDecoder } from './svg.ts';
 
@@ -216,4 +217,36 @@ test('render with an aborted signal starts no process and fails as an aborted re
     },
   );
   assert.equal(spawn.mock.callCount(), 0);
+});
+
+test('svgRasterDensity picks a density whose rendered sides fit the pixel budget', async () => {
+  const opts = { inputPixels: 1000, timeoutSeconds: 5 };
+  for (const [width, height, pixelBudget, largestScale] of [
+    [10, 11, 150, 2],
+    [10, 10, 213, 3],
+    [10, 10, 100, 1],
+  ]) {
+    const svg = sizedSvg(width, height);
+    const density = await svgRasterDensity(svg, width, height, {
+      ...opts,
+      pixelBudget,
+      largestScale,
+    });
+    assert.ok(density !== undefined);
+    // The renderer's own sides at that density.
+    const meta = await sharp(svg, { density }).metadata();
+    assert.ok(
+      (meta.width ?? 0) * (meta.height ?? 0) <= pixelBudget,
+      `${width}×${height} at ${density} dpi renders ${meta.width}×${meta.height}, over ${pixelBudget}`,
+    );
+  }
+  // A source well inside the budget keeps the density of its scale.
+  assert.equal(
+    await svgRasterDensity(sizedSvg(10, 11), 10, 11, {
+      ...opts,
+      pixelBudget: 100_000,
+      largestScale: 2,
+    }),
+    144,
+  );
 });

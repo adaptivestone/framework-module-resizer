@@ -205,6 +205,25 @@ export function planVariants(
 }
 
 /**
+ * The plans with every size's variants next to each other, sizes in the order they first appear
+ * and variants in request order within a size. Rendered in this order, a size's pixels are
+ * released before a pool of `concurrency` variants starts a size beyond it, so at most
+ * `concurrency` sizes are held at once.
+ */
+export function groupBySize(plans: readonly VariantPlan[]): VariantPlan[] {
+  const bySize = new Map<string, VariantPlan[]>();
+  for (const plan of plans) {
+    const group = bySize.get(plan.size.key);
+    if (group === undefined) {
+      bySize.set(plan.size.key, [plan]);
+    } else {
+      group.push(plan);
+    }
+  }
+  return [...bySize.values()].flat();
+}
+
+/**
  * The box a decoder renders: the source scaled by the largest factor any plan needs. With
  * `atLeastOwnSize` (beforeSteps see the whole source) it is at least the source's own size; a
  * raster box never exceeds the source, a vector box may.

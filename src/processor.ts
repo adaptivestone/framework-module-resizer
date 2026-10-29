@@ -43,6 +43,7 @@ import type { PipelineRegistry } from './pipelines.ts';
 import {
   decodeBox,
   framesToDecode,
+  groupBySize,
   planRules,
   planVariants,
   type VariantPlan,
@@ -751,6 +752,8 @@ export class Processor {
       encode: config.encode,
       limits,
     };
+    // Each variant's stored row, by plan; read back in request order after the pool.
+    const rows = new Map<VariantPlan, Preview>();
     const renderVariant = async (plan: VariantPlan): Promise<void> => {
       try {
         let encoded: EncodedVariant;
@@ -778,7 +781,8 @@ export class Processor {
             { code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID' },
           );
         }
-        generated.push(
+        rows.set(
+          plan,
           previewRow(plan, encoded, ref, {
             scope,
             origin,
@@ -804,11 +808,18 @@ export class Processor {
       }
     };
 
-    // Bounded pool over the variants, in request order (NOT unbounded Promise.all); between
-    // variants stop launching new ones if the lease was lost (best-effort — correctness holds via
-    // the fencing token).
-    await runBounded(plans, config.concurrency, signal, renderVariant);
+    // Bounded pool over the variants (NOT unbounded Promise.all), each size's variants together,
+    // so at most `concurrency` sized rasters are held at once; between variants stop launching new
+    // ones if the lease was lost (best-effort — correctness holds via the fencing token).
+    await runBounded(
+      groupBySize(plans),
+      config.concurrency,
+      signal,
+      renderVariant,
+    );
     sized.clear();
+    // The rows in request order, whatever order the pool finished them in.
+    generated = plans.flatMap((plan) => rows.get(plan) ?? []);
 
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
     // never carried dims; previewRecorder.ts), then fire onPreviewGenerated per stored preview

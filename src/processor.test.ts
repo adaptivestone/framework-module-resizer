@@ -26,7 +26,11 @@ import {
 } from './contracts/decoder.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
-import type { BeforeStep, Pipeline } from './contracts/pipeline.ts';
+import type {
+  BeforeStep,
+  Pipeline,
+  VariantStep,
+} from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
@@ -70,6 +74,7 @@ import type {
   ResizeConfig,
   ResizeLimits,
   ResizeLogger,
+  SizeInput,
 } from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
 
@@ -977,6 +982,159 @@ describe('decoding the source', () => {
     assert.ok(stepOutput, 'the step ran');
     assert.deepEqual(alive, [false, false]);
   });
+
+  /**
+   * The most sized rasters alive at once while `sizes` render with `concurrency`, seen from a
+   * variantStep: each step keeps a WeakRef on the sized pixels it receives (Sharp's input buffer),
+   * forces a GC, and counts the sizes still alive.
+   */
+  async function mostResidentSizes(
+    sizes: SizeInput[],
+    concurrency: number,
+  ): Promise<{ most: number; created: number }> {
+    v8.setFlagsFromString('--expose-gc');
+    const gc = vm.runInNewContext('gc') as () => void;
+    const square = await sharp({
+      create: { width: 200, height: 200, channels: 3, background: '#4080c0' },
+    })
+      .png()
+      .toBuffer();
+    const refs = new Map<string, WeakRef<Buffer>>();
+    let most = 0;
+    const watch: VariantStep = async (img, { variant }) => {
+      const side = variant.requestedWidth ?? variant.requestedHeight;
+      const input = (
+        img as unknown as { options: { input: { buffer: Buffer } } }
+      ).options.input.buffer;
+      refs.set(String(side), new WeakRef(input));
+      await new Promise((resolve) => setImmediate(resolve));
+      gc();
+      await new Promise((resolve) => setImmediate(resolve));
+      gc();
+      const alive = [...refs.values()].filter((r) => r.deref() !== undefined);
+      most = Math.max(most, alive.length);
+      return img;
+    };
+    const { deps, media } = decodeDeps(square, {
+      config: { concurrency },
+      pipeline: { variantSteps: [watch] },
+    });
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes,
+    });
+    return { most, created: created.length };
+  }
+
+  test('sized rasters resident at once are bounded by concurrency: one geometry asked by width and by height', async () => {
+    const { most, created } = await mostResidentSizes(
+      [
+        { width: 60 },
+        { width: 50 },
+        { width: 40 },
+        { height: 60 },
+        { height: 50 },
+        { height: 40 },
+      ],
+      1,
+    );
+    assert.equal(created, 6);
+    assert.equal(most, 1);
+  });
+
+  test('sized rasters resident at once are bounded by concurrency: the same widths with other filters', async () => {
+    const { most, created } = await mostResidentSizes(
+      [
+        { width: 30 },
+        { width: 40 },
+        { width: 50 },
+        { width: 30, filters: { tint: 'a' } },
+        { width: 40, filters: { tint: 'a' } },
+        { width: 50, filters: { tint: 'a' } },
+      ],
+      2,
+    );
+    assert.equal(created, 6);
+    assert.ok(most <= 2, `${most} sizes resident with concurrency 2`);
+  });
+
+  test('previews come back in request order when the sizes are rendered grouped', async () => {
+    const { deps, media } = decodeDeps(png600, { config: { concurrency: 1 } });
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [
+        { width: 60, height: 60 },
+        { width: 50, height: 50 },
+        { width: 60, height: 60, filters: { tint: 'b' } },
+      ],
+    });
+    assert.deepEqual(
+      created.map((p) => [p.sizeKey, p.filters?.tint ?? null]),
+      [
+        ['60x60', null],
+        ['50x50', null],
+        ['60x60', 'b'],
+      ],
+    );
+  });
+
+  for (const { name, svg, limits, width } of [
+    {
+      name: '10×11 at sourcePixels 150',
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="11"><rect width="10" height="11" fill="red"/></svg>',
+      limits: { sourcePixels: 150, inputPixels: 1000 },
+      width: 20,
+    },
+    {
+      name: '10×10 at sourcePixels 213',
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="red"/></svg>',
+      limits: { sourcePixels: 213 },
+      width: 30,
+    },
+  ]) {
+    test(`an SVG whose rounded raster would pass the pixel budget renders within it (${name}), eager and queued`, async () => {
+      const recording = new RecordingDecoder(new SvgDecoder());
+      const rasters: number[] = [];
+      const inner = recording.render.bind(recording);
+      recording.render = async (bytes, box, opts) => {
+        const raster = await inner(bytes, box, opts);
+        rasters.push(raster.info.width * raster.info.height);
+        return raster;
+      };
+      const { deps, appendCalls, media } = decodeDeps(Buffer.from(svg), {
+        config: { limits },
+        decoders: createDecoderSet([recording]),
+        original: { format: 'svg' },
+      });
+      const processor = new Processor(deps);
+      const { created, failed } = await processor.generate({
+        media: media(),
+        sizes: [{ width }],
+      });
+      assert.equal(failed, 0);
+      assert.equal(created.length, 1);
+      await processor.processTask(
+        task({
+          previews: [
+            variant({
+              sizeKey: `${width}w`,
+              requestedWidth: width,
+              requestedHeight: undefined,
+            }),
+          ],
+        }),
+      );
+      assert.equal(appendCalls.length, 2);
+      const budget = Math.min(
+        limits.sourcePixels,
+        (limits as { inputPixels?: number }).inputPixels ?? Infinity,
+      );
+      assert.equal(rasters.length, 2);
+      for (const pixels of rasters) {
+        assert.ok(pixels <= budget, `${pixels} px over the ${budget} budget`);
+      }
+    });
+  }
 
   test('a decoder raster over the pixel budget is refused with RESIZE_SOURCE_TOO_LARGE and the media id', async () => {
     const pdf = new RecordingDecoder(new TestPdfDecoder());

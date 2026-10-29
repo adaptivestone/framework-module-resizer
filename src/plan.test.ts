@@ -8,6 +8,7 @@ import { getPreviewIdentity } from './images.ts';
 import {
   decodeBox,
   framesToDecode,
+  groupBySize,
   type PlanRules,
   planRules,
   planVariants,
@@ -416,4 +417,29 @@ test('the decode box of an empty plan list is the smallest box', () => {
     width: 1,
     height: 1,
   });
+});
+
+test("groupBySize puts each size's variants together, sizes in first-appearance order", () => {
+  const src = info(200, 200);
+  const r = rules({}, { variantSteps: [step] });
+  const plans = planVariants(
+    src,
+    [
+      size(60, undefined),
+      size(50, undefined),
+      size(undefined, 60),
+      size(40, undefined),
+      size(undefined, 50),
+    ],
+    r,
+  );
+  assert.deepEqual(
+    groupBySize(plans).map((p) => p.variant.sizeKey),
+    ['60w', '60h', '50w', '50h', '40w'],
+  );
+  // The input list is left as it is.
+  assert.deepEqual(
+    plans.map((p) => p.variant.sizeKey),
+    ['60w', '50w', '60h', '40w', '50h'],
+  );
 });

@@ -40,8 +40,8 @@ export async function svgNaturalSize(
 
 /**
  * Density for the shared SVG raster, or undefined when the capped raster has a zero-sized
- * side. Uploads check the same baseline as the worker; a larger requested scale only increases
- * the density. Do not raise the density to save a thin side: that can exceed librsvg's side cap.
+ * side. The rendered sides, rounded to whole pixels, fit `pixelBudget`. Uploads check the same
+ * baseline as the worker; a larger requested scale only increases the density. Do not raise the density to save a thin side: that can exceed librsvg's side cap.
  */
 export async function svgRasterDensity(
   svg: Buffer,
@@ -66,7 +66,22 @@ export async function svgRasterDensity(
     ),
     SVG_MAX_SIDE / Math.max(width, height),
   );
-  const density = Math.max(1, Math.min(100_000, Math.floor(72 * scale)));
+  let density = Math.max(1, Math.min(100_000, Math.floor(72 * scale)));
+  // The renderer rounds each side to whole pixels (to the nearest; counted up here, since a
+  // fractional natural size is an estimate), which can take the raster past the budget: step the
+  // density down until the rounded sides fit.
+  const pixelsAt = (d: number) =>
+    Math.max(1, Math.ceil((width * d) / 72)) *
+    Math.max(1, Math.ceil((height * d) / 72));
+  while (density > 1 && pixelsAt(density) > pixelBudget) {
+    density = Math.max(
+      1,
+      Math.min(
+        density - 1,
+        Math.floor(density * Math.sqrt(pixelBudget / pixelsAt(density))),
+      ),
+    );
+  }
   if (density < 72) {
     // Probe the actual header at the reduced density: fractional natural dimensions are only
     // estimates, so arithmetic alone can misclassify a short side at the rounding boundary.
