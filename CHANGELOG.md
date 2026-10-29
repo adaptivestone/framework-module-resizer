@@ -191,9 +191,10 @@ later release that puts the image engine behind a port.
   which a step gets when it resolves with something that is not a one-frame `Raster` (a `Buffer`,
   a Sharp instance, a raster whose `data` length does not match its `info`).
 - **`variantSteps` receive the sized pixels.** They keep their Sharp instance, now over the raw
-  pixels of the preview's exact size: `metadata()` reports the preview, a step's `resize()` resizes
-  the preview, and operations Sharp used to apply before its resize (such as `trim()`) now apply to
-  the preview.
+  pixels of the preview's exact size: `metadata()` reports the preview (with `format: 'raw'`, no
+  EXIF, ICC profile, density or orientation, and `hasAlpha` as the sized pixels have it), a step's
+  `resize()` resizes the preview, and operations Sharp used to apply before its resize (such as
+  `trim()`) now apply to the preview.
 - **Animation needs a pipeline without `beforeSteps`.** With `animated: true`, WebP and GIF
   previews keep an animation's frames only for a pipeline with neither `beforeSteps` nor
   `variantSteps`; `beforeSteps` receive the first frame, and every preview of their pipeline is a
@@ -205,8 +206,10 @@ later release that puts the image engine behind a port.
 - **The worker reads `original.format`** to pick the decoder to try first. A format that no
   decoder lists, or one whose decoder refuses the bytes, is logged as a warning
   (`resize worker: media <id> is stored as '<stored>' but its bytes are '<format>' (<why>);
-  rendering it as '<format>'`) and the bytes are probed through the other decoders, so a record
-  with an alias (`jpg`) or a MIME type still renders. Store the decoder's id (`jpeg`, `png`,
+  rendering it as '<format>'`; when a host decoder lists the stored format, refuses the bytes and
+  a later decoder reads them as that format, `… the first decoder listing '<stored>' refused these
+  bytes, and another decoder read them`) and the bytes are probed through the other decoders, so a
+  record with an alias (`jpg`) or a MIME type still renders. Store the decoder's id (`jpeg`, `png`,
   `svg`, …), as `uploadOriginal()` returns it.
 - **`RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` means "no decoder reads these bytes".** It meant "Sharp
   named no format". It fires when Sharp identifies a format that no decoder lists (a libvips build
@@ -223,10 +226,28 @@ later release that puts the image engine behind a port.
   (upright) sides. The codes are unchanged.
 - **Worker memory and rounding.** With `beforeSteps`, the worker decodes the source at least at
   its own size and holds it as raw pixels plus the step's result: about 2 × width × height × 4
-  bytes, up to about 400 MB at the default `limits.sourcePixels`; an animation holds frames × box ×
-  channels bytes. Size worker containers for `limits.sourcePixels`. Preview sizes are computed from
+  bytes, up to about 400 MB at the default `limits.sourcePixels`; the result is released once the
+  sizes are made from it. Each size is held raw too, up to `concurrency` sizes at once, each up to
+  `limits.resultDimension`² pixels. An animated size holds frames × size pixels × channels bytes,
+  with the frames cut so that frames × the larger of the source's and the size's pixels stays
+  within `min(limits.sourcePixels, limits.inputPixels)`. Size worker containers for
+  `limits.sourcePixels`. Preview sizes are computed from
   the source's display dimensions and rounded once per side, so a preview side can differ by one
   pixel from what Sharp derived before.
+- **Pixel limits.** Pixels the module renders itself are no longer limited by
+  `limits.inputPixels`, which now guards only the bytes a decoder reads: a `variantSteps` box that
+  enlarges a small source renders instead of failing Sharp's input limit. The Sharp decoder
+  inspects the first frame of an animation, so the input limit applies to one frame (a stored
+  animation whose stack exceeds `limits.inputPixels` renders its stills and the frames that fit);
+  `uploadOriginal()` still rejects an original whose width × height × frames exceeds
+  `limits.sourcePixels` (`RESIZE_ORIGINAL_TOO_MANY_PIXELS`). The animation stack is bounded by the
+  pixel budget at the preview's size: a width-only size that enlarges an animation keeps fewer
+  frames. A decoder's raster over `min(limits.sourcePixels, limits.inputPixels)` fails the task
+  with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`). `sharpToRaster` checks
+  the pixels it reads back and refuses a multi-page image resized as one
+  (`RESIZE_PIPELINE_STEP_INVALID`), and so does `rasterToSharp` given a value that is not a
+  `Raster`. A decoder's `ResizeMediaError` (or a subclass of it) keeps its class and `name` when
+  the worker adds the media id.
 - Persisted locators are nested, driver-owned refs: `original.storageRef` and
   `previews[].storageRef` replace the flat `key`/`bucket` fields, and `StorageRef` is now an
   opaque JSON value. No reader or migration for old resize records is included; update host
@@ -723,8 +744,8 @@ later release that puts the image engine behind a port.
   (a signature of the original it was made from: its storage ref and dimensions) and `encodeSig`
   (a signature of its format's encode settings, the sharpen setting of its fit mode, its animation
   settings (for animated formats: `animated`, `limits.animationFrames` and the pixel budget
-  `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames), the
-  result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
+  `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames at the larger of
+  the source's and the preview's size), the result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
   from `generate()`; `resizeMediaSchemaFragment` declares them. The read path does not check them
   yet.
 - `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it to mark the

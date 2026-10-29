@@ -443,9 +443,9 @@ Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFaile
 Pipelines: `beforeSteps` run once on the decoded first frame, as a `Raster` in and a `Raster` out
 (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
 pixels, not a library object, so the engine stays replaceable); `variantSteps` run on each size's
-pixels as a Sharp instance, before encode. An optional pipeline `version` (string) is part of
-each preview row's `encodeSig`: bump it when a step's output changes (stored previews are not
-regenerated yet).
+pixels as a Sharp instance (its `metadata()` reports the preview's size, `format: 'raw'` and no
+EXIF), before encode. An optional pipeline `version` (string) is part of each preview row's
+`encodeSig`: bump it when a step's output changes (stored previews are not regenerated yet).
 
 ```ts
 import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
@@ -473,7 +473,9 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
   wrap Sharp work with `rasterToSharp` / `sharpToRaster`. For a raster source it sees the upright
   original at its own size; for a vector source (SVG) the pixels can be larger, so multiply
   coordinates stored in the source's units by `meta.scale`. A pipeline with `beforeSteps` (or
-  `variantSteps`) renders the first frame of an animation only.
+  `variantSteps`) renders the first frame of an animation only; an animated preview keeps the
+  frames that fit `min(limits.sourcePixels, limits.inputPixels)` at the larger of the source's
+  size and its own.
 - Register every pipeline in `src/resizer.ts`, so the API and the worker both have it
   (`resizer.hasPipeline(name)` checks). An unregistered name (anything but `'default'`) never
   renders: `resolve()` serves only previews already stored for it and queues nothing, `prewarm()`

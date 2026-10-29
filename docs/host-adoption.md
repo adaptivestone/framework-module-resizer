@@ -362,19 +362,28 @@ export default {
   source (SVG) the pixels can be larger, so multiply coordinates stored in the
   source's units by `meta.scale`.
 - `variantSteps` keep their Sharp instance, now over each size's pixels:
-  `metadata()` reports the preview, a step's `resize()` resizes the preview, and
-  operations Sharp used to apply before its resize (such as `trim()`) now apply to
-  the preview. Their raster form waits for a later release.
+  `metadata()` reports the preview (`format: 'raw'`, no EXIF, ICC profile, density
+  or orientation; `hasAlpha` as the sized pixels have it), a step's `resize()`
+  resizes the preview, and operations Sharp used to apply before its resize (such
+  as `trim()`) now apply to the preview. Their raster form waits for a later
+  release.
 - With `animated: true`, an animation keeps its frames only for a pipeline with
   neither `beforeSteps` nor `variantSteps`; `beforeSteps` receive its first frame.
 - With `beforeSteps`, a worker holds the decoded source as raw pixels plus a step's
   result, about 2 × width × height × 4 bytes (up to about 400 MB at the default
-  `limits.sourcePixels`): size worker containers for it.
+  `limits.sourcePixels`): size worker containers for it. Each size is held raw
+  too, up to `concurrency` sizes at once. An animated size holds frames × size
+  pixels × channels bytes, with the frames cut to fit
+  `min(limits.sourcePixels, limits.inputPixels)` at the larger of the source's
+  and the size's pixels.
+- `limits.inputPixels` now guards only the bytes a decoder reads (one frame of an
+  animation), not the pixels the module renders itself.
 - A source that cannot be decoded fails the task (and `generate()`) with the
   decoder's error, or with the retryable `RESIZE_SOURCE_DECODE_FAILED`.
 - New source kinds come as decoders: `new FrameworkResizer({ decoders })` (or
   `new Resizer({ decoders })`) takes `SourceDecoder` objects, asked before the
   built-in Sharp and SVG decoders; pass them in every process (API and worker),
   and add their formats to `upload.formats` (else `uploadOriginal()` throws
-  `RESIZE_ORIGINAL_FORMAT_DISABLED`). See "Decoders" in `README.md`. `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means
-  that no decoder reads the uploaded bytes.
+  `RESIZE_ORIGINAL_FORMAT_DISABLED`). See "Decoders" in `README.md`.
+  `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means that no decoder reads the
+  uploaded bytes.

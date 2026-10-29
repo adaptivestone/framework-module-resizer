@@ -536,7 +536,10 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   limits allow. The core resizes it to each exact size either way, and a raster source smaller
   than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
   its engine can. A raster whose `data` length does not match its `info` is
-  `RESIZE_DECODER_INVALID`.
+  `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
+  `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
+  (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
+  `generate()`, with the media id added, its class and `name` kept.
 - Optionally `verify()`: awaited by `resizer.verify()` and at worker start; throw there when the
   decoder cannot work (e.g. a missing engine).
 
@@ -553,7 +556,10 @@ the bytes are probed through the other decoders:
 resize worker: media <id> is stored as 'jpg' but its bytes are 'jpeg' (no decoder lists the stored format); rendering it as 'jpeg'
 ```
 
-(`its decoder refused the bytes` for the second case). So `original.format` should be the
+(`its decoder refused the bytes` for the second case; when a host decoder lists the stored format,
+refuses the bytes and a later decoder reads them as that same format, the warning says
+`… is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder
+read them`). So `original.format` should be the
 decoder's id: `jpeg`, not `jpg` or `image/jpeg`; fix such a record to silence the warning. When no
 decoder lists the stored format and none reads the bytes, the source fails with the retryable
 `ResizeSetupError` `RESIZE_DECODER_MISSING`: a process without the decoder that record needs (pass
@@ -578,10 +584,10 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
-| `limits.inputPixels` | `268402689` | Sharp decoder limit |
+| `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
 | `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
-| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit `sourcePixels` and `inputPixels` |
+| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -600,14 +606,15 @@ object, because the image engine is replaceable. A Sharp-based step stays one li
 helpers from the main entry:
 
 ```ts
-import {
-  type BeforeStep,
-  rasterToSharp,
-  sharpToRaster,
-} from '@adaptivestone/framework-module-resize';
+import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
 
-const blur: BeforeStep = async (r) => sharpToRaster(rasterToSharp(r).blur(5));
-// pipelines: { photo: { beforeSteps: [blur] } }
+const pipelines = {
+  photo: {
+    beforeSteps: [
+      // async (r) => sharpToRaster(rasterToSharp(r).blur(5)), // e.g. blur plates: a Raster in, a Raster out
+    ],
+  },
+};
 ```
 
 `source` is the decoder's `SourceInfo` for the original. For a raster source the step sees the
@@ -619,8 +626,10 @@ variant is planned from its result. A step that resolves with anything that is n
 fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does `sharpToRaster` given a
 multi-page image. A `variantStep` is `(img, { variant, ctx }) => Sharp` (or a promise of one): it
 runs per variant, after the resize and before the encode, on a Sharp instance over that size's
-pixels, so `metadata()` reports the preview's size, a `resize()` resizes the preview, and
-operations Sharp used to apply before its resize (such as `trim()`) apply to the preview.
+pixels, so `metadata()` reports the preview's size (with `format: 'raw'`, no EXIF, ICC profile,
+density or orientation, and `hasAlpha` as the sized pixels have it), a `resize()` resizes the
+preview, and operations Sharp used to apply before its resize (such as `trim()`) apply to the
+preview.
 
 **Rounding.** Preview sizes are computed from the source's display dimensions and rounded once
 per side, so a preview side can differ by one pixel from what Sharp derived in earlier releases,
@@ -903,10 +912,15 @@ the `cooldownMs` of the task's own Resizer.
   - Completed rows expire after 24 h and dead rows after ~30 days (the `expireAfterSeconds` in
     the model).
 - **Worker memory:** a worker holds the decoded source as raw pixels, decoded once per task at
-  the largest box the requested previews need. An animation holds frames × box × channels bytes.
-  With `beforeSteps` the source is decoded at least at its own size, and the peak is about
-  2 × width × height × 4 bytes (a step's input and its result): up to about 400 MB at the default
-  `limits.sourcePixels` (50,000,000). Size worker containers for `limits.sourcePixels`. The pixel
+  the largest box the requested previews need. Each size is then held raw too, up to
+  `concurrency` sizes at once, each up to `limits.resultDimension`² pixels. An animated size holds
+  frames × size pixels × channels bytes; the frames are cut so that frames × the larger of the
+  source's and the size's pixels stays within the pixel budget
+  `min(limits.sourcePixels, limits.inputPixels)`. With `beforeSteps` the source is decoded at
+  least at its own size, and the peak is about 2 × width × height × 4 bytes (a step's input and
+  its result): up to about 400 MB at the default `limits.sourcePixels` (50,000,000); the step's
+  result is released once the sizes are made from it. Size worker containers for
+  `limits.sourcePixels`. The pixel
   limit after `beforeSteps` (`min(limits.sourcePixels, limits.inputPixels)`) is checked once, on
   the dimensions of the raster the last step returned, so a step that grows the image has already
   allocated it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`,
@@ -944,7 +958,8 @@ await ResizeTask.updateOne(
   its storage ref and dimensions) and `encodeSig` (a signature of its format's encode settings,
   the sharpen setting of its fit mode, its animation settings (for animated formats: `animated`,
   `limits.animationFrames` and the pixel budget `min(limits.sourcePixels, limits.inputPixels)`,
-  which also caps the frames), the result-dimension cap, the fit box (for fit rows) and the
+  which also caps the frames at the larger of the source's and the preview's size), the
+  result-dimension cap, the fit box (for fit rows) and the
   pipeline `version`). The worker and `generate()` record them on every row from `0.3.0-rc.1` on,
   and `resizeMediaSchemaFragment` declares them. The read path does not check them yet. Rows
   written earlier have no `origin` or `encodeSig`: they are served for now, and a later release's

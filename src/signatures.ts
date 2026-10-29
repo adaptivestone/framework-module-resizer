@@ -69,7 +69,8 @@ export function encodeSignature(
         ? {
             animated: config.animated,
             animationFrames: config.limits.animationFrames,
-            // The budget that also caps the frames rendered (src/processor.ts).
+            // The budget that also caps the frames rendered, at the larger of the source's and
+            // the preview's size (framesToDecode in src/plan.ts).
             pixelBudget: Math.min(
               config.limits.sourcePixels,
               config.limits.inputPixels,
