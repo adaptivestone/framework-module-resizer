@@ -8,6 +8,7 @@
 // builds every part from the app's config file.
 import { Catalog } from './catalog.ts';
 import defaultResizeConfig, { defaultCoordination } from './config/resize.ts';
+import type { SourceDecoder } from './contracts/decoder.ts';
 import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
@@ -83,6 +84,7 @@ export interface ResizerOptions {
   // from its config file).
   queueName?: string | (() => string);
   pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
+  decoders?: SourceDecoder[]; // asked before the built-in Sharp and SVG decoders; FrameworkResizer passes it through
   // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
   hooks?: HookTaps;
 }
@@ -277,7 +279,8 @@ export class Resizer {
       this.#loadedParts.add('tasks');
     }
     this.#pipelines = new PipelineRegistry(opts.pipelines);
-    this.#decoders = createDecoderSet();
+    // The host's decoders are checked here (RESIZE_DECODER_INVALID), before the name is registered.
+    this.#decoders = createDecoderSet(opts.decoders);
     this.#hooks = new HookBus({
       logger: this.logger,
       events: opts.events,
@@ -540,7 +543,7 @@ export class Resizer {
    * Optional startup check: load the drivers and resolve and validate the config (see ready());
    * check that a task queue can be used (a lock store beside one without gatesByTask, its timing
    * and the coordination); run the media store's verify() and check it has replacePreviews; run
-   * the lock store's verify(); check the task queue (its own verify(), and that it serves this
+   * the lock store's verify(), then each decoder's optional verify(); check the task queue (its own verify(), and that it serves this
    * Resizer's queueName). Framework hosts call it after `Server.init()` to fail at boot instead of
    * at the first upload or read; it is the one call that rejects for a task queue that cannot be
    * used (the read path degrades instead). The worker runs it for every Resizer before leasing.
@@ -554,6 +557,7 @@ export class Resizer {
     await this.media.verify?.();
     requireReplacePreviews(this.media);
     await this.locks?.verify?.();
+    await this.#decoders.verify();
     if (this.tasks) {
       await this.tasks.verify?.();
       if (this.tasks.servesQueue && !this.tasks.servesQueue(this.queueName)) {

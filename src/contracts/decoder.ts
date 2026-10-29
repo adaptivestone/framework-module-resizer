@@ -60,7 +60,7 @@ export interface Raster {
 
 /** One source kind: the formats it reads, how to measure its bytes and how to render them. */
 export abstract class SourceDecoder {
-  /** The format ids this decoder reads (`original.format` values), e.g. `['pdf']`. */
+  /** The format ids this decoder reads (`original.format` values), e.g. `['svg']`. */
   abstract readonly formats: readonly string[];
 
   /**

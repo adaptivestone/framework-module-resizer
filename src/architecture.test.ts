@@ -164,3 +164,12 @@ test('only the SVG decoder imports the SVG helpers', () => {
     [],
   );
 });
+
+// A new source kind is a decoder the host passes in `decoders`: no shipped file names a format the
+// package does not read. The test-only PDF decoder (testHelpers/pdfDecoder.ts) proves it.
+test('no shipped file names the pdf format', () => {
+  assert.deepEqual(
+    sourceFiles().filter((f) => /['"`]pdf['"`]/.test(read(f))),
+    [],
+  );
+});
