@@ -204,7 +204,8 @@ later release that puts the image engine behind a port.
   error, for example) with the retryable `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED`, the
   original error as its `cause`.
 - **The worker reads `original.format`** to pick the decoder to try first. A format that no
-  decoder lists, or one whose decoder refuses the bytes, is logged as a warning
+  decoder lists, one whose decoder refuses the bytes, or one whose decoder reads them as another of
+  its formats (JPEG bytes stored as `png`) is logged as a warning
   (`resize worker: media <id> is stored as '<stored>' but its bytes are '<format>' (<why>);
   rendering it as '<format>'`; when a host decoder lists the stored format, refuses the bytes and
   a later decoder reads them as that format, `… the first decoder listing '<stored>' refused these
@@ -244,10 +245,10 @@ later release that puts the image engine behind a port.
   pixel budget at the preview's size: a width-only size that enlarges an animation keeps fewer
   frames. A decoder's raster over `min(limits.sourcePixels, limits.inputPixels)` fails the task
   with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`). `sharpToRaster` checks
-  the pixels it reads back and refuses a multi-page image resized as one
+  the pixels it reads back and refuses stacked input frames, whatever size they are resized to
   (`RESIZE_PIPELINE_STEP_INVALID`), and so does `rasterToSharp` given a value that is not a
-  `Raster`. A decoder's `ResizeMediaError` (or a subclass of it) keeps its class and `name` when
-  the worker adds the media id.
+  `Raster`. The worker sets the media id on a decoder's own `ResizeMediaError` (or subclass), so
+  the same object reaches the task and `generate()`; a frozen one is wrapped, with it as `cause`.
 - Persisted locators are nested, driver-owned refs: `original.storageRef` and
   `previews[].storageRef` replace the flat `key`/`bucket` fields, and `StorageRef` is now an
   opaque JSON value. No reader or migration for old resize records is included; update host

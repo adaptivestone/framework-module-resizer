@@ -539,7 +539,9 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
   `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
   (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
-  `generate()`, with the media id added, its class and `name` kept.
+  `generate()`, as the same object with the media id set on it; one that cannot take it (frozen)
+  is wrapped in a plain `ResizeMediaError` with the media id, its code and `retryable`, and itself
+  as `cause`.
 - Optionally `verify()`: awaited by `resizer.verify()` and at worker start; throw there when the
   decoder cannot work (e.g. a missing engine).
 
@@ -550,13 +552,15 @@ accepts the bytes measures them: its `format` is stored as `original.format` and
 `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`; bytes Sharp cannot read at all stay `RESIZE_ORIGINAL_INVALID`.
 In the worker and `generate()`, the stored `original.format` picks the decoder to try first. A
 format that no decoder lists, or one whose decoder refuses the bytes, is logged as a warning, and
-the bytes are probed through the other decoders:
+the bytes are probed through the other decoders; a format whose decoder reads the bytes as another
+of its formats (JPEG bytes stored as `png`) is logged too, and rendered as what it is:
 
 ```text
 resize worker: media <id> is stored as 'jpg' but its bytes are 'jpeg' (no decoder lists the stored format); rendering it as 'jpeg'
 ```
 
-(`its decoder refused the bytes` for the second case; when a host decoder lists the stored format,
+(`its decoder refused the bytes` for the second case, `its decoder read another of its formats`
+for the third; when a host decoder lists the stored format,
 refuses the bytes and a later decoder reads them as that same format, the warning says
 `… is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder
 read them`). So `original.format` should be the
