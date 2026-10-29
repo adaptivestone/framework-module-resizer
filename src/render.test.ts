@@ -3,14 +3,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
-import type { Raster } from './contracts/decoder.ts';
-import type { VariantStep } from './contracts/pipeline.ts';
+import type { Raster, SourceInfo } from './contracts/decoder.ts';
+import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
+import { ResizeSetupError } from './errors.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
+import { rasterToSharp, sharpToRaster } from './raster.ts';
 import {
   type EncodeOptions,
   encodeVariant,
   reduceToBox,
   renderSize,
+  runBeforeSteps,
   SizedRasters,
   straightAlpha,
 } from './render.ts';
@@ -309,4 +312,131 @@ test('SizedRasters renders each size once for the variants that share it, and dr
   const again = sized.get(a.size);
   assert.notEqual(again, first);
   assert.equal((await again).info.width, 10);
+});
+
+/** The meta runBeforeSteps passes on (without the scale it adds per step). */
+function stepMeta(source: Partial<SourceInfo> = {}) {
+  return {
+    media: { id: 'm1' },
+    source: {
+      format: 'png',
+      contentType: 'image/png',
+      width: 40,
+      height: 30,
+      ...source,
+    },
+    ctx: {},
+  };
+}
+
+test('runBeforeSteps hands each step the current raster with its scale, and passes the result on', async () => {
+  const seen: Array<{ width: number; scale: number }> = [];
+  const steps: BeforeStep[] = [
+    async (raster, { scale }) => {
+      seen.push({ width: raster.info.width, scale });
+      return sharpToRaster(
+        rasterToSharp(raster).extract({
+          left: 0,
+          top: 0,
+          width: 10,
+          height: 10,
+        }),
+      );
+    },
+    (raster, { scale }) => {
+      seen.push({ width: raster.info.width, scale });
+      return raster;
+    },
+  ];
+  const result = await runBeforeSteps(
+    solid(40, 20, [10, 20, 30]),
+    steps,
+    stepMeta({ format: 'svg', width: 20, height: 10, vector: true }),
+    limits,
+  );
+  assert.deepEqual(seen, [
+    { width: 40, scale: 2 },
+    { width: 10, scale: 0.5 },
+  ]);
+  assert.equal(result.info.width, 10);
+  assert.equal(result.info.height, 10);
+});
+
+test('runBeforeSteps keeps semi-transparent colours through the helpers', async () => {
+  const result = await runBeforeSteps(
+    solid(40, 30, [100, 50, 200, 128]),
+    [async (r) => sharpToRaster(rasterToSharp(r).resize(20, 15))],
+    stepMeta(),
+    limits,
+  );
+  assert.equal(result.info.width, 20);
+  assertNear(pixelAt(result, 0, 0), [100, 50, 200, 128]);
+  assert.equal(result.info.premultiplied, undefined);
+});
+
+test('a returned raster marked premultiplied is converted to straight alpha', async () => {
+  const result = await runBeforeSteps(
+    solid(40, 30, [10, 20, 30]),
+    [
+      () => {
+        const marked = solid(8, 4, [50, 25, 100, 128]);
+        marked.info.premultiplied = true;
+        return marked;
+      },
+    ],
+    stepMeta(),
+    limits,
+  );
+  assert.equal(result.info.width, 8);
+  assertNear(pixelAt(result, 0, 0), [100, 50, 200, 128]);
+  assert.equal(result.info.premultiplied, undefined);
+});
+
+test('a step result that is not a one-frame Raster is RESIZE_PIPELINE_STEP_INVALID', async () => {
+  const input = solid(4, 2, [10, 20, 30]);
+  const cases: Array<[string, (r: Raster) => unknown]> = [
+    ['a Buffer', (r) => Buffer.from(r.data)],
+    ['undefined', () => undefined],
+    ['a Sharp instance', (r) => rasterToSharp(r)],
+    [
+      'channels 5',
+      (r) => ({
+        data: Buffer.alloc(4 * 2 * 5),
+        info: { ...r.info, channels: 5 },
+      }),
+    ],
+    ['width 0', (r) => ({ data: r.data, info: { ...r.info, width: 0 } })],
+    [
+      'frames 2',
+      (r) => ({
+        data: Buffer.concat([r.data, r.data]),
+        info: { ...r.info, frames: 2 },
+      }),
+    ],
+    [
+      'data one byte short',
+      (r) => ({ data: r.data.subarray(1), info: r.info }),
+    ],
+    [
+      'data a Uint8Array',
+      (r) => ({ data: new Uint8Array(r.data), info: r.info }),
+    ],
+  ];
+  for (const [name, step] of cases) {
+    await assert.rejects(
+      runBeforeSteps(
+        input,
+        [step as unknown as BeforeStep],
+        stepMeta(),
+        limits,
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeSetupError, name);
+        assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID', name);
+        assert.equal(err.retryable, true, name);
+        assert.match(err.message, /beforeStep/, name);
+        return true;
+      },
+    );
+  }
 });

@@ -19,6 +19,7 @@ import {
   fillCoordination,
   type TaskCoordination,
 } from './coordination.ts';
+import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
@@ -174,6 +175,8 @@ export class Resizer {
   readonly #loadingParts = new Map<PartName, Promise<void>>();
   readonly #pipelines: PipelineRegistry;
   readonly #hooks: HookBus;
+  // The decoders that read originals, built once: the Processor renders every task through them.
+  readonly #decoders: DecoderSet;
   #builtServices: Services | undefined;
   // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
   #dispatcher: Dispatcher | undefined;
@@ -274,6 +277,7 @@ export class Resizer {
       this.#loadedParts.add('tasks');
     }
     this.#pipelines = new PipelineRegistry(opts.pipelines);
+    this.#decoders = createDecoderSet();
     this.#hooks = new HookBus({
       logger: this.logger,
       events: opts.events,
@@ -411,6 +415,7 @@ export class Resizer {
           catalog,
           media,
           storage,
+          decoders: this.#decoders,
           pipelines: this.#pipelines,
           hooks: this.#hooks,
           config,
@@ -612,8 +617,9 @@ export class Resizer {
    * Eager mode — generate at upload, within this call. It uses no task queue, worker or locks, so
    * it also works on a Resizer whose task queue cannot be used. Delegates to the
    * Processor (src/processor.ts): resolveSizes waterfall with the caller's REAL ctx → expand
-   * sizes × formats, skipping identities already in media.previews (idempotent) → download once →
-   * beforeSteps once → per-variant resize/encode/upload (bounded by config.concurrency, NO locks).
+   * sizes × formats, skipping identities already in media.previews (idempotent) → download and
+   * decode once → beforeSteps once → one resize per size, then encode/upload per variant (bounded
+   * by config.concurrency, NO locks).
    * `persist !== false` → one media.appendPreviews (+ display-dim backfill); else the previews are
    * returned unstored.
    */

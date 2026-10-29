@@ -202,7 +202,6 @@ test('only the allowed shipped files import sharp', () => {
     'decoders/svg.ts',
     'helpers/svgDimensions.ts',
     'helpers/svgRasterChild.ts',
-    'processor.ts', // until the Processor renders through render.ts
     'raster.ts',
     'render.ts',
     'uploader.ts', // until the Uploader measures through the decoders

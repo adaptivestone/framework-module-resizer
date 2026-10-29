@@ -30,9 +30,11 @@ const EXPECTED_VALUE_EXPORTS = [
   'MediaStore',
   'ResizeStorage',
   'parseSizeKey',
+  'rasterToSharp',
   'SourceDecoder',
   'resetResizerForTests',
   'runWorker',
+  'sharpToRaster',
   'TaskQueue',
 ];
 
@@ -90,6 +92,8 @@ describe('public API surface (src/index.ts)', () => {
       'parseSizeKey',
       'formatPictureUrls',
       'isCatalogCovered',
+      'rasterToSharp',
+      'sharpToRaster',
     ]) {
       assert.equal(
         typeof asRecord[name],

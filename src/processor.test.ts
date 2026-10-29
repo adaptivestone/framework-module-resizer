@@ -15,13 +15,24 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
 import { Catalog } from './catalog.ts';
+import {
+  type DecodeBox,
+  type Raster,
+  type RenderOptions,
+  SourceDecoder,
+  type SourceInfo,
+} from './contracts/decoder.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
-import type { Pipeline } from './contracts/pipeline.ts';
+import type { BeforeStep, Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
+import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
+import { SharpDecoder } from './decoders/sharp.ts';
+import { SvgDecoder } from './decoders/svg.ts';
 import {
   ResizeConfigError,
+  ResizeError,
   ResizeGenerateError,
   ResizeMediaError,
   ResizeNoOriginalError,
@@ -34,6 +45,7 @@ import { HookBus } from './hooks.ts';
 import { getSizeKey, toMissingPreview } from './images.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { Processor, type ProcessorDeps } from './processor.ts';
+import { rasterToSharp, sharpToRaster } from './raster.ts';
 import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
@@ -47,10 +59,13 @@ import {
   makeResizeConfig,
 } from './testHelpers/resizeConfig.ts';
 import type {
+  DeepPartial,
   MediaLike,
   MissingPreview,
   Original,
   Preview,
+  ResizeConfig,
+  ResizeLimits,
   ResizeLogger,
 } from './types.d.ts';
 import { processTask, runWorker } from './worker.ts';
@@ -389,19 +404,87 @@ function countRenders(): () => number {
 
 const silent: ResizeLogger = { info() {}, warn() {}, error() {} };
 
-/** A Processor on a jpeg-only config whose media store loads mediaDoc(). */
-function processorDeps(): ProcessorDeps {
-  const config = makeImageConfig({ formats: ['jpeg'] });
+/**
+ * A Processor on a jpeg-only config (with `config` overrides) whose media store loads mediaDoc(),
+ * on the given decoders (default: the built-in ones) and logger.
+ */
+function processorDeps(
+  opts: {
+    config?: DeepPartial<ResizeConfig>;
+    decoders?: DecoderSet;
+    logger?: ResizeLogger;
+  } = {},
+): ProcessorDeps {
+  const config = makeImageConfig({ formats: ['jpeg'], ...opts.config });
   return {
     catalog: new Catalog({ config }),
     media: fakeMedia({ load: async () => mediaDoc() }),
     storage: makeStorage(redPng).storage,
+    decoders: opts.decoders ?? createDecoderSet(),
     pipelines: new PipelineRegistry(),
     hooks: new HookBus({ logger: silent }),
     config,
-    logger: silent,
+    logger: opts.logger ?? silent,
     name: 'default',
   };
+}
+
+/** A logger that records every call. */
+function recordingLogger(): {
+  logger: ResizeLogger;
+  logs: { info: unknown[][]; warn: unknown[][]; error: unknown[][] };
+} {
+  const logs = {
+    info: [] as unknown[][],
+    warn: [] as unknown[][],
+    error: [] as unknown[][],
+  };
+  const logger: ResizeLogger = {
+    info: (...a: unknown[]) => {
+      logs.info.push(a);
+    },
+    warn: (...a: unknown[]) => {
+      logs.warn.push(a);
+    },
+    error: (...a: unknown[]) => {
+      logs.error.push(a);
+    },
+  };
+  return { logger, logs };
+}
+
+/**
+ * A decoder that wraps a real one: it lists the same formats, records each render box, and can
+ * be told to reject or to return a given raster instead of rendering.
+ */
+class RecordingDecoder extends SourceDecoder {
+  readonly formats: readonly string[];
+  readonly renders: DecodeBox[] = [];
+  rejectWith: unknown;
+  returns: Raster | undefined;
+  readonly #inner: SourceDecoder;
+
+  constructor(inner: SourceDecoder) {
+    super();
+    this.#inner = inner;
+    this.formats = inner.formats;
+  }
+
+  inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
+    return this.#inner.inspect(bytes, limits);
+  }
+
+  async render(
+    bytes: Buffer,
+    box: DecodeBox,
+    opts: RenderOptions,
+  ): Promise<Raster> {
+    this.renders.push(box);
+    if (this.rejectWith !== undefined) {
+      throw this.rejectWith;
+    }
+    return this.returns ?? this.#inner.render(bytes, box, opts);
+  }
 }
 
 describe('Processor', () => {
@@ -489,6 +572,349 @@ describe('Processor', () => {
     assert.ok(processorOf(r) instanceof Processor);
     assert.equal(processorOf(r), processorOf(r));
     assert.equal('processor' in r, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The source goes through the decoder port: decoded once per task, at the largest box needed
+// ---------------------------------------------------------------------------
+
+// 600×400, so the previews below need less than the whole source.
+const png600 = await sharp({
+  create: { width: 600, height: 400, channels: 3, background: '#3366cc' },
+})
+  .png()
+  .toBuffer();
+
+const plainJpeg = await sharp({
+  create: { width: 40, height: 30, channels: 3, background: '#808080' },
+})
+  .jpeg()
+  .toBuffer();
+
+// Three 20×20 frames with their own delays and a loop count.
+const timedGif = await sharp(solidFrames(RGB, 20, 20), {
+  raw: { width: 20, height: 60, channels: 3, pageHeight: 20 },
+})
+  .gif({ delay: [100, 200, 300], loop: 3 })
+  .toBuffer();
+
+describe('decoding the source', () => {
+  /** Deps whose storage serves `fixture` and records uploads, and whose media store records appends. */
+  function decodeDeps(
+    fixture: Buffer,
+    opts: Parameters<typeof processorDeps>[0] & {
+      original?: Partial<Original>;
+      pipeline?: Pipeline;
+    } = {},
+  ) {
+    const deps = processorDeps(opts);
+    const { storage, uploads } = makeStorage(fixture);
+    const { mediaStore, appendCalls } = makeMediaStore(
+      mediaDoc({ original: opts.original }),
+    );
+    deps.storage = storage;
+    deps.media = mediaStore;
+    if (opts.pipeline) {
+      deps.pipelines = new PipelineRegistry({ default: opts.pipeline });
+    }
+    return {
+      deps,
+      uploads,
+      appendCalls,
+      media: () => mediaDoc({ original: opts.original }),
+    };
+  }
+
+  test('the source is decoded once per task, at the largest box the previews need', async () => {
+    const recording = new RecordingDecoder(new SharpDecoder());
+    const { deps, uploads, media } = decodeDeps(png600, {
+      config: { maxSize: { width: 300, height: 200 } },
+      decoders: createDecoderSet([recording]),
+      original: { format: 'png' },
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ fit: true }, { width: 100, height: 100 }, { width: 50 }],
+      formats: ['jpeg', 'webp'],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 6);
+    assert.deepEqual(recording.renders, [{ width: 300, height: 200 }]);
+    assert.equal(uploads.length, 6);
+  });
+
+  test('a decoder whose render rejects fails the task before any upload, with its code, retryable and media id', async () => {
+    const recording = new RecordingDecoder(new SharpDecoder());
+    recording.rejectWith = new ResizeMediaError('test: render refused', {
+      code: 'TEST_RENDER',
+      retryable: false,
+    });
+    const { deps, uploads, appendCalls, media } = decodeDeps(redPng, {
+      decoders: createDecoderSet([recording]),
+    });
+    const isRenderError = (err: unknown) => {
+      assert.ok(ResizeError.isResizeError(err));
+      assert.equal(err.code, 'TEST_RENDER');
+      assert.equal(err.retryable, false);
+      assert.equal((err as ResizeMediaError).mediaId, 'm1');
+      assert.match(err.message, /test: render refused \(media m1\)/);
+      return true;
+    };
+    const processor = new Processor(deps);
+    await assert.rejects(
+      processor.processTask(task({ previews: [variant()] })),
+      isRenderError,
+    );
+    await assert.rejects(
+      processor.generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      isRenderError,
+    );
+    assert.equal(uploads.length, 0);
+    assert.equal(appendCalls.length, 0);
+  });
+
+  test('a source Sharp cannot decode fails with RESIZE_SOURCE_DECODE_FAILED, retryable, with the media id and the cause', async () => {
+    const { deps, uploads, media } = decodeDeps(Buffer.from('not an image'), {
+      original: { format: 'jpeg' },
+    });
+    const isDecodeFailure = (err: unknown) => {
+      assert.ok(err instanceof ResizeMediaError);
+      assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED');
+      assert.equal(err.retryable, true);
+      assert.equal(err.mediaId, 'm1');
+      assert.ok(err.cause instanceof Error);
+      assert.match(
+        err.message,
+        /^resize: decoding the source failed for media m1: /,
+      );
+      return true;
+    };
+    const processor = new Processor(deps);
+    await assert.rejects(
+      processor.processTask(task({ previews: [variant()] })),
+      isDecodeFailure,
+    );
+    await assert.rejects(
+      processor.generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      isDecodeFailure,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('a stored png original holding SVG markup is rendered by the SVG decoder in its child process', async () => {
+    const recordingSharp = new RecordingDecoder(new SharpDecoder());
+    const recordingSvg = new RecordingDecoder(new SvgDecoder());
+    const { logger, logs } = recordingLogger();
+    const renders = countRenders();
+    const { deps, uploads } = decodeDeps(smallSvg, {
+      decoders: createDecoderSet([recordingSharp, recordingSvg]),
+      logger,
+      original: { format: 'png' },
+    });
+    await new Processor(deps).processTask(
+      task({ previews: [variant(), fitVariant] }),
+    );
+    assert.equal(recordingSharp.renders.length, 0);
+    assert.equal(recordingSvg.renders.length, 1);
+    assert.equal(renders(), 1);
+    assert.equal(uploads.length, 2);
+    assert.equal(logs.warn.length, 1);
+    assert.match(String(logs.warn[0][0]), /stored as 'png'.*bytes are 'svg'/);
+  });
+
+  test('an original stored under an alias renders, with one warning', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, uploads, media } = decodeDeps(plainJpeg, {
+      logger,
+      original: { format: 'jpg' },
+    });
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.equal(created.length, 1);
+    assert.equal(uploads.length, 1);
+    assert.equal(logs.warn.length, 1);
+    assert.match(
+      String(logs.warn[0][0]),
+      /stored as 'jpg' but its bytes are 'jpeg' \(no decoder lists the stored format\); rendering it as 'jpeg'/,
+    );
+  });
+
+  test('a decoder raster marked premultiplied is encoded with straight colours', async () => {
+    const source = await sharp({
+      create: {
+        width: 8,
+        height: 4,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0.5 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const pixels = Buffer.alloc(8 * 4 * 4);
+    for (let i = 0; i < 8 * 4; i++) {
+      pixels.set([50, 25, 100, 128], i * 4);
+    }
+    const recording = new RecordingDecoder(new SharpDecoder());
+    recording.returns = {
+      data: pixels,
+      info: { width: 8, height: 4, channels: 4, premultiplied: true },
+    };
+    const { deps, uploads, media } = decodeDeps(source, {
+      config: { formats: ['png'], encode: { formats: { png: {} } } },
+      decoders: createDecoderSet([recording]),
+    });
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ fit: true }],
+      formats: ['png'],
+    });
+    assert.equal(uploads.length, 1);
+    const { data } = await sharp(uploads[0].body)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const expected = [100, 50, 200, 128];
+    for (let i = 0; i < 4; i++) {
+      assert.ok(
+        Math.abs(data[i] - expected[i]) <= 2,
+        `${[...data.subarray(0, 4)]} is not within ±2 of ${expected}`,
+      );
+    }
+  });
+
+  test('the SVG raster follows the capped size, not the requested one', async () => {
+    const recording = new RecordingDecoder(new SvgDecoder());
+    const { deps, media } = decodeDeps(
+      Buffer.from(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red"/></svg>',
+      ),
+      {
+        config: { limits: { resultDimension: 500 } },
+        decoders: createDecoderSet([recording]),
+        original: { format: 'svg' },
+      },
+    );
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 900, height: 900 }],
+    });
+    assert.deepEqual(recording.renders, [{ width: 500, height: 500 }]);
+    assert.deepEqual(
+      [created[0].actualWidth, created[0].actualHeight],
+      [500, 500],
+    );
+  });
+
+  test('an animated GIF keeps its frame delays and loop count in WebP and GIF previews', async () => {
+    const { deps, uploads, media } = decodeDeps(timedGif, {
+      config: { animated: true, encode: { formats: { gif: {} } } },
+    });
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+      formats: ['webp', 'gif'],
+    });
+    assert.equal(uploads.length, 2);
+    for (const upload of uploads) {
+      const meta = await sharp(upload.body, { animated: true }).metadata();
+      assert.equal(meta.pages, 3, upload.contentType);
+      assert.deepEqual(meta.delay, [100, 200, 300], upload.contentType);
+      assert.equal(meta.loop, 3, upload.contentType);
+    }
+  });
+
+  test('with beforeSteps an animation renders from its first frame', async () => {
+    const { deps, uploads, media } = decodeDeps(timedGif, {
+      config: { animated: true },
+      pipeline: { beforeSteps: [(r) => r] },
+    });
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+      formats: ['webp'],
+    });
+    assert.equal(uploads.length, 1);
+    const meta = await sharp(uploads[0].body, { animated: true }).metadata();
+    assert.equal(meta.pages ?? 1, 1);
+  });
+
+  test('a beforeStep that returns a different size re-plans every variant from it', async () => {
+    const { deps, media } = decodeDeps(redPng, {
+      pipeline: {
+        beforeSteps: [
+          async (r) => sharpToRaster(rasterToSharp(r).resize(32, 24)),
+        ],
+      },
+    });
+    const { created } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ fit: true }, { width: 300, height: 300 }],
+    });
+    const dims = Object.fromEntries(
+      created.map((p) => [p.sizeKey, `${p.actualWidth}x${p.actualHeight}`]),
+    );
+    assert.deepEqual(dims, { fit: '32x24', '300x300': '32x24' });
+  });
+
+  test('a beforeStep that resolves with anything but a one-frame Raster is RESIZE_PIPELINE_STEP_INVALID', async () => {
+    const cases: Array<[string, (r: Raster) => unknown]> = [
+      ['a Buffer', async (r) => rasterToSharp(r).png().toBuffer()],
+      ['a Sharp instance', (r) => rasterToSharp(r)],
+      [
+        'a two-frame raster',
+        ({ info: { width: w, height: h } }) => ({
+          data: Buffer.alloc(w * h * 3 * 2),
+          info: { width: w, height: h, channels: 3, frames: 2 },
+        }),
+      ],
+      [
+        'a wrong data length',
+        (r) => ({ data: r.data.subarray(1), info: r.info }),
+      ],
+    ];
+    for (const [name, step] of cases) {
+      const { deps, uploads, media } = decodeDeps(redPng, {
+        pipeline: { beforeSteps: [step as unknown as BeforeStep] },
+      });
+      await assert.rejects(
+        new Processor(deps).generate({
+          media: media(),
+          sizes: [{ width: 20, height: 20 }],
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof ResizeSetupError, name);
+          assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID', name);
+          assert.equal(err.retryable, true, name);
+          return true;
+        },
+      );
+      assert.equal(uploads.length, 0, name);
+    }
+  });
+
+  test('an old Buffer-style beforeStep fails inside its own sharp() call', async () => {
+    const oldStep = async (buf: Buffer) => sharp(buf).blur(5).toBuffer();
+    const { deps, uploads } = decodeDeps(redPng, {
+      pipeline: { beforeSteps: [oldStep as unknown as BeforeStep] },
+    });
+    await assert.rejects(
+      new Processor(deps).processTask(task({ previews: [variant()] })),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /Input file is missing/);
+        assert.equal(ResizeError.isResizeError(err), false);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
   });
 });
 
@@ -622,7 +1048,9 @@ describe('processTask — source handling', () => {
       storage,
       media: mediaStore,
       locks: makeLocks().locks,
-      pipelines: { default: { beforeSteps: [async () => grown] } },
+      pipelines: {
+        default: { beforeSteps: [async () => sharpToRaster(sharp(grown))] },
+      },
     });
     await assert.rejects(
       () => processTask(task({ previews: [variant()] })),
@@ -659,14 +1087,17 @@ describe('processTask — source handling', () => {
     installApp();
     const { storage } = makeStorage(orientedJpeg);
     let calls = 0;
-    const seenDims: Array<{ w?: number; h?: number }> = [];
+    const seenDims: Array<{ w: number; h: number; scale: number }> = [];
     const pipeline: Pipeline = {
       beforeSteps: [
-        async (buf) => {
+        (raster, { scale }) => {
           calls += 1;
-          const m = await sharp(buf).metadata();
-          seenDims.push({ w: m.width, h: m.height });
-          return buf;
+          seenDims.push({
+            w: raster.info.width,
+            h: raster.info.height,
+            scale,
+          });
+          return raster;
         },
       ],
     };
@@ -679,16 +1110,15 @@ describe('processTask — source handling', () => {
     });
     await processTask(task({ previews: [variant()] }));
     assert.equal(calls, 1);
-    assert.deepEqual(seenDims, [{ w: 48, h: 64 }]); // swapped → display orientation
+    assert.deepEqual(seenDims, [{ w: 48, h: 64, scale: 1 }]); // swapped → display orientation
   });
 
-  test('a beforeStep that round-trips sharp().toBuffer() keeps final orientation', async () => {
+  test('a beforeStep through the Sharp helpers keeps the final orientation', async () => {
     installApp();
     const { storage, uploads } = makeStorage(orientedJpeg);
     const pipeline: Pipeline = {
-      // NO .rotate() here — the EXIF-strip hazard: only safe because orientation is normalized
-      // ONCE before beforeSteps, so the pixels are already display-oriented + EXIF-free.
-      beforeSteps: [async (buf) => sharp(buf).toBuffer()],
+      // NO .rotate() here: the raster a step receives is already upright and carries no EXIF.
+      beforeSteps: [async (r) => sharpToRaster(rasterToSharp(r))],
     };
     const { mediaStore } = makeMediaStore(mediaDoc());
     new FrameworkResizer({
@@ -1727,9 +2157,9 @@ describe('generate (eager)', () => {
     let variantMarker: unknown;
     const pipeline: Pipeline = {
       beforeSteps: [
-        async (buf, { ctx }) => {
+        async (raster, { ctx }) => {
           beforeMarker = ctx.marker;
-          return buf;
+          return raster;
         },
       ],
       variantSteps: [
@@ -2295,7 +2725,11 @@ describe('unconfigured formats', () => {
 describe('EXIF orientation quality', () => {
   const sizes = [{ width: 100, height: 120 }, { fit: true }, { width: 100 }];
 
-  /** Generate PNG (lossless) previews and score each against a rotate-first reference. */
+  /**
+   * Generate PNG (lossless) previews and score each against a full-decode reference: the upright
+   * source decoded at its own size, then resized as the plan does (cover for 100x120, fill for
+   * fit and 100w, sharpened except fit) to the preview's size.
+   */
   async function score(source: Buffer, pipeline?: Pipeline) {
     resetResizerForTests();
     resetAppInstance();
@@ -2312,33 +2746,35 @@ describe('EXIF orientation quality', () => {
       sizes,
       formats: ['png'],
     });
+    const full = await sharp(source)
+      .rotate()
+      .toColorspace('srgb')
+      .raw()
+      .toBuffer({ resolveWithObject: true });
     const scores = new Map<string, { dims: string; psnr: number }>();
     for (const preview of created) {
       const body = uploads.find(
         (u) => u.key === (preview.storageRef as { key: string }).key,
       )?.body as Buffer;
-      const reference = await (preview.fit
-        ? sharp(source)
-            .rotate()
-            .resize(2000, 1200, { fit: 'inside', withoutEnlargement: true })
-            .toColorspace('srgb')
-        : sharp(source)
-            .rotate()
-            .resize(preview.requestedWidth, preview.requestedHeight, {
-              fit: 'cover',
-              position: 'center',
-            })
-            .toColorspace('srgb')
-            .sharpen()
-      )
-        .png()
-        .toBuffer();
       const out = await sharp(body).metadata();
-      const ref = await sharp(reference).metadata();
-      assert.deepEqual([out.width, out.height], [ref.width, ref.height]);
+      let reference = sharp(full.data, {
+        raw: {
+          width: full.info.width,
+          height: full.info.height,
+          channels: full.info.channels,
+        },
+      })
+        .resize(out.width, out.height, {
+          fit: preview.sizeKey === '100x120' ? 'cover' : 'fill',
+          position: 'center',
+        })
+        .toColorspace('srgb');
+      if (!preview.fit) {
+        reference = reference.sharpen();
+      }
       scores.set(preview.sizeKey, {
         dims: `${out.width}x${out.height}`,
-        psnr: await psnr(body, reference),
+        psnr: await psnr(body, await reference.png().toBuffer()),
       });
     }
     return scores;
@@ -2351,24 +2787,27 @@ describe('EXIF orientation quality', () => {
       [...rotated].map(([key, s]) => `${key}=${s.dims}`).sort(),
       ['100w=100x150', '100x120=100x120', 'fit=200x300'],
     );
-    for (const [key, { psnr: db }] of rotated) {
-      assert.ok(db >= 50, `${key}: ${db.toFixed(2)} dB vs rotate-first`);
-      const baseline = upright.get(key)?.psnr ?? 0;
-      assert.ok(
-        db >= baseline - 0.5,
-        `${key}: ${db.toFixed(2)} dB vs orientation-1 ${baseline.toFixed(2)} dB`,
-      );
+    for (const [orientation, scores] of [
+      [6, rotated],
+      [1, upright],
+    ] as const) {
+      assert.equal(scores.size, 3);
+      for (const [key, { psnr: db }] of scores) {
+        assert.ok(
+          db >= 50,
+          `orientation ${orientation}, ${key}: ${db.toFixed(2)} dB vs the full decode`,
+        );
+      }
     }
   });
 
-  test('orientation 6 with beforeSteps: normalised first, without visible loss', async () => {
+  test('orientation 6 with beforeSteps: the steps see upright pixels and nothing is re-encoded', async () => {
     let seen: { width?: number; height?: number } = {};
     const scores = await score(await texturedJpeg(6), {
       beforeSteps: [
-        async (buf) => {
-          const meta = await sharp(buf).metadata();
-          seen = { width: meta.width, height: meta.height };
-          return buf;
+        (raster) => {
+          seen = { width: raster.info.width, height: raster.info.height };
+          return raster;
         },
       ],
     });
@@ -2376,49 +2815,8 @@ describe('EXIF orientation quality', () => {
     assert.equal(scores.size, 3);
     for (const [key, { psnr: db }] of scores) {
       // A default-quality JPEG round trip of this texture scores about 35 dB.
-      assert.ok(db >= 45, `${key}: ${db.toFixed(2)} dB vs rotate-first`);
+      assert.ok(db >= 50, `${key}: ${db.toFixed(2)} dB vs the full decode`);
     }
-  });
-
-  test('an oriented WebP with beforeSteps is normalised with a fast lossy encode', async () => {
-    // Lossless WebP of a large photo takes seconds and tens of MB; quality 95 is enough for
-    // an intermediate.
-    const source = await sharp(texture(300, 200), {
-      raw: { width: 300, height: 200, channels: 3 },
-    })
-      .webp({ quality: 95 })
-      .withMetadata({ orientation: 6 })
-      .toBuffer();
-    let chunk = '';
-    let seen: { width?: number; height?: number } = {};
-    installApp({ encode: { formats: { png: {} } } });
-    const { storage } = makeStorage(source);
-    const { mediaStore } = makeMediaStore(null);
-    const r = new FrameworkResizer({
-      storage,
-      media: mediaStore,
-      pipelines: {
-        default: {
-          beforeSteps: [
-            async (buf) => {
-              // Simple-format WebP: the first chunk names the codec (VP8 lossy, VP8L lossless).
-              chunk = Buffer.from(buf).toString('ascii', 12, 16);
-              const meta = await sharp(buf).metadata();
-              seen = { width: meta.width, height: meta.height };
-              return buf;
-            },
-          ],
-        },
-      },
-    });
-    const { created } = await r.generate({
-      media: mediaDoc(),
-      sizes: [{ width: 100 }],
-      formats: ['png'],
-    });
-    assert.equal(chunk, 'VP8 ');
-    assert.deepEqual(seen, { width: 200, height: 300 });
-    assert.equal(created[0].actualHeight, 150);
   });
 });
 
@@ -2812,7 +3210,7 @@ describe('SVG rendering', () => {
   const isRed = ([r, g, b]: number[]) => r > 200 && g < 60 && b < 60;
   const isBlue = ([r, g, b]: number[]) => b > 200 && r < 60 && g < 60;
 
-  test('beforeSteps receive the rendered PNG: one render, and a large size stays sharp', async () => {
+  test('beforeSteps receive the rendered SVG pixels: one render, and a large size stays sharp', async () => {
     installApp({ encode: { formats: { png: {} } } });
     const renders = countRenders();
     // Left half red, right half blue. A 2000 px preview upscaled from the 20×10 natural size
@@ -2823,21 +3221,27 @@ describe('SVG rendering', () => {
       ),
     );
     const { mediaStore } = makeMediaStore(null);
-    const seen: Array<{ head: string; format?: string; width?: number }> = [];
+    const seen: Array<{
+      width: number;
+      channels: number;
+      sourceFormat: string;
+      scale: number;
+    }> = [];
     const r = new FrameworkResizer({
       storage,
       media: mediaStore,
       pipelines: {
         default: {
           beforeSteps: [
-            async (buf, { metadata }) => {
+            // The step gets pixels, never SVG markup it could render in-process.
+            (raster, { source, scale }) => {
               seen.push({
-                head: Buffer.from(buf).subarray(0, 8).toString('latin1'),
-                format: metadata.format,
-                width: metadata.width,
+                width: raster.info.width,
+                channels: raster.info.channels,
+                sourceFormat: source.format,
+                scale,
               });
-              // A step that decodes: it must get pixels, not SVG markup to render in-process.
-              return sharp(buf).toBuffer();
+              return raster;
             },
           ],
         },
@@ -2850,10 +3254,9 @@ describe('SVG rendering', () => {
     });
     assert.equal(failed, 0);
     assert.equal(renders(), 1);
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0].head, '\x89PNG\r\n\x1a\n');
-    assert.equal(seen[0].format, 'png');
-    assert.equal(seen[0].width, 2000);
+    assert.deepEqual(seen, [
+      { width: 2000, channels: 4, sourceFormat: 'svg', scale: 100 },
+    ]);
     assert.deepEqual(
       [created[0].actualWidth, created[0].actualHeight],
       [2000, 1000],
@@ -4088,6 +4491,7 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
           },
         }),
       storage,
+      decoders: createDecoderSet(),
       pipelines: over.pipelines ?? new PipelineRegistry(),
       hooks: new HookBus({ logger: silent }),
       config,

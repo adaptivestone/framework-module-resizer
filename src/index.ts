@@ -69,6 +69,9 @@ export {
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
+// --- the Raster helpers: a Sharp-based beforeStep wraps the raster it receives and reads its
+// result back (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))`) ---
+export { rasterToSharp, sharpToRaster } from './raster.ts';
 // --- core: the Resizer + named lookup (constructor-wired; one per name) ---
 // `resetResizerForTests` is a TEST-ONLY escape hatch for host test suites.
 export type { ResizerOptions } from './resizer.ts';

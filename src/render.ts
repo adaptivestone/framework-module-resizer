@@ -1,15 +1,21 @@
 // The Sharp work on decoded rasters, with no port: straight alpha once on the decoded raster, the
-// box reduction after beforeSteps, one render per exact size, and the encode of each format from
-// it. Every function but `straightAlpha` takes a straight-alpha raster: the Processor converts a
-// premultiplied one first, so nothing here forwards a premultiplied flag.
+// beforeSteps chain, the box reduction after it, one render per exact size, and the encode of each
+// format from it. Every function but `straightAlpha` takes a straight-alpha raster: the Processor
+// converts a premultiplied one first, and so does `runBeforeSteps` for a step's result, so nothing
+// here forwards a premultiplied flag.
 import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
-import type { DecodeBox, Raster, RasterInfo } from './contracts/decoder.ts';
-import type { VariantStep } from './contracts/pipeline.ts';
-import { ResizeMediaError } from './errors.ts';
+import type {
+  DecodeBox,
+  Raster,
+  RasterInfo,
+  SourceInfo,
+} from './contracts/decoder.ts';
+import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
+import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
-import { rasterInput, readRaster } from './raster.ts';
-import type { ResizeConfig, ResizeLimits } from './types.d.ts';
+import { rasterInput, rasterProblem, readRaster } from './raster.ts';
+import type { MediaLike, ResizeConfig, ResizeLimits } from './types.d.ts';
 
 const timeout = (limits: ResizeLimits) => ({
   seconds: limits.processingTimeoutSeconds,
@@ -49,6 +55,62 @@ export function firstFrame(raster: Raster): Raster {
     info.premultiplied = true;
   }
   return { data: raster.data.subarray(0, width * height * channels), info };
+}
+
+export interface BeforeStepMeta {
+  media: MediaLike;
+  source: SourceInfo;
+  ctx: Record<string, unknown>;
+}
+
+/** What a beforeStep resolved with, as a one-frame Raster, or a step error naming the problem. */
+function stepResult(value: unknown): Raster {
+  const frames = (value as { info?: RasterInfo } | null)?.info?.frames;
+  const problem =
+    rasterProblem(value) ??
+    (frames !== undefined && frames !== 1
+      ? `\`info.frames\` is ${frames}, not 1`
+      : undefined);
+  if (problem !== undefined) {
+    throw new ResizeSetupError(
+      `resize: a beforeStep resolved with something that is not a one-frame Raster: ${problem} — a beforeStep receives and returns a Raster ({ data, info }); rasterToSharp / sharpToRaster wrap a Sharp step`,
+      { code: 'RESIZE_PIPELINE_STEP_INVALID' },
+    );
+  }
+  return value as Raster;
+}
+
+/**
+ * The pipeline's beforeSteps, in order, from the raster's first frame. Each step gets the current
+ * raster and `scale` (its width over the source's); what it resolves with must be a one-frame
+ * Raster, converted to straight alpha when marked premultiplied, and replaces the current one.
+ * Not async itself: the raster is handed to the chain, so this frame keeps no reference to it.
+ */
+export function runBeforeSteps(
+  raster: Raster,
+  steps: readonly BeforeStep[],
+  meta: BeforeStepMeta,
+  limits: ResizeLimits,
+): Promise<Raster> {
+  return stepChain(firstFrame(raster), steps, meta, limits);
+}
+
+/**
+ * Holds only the current raster, in its one binding: a step's input is dropped as soon as the step
+ * resolves (unless the step keeps it), so the peak is one step's input and its output.
+ */
+async function stepChain(
+  raster: Raster,
+  steps: readonly BeforeStep[],
+  meta: BeforeStepMeta,
+  limits: ResizeLimits,
+): Promise<Raster> {
+  for (const step of steps) {
+    const scale = raster.info.width / meta.source.width;
+    raster = stepResult(await step(raster, { ...meta, scale }));
+    raster = await straightAlpha(raster, limits);
+  }
+  return raster;
 }
 
 /**

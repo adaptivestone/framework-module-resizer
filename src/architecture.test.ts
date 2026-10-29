@@ -130,3 +130,16 @@ test('lock settings are validated only in the core', () => {
     [],
   );
 });
+
+// The Processor renders through the decoder port and the plan: the single Sharp path that rendered
+// every variant is gone, and no source kind gets a branch of its own.
+test('generatePreviews is gone', () => {
+  assert.deepEqual(
+    sourceFiles().filter((f) => read(f).includes('generatePreviews')),
+    [],
+  );
+});
+
+test('the Processor has no SVG branch', () => {
+  assert.equal(read('processor.ts').includes("'svg'"), false);
+});
