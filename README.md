@@ -295,14 +295,64 @@ Resizers that `src/resizer.ts` constructs.
 
 | Import | Contents |
 |---|---|
-| `@adaptivestone/framework-module-resize` | `Resizer`, `createResizer`, `getResizer`, `resetResizerForTests`, `runWorker`, `RoutingTaskQueue`, `carrierOf`, the contracts (`ResizeStorage`, `MediaStore`, `LockStore`, `TaskQueue`, `SourceDecoder`, `ResizeMetrics`), the metrics sinks `LogMetrics` and `NoopMetrics`, helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `rasterToSharp`, `sharpToRaster`), errors, types (among them `InvalidateOpts`, `ReplacedPreviews`, the metrics types `MetricLabels`, `MetricContext`, `LogMetricsOptions`, the queue entry types `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`, the decoder types `SourceInfo`, `Raster`, `RasterInfo`, `DecodeBox`, `RenderOptions`, `ResizeLimits`, the factory types `ResizerConfig`, `CreateResizerOptions`, `ResizerSections`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`, `MongoDatabaseConfig`, `PartialFrameworkResizeConfig`, the driver types `DriverRegistry`, `DriverContext`, `StorageDriver`, `DatabaseDriver`, `DatabaseParts`, `QueueDriver`, `QueueDriverContext`, `QueueEntry`, `QueueSection`, and the routing types `Route`, `RoutingTaskQueueOptions`) |
+| `@adaptivestone/framework-module-resize` | The core; every name is listed below |
 | `…/config/resize.js` | The framework-free core defaults: the default core config (default export), `defaultQueueOptions`, `defaultCoordination` |
-| `…/drivers/fs.js` | `LocalFsStorage` (the `'local'` storage driver) |
-| `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) |
-| `…/drivers/mongo.js` | `mongoParts`, `MongoDatabase` (the `'mongo'` database driver), `MongoMediaStore`, `MongoLockStore`, `MongoTaskQueue`, `createResizeModels`, the schemas, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
-| `…/drivers/sqs.js` | `SqsTaskQueue` (the `'sqs'` queue driver) |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig` (and their deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`), `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported). `FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every config type |
-| `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim |
+| `…/drivers/fs.js` | `LocalFsStorage` (the `'local'` storage driver) and its options type `LocalFsStorageOptions` |
+| `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) and its options type `S3StorageOptions` |
+| `…/drivers/mongo.js` | `mongoParts` (and its types `MongoParts`, `MongoPartsOptions`), `MongoDatabase` (the `'mongo'` database driver), `MongoMediaStore` (and `MongoMediaModel`, `MongoMediaStoreOptions`, `MongoMediaUpdateOptions`), `MongoLockStore` (and `MongoLockModel`, `MongoLockStoreOptions`), `MongoTaskQueue` (and `MongoTaskQueueOptions`), `createResizeModels` (and `CreateResizeModelsOptions`), the schemas `resizeTaskFields`, `resizeTaskIndexes`, `resizeLockFields`, `resizeLockIndexes` and `resizeSchemaOptions`, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
+| `…/drivers/sqs.js` | `SqsTaskQueue` (the `'sqs'` queue driver) and its options type `SqsTaskQueueOptions` |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig` (and their deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`), `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported) |
+| `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim, and its document type `TResizeTask` |
+| `…/package.json` | The package manifest (a JSON module, default export only; import it `with { type: 'json' }`), for tools that read the installed version |
+
+**The main entry** exports:
+- the Resizer and its registry: `Resizer` (its options `ResizerOptions`), `getResizer`, and the
+  test-only `resetResizerForTests`;
+- `createResizer`, which builds a Resizer from one config, and its types `ResizerConfig` and
+  `CreateResizerOptions`;
+- `runWorker`, the framework-free worker, and its options `RunWorkerOptions`;
+- routing: `RoutingTaskQueue` (each queue name goes to the backend that carries it), `carrierOf`,
+  and the types `Route` and `RoutingTaskQueueOptions`;
+- the contracts a driver extends, with their types: `ResizeStorage` (`StorageUploadArgs`),
+  `MediaStore` (`ReplacedPreviews`), `LockStore`, and `TaskQueue` (`NewTask`, `TaskAddResult`,
+  `ClaimOptions`, `ClaimedTask`, `LeasedTask`, `FailOptions`, `TaskEvent`, `TaskEventHandler`);
+- the decoder contract `SourceDecoder` and the decoder types `SourceInfo`, `Raster`, `RasterInfo`,
+  `DecodeBox`, `RenderOptions`;
+- metrics: the contract `ResizeMetrics`, the sinks `LogMetrics` (its options `LogMetricsOptions`)
+  and `NoopMetrics`, and the types `MetricLabels` and `MetricContext`;
+- the errors: `ResizeError`, `ResizeConfigError`, `ResizeSetupError`, `ResizeMediaError`,
+  `ResizeNoOriginalError`, `ResizeOriginalError`, `ResizeGenerateError`, `ResizeStorageError`,
+  `ResizeSecurityError`, and their options `ResizeErrorOptions`;
+- the helpers: `formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`,
+  `rasterToSharp`, `sharpToRaster`;
+- the hook and pipeline types: `HookName`, `HookFn`, `HookSignatures`, `HookTaps`, `WaterfallName`,
+  `ObserverName`, `Pipeline`, `BeforeStep`, `VariantStep`;
+- the driver-factory types (how a config section becomes a part): `DriverRegistry`,
+  `DriverContext`, `StorageDriver`, `DatabaseDriver`, `DatabaseParts`, `QueueDriver`,
+  `QueueDriverContext`, `QueueEntry`, `QueueSection`;
+- the data shapes and options (`src/types.d.ts`):
+  - the Resizer calls: for `resolve()`, `ResolveOpts`, `SizeInput`, `ReadDecision`, `ReadyEntry`
+    and `MissingPreview`; for `prewarm()`, `PrewarmOpts`, `PrewarmResult`, `PrewarmStatus`,
+    `EnqueueReceipt` and `EnqueueIssue`; for `generate()`, `GenerateOpts` and `GenerateResult`;
+    for `invalidate()`, `InvalidateOpts`; for `uploadOriginal()`, `UploadOriginalOpts`; and
+    `PictureUrls`, what `formatPictureUrls` makes of a decision;
+  - the media and preview shapes: `MediaLike`, `Original`, `OriginalFormat`, `Preview`,
+    `PreviewFormat`, `PreviewScope`, `Filters`, `StorageRef`;
+  - the config sections: the image settings `ResizeConfig` and `ResizeLimits`, and `DeepPartial`
+    for overrides; storage `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`; database
+    `MongoDatabaseConfig`; coordination `CoordinationOptions`; worker `FrameworkWorkerConfig`; the
+    framework config `FrameworkResizeConfig` and `PartialFrameworkResizeConfig`; and the sections
+    that registered drivers add, `ResizerSections`, `StorageSectionOf`, `DatabaseSectionOf`,
+    `QueueSectionOf`;
+  - the queue entries and timing: `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`,
+    `QueueTimingOptions`;
+  - the logger, the event bus and a part built on first use: `ResizeLogger`, `ResizeEventBus`,
+    `LazyPart`;
+  - the deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
+    `FrameworkS3StorageConfig`, each the same type under its core name.
+
+`FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every
+config type; `…/framework.js` re-exports only the config types its row names.
 
 ## Drivers
 
