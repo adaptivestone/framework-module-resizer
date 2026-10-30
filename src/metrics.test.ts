@@ -110,7 +110,7 @@ describe('LogMetrics', () => {
     metrics.timing('resize.claim', 30, { ...r, queue: 'default' });
     mock.timers.tick(60_000);
     assert.deepEqual(infoLines(logger), [
-      "resize: Resizer 'default' over 60 s: reads 6 (ready 3, enqueued 1, in-flight 2), stale previews served 2, uploads 3 (150 bytes, rejected 1), variants 3 (300 bytes), claims 2 (average wait 20 ms)",
+      "resize: Resizer 'default' over 60 s: reads 6 (ready 3, enqueued 1, in-flight 2), stale previews found 2, uploads 3 (150 bytes, rejected 1), variants 3 (300 bytes), claims 2 (average wait 20 ms)",
     ]);
   });
 
@@ -264,7 +264,8 @@ describe('LogMetrics', () => {
 
   test('summaryIntervalMs must be a positive safe integer', () => {
     const logger = recordingLogger();
-    for (const summaryIntervalMs of [0, -1, 1.5, Number.NaN, '60000']) {
+    // Only a missing value (undefined) takes the default; null is a value, and invalid.
+    for (const summaryIntervalMs of [0, -1, 1.5, Number.NaN, '60000', null]) {
       assert.throws(
         () =>
           new LogMetrics(logger, {

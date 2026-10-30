@@ -66,7 +66,7 @@ export class MongoDatabase {
       media.modelName ? { mediaModelName: media.modelName } : {},
     );
     return {
-      media: new MongoMediaStore({ model: media }),
+      media: new MongoMediaStore({ model: media, logger: ctx.logger }),
       locks: new MongoLockStore({ model: ResizeLock }),
       taskQueue: ({ queues, getTiming, logger }) =>
         new MongoTaskQueue({ model: ResizeTask, queues, getTiming, logger }),

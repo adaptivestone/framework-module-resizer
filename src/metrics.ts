@@ -94,7 +94,8 @@ class Tally {
       sections.push(`reads ${total} (${parts.join(', ')})`);
     }
     if (this.stale !== 0) {
-      sections.push(`stale previews served ${this.stale}`);
+      // Found, not served: a stale cell whose publicUrl threw is counted too.
+      sections.push(`stale previews found ${this.stale}`);
     }
     const uploads = this.uploadsStored + this.uploadsRejected;
     if (uploads !== 0 || this.uploadBytes !== 0) {
@@ -170,7 +171,11 @@ export class LogMetrics extends ResizeMetrics {
 
   constructor(logger: ResizeLogger, opts: LogMetricsOptions = {}) {
     super();
-    const intervalMs = opts.summaryIntervalMs ?? DEFAULT_SUMMARY_INTERVAL_MS;
+    // Only a missing value takes the default: an explicit null is checked like any other value.
+    const intervalMs =
+      opts.summaryIntervalMs === undefined
+        ? DEFAULT_SUMMARY_INTERVAL_MS
+        : opts.summaryIntervalMs;
     if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
       throw new ResizeSetupError(
         'resize: LogMetrics `summaryIntervalMs` must be a positive safe integer (ms)',

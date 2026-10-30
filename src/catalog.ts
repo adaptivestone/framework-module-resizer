@@ -114,23 +114,40 @@ export class Catalog {
     // One signature per format and fit flag within this call; the fit flag leads the key, so a
     // format id holding ':' cannot collide.
     const sigs = new Map<string, string>();
-    const encodeSigOf = (row: Preview): string => {
-      const fit = row.fit === true;
-      const key = `${fit ? 'fit' : 'cover'}:${row.format}`;
+    const encodeSigOf = (format: PreviewFormat, fit: boolean): string => {
+      const key = `${fit ? 'fit' : 'cover'}:${format}`;
       let sig = sigs.get(key);
       if (sig === undefined) {
-        sig = this.encodeSig(scope.pipeline, row.format, fit);
+        sig = this.encodeSig(scope.pipeline, format, fit);
         sigs.set(key, sig);
       }
       return sig;
     };
+    // A row whose `fit` is not a boolean comes from a store that does not keep it (a strict row
+    // schema without the field, a table without the column) or from before rows recorded it: it
+    // may have been made either way, so either signature proves it fresh. The two always differ,
+    // and the identity already tells a fit variant from a cover one.
+    const isFresh = (row: Preview, at: string): boolean =>
+      typeof row.fit === 'boolean'
+        ? isFreshRow(row, {
+            encodeSig: encodeSigOf(row.format, row.fit),
+            origin: at,
+          })
+        : isFreshRow(row, {
+            encodeSig: encodeSigOf(row.format, false),
+            origin: at,
+          }) ||
+          isFreshRow(row, {
+            encodeSig: encodeSigOf(row.format, true),
+            origin: at,
+          });
     const fresh = new Map<string, Preview>();
     const stale = new Map<string, Preview>();
     for (const [identity, rows] of storedPreviewRows(media, scope)) {
       let freshRow: Preview | undefined;
       if (origin !== undefined) {
         for (const row of rows) {
-          if (isFreshRow(row, { encodeSig: encodeSigOf(row), origin })) {
+          if (isFresh(row, origin)) {
             freshRow = row;
           }
         }

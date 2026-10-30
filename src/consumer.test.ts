@@ -2364,6 +2364,38 @@ describe('Consumer metrics', () => {
     }
   });
 
+  test('the queue label is the consumed queue; a payload naming another queue goes to the context', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    // A replayed or malformed message (an SQS body is the producer's) names a queue of its own.
+    const claim = tasks.claim.bind(tasks);
+    tasks.claim = async (...args: Parameters<typeof claim>) => {
+      const task = await claim(...args);
+      return task && { ...task, queue: 'elsewhere' };
+    };
+    const rec = recordingMetrics();
+    await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      { metricsOf: () => rec },
+    );
+    assert.deepEqual(callsOf(rec, 'resize.claim')[0][1], { queue: 'default' });
+    const [[, labels, context]] = callsOf(rec, 'resize.task');
+    assert.deepEqual(labels, {
+      queue: 'default',
+      pipeline: 'default',
+      outcome: 'completed',
+    });
+    assert.deepEqual(context, {
+      taskId: 'task-1',
+      mediaId: 'm1',
+      attempts: 1,
+      variants: 1,
+      payloadQueue: 'elsewhere',
+    });
+  });
+
   test('a retried task records failed with the error code, its last attempt records dead', async () => {
     const timing = {
       ...fastTiming,

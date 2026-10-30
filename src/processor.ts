@@ -191,6 +191,17 @@ interface LoadedSource {
   info: SourceInfo;
 }
 
+/** A copy of what a render reads of the original: its locator, stored format and dimensions. */
+function snapshotOriginal(original: Original): Original {
+  const { storageRef, format, width, height } = original;
+  return {
+    storageRef,
+    ...(format === undefined ? {} : { format }),
+    ...(width === undefined ? {} : { width }),
+    ...(height === undefined ? {} : { height }),
+  };
+}
+
 /**
  * Download the original once and identify its bytes. The detected format is the truth: a stored
  * format that does not match is logged once and the bytes are rendered as what they are. One frame
@@ -750,19 +761,23 @@ export class Processor {
       return nothing();
     }
 
-    const original = media.original;
-    if (original?.storageRef == null) {
+    if (media.original?.storageRef == null) {
       // Callers guard this, but never assume — a media without an original has nothing to
       // resize from.
       return nothing();
     }
+    // The original as the render found it, read once before any await: the host may replace it
+    // while its bytes download, and the download, the origin every row records, the stored
+    // dimensions and the upload's parent must all describe the bytes that were rendered.
+    const original = snapshotOriginal(media.original);
+    const atStart: MediaLike = { original, previews: media.previews };
 
     // The fresh stored identities are done (the DB check that makes re-runs idempotent); a stale
     // one renders again. Stored previews keep their own scope, so another pipeline's rendering
     // never counts as done here. Without stored dimensions no row is proven fresh yet: the
     // measured original decides below.
     const scope: PreviewScope = { resizer: name, pipeline: pipelineName };
-    const freshAtLoad = catalog.freshIdentities(media, scope);
+    const freshAtLoad = catalog.freshIdentities(atStart, scope);
     const notFresh = requested.filter(
       (v) => !freshAtLoad.has(catalog.identity(scope, v)),
     );
@@ -773,7 +788,7 @@ export class Processor {
       format: string,
       ms: number,
       outcome: 'stored' | 'duplicate' | 'rendered' | 'failed',
-      extra: { code?: string; bytes?: number } = {},
+      extra: { code?: string; bytes?: number; rawFormat?: string } = {},
     ): void => {
       metrics.timing(
         'resize.variant',
@@ -789,6 +804,9 @@ export class Processor {
           mediaId,
           identity,
           ...(taskId === undefined ? {} : { taskId }),
+          ...(extra.rawFormat === undefined
+            ? {}
+            : { rawFormat: extra.rawFormat }),
         },
       );
       if (extra.bytes !== undefined) {
@@ -799,7 +817,8 @@ export class Processor {
       }
     };
     // A task payload can name any format; only configured encoders run. Every other variant fails
-    // alone, before any download, so it is recorded with no time spent.
+    // alone, before any download, so it is recorded with no time spent, under one `format` label
+    // value (a label holds configured formats only), its own format in the context.
     const { configured, unconfigured } = catalog.splitConfigured(notFresh);
     let pending = configured;
     for (const v of unconfigured) {
@@ -810,7 +829,10 @@ export class Processor {
         error,
       );
       failedCount += 1;
-      recordVariant(identity, v.format, 0, 'failed', errorCodeLabel(error));
+      recordVariant(identity, 'unconfigured', 0, 'failed', {
+        ...errorCodeLabel(error),
+        rawFormat: v.format,
+      });
     }
     // Everything requested is already fresh or cannot be encoded: no download.
     if (pending.length === 0) {
@@ -839,7 +861,7 @@ export class Processor {
     const origin = previewOrigin(original.storageRef, mediaDims);
     if (stored === undefined) {
       // Measured now, before any pixel decode: the rows signed with this size are fresh after all.
-      const fresh = catalog.freshIdentities(media, scope, mediaDims);
+      const fresh = catalog.freshIdentities(atStart, scope, mediaDims);
       pending = pending.filter((v) => !fresh.has(catalog.identity(scope, v)));
       if (pending.length === 0) {
         // Nothing to render, but the dimensions are recorded, so the next read proves the rows
@@ -861,7 +883,7 @@ export class Processor {
     }
     // The pending identities a stored row holds (stale, or from before rows were signed): the
     // persist replaces those rows instead of appending beside them.
-    const storedIds = catalog.storedIdentities(media, scope);
+    const storedIds = catalog.storedIdentities(atStart, scope);
     const replacing = new Set(
       pending
         .map((v) => catalog.identity(scope, v))
@@ -872,8 +894,18 @@ export class Processor {
       requireReplacePreviews(this.#deps.media);
     }
 
+    // The steps and the signature each row records, taken together before any pixel work: a
+    // pipeline version, step set or encode setting changed while the variants render or upload
+    // must not be credited to pixels made before it, or the row would read fresh for good.
     const pipeline = pipelines.get(pipelineName);
     const beforeSteps = pipeline.beforeSteps ?? [];
+    const variantSteps = pipeline.variantSteps ?? [];
+    const encodeSigs = new Map(
+      pending.map((v) => [
+        catalog.identity(scope, v),
+        catalog.encodeSig(pipelineName, v.format, v.fit === true),
+      ]),
+    );
     const rules = planRules(config, scope, pipeline);
     let plans = planVariants(info, pending, rules);
 
@@ -944,7 +976,7 @@ export class Processor {
     const sized = new SizedRasters(raster, plans, limits);
     raster = undefined;
     const encodeOptions = {
-      variantSteps: pipeline.variantSteps ?? [],
+      variantSteps,
       ctx,
       encode: config.encode,
       limits,
@@ -989,11 +1021,8 @@ export class Processor {
           previewRow(plan, encoded, ref, {
             scope,
             origin,
-            encodeSig: catalog.encodeSig(
-              pipelineName,
-              plan.variant.format,
-              plan.variant.fit === true,
-            ),
+            // Every plan is one of `pending`, so its signature was taken above.
+            encodeSig: encodeSigs.get(plan.identity) ?? '',
           }),
         );
       } catch (err) {
@@ -1044,8 +1073,8 @@ export class Processor {
       if (recorded.failure) {
         // The persist failed. A write the store rejected is logged by the recorder; a malformed
         // append result and a store without replacePreviews are not, and travel in `error`. What
-        // an earlier write of this persist stored (the append before a failed replace) is stored;
-        // nothing else this call rendered is.
+        // the store kept before the failure (the append before a failed replace, or the part of a
+        // failed append the reloaded media holds) is stored; nothing else this call rendered is.
         const { error } = recorded.failure;
         const stored = new Set(recorded.stored);
         for (const { plan, row } of rendered) {

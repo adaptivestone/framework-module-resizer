@@ -269,11 +269,25 @@ test('a fit row is judged with the fit settings', () => {
     fitCatalog.encodeSig('default', 'jpeg', true),
     media.previews[0].encodeSig,
   );
-  // Signed as a fit row, read as a cover row: stale.
-  delete media.previews[0].fit;
+  // Signed as a fit row, stored as a cover row (`fit: false`): stale.
+  media.previews[0].fit = false;
   assert.deepEqual(
     [...fitCatalog.splitStored(media, scope).stale.keys()],
     [fitId],
+  );
+  // A store that dropped `fit` (not a boolean): either signature proves the row fresh.
+  delete media.previews[0].fit;
+  assert.deepEqual([...fitCatalog.freshIdentities(media, scope)], [fitId]);
+  (media.previews[0] as { fit?: unknown }).fit = 1;
+  assert.deepEqual([...fitCatalog.freshIdentities(media, scope)], [fitId]);
+  // A cover row (written without `fit`) is still fresh by the cover signature.
+  const cover = stampFresh(freshMedia({ formats: ['jpeg'] }), {
+    config: fitConfig,
+  });
+  assert.equal('fit' in cover.previews[0], false);
+  assert.deepEqual(
+    [...fitCatalog.freshIdentities(cover, scope)],
+    ['default:default:10x10:jpeg:none'],
   );
 });
 

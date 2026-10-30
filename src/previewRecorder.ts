@@ -6,9 +6,10 @@
 // gone. A row left out for a fresh row of another worker is covered; one left out for a row with
 // other signatures is blocked, so the variant is not covered and its task retries (the retry
 // replaces that row). A failed write is logged with the uploads no row points at and returned as
-// the result's `failure`, beside what an earlier write of the same persist stored, so the caller
-// can tell which variants were stored before it rethrows. It renders nothing and fires no
-// observer: the Processor fires onPreviewGenerated over the rows it returns.
+// the result's `failure`, beside what the store kept before it failed (an earlier write of the
+// same persist, or the part a failed append stored), so the caller can tell which variants were
+// stored before it rethrows. It renders nothing and fires no observer: the Processor fires
+// onPreviewGenerated over the rows it returns.
 import type { Catalog } from './catalog.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import { ResizeSetupError } from './errors.ts';
@@ -92,8 +93,8 @@ export interface RecordResult {
   // Set when the persist failed: the caller rethrows `error`. A write the store rejected is
   // already logged here; an append result that is not an array (RESIZE_MEDIA_APPEND_RESULT_INVALID)
   // and a store without replacePreviews are not, and reach the caller through `error` alone.
-  // `stored` then holds only what an earlier write of this persist stored (the append before a
-  // failed replace).
+  // `stored` then holds only what the store kept before the failure: the append before a failed
+  // replace, or the rows a failed append stored part-way (by the reloaded media).
   failure?: { error: unknown };
 }
 
@@ -148,6 +149,7 @@ export class PreviewRecorder {
           pending: replacements,
           backfillDims,
           originDims,
+          kept,
         });
         for (const p of appended.stored) {
           kept.add(p);
@@ -199,7 +201,11 @@ export class PreviewRecorder {
     );
   }
 
-  /** The append write and its reconciliation; `pending` are the replacements still to write. */
+  /**
+   * The append write and its reconciliation; `pending` are the replacements still to write. When
+   * the write fails part-way, the appends whose identity the reloaded media holds go to `kept`
+   * before it rethrows: the store did keep them.
+   */
   async #append(
     mediaId: string,
     scope: PreviewScope,
@@ -208,6 +214,7 @@ export class PreviewRecorder {
       pending: Preview[];
       backfillDims: { width: number; height: number } | undefined;
       originDims: { width: number; height: number } | undefined;
+      kept: Set<Preview>;
     },
   ): Promise<Pick<RecordResult, 'stored' | 'alreadyStored' | 'blocked'>> {
     const { catalog, logger, media: mediaStore } = this.#deps;
@@ -234,6 +241,13 @@ export class PreviewRecorder {
         const recorded = reloaded
           ? catalog.storedIdentities(reloaded, scope)
           : reloaded;
+        if (recorded) {
+          for (const p of appends) {
+            if (recorded.has(identity(p))) {
+              opts.kept.add(p);
+            }
+          }
+        }
         const unrecorded = [
           ...(recorded
             ? appends.filter((p) => !recorded.has(identity(p)))
@@ -311,8 +325,14 @@ export class PreviewRecorder {
     const { catalog, logger, media: mediaStore } = this.#deps;
     let result: ReplacedPreviews;
     try {
+      // The replaced identities are named as well as carried by the rows: a store that removes
+      // only the rows of `identities` (all invalidate() ever needed) still removes the old rows.
       result = checkReplaced(
-        await mediaStore.replacePreviews(mediaId, [], rows),
+        await mediaStore.replacePreviews(
+          mediaId,
+          rows.map((row) => this.#identity(scope, row)),
+          rows,
+        ),
       );
     } catch (err) {
       // The old row of each identity may still be there, so a reload by identity cannot tell:

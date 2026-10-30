@@ -5339,7 +5339,10 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
     // Both identities are stored (the fit row's is derived from its fields), so both new rows
     // go to one replace; the measured dimensions go to one append of no rows.
     assert.equal(replaceCalls.length, 1);
-    assert.deepEqual(replaceCalls[0].identities, []);
+    assert.deepEqual(
+      replaceCalls[0].identities,
+      replaceCalls[0].rows.map((row) => row.identity),
+    );
     assert.deepEqual(
       replaceCalls[0].rows.map((row) => row.sizeKey),
       ['20x20', 'fit'],
@@ -5713,6 +5716,43 @@ describe('variant metrics', () => {
     assert.equal(byteCounts(metrics).length, 0);
   });
 
+  test('an append that throws after storing part of its rows records those as stored, the rest failed', async () => {
+    const { deps, metrics } = measuredDeps();
+    const doc = mediaDoc();
+    const db = new Error('db');
+    deps.media = fakeMedia({
+      load: async () => doc,
+      // A driver that writes one row at a time and fails on the second.
+      appendPreviews: async (_mediaId, previews) => {
+        doc.previews = [...(doc.previews ?? []), previews[0]];
+        throw db;
+      },
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({ media: mediaDoc(), sizes: twoSizes }),
+      (err: unknown) => err === db,
+    );
+    assert.deepEqual(
+      timings(metrics).map((c) => [c.labels.outcome, c.context?.identity]),
+      [
+        ['stored', doc.previews?.[0]?.identity],
+        [
+          'failed',
+          deps.catalog.identity(
+            { resizer: 'default', pipeline: 'default' },
+            variant({
+              sizeKey: '10x10',
+              requestedWidth: 10,
+              requestedHeight: 10,
+            }),
+          ),
+        ],
+      ],
+    );
+    assert.equal(byteCounts(metrics).length, 1);
+  });
+
   test('a row the persist leaves out that no row holds records failed with no code', async () => {
     const { deps, metrics } = measuredDeps();
     // The store keeps nothing and the reload holds nothing: neither stored nor a duplicate.
@@ -5735,31 +5775,45 @@ describe('variant metrics', () => {
     assert.equal(byteCounts(metrics).length, 0);
   });
 
-  test('a task variant with an unconfigured format records failed at 0 ms with its code', async () => {
+  test('a task variant with an unconfigured format records failed at 0 ms with its code, labelled unconfigured', async () => {
     const { deps, metrics } = measuredDeps();
-    const gif = variant({ format: 'gif' });
+    // A payload can name any format: one label value for all of them, the raw one in the context.
+    const formats = ['gif', 'x-made-up', 'tiff2'];
+    const unconfigured = formats.map((format) => variant({ format }));
     await assert.rejects(
-      () => new Processor(deps).processTask(task({ previews: [gif] })),
+      () => new Processor(deps).processTask(task({ previews: unconfigured })),
       { code: 'RESIZE_WORKER_INCOMPLETE' },
     );
     const recorded = timings(metrics);
-    assert.equal(recorded.length, 1);
-    assert.equal(recorded[0].value, 0);
-    assert.deepEqual(recorded[0].labels, {
-      pipeline: 'default',
-      format: 'gif',
-      mode: 'task',
-      outcome: 'failed',
-      code: 'RESIZE_FORMAT_NOT_CONFIGURED',
-    });
-    assert.deepEqual(recorded[0].context, {
-      mediaId: 'm1',
-      identity: deps.catalog.identity(
-        { resizer: 'default', pipeline: 'default' },
-        gif,
-      ),
-      taskId: 't1',
-    });
+    assert.equal(recorded.length, 3);
+    for (const call of recorded) {
+      assert.equal(call.value, 0);
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'unconfigured',
+        mode: 'task',
+        outcome: 'failed',
+        code: 'RESIZE_FORMAT_NOT_CONFIGURED',
+      });
+    }
+    assert.deepEqual(
+      recorded
+        .map((c) => c.context)
+        .sort((a, b) =>
+          String(a?.rawFormat).localeCompare(String(b?.rawFormat)),
+        ),
+      unconfigured
+        .map((v) => ({
+          mediaId: 'm1',
+          identity: deps.catalog.identity(
+            { resizer: 'default', pipeline: 'default' },
+            v,
+          ),
+          taskId: 't1',
+          rawFormat: v.format,
+        }))
+        .sort((a, b) => a.rawFormat.localeCompare(b.rawFormat)),
+    );
     assert.equal(byteCounts(metrics).length, 0);
   });
 

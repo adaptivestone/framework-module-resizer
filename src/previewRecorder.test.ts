@@ -156,9 +156,15 @@ test('record() appends new rows, then replaces the rows in replacing, and return
   const result = await recorder.record('m1', scope, [replacement, added], {
     replacing: new Set([replacement.identity as string]),
   });
+  // The replaced identities are named too, so a store that removes only by that argument (one
+  // written when the core called it from invalidate() alone) removes the old rows.
   assert.deepEqual(calls, [
     { write: 'append', previews: [added] },
-    { write: 'replace', identities: [], rows: [replacement] },
+    {
+      write: 'replace',
+      identities: [replacement.identity],
+      rows: [replacement],
+    },
   ]);
   // The generated objects, in the order given.
   assert.deepEqual(result.stored, [replacement, added]);
@@ -189,7 +195,11 @@ test('an all-replacement batch with backfillDims calls appendPreviews(id, [], di
   });
   assert.deepEqual(calls, [
     { write: 'append', previews: [], dims },
-    { write: 'replace', identities: [], rows: [replacement] },
+    {
+      write: 'replace',
+      identities: [replacement.identity],
+      rows: [replacement],
+    },
   ]);
   assert.deepEqual(result.stored, [replacement]);
   assert.deepEqual(result.removed, [old]);

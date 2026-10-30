@@ -82,6 +82,13 @@ export interface ConsumerDeps {
   metricsOf?: (task: LeasedTask) => ResizeMetrics | undefined;
 }
 
+// The queue a claimed task was claimed from and when (performance.now()): its outcome's `queue`
+// label and the start of its run time.
+interface ClaimStart {
+  queue: string;
+  start: number;
+}
+
 // The `outcome` label of a task event on the metrics sink.
 const OUTCOMES: Record<TaskEvent, string> = {
   completed: 'completed',
@@ -246,7 +253,7 @@ export class Consumer {
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
             { code: 'RESIZE_TASK_MAX_ATTEMPTS' },
           ),
-          { forceDead: true, runStart: claimedAt },
+          { forceDead: true, claim: { queue, start: claimedAt } },
         );
         waitStart = performance.now();
         continue;
@@ -256,20 +263,24 @@ export class Consumer {
         await this.#giveBackAtShutdown(task, coordination);
         break;
       }
-      await this.#runTask(task, coordination, signal, claimedAt);
+      await this.#runTask(task, coordination, signal, {
+        queue,
+        start: claimedAt,
+      });
       waitStart = performance.now();
     }
   }
 
   /**
    * Run one claimed task under its lease, holding its gate lock (when it has one), then complete,
-   * fail or give it back. `runStart` (performance.now() at its claim) times its outcome.
+   * fail or give it back. `claim` (the consumed queue and its claim time) labels and times its
+   * outcome.
    */
   async #runTask(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
     signal: AbortSignal,
-    runStart: number,
+    claim: ClaimStart,
   ): Promise<void> {
     const { tasks, timing, handle, logger } = this.#deps;
     const { leaseMs, taskTimeoutMs } = timing;
@@ -409,7 +420,7 @@ export class Consumer {
           `resize worker: task ${task.taskId} exceeded taskTimeoutMs (${taskTimeoutMs}ms)`,
           { code: 'RESIZE_TASK_TIMEOUT' },
         ),
-        { gateDeadline, run, runStart },
+        { gateDeadline, run, claim },
       );
     } else if (ok) {
       try {
@@ -420,7 +431,7 @@ export class Consumer {
               this.#releaseGate(task, gate, deadline, detached),
             gateDeadline,
           );
-          await this.#report('completed', task, undefined, runStart);
+          await this.#report('completed', task, undefined, claim);
         }
       } catch (err) {
         logNeverThrow(
@@ -437,26 +448,27 @@ export class Consumer {
       await this.#finish(task, coordination, handlerError, {
         gateDeadline,
         run,
-        runStart,
+        claim,
       });
     }
   }
 
   /**
-   * A task's outcome, once the queue took it: recorded on its Resizer's metrics sink, timed from
-   * `runStart` (performance.now() at its claim), then sent to the observers.
+   * A task's outcome, once the queue took it: recorded on its Resizer's metrics sink, labelled
+   * with the queue this loop consumes and timed from its claim, then sent to the observers. The
+   * queue a payload names is the producer's (an SQS body), so a different one is context only.
    */
   async #report(
     event: TaskEvent,
     task: ClaimedTask,
     error: unknown,
-    runStart: number,
+    claim: ClaimStart,
   ): Promise<void> {
     this.#deps.metricsOf?.(toLeasedTask(task))?.timing(
       'resize.task',
-      performance.now() - runStart,
+      performance.now() - claim.start,
       {
-        queue: task.queue,
+        queue: claim.queue,
         pipeline: task.pipeline,
         outcome: OUTCOMES[event],
         ...errorCodeLabel(error),
@@ -466,6 +478,7 @@ export class Consumer {
         mediaId: task.mediaId,
         attempts: task.attempts,
         variants: task.previews.length,
+        ...(task.queue === claim.queue ? {} : { payloadQueue: task.queue }),
       },
     );
     try {
@@ -484,8 +497,8 @@ export class Consumer {
    * Retry the task after its backoff, or dead-letter it (forced, not retryable, last attempt) with
    * its Resizer's cooldown. Its gate lock is then held until the retry is due plus one lease, or
    * for the cooldown: the task's final gate action (see #finalGate), whose call waits until
-   * `opts.gateDeadline` at most (default: one gate bound). `opts.runStart` (performance.now() at
-   * its claim) times its outcome (see #report).
+   * `opts.gateDeadline` at most (default: one gate bound). `opts.claim` labels and times its
+   * outcome (see #report).
    */
   async #finish(
     task: ClaimedTask,
@@ -495,7 +508,7 @@ export class Consumer {
       forceDead?: boolean;
       gateDeadline?: number;
       run?: GateRun;
-      runStart: number;
+      claim: ClaimStart;
     },
   ): Promise<void> {
     const { tasks, timing, logger } = this.#deps;
@@ -519,7 +532,7 @@ export class Consumer {
             gateDeadline,
             opts.run,
           );
-          await this.#report('deadLettered', task, error, opts.runStart);
+          await this.#report('deadLettered', task, error, opts.claim);
         }
         return;
       }
@@ -533,7 +546,7 @@ export class Consumer {
           gateDeadline,
           opts.run,
         );
-        await this.#report('failed', task, error, opts.runStart);
+        await this.#report('failed', task, error, opts.claim);
       }
     } catch (err) {
       logNeverThrow(

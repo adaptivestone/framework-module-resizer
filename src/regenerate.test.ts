@@ -652,3 +652,123 @@ test("a beforeEnqueue tap's `fit: 1` is a cover variant: queued, rendered, store
   assert.equal(again.decision.ready.length, 1);
   assert.equal(again.decision.ready[0].stale, undefined);
 });
+
+test('settings changed while a preview uploads: the row keeps the signature it was rendered with, so the next read regenerates it', async () => {
+  const w = world();
+  const pipeline: Pipeline = { version: 'v1' };
+  const config = webpConfig(80);
+  const r = w.resizer(config, undefined, { default: pipeline });
+  const original = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+  const upload = w.storage.upload;
+  w.storage.upload = async (args) => {
+    // A redeploy's settings land while the old rendering is on its way to storage.
+    pipeline.version = 'v2';
+    (config.encode.formats.webp as { quality: number }).quality = 60;
+    return upload(args);
+  };
+
+  await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+  const [row] = rowsOf(doc);
+  assert.equal(
+    row.encodeSig,
+    encodeSignature(webpConfig(80), {
+      format: 'webp',
+      fit: false,
+      version: 'v1',
+    }),
+  );
+  const { decision } = await w.read(r, doc);
+  assert.equal(decision.ready[0].stale, true);
+});
+
+test('the original replaced while it downloads: the row records the original it was made from, so the next read regenerates it', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const blue = await sharp({
+    create: {
+      width: 64,
+      height: 64,
+      channels: 3,
+      background: { r: 0, g: 0, b: 255 },
+    },
+  })
+    .png()
+    .toBuffer();
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const replacement = await r.uploadOriginal({
+    body: blue,
+    visibility: 'private',
+  });
+  const doc: MediaLike = { id: 'm1', original: { ...red }, previews: [] };
+  w.docs.set('m1', doc);
+  const media = structuredClone(doc);
+  const download = w.storage.download;
+  w.storage.download = async (ref) => {
+    const bytes = await download(ref);
+    // The host swaps the original while its old bytes are being read.
+    for (const m of [media, doc]) {
+      if (m.original) {
+        m.original.storageRef = replacement.storageRef;
+      }
+    }
+    return bytes;
+  };
+  const parents: unknown[] = [];
+  const upload = w.storage.upload;
+  w.storage.upload = async (args) => {
+    parents.push(args.parentRef);
+    return upload(args);
+  };
+
+  await r.generate({ media, sizes: cell, formats: ['webp'] });
+  const [row] = rowsOf(doc);
+  assert.equal(
+    row.origin,
+    previewOrigin(red.storageRef, { width: 64, height: 64 }),
+  );
+  assert.deepEqual(parents, [red.storageRef]);
+  w.storage.download = download;
+  const { decision } = await w.read(r, doc);
+  assert.equal(decision.ready[0].stale, true);
+});
+
+test('a store that drops `fit` from the rows it stores: the fit row is fresh after its task, and nothing more is queued', async () => {
+  const strip = (rows: Preview[]): Preview[] =>
+    rows.map(({ fit: _fit, ...row }) => row);
+  const w = world({
+    // A strict row schema without `fit`, or a table without a fit column.
+    wrap: (inner) =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: (id, previews, dims) =>
+          inner.appendPreviews(id, strip(previews), dims),
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, strip(rows)),
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const original = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+  const fit: SizeInput[] = [{ fit: true }];
+
+  const first = await w.read(r, doc, fit);
+  assert.equal(first.decision.missing.length, 1);
+  assert.equal(w.tasks.rows.length, 1);
+  await w.work(r);
+  assert.equal(w.tasks.rows[0].status, 'completed');
+  const [row] = rowsOf(doc, 'default:default:fit:webp:none');
+  assert.equal('fit' in row, false);
+
+  const again = await w.read(r, doc, fit);
+  assert.equal('stale' in again.decision, false);
+  assert.equal(again.decision.ready.length, 1);
+  assert.equal(again.decision.ready[0].stale, undefined);
+  assert.equal(w.tasks.rows.length, 1);
+});

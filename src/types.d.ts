@@ -145,8 +145,9 @@ export interface ReadDecision {
   /**
    * The variants that replace a stale stored preview (after `beforeEnqueue`), apart from
    * `missing`. Like `missing`, they are requested, and queued only when the read queues (not
-   * with `enqueueMissing: false`, without an original, or without a usable task queue). Set only
-   * when there is one, so a fresh decision has no `stale` key.
+   * with `enqueueMissing: false`, without an original, or without a usable task queue), so it does
+   * not confirm a queued task; nor that the stale preview was served (a cell whose `publicUrl`
+   * threw is not). Set only when there is one, so a fresh decision has no `stale` key.
    */
   stale?: MissingPreview[];
 }

@@ -826,6 +826,31 @@ describe('MongoMediaStore: the preview metadata', () => {
       }).verify(),
     );
   });
+
+  test('strict preview rows without fit pass verify() with one warning; the fragment gets none', () => {
+    const warnings: unknown[][] = [];
+    const logger = {
+      info() {},
+      warn: (...args: unknown[]) => void warnings.push(args),
+      error() {},
+    };
+    const { fit: _fit, ...rowFields } = resizeMediaSchemaFragment.previews[0];
+    const store = new MongoMediaStore({
+      model: mediaModelWith('NoFitMedia', [rowFields]),
+      logger,
+    });
+    assert.doesNotThrow(() => store.verify());
+    assert.doesNotThrow(() => store.verify());
+    assert.equal(warnings.length, 1);
+    assert.match(
+      String(warnings[0][0]),
+      /media model 'NoFitMedia' has no previews\.fit field/,
+    );
+    assert.match(String(warnings[0][0]), /resizeMediaSchemaFragment/);
+
+    new MongoMediaStore({ model: Media(), logger }).verify();
+    assert.equal(warnings.length, 1);
+  });
 });
 
 describe('MongoMediaStore options', () => {

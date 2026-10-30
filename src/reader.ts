@@ -241,6 +241,9 @@ export class Reader {
       read.missing = missingCount;
       read.stale = staleIdentities.size;
       this.#countStale(pipeline, mediaId, read.stale);
+      // Decided before the tap runs: a tap may change the list in place, and an emptied list
+      // still means the read found work to do.
+      const workNeeded = toQueue.length > 0;
 
       // beforeEnqueue — REASSIGN the (post-hook) queue list so the enqueue below and the host's
       // formatPublicUrls both see exactly what was enqueued: a variant whose identity was stale
@@ -282,7 +285,7 @@ export class Reader {
         );
         // Every requested cell was served fresh; a variant a tap added (queued above) does not
         // change it.
-        outcome = toQueue.length === 0 ? 'ready' : result;
+        outcome = workNeeded ? result : 'ready';
       }
 
       // The host turns the decision into its response shape. No tap / tap throws →

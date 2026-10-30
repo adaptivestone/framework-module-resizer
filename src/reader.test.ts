@@ -1983,6 +1983,35 @@ describe('read metrics', () => {
     assert.equal(reads[5].context.pipeline, 'retired');
   });
 
+  test('a beforeEnqueue tap that empties the list in place counts suppressed, not ready', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      name: 'emptied',
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      metrics: sink,
+      logger: silent,
+      hooks: {
+        beforeEnqueue: (missing) => {
+          missing.length = 0;
+          return missing;
+        },
+      },
+    });
+    await r.ready();
+    const media = stampFresh(storedMedia('emptied'), { config: r.config });
+    await r.resolve({ media, formats: ['jpeg'], sizes: withMissing });
+    const [read] = readsOf(sink);
+    assert.equal(read.labels.outcome, 'suppressed');
+    assert.deepEqual(read.context, {
+      mediaId: 'm1',
+      ready: 1,
+      missing: 1,
+      stale: 0,
+    });
+  });
+
   test('a route whose build fails: resolve() serves the stored previews, logs once, and counts failed', async () => {
     const sink = recordingMetrics();
     const log = recordingLogger();

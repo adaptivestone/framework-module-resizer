@@ -4,7 +4,7 @@
 // one write per call that removes and stores rows by identity together.
 import { MediaStore, type ReplacedPreviews } from '../../contracts/media.ts';
 import { ResizeSetupError } from '../../errors.ts';
-import type { MediaLike, Preview } from '../../types.d.ts';
+import type { MediaLike, Preview, ResizeLogger } from '../../types.d.ts';
 import { resolveModelOption } from './modelOption.ts';
 
 /** The `findOneAndUpdate` options the store passes (Mongoose query options). */
@@ -40,6 +40,7 @@ export interface MongoMediaStoreOptions {
   // The host media model, or a getter called on each use (for a model registered later).
   model?: MongoMediaModel;
   getModel?: () => MongoMediaModel | null | undefined;
+  logger?: ResizeLogger; // default: console
 }
 
 // Each append asks for the matched document's id only, not the whole media document.
@@ -175,6 +176,8 @@ const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
 
 export class MongoMediaStore extends MediaStore {
   readonly #model: () => MongoMediaModel;
+  readonly #logger: ResizeLogger;
+  #warnedFit = false;
 
   constructor(opts: MongoMediaStoreOptions) {
     super();
@@ -185,6 +188,7 @@ export class MongoMediaStore extends MediaStore {
       missing:
         'resize: the media model does not resolve — check the model name',
     });
+    this.#logger = opts.logger ?? console;
   }
 
   protected mediaModel(): MongoMediaModel {
@@ -197,7 +201,8 @@ export class MongoMediaStore extends MediaStore {
    * (Mongoose strict mode strips an undeclared field from every row: without `identity` every
    * worker that renders a variant would add its own row, and without the signatures no row could
    * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
-   * field. `bytes` and `createdAt` are informational and not checked.
+   * field. Such rows without `fit` only get a warning, once per store: freshness still holds
+   * without it. `bytes` and `createdAt` are informational and not checked.
    */
   verify(): void {
     const model = this.mediaModel();
@@ -216,6 +221,12 @@ export class MongoMediaStore extends MediaStore {
       throw new ResizeSetupError(
         `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no ${named}, so Mongoose would drop ${missing.length > 1 ? 'them' : 'it'} and ${lost} — spread the current resizeMediaSchemaFragment into the media model's schema`,
         { code: 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' },
+      );
+    }
+    if (!rows.path('fit') && !this.#warnedFit) {
+      this.#warnedFit = true;
+      this.#logger.warn(
+        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no previews.fit field, so Mongoose drops it and a stored row no longer says whether it is a fit preview — spread the current resizeMediaSchemaFragment into the media model's schema, or add fit: { type: Boolean } to its preview rows`,
       );
     }
   }

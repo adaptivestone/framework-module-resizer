@@ -340,8 +340,10 @@ export function toMissingPreview(
 
 /**
  * True when every `sizes × formats` identity of `scope` (default: the default Resizer and
- * pipeline) is already stored on `media.previews`. Hosts use this to skip a no-op
- * `generate` / `prewarm`.
+ * pipeline) is already stored on `media.previews`. It checks presence by identity only, not
+ * freshness: a stale row counts as stored. So it must not decide whether to skip `generate()` or
+ * `prewarm()` where freshness matters; `generate()` is idempotent and renders only what is
+ * missing or stale.
  */
 export function isCatalogCovered(
   media: MediaLike,

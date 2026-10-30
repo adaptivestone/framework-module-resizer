@@ -4,7 +4,7 @@
 import { MongoMediaStore } from '../drivers/mongo/media.ts';
 import { ResizeConfigError } from '../errors.ts';
 import type { FrameworkResizeConfig } from '../types.d.ts';
-import { getApp } from './app.ts';
+import { appLogger, getApp } from './app.ts';
 import { getResizeConfig, resolveFrameworkConfig } from './config.ts';
 
 export interface FrameworkMediaStoreOptions {
@@ -37,6 +37,8 @@ export class FrameworkMediaStore extends MongoMediaStore {
         }
         return model;
       },
+      // verify() warns through the app logger, resolved when it logs.
+      logger: appLogger,
     });
   }
 }
