@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { describe, test } from 'node:test';
 import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
+import { silentLogger } from '../testHelpers/fakes.ts';
 import type { LocalStorageConfig } from '../types.d.ts';
 import { LocalFsStorage } from './fs.ts';
 
@@ -219,8 +220,7 @@ describe('LocalFsStorage', () => {
 });
 
 describe('LocalFsStorage.fromConfig', () => {
-  const silent = { info() {}, warn() {}, error() {} };
-  const ctx = { logger: silent, where: 'src/config/resize.ts' };
+  const ctx = { logger: silentLogger, where: 'src/config/resize.ts' };
 
   test("builds from its own keys and ignores another driver's", async (t) => {
     const dir = await fresh();
@@ -259,7 +259,6 @@ describe('LocalFsStorage.fromConfig', () => {
   test('rejects a missing rootDir with RESIZE_CONFIG_INVALID naming where', () => {
     const cases: Array<[Record<string, unknown>, string]> = [
       [{ publicBaseUrl: '/media' }, '`storage.rootDir`'],
-      [{ rootDir: '', publicBaseUrl: '/media' }, '`storage.rootDir`'],
       [{ rootDir: 7, publicBaseUrl: '/media' }, '`storage.rootDir`'],
       [{ rootDir: '/srv/media' }, '`storage.publicBaseUrl`'],
       [
@@ -278,8 +277,19 @@ describe('LocalFsStorage.fromConfig', () => {
           err instanceof ResizeConfigError &&
           err.code === 'RESIZE_CONFIG_INVALID' &&
           err.message ===
-            `resize config: ${key} in src/config/resize.ts must be a non-empty string`,
+            `resize config: ${key} in src/config/resize.ts must be a string`,
       );
     }
+  });
+
+  test('an empty publicBaseUrl is accepted as on rc.2 and gives root-relative URLs', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = LocalFsStorage.fromConfig(
+      { driver: 'local', rootDir: join(dir, 'media'), publicBaseUrl: '' },
+      ctx,
+    );
+    const ref = await s.upload(uploadArgs('previews/a.jpg', 'public'));
+    assert.equal(s.publicUrl(ref), '/previews/a.jpg');
   });
 });

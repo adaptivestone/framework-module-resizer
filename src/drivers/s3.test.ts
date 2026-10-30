@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { S3Client } from '@aws-sdk/client-s3';
 import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
+import { silentLogger } from '../testHelpers/fakes.ts';
 import type { S3StorageConfig } from '../types.d.ts';
 import { S3Storage } from './s3.ts';
 
@@ -313,8 +314,10 @@ describe('S3Storage', () => {
 });
 
 describe('S3Storage.fromConfig', () => {
-  const silent = { info() {}, warn() {}, error() {} };
-  const ctx = { logger: silent, where: 'src/config/resize.production.ts' };
+  const ctx = {
+    logger: silentLogger,
+    where: 'src/config/resize.production.ts',
+  };
   const ref = { bucket: 'pub', key: 'previews/a.jpg' };
   const invalid = (key: string, what: string) => (err: unknown) =>
     err instanceof ResizeConfigError &&
@@ -392,20 +395,37 @@ describe('S3Storage.fromConfig', () => {
             } as unknown as S3StorageConfig,
             ctx,
           ),
-        invalid(key, 'a non-empty string'),
+        invalid(key, 'a string'),
       );
     }
-    assert.throws(
-      () =>
-        S3Storage.fromConfig(
-          {
-            driver: 's3',
-            bucketPublic: 'pub',
-            forcePathStyle: 'true',
-          } as unknown as S3StorageConfig,
-          ctx,
-        ),
-      invalid('forcePathStyle', 'a boolean'),
+  });
+
+  test('accepts what rc.2 accepted: an empty publicBaseUrl and forcePathStyle as given', () => {
+    // '' is no CDN base: the bucket URL.
+    assert.equal(
+      S3Storage.fromConfig(
+        {
+          driver: 's3',
+          bucketPublic: 'pub',
+          publicBaseUrl: '',
+          region: 'eu-west-1',
+        },
+        ctx,
+      ).publicUrl(ref),
+      'https://pub.s3.eu-west-1.amazonaws.com/previews/a.jpg',
+    );
+    // Passed on unchecked, as the framework adapter did: a truthy string turns path style on.
+    assert.equal(
+      S3Storage.fromConfig(
+        {
+          driver: 's3',
+          bucketPublic: 'pub',
+          region: 'eu-west-1',
+          forcePathStyle: 'true',
+        } as unknown as S3StorageConfig,
+        ctx,
+      ).publicUrl(ref),
+      'https://s3.eu-west-1.amazonaws.com/pub/previews/a.jpg',
     );
   });
 

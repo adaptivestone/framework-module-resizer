@@ -5,6 +5,7 @@ import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { ResizeConfigError } from '../../errors.ts';
+import { silentLogger } from '../../testHelpers/fakes.ts';
 import { timingOf } from '../../timing.ts';
 import type { MongoDatabaseConfig } from '../../types.d.ts';
 import {
@@ -328,8 +329,10 @@ describe('mongoParts', () => {
 });
 
 describe('MongoDatabase.fromConfig', () => {
-  const silent = { info() {}, warn() {}, error() {} };
-  const ctx = { logger: silent, where: 'the config passed to createResizer()' };
+  const ctx = {
+    logger: silentLogger,
+    where: 'the config passed to createResizer()',
+  };
 
   test('MongoDatabase.fromConfig gives media, locks and a task queue over the package models', async () => {
     const parts = MongoDatabase.fromConfig(
@@ -350,7 +353,7 @@ describe('MongoDatabase.fromConfig', () => {
     const tasks = parts.taskQueue?.({
       queues: ['default', 'bulk'],
       getTiming: (queue) => timing[queue],
-      logger: silent,
+      logger: silentLogger,
     });
     assert.ok(tasks instanceof MongoTaskQueue);
     assert.equal(tasks.servesQueue('default'), true);
@@ -384,7 +387,16 @@ describe('MongoDatabase.fromConfig', () => {
       err.code === 'RESIZE_CONFIG_INVALID' &&
       err.message ===
         `resize config: \`database.${key}\` in the config passed to createResizer() must be ${what}`;
-    for (const bad of [undefined, null, 'mongodb://x', {}, { model: 1 }]) {
+    // The default mongoose instance has model() and models but no `base`.
+    for (const bad of [
+      undefined,
+      null,
+      'mongodb://x',
+      {},
+      { model: 1 },
+      { model() {}, models: {} },
+      mongoose,
+    ]) {
       assert.throws(
         () =>
           MongoDatabase.fromConfig(

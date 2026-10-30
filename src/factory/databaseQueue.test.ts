@@ -2,13 +2,16 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { QueueEntry } from '../contracts/drivers.ts';
 import { ResizeConfigError } from '../errors.ts';
-import { fakeDatabaseParts, fakeMedia } from '../testHelpers/fakes.ts';
+import {
+  fakeDatabaseParts,
+  fakeMedia,
+  silentLogger,
+} from '../testHelpers/fakes.ts';
 import type { DatabaseQueueConfig } from '../types.d.ts';
 import { databaseQueueDriver } from './databaseQueue.ts';
 import { resolveQueueEntries } from './queues.ts';
 
 const WHERE = 'the config passed to createResizer()';
-const silent = { info() {}, warn() {}, error() {} };
 
 const entries = () =>
   resolveQueueEntries(
@@ -31,7 +34,7 @@ describe('databaseQueueDriver', () => {
     await assert.rejects(
       async () =>
         databaseQueueDriver.fromConfig(entries(), {
-          logger: silent,
+          logger: silentLogger,
           where: WHERE,
           database: undefined,
         }),
@@ -43,7 +46,7 @@ describe('databaseQueueDriver', () => {
     await assert.rejects(
       async () =>
         databaseQueueDriver.fromConfig(entries(), {
-          logger: silent,
+          logger: silentLogger,
           where: WHERE,
           database: { media: fakeMedia() },
         }),
@@ -57,7 +60,7 @@ describe('databaseQueueDriver', () => {
     const database = fakeDatabaseParts();
     const given = entries();
     const tasks = await databaseQueueDriver.fromConfig(given, {
-      logger: silent,
+      logger: silentLogger,
       where: WHERE,
       database,
     });
@@ -70,7 +73,7 @@ describe('databaseQueueDriver', () => {
     assert.equal(opts.getTiming('default')?.maxAttempts, 4);
     assert.equal(opts.getTiming('bulk')?.leaseMs, 120_000);
     assert.equal(opts.getTiming('other'), undefined);
-    assert.strictEqual(opts.logger, silent);
+    assert.strictEqual(opts.logger, silentLogger);
     assert.equal(tasks.servesQueue?.('bulk'), true);
     assert.equal(tasks.servesQueue?.('other'), false);
   });

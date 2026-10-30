@@ -27,23 +27,23 @@ export function requiredString(
   return value;
 }
 
-/** Like requiredString, but `undefined` (a key left out) is allowed and comes back as it is. */
+/** `value` (the key `path` of the config `where`), which must be a string; '' is allowed. */
+export function stringValue(
+  value: unknown,
+  path: string,
+  where: string,
+): string {
+  if (typeof value !== 'string') {
+    throw invalidConfigValue(path, where, 'a string');
+  }
+  return value;
+}
+
+/** Like stringValue, but `undefined` (a key left out) is allowed and comes back as it is. */
 export function optionalString(
   value: unknown,
   path: string,
   where: string,
 ): string | undefined {
-  return value === undefined ? undefined : requiredString(value, path, where);
-}
-
-/** `value` (the key `path` of the config `where`): a boolean, or `undefined` when left out. */
-export function optionalBoolean(
-  value: unknown,
-  path: string,
-  where: string,
-): boolean | undefined {
-  if (value !== undefined && typeof value !== 'boolean') {
-    throw invalidConfigValue(path, where, 'a boolean');
-  }
-  return value;
+  return value === undefined ? undefined : stringValue(value, path, where);
 }

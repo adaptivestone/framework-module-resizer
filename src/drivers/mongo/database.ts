@@ -14,18 +14,28 @@ import { MongoTaskQueue } from './taskQueue.ts';
 export class MongoDatabase {
   /**
    * The parts on `section.connection`. The package's models are registered on that connection
-   * (with autoIndex off: create their indexes through your migration process). It sends nothing
-   * to the server: checks that need it belong to verify().
+   * (with autoIndex off: create their indexes through your migration process). It does not wait
+   * on the server: checks that need it belong to verify().
    */
   static fromConfig(
     section: MongoDatabaseConfig,
     ctx: DriverContext,
   ): DatabaseParts {
     const { connection, mediaModel } = section;
+    // What createResizeModels uses: the default `mongoose` instance has model() and models but no
+    // `base`, so it is refused here rather than failing inside with a TypeError.
+    const shape = connection as {
+      model?: unknown;
+      models?: unknown;
+      base?: { Schema?: unknown };
+    } | null;
     if (
-      typeof connection !== 'object' ||
-      connection === null ||
-      typeof (connection as { model?: unknown }).model !== 'function'
+      typeof shape !== 'object' ||
+      shape === null ||
+      typeof shape.model !== 'function' ||
+      typeof shape.models !== 'object' ||
+      shape.models === null ||
+      typeof shape.base?.Schema !== 'function'
     ) {
       throw invalidConfigValue(
         'database.connection',

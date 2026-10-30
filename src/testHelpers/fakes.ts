@@ -7,7 +7,7 @@
 // the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it. observedQueue
 // wraps one so a test can stop an idle worker once its work is handled. fakeQueueDriver is a queue
 // driver factory over PlainTaskQueue; fakeDatabaseParts are database parts whose task queue is a
-// MemoryTaskQueue.
+// MemoryTaskQueue; silentLogger drops every message.
 import type { DatabaseParts, QueueDriver } from '../contracts/drivers.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
@@ -24,7 +24,15 @@ import type {
   MediaLike,
   Preview,
   QueueTimingOptions,
+  ResizeLogger,
 } from '../types.d.ts';
+
+/** A logger that drops every message. */
+export const silentLogger: ResizeLogger = {
+  info() {},
+  warn() {},
+  error() {},
+};
 
 /** In-memory locks (no expiry). Owners are honoured: only the holder extends or releases a lock. */
 export function memoryLocks(): LockStore {
