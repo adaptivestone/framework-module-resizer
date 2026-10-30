@@ -80,8 +80,8 @@ regenerate on their next read. So:
 the timing keys of a custom queue driver's `queues` entry; see Fixes in `CHANGELOG.md`), and every
 public object `S3Storage` uploads (previews and public raster originals, and your own direct
 uploads, which must use new keys) carries `Cache-Control: public, max-age=31536000, immutable`, so
-purge your CDN when you delete one that must disappear sooner. Release candidates after
-`0.3.0-rc.5` change only internals.
+purge your CDN when you delete one that must disappear sooner (browsers that already have it may
+keep it until it expires). Release candidates after `0.3.0-rc.5` change only internals.
 `CHANGELOG.md` (`# 0.3.0`) has the details of everything below.
 
 ## Named queues: from `queue: { … }` to `queues`

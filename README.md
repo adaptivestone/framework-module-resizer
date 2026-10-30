@@ -418,7 +418,9 @@ and keeps the parts that loaded.
 
 The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Do not put
 symlinks into the public tree. Serve `rootDir` with a long-lived cache too, for example
-`express.static(rootDir, { immutable: true, maxAge: '1y' })`: preview file names are never reused.
+`express.static(rootDir, { immutable: true, maxAge: '1y' })`: every file name the module writes
+there is new (previews and public raster originals), so a file never changes under its URL; if you
+write your own files under `rootDir`, give each a new name.
 
 **`S3Storage`**
 
@@ -442,7 +444,8 @@ direct uploads) carries `Cache-Control: public, max-age=31536000, immutable`. Ev
 writes is new, so an object never changes under its URL; if you call `S3Storage.upload` yourself,
 give every upload a new key, as the `ResizeStorage.upload` contract requires (the driver does not
 check). CDNs and browsers keep these objects up to a year, so purge your CDN when you delete one
-that must disappear sooner. Private objects get no cache header.
+that must disappear sooner (browsers that already have it may keep it until it expires). Private
+objects get no cache header.
 
 **`mongoParts(connection, { mediaModel, timing?, logger? })`** returns `{ media, locks, tasks }`
 to spread into a Resizer: a `MongoMediaStore` over your media model, and a `MongoLockStore` and a

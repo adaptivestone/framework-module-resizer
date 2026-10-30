@@ -755,8 +755,9 @@ later release that puts the image engine behind a port.
   key the module writes is new, so an object never changes under its URL; a host that calls
   `S3Storage.upload` itself must give every upload a new key, as the `ResizeStorage.upload`
   contract requires (the driver does not check). CDNs and browsers keep these objects up to a
-  year, so purge your CDN when you delete one that must disappear sooner. Objects uploaded before
-  `0.3.0-rc.5` keep the headers they were stored with.
+  year, so purge your CDN when you delete one that must disappear sooner (browsers that already
+  have it may keep it until it expires). Objects uploaded before `0.3.0-rc.5` keep the headers they
+  were stored with.
 
 **Features**
 

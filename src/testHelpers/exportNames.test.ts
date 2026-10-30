@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import {
   type DocImport,
@@ -297,4 +298,145 @@ test('the word "import" in a comment does not swallow the next import', async ()
   );
   assert.equal(problems.length, 1, problems.join('\n'));
   assert.ok(problems[0].includes("'Gone'"), problems[0]);
+});
+
+// Each fenced line must yield one statement with one problem naming `named`.
+const assertOneProblem = async (line: string, named: string) => {
+  const imports = docImports(fenced(line));
+  assert.equal(imports.length, 1, line);
+  const problems = importProblems(
+    imports,
+    await packageEntries(),
+    exportKeys(),
+  );
+  assert.equal(problems.length, 1, `${line}\n${problems.join('\n')}`);
+  assert.ok(problems[0].includes(`'${named}'`), problems[0]);
+};
+
+test('an import with no space after the keyword is read, a comment there included', async () => {
+  for (const line of [
+    `import{ MissingExport }from '${PKG}/framework.js';`,
+    `import/* API */{ MissingExport } from '${PKG}/framework.js';`,
+    `import{MissingExport}from"${PKG}/framework.js";`,
+    `import*as gone from'${PKG}/drivers/gone.js';`,
+  ]) {
+    await assertOneProblem(
+      line,
+      line.includes('gone') ? './drivers/gone.js' : 'MissingExport',
+    );
+  }
+  assert.deepEqual(
+    docImports(fenced(`import'${PKG}/drivers/sqs.js';`)).map(shape),
+    [
+      {
+        subpath: './drivers/sqs.js',
+        typeOnly: false,
+        named: [],
+        sideEffect: true,
+      },
+    ],
+  );
+});
+
+test('`export … from` re-exports are read and checked like imports', async () => {
+  const entries = await packageEntries();
+  const keys = exportKeys();
+  const valid = docImports(
+    fenced(
+      [
+        `export { default } from '${PKG}/framework/ResizeTaskModel.js';`,
+        `export { FrameworkResizer as Resizer } from '${PKG}/framework.js';`,
+        `export type { MediaLike } from '${PKG}';`,
+        `export * from '${PKG}/drivers/fs.js';`,
+        `export * as s3 from '${PKG}/drivers/s3.js';`,
+      ].join('\n'),
+    ),
+  );
+  assert.deepEqual(valid.map(shape), [
+    {
+      subpath: './framework/ResizeTaskModel.js',
+      typeOnly: false,
+      named: [{ name: 'default', type: false }],
+      sideEffect: false,
+    },
+    {
+      subpath: './framework.js',
+      typeOnly: false,
+      named: [{ name: 'FrameworkResizer', type: false }],
+      sideEffect: false,
+    },
+    {
+      subpath: '.',
+      typeOnly: true,
+      named: [{ name: 'MediaLike', type: false }],
+      sideEffect: false,
+    },
+    {
+      subpath: './drivers/fs.js',
+      typeOnly: false,
+      named: [],
+      sideEffect: false,
+    },
+    {
+      subpath: './drivers/s3.js',
+      typeOnly: false,
+      namespace: 's3',
+      named: [],
+      sideEffect: false,
+    },
+  ]);
+  assert.deepEqual(importProblems(valid, entries, keys), []);
+  for (const [line, named] of [
+    [`export { MissingExport } from '${PKG}/framework.js';`, 'MissingExport'],
+    [`export{ MissingExport }from '${PKG}/framework.js';`, 'MissingExport'],
+    [`export { default } from '${PKG}/drivers/fs.js';`, 'default'],
+    [`export * from '${PKG}/drivers/gone.js';`, './drivers/gone.js'],
+    [`export * as gone from '${PKG}/gone.js';`, './gone.js'],
+  ]) {
+    await assertOneProblem(line, named);
+  }
+});
+
+test('a keyword that is part of a longer word, or names no module, is not a statement', () => {
+  for (const line of [
+    `imports from '${PKG}/gone.js';`,
+    `importer { NotThere } from '${PKG}';`,
+    `reimport { NotThere } from '${PKG}';`,
+    `$import { NotThere } from '${PKG}';`,
+    `loader.import { NotThere } from '${PKG}';`,
+    `exports { NotThere } from '${PKG}';`,
+    `export const name = '${PKG}/gone.js';`,
+    `export default '${PKG}/gone.js';`,
+    `export '${PKG}/gone.js';`,
+    `const mod = await import('${PKG}/gone.js');`,
+    `const url = import.meta.resolve('${PKG}/gone.js');`,
+  ]) {
+    assert.deepEqual(docImports(fenced(line)), [], line);
+  }
+});
+
+// A doc edit must fail the guard, never hang `npm test`, and node:test cannot interrupt a
+// synchronous scan: so the scan runs in a child process with a deadline. Each input is read in
+// well under the budget only when the scan is linear in the fence length.
+test('the scan is linear on a long statement without a specifier, or a comment that never closes', () => {
+  const url = new URL('./exportNames.ts', import.meta.url).href;
+  const script = `import { docImports } from ${JSON.stringify(url)};
+const spaces = ' '.repeat(100000);
+const inputs = { semicolon: 'import' + spaces + ';', unterminated: 'import' + spaces, comments: '/* '.repeat(50000) };
+const slow = [];
+for (const [name, body] of Object.entries(inputs)) {
+  const start = performance.now();
+  const found = docImports('\`\`\`ts\\n' + body + '\\n\`\`\`');
+  const ms = performance.now() - start;
+  if (found.length !== 0 || ms > 200) slow.push(name + ': ' + found.length + ' imports in ' + ms.toFixed(0) + ' ms');
+}
+if (slow.length > 0) { console.error(slow.join('\\n')); process.exit(1); }`;
+  const result = spawnSync(
+    process.execPath,
+    ['--experimental-strip-types', '--input-type=module', '-e', script],
+    { timeout: 5_000, encoding: 'utf8' },
+  );
+  assert.equal(result.error, undefined, 'the scan was killed at its deadline');
+  assert.equal(result.signal, null, 'the scan was killed at its deadline');
+  assert.equal(result.status, 0, result.stderr);
 });

@@ -159,12 +159,12 @@ test('every package specifier and …/x.js path README and AGENTS.md name is a k
   assert.ok(shortPaths >= 30, `only ${shortPaths} …/x.js paths found`);
 });
 
-// The files a task runs through, where a code can be marked terminal (`retryable: false`).
+// The files outside src/decoders/ and src/drivers/ that a task runs through, where a code can be
+// marked terminal (`retryable: false`). Every decoder and driver file is read from its folder, so
+// a new one is scanned without an edit here.
 const TASK_PATH = [
   'errors.ts',
   'decoderSet.ts',
-  'decoders/sharp.ts',
-  'decoders/svg.ts',
   'helpers/svgRaster.ts',
   'processor.ts',
   'render.ts',
@@ -179,22 +179,40 @@ const TASK_PATH = [
   'worker.ts',
 ];
 
-const driverFiles = (): string[] =>
-  readdirSync(new URL('./drivers/', import.meta.url), {
+// Every non-test `.ts` file under src/<folder>/, subfolders included: 'drivers/mongo/…'.
+const sourceFiles = (folder: string): string[] =>
+  readdirSync(new URL(`./${folder}/`, import.meta.url), {
     recursive: true,
     encoding: 'utf8',
   })
     .map((file) => file.split('\\').join('/'))
     .filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts'))
-    .map((file) => `drivers/${file}`);
+    .map((file) => `${folder}/${file}`);
+
+const taskPathFiles = (): string[] => [
+  ...TASK_PATH,
+  ...sourceFiles('decoders'),
+  ...sourceFiles('drivers'),
+];
+
+// A comment as spaces, its line breaks kept, so every index of the text stays on its line.
+const blank = (comment: string): string => comment.replace(/[^\n]/g, ' ');
 
 // The codes of the object literals in `file` that also hold `retryable: false`: a 'RESIZE_…'
-// literal, or a module constant of the same file that holds one. Comments are stripped first, so
-// a commented-out literal does not count.
-const terminalCodes = (file: string): Set<string> => {
+// literal, or a module constant of the same file that holds one. Comments are blanked first, so
+// a commented-out literal does not count. Every `retryable: false` the scan cannot tie to a code
+// (in an object with a nested object or a `${…}`, or beside a template literal, a helper call or
+// a property read) is returned as `file:line` in `unread`, so a shape the scan does not know fails
+// the guard instead of being skipped.
+const terminalScan = (
+  file: string,
+): { codes: Set<string>; read: number; unread: string[] } => {
   const text = readFileSync(new URL(`./${file}`, import.meta.url), 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+    .replace(/\/\*[\s\S]*?\*\//g, blank)
+    .replace(
+      /(^|[^:])(\/\/.*)$/gm,
+      (_, before: string, comment: string) => before + blank(comment),
+    );
   const constants = new Map(
     [
       ...text.matchAll(
@@ -203,20 +221,47 @@ const terminalCodes = (file: string): Set<string> => {
     ].map((m) => [m[1], m[2]]),
   );
   const codes = new Set<string>();
-  for (const [literal] of text.matchAll(/\{[^{}]*\}/g)) {
-    if (!/retryable:\s*false/.test(literal)) {
+  const resolved = new Set<number>(); // the index of each `retryable: false` tied to a code
+  for (const literal of text.matchAll(/\{[^{}]*\}/g)) {
+    const flags = [...literal[0].matchAll(/retryable:\s*false/g)];
+    if (flags.length === 0) {
       continue;
     }
     const code = /code:\s*(?:'(RESIZE_[A-Z0-9_]+)'|([A-Z_][A-Z0-9_]*))/.exec(
-      literal,
+      literal[0],
     );
     const value = code?.[1] ?? (code?.[2] && constants.get(code[2]));
     if (value) {
       codes.add(value);
+      for (const flag of flags) {
+        resolved.add(literal.index + flag.index);
+      }
     }
   }
-  return codes;
+  const unread = [...text.matchAll(/retryable:\s*false/g)]
+    .filter((flag) => !resolved.has(flag.index))
+    .map((flag) => `${file}:${text.slice(0, flag.index).split('\n').length}`);
+  return { codes, read: resolved.size, unread };
 };
+
+test('the terminal-code scan reads every decoder and driver file, and the consumer, worker and processor', () => {
+  const scanned = new Set(taskPathFiles());
+  const decoders = sourceFiles('decoders');
+  const drivers = sourceFiles('drivers');
+  assert.ok(decoders.length >= 2, `only ${decoders.length} decoder files`);
+  assert.ok(drivers.length >= 5, `only ${drivers.length} driver files`);
+  const required = [
+    ...decoders,
+    ...drivers,
+    'consumer.ts',
+    'worker.ts',
+    'processor.ts',
+  ];
+  assert.deepEqual(
+    required.filter((file) => !scanned.has(file)),
+    [],
+  );
+});
 
 test('the README lists exactly the codes a task is dead-lettered with at once', () => {
   const expected = [
@@ -227,13 +272,21 @@ test('the README lists exactly the codes a task is dead-lettered with at once', 
     'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
     'RESIZE_SVG_RENDER_TIMEOUT',
   ];
-  const files = [...TASK_PATH, ...driverFiles()];
+  const files = taskPathFiles();
   assert.ok(files.length >= 25, `only ${files.length} task-path files`);
   assert.deepEqual(
-    [...terminalCodes('decoderSet.ts')],
+    [...terminalScan('decoderSet.ts').codes],
     ['RESIZE_SOURCE_FORMAT_UNSUPPORTED'],
   );
-  const inCode = new Set(files.flatMap((file) => [...terminalCodes(file)]));
+  const scans = files.map(terminalScan);
+  assert.deepEqual(
+    scans.flatMap((scan) => scan.unread),
+    [],
+    'a `retryable: false` the scan cannot tie to a code',
+  );
+  const sites = scans.reduce((sum, scan) => sum + scan.read, 0);
+  assert.ok(sites >= 12, `only ${sites} \`retryable: false\` sites read`);
+  const inCode = new Set(scans.flatMap((scan) => [...scan.codes]));
   assert.deepEqual([...inCode].sort(), expected);
 
   const readme = read('README.md');
