@@ -15,6 +15,8 @@
 - `0.3.0-rc.4`: metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics`, the `metrics` option) and
   the freshness check, which regenerates outdated previews (see Changed behaviour for the storage
   cost).
+- `0.3.0-rc.5`: long-lived cache headers on S3 public objects, and hygiene (test types, doc
+  guards); no host change.
 - Later release candidates: internal changes that need no host change.
 
 `variantSteps` keep their Sharp instance in `0.3.0-rc.2`, now over each size's pixels (operations
@@ -745,6 +747,17 @@ later release that puts the image engine behind a port.
   its fit previews on every read. `MongoMediaStore.verify()` logs one warning (it does not throw)
   when strict preview rows lack `fit`: declare it as `{ type: Boolean }`.
 
+**Changed behaviour** (`0.3.0-rc.5`, without a host change)
+
+- **S3 public objects are cached for a year.** Every public object `S3Storage` uploads (previews
+  and public raster originals, and a host's own direct uploads) carries
+  `Cache-Control: public, max-age=31536000, immutable`; private objects get no cache header. Every
+  key the module writes is new, so an object never changes under its URL; a host that calls
+  `S3Storage.upload` itself must give every upload a new key, as the `ResizeStorage.upload`
+  contract requires (the driver does not check). CDNs and browsers keep these objects up to a
+  year, so purge your CDN when you delete one that must disappear sooner. Objects uploaded before
+  `0.3.0-rc.5` keep the headers they were stored with.
+
 **Features**
 
 - **Metrics.** A Resizer reports reads, uploads, rendered variants, task outcomes and the worker's
@@ -988,6 +1001,14 @@ later release that puts the image engine behind a port.
 - One read or pre-warm takes at most one lock (the gate lock, beside a task queue without
   `gatesByTask`) instead of a dispatch lock per variant, one after another.
 - `package.json` points to the right repository (`adaptivestone/framework-module-resizer`).
+- `NoopMetrics` declares its parameters, all optional (`0.3.0-rc.5`), so a call with arguments
+  (`new NoopMetrics().count('resize.read', 1)`) type-checks and a call without them still does.
+  A widening: compatible for every call, subclass and config the runtime accepts.
+- A custom queue driver's `queues` entry may hold the timing keys (`leaseMs`, `retryBackoffMs`,
+  `maxAttempts`, `idlePollMs`, `taskTimeoutMs`, each optional) at the type level, as the runtime
+  already accepted (`0.3.0-rc.5`). A widening: compatible for every call, subclass and config the
+  runtime accepts. A host section type that declared a timing key with another type (e.g.
+  `maxAttempts: string`) now fails to type-check; the runtime already rejected such a value.
 
 **Internal**
 
@@ -1011,6 +1032,13 @@ later release that puts the image engine behind a port.
 - The factory: `createResizer` and `FrameworkResizer` share one path from a config to Resizer
   options (the image merge, the driver registry, the queue set, the peer probe); only
   `src/factory/builtins.ts` imports a driver module dynamically.
+- `types:check` covers the tests and the root tooling (`tsconfig.tests.json`); `types:check:src`
+  keeps the type pins (`tsconfig.type-pins.json`) against the minimum peers.
+- README and AGENTS.md are checked against the exports (`src/docsExports.test.ts`).
+- The smoke compiles fresh default, `--eager` and `--eject` scaffolds against the installed
+  package.
+- `processTask` stays internal: a pushed task would skip the worker's task lifecycle (lease
+  renewal, retries, dead-letters, the gate lock). Push delivery is not supported in 0.3.0.
 
 # 0.2.1
 

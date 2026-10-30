@@ -204,6 +204,10 @@ is `RESIZE_CONFIG_STORAGE_MISSING`; without a `database` section or a `media` op
 `RESIZE_MEDIA_REQUIRED`; a `'database'` queue without a `database` section is
 `RESIZE_CONFIG_INVALID`.
 
+With strict types, a loaded Mongoose document is not a `MediaLike` (Mongoose types the nested
+fields as nullable): pass it as `media: doc as MediaLike` (`import type { MediaLike }` from the
+main entry), or type the model's `original` and `previews` paths with `Original` and `Preview`.
+
 Wired by hand, the same Resizer is:
 
 ```ts
@@ -413,7 +417,8 @@ and keeps the parts that loaded.
 | `privateRootDir` | optional | Private originals; default `rootDir` + `-private`, and never inside `rootDir` |
 
 The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Do not put
-symlinks into the public tree.
+symlinks into the public tree. Serve `rootDir` with a long-lived cache too, for example
+`express.static(rootDir, { immutable: true, maxAge: '1y' })`: preview file names are never reused.
 
 **`S3Storage`**
 
@@ -431,6 +436,13 @@ bucket policy, not a per-object ACL. Without `publicBaseUrl`, URLs are virtual-h
 `forcePathStyle` (`<endpoint>/<bucket>/<key>`; without an endpoint,
 `https://s3.<region>.amazonaws.com/<bucket>/<key>`). China regions (`cn-…`) use
 `amazonaws.com.cn` in both forms. SVG objects are uploaded with `Content-Disposition: attachment`.
+
+Every public object `S3Storage` uploads (previews and public raster originals, and a host's own
+direct uploads) carries `Cache-Control: public, max-age=31536000, immutable`. Every key the module
+writes is new, so an object never changes under its URL; if you call `S3Storage.upload` yourself,
+give every upload a new key, as the `ResizeStorage.upload` contract requires (the driver does not
+check). CDNs and browsers keep these objects up to a year, so purge your CDN when you delete one
+that must disappear sooner. Private objects get no cache header.
 
 **`mongoParts(connection, { mediaModel, timing?, logger? })`** returns `{ media, locks, tasks }`
 to spread into a Resizer: a `MongoMediaStore` over your media model, and a `MongoLockStore` and a
@@ -1448,6 +1460,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   duplicates them. A task completes only when every requested
   variant is stored fresh. When an attempt is only partly successful, its previews are saved and the
   next attempt makes only the missing ones.
+- **Push delivery** (an SQS-triggered Lambda) is not supported in 0.3.0: run the worker as a
+  long-lived process (`runWorker`, or `npm run cli ResizeWorker`). The worker runs each task's
+  lifecycle (lease renewal, retries, dead-letters, the gate lock), which a pushed task would skip.
 - **Retrying a dead task:** after fixing the cause, call `prewarm()` for that media once the
   cooldown (`coordination.cooldownMs`, 10 minutes by default) has ended: on Mongo its `add()` then
   takes the dead row over and queues a new task. Until then `prewarm()` reports the retryable
@@ -1552,7 +1567,10 @@ exhaustive.
 `npm test` runs the `node:test` suite. Core tests construct `new Resizer({ … })` with fakes and
 need no framework app. Framework-adapter tests install a fake app with `setAppInstance()`.
 `src/importGraph.test.ts` fails if the main entry ever reaches framework code. Before a release,
-run `npm run build` and `npm run smoke`.
+run `npm run build` and `npm run smoke`. `npm run types:check` checks the shipped code
+(`tsconfig.json`), then the tests, the test helpers and the root tooling (`tsconfig.tests.json`).
+`npm run types:check:src` checks the shipped code and the type pins (`tsconfig.type-pins.json`);
+CI runs it against the minimum peer versions.
 `node --experimental-strip-types bench/renderOnce.ts [rounds] [--single-thread]` benchmarks the
 render path (3 sizes × JPEG and WebP from one 24 MP JPEG) against a "resize once per size"
 baseline, with an A/A control, and exits 0 (PASS: within 5% of the baseline in wall and CPU
