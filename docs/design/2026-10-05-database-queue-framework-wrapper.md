@@ -4,6 +4,22 @@ Status: **implemented** in pull requests #46 and #47 (proposed 2026-10-05). Foll
 [drivers and framework independence](./2026-10-02-drivers-and-framework-independence.md) (Q1–Q4,
 merged). Pre-release: breaking changes are fine; hosts migrate their own data.
 
+> **Superseded** by [the reference architecture](./2026-10-26-reference-architecture.md) (0.3.0,
+> S1–S6). Read this doc for history only. What no longer holds:
+> - E1: `ResizeDatabase` is split back into `MediaStore` and `LockStore`. `TaskQueue.add`
+>   resolves a `TaskAddResult` (`added`, `in-flight` or `unconfirmed`), and the optional flags
+>   `gatesByTask` and `claimFilters` change what the core does around it.
+> - E2: de-duplication by `requestKey` is replaced by one gate per Resizer, media, pipeline and
+>   queue. `lockTtlMs` is replaced by `coordination.gateTtlMs` and `coordination.cooldownMs`.
+> - E4: the `db` option is now `media`, `locks` and `tasks`
+>   (`...mongoParts(connection, { mediaModel })`), and the `queue` option is `queueName`.
+> - E5: the framework config's `queue: { … }` object is the process-wide `queues` map and a
+>   `queue` name. A plain-Node app builds a Resizer from one config object with
+>   `createResizer()`.
+>
+> Still as decided: E2's core-owned queue logic, E3's SQS operations, and R2's parts as functions
+> resolved on first use.
+
 ## Goal
 
 Three layers:

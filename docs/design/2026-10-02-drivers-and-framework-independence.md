@@ -4,6 +4,27 @@ Status: **accepted** 2026-10-02 and implemented in phases Q1–Q4. Follows
 [the multi-resizer redesign](./2026-09-30-multi-resizer.md) (P1–P4, merged). Pre-release:
 breaking changes are fine; hosts migrate their own data.
 
+> **Superseded** by [the reference architecture](./2026-10-26-reference-architecture.md) (0.3.0,
+> S1–S6), through
+> [database, queue and framework wrapper](./2026-10-05-database-queue-framework-wrapper.md). Read
+> this doc for history only. What no longer holds:
+> - D1: `QueueTransport` is now `TaskQueue`, which only stores tasks; the core runs the worker
+>   loop. `MediaStore` is `loadMedia`, `appendPreviews` and `replacePreviews`. `LockStore` locks
+>   carry an owner (`release(key, owner)`). `canServeOriginalPublicly` is gone: no original is
+>   ever served.
+> - D2: locks are a Resizer part (`locks`), used only for the gate of a task queue without
+>   `gatesByTask`. The per-identity locks and `requestKey` are gone.
+> - D3, D4: the transports are `MongoTaskQueue` and `SqsTaskQueue` (`mongoParts()` builds the
+>   Mongo parts). The framework adapter is `new FrameworkResizer({ pipelines, hooks })`, which
+>   reads everything else from the config files; there is no `createFrameworkResizer` or
+>   `createFrameworkMongoTransport`.
+> - D6: the framework config's `queue` section is the process-wide `queues` map and a `queue`
+>   name. Lock TTLs are the Resizer's `coordination` (`gateTtlMs`, `cooldownMs`).
+> - D8: one consume loop per backend and queue name.
+>
+> Still as decided: D5 (optional peers), D7 (one `prewarm()`), D9 (the framework adapter reads
+> lazily).
+
 ## Goal
 
 The module is a core plus drivers. Every kind of driver has a published abstract contract (the
