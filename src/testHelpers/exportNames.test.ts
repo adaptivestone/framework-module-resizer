@@ -433,6 +433,30 @@ test('a local `export` without a quote or `;` does not swallow the import after 
   assert.deepEqual(imp?.named, [{ name: 'Resizer', type: false }]);
 });
 
+test('a keyword inside the braces of a clause does not start a statement', async () => {
+  for (const line of [
+    `import { import as I, MissingExport } from '${PKG}';`,
+    `import { MissingExport, import as I } from '${PKG}';`,
+  ]) {
+    const imports = docImports(fenced(line));
+    assert.equal(imports.length, 1, line);
+    assert.deepEqual(
+      imports[0].named.map((n) => n.name).sort(),
+      ['MissingExport', 'import'],
+      line,
+    );
+    const problems = importProblems(
+      imports,
+      await packageEntries(),
+      exportKeys(),
+    );
+    assert.ok(
+      problems.some((p) => p.includes("'MissingExport'")),
+      problems.join('\n'),
+    );
+  }
+});
+
 test('a string import name (ES2022) is read and checked', async () => {
   await assertOneProblem(
     `import {"MissingExport" as X} from '${PKG}';`,

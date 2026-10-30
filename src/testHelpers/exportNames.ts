@@ -237,9 +237,9 @@ const stringEnd = (code: string, open: number): number => {
 // keyword the scan walks forward, counting braces: a `;` means no specifier; a quote inside an
 // open `{` is a string import name (`{ "a-b" as x }`) and belongs to the clause; a quote outside
 // braces opens the specifier, and a clause that then does not end in `from` names no module this
-// way (a dynamic `import(…)`, `import.meta`). Another statement keyword met on the way starts the
-// statement again there, so a local `export` or an unfinished line never swallows the import after
-// it. What follows the specifier (`with { type: 'json' }`, `;`) is not read. One forward pass:
+// way (a dynamic `import(…)`, `import.meta`). Another statement keyword met on the way outside
+// braces starts the statement again there, so a local `export` or an unfinished line never
+// swallows the import after it; inside braces it is a name (`{ import as I }`). What follows the specifier (`with { type: 'json' }`, `;`) is not read. One forward pass:
 // linear in the body's length.
 function moduleStatements(
   code: string,
@@ -272,7 +272,10 @@ function moduleStatements(
     let at = clauseStart;
     for (; at < code.length; at += 1) {
       if (next < starts.length && starts[next].index === at) {
-        break; // a later keyword: the statement starts again there
+        if (depth === 0) {
+          break; // a later keyword: the statement starts again there
+        }
+        next += 1; // inside braces it is a name (`{ import as I }`), not a statement
       }
       const char = code[at];
       if (char === ';') {

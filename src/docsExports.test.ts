@@ -214,11 +214,13 @@ const terminalScan = (
       /(^|[^:])(\/\/.*)$/gm,
       (_, before: string, comment: string) => before + blank(comment),
     );
-  // Module constants bound to a string literal and nothing more (`const X = 'RESIZE_…';`).
+  // Module constants bound to a string literal and nothing more: `const X = 'RESIZE_…';`, the `;`
+  // right after the closing quote (spaces allowed before it). A value continued on the next line
+  // (`'RESIZE_…'` then `+ '_NEW';`) binds no code, so its uses stay unread.
   const constants = new Map(
     [
       ...text.matchAll(
-        /const\s+([A-Z_][A-Z0-9_]*)\s*=\s*'(RESIZE_[A-Z0-9_]+)'\s*(?:;|$)/gm,
+        /const\s+([A-Z_][A-Z0-9_]*)\s*=\s*'(RESIZE_[A-Z0-9_]+)'[ \t]*;/g,
       ),
     ].map((m) => [m[1], m[2]]),
   );
