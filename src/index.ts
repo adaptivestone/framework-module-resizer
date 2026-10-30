@@ -74,7 +74,13 @@ export {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
-// --- the config a Resizer is built from: image settings over the defaults, and its sections ---
+// --- the config a Resizer is built from: image settings over the defaults, and its sections;
+// createResizer builds a Resizer from it, each section through a built-in driver or one the host
+// registers by name (the built-in drivers' modules load only when a config selects them) ---
+export {
+  type CreateResizerOptions,
+  createResizer,
+} from './factory/createResizer.ts';
 export type { ResizerConfig } from './factory/types.ts';
 // --- public URL formatting and size catalog helpers ---
 export { formatPictureUrls } from './formatPictureUrls.ts';

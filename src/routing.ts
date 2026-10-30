@@ -38,8 +38,12 @@ type Builder = () => Promise<TaskQueue>;
 
 const REQUIRED_METHODS = ['add', 'claim', 'renew', 'complete', 'fail'] as const;
 
-/** True for an object with the five required TaskQueue methods (duck typing, never the class). */
-function isTaskQueue(value: unknown): value is TaskQueue {
+/**
+ * True for an object with the five required TaskQueue methods (duck typing, never the class).
+ * Internal: the main entry does not export it.
+ * @internal
+ */
+export function isTaskQueue(value: unknown): value is TaskQueue {
   if (typeof value !== 'object' || value === null) {
     return false;
   }

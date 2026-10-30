@@ -23,9 +23,11 @@ const removed = (message: string): ResizeConfigError =>
     code: 'RESIZE_CONFIG_REMOVED_KEY',
   });
 
-// The driver names a message offers: the registered ones in registry order (the built-in ones
-// first), as 'a', 'b' or 'c'.
-const driverChoice = (names: readonly string[]): string => {
+/**
+ * The driver names a message offers: the registered ones in registry order (the built-in ones
+ * first), as 'a', 'b' or 'c'.
+ */
+export const driverChoice = (names: readonly string[]): string => {
   const quoted = names.map((name) => `'${name}'`);
   return quoted.length > 1
     ? `${quoted.slice(0, -1).join(', ')} or ${quoted[quoted.length - 1]}`

@@ -7,10 +7,18 @@
 // the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it. observedQueue
 // wraps one so a test can stop an idle worker once its work is handled. fakeQueueDriver is a queue
 // driver factory over PlainTaskQueue; fakeDatabaseParts are database parts whose task queue is a
-// MemoryTaskQueue; silentLogger drops every message.
-import type { DatabaseParts, QueueDriver } from '../contracts/drivers.ts';
+// MemoryTaskQueue; memoryStorage keeps files in a map; memoryStorageDriver and
+// fakeDatabaseDriver are the storage and database drivers a test registers by name;
+// silentLogger drops every message.
+import type {
+  DatabaseDriver,
+  DatabaseParts,
+  QueueDriver,
+  StorageDriver,
+} from '../contracts/drivers.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
+import type { ResizeStorage } from '../contracts/storage.ts';
 import {
   type ClaimedTask,
   type ClaimOptions,
@@ -25,6 +33,7 @@ import type {
   Preview,
   QueueTimingOptions,
   ResizeLogger,
+  StorageRef,
 } from '../types.d.ts';
 
 /** A logger that drops every message. */
@@ -543,15 +552,26 @@ export function sigtermOnceClaimed(
 
 /**
  * A queue driver with the given `validate` (none by default): its `fromConfig` builds a
- * PlainTaskQueue serving exactly the names of the entries it is given.
+ * PlainTaskQueue serving exactly the names of the entries it is given, each with its entry's
+ * timing, and keeps each queue it built in `built`.
  */
 export function fakeQueueDriver(
   validate?: QueueDriver['validate'],
-): QueueDriver {
+): QueueDriver & { built: PlainTaskQueue[] } {
+  const built: PlainTaskQueue[] = [];
   return {
     ...(validate ? { validate } : {}),
-    fromConfig: (entries) =>
-      new PlainTaskQueue({ queues: entries.map((entry) => entry.name) }),
+    built,
+    fromConfig: (entries) => {
+      const tasks = new PlainTaskQueue({
+        queues: entries.map((entry) => entry.name),
+        queueTiming: Object.fromEntries(
+          entries.map((entry) => [entry.name, entry.timing]),
+        ),
+      });
+      built.push(tasks);
+      return tasks;
+    },
   };
 }
 
@@ -560,27 +580,125 @@ export type DatabaseTaskQueueOptions = Parameters<
   NonNullable<DatabaseParts['taskQueue']>
 >[0];
 
-/**
- * Database parts over fakeMedia and memoryLocks. `taskQueue` builds a MemoryTaskQueue serving
- * exactly the names it is given and records each call's options in `taskQueueCalls`, with the
- * queue it built in `built`.
- */
-export function fakeDatabaseParts(): DatabaseParts & {
+/** Database parts as fakeDatabaseParts() builds them, with its records. */
+export type FakeDatabaseParts = DatabaseParts & {
   taskQueueCalls: DatabaseTaskQueueOptions[];
   built: MemoryTaskQueue[];
-} {
+};
+
+/**
+ * Database parts over `media` (default fakeMedia()) and memoryLocks. `taskQueue` builds a
+ * MemoryTaskQueue serving exactly the names it is given, each with the timing `getTiming` gives
+ * it, and records each call's options in `taskQueueCalls`, with the queue it built in `built`.
+ */
+export function fakeDatabaseParts(
+  media: MediaStore = fakeMedia(),
+): FakeDatabaseParts {
   const taskQueueCalls: DatabaseTaskQueueOptions[] = [];
   const built: MemoryTaskQueue[] = [];
   return {
-    media: fakeMedia(),
+    media,
     locks: memoryLocks(),
     taskQueueCalls,
     built,
     taskQueue(opts) {
       taskQueueCalls.push(opts);
-      const tasks = new MemoryTaskQueue({ queues: opts.queues });
+      const tasks = new MemoryTaskQueue({
+        queues: opts.queues,
+        queueTiming: Object.fromEntries(
+          opts.queues.map((queue) => [queue, opts.getTiming(queue) ?? {}]),
+        ),
+      });
       built.push(tasks);
       return tasks;
+    },
+  };
+}
+
+/**
+ * Storage in memory: files by key, refs are `{ key }`, public URLs are `/m/<key>`. `files` is open
+ * for assertions.
+ */
+export function memoryStorage(): {
+  storage: ResizeStorage;
+  files: Map<string, Buffer>;
+} {
+  const files = new Map<string, Buffer>();
+  const keyOf = (ref: StorageRef) => (ref as { key: string }).key;
+  const storage: ResizeStorage = {
+    download: async (ref) => {
+      const body = files.get(keyOf(ref));
+      if (body === undefined) {
+        throw new Error(`no file ${keyOf(ref)}`);
+      }
+      return body;
+    },
+    upload: async ({ key, body }) => {
+      files.set(key, Buffer.from(body));
+      return { key };
+    },
+    publicUrl: (ref) => `/m/${keyOf(ref)}`,
+  };
+  return { storage, files };
+}
+
+/** A storage driver whose `fromConfig` builds a new memoryStorage(), kept in `built`. */
+export function memoryStorageDriver(): StorageDriver & {
+  built: ResizeStorage[];
+} {
+  const built: ResizeStorage[] = [];
+  return {
+    built,
+    fromConfig: () => {
+      const { storage } = memoryStorage();
+      built.push(storage);
+      return storage;
+    },
+  };
+}
+
+/**
+ * A MediaStore over the media documents in `docs`: loadMedia returns the document, and stored
+ * previews land on its `previews` (one row per preview identity), so a test that holds the
+ * document sees what a worker stored.
+ */
+export function docMedia(docs: Map<string, MediaLike>): MediaStore {
+  return fakeMedia({
+    load: async (id) => docs.get(id) ?? null,
+    appendPreviews: async (id, previews: Preview[]) => {
+      const doc = docs.get(id);
+      if (!doc) {
+        return [];
+      }
+      const rows = doc.previews ?? [];
+      const stored = previews.filter(
+        (preview) =>
+          preview.identity === undefined ||
+          !rows.some((row) => row.identity === preview.identity),
+      );
+      doc.previews = [...rows, ...stored];
+      return stored;
+    },
+  });
+}
+
+/**
+ * A database driver whose `fromConfig` builds fakeDatabaseParts() over docMedia(docs); each parts
+ * object it built is kept in `built`.
+ */
+export function fakeDatabaseDriver(): DatabaseDriver & {
+  docs: Map<string, MediaLike>;
+  built: FakeDatabaseParts[];
+} {
+  const docs = new Map<string, MediaLike>();
+  const built: FakeDatabaseParts[] = [];
+  return {
+    docs,
+    built,
+    fromConfig: () => {
+      const parts = fakeDatabaseParts(docMedia(docs));
+      built.push(parts);
+      return parts;
     },
   };
 }

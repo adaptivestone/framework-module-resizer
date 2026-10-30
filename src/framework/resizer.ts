@@ -20,6 +20,7 @@ import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
 import { ResizeConfigError } from '../errors.ts';
+import { type Lane as ChosenLane, chooseLane } from '../factory/lane.ts';
 import { importDriver } from '../helpers/peers.ts';
 import { Resizer, type ResizerOptions } from '../resizer.ts';
 import type {
@@ -110,13 +111,21 @@ export class FrameworkResizer extends Resizer {
     // that fails (e.g. a name `queues` does not define) is made again on the next call.
     let lane: Lane | undefined;
     const readLane = (): Lane => {
-      lane ??= chooseLane({
-        resizer: rest.name ?? 'default',
-        where,
-        option: queueName,
-        file: read().queue,
-        fromCode: tasks !== undefined,
-      });
+      if (!lane) {
+        const chosen = chooseLane<ResolvedQueue>({
+          resizer: rest.name ?? 'default',
+          where,
+          queuesIn: 'src/config/resize.ts',
+          option: queueName,
+          file: read().queue,
+          fromCode: tasks !== undefined,
+          queues: () => getProcessConfig().queues,
+        });
+        lane = {
+          ...chosen,
+          processConfig: chosen.entry ? getProcessConfig() : undefined,
+        };
+      }
       return lane;
     };
     // The task queue of that queue, built once for the `tasks` part and the default `locks` part:
@@ -174,59 +183,8 @@ export class FrameworkResizer extends Resizer {
 }
 
 /** The queue a Resizer's tasks go to: its name, and the `queues` entry to build the task queue for. */
-interface Lane {
-  queueName: string;
-  // undefined: no task queue from the config (eager only, or the task queue was given in code)
-  entry: ResolvedQueue | undefined;
+interface Lane extends ChosenLane<ResolvedQueue> {
   processConfig: ResolvedProcessConfig | undefined;
-}
-
-/**
- * Choose the queue of a Resizer from the `queueName` option (`option`), else its file's `queue`
- * (`file`). With a task queue in code (`fromCode`), the lane is not looked up in `queues`: the name
- * is the option, the file's name, or 'default' (`coordination` may still read and validate
- * src/config/resize.ts as a whole). Otherwise false is eager only; no name is 'default' when
- * src/config/resize.ts defines queues, and eager only when it defines none; a name it does not
- * define is RESIZE_CONFIG_QUEUE_UNKNOWN.
- */
-function chooseLane(opts: {
-  resizer: string; // the Resizer's name, for the message
-  where: string; // its config, for the message
-  option: string | undefined;
-  file: string | false | undefined;
-  fromCode: boolean;
-}): Lane {
-  const { resizer, where, option, file, fromCode } = opts;
-  if (fromCode) {
-    const queueName = option ?? (typeof file === 'string' ? file : 'default');
-    return { queueName, entry: undefined, processConfig: undefined };
-  }
-  const name = option ?? file;
-  if (name === false) {
-    return { queueName: 'default', entry: undefined, processConfig: undefined };
-  }
-  const processConfig = getProcessConfig();
-  if (name === undefined && processConfig.queues.size === 0) {
-    return { queueName: 'default', entry: undefined, processConfig: undefined };
-  }
-  const queueName = name ?? 'default';
-  const entry = processConfig.queues.get(queueName);
-  if (!entry) {
-    const implied =
-      name === undefined
-        ? ` (the default when ${where} sets no \`queue\`)`
-        : '';
-    // The option wins over the file, so a name from it is fixed in the code.
-    const fix =
-      option === undefined
-        ? 'set `queue` to a defined name, or queue: false for eager only'
-        : 'set `queueName` to a defined name, or pass tasks: false for eager only';
-    throw new ResizeConfigError(
-      `resize config: Resizer '${resizer}' queues to '${queueName}'${implied}, which \`queues\` in src/config/resize.ts does not define — add queues.${queueName}, ${fix}`,
-      { code: 'RESIZE_CONFIG_QUEUE_UNKNOWN' },
-    );
-  }
-  return { queueName, entry, processConfig };
 }
 
 /** The lock store for the gate locks of `tasks`: needed only beside a queue without gatesByTask. */
