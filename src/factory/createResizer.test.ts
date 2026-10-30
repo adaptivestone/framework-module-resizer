@@ -172,7 +172,8 @@ test('a custom queue driver registered by name: queues on two backends route, an
 
 test('backends are told apart by driver and backend, whatever characters their names hold', async () => {
   // Driver 'a' with backend 'b:c' and driver 'a:b' with backend 'c' are two backends.
-  const backendOf = (section: { backend?: unknown }) => String(section.backend);
+  const backendOf = (section: { driver: string; backend?: unknown }) =>
+    String(section.backend);
   const a = { ...fakeQueueDriver(), backendOf };
   const ab = { ...fakeQueueDriver(), backendOf };
   const resizer = createResizer(
@@ -841,7 +842,7 @@ test('options win over the config: storage, media, tasks: false, queueName', asy
 
 test('a metrics option reaches the Resizer; without one it is a LogMetrics on its logger', () => {
   const memory = memoryStorageDriver();
-  const config = { storage: { driver: 'memory' } };
+  const config = { storage: { driver: 'memory' } } as const;
   const sink = recordingMetrics();
   const metered = createResizer(config, {
     name: 'metered',

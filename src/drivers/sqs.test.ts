@@ -444,6 +444,7 @@ describe('SqsTaskQueue.claim', () => {
       client,
     });
     const task = await tasks.claim('bulk', 60_000);
+    assert.ok(task);
     assert.equal(task.resizer, 'default');
     assert.equal(task.queue, 'bulk');
     assert.equal(task.attempts, 1);
@@ -508,7 +509,9 @@ describe('SqsTaskQueue.claim', () => {
       message: message({ MessageId: undefined }),
     });
     const tasks = new SqsTaskQueue({ queueUrl: 'q', client });
-    assert.equal((await tasks.claim('default', 60_000)).taskId, 'rh');
+    const task = await tasks.claim('default', 60_000);
+    assert.ok(task);
+    assert.equal(task.taskId, 'rh');
   });
   test('malformed task bodies go to the configured dead-letter queue before deletion', async () => {
     for (const body of ['not json{{{', JSON.stringify({ mediaId: 'm1' })]) {

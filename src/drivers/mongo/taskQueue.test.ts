@@ -58,7 +58,7 @@ before(async () => {
     autoIndex: false,
   });
   ResizeTaskModel.initHooks(schema);
-  M = connection.model('ResizeTask', schema);
+  M = connection.model<Record<string, unknown>>('ResizeTask', schema);
   await M.createCollection();
   await M.createIndexes();
 });
@@ -263,10 +263,17 @@ async function consumeOne(
   return rec;
 }
 
+/** A task row as insert() returns it: the document's fields, with its ObjectId. */
+type InsertedTask = Record<string, unknown> & { _id: mongoose.Types.ObjectId };
+
 async function insert(
   over: Record<string, unknown> = {},
   createdAt?: Date,
-): Promise<Record<string, unknown>> {
+): Promise<InsertedTask> {
+  // Mongoose's CreateOptions type lists no `writeConcern`, though save() applies it.
+  const majority: mongoose.CreateOptions & { writeConcern: { w: string } } = {
+    writeConcern: { w: 'majority' },
+  };
   const [doc] = await M.create(
     [
       {
@@ -278,13 +285,14 @@ async function insert(
         ...over,
       },
     ],
-    { writeConcern: { w: 'majority' } },
+    majority,
   );
+  const row = doc as unknown as InsertedTask;
   if (createdAt) {
     // Bypass Mongoose timestamp management for deterministic oldest-first ordering.
-    await M.collection.updateOne({ _id: doc._id }, { $set: { createdAt } });
+    await M.collection.updateOne({ _id: row._id }, { $set: { createdAt } });
   }
-  return doc as unknown as Record<string, unknown>;
+  return row;
 }
 
 const past = () => new Date(Date.now() - 60_000);
@@ -2107,7 +2115,7 @@ describe('MongoTaskQueue task times', () => {
       for (const [keys, options] of resizeTaskIndexes) {
         schema.index(keys, options);
       }
-      Strict = connection.model(name, schema);
+      Strict = connection.model<Record<string, unknown>>(name, schema);
       await Strict.createCollection();
       await Strict.createIndexes();
     }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { S3Client } from '@aws-sdk/client-s3';
 import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
-import { silentLogger } from '../testHelpers/fakes.ts';
+import { asS3Client, silentLogger } from '../testHelpers/fakes.ts';
 import type { S3StorageConfig } from '../types.d.ts';
 import { S3Storage } from './s3.ts';
 
@@ -25,7 +25,7 @@ function fakeClient() {
       return {};
     },
   };
-  return { client, sent };
+  return { client: asS3Client(client), sent };
 }
 
 const args = (key: string, visibility: 'public' | 'private') => ({

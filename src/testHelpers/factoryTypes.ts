@@ -130,6 +130,23 @@ export const withRedis = {
     bulk: { driver: 'redis', url: 'redis://r' },
   },
 } satisfies ResizerConfig<{ queue: { redis: typeof redisQueue } }>;
+// A custom queue entry may carry the timing keys the core reads from every entry.
+export const withRedisTiming = {
+  queues: {
+    bulk: {
+      driver: 'redis',
+      url: 'redis://r',
+      maxAttempts: 3,
+      leaseMs: 60_000,
+    },
+  },
+} satisfies ResizerConfig<{ queue: { redis: typeof redisQueue } }>;
+export const redisTimingWrongType: ResizerConfig<{
+  queue: { redis: typeof redisQueue };
+}> = {
+  // @ts-expect-error a timing key keeps its type
+  queues: { bulk: { driver: 'redis', url: 'redis://r', maxAttempts: '3' } },
+};
 export const redisWithoutUrl: ResizerConfig<{
   queue: { redis: typeof redisQueue };
 }> = {
