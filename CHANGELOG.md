@@ -49,8 +49,9 @@ later release that puts the image engine behind a port.
     `queue` object was on the same backend (both `database`, or the same SQS settings) drops it and
     keeps `queue: 'default'`: the Resizers share that queue, and no new worker is needed. Only a
     queue on a different backend, or one that should get its own timing, needs a name of its own in
-    `queues` and `queue: '<that name>'`, and every new name needs its own worker process:
-    `npm run cli ResizeWorker -- --queue=<name>`. A `queue` object, in any file, is `RESIZE_CONFIG_REMOVED_KEY`
+    `queues` and `queue: '<that name>'`, and every new name needs a worker that consumes it:
+    `npm run cli ResizeWorker -- --queue=<name>`, or, from `0.3.0-rc.3`, one worker for several
+    names (`--queue=default --queue=<name>`). A `queue` object, in any file, is `RESIZE_CONFIG_REMOVED_KEY`
     with the new shape in the message, and so is `queues.<name>.queues` (give each SQS queue its own
     entry).
   - `RESIZE_CONFIG_INVALID` also covers a malformed `queues` map or entry (no `driver`, an SQS
@@ -144,8 +145,8 @@ later release that puts the image engine behind a port.
   `resolve()` logs a warning once per queue name. On SQS this replaces the logged
   `RESIZE_SQS_QUEUE_UNKNOWN` and the issue `RESIZE_ENQUEUE_QUEUE_FAILED` for a queue name without a
   URL; `SqsTaskQueue` still throws `RESIZE_SQS_QUEUE_UNKNOWN` to a direct caller. A Resizer's own
-  `queueName` that its task queue does not serve is still caught by `verify()` and worker start
-  (`RESIZE_QUEUE_NOT_SERVED`).
+  `queueName` that its task queue does not serve is still caught by `verify()` and, when the
+  worker consumes that queue, by worker start (`RESIZE_QUEUE_NOT_SERVED`).
 - **`SqsTaskQueue` `queueUrl` is optional beside `queues`.** `queues` may name `'default'` too,
   and a queue that serves only other names needs no `queueUrl`;
   `RESIZE_SQS_QUEUE_URL_REQUIRED` now means that neither `queueUrl` nor a `queues` entry gives a
@@ -373,8 +374,9 @@ later release that puts the image engine behind a port.
     SendMessage), so `sqs-consumer` is no longer a peer. Retries are the core's, a dead task goes
     to `deadLetterQueueUrl` (when set) and `onTaskDeadLettered` fires for SQS too. Its timing is
     checked by the core per queue name, like every task queue's, not when the queue is
-    constructed: on the first read or call on that name, by `verify()` for the Resizer's own
-    queue, and at worker start for each name the worker consumes. Its messages carry the gate lock's owner (`gateOwner`), which the worker uses to
+    constructed: by `verify()` for the Resizer's own queue, at worker start for each name the
+    worker consumes, and by each call on that name (`prewarm()` reports it; `resolve()` logs it
+    once per queue name, on the first read of that queue). Its messages carry the gate lock's owner (`gateOwner`), which the worker uses to
     extend and release that lock.
   - Re-run `resize-scaffold` after deleting the old model and command shims.
 - `ResizeTask` gains `resizer`, `queue` and `availableAt` (when the task may next be claimed)
@@ -671,8 +673,16 @@ later release that puts the image engine behind a port.
   `carrierOf(resizer.tasks, name)`.
 - `verify()` checks the framework `Lock` model only for a Resizer whose own queue is on SQS.
 - A driver name in a config (`storage`, `queues`) is checked against the Resizer's drivers when the
-  Resizer first reads that section, so an unregistered storage driver in an explicit `config`
-  option is reported on first use or `verify()`, no longer at construction.
+  Resizer first reads that section. An unregistered storage driver in an explicit `config` option
+  still throws at construction, with the text and code of `0.3.0-rc.2`.
+- With `queues` on more than one available backend, every `FrameworkResizer` that takes its task
+  queue from the config file has the same router as `tasks`, which can queue to every name. So a
+  custom `runWorker({ resizers })` that consumes a queue on SQS (a backend that cannot filter
+  claims) must list every such `FrameworkResizer` of the process, whatever its own queue; else it
+  fails with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. `0.3.0-rc.2` accepted, for example,
+  `runWorker({ resizers: [b], queue: 'bulk' })` with `'bulk'` on SQS beside a Resizer `a` on the
+  database queue `'default'`. The framework CLI (`npm run cli ResizeWorker`) serves every Resizer
+  and is not affected.
 - `RESIZE_QUEUE_NOT_SERVED` is narrower: an unknown name, or a backend whose SDK is not installed;
   a queue on another available backend now queues.
 - `EnqueueIssue` gains the optional `causeCode` (the code of the error behind an issue); the union

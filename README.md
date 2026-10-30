@@ -270,7 +270,11 @@ start, or whose task queue cannot be used for a consumed name (no lock store bes
 once (two Resizers under one name: `RESIZE_DUPLICATE_RESIZER`). Beside
 a task queue the worker consumes that cannot filter claims, the list must also include every
 Resizer of the process that uses that queue: otherwise the worker would claim their tasks without
-running them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. For a Resizer it does not
+running them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. With `queues` on more
+than one backend, every `FrameworkResizer` that takes its task queue from the config file shares
+one router that reaches every name, so a list for a worker that consumes a queue on SQS must name
+all of them, whatever their own queue (`0.3.0-rc.2` did not ask this; `npm run cli ResizeWorker`
+serves every Resizer). For a Resizer it does not
 serve it loads only the task queue and, when a consumed backend cannot filter claims, that
 Resizer's backend of the consumed name (built now), and it rejects the same way when either cannot
 be loaded, since it may be a shared one. Resizers built only in other processes cannot be checked:
@@ -561,7 +565,8 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     after an `in-flight` add, so `prewarm()` can accept the variants the active task holds.
   - Optionally `servesQueue(queue)`: omit it to serve every name; return `false` for a name this
     queue cannot carry. A Resizer's call on such a name queues nothing (`RESIZE_QUEUE_NOT_SERVED`),
-    and `verify()` and the worker reject a Resizer whose own `queueName` it does not serve.
+    and `verify()` rejects a Resizer whose own `queueName` it does not serve; the worker rejects
+    it only when it consumes that queue.
   - Optionally `routeOf(queue)`: a task queue that routes names to several backends resolves the
     task queue that carries `queue`, `undefined` for a name it does not route, and rejects when
     that backend cannot be built. Any task queue with this method counts as a router: the core asks
@@ -641,7 +646,8 @@ is taken. The part it returns is checked the same way on first use (a storage ne
 task queue the five required methods, and it must serve every name of its entries), else
 `RESIZE_DRIVER_INVALID`. A host driver under a built-in name replaces it, so a test can replace
 `'sqs'`. A section's driver name is checked against the Resizer's drivers when the Resizer first
-reads that section (on first use or in `verify()`): an unregistered name is `RESIZE_CONFIG_INVALID`
+reads that section (on first use or in `verify()`; the `storage` of a config object passed in code,
+at construction): an unregistered name is `RESIZE_CONFIG_INVALID`
 listing the registered ones (`` `storage` in <config> needs driver 'local', 's3' or 'gcs' ``). A
 framework config file accepts any non-empty driver name when it is read, so a disabled worker
 (`worker.enabled: false`) only logs that it is disabled. A queue build that fails reaches

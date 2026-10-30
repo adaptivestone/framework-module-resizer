@@ -7,7 +7,9 @@
 // HookTaps, HookFn). ResizerOptions stays beside the Resizer in resizer.ts.
 
 // Recursive partial for environment-specific config overrides. Arrays stay whole because
-// the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts.
+// the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts. Objects are
+// partial at every depth, `encode.formats` entries too, although the module's merge replaces
+// `encode.formats` whole: an override that sets it must hold every format it generates.
 export type DeepPartial<T> = T extends readonly (infer _U)[]
   ? T
   : T extends object
@@ -471,7 +473,9 @@ export interface FrameworkResizeConfig<D extends DriverRegistryShape = {}>
 
 /**
  * A file that overrides part of a config, e.g. resize.<NODE_ENV>.ts: every object key by key, at any
- * depth; arrays stay whole, as the framework's merge replaces them.
+ * depth; arrays stay whole, as the framework's merge replaces them. The type leaves the entries
+ * of `encode.formats` partial too, but at run time the module replaces `encode.formats` whole: an
+ * override that sets it must hold every format it generates.
  */
 // biome-ignore lint/complexity/noBannedTypes: `{}` is the empty registry, the default when a host registers no driver
 export type PartialFrameworkResizeConfig<D extends DriverRegistryShape = {}> =

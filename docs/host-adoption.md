@@ -49,13 +49,18 @@ signature and adds decoders (see [Changed in `0.3.0-rc.2`](#changed-in-030-rc2))
 object, without the framework), drivers registered by name (the `drivers` option, `fromConfig`),
 `RoutingTaskQueue` and `carrierOf`, a worker that consumes several queues
 (`--queue=default --queue=bulk`), and partial config files (`PartialFrameworkResizeConfig`). It
-requires no host change. Two things a host may notice without changing anything:
+requires no host change. Three things a host may notice without changing anything:
 
 - when `queues` spans two available backends (a database entry and an SQS entry whose SDK is
   installed), `resizer.tasks` is a `RoutingTaskQueue`, not the backend's own task queue (no
   `release`; an `instanceof MongoTaskQueue` check fails: ask `carrierOf(resizer.tasks, name)`);
 - a call on a queue of another backend now queues there, where `0.3.0-rc.2` reported
-  `RESIZE_QUEUE_NOT_SERVED`.
+  `RESIZE_QUEUE_NOT_SERVED`;
+- with those two backends, every `FrameworkResizer` that takes its task queue from the config
+  file can queue to every name, so a custom `runWorker({ resizers })` that consumes a queue on SQS
+  must list all of them, whatever their own queue (else `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`;
+  `0.3.0-rc.2` accepted `runWorker({ resizers: [b], queue: 'bulk' })` beside a Resizer `a` on the
+  database queue). `npm run cli ResizeWorker` serves every Resizer and is not affected.
 
 Release candidates after `0.3.0-rc.3` change only internals. `CHANGELOG.md` (`# 0.3.0`) has the
 details of everything below.
