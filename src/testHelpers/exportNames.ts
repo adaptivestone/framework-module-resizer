@@ -2,7 +2,10 @@
 // keep README.md and AGENTS.md in step with the exports. Value names come from the runtime module;
 // type names and the default export's declared name come from the entry's source (its export
 // lists, its own `export interface|type`, and every type of a `export type * from` file). The
-// value names are parsed too, so a test can check the parser against the runtime.
+// value names are parsed too, so a test can check the parser against the runtime; the type names
+// have no such check, so the parse has known limits: `export type * from` is read with a
+// single-quoted specifier only, and a starred file is read for its own `export interface|type`
+// declarations only, not for its `export type {…} from` lists or a nested `export type *`.
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -150,15 +153,19 @@ export interface DocImport {
   text: string; // the statement, for messages
 }
 
-// The contents of every code fence (``` or ~~~, of three or more, indented too), one string each.
-function fenceBodies(markdown: string): string[] {
+// The contents of every code fence (``` or ~~~, of three or more, indented too), one string each,
+// and the 1-based line of a fence still open at the end of the file (its body is kept too).
+function scanFences(markdown: string): {
+  bodies: string[];
+  unclosedAt: number | undefined;
+} {
   const bodies: string[] = [];
-  let open: { marker: string; lines: string[] } | undefined;
-  for (const line of markdown.split('\n')) {
+  let open: { marker: string; line: number; lines: string[] } | undefined;
+  for (const [index, line] of markdown.split('\n').entries()) {
     const fence = /^\s*(`{3,}|~{3,})/.exec(line);
     if (!open) {
       if (fence) {
-        open = { marker: fence[1], lines: [] };
+        open = { marker: fence[1], line: index + 1, lines: [] };
       }
     } else if (
       fence &&
@@ -172,19 +179,34 @@ function fenceBodies(markdown: string): string[] {
       open.lines.push(line);
     }
   }
-  return bodies;
+  if (open) {
+    bodies.push(open.lines.join('\n'));
+  }
+  return { bodies, unclosedAt: open?.line };
 }
 
-// One statement from `import` to the specifier's closing quote, at the start of a line; what
-// follows the quote (`with { type: 'json' }`, `;`) is not read. The clause holds no quote and no
-// semicolon, so a match cannot run from one statement into the next.
+/** A fence still open at the end of the markdown, as a problem; its imports are read all the same. */
+export function fenceProblems(markdown: string): string[] {
+  const { unclosedAt } = scanFences(markdown);
+  return unclosedAt === undefined
+    ? []
+    : [`the code fence opened on line ${unclosedAt} is never closed`];
+}
+
+// One statement from `import` to the specifier's closing quote, anywhere on a line (not after a
+// `.` or an identifier character); what follows the quote (`with { type: 'json' }`, `;`) is not
+// read. Outside its `//` and `/* */` comments the clause holds no quote and no semicolon, so a
+// match cannot run from one statement into the next, and a quote in a comment does not end it.
 const IMPORT_STATEMENT =
-  /(?:^|\n)[ \t]*import\s+(?:([^'";]*?)\s*\bfrom\s*)?(['"])([^'"\n]+)\2/g;
+  /(?<![\w$.])import\s+(?:((?:[^'";/]|\/\/[^\n]*|\/\*[\s\S]*?\*\/|\/(?![/*]))*?)\s*\bfrom\s*)?(['"])([^'"\n]+)\2/g;
 
 function parseClause(
   clause: string,
 ): Pick<DocImport, 'typeOnly' | 'defaultName' | 'namespace' | 'named'> {
-  let rest = clause.trim();
+  let rest = clause
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+    .trim();
   const typeOnly = /^type\s/.test(rest);
   if (typeOnly) {
     rest = rest.replace(/^type\s+/, '');
@@ -223,12 +245,13 @@ function parseClause(
 /**
  * Every import of the package in the markdown's code fences (``` or ~~~, indented fences too):
  * single or double quotes; default, named, namespace and side-effect imports and their combinations;
- * `import type` and inline `type` specifiers; statements over several lines. Imports of other
- * packages and imports outside fences are ignored.
+ * `import type` and inline `type` specifiers; `{ default as X }` (named `default`); statements
+ * over several lines, with comments, or several on one line. Imports of other packages and imports
+ * outside fences are ignored; an unclosed fence is read too (`fenceProblems` reports it).
  */
 export function docImports(markdown: string): DocImport[] {
   const imports: DocImport[] = [];
-  for (const body of fenceBodies(markdown)) {
+  for (const body of scanFences(markdown).bodies) {
     for (const match of body.matchAll(IMPORT_STATEMENT)) {
       const [statement, clause, , specifier] = match;
       if (specifier !== PKG_NAME && !specifier.startsWith(`${PKG_NAME}/`)) {
@@ -281,7 +304,7 @@ export function importProblems(
       continue;
     }
     if (imp.subpath === PKG_JSON) {
-      for (const { name } of imp.named) {
+      for (const { name } of imp.named.filter((n) => n.name !== 'default')) {
         problems.push(
           `${where}: '${name}' is a named import, and a JSON module has only a default export`,
         );
@@ -299,6 +322,14 @@ export function importProblems(
       );
     }
     for (const { name, type } of imp.named) {
+      if (name === 'default') {
+        if (!entry.hasDefault) {
+          problems.push(
+            `${where}: 'default' is imported by name, and the entry has no default export`,
+          );
+        }
+        continue;
+      }
       const isType = imp.typeOnly || type;
       const known = isType
         ? entry.values.has(name) || entry.types.has(name)

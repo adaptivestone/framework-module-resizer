@@ -1,7 +1,8 @@
 // README.md is the reference for the export surface, so its "Package exports" section is checked
 // both ways against the exports. In README.md and AGENTS.md, every package import in a code fence
-// and every subpath the text names must exist. The README's list of the codes that dead-letter a
-// task at once is checked against the code.
+// and every subpath the text names (quoted or in backticks) must exist, and every fence must
+// close. The README's list of the codes that dead-letter a task at once is checked against the
+// code.
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
@@ -10,6 +11,7 @@ import {
   docName,
   type EntryExports,
   exportKeys,
+  fenceProblems,
   importProblems,
   packageEntries,
 } from './testHelpers/exportNames.ts';
@@ -115,9 +117,14 @@ test('every package import in README and AGENTS.md code fences names a real expo
   const keys = exportKeys();
   let total = 0;
   for (const file of DOCS) {
-    const imports = docImports(read(file));
+    const text = read(file);
+    const imports = docImports(text);
     total += imports.length;
-    assert.deepEqual(importProblems(imports, entries, keys), [], file);
+    assert.deepEqual(
+      [...fenceProblems(text), ...importProblems(imports, entries, keys)],
+      [],
+      file,
+    );
   }
   assert.ok(total >= 20, `only ${total} package imports found in fences`);
 });
@@ -130,7 +137,7 @@ test('every package specifier and …/x.js path README and AGENTS.md name is a k
   for (const file of DOCS) {
     const text = read(file);
     for (const m of text.matchAll(
-      /['"](@adaptivestone\/framework-module-resize(?:\/[^'"\s]*)?)['"]/g,
+      /[`'"](@adaptivestone\/framework-module-resize(?:\/[^`'"\s]*)?)[`'"]/g,
     )) {
       specifiers += 1;
       const key = `.${m[1].slice('@adaptivestone/framework-module-resize'.length)}`;

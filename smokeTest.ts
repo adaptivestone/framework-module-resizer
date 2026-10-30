@@ -693,7 +693,7 @@ try {
 
   // (d2) the emitted files compile against the installed package and peers, as in a framework
   // host. The consumer's own `npm init -y` package is CommonJS, so each scaffold directory gets
-  // an ESM package.json; the scaffolded files import `../resizer.ts`, hence
+  // an ESM package.json; the worker command imports `../resizer.ts`, hence
   // allowImportingTsExtensions.
   const writeEsmPackage = (dir: string): void => {
     writeFileSync(
@@ -766,6 +766,21 @@ try {
     ['--no-install', 'resize-scaffold', '--eject', '--agents', 'skip'],
     ejectDir,
   );
+  // The same four files as the default form, with the full model in place of the shim.
+  for (const rel of scaffoldFiles) {
+    if (!existsSync(join(ejectDir, rel))) {
+      throw new Error(`resize-scaffold --eject did not emit ${rel}`);
+    }
+  }
+  if (
+    !readFileSync(join(ejectDir, 'src/models/ResizeTask.ts'), 'utf8').includes(
+      'extends BaseModel',
+    )
+  ) {
+    throw new Error(
+      'resize-scaffold --eject did not emit the full model: src/models/ResizeTask.ts does not contain `extends BaseModel`',
+    );
+  }
   run('npx', ['--no-install', 'resize-scaffold', '--check'], ejectDir);
   compileScaffold(ejectDir);
   console.log('  ok  an --eject scaffold passes --check and compiles');

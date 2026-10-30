@@ -4,6 +4,7 @@ import {
   type DocImport,
   docImports,
   exportKeys,
+  fenceProblems,
   importProblems,
   packageEntries,
   parsedValueNames,
@@ -188,4 +189,75 @@ test('importProblems accepts the valid fixture imports and flags each bad one', 
     assert.equal(problems.length, 1, `${line}\n${problems.join('\n')}`);
     assert.ok(problems[0].includes(`'${named}'`), problems[0]);
   }
+});
+
+test('a comment inside an import clause is skipped, quotes in it included', async () => {
+  const md = fenced(
+    [
+      'import {',
+      "  Resizer, // the host's resizer",
+      '  runWorker, /* the worker */',
+      '  NotThere,',
+      `} from '${PKG}';`,
+    ].join('\n'),
+  );
+  const imports = docImports(md);
+  assert.equal(imports.length, 1);
+  assert.deepEqual(imports[0].named, [
+    { name: 'Resizer', type: false },
+    { name: 'runWorker', type: false },
+    { name: 'NotThere', type: false },
+  ]);
+  const problems = importProblems(
+    imports,
+    await packageEntries(),
+    exportKeys(),
+  );
+  assert.equal(problems.length, 1, problems.join('\n'));
+  assert.ok(problems[0].includes("'NotThere'"), problems[0]);
+});
+
+test('every import statement on a line is read', () => {
+  const md = fenced(
+    `import { Resizer } from '${PKG}'; import { NotThere } from '${PKG}/framework.js';`,
+  );
+  assert.deepEqual(
+    docImports(md).map((imp) => [imp.subpath, imp.named[0]?.name]),
+    [
+      ['.', 'Resizer'],
+      ['./framework.js', 'NotThere'],
+    ],
+  );
+});
+
+test('`{ default as X }` names the default export', async () => {
+  const entries = await packageEntries();
+  const keys = exportKeys();
+  const valid = docImports(
+    fenced(`import { default as Defaults } from '${PKG}/config/resize.js';`),
+  );
+  assert.deepEqual(valid[0]?.named, [{ name: 'default', type: false }]);
+  assert.deepEqual(importProblems(valid, entries, keys), []);
+  const bad = importProblems(
+    docImports(fenced(`import { default as Fs } from '${PKG}/drivers/fs.js';`)),
+    entries,
+    keys,
+  );
+  assert.equal(bad.length, 1, bad.join('\n'));
+  assert.ok(bad[0].includes("'default'"), bad[0]);
+});
+
+test('an unclosed fence at the end of a file is read and reported, not dropped', () => {
+  const md = [
+    '# Doc',
+    '',
+    '```ts',
+    `import { Resizer } from '${PKG}';`,
+    '',
+  ].join('\n');
+  assert.equal(docImports(md).length, 1);
+  assert.deepEqual(fenceProblems(md), [
+    'the code fence opened on line 3 is never closed',
+  ]);
+  assert.deepEqual(fenceProblems(fixture), []);
 });

@@ -341,9 +341,9 @@ Resizers that `src/resizer.ts` constructs.
   - the config sections: the image settings `ResizeConfig` and `ResizeLimits`, and `DeepPartial`
     for overrides; storage `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`; database
     `MongoDatabaseConfig`; coordination `CoordinationOptions`; worker `FrameworkWorkerConfig`; the
-    framework config `FrameworkResizeConfig` and `PartialFrameworkResizeConfig`; and the sections
-    that registered drivers add, `ResizerSections`, `StorageSectionOf`, `DatabaseSectionOf`,
-    `QueueSectionOf`;
+    framework config `FrameworkResizeConfig` and `PartialFrameworkResizeConfig`; the Resizer's
+    other sections, `ResizerSections`, and the sections that registered drivers add,
+    `StorageSectionOf`, `DatabaseSectionOf`, `QueueSectionOf`;
   - the queue entries and timing: `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`,
     `QueueTimingOptions`;
   - the logger, the event bus and a part built on first use: `ResizeLogger`, `ResizeEventBus`,
