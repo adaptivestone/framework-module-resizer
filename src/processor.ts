@@ -212,12 +212,16 @@ function copyLocator(ref: StorageRef): StorageRef {
 }
 
 /**
- * The locator in the form the origin signature reads (its JSON form, `toJSON()` included), taken
- * now. Signing this form gives exactly what the read path computes from the live locator, and a
- * JSON form cannot change in place or fail to copy.
+ * The locator in the form the origin signature reads, taken now: its JSON form under the same
+ * `storageRef` key the recipe serializes it under (`toJSON('storageRef')` included). Signing this
+ * form gives exactly what the read path computes from the live locator, and a JSON form cannot
+ * change in place or fail to copy. A locator whose JSON form is nothing is kept as it is: the
+ * recipe leaves it out of every signature, so any value signs the same.
  */
 function signedLocator(ref: StorageRef): StorageRef {
-  return JSON.parse(JSON.stringify(ref)) as StorageRef;
+  const json = JSON.stringify({ storageRef: ref });
+  const { storageRef } = JSON.parse(json) as { storageRef?: StorageRef };
+  return storageRef === undefined ? ref : storageRef;
 }
 
 /**

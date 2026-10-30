@@ -897,6 +897,32 @@ test('a locator with its own toJSON (a Mongoose sub-document, say): the row is s
   assert.deepEqual(decision.missing, []);
 });
 
+test('a locator whose toJSON reads its key, or returns nothing: the row is signed as the read path signs it', async () => {
+  for (const toJSON of [
+    // The signature recipe serializes the locator under the `storageRef` key.
+    (keyName: string) =>
+      keyName === 'storageRef' ? { key: 'k' } : { key: 'k', root: true },
+    () => undefined,
+  ]) {
+    resetResizerForTests();
+    const w = world();
+    const r = w.resizer(webpConfig(80));
+    const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+    const { key } = red.storageRef as { key: string };
+    const doc: MediaLike = {
+      id: 'm1',
+      original: { ...red, storageRef: { key, toJSON } },
+      previews: [],
+    };
+    w.docs.set('m1', doc);
+
+    await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+    const { decision } = await w.read(r, doc);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(decision.ready[0].stale ?? false, false);
+  }
+});
+
 test('a locator holding a Buffer: the row is signed as the read path signs it, so the next read is fresh', async () => {
   const w = world();
   const r = w.resizer(webpConfig(80));
