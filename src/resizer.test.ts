@@ -1319,7 +1319,7 @@ describe('Resizer registry', () => {
       () =>
         new FrameworkResizer({
           ...baseOpts(),
-          config: { mediaModelName: 'File' } as never,
+          config: { mediaModelName: 'File', maxSize: 'big' } as never,
         }),
       (err: unknown) => err instanceof ResizeConfigError,
     );

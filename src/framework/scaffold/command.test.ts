@@ -186,7 +186,10 @@ describe('runScaffold — default run', () => {
     assert.strictEqual(resolved.image.encode, scaffoldedConfig.encode);
     const processConfig = getProcessConfig();
     assert.deepEqual([...processConfig.queues.keys()], ['default']);
-    assert.equal(processConfig.queues.get('default')?.backend, 'database');
+    assert.equal(
+      processConfig.queues.get('default')?.section.driver,
+      'database',
+    );
     assert.deepEqual(processConfig.worker, scaffoldedConfig.worker);
     assert.equal(processConfig.coordination, undefined);
   });

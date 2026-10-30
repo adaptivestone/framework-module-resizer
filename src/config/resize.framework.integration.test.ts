@@ -88,7 +88,7 @@ test('the Framework loads the scaffold bridge and merges the environment overrid
     sharpCache: false,
   });
   assert.deepEqual([...processConfig.queues.keys()], ['default']);
-  assert.equal(processConfig.queues.get('default')?.backend, 'database');
+  assert.equal(processConfig.queues.get('default')?.section.driver, 'database');
 });
 
 test('an eager scaffold switches the worker on from an environment file that sets only worker.enabled', {

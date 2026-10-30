@@ -1,11 +1,14 @@
 // End-to-end worker routing on a real Mongo queue: one worker process serves two Resizers that
-// share a task queue, named queues are isolated from each other, and a FrameworkResizer wired only
-// by its config file runs through the framework worker entry.
+// share a task queue, named queues are isolated from each other, a FrameworkResizer wired only
+// by its config file runs through the framework worker entry, and queue names on two backends
+// (the database and SQS, or a stand-in registered under 'sqs') route to their own backend.
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
+import { promisify } from 'node:util';
 import {
   resetAppInstance,
   setAppInstance,
@@ -19,8 +22,10 @@ import type { ResizeStorage } from '../contracts/storage.ts';
 import { resizeMediaSchemaFragment } from '../drivers/mongo/mediaFragment.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { gateKey } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
-import { fakeMedia } from '../testHelpers/fakes.ts';
+import { RoutingTaskQueue } from '../routing.ts';
+import { fakeMedia, fakeQueueDriver } from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import type { MediaLike, Preview } from '../types.d.ts';
 import { runWorker } from '../worker.ts';
@@ -481,5 +486,352 @@ test('verify() rejects a media model registered without previews.identity', asyn
       err instanceof ResizeSetupError &&
       err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
       err.message.includes("'OldFile'"),
+  );
+});
+
+// --- queue names on two backends ------------------------------------------------------------
+
+const runNode = promisify(execFile);
+const href = (path: string) =>
+  JSON.stringify(new URL(path, import.meta.url).href);
+
+/**
+ * Run `body` in a child process where the SQS SDK is missing (resolving it fails, so importing
+ * the SQS driver would show), over a FrameworkResizer wired from a resize.ts with `queues`, on
+ * this file's MongoDB server. The app has the ResizeTask and File models and no Lock model. The
+ * body has `resizer`, `media` (an uploaded original on a stored File), `File`, `ResizeTask`,
+ * `models` (every model name asked for), `outcome(promise)`, `untilPreviews(count, worker)` and
+ * `sqsDriver` (every resolved drivers/sqs.ts), and prints its JSON result.
+ */
+async function runWithoutSqsSdk(
+  name: string,
+  queues: Record<string, unknown>,
+  body: string,
+): Promise<Record<string, unknown>> {
+  const root = await mkdtemp(join(tmpdir(), 'resize-routes-'));
+  try {
+    const { stdout } = await runNode(
+      process.execPath,
+      [
+        '--experimental-strip-types',
+        '--input-type=module',
+        '-e',
+        `
+        import { registerHooks } from 'node:module';
+        import mongoose from 'mongoose';
+        import sharp from 'sharp';
+        import { setAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
+        import { FrameworkResizer } from ${href('./resizer.ts')};
+        import { runResizeWorker } from ${href('./worker.ts')};
+        import ResizeTaskModel from ${href('./ResizeTaskModel.ts')};
+        import { resizeMediaSchemaFragment } from ${href('../drivers/mongo/mediaFragment.ts')};
+        import { makeResizeConfig } from ${href('../testHelpers/resizeConfig.ts')};
+        const sqsDriver = [];
+        registerHooks({
+          resolve(specifier, context, nextResolve) {
+            if (specifier === '@aws-sdk/client-sqs') {
+              throw Object.assign(new Error("Cannot find package '@aws-sdk/client-sqs' imported from driver"), { code: 'ERR_MODULE_NOT_FOUND' });
+            }
+            const resolved = nextResolve(specifier, context);
+            if (resolved.url.endsWith('/drivers/sqs.ts')) {
+              sqsDriver.push(resolved.url);
+            }
+            return resolved;
+          },
+        });
+        const connection = await mongoose
+          .createConnection(process.env.MONGO_URI, { dbName: process.env.MONGO_DB })
+          .asPromise();
+        const taskSchema = new mongoose.Schema(ResizeTaskModel.modelSchema, { timestamps: true, minimize: false });
+        ResizeTaskModel.initHooks(taskSchema);
+        const ResizeTask = connection.model('ResizeTask', taskSchema);
+        const File = connection.model('File', new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }));
+        await ResizeTask.init();
+        const configs = {
+          resize: makeResizeConfig({
+            formats: ['webp'],
+            worker: { enabled: true },
+            storage: { driver: 'local', rootDir: process.env.MEDIA_ROOT, publicBaseUrl: '/media' },
+            queues: ${JSON.stringify(queues)},
+          }),
+        };
+        const models = [];
+        const registered = { ResizeTask, File };
+        setAppInstance({
+          getConfig: (name) => configs[name] ?? {},
+          getModel: (name) => {
+            models.push(name);
+            return registered[name];
+          },
+          logger: { info() {}, warn() {}, error() {} },
+        });
+        const outcome = (promise) =>
+          promise.then(() => 'ok', (err) => ({ code: err.code, message: err.message }));
+        let failed;
+        const untilPreviews = async (count, worker) => {
+          worker.catch((err) => {
+            failed = err;
+          });
+          const until = Date.now() + 20000;
+          while ((await File.findById(media.id).lean())?.previews?.length !== count) {
+            if (failed) throw failed;
+            if (Date.now() > until) throw new Error('the worker stored no preview');
+            await new Promise((r) => setTimeout(r, 20));
+          }
+        };
+        const png = await sharp({ create: { width: 32, height: 32, channels: 3, background: '#08f' } }).png().toBuffer();
+        const resizer = new FrameworkResizer();
+        const original = await resizer.uploadOriginal({ body: png, visibility: 'private' });
+        const doc = await File.create({ original, previews: [] });
+        const media = { id: String(doc._id), original, previews: [] };
+        ${body}
+        await connection.dropDatabase();
+        await connection.close();
+      `,
+      ],
+      {
+        env: {
+          ...process.env,
+          MONGO_URI: server.getUri(),
+          MONGO_DB: `resize_routes_${name}_${process.pid}`,
+          MEDIA_ROOT: join(root, 'public'),
+        },
+        timeout: 60_000,
+      },
+    );
+    return JSON.parse(stdout);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test('a database Resizer beside an SQS entry without its SDK: stored previews are served, database prewarm is accepted, a database worker starts, verify() needs no Lock model', async () => {
+  const seen = await runWithoutSqsSdk(
+    'database',
+    {
+      default: { driver: 'database', idlePollMs: 20 },
+      bulk: { driver: 'sqs', queueUrl: 'https://sqs.example/bulk' },
+    },
+    `
+      const verified = await outcome(resizer.verify());
+      await resizer.generate({ media, sizes: [{ width: 8, height: 8 }] });
+      const stored = await File.findById(media.id).lean();
+      const read = await resizer.resolve({
+        media: { id: media.id, original, previews: stored.previews },
+        sizes: [{ width: 8, height: 8 }],
+      });
+      const warmed = await resizer.prewarm({ media, sizes: [{ width: 16, height: 16 }] });
+      const bulk = await resizer.prewarm({ media, sizes: [{ width: 16, height: 16 }], queue: 'bulk' });
+      const bulkWorker = await outcome(runResizeWorker({ queue: 'bulk' }));
+      const worker = runResizeWorker({ queue: 'default' });
+      try {
+        await untilPreviews(2, worker);
+      } finally {
+        process.emit('SIGTERM');
+        await worker;
+      }
+      const task = await ResizeTask.findOne({}).lean();
+      console.log(JSON.stringify({
+        verified,
+        ready: read.decision.ready.length,
+        missing: read.decision.missing.length,
+        warmed: warmed.status,
+        bulk: bulk.issues.map(({ code, retryable, message }) => ({ code, retryable, message })),
+        bulkWorker,
+        task: [task?.queue, task?.status],
+        tasks: resizer.tasks.constructor.name,
+        locks: resizer.locks === undefined,
+        models: [...new Set(models)],
+        sqsDriver,
+      }));
+    `,
+  );
+  assert.equal(seen.verified, 'ok');
+  assert.equal(seen.ready, 1);
+  assert.equal(seen.missing, 0);
+  assert.equal(seen.warmed, 'accepted');
+  const [bulk] = seen.bulk as Array<{
+    code: string;
+    retryable: boolean;
+    message: string;
+  }>;
+  assert.equal(bulk.code, 'RESIZE_QUEUE_NOT_SERVED');
+  assert.equal(bulk.retryable, false);
+  assert.match(bulk.message, /@aws-sdk\/client-sqs/);
+  const bulkWorker = seen.bulkWorker as { code: string; message: string };
+  assert.equal(bulkWorker.code, 'RESIZE_QUEUE_NOT_SERVED');
+  assert.match(bulkWorker.message, /@aws-sdk\/client-sqs/);
+  assert.deepEqual(seen.task, ['default', 'completed']);
+  assert.equal(seen.tasks, 'MongoTaskQueue');
+  assert.equal(seen.locks, true);
+  assert.equal((seen.models as string[]).includes('Lock'), false);
+  assert.deepEqual(seen.sqsDriver, []);
+});
+
+test('the own queue on SQS without its SDK, bulk on the database: a worker for bulk starts and needs no Lock model; verify() is RESIZE_PEER_MISSING', async () => {
+  const seen = await runWithoutSqsSdk(
+    'own-sqs',
+    {
+      default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
+      bulk: { driver: 'database', idlePollMs: 20 },
+    },
+    `
+      const verified = await outcome(resizer.verify());
+      const own = await resizer.prewarm({ media, sizes: [{ width: 16, height: 16 }] });
+      const bulk = await resizer.prewarm({ media, sizes: [{ width: 16, height: 16 }], queue: 'bulk' });
+      const worker = runResizeWorker({ queue: 'bulk' });
+      try {
+        await untilPreviews(1, worker);
+      } finally {
+        process.emit('SIGTERM');
+        await worker;
+      }
+      const task = await ResizeTask.findOne({}).lean();
+      console.log(JSON.stringify({
+        verified,
+        own: own.issues.map(({ code, retryable, message }) => ({ code, retryable, message })),
+        bulk: bulk.status,
+        task: [task?.queue, task?.status],
+        models: [...new Set(models)],
+        sqsDriver,
+      }));
+    `,
+  );
+  const verified = seen.verified as { code: string; message: string };
+  assert.equal(verified.code, 'RESIZE_PEER_MISSING');
+  assert.match(verified.message, /@aws-sdk\/client-sqs/);
+  const [own] = seen.own as Array<{
+    code: string;
+    retryable: boolean;
+    message: string;
+  }>;
+  assert.equal(own.code, 'RESIZE_QUEUE_NOT_SERVED');
+  assert.equal(own.retryable, false);
+  assert.match(own.message, /@aws-sdk\/client-sqs/);
+  assert.equal(seen.bulk, 'accepted');
+  assert.deepEqual(seen.task, ['bulk', 'completed']);
+  assert.equal((seen.models as string[]).includes('Lock'), false);
+  assert.deepEqual(seen.sqsDriver, []);
+});
+
+test('an environment override that moves only queues.default to SQS routes both names', async () => {
+  await taskModel.deleteMany({});
+  await lockModel.deleteMany({});
+  const File = fileModel();
+  const configs = {
+    resize: makeResizeConfig({
+      formats: ['webp'],
+      storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/m' },
+      queues: {
+        default: {
+          driver: 'sqs',
+          queueUrl: 'https://sqs.example/resize',
+          ...testQueue,
+        },
+        bulk: { driver: 'database', ...testQueue },
+      },
+    }),
+  };
+  installApp({ configs, models: { File } });
+  // A stand-in for SQS, registered under its name: it replaces the built-in driver.
+  const sqs = fakeQueueDriver();
+  const resizer = new FrameworkResizer({ drivers: { queue: { sqs } } });
+  await resizer.ready();
+  assert.ok(resizer.tasks instanceof RoutingTaskQueue);
+  const media = newMedia();
+  // The database queue's task row is its gate: no lock.
+  const bulk = await resizer.prewarm({ media, sizes, queue: 'bulk' });
+  assert.equal(bulk.status, 'accepted');
+  assert.equal(await lockModel.countDocuments({}), 0);
+  assert.deepEqual(
+    (await taskModel.find({}).lean()).map((row) => row.queue),
+    ['bulk'],
+  );
+  // The queue on SQS takes the gate lock in the framework Lock model.
+  const own = await resizer.prewarm({ media, sizes });
+  assert.equal(own.status, 'accepted');
+  assert.equal(sqs.built.length, 1);
+  assert.equal(sqs.built[0].added.length, 1);
+  assert.deepEqual(
+    (await lockModel.find({}).lean()).map((lock) => lock._id),
+    [gateKey('default', 'default', String(media.id), 'default')],
+  );
+  await resizer.verify();
+  // So verify() requires that model.
+  installApp({ configs, models: { File, Lock: undefined } });
+  const noLock = new FrameworkResizer({
+    drivers: { queue: { sqs: fakeQueueDriver() } },
+  });
+  await assert.rejects(
+    noLock.verify(),
+    (err: unknown) =>
+      err instanceof ResizeSetupError &&
+      err.code === 'RESIZE_MONGO_MODEL_MISSING',
+  );
+});
+
+test('two Resizers on different named queues run under one worker', async () => {
+  await taskModel.deleteMany({});
+  await lockModel.deleteMany({});
+  installApp({
+    configs: {
+      resize: makeResizeConfig({
+        formats: ['webp'],
+        worker: { enabled: true },
+        queues: {
+          default: { driver: 'database', ...testQueue },
+          bulk: {
+            driver: 'sqs',
+            queueUrl: 'https://sqs.example/bulk',
+            ...testQueue,
+          },
+        },
+      }),
+      resizeListings: makeResizeConfig({ formats: ['webp'], queue: 'bulk' }),
+    },
+  });
+  const sqs = fakeQueueDriver();
+  const drivers = { queue: { sqs } };
+  const mediaA = newMedia();
+  const mediaB = newMedia();
+  const a = new FrameworkResizer({
+    drivers,
+    storage: memoryStorage().storage,
+    media: memoryMedia(mediaA),
+  });
+  const listings = new FrameworkResizer({
+    name: 'listings',
+    configName: 'resizeListings',
+    drivers,
+    storage: memoryStorage().storage,
+    media: memoryMedia(mediaB),
+  });
+  assert.equal((await a.prewarm({ media: mediaA, sizes })).status, 'accepted');
+  assert.equal(
+    (await listings.prewarm({ media: mediaB, sizes })).status,
+    'accepted',
+  );
+  const worker = runResizeWorker({ queue: ['default', 'bulk'] });
+  try {
+    await waitFor(
+      () =>
+        (mediaA.previews?.length ?? 0) > 0 &&
+        (mediaB.previews?.length ?? 0) > 0,
+    );
+  } finally {
+    process.emit('SIGTERM');
+    await worker;
+  }
+  assert.deepEqual(
+    sqs.built[0].rows.map((row) => [row.task.resizer, row.status]),
+    [['listings', 'completed']],
+  );
+  assert.deepEqual(
+    (await taskModel.find({}).lean()).map((row) => [
+      row.resizer,
+      row.queue,
+      row.status,
+    ]),
+    [['default', 'default', 'completed']],
   );
 });

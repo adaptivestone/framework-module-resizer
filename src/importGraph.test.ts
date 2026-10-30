@@ -11,8 +11,9 @@
 //   that builds a Resizer from a config (factory/createResizer.ts) and the framework adapter
 //   import it, and nothing it reaches imports it back, not even as a type; nor does any other
 //   file import the main entry, which re-exports the Resizer;
-// - outside the drivers and the framework adapter, only factory/builtins.ts imports a driver
-//   module, and only dynamically, so a driver's optional SDK loads only when a config selects it.
+// - outside the drivers, only factory/builtins.ts imports a driver module dynamically (the
+//   framework adapter builds its drivers through it too), so a driver's optional SDK loads only
+//   when a config selects it.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -269,12 +270,11 @@ test('only index.ts, worker.ts, factory/createResizer.ts and the framework adapt
   );
 });
 
-test('only src/factory/builtins.ts imports a driver dynamically from the core', () => {
+test('only src/factory/builtins.ts imports a driver dynamically, the framework adapter included', () => {
   const dynamicDriver = /import\(\s*['"][^'"]*drivers\//;
   const importers = sourceFiles().filter(
     (f) =>
       !f.startsWith('drivers/') &&
-      !f.startsWith('framework/') &&
       dynamicDriver.test(readFileSync(resolve(SRC, f), 'utf8')),
   );
   assert.deepEqual(importers, ['factory/builtins.ts']);

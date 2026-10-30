@@ -14,8 +14,12 @@ export type {
   FrameworkResizeConfig,
   FrameworkS3StorageConfig,
   FrameworkStorageConfig,
+  LocalStorageConfig,
+  PartialFrameworkResizeConfig,
   QueueConfig,
+  S3StorageConfig,
   SqsQueueConfig,
+  StorageConfig,
 } from '../types.d.ts';
 export {
   defaultFrameworkResizeConfig,

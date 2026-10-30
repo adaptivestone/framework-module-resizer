@@ -832,7 +832,23 @@ export function sharedPart<V>(
   return registry.shared(key, build);
 }
 
-/** TEST-ONLY: forget every constructed Resizer and shared part so a test can construct fresh ones. */
+/**
+ * The value shared in this process under `key` (e.g. the framework adapter's queue drivers): the
+ * first call records `value`, and every call until resetResizerForTests() returns that recorded
+ * value, so the caller can compare its own with it. Internal: the main entry does not export it,
+ * and it may change in any release.
+ * @internal
+ */
+export function sharedValue<V>(key: string, value: V): V {
+  return registry.sharedValue(key, value);
+}
+
+/**
+ * TEST-ONLY: forget every constructed Resizer, shared part and shared value so a test can construct
+ * fresh ones. The framework adapter's task queues are such shared parts, kept per process: a test
+ * that installs another fake app without calling this keeps the task queues built for the previous
+ * app.
+ */
 export function resetResizerForTests(): void {
   registry.reset();
 }

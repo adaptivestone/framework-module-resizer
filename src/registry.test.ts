@@ -101,3 +101,14 @@ test('reset() forgets every item and shared part', async () => {
   registry.register(again);
   assert.equal(registry.get('a'), again);
 });
+
+test('sharedValue() records the first value per key and returns it; reset() forgets it', () => {
+  const registry = new Registry<{ name: string }>();
+  const first = { kind: 'first' };
+  const second = { kind: 'second' };
+  assert.equal(registry.sharedValue('k', first), first);
+  assert.equal(registry.sharedValue('k', second), first);
+  assert.equal(registry.sharedValue('other', second), second);
+  registry.reset();
+  assert.equal(registry.sharedValue('k', second), second);
+});

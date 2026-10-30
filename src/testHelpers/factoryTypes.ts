@@ -1,7 +1,8 @@
 // Compiled by `npm run types:check` (tsconfig.test-helpers.json), never run. It pins the config
 // types: the core section types and their deprecated framework names, the sections a registered
-// custom driver adds, the nested partial a file that overrides part of a config writes, and the
-// shipped drivers as drivers of their own sections.
+// custom driver adds, the nested partial a file that overrides part of a config writes, the
+// shipped drivers as drivers of their own sections, and FrameworkResizer's `drivers` and `config`
+// options.
 import type {
   DatabaseDriver,
   DriverContext,
@@ -17,7 +18,9 @@ import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { databaseQueueDriver } from '../factory/databaseQueue.ts';
 import type { ResizerConfig } from '../factory/types.ts';
 import { defaultFrameworkResizeConfig } from '../framework/defaults.ts';
+import { FrameworkResizer } from '../framework/resizer.ts';
 import { sqsBackendKey, validateSqsEntries } from '../helpers/queueSections.ts';
+import type { Resizer } from '../resizer.ts';
 import type {
   DatabaseQueueConfig,
   FrameworkLocalStorageConfig,
@@ -173,3 +176,42 @@ export const shippedRegistry: DriverRegistry = {
   database: { mongo: MongoDatabase },
   queue: { database: databaseQueueDriver, sqs: SqsTaskQueue },
 };
+
+// A queue driver of its own section.
+export const plainQueue: QueueDriver<{ driver: 'plain' }> = {
+  fromConfig: () => {
+    throw new Error('never run');
+  },
+};
+
+// The registry reaches FrameworkResizer: its `config` option takes the sections of its `drivers`.
+// Never called: constructing would register a Resizer.
+export function frameworkResizers(): Resizer[] {
+  const plainResizer: Resizer = new FrameworkResizer(); // no drivers; still a Resizer
+  return [
+    plainResizer,
+    new FrameworkResizer({
+      drivers: { storage: { memory: MemoryStorageDriver } },
+      config: { ...file, storage: { driver: 'memory', bucket: 'b' } },
+    }),
+    new FrameworkResizer({
+      config: {
+        ...file,
+        // @ts-expect-error a custom storage section in the config option without its driver
+        storage: { driver: 'memory', bucket: 'b' },
+      },
+    }),
+    new FrameworkResizer({
+      drivers: { queue: { plain: plainQueue } },
+      config: { ...file, queues: { bulk: { driver: 'plain' } } },
+    }),
+    new FrameworkResizer({
+      drivers: { storage: { memory: MemoryStorageDriver } },
+      config: {
+        ...file,
+        // @ts-expect-error a registered driver's section keeps its field types
+        storage: { driver: 'memory', bucket: 1 },
+      },
+    }),
+  ];
+}

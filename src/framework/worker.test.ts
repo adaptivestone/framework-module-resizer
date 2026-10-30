@@ -65,6 +65,20 @@ describe('runResizeWorker', () => {
     );
   });
 
+  test('a disabled worker logs that it is disabled, even beside a queue driver no Resizer registers', async () => {
+    const lines: string[] = [];
+    setAppInstance({
+      getConfig: () => ({
+        worker: { enabled: false },
+        queues: { default: { driver: 'redis' } },
+      }),
+      getModel: () => undefined,
+      logger: { info: (m: string) => lines.push(m), warn() {}, error() {} },
+    } as never);
+    await runResizeWorker();
+    assert.match(lines.join('\n'), /resize worker disabled/);
+  });
+
   test('configName (the old --config) is RESIZE_CONFIG_REMOVED_KEY, before any config is read', async () => {
     const asked: string[] = [];
     setAppInstance({

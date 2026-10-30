@@ -11,9 +11,9 @@ import type { ResizeStorage } from '../contracts/storage.ts';
 import { gateKey } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
-import { getProcessConfig, type ResolvedQueue } from './config.ts';
+import { appLogger } from './app.ts';
+import { FrameworkDatabase } from './database.ts';
 import { FrameworkLockStore } from './locks.ts';
-import { taskQueueOf } from './queue.ts';
 import ResizeTaskModel from './ResizeTaskModel.ts';
 import { FrameworkResizer } from './resizer.ts';
 
@@ -82,17 +82,20 @@ async function createFixture(name: string) {
   } as never);
 
   // The app's database task queue, as a FrameworkResizer builds it from src/config/resize.ts.
-  const processConfig = getProcessConfig();
   return {
     server,
     connection,
     taskModel,
     lockModel,
     locks: new FrameworkLockStore(),
-    tasks: await taskQueueOf(
-      processConfig.queues.get('default') as ResolvedQueue,
-      processConfig,
-    ),
+    tasks: FrameworkDatabase.fromConfig(
+      { driver: 'framework', configName: 'resize' },
+      { logger: appLogger, where: 'test' },
+    ).taskQueue?.({
+      queues: ['default'],
+      getTiming: () => undefined,
+      logger: appLogger,
+    }),
   };
 }
 

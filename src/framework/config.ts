@@ -1,12 +1,17 @@
 // Loads the framework config files; the framework has already merged each file's
 // <name>.<NODE_ENV>.ts over it. Every Resizer reads its own file (`configName`, default 'resize'),
 // which holds what belongs to that Resizer: the image settings (passed to the Resizer),
-// `mediaModelName`, `storage` and `queue` (the name of the queue its tasks go to). What belongs to
-// the process is read only from src/config/resize.ts and rejected in any other file: `queues`
-// (every queue, by name, with its timing), `worker` (the worker command's settings) and
-// `coordination` (passed to every Resizer as it is: the core validates it).
-import type { QueueEntry } from '../contracts/drivers.ts';
+// `mediaModelName`, `storage` and `queue` (the name of the queue its tasks go to). Its image
+// settings are merged over the package defaults, so a file may set only what it changes. What
+// belongs to the process is read only from src/config/resize.ts and rejected in any other file:
+// `queues` (every queue, by name, with its timing), `worker` (the worker command's settings) and
+// `coordination` (passed to every Resizer as it is: the core validates it). A driver name is
+// checked here only for its shape: each Resizer checks it against its own drivers when it reads
+// the section.
+import type { QueueDriver, QueueEntry } from '../contracts/drivers.ts';
 import { ResizeConfigError } from '../errors.ts';
+import { mergeImageConfig } from '../factory/image.ts';
+import { checkedQueue, queueObjectRemoved } from '../factory/lane.ts';
 import { resolveQueueEntries } from '../factory/queues.ts';
 import { validateSqsEntries } from '../helpers/queueSections.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
@@ -14,13 +19,10 @@ import type {
   CoordinationOptions,
   FrameworkResizeConfig,
   FrameworkWorkerConfig,
-  QueueConfig,
   ResizeConfig,
-  StorageConfig,
 } from '../types.d.ts';
 import { getApp } from './app.ts';
 import { defaultWorkerOptions } from './defaults.ts';
-import { backendKey } from './queue.ts';
 
 /** Where a Resizer's config comes from: a config file, or the `config` option. */
 export interface ConfigSource {
@@ -30,29 +32,28 @@ export interface ConfigSource {
 
 /** A Resizer's validated config, split by who reads each part. */
 export interface ResolvedFrameworkConfig {
-  image: ResizeConfig; // the Resizer's config
+  image: ResizeConfig; // the Resizer's config, merged over the package defaults
   mediaModelName: string;
-  storage: StorageConfig | undefined; // the file's `storage`, if any
+  // The file's `storage`, if any: an object with a driver name, the rest unchecked (its driver
+  // checks it).
+  storage: { driver: string } | undefined;
   // The name of the queue the Resizer's tasks go to; false: eager only; undefined: not set.
   queue: string | false | undefined;
 }
 
-/**
- * One `queues` entry of src/config/resize.ts, validated, with its backend: backendKey(section), the
- * entries with one key share one task queue.
- */
-export type ResolvedQueue = QueueEntry<QueueConfig> & { backend: string };
-
 /** The process-wide sections of src/config/resize.ts, validated. */
 export interface ResolvedProcessConfig {
-  queues: ReadonlyMap<string, ResolvedQueue>; // in the file's order; empty: no queues
+  // Every `queues` entry by name, in the file's order (empty: no queues), each with its timing.
+  queues: ReadonlyMap<string, QueueEntry>;
+  // The queue drivers' checks already run on these entries: the built-in SQS ones.
+  validated: ReadonlySet<QueueDriver['validate']>;
   worker: FrameworkWorkerConfig; // the file's `worker` over defaultWorkerOptions
   // Unvalidated: the core validates it when a Resizer sets up its task queue.
   coordination: CoordinationOptions | undefined;
 }
 
-const STORAGE_DRIVERS = ['local', 's3'];
-const QUEUE_DRIVERS = ['database', 'sqs'];
+// The file that defines `queues`, as the messages about a Resizer's `queue` name it.
+const QUEUES_IN = 'src/config/resize.ts';
 const PROCESS_WIDE = ['queues', 'worker', 'coordination'] as const;
 const WORKER_KEYS = Object.keys(defaultWorkerOptions);
 
@@ -86,12 +87,6 @@ export function sourceName(source: ConfigSource): string {
     ? 'the config passed to new FrameworkResizer()'
     : configFile(source.configName);
 }
-
-// A `queue` object is the 0.2 shape, where each file carried its own task queue.
-const queueMoved = (where: string): ResizeConfigError =>
-  removed(
-    `\`queue\` in ${where} is now a queue name — define the queue once in src/config/resize.ts as queues: { default: { driver: 'database', …timing } } and set queue: 'default' (or queue: false for eager only)`,
-  );
 
 // The framework returns the same cached object on every getConfig call, so each file is split and
 // validated once. But `app.updateConfig()` assigns new values into that same object, so a cached
@@ -161,24 +156,18 @@ export function resolveFrameworkConfig(
     );
   }
   const where = sourceName(source);
+  // The name itself is checked against the Resizer's drivers when it reads the section.
   if (
     storage !== undefined &&
-    !(isRecord(storage) && STORAGE_DRIVERS.includes(storage.driver as string))
+    !(
+      isRecord(storage) &&
+      typeof storage.driver === 'string' &&
+      storage.driver.trim().length > 0
+    )
   ) {
     throw invalid(`\`storage\` in ${where} needs driver 'local' or 's3'`);
   }
-  if (isRecord(queue)) {
-    throw queueMoved(where);
-  }
-  if (
-    queue !== undefined &&
-    queue !== false &&
-    !(typeof queue === 'string' && queue.trim().length > 0)
-  ) {
-    throw invalid(
-      `\`queue\` in ${where} must be a queue name (a key of \`queues\` in src/config/resize.ts) or false for eager only`,
-    );
-  }
+  checkedQueue(queue, where, QUEUES_IN);
   // src/config/resize.ts holds them as a file; anywhere else they would be ignored silently.
   if (source.explicit || source.configName !== 'resize') {
     for (const section of PROCESS_WIDE) {
@@ -190,9 +179,9 @@ export function resolveFrameworkConfig(
     }
   }
   const result: ResolvedFrameworkConfig = {
-    image: validateResizeConfig(image),
+    image: validateResizeConfig(mergeImageConfig(image)),
     mediaModelName,
-    storage: storage as StorageConfig | undefined,
+    storage: storage as { driver: string } | undefined,
     queue: queue as string | false | undefined,
   };
   let bySource = resolvedFiles.get(raw);
@@ -221,45 +210,22 @@ export function resolveProcessConfig(raw: unknown): ResolvedProcessConfig {
   const where = configFile('resize');
   // Caught here too, so that worker start, which reads only this, reports the old shape.
   if (isRecord(raw.queue)) {
-    throw queueMoved(where);
+    throw queueObjectRemoved(where, QUEUES_IN);
   }
+  const entries = resolveQueueEntries(raw.queues, where);
+  // The built-in SQS driver's checks, run on the file whatever drivers a Resizer registers.
+  validateSqsEntries(
+    entries.filter((entry) => entry.section.driver === 'sqs'),
+    { where },
+  );
   const result: ResolvedProcessConfig = {
-    queues: resolveQueues(raw.queues, where),
+    queues: new Map(entries.map((entry) => [entry.name, entry])),
+    validated: new Set([validateSqsEntries]),
     worker: resolveWorker(raw.worker, where),
     coordination: raw.coordination as CoordinationOptions | undefined,
   };
   resolvedProcess.set(raw, { result, values: new Map(Object.entries(raw)) });
   return result;
-}
-
-/**
- * The `queues` map, through the core's checks of every entry; the adapter builds only its two
- * drivers, so any other driver name is refused here, and the SQS entries get the SQS driver's own
- * checks.
- */
-function resolveQueues(
-  value: unknown,
-  where: string,
-): ReadonlyMap<string, ResolvedQueue> {
-  const entries = resolveQueueEntries(value, where);
-  const unknown = entries.find(
-    (entry) => !QUEUE_DRIVERS.includes(entry.section.driver),
-  );
-  if (unknown) {
-    throw invalid(
-      `\`queues.${unknown.name}\` in ${where} needs driver 'database' or 'sqs'`,
-    );
-  }
-  validateSqsEntries(
-    entries.filter((entry) => entry.section.driver === 'sqs'),
-    { where },
-  );
-  const queues = new Map<string, ResolvedQueue>();
-  for (const entry of entries) {
-    const section = entry.section as QueueConfig;
-    queues.set(entry.name, { ...entry, section, backend: backendKey(section) });
-  }
-  return queues;
 }
 
 /** The `worker` section over defaultWorkerOptions: a missing key takes its default. */

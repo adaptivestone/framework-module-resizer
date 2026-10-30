@@ -63,18 +63,31 @@ export function chooseLane<E>(opts: ChooseLaneOptions<E>): Lane<E> {
   return { queueName, entry };
 }
 
-/** The config's `queue`: a queue name, false or undefined; any other value throws. */
-function checkedQueue(
+/**
+ * The error for a `queue` object in `where`: the 0.2 shape, where each config carried its own
+ * task queue (RESIZE_CONFIG_REMOVED_KEY, pointing at `queues` in `queuesIn`).
+ */
+export function queueObjectRemoved(
+  where: string,
+  queuesIn: string,
+): ResizeConfigError {
+  return new ResizeConfigError(
+    `resize config: \`queue\` in ${where} is now a queue name — define the queue once in ${queuesIn} as queues: { default: { driver: 'database', …timing } } and set queue: 'default' (or queue: false for eager only)`,
+    { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+  );
+}
+
+/**
+ * The config's `queue` (in `where`): a queue name, false or undefined. A `queue` object is
+ * queueObjectRemoved; any other value is RESIZE_CONFIG_INVALID.
+ */
+export function checkedQueue(
   value: unknown,
   where: string,
   queuesIn: string,
 ): string | false | undefined {
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-    // A `queue` object is the 0.2 shape, where each config carried its own task queue.
-    throw new ResizeConfigError(
-      `resize config: \`queue\` in ${where} is now a queue name — define the queue once in ${queuesIn} as queues: { default: { driver: 'database', …timing } } and set queue: 'default' (or queue: false for eager only)`,
-      { code: 'RESIZE_CONFIG_REMOVED_KEY' },
-    );
+    throw queueObjectRemoved(where, queuesIn);
   }
   if (
     value === undefined ||

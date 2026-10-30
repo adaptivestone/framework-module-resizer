@@ -75,7 +75,7 @@ describe('getResizeConfig', () => {
     assert.equal(defaultResizeConfig.concurrency, 4);
   });
 
-  test('returns the final framework config without merging another defaults object', () => {
+  test('returns a complete framework config as it is: the merge over the package defaults keeps its objects', () => {
     const config = makeResizeConfig({
       formats: ['webp'],
       storage: { driver: 'local', rootDir: './m', publicBaseUrl: '/m' },
@@ -94,7 +94,11 @@ describe('getResizeConfig', () => {
     const entry = processConfig.queues.get('default');
     assert.strictEqual(entry?.section, config.queues?.default);
     assert.equal(entry?.name, 'default');
-    assert.equal(entry?.backend, 'database');
+    assert.deepEqual(Object.keys(entry ?? {}).sort(), [
+      'name',
+      'section',
+      'timing',
+    ]);
     assert.equal(entry?.timing.maxAttempts, 3);
     assert.equal(entry?.timing.leaseMs, defaultQueueOptions.leaseMs);
   });
@@ -144,14 +148,9 @@ describe('getResizeConfig', () => {
     assert.deepEqual(getResizeConfig().image.upload.formats, ['tiff', 'heif']);
   });
 
-  test('rejects a partial host config because the framework config must be complete', () => {
+  test('merges a partial host config over the package defaults', () => {
     install({ mediaModelName: 'File' });
-    assert.throws(
-      () => getResizeConfig(),
-      (error: unknown) =>
-        error instanceof ResizeConfigError &&
-        error.code === 'RESIZE_CONFIG_UPLOAD_INVALID',
-    );
+    assert.deepEqual(getResizeConfig().image, defaultResizeConfig);
   });
 
   test('rejects missing mediaModelName, empty format lists, and blank ids', () => {
@@ -294,11 +293,11 @@ describe('config split: core validation vs framework loading', () => {
 
   // Each entry check is tested once, beside the core helper that makes it
   // (src/factory/queues.test.ts, src/helpers/helpers.test.ts); this case pins that the adapter
-  // runs them, refuses a driver it does not build, and keeps each entry's backend.
-  test('queues resolve through the core checks; the adapter takes its two drivers and keeps each backend', () => {
+  // runs them and the SQS checks. Any driver name passes here: a Resizer checks it against its
+  // own drivers when it reads the queues.
+  test('queues resolve through the core checks; any driver name passes the file read', () => {
     const noDriver = `\`queues.bulk\` in src/config/resize.ts ${OVERRIDE} needs driver 'database' or 'sqs'`;
     for (const [queues, ...parts] of [
-      [{ bulk: { driver: 'redis' } }, noDriver],
       [{ bulk: {} }, noDriver],
       [{ bulk: { driver: 'sqs' } }, '`queues.bulk.queueUrl`', 'required'],
     ] as Array<[unknown, ...string[]]>) {
@@ -323,10 +322,11 @@ describe('config split: core validation vs framework loading', () => {
       },
     });
     assert.deepEqual([...resolved.queues.keys()], ['default', 'bulk']);
-    assert.equal(resolved.queues.get('default')?.backend, 'database');
     assert.equal(
-      resolved.queues.get('bulk')?.backend,
-      'sqs:[null,null,null,10]',
+      resolveProcessConfig({
+        queues: { bulk: { driver: 'redis' } },
+      }).queues.get('bulk')?.section.driver,
+      'redis',
     );
   });
 
