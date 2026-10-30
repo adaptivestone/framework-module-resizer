@@ -11,8 +11,9 @@
 // the task observers, and invalidate() removes stored previews for `resizer.invalidate` (one media
 // store write). It takes no locks: the queue leases a task to one worker at a time, the lease token
 // fences the task's writes, and the media store keeps one row per preview identity when an expired
-// lease lets two workers render the same variant. It takes its parts explicitly and knows no
-// Resizer.
+// lease lets two workers render the same variant. Each variant is timed from its encode to the end
+// of its upload and recorded on the metrics sink once the persist says what became of it. It takes
+// its parts explicitly and knows no Resizer.
 import type { Catalog } from './catalog.ts';
 import type {
   DecodeBox,
@@ -23,6 +24,7 @@ import type {
 } from './contracts/decoder.ts';
 import type { ObserverName } from './contracts/hooks.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
+import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
 import type { DecoderSet, IdentifiedSource } from './decoderSet.ts';
@@ -40,6 +42,7 @@ import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import type { HookBus } from './hooks.ts';
 import { previewScope, requireMediaId } from './images.ts';
+import { NoopMetrics } from './metrics.ts';
 import type { PipelineRegistry } from './pipelines.ts';
 import {
   decodeBox,
@@ -49,7 +52,7 @@ import {
   planVariants,
   type VariantPlan,
 } from './plan.ts';
-import { PreviewRecorder } from './previewRecorder.ts';
+import { PreviewRecorder, type RecordResult } from './previewRecorder.ts';
 import { checkRaster } from './raster.ts';
 import {
   type EncodedVariant,
@@ -341,6 +344,8 @@ interface RenderPendingArgs {
   ctx: Record<string, unknown>;
   persist: boolean;
   signal?: AbortSignal;
+  mode: 'task' | 'eager'; // how the variants are recorded on the metrics sink
+  taskId?: string; // the queued task's id, in task mode
 }
 
 interface RenderPendingResult {
@@ -361,7 +366,15 @@ export interface ProcessorDeps {
   config: ResizeConfig;
   logger: ResizeLogger;
   name: string; // the Resizer's name: part of every preview identity
+  // Where each variant is recorded (a Resizer passes its bound sink); default: nothing is recorded.
+  metrics?: ResizeMetrics;
 }
+
+const noMetrics = new NoopMetrics();
+
+/** The code label of a failure: the code of a module error, none for anything else. */
+const codeLabel = (err: unknown): { code?: string } =>
+  ResizeError.isResizeError(err) ? { code: err.code } : {};
 
 /**
  * Renders the previews of one Resizer: eagerly for a caller, or for one queued task. Also fires
@@ -370,9 +383,11 @@ export interface ProcessorDeps {
 export class Processor {
   readonly #deps: ProcessorDeps;
   readonly #recorder: PreviewRecorder;
+  readonly #metrics: ResizeMetrics;
 
   constructor(deps: ProcessorDeps) {
     this.#deps = deps;
+    this.#metrics = deps.metrics ?? noMetrics;
     this.#recorder = new PreviewRecorder({
       catalog: deps.catalog,
       media: deps.media,
@@ -428,6 +443,7 @@ export class Processor {
       pipeline,
       ctx,
       persist,
+      mode: 'eager',
     });
 
     if (requested.length > 0 && generated.length === 0 && failedCount > 0) {
@@ -558,6 +574,8 @@ export class Processor {
         ctx,
         persist: true,
         signal: opts.signal,
+        mode: 'task',
+        taskId: task.taskId,
       },
     );
 
@@ -630,6 +648,8 @@ export class Processor {
       ctx,
       persist,
       signal,
+      mode,
+      taskId,
     } = args;
     const {
       catalog,
@@ -785,7 +805,42 @@ export class Processor {
     };
     // Each variant's stored row, by plan; read back in request order after the pool.
     const rows = new Map<VariantPlan, Preview>();
+    // How long each rendered variant took, from its encode to the end of its upload. It is recorded
+    // once the persist says what became of the row.
+    const durations = new Map<VariantPlan, number>();
+    const metrics = this.#metrics;
+    const recordVariant = (
+      plan: VariantPlan,
+      ms: number,
+      outcome: 'stored' | 'duplicate' | 'rendered' | 'failed',
+      extra: { code?: string; bytes?: number } = {},
+    ): void => {
+      const format = plan.variant.format;
+      metrics.timing(
+        'resize.variant',
+        ms,
+        {
+          pipeline: pipelineName,
+          format,
+          mode,
+          outcome,
+          ...(extra.code === undefined ? {} : { code: extra.code }),
+        },
+        {
+          mediaId,
+          identity: plan.identity,
+          ...(taskId === undefined ? {} : { taskId }),
+        },
+      );
+      if (extra.bytes !== undefined) {
+        metrics.count('resize.variant.bytes', extra.bytes, {
+          pipeline: pipelineName,
+          format,
+        });
+      }
+    };
     const renderVariant = async (plan: VariantPlan): Promise<void> => {
+      const started = performance.now();
       try {
         let encoded: EncodedVariant;
         try {
@@ -812,6 +867,7 @@ export class Processor {
             { code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID' },
           );
         }
+        durations.set(plan, performance.now() - started);
         rows.set(
           plan,
           previewRow(plan, encoded, ref, {
@@ -827,11 +883,18 @@ export class Processor {
       } catch (err) {
         // One bad variant must not fail the whole task; the caller decides what the failures mean.
         // A media error from the pixel work (an SVG output) does not know its media: add it.
+        const failure = lacksMediaId(err) ? withMediaId(err, mediaId) : err;
         logger.error(
           `resize worker: variant ${plan.identity} failed for media ${mediaId}`,
-          lacksMediaId(err) ? withMediaId(err, mediaId) : err,
+          failure,
         );
         failedCount += 1;
+        recordVariant(
+          plan,
+          performance.now() - started,
+          'failed',
+          codeLabel(failure),
+        );
       }
     };
 
@@ -846,23 +909,61 @@ export class Processor {
     );
     sized.clear();
     // The rows in request order, whatever order the pool finished them in.
-    generated = plans.flatMap((plan) => rows.get(plan) ?? []);
+    const rendered = plans.flatMap((plan) => {
+      const row = rows.get(plan);
+      return row ? [{ plan, row }] : [];
+    });
+    generated = rendered.map(({ row }) => row);
 
     // ONE atomic persist for everything generated (+ display-dim backfill when the original
     // never carried dims; previewRecorder.ts), then fire onPreviewGenerated per stored preview
     // (ctx {}).
     if (persist && generated.length > 0) {
       const backfillDims = storedDims === undefined ? mediaDims : undefined;
-      const recorded = await this.#recorder.record(
-        mediaId,
-        scope,
-        generated,
-        backfillDims,
-      );
+      let recorded: RecordResult;
+      try {
+        recorded = await this.#recorder.record(
+          mediaId,
+          scope,
+          generated,
+          backfillDims,
+        );
+      } catch (err) {
+        // Nothing this call rendered is known to be stored.
+        for (const { plan } of rendered) {
+          recordVariant(
+            plan,
+            durations.get(plan) ?? 0,
+            'failed',
+            codeLabel(err),
+          );
+        }
+        throw err;
+      }
       generated = recorded.stored;
       alreadyStored.push(...recorded.alreadyStored);
+      const kept = new Set(generated);
+      const duplicates = new Set(recorded.alreadyStored);
+      for (const { plan, row } of rendered) {
+        const ms = durations.get(plan) ?? 0;
+        if (kept.has(row)) {
+          recordVariant(plan, ms, 'stored', { bytes: row.bytes });
+        } else if (duplicates.has(plan.identity)) {
+          recordVariant(plan, ms, 'duplicate', { bytes: row.bytes });
+        } else {
+          // The media store left it out and does not hold it (or the media is gone): logged by
+          // the recorder, and not stored.
+          recordVariant(plan, ms, 'failed');
+        }
+      }
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
+      }
+    } else if (!persist) {
+      for (const { plan, row } of rendered) {
+        recordVariant(plan, durations.get(plan) ?? 0, 'rendered', {
+          bytes: row.bytes,
+        });
       }
     }
 

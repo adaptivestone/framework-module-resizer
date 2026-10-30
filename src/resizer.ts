@@ -479,6 +479,7 @@ export class Resizer {
           storage,
           decoders: this.#decoders,
           config,
+          metrics: this.#boundMetrics,
         }),
         reader: this.#buildReader(catalog),
         processor: new Processor({
@@ -491,6 +492,7 @@ export class Resizer {
           config,
           logger: this.logger,
           name: this.name,
+          metrics: this.#boundMetrics,
         }),
       };
     } else if (this.#readerStale) {

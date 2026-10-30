@@ -60,7 +60,9 @@ import {
   memoryLocks,
   observedQueue,
   PlainTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
+import { stampFresh } from './testHelpers/fresh.ts';
 import { fakePdf, TestPdfDecoder } from './testHelpers/pdfDecoder.ts';
 import {
   makeImageConfig,
@@ -5242,5 +5244,236 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
     assert.equal(downloads, 0);
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Each variant is timed from its encode to the end of its upload, and recorded with its outcome
+// once the persist has said what became of it.
+// ---------------------------------------------------------------------------
+
+describe('variant metrics', () => {
+  /** processorDeps() with a recording metrics sink and recording storage. */
+  function measuredDeps() {
+    const deps = processorDeps();
+    const metrics = recordingMetrics();
+    deps.metrics = metrics;
+    const { storage, uploads } = makeStorage(redPng);
+    deps.storage = storage;
+    return { deps, metrics, uploads };
+  }
+
+  const timings = (metrics: ReturnType<typeof recordingMetrics>) =>
+    metrics.calls.filter(
+      (c) => c.kind === 'timing' && c.name === 'resize.variant',
+    );
+  const byteCounts = (metrics: ReturnType<typeof recordingMetrics>) =>
+    metrics.calls.filter(
+      (c) => c.kind === 'count' && c.name === 'resize.variant.bytes',
+    );
+
+  const twoSizes: SizeInput[] = [
+    { width: 20, height: 20 },
+    { width: 10, height: 10 },
+  ];
+
+  test('generate() records each stored variant in eager mode, with its bytes', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { created } = await new Processor(deps).generate({
+      media: mediaDoc(),
+      sizes: twoSizes,
+    });
+    assert.equal(created.length, 2);
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 2);
+    for (const call of recorded) {
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'jpeg',
+        mode: 'eager',
+        outcome: 'stored',
+      });
+      assert.ok(call.value >= 0);
+    }
+    assert.deepEqual(
+      recorded.map((c) => c.context),
+      created.map((row) => ({ mediaId: 'm1', identity: row.identity })),
+    );
+    const bytes = byteCounts(metrics);
+    assert.deepEqual(
+      bytes.map((c) => ({ value: c.value, labels: c.labels })),
+      created.map((row) => ({
+        value: row.bytes,
+        labels: { pipeline: 'default', format: 'jpeg' },
+      })),
+    );
+  });
+
+  test('persist: false records rendered variants', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { created } = await new Processor(deps).generate({
+      media: mediaDoc(),
+      sizes: twoSizes,
+      persist: false,
+    });
+    assert.equal(created.length, 2);
+    assert.deepEqual(
+      timings(metrics).map((c) => c.labels.outcome),
+      ['rendered', 'rendered'],
+    );
+    assert.deepEqual(
+      byteCounts(metrics).map((c) => c.value),
+      created.map((row) => row.bytes),
+    );
+  });
+
+  test('a failed variant records failed with its code and is still logged at error', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    deps.pipelines = new PipelineRegistry({
+      default: {
+        variantSteps: [
+          (img, { variant: v }) => {
+            if (v.sizeKey === '10x10') {
+              throw new ResizeMediaError('the step refuses', {
+                code: 'RESIZE_PIPELINE_STEP_INVALID',
+              });
+            }
+            return img;
+          },
+        ],
+      },
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: mediaDoc(),
+      sizes: twoSizes,
+    });
+    assert.equal(created.length, 1);
+    assert.equal(failed, 1);
+    const failedCalls = timings(metrics).filter(
+      (c) => c.labels.outcome === 'failed',
+    );
+    assert.equal(failedCalls.length, 1);
+    assert.deepEqual(failedCalls[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'eager',
+      outcome: 'failed',
+      code: 'RESIZE_PIPELINE_STEP_INVALID',
+    });
+    const identity = String(failedCalls[0].context.identity);
+    assert.match(identity, /:10x10:/);
+    assert.deepEqual(failedCalls[0].context, { mediaId: 'm1', identity });
+    assert.ok(
+      logs.error.some((a) =>
+        String(a[0]).includes(`variant ${identity} failed for media m1`),
+      ),
+    );
+    // A failed variant uploaded nothing: only the stored one counts bytes.
+    assert.deepEqual(
+      byteCounts(metrics).map((c) => c.value),
+      [created[0].bytes],
+    );
+  });
+
+  test('a variant another worker stored first records duplicate', async () => {
+    const { deps, metrics } = measuredDeps();
+    const scope = { resizer: 'default', pipeline: 'default' };
+    const identity = deps.catalog.identity(scope, variant());
+    const dims = { width: 64, height: 48 };
+    // The other worker's row carries the signatures this worker would record, so it is fresh.
+    const stored = stampFresh(
+      mediaDoc({
+        original: dims,
+        previews: [
+          {
+            storageRef: { key: 'previews/other-worker.jpeg' },
+            identity,
+            resizer: 'default',
+            pipeline: 'default',
+            sizeKey: '20x20',
+            requestedWidth: 20,
+            requestedHeight: 20,
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+          },
+        ],
+      }),
+      { config: deps.config },
+    );
+    let appended = false;
+    deps.media = fakeMedia({
+      load: async () => (appended ? stored : mediaDoc({ original: dims })),
+      appendPreviews: async () => {
+        appended = true;
+        return [];
+      },
+    });
+    await new Processor(deps).processTask(task({ previews: [variant()] }));
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'duplicate',
+    });
+    assert.deepEqual(recorded[0].context, {
+      mediaId: 'm1',
+      identity,
+      taskId: 't1',
+    });
+    assert.equal(byteCounts(metrics).length, 1);
+  });
+
+  test('a persist that throws records failed for every rendered variant and rethrows', async () => {
+    const { deps, metrics } = measuredDeps();
+    const db = new Error('db');
+    deps.media = fakeMedia({
+      load: async () => mediaDoc(),
+      appendPreviews: async () => {
+        throw db;
+      },
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({ media: mediaDoc(), sizes: twoSizes }),
+      (err: unknown) => err === db,
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 2);
+    for (const call of recorded) {
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'jpeg',
+        mode: 'eager',
+        outcome: 'failed',
+      });
+    }
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('processTask records task mode with the task id in the context', async () => {
+    const { deps, metrics } = measuredDeps();
+    await new Processor(deps).processTask(
+      task({ taskId: 'task-7', previews: [variant()] }),
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'stored',
+    });
+    assert.deepEqual(recorded[0].context, {
+      mediaId: 'm1',
+      identity: deps.catalog.identity(
+        { resizer: 'default', pipeline: 'default' },
+        variant(),
+      ),
+      taskId: 'task-7',
+    });
   });
 });
