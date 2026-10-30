@@ -9,7 +9,8 @@
 // driver factory over PlainTaskQueue; fakeDatabaseParts are database parts whose task queue is a
 // MemoryTaskQueue; memoryStorage keeps files in a map; memoryStorageDriver and
 // fakeDatabaseDriver are the storage and database drivers a test registers by name;
-// silentLogger drops every message; recordingMetrics keeps every metrics call.
+// silentLogger drops every message; recordingMetrics keeps every metrics call; refKey reads the
+// key of a fake storage ref; asS3Client types a recording fake as the S3 SDK client.
 import type { S3Client } from '@aws-sdk/client-s3';
 import type {
   DatabaseDriver,

@@ -89,15 +89,23 @@ async function createFixture(name: string) {
   } as never);
 
   // The app's database task queue, as a FrameworkResizer builds it from src/config/resize.ts.
-  const tasks = FrameworkDatabase.fromConfig(
-    { driver: 'framework', configName: 'resize' },
-    { logger: appLogger, where: 'test' },
-  ).taskQueue?.({
-    queues: ['default'],
-    getTiming: () => undefined,
-    logger: appLogger,
-  });
-  assert.ok(tasks, 'the framework database builds a task queue');
+  // The callers' try/finally starts only once this returns, so a failure here closes the fixture
+  // itself: a leaked server or connection would keep the test file from exiting.
+  let tasks: TaskQueue | undefined;
+  try {
+    tasks = FrameworkDatabase.fromConfig(
+      { driver: 'framework', configName: 'resize' },
+      { logger: appLogger, where: 'test' },
+    ).taskQueue?.({
+      queues: ['default'],
+      getTiming: () => undefined,
+      logger: appLogger,
+    });
+    assert.ok(tasks, 'the framework database builds a task queue');
+  } catch (err) {
+    await closeFixture({ connection, server });
+    throw err;
+  }
   return {
     server,
     connection,

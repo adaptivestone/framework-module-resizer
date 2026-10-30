@@ -1831,6 +1831,26 @@ describe('processTask — variants', () => {
     assert.equal(appendCalls[0].previews[0].contentType, 'image/avif');
   });
 
+  // Public previews are stored with an immutable cache header, which is safe only while every
+  // preview gets a new random key: a re-rendered preview must never reuse an old URL.
+  test('a stored preview has a random key under previews/', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+    });
+
+    await processTask(task({ previews: [variant()] }));
+
+    assert.match(
+      refKey(appendCalls[0].previews[0].storageRef),
+      /^previews\/[0-9a-f]{32}\.\w+$/,
+    );
+  });
+
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {
     installApp();
     const { storage, uploads } = makeStorage(alphaPng);

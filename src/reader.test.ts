@@ -1984,6 +1984,24 @@ describe('read metrics', () => {
     assert.equal(reads[5].context.pipeline, 'retired');
   });
 
+  test("the Reader's never-throw catch counts one failed read", async () => {
+    const sink = recordingMetrics();
+    const reader = new Reader({ ...readerDeps(undefined), metrics: sink });
+    // @ts-expect-error a JS host may call resolve() with no options
+    const result = await reader.resolve(undefined);
+    assert.deepEqual(result, {
+      decision: { ready: [], missing: [] },
+      output: undefined,
+    });
+    const reads = readsOf(sink);
+    assert.equal(reads.length, 1);
+    assert.deepEqual(reads[0].labels, {
+      pipeline: 'default',
+      outcome: 'failed',
+    });
+    assert.equal('mediaId' in reads[0].context, false);
+  });
+
   test('a beforeEnqueue tap that empties the list in place counts suppressed, not ready', async () => {
     const sink = recordingMetrics();
     const r = new Resizer({

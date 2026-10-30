@@ -228,7 +228,7 @@ describe('S3Storage', () => {
     );
     await s.upload(args('originals/a.jpg', 'private'));
     assert.equal('CacheControl' in sent[1].input, false);
-    await s.upload({ ...args('originals/b.jpg', 'public') });
+    await s.upload(args('originals/b.jpg', 'public'));
     assert.equal(
       sent[2].input.CacheControl,
       'public, max-age=31536000, immutable',

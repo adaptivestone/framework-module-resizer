@@ -137,10 +137,14 @@ test('lock settings are validated only in the core', () => {
 // 'other'), so the list of codes must follow the sources: a new code joins it, and a code no
 // source raises any more leaves it. The second scan skips errorCodes.ts, which holds every entry.
 test('every error code a shipped file uses is in RESIZE_ERROR_CODES, and every entry is used', () => {
+  // Comments are stripped; limit: a `//` in a string not after `:` cuts the rest of its line.
   const codesIn = (files: string[]): Set<string> => {
     const codes = new Set<string>();
     for (const f of files) {
-      for (const match of read(f).matchAll(/'(RESIZE_[A-Z0-9_]+)'/g)) {
+      const code = read(f)
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/.*$/gm, '$1');
+      for (const match of code.matchAll(/'(RESIZE_[A-Z0-9_]+)'/g)) {
         codes.add(match[1]);
       }
     }
@@ -205,6 +209,31 @@ test('no shipped file names the pdf format', () => {
   );
 });
 
+/**
+ * The module-level state `source` declares: every top-level `let` or `var`, then every top-level
+ * `const` holding a new Map, Set, WeakMap or WeakSet (typed or not), each exported or not.
+ */
+function moduleState(source: string): string[] {
+  const lets = [...source.matchAll(/^(?:export )?(?:let|var) (\w+)/gm)].map(
+    (m) => m[1],
+  );
+  const collections = [
+    ...source.matchAll(
+      /^(?:export )?const (\w+)(?:\s*:[^=]+)?\s*=\s*new (?:Map|Set|WeakMap|WeakSet)\b/gm,
+    ),
+  ].map((m) => m[1]);
+  return [...lets, ...collections];
+}
+
+test('the module-state scan sees typed collections, var and let', () => {
+  assert.deepEqual(
+    moduleState(
+      'const a: Map<string, number> = new Map();\nvar b = 1;\nexport let c;\nexport const d = new WeakSet();\nconst e = 1;',
+    ),
+    ['b', 'c', 'a', 'd'],
+  );
+});
+
 // Per-process state lives in the core's process registry, which resetResizerForTests() clears: the
 // framework adapter keeps none of its own, except the caches of validated config files, which are
 // keyed by the config objects and so cannot outlive them.
@@ -221,19 +250,10 @@ test('the framework adapter keeps no module-level state except the config-valida
     files.includes('framework/config.ts'),
     'sanity check: the listing sees the framework adapter',
   );
-  const found = files.flatMap((f) => {
-    const source = read(f);
-    const lets = [...source.matchAll(/^let (\w+)/gm)].map(
-      (m) => `${f} ${m[1]}`,
-    );
-    const collections = [
-      ...source.matchAll(
-        /^(?:export )?const (\w+) = new (?:Map|Set|WeakMap|WeakSet)\b/gm,
-      ),
-    ]
-      .map((m) => `${f} ${m[1]}`)
-      .filter((entry) => !allowed.has(entry));
-    return [...lets, ...collections];
-  });
+  const found = files.flatMap((f) =>
+    moduleState(read(f))
+      .map((name) => `${f} ${name}`)
+      .filter((entry) => !allowed.has(entry)),
+  );
   assert.deepEqual(found, []);
 });

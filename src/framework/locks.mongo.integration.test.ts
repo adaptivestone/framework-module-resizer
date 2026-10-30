@@ -24,7 +24,7 @@ let connection: mongoose.Connection;
 let LockModel: LockModelType;
 
 /** The lock documents as stored: string ids, and the owner the strict schema does not declare. */
-type LockRow = { _id: string; expiredAt?: Date; owner?: string };
+type LockRow = LockDoc & { owner?: string };
 function rawLocks() {
   assert.ok(connection.db, 'the connection is open');
   return connection.db.collection<LockRow>(LockModel.collection.collectionName);
