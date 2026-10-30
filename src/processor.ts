@@ -1041,8 +1041,10 @@ export class Processor {
         originDims: mediaDims,
       });
       if (recorded.failure) {
-        // A write failed (logged by the recorder). What an earlier write of this persist stored
-        // (the append before a failed replace) is stored; nothing else this call rendered is.
+        // The persist failed. A write the store rejected is logged by the recorder; a malformed
+        // append result and a store without replacePreviews are not, and travel in `error`. What
+        // an earlier write of this persist stored (the append before a failed replace) is stored;
+        // nothing else this call rendered is.
         const { error } = recorded.failure;
         const stored = new Set(recorded.stored);
         for (const { plan, row } of rendered) {

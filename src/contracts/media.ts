@@ -19,7 +19,10 @@ export abstract class MediaStore {
   abstract loadMedia(mediaId: string): Promise<MediaLike | null>;
 
   /**
-   * Append generated previews, and optionally backfill the original's dimensions. The store keeps
+   * Append generated previews, and save `backfillDims` on the original when it is given, whether or
+   * not a preview is stored (also for `previews: []`): the freshness check needs the original's
+   * dimensions, and a store that drops them makes every read of such a media queue a task that
+   * downloads the original. The store keeps
    * one row per `identity`: a preview whose identity is already stored on the media is skipped, so
    * two workers that rendered the same variant leave one row. The core identifies a stored row by
    * its scope (`resizer` and `pipeline`, `default` when unset), size key, format and filters,

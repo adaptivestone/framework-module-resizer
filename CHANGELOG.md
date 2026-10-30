@@ -12,6 +12,9 @@
 - `0.3.0-rc.3`: new APIs a host may use, no required host change: `createResizer`, `fromConfig`
   and drivers by name, routing between backends, `carrierOf`, one worker for several queues,
   partial config files (see Changed behaviour for what a host may notice).
+- `0.3.0-rc.4`: metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics`, the `metrics` option) and
+  the freshness check, which regenerates outdated previews (see Changed behaviour for the storage
+  cost).
 - Later release candidates: internal changes that need no host change.
 
 `variantSteps` keep their Sharp instance in `0.3.0-rc.2`, now over each size's pixels (operations
@@ -164,10 +167,12 @@ later release that puts the image engine behind a port.
   restore your customizations; the scaffold never overwrites a file, so re-running `--eject` alone
   changes nothing). The config file is still never diffed. An ejected model without the two times
   keeps working: they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
-- **Old preview rows.** Rows written before `0.3.0-rc.1` have no `origin` or `encodeSig`. They are
-  served for now, and will be regenerated once a later release's freshness check ships, so plan
-  the storage cost of rendering them again. Rows without an `identity` (written before 0.3.0) are
-  never removed by `invalidate` or `replacePreviews`: the host deletes their files itself.
+- **Old preview rows.** Rows written before `0.3.0-rc.1` have no `origin` or `encodeSig`, so the
+  freshness check (`0.3.0-rc.4`) finds them stale: each is served until its replacement is stored,
+  regenerated on its next read, `prewarm()` or `generate()`, and its old file stays in storage, so
+  plan the storage cost and the cleanup (see Changed behaviour). Rows without an `identity`
+  (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`: the host deletes
+  their files itself.
 - **`beforeSteps` take and return a `Raster`.** `BeforeStep` is now
   `(raster, { media, source, scale, ctx }) => Raster` (or a promise of one), for every source
   kind: `raster` is the decoded first frame (`{ data, info }`: raw 8-bit sRGB pixels, upright), and
@@ -697,7 +702,61 @@ later release that puts the image engine behind a port.
 - `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and `FrameworkS3StorageConfig` are
   deprecated (use `StorageConfig`, `LocalStorageConfig` and `S3StorageConfig`).
 
+**Changed behaviour** (`0.3.0-rc.4`, without a required host change)
+
+- **Outdated previews regenerate.** A stored preview whose `origin` or `encodeSig` differs from
+  what the current settings would record (another original or other stored dimensions, other
+  encode settings, another pipeline `version`), or that has neither (written before
+  `0.3.0-rc.1`), is stale. It is still served, and its replacement is made on its next read,
+  `prewarm()` or `generate()` and stored over it in one write. Each replacement costs a render and
+  an upload, and the old file is never deleted: plan the storage cost, and clean up from the
+  `info` line "resize: replaced <n> outdated preview(s) of media <id>; their files are not
+  deleted: storage refs …", or sweep preview objects no row references (rows without an
+  `identity` keep their files referenced: delete them yourself). The wave shares the queue with
+  new uploads' previews, which wait behind it. An eager-only host's stale rows are served until it
+  calls `generate()`.
+- **Roll out settings with every worker at once.** The API and the workers must run the same image
+  settings and pipeline versions: deploy every worker together, or change settings only after the
+  old workers have stopped. Two worker versions with different settings re-make each other's rows,
+  each costing one render, one upload and one orphaned file per read after a task ends.
+- **A media without stored dimensions** (or with a stored `null`) takes one task that downloads and
+  inspects the original and records its dimensions; no row of it can be proven fresh before. A
+  `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`; a store that
+  drops them makes every read of such a media queue that task, and the worker warns once.
+- **`beforeEnqueue` also receives stale variants**, with the missing ones, in cell order; a
+  variant that replaces a stale row ends in `decision.stale`, not `decision.missing`.
+- **Changing the smaller of `limits.sourcePixels` and `limits.inputPixels`** (the animation pixel
+  budget) regenerates webp and gif previews; changing only the larger one changes nothing.
+- **Per-read logs.** A read logs an unregistered pipeline name and a format list without
+  `encode.formats` entries once per Resizer (at most 100 of each), and the missing task queue
+  (when the caller passed `enqueueMissing: true`) once; a media without an original logs nothing.
+  Each read is counted instead (`resize.read` with its outcome).
+- **New `info` lines** from the default metrics: one summary line per Resizer per window (60 s by
+  default) when something was counted, and one line per task outcome and per failed variant.
+  `new NoopMetrics()` turns them off.
+- **A truthy `fit` that is not `true`** (from untyped JS, e.g. a `beforeEnqueue` tap's `fit: 1`) is
+  now a cover row: only `fit: true` makes a fit row. On the database queue such a variant used to
+  render as a fit row (Mongoose cast `1` to `true`); fit rows already stored stay fresh and are not
+  regenerated. Typed hosts are unaffected.
+
 **Features**
+
+- **Metrics.** A Resizer reports reads, uploads, rendered variants, task outcomes and the worker's
+  waits to a `ResizeMetrics` sink (`count`, `timing`, optional `flush`; each may be `async`, and the
+  4th argument carries per-event context for logs), given as the `metrics` option of `new
+  Resizer`, `createResizer` and `new FrameworkResizer` and read back as `resizer.metrics`. The
+  default is `LogMetrics` on the Resizer's logger (with debug lines on, on the app logger, for a
+  `FrameworkResizer`); `NoopMetrics` records nothing. The Resizer adds the `resizer` label, bounds
+  the `pipeline` and `code` labels (`'unregistered'`, `'other'`; the raw value goes to the
+  context), and never lets the sink throw or reject into a read or a task. The worker flushes the
+  sinks when it stops, waiting at most 5 s. A sink that is not one (`metrics: null` too) is
+  `ResizeSetupError` `RESIZE_METRICS_INVALID`. See "Metrics" in `README.md`.
+- **The freshness check.** The read path, `prewarm()`, `generate()` and the worker compare each
+  stored row's `origin` and `encodeSig` with the current settings; stale rows are served while the
+  worker replaces them in one write. See "Freshness" in `README.md`.
+- New fields: `decision.stale` and `ReadyEntry.stale` (stale rows served and their queued
+  replacements), `GenerateResult.replaced` (the storage refs of the rows `generate()` replaced) and
+  the optional `ResizeLogger.debug`.
 
 - The framework is optional. `@adaptivestone/framework` and `mongoose` are optional peers, so
   npm no longer installs them into a plain Node app; the core needs only `sharp`. A plain Node app
@@ -787,10 +846,10 @@ later release that puts the image engine behind a port.
   settings (for animated formats: `animated`, `limits.animationFrames` and the pixel budget
   `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames at the larger of
   the source's and the preview's size), the result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
-  from `generate()`; `resizeMediaSchemaFragment` declares them. The read path does not check them
-  yet.
-- `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it to mark the
-  pipeline's stored previews as made with older settings. They are not regenerated yet. It is not
+  from `generate()`; `resizeMediaSchemaFragment` declares them. From `0.3.0-rc.4` the freshness
+  check compares them with the current settings (below).
+- `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it when a step's
+  output changes, and the pipeline's stored previews are regenerated on their next read. It is not
   validated, and `''` signs differently from an absent version.
 - `ResizeTask` rows record `startedAt` (when the latest delivery started; every claim sets it) and
   `finishedAt` (when the task completed or was dead-lettered; a retry leaves both as they are), for

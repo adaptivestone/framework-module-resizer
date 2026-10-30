@@ -89,8 +89,11 @@ export interface RecordResult {
   blocked: string[];
   // The stored rows the replacement removed (their files are not deleted).
   removed: Preview[];
-  // Set when a write failed (already logged): the caller rethrows `error`. `stored` then holds
-  // only what an earlier write of this persist stored (the append before a failed replace).
+  // Set when the persist failed: the caller rethrows `error`. A write the store rejected is
+  // already logged here; an append result that is not an array (RESIZE_MEDIA_APPEND_RESULT_INVALID)
+  // and a store without replacePreviews are not, and reach the caller through `error` alone.
+  // `stored` then holds only what an earlier write of this persist stored (the append before a
+  // failed replace).
   failure?: { error: unknown };
 }
 

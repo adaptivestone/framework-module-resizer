@@ -62,7 +62,20 @@ requires no host change. Three things a host may notice without changing anythin
   `0.3.0-rc.2` accepted `runWorker({ resizers: [b], queue: 'bulk' })` beside a Resizer `a` on the
   database queue). `npm run cli ResizeWorker` serves every Resizer and is not affected.
 
-Release candidates after `0.3.0-rc.3` change only internals. `CHANGELOG.md` (`# 0.3.0`) has the
+`0.3.0-rc.4` adds metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics` and the `metrics`
+option; by default one summary `info` line per Resizer per minute and one per task outcome) and the
+freshness check. It requires no host change, but one behaviour is visible: outdated previews (made
+from another original, with other image settings or pipeline `version`, or before `0.3.0-rc.1`)
+regenerate on their next read. So:
+
+- plan worker capacity and storage for that wave, which shares the queue with new uploads;
+- clean up the old files, which the module never deletes (from the "resize: replaced …
+  outdated preview(s)" log line, or with a sweep of preview objects no row references);
+- roll out image settings and pipeline versions with every worker at once (or after the old
+  workers have stopped): two worker versions with different settings re-make each other's rows;
+- a custom `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`.
+
+Release candidates after `0.3.0-rc.4` change only internals. `CHANGELOG.md` (`# 0.3.0`) has the
 details of everything below.
 
 ## Named queues: from `queue: { … }` to `queues`
@@ -228,10 +241,12 @@ export default {
    (`RESIZE_QUEUE_NOT_SERVED`, naming the package). With two backends, `resizer.tasks` is a
    `RoutingTaskQueue`: use `carrierOf(resizer.tasks, name)` instead of an `instanceof` check.
 6. **Old preview rows.**
-   - Rows written before `0.3.0-rc.1` (no `origin` or `encodeSig`) are served for now. They will
-     be regenerated once a later release's freshness check ships, so plan the storage cost.
-   - Rows without an `identity` are never removed by `invalidate` or `replacePreviews`; the host
-     deletes their files itself.
+   - Rows written before `0.3.0-rc.1` (no `origin` or `encodeSig`) are stale: each is served until
+     its replacement is stored, and regenerated on its next read, `prewarm()` or `generate()`. The
+     old files stay in storage: plan the storage cost and clean them up (see "Freshness" in
+     `README.md`).
+   - Rows without an `identity` are never removed by `invalidate` or `replacePreviews`, and a sweep
+     never finds their files; the host deletes those rows and files itself.
 
 ## Other changes a host must make for 0.3.0
 
@@ -311,8 +326,8 @@ export default {
   or queues. It takes no gate: a task running for that media can still store rows after it
   returns.
 - Preview rows now record `bytes`, `createdAt`, `origin` and `encodeSig`, and a pipeline may set
-  `version`, which is part of its rows' `encodeSig`. The read path does not check them yet
-  (statement 6).
+  `version`, which is part of its rows' `encodeSig`. From `0.3.0-rc.4` a row whose signatures no
+  longer match the current settings is regenerated on its next read (statement 6).
 - The original is never served. Code that read `isOriginal`, or relied on
   `ctx.isOwner` / `ctx.isAdmin` to get the original from `resolve()`, must change:
   to give an owner the private original, call
