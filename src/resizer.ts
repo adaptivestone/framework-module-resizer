@@ -98,8 +98,31 @@ const registry = new Registry<Resizer>();
 let readProcessor: (resizer: Resizer) => Processor;
 let loadTasksPart: (resizer: Resizer) => Promise<TaskQueue | undefined>;
 let readTaskCoordination: (resizer: Resizer) => TaskCoordination;
-let runVerifyServices: (resizer: Resizer) => Promise<void>;
-let runVerifyRoute: (resizer: Resizer, queue: string) => Promise<void>;
+let runVerifyServices: (
+  resizer: Resizer,
+  verified: Set<object> | undefined,
+) => Promise<void>;
+let runVerifyRoute: (
+  resizer: Resizer,
+  queue: string,
+  verified: Set<object> | undefined,
+) => Promise<void>;
+
+/**
+ * Run `part.verify()` unless `verified` already holds `part`, and record it once it passes. The
+ * worker passes one set for its whole start, so a backend or a lock store that several Resizers
+ * share is checked once; verify() passes none and checks every part of its own.
+ */
+async function verifyPart(
+  part: { verify?(): void | Promise<void> } | undefined,
+  verified: Set<object> | undefined,
+): Promise<void> {
+  if (!part || verified?.has(part)) {
+    return;
+  }
+  await part.verify?.();
+  verified?.add(part);
+}
 
 const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
 type PartName = (typeof PART_NAMES)[number];
@@ -212,8 +235,10 @@ export class Resizer {
         locks: resizer.#locks,
       };
     };
-    runVerifyServices = (resizer) => resizer.#verifyServices();
-    runVerifyRoute = (resizer, queue) => resizer.#verifyRoute(queue);
+    runVerifyServices = (resizer, verified) =>
+      resizer.#verifyServices(verified);
+    runVerifyRoute = (resizer, queue, verified) =>
+      resizer.#verifyRoute(queue, verified);
   }
 
   constructor(opts: ResizerOptions) {
@@ -560,9 +585,9 @@ export class Resizer {
    * runs the same checks for the queue names it consumes.
    */
   async verify(): Promise<void> {
-    await this.#verifyServices();
+    await this.#verifyServices(undefined);
     if (this.tasks) {
-      await this.#verifyRoute(this.queueName);
+      await this.#verifyRoute(this.queueName, undefined);
     }
   }
 
@@ -570,8 +595,9 @@ export class Resizer {
    * The checks of verify() that need no queue name: the parts, the config, the Resizer-wide queue
    * set-up, the media store, the lock store (unless the task queue is a router: its lock store is
    * checked with a carrier that needs it) and the decoders. Builds no route and reads no timing.
+   * A lock store already in `verified` is not checked again.
    */
-  async #verifyServices(): Promise<void> {
+  async #verifyServices(verified: Set<object> | undefined): Promise<void> {
     // ready() resolves while the task queue cannot be used; verify() rejects with the reason.
     await this.ready();
     if (this.#queueFailure) {
@@ -582,7 +608,7 @@ export class Resizer {
     // With a router, the lock store may serve no route at all (every route gates by task), so it
     // is verified only beside a carrier that needs it.
     if (!this.tasks || !isRouter(this.tasks)) {
-      await this.locks?.verify?.();
+      await verifyPart(this.locks, verified);
     }
     await this.#decoders.verify();
   }
@@ -591,9 +617,13 @@ export class Resizer {
    * The checks of verify() for one queue name: its unavailable reason, then, on a router, its
    * carrier (built now), its timing, the carrier's verify() and the lock store when the carrier
    * lacks gatesByTask; on any other task queue, its timing, the task queue's verify() and that it
-   * serves the name. Only that name's route is built.
+   * serves the name. Only that name's route is built. A carrier or lock store already in `verified`
+   * is not checked again.
    */
-  async #verifyRoute(queue: string): Promise<void> {
+  async #verifyRoute(
+    queue: string,
+    verified: Set<object> | undefined,
+  ): Promise<void> {
     await this.ready();
     const tasks = this.tasks;
     if (!tasks) {
@@ -612,7 +642,7 @@ export class Resizer {
       );
     if (!isRouter(tasks)) {
       timingOf(tasks, queue);
-      await tasks.verify?.();
+      await verifyPart(tasks, verified);
       if (tasks.servesQueue && !tasks.servesQueue(queue)) {
         throw notServed();
       }
@@ -623,12 +653,12 @@ export class Resizer {
       throw notServed();
     }
     timingOf(tasks, queue);
-    await carrier.verify?.();
+    await verifyPart(carrier, verified);
     if (!carrier.gatesByTask) {
       if (!this.#locks) {
         throw locksRequired(this.name);
       }
-      await this.#locks.verify?.();
+      await verifyPart(this.#locks, verified);
     }
   }
 
@@ -759,23 +789,33 @@ export function taskCoordinationOf(resizer: Resizer): TaskCoordination {
 /**
  * The checks of verify() that need no queue name (the parts, the config, the coordination, the
  * media store, the lock store unless the task queue is a router, the decoders): the worker runs
- * them for every Resizer it serves. Builds no route and reads no timing. Internal: the main entry
- * does not export it, and it may change in any release.
+ * them for every Resizer it serves. Builds no route and reads no timing. A lock store already in
+ * `verified` is skipped, and one that passes is added, so the worker checks a shared one once.
+ * Internal: the main entry does not export it, and it may change in any release.
  * @internal
  */
-export function verifyServicesOf(resizer: Resizer): Promise<void> {
-  return runVerifyServices(resizer);
+export function verifyServicesOf(
+  resizer: Resizer,
+  verified?: Set<object>,
+): Promise<void> {
+  return runVerifyServices(resizer, verified);
 }
 
 /**
  * The checks of verify() for the queue name `queue` (its unavailable reason, its carrier, its
  * timing, the carrier's verify(), the lock store a router's carrier needs): the worker runs them
  * for each name it consumes, for every served Resizer whose task queue carries it. Builds only that
- * name's route. Internal: the main entry does not export it, and it may change in any release.
+ * name's route. A carrier or lock store already in `verified` is skipped, and one that passes is
+ * added, so the worker checks a shared one once. Internal: the main entry does not export it, and
+ * it may change in any release.
  * @internal
  */
-export function verifyRouteOf(resizer: Resizer, queue: string): Promise<void> {
-  return runVerifyRoute(resizer, queue);
+export function verifyRouteOf(
+  resizer: Resizer,
+  queue: string,
+  verified?: Set<object>,
+): Promise<void> {
+  return runVerifyRoute(resizer, queue, verified);
 }
 
 /**

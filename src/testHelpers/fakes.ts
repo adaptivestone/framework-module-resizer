@@ -4,7 +4,8 @@
 // MemoryTaskQueue behaves like the database queue: it gates by task (one active task per Resizer,
 // media, pipeline and queue, and a dead task holds the gate until its cooldown ends), filters
 // claims by Resizer, gives tasks back with `release` and answers findActive. PlainTaskQueue has
-// the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it.
+// the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it. observedQueue
+// wraps one so a test can stop an idle worker once its work is handled.
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
@@ -191,7 +192,7 @@ export interface RowQueueOptions {
 /**
  * The rows and the lease logic of the in-memory task queues: oldest-first claims, fenced leases,
  * retry times and dead tasks. A claimed task carries the `gateOwner` it was added with, when it has
- * one. `rows`, `added` and `claims` are open for assertions.
+ * one. `rows`, `added`, `claims` and `leases` are open for assertions.
  */
 abstract class RowQueue extends TaskQueue {
   readonly rows: Row[] = [];
@@ -199,6 +200,8 @@ abstract class RowQueue extends TaskQueue {
   readonly added: NewTask[] = [];
   /** Every `claim` call, with the lease it asked for, also those that claimed nothing. */
   readonly claims: Array<{ queue: string; leaseMs: number }> = [];
+  /** Every task a `claim` call handed out (`claims` also records the empty ones). */
+  readonly leases: ClaimedTask[] = [];
   readonly #timing: Partial<QueueTimingOptions>;
   readonly #queueTiming: Record<string, Partial<QueueTimingOptions>>;
   readonly #queues: readonly string[] | undefined;
@@ -271,7 +274,7 @@ abstract class RowQueue extends TaskQueue {
     row.attempts += 1;
     row.token = `lease-${this.#seq}`;
     row.leaseUntil = now + leaseMs;
-    return {
+    const leased: ClaimedTask = {
       taskId: row.id,
       resizer: row.task.resizer,
       queue: row.task.queue,
@@ -284,6 +287,8 @@ abstract class RowQueue extends TaskQueue {
         ? {}
         : { gateOwner: row.task.gateOwner }),
     };
+    this.leases.push(leased);
+    return leased;
   }
 
   /** The row `task` still holds under its lease token. */
@@ -479,4 +484,48 @@ export class ReleasingTaskQueue extends PlainTaskQueue {
     this.releaseCalls.push(task.taskId);
     return this.giveBack(task);
   }
+}
+
+/**
+ * An in-memory task queue (MemoryTaskQueue unless `Queue` says otherwise) that records the queue
+ * name of every claim in `claimedQueues` and calls `onIdle` with them whenever a claim finds
+ * nothing, so a test can stop an idle worker deterministically once its work is handled. The
+ * default stops a framework worker the way the host does, with SIGTERM. Pass PlainTaskQueue when a
+ * task of a Resizer the worker does not serve must fail rather than be given back. The claim
+ * passes no filter on, so a test sees every Resizer's tasks.
+ */
+export function observedQueue(
+  onIdle: (claimedQueues: readonly string[]) => void = () =>
+    process.emit('SIGTERM'),
+  Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
+): { tasks: MemoryTaskQueue | PlainTaskQueue; claimedQueues: string[] } {
+  const tasks = new Queue({ timing: { idlePollMs: 1 } });
+  const claimedQueues: string[] = [];
+  const claim = tasks.claim.bind(tasks);
+  tasks.claim = async (queue: string, leaseMs: number) => {
+    claimedQueues.push(queue);
+    const next = await claim(queue, leaseMs);
+    if (!next) {
+      onIdle(claimedQueues);
+    }
+    return next;
+  };
+  return { tasks, claimedQueues };
+}
+
+/**
+ * An `onIdle` for observedQueue that stops a framework worker with SIGTERM once every one of
+ * `names` has been claimed, and only once: a worker on several queues has one claim loop per
+ * queue, and each of them may find nothing.
+ */
+export function sigtermOnceClaimed(
+  names: readonly string[],
+): (claimedQueues: readonly string[]) => void {
+  let sent = false;
+  return (claimedQueues) => {
+    if (!sent && names.every((name) => claimedQueues.includes(name))) {
+      sent = true;
+      process.emit('SIGTERM');
+    }
+  };
 }

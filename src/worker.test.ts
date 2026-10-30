@@ -9,6 +9,7 @@ import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
 import type {
+  ClaimedTask,
   LeasedTask,
   TaskEvent,
   TaskQueue,
@@ -1700,5 +1701,249 @@ describe('a worker on a router', () => {
     );
     await start(a3);
     assert.equal(builds, 0);
+  });
+});
+
+describe('a worker for several queues', () => {
+  const fast = { idlePollMs: 5 };
+  const sizes = [{ width: 10, height: 10 }];
+  const sourceOf = (id: string): MediaLike => ({
+    id,
+    original: { storageRef: { key: `o-${id}` }, contentType: 'image/png' },
+    previews: [],
+  });
+  // A storage that records the keys of the files it receives.
+  const recordingStorage = () => {
+    const keys: string[] = [];
+    return {
+      keys,
+      storage: {
+        download: async () => png,
+        upload: async (opts: { key: string }) => {
+          keys.push(opts.key);
+          return { key: opts.key };
+        },
+        publicUrl: () => '',
+      },
+    };
+  };
+
+  test('one worker runs two Resizers on two queues of two backends', async () => {
+    const memory = new MemoryTaskQueue({ timing: fast, queues: ['default'] });
+    const plain = new PlainTaskQueue({ timing: fast, queues: ['bulk'] });
+    const aStorage = recordingStorage();
+    const listingsStorage = recordingStorage();
+    const aPreviews = new Map<string, Preview[]>();
+    const listingsPreviews = new Map<string, Preview[]>();
+    const a = queuedResizer(
+      'a',
+      memory,
+      fakeMedia({ load: async () => sourceOf('m1'), previews: aPreviews }),
+      { storage: aStorage.storage },
+    );
+    const listings = queuedResizer(
+      'listings',
+      plain,
+      fakeMedia({
+        load: async () => sourceOf('m2'),
+        previews: listingsPreviews,
+      }),
+      { storage: listingsStorage.storage, queueName: 'bulk' },
+    );
+    assert.equal(
+      (await a.prewarm({ media: sourceOf('m1'), sizes })).status,
+      'accepted',
+    );
+    assert.equal(
+      (await listings.prewarm({ media: sourceOf('m2'), sizes })).status,
+      'accepted',
+    );
+    await workUntil(
+      { queue: ['default', 'bulk'], logger: silent, resizers: [a, listings] },
+      () =>
+        (aPreviews.get('m1')?.length ?? 0) > 0 &&
+        (listingsPreviews.get('m2')?.length ?? 0) > 0,
+    );
+    assert.equal(aStorage.keys.length, 1);
+    assert.equal(listingsStorage.keys.length, 1);
+    assert.deepEqual(
+      memory.leases.map((t) => [t.queue, t.resizer]),
+      [['default', 'a']],
+    );
+    assert.deepEqual(
+      plain.leases.map((t) => [t.queue, t.resizer]),
+      [['bulk', 'listings']],
+    );
+  });
+
+  test('a listed queue that no task queue serves is RESIZE_QUEUE_NOT_SERVED naming it, before any claim', async () => {
+    const memory = new MemoryTaskQueue({ timing: fast, queues: ['default'] });
+    const resizer = queuedResizer('default', memory);
+    await assert.rejects(
+      () =>
+        runWorker({
+          queue: ['default', 'typo'],
+          signal: AbortSignal.timeout(2000), // only stops a worker that wrongly started
+          logger: silent,
+          resizers: [resizer],
+        }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_QUEUE_NOT_SERVED' &&
+        /'typo'/.test(err.message),
+    );
+    assert.deepEqual(memory.claims, []);
+  });
+
+  test('a listed queue whose route fails to build rejects start naming it; a worker for the other queue never builds it', async () => {
+    const down = new ResizeSetupError('install @aws-sdk/client-sqs', {
+      code: 'RESIZE_PEER_MISSING',
+    });
+    let builds = 0;
+    const memory = new MemoryTaskQueue({ timing: fast });
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({
+        default: memory,
+        bulk: async () => {
+          builds += 1;
+          throw down;
+        },
+      }),
+    );
+    const errors: unknown[][] = [];
+    await assert.rejects(
+      () =>
+        runWorker({
+          queue: ['default', 'bulk'],
+          signal: AbortSignal.timeout(2000), // only stops a worker that wrongly started
+          logger: { ...silent, error: (...args) => errors.push(args) },
+          resizers: [resizer],
+        }),
+      (err: unknown) => err === down,
+    );
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0][0]), /queue 'bulk'/);
+    assert.deepEqual(memory.claims, []);
+    assert.equal(builds, 1);
+    await memory.add(taskOf('default'));
+    const [row] = memory.rows;
+    await workUntil(
+      { queue: ['default'], logger: silent, resizers: [resizer] },
+      () => row.status === 'completed',
+    );
+    assert.equal(builds, 1);
+  });
+
+  test('an empty queue list, or a blank name in it, is RESIZE_QUEUE_INVALID', async () => {
+    const memory = new MemoryTaskQueue({ timing: fast });
+    const resizer = queuedResizer('default', memory);
+    for (const queue of [[], ['default', ''], ['  '], '', ['default', 42]]) {
+      await assert.rejects(
+        () =>
+          runWorker({
+            queue: queue as never,
+            signal: AbortSignal.timeout(2000), // only stops a worker that wrongly started
+            logger: silent,
+            resizers: [resizer],
+          }),
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_QUEUE_INVALID',
+        JSON.stringify(queue),
+      );
+    }
+    assert.deepEqual(memory.claims, []);
+  });
+
+  test('a queue listed twice is consumed by one Consumer', {
+    timeout: 5000,
+  }, async () => {
+    // A long poll: with nothing due, claim waits until the worker stops. It records how many claim
+    // calls run at once, and wakes the test when a claim waits after the task completed.
+    let inFlight = 0;
+    let mostInFlight = 0;
+    let idleAfterDone: () => void = () => {};
+    const idle = new Promise<void>((resolve) => {
+      idleAfterDone = resolve;
+    });
+    class LongPollQueue extends PlainTaskQueue {
+      async claim(
+        queue: string,
+        leaseMs: number,
+        signal?: AbortSignal,
+      ): Promise<ClaimedTask | null> {
+        inFlight += 1;
+        mostInFlight = Math.max(mostInFlight, inFlight);
+        try {
+          const next = await super.claim(queue, leaseMs, signal);
+          if (next || !signal || signal.aborted) {
+            return next;
+          }
+          if (this.rows.every((row) => row.status === 'completed')) {
+            idleAfterDone();
+          }
+          await new Promise((resolve) =>
+            signal.addEventListener('abort', resolve, { once: true }),
+          );
+          return null;
+        } finally {
+          inFlight -= 1;
+        }
+      }
+    }
+    const tasks = new LongPollQueue({ timing: fast });
+    const resizer = queuedResizer('default', tasks);
+    await tasks.add(taskOf('default'));
+    const stop = new AbortController();
+    const working = runWorker({
+      queue: ['default', 'default'],
+      signal: stop.signal,
+      logger: silent,
+      resizers: [resizer],
+    });
+    await idle;
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.equal(tasks.leases.length, 1);
+    assert.equal(mostInFlight, 1);
+    stop.abort();
+    await working;
+  });
+
+  test('Resizers that share a router or a task queue verify its carrier and their lock store once at worker start', async () => {
+    let carrierVerifies = 0;
+    let lockVerifies = 0;
+    const locks: LockStore = {
+      ...memoryLocks(),
+      verify: async () => {
+        lockVerifies += 1;
+      },
+    };
+    const plain = new PlainTaskQueue({ timing: fast });
+    plain.verify = async () => {
+      carrierVerifies += 1;
+    };
+    const router = new RoutingTaskQueue({ default: plain });
+    for (const tasks of [router, plain]) {
+      resetResizerForTests();
+      carrierVerifies = 0;
+      lockVerifies = 0;
+      const label = tasks === router ? 'router' : 'plain';
+      const a = queuedResizer('a', tasks, fakeMedia(), { locks });
+      const b = queuedResizer('b', tasks, fakeMedia(), { locks });
+      await runWorker({
+        queue: ['default'],
+        signal: AbortSignal.abort(),
+        logger: silent,
+        resizers: [a, b],
+      });
+      assert.equal(carrierVerifies, 1, label);
+      assert.equal(lockVerifies, 1, label);
+      // verify() itself shares nothing: each Resizer checks its own parts.
+      await a.verify();
+      await b.verify();
+      assert.equal(carrierVerifies, 3, label);
+      assert.equal(lockVerifies, 3, label);
+    }
   });
 });

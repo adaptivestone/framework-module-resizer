@@ -8,8 +8,12 @@ import { runWorker } from '../worker.ts';
 import { getApp } from './app.ts';
 import { getProcessConfig } from './config.ts';
 
+/**
+ * Run the worker for `queue`: one name or a list of them (default 'default'), checked and
+ * de-duplicated by runWorker.
+ */
 export async function runResizeWorker(
-  opts: { queue?: string } = {},
+  opts: { queue?: string | readonly string[] } = {},
 ): Promise<void> {
   // Removed with the CLI's --config: a JS caller passing it gets the fix, not a silent default.
   if (Object.hasOwn(opts, 'configName')) {
