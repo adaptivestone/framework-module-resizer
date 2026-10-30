@@ -40,6 +40,19 @@ function memoryMedia(docs: Map<string, MediaLike>): MediaStore {
       doc.previews = [...(doc.previews ?? []), ...previews];
       return previews;
     },
+    replacePreviews: async (id, identities, rows) => {
+      const doc = docs.get(id);
+      if (!doc) {
+        return { stored: [], removed: [] };
+      }
+      const replaced = new Set(identities);
+      const kept = doc.previews ?? [];
+      const removed = kept.filter(
+        (row) => row.identity !== undefined && replaced.has(row.identity),
+      );
+      doc.previews = [...kept.filter((row) => !removed.includes(row)), ...rows];
+      return { stored: rows, removed };
+    },
   };
 }
 
@@ -121,7 +134,8 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
   const file = await File.create({ original, previews: [] });
   const sizes = [{ width: 16, height: 16 }];
   assert.equal(
-    (await resizer.prewarm({ media: file, sizes })).accepted.length,
+    (await resizer.prewarm({ media: file as MediaLike, sizes })).accepted
+      .length,
     1,
   );
 
@@ -195,9 +209,12 @@ test('invalidate on MongoDB removes one pipeline in one write; the next resolve 
     { width: 16, height: 16 },
     { width: 8, height: 8 },
   ];
-  const { created: defaults } = await resizer.generate({ media: file, sizes });
+  const { created: defaults } = await resizer.generate({
+    media: file as MediaLike,
+    sizes,
+  });
   const { created: watermarked } = await resizer.generate({
-    media: file,
+    media: file as MediaLike,
     sizes,
     pipeline: 'wm',
   });
@@ -205,7 +222,10 @@ test('invalidate on MongoDB removes one pipeline in one write; the next resolve 
   assert.equal(watermarked.length, 2);
   updates.length = 0;
 
-  const refs = await resizer.invalidate({ media: file, pipeline: 'wm' });
+  const refs = await resizer.invalidate({
+    media: file as MediaLike,
+    pipeline: 'wm',
+  });
 
   assert.deepEqual(
     refs,
@@ -278,7 +298,7 @@ test('createResizer: a config object and one call on MongoDB, with no framework 
     });
     const file = await File.create({ original, previews: [] });
     const sizes = [{ width: 16, height: 16 }];
-    const warm = await resizer.prewarm({ media: file, sizes });
+    const warm = await resizer.prewarm({ media: file as MediaLike, sizes });
     assert.equal(warm.status, 'accepted');
 
     const { ResizeTask } = connection.models;
@@ -345,7 +365,10 @@ test('a stale preview is replaced in the media document', async () => {
     visibility: 'private',
   });
   const file = await File.create({ original, previews: [] });
-  const { created: old } = await before.generate({ media: file, sizes });
+  const { created: old } = await before.generate({
+    media: file as MediaLike,
+    sizes,
+  });
   assert.equal(old.length, 1);
   resetResizerForTests();
 

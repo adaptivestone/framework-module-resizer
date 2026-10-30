@@ -299,6 +299,8 @@ describe('mongoParts', () => {
     );
   });
 
+  const modelsOf = (connection: mongoose.Connection) => connection.models;
+
   test('registers the package models on its connection, referring to the host media model', async () => {
     // A fresh connection: the tests above already registered the models on the shared one.
     const fresh = await mongoose
@@ -317,7 +319,8 @@ describe('mongoParts', () => {
       assert.equal(fresh.models.ResizeTask, undefined);
       assert.equal(fresh.models.ResizeLock, undefined);
       mongoParts(fresh, { mediaModel });
-      const { ResizeTask, ResizeLock } = fresh.models;
+      // Read again through a call: the assertions above narrowed `fresh.models.*` to undefined.
+      const { ResizeTask, ResizeLock } = modelsOf(fresh);
       assert.ok(ResizeTask && ResizeLock);
       assert.equal(ResizeTask.schema.path('fileId').options.ref, 'PartsMedia');
       assert.equal(ResizeTask.schema.options.autoIndex, false);

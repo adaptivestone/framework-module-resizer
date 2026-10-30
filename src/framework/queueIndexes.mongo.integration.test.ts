@@ -8,6 +8,7 @@ import LockModel from '@adaptivestone/framework/models/Lock.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import type { ResizeStorage } from '../contracts/storage.ts';
+import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { gateKey } from '../lockKeys.ts';
 import { resetResizerForTests } from '../resizer.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
@@ -22,6 +23,12 @@ const storage: ResizeStorage = {
   upload: async ({ key }) => ({ key }),
   publicUrl: () => '',
 };
+
+/** The task queue's verify(); the database task queue always has one. */
+async function verifyTasks(tasks: TaskQueue): Promise<void> {
+  assert.ok(tasks.verify, 'the database task queue has verify()');
+  await tasks.verify();
+}
 
 function hasExactKey(key: unknown, expected: Record<string, number>): boolean {
   return JSON.stringify(key) === JSON.stringify(expected);
@@ -82,26 +89,29 @@ async function createFixture(name: string) {
   } as never);
 
   // The app's database task queue, as a FrameworkResizer builds it from src/config/resize.ts.
+  const tasks = FrameworkDatabase.fromConfig(
+    { driver: 'framework', configName: 'resize' },
+    { logger: appLogger, where: 'test' },
+  ).taskQueue?.({
+    queues: ['default'],
+    getTiming: () => undefined,
+    logger: appLogger,
+  });
+  assert.ok(tasks, 'the framework database builds a task queue');
   return {
     server,
     connection,
     taskModel,
     lockModel,
     locks: new FrameworkLockStore(),
-    tasks: FrameworkDatabase.fromConfig(
-      { driver: 'framework', configName: 'resize' },
-      { logger: appLogger, where: 'test' },
-    ).taskQueue?.({
-      queues: ['default'],
-      getTiming: () => undefined,
-      logger: appLogger,
-    }),
+    tasks,
   };
 }
 
-async function closeFixture(
-  fixture: Awaited<ReturnType<typeof createFixture>>,
-) {
+async function closeFixture(fixture: {
+  connection: mongoose.Connection;
+  server: MongoMemoryServer;
+}) {
   resetResizerForTests();
   resetAppInstance();
   await fixture.connection.close().catch(() => {});
@@ -123,7 +133,7 @@ test('resizer operations do not create secondary indexes when autoIndex is disab
     assert.ok(added.taskId);
     // verify() reads the indexes and reports the missing gate index; it creates none.
     await assert.rejects(
-      fixture.tasks.verify(),
+      verifyTasks(fixture.tasks),
       (error: Error & { code?: string }) =>
         error.code === 'RESIZE_MONGO_INDEX_MISSING',
     );
@@ -190,10 +200,11 @@ test('prepared indexes enforce the gate: concurrent adds create one active row',
       ),
       'fixture should create the queue-scoped claim index',
     );
-    for (const old of [
+    const oldLeaseIndexes: Record<string, number>[] = [
       { queue: 1, status: 1, createdAt: 1 },
       { status: 1, createdAt: 1 },
-    ]) {
+    ];
+    for (const old of oldLeaseIndexes) {
       assert.equal(
         taskIndexes.some(({ key }) => hasExactKey(key, old)),
         false,
@@ -203,7 +214,7 @@ test('prepared indexes enforce the gate: concurrent adds create one active row',
     assert.equal(gate.unique, true);
     assert.deepEqual(gate.partialFilterExpression, { active: true });
     // The prepared collection passes verify().
-    await fixture.tasks.verify();
+    await verifyTasks(fixture.tasks);
 
     const mediaId = new mongoose.Types.ObjectId().toString();
     const request = {

@@ -1,6 +1,8 @@
-// Compiled by `npm run types:check` (tsconfig.test-helpers.json), never run. It pins the promise
+// Compiled by `npm run types:check:src` (`tsconfig.type-pins.json`, which the minimum-peers CI
+// job runs) and by `npm run types:check` (`tsconfig.tests.json`), never run. It pins the promise
 // that each contract is an abstract class, yet a plain object of the same shape still
-// type-checks as that contract. A contract change that breaks plain objects fails CI here.
+// type-checks as that contract, and that `NoopMetrics` still takes zero-argument calls. A
+// contract change that breaks plain objects fails CI here.
 import type { SourceDecoder } from '../contracts/decoder.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';

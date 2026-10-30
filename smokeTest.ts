@@ -9,8 +9,8 @@
 //
 // Repo tooling (like preBuild.ts / postBuild.ts): plain TS, run with type-stripping via
 // `node smokeTest.ts` (the `smoke` npm script). Top-level await, no test framework. It is
-// a ROOT file (outside tsconfig's `src` rootDir, same as preBuild/postBuild) — biome lints
-// it, tsc does not type-check it.
+// a ROOT file (outside tsconfig's `src` rootDir, same as preBuild/postBuild): biome lints
+// it, and `tsconfig.tests.json` type-checks it.
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,

@@ -39,7 +39,8 @@
   "scripts": {
     "prepublishOnly": "npm run build",
     "build": "node preBuild.ts && tsc && node postBuild.ts",
-    "types:check": "tsc --noEmit && tsc -p tsconfig.test-helpers.json",
+    "types:check": "tsc --noEmit && tsc -p tsconfig.tests.json",
+    "types:check:src": "tsc --noEmit && tsc -p tsconfig.type-pins.json",
     "test": "node --experimental-strip-types --test",
     "check": "biome check",
     "check:fix": "biome check --write",

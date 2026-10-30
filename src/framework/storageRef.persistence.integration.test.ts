@@ -187,12 +187,14 @@ for (const [mode, options] of Object.entries({
       });
       const loaded = await Media.findById(row.id).orFail();
       assert.deepEqual(loaded.original?.storageRef, storageRef);
+      assert.ok(loaded.previews);
       assert.deepEqual(loaded.previews[0].storageRef, storageRef);
       loaded.set('original.width', 24);
       loaded.markModified('previews');
       await loaded.save();
       const reloaded = await Media.findById(row.id).lean().orFail();
       assert.deepEqual(reloaded.original?.storageRef, storageRef);
+      assert.ok(reloaded.previews);
       assert.deepEqual(reloaded.previews[0].storageRef, storageRef);
     }
   });

@@ -23,6 +23,13 @@ let server: MongoMemoryServer;
 let connection: mongoose.Connection;
 let LockModel: LockModelType;
 
+/** The lock documents as stored: string ids, and the owner the strict schema does not declare. */
+type LockRow = { _id: string; expiredAt?: Date; owner?: string };
+function rawLocks() {
+  assert.ok(connection.db, 'the connection is open');
+  return connection.db.collection<LockRow>(LockModel.collection.collectionName);
+}
+
 before(async () => {
   server = await MongoMemoryServer.create({ instance: { ip: '127.0.0.1' } });
   connection = await mongoose
@@ -77,22 +84,22 @@ test('a gate lock taken by one store (the API) is extended and released by anoth
 test('the owner is stored despite the strict schema, and the framework statics still see the lock', async () => {
   const a = new FrameworkLockStore();
   assert.equal(await a.acquire('k3', 'A', 60_000), true);
-  const stored = await LockModel.collection.findOne({ _id: 'k3' });
+  const stored = await rawLocks().findOne({ _id: 'k3' });
   assert.equal(stored?.owner, 'A');
   assert.equal(await LockModel.acquireLock('k3', 30), false);
 });
 
 test('a lock without an expiry, or an expired one, is taken over; a live one blocks', async () => {
   const a = new FrameworkLockStore();
-  await LockModel.collection.insertOne({ _id: 'k4' });
+  await rawLocks().insertOne({ _id: 'k4' });
   assert.equal(await a.acquire('k4', 'A', 60_000), true);
   assert.equal(await a.acquire('k4', 'B', 60_000), false);
-  await LockModel.collection.updateOne(
+  await rawLocks().updateOne(
     { _id: 'k4' },
     { $set: { expiredAt: new Date(Date.now() - 1000) } },
   );
   assert.equal(await a.acquire('k4', 'B', 60_000), true);
-  assert.equal((await LockModel.collection.findOne({ _id: 'k4' }))?.owner, 'B');
+  assert.equal((await rawLocks().findOne({ _id: 'k4' }))?.owner, 'B');
   // The framework model's strict schema has no owner; the store writes around it, so verify()
   // checks only that the model is registered.
   new FrameworkLockStore().verify();

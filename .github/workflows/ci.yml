@@ -88,6 +88,7 @@ jobs:
         run: |
           npm install --no-save $(node -p "Object.entries(require('./package.json').peerDependencies).map(([name, range]) => name + '@' + range.replace(/^[^0-9]*/, '')).join(' ')")
 
-      - run: node --run types:check
+      # Shipped code and the type pins against the minimum peers; tests compile against the dev versions they run with.
+      - run: node --run types:check:src
       - run: node --run build
       - run: node --run test
