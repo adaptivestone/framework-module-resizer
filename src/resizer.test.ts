@@ -6,6 +6,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
 import { defaultCoordination } from './config/resize.ts';
+import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
@@ -21,7 +22,10 @@ import {
   resetResizerForTests,
   sharedPart,
   taskCoordinationOf,
+  verifyRouteOf,
+  verifyServicesOf,
 } from './resizer.ts';
+import { markUnavailable, RoutingTaskQueue } from './routing.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
@@ -673,12 +677,14 @@ describe('a task queue the Resizer cannot use', () => {
 
   /**
    * The read path serves what is stored and queues nothing, uploads and eager generate() work,
-   * prewarm() reports the failure, verify() rejects with it, and it is logged once, not per call.
+   * prewarm() reports the failure, verify() rejects with it, and it is logged once, not per call:
+   * by default when the Resizer starts, or with the message `logged` says.
    */
   async function assertDegraded(
     parts: Pick<ResizerOptions, 'locks' | 'tasks'>,
     tasks: MemoryTaskQueue | PlainTaskQueue,
     failed: (e: unknown) => boolean,
+    logged = /cannot use its task queue/,
   ) {
     const errors: unknown[][] = [];
     const body = await png;
@@ -747,20 +753,23 @@ describe('a task queue the Resizer cannot use', () => {
     assert.deepEqual(tasks.added, []);
     await assert.rejects(() => r.verify(), failed);
     await assert.rejects(() => r.verify(), failed);
-    assert.equal(errors.length, 1, 'logged once, when the Resizer started');
-    assert.match(String(errors[0][0]), /cannot use its task queue/);
+    assert.equal(errors.length, 1, 'logged once');
+    assert.match(String(errors[0][0]), logged);
     assert.ok(failed(errors[0][1]));
     return result;
   }
 
   test('invalid queue timing: reads serve stored previews, uploads and generate() work, prewarm() reports it, verify() rejects', async () => {
     const tasks = new MemoryTaskQueue({ timing: { leaseMs: 0 } });
+    // Timing is a check of the queue name, not of the Resizer's start: the Dispatcher logs it once
+    // per queue name, on the first read.
     const result = await assertDegraded(
       { tasks, locks: memoryLocks() },
       tasks,
       (e: unknown) =>
         e instanceof ResizeConfigError &&
         e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+      /cannot queue to 'default': its timing is invalid/,
     );
     assert.match(result.issues[0].message, /leaseMs/);
   });
@@ -780,7 +789,7 @@ describe('a task queue the Resizer cannot use', () => {
     assert.match(result.issues[0].message, /no `locks`/);
   });
 
-  test('a queue timing that becomes valid is used from the next call, and the failure is logged again only when it changes', async () => {
+  test('a queue timing that becomes valid is used from the next call; an invalid timing is logged once per queue name', async () => {
     let timing: Record<string, unknown> = { leaseMs: 0 };
     const tasks = new MemoryTaskQueue();
     tasks.getTiming = () => timing as never;
@@ -805,11 +814,18 @@ describe('a task queue the Resizer cannot use', () => {
     });
     await r.ready();
     await r.ready();
-    assert.equal(errors.length, 1);
+    // Building the Dispatcher reads no timing, so the first value is never read.
+    assert.equal(errors.length, 0);
     timing = { maxAttempts: 0 };
     await r.resolve({ media: media(), sizes });
     await r.resolve({ media: media(), sizes });
-    assert.equal(errors.length, 2, 'a different failure is logged once more');
+    assert.equal(errors.length, 1, 'logged once per queue name');
+    assert.match(
+      String(errors[0][0]),
+      /cannot queue to 'default': its timing is invalid/,
+    );
+    assert.ok(errors[0][1] instanceof ResizeConfigError);
+    assert.match((errors[0][1] as Error).message, /maxAttempts/);
     assert.deepEqual(tasks.added, []);
     timing = {};
     const { decision } = await r.resolve({ media: media(), sizes });
@@ -822,7 +838,158 @@ describe('a task queue the Resizer cannot use', () => {
       [['20x20']],
     );
     await r.verify();
-    assert.equal(errors.length, 2);
+    assert.equal(errors.length, 1);
+  });
+});
+
+describe('a Resizer on a router', () => {
+  const routed = (
+    tasks: ResizerOptions['tasks'],
+    over: Partial<ResizerOptions> = {},
+  ) =>
+    new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: { info() {}, warn() {}, error() {} },
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      tasks,
+      ...over,
+    });
+  const cold = {
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [],
+  };
+  const locksRequired = (e: unknown) =>
+    e instanceof ResizeSetupError && e.code === 'RESIZE_LOCKS_REQUIRED';
+  const leaseInvalid = (e: unknown) =>
+    e instanceof ResizeConfigError &&
+    e.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID';
+
+  test("a Resizer with a router builds its Dispatcher without a lock store; verify() checks the lock store only for its own queue's carrier", async () => {
+    const memory = new MemoryTaskQueue();
+    const plain = new PlainTaskQueue();
+    const routes = { default: memory, bulk: plain };
+    const own = routed(new RoutingTaskQueue(routes));
+    await own.verify();
+    const result = await own.prewarm({
+      media: cold,
+      sizes: [{ width: 10, height: 10 }],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.equal(memory.added.length, 1);
+    const onPlain = routed(new RoutingTaskQueue(routes), {
+      name: 'bulk',
+      queueName: 'bulk',
+    });
+    await assert.rejects(() => onPlain.verify(), locksRequired);
+  });
+
+  test("verify() rejects with the unavailable reason of the Resizer's own queue", async () => {
+    const tasks = new MemoryTaskQueue({ queues: ['default'] });
+    const error = new ResizeSetupError('install @aws-sdk/client-sqs', {
+      code: 'RESIZE_PEER_MISSING',
+    });
+    markUnavailable(tasks, ['bulk'], {
+      driver: 'sqs',
+      packages: ['@aws-sdk/client-sqs'],
+      error,
+    });
+    const r = routed(tasks, { queueName: 'bulk' });
+    await assert.rejects(
+      () => r.verify(),
+      (e: unknown) => e === error,
+    );
+  });
+
+  test('verifyServicesOf builds no route and reads no timing; verifyRouteOf builds only the named one', async () => {
+    const built: string[] = [];
+    const timings: string[] = [];
+    const builder = (name: string) => async () => {
+      built.push(name);
+      return new MemoryTaskQueue();
+    };
+    const r = routed(
+      new RoutingTaskQueue(
+        { default: builder('default'), bulk: builder('bulk') },
+        {
+          getTiming: (queue) => {
+            timings.push(queue);
+            return undefined;
+          },
+        },
+      ),
+    );
+    await verifyServicesOf(r);
+    assert.deepEqual(built, []);
+    assert.deepEqual(timings, []);
+    await verifyRouteOf(r, 'bulk');
+    assert.deepEqual(built, ['bulk']);
+    assert.deepEqual(timings, ['bulk']);
+  });
+
+  test('verify() of a router whose own name has invalid timing rejects with RESIZE_CONFIG_QUEUE_LEASE_INVALID; a call on its other name still queues', async () => {
+    const bulk = new MemoryTaskQueue();
+    const routers = [
+      // The invalid timing is the object route's own.
+      new RoutingTaskQueue({
+        default: new MemoryTaskQueue({ timing: { leaseMs: 0 } }),
+        bulk,
+      }),
+      // A builder route's timing is the router's option.
+      new RoutingTaskQueue(
+        { default: async () => new MemoryTaskQueue(), bulk },
+        {
+          getTiming: (queue) =>
+            queue === 'default' ? { leaseMs: 0 } : undefined,
+        },
+      ),
+    ];
+    for (const [i, router] of routers.entries()) {
+      resetResizerForTests();
+      const r = routed(router);
+      await assert.rejects(() => r.verify(), leaseInvalid);
+      const result = await r.prewarm({
+        media: cold,
+        sizes: [{ width: 10, height: 10 }],
+        queue: 'bulk',
+      });
+      assert.equal(result.status, 'accepted');
+      assert.equal(bulk.added.length, i + 1);
+    }
+  });
+
+  test('a supplied lock store is verified in the shared step, with no task queue and with a plain one, but not with a router', async () => {
+    const cases: [string, ResizerOptions['tasks'], boolean][] = [
+      ['no task queue', undefined, true],
+      ['a plain task queue', new PlainTaskQueue(), true],
+      [
+        'a router',
+        new RoutingTaskQueue({ default: new MemoryTaskQueue() }),
+        false,
+      ],
+    ];
+    for (const [label, tasks, verified] of cases) {
+      resetResizerForTests();
+      let checks = 0;
+      const base = memoryLocks();
+      const locks: LockStore = {
+        acquire: base.acquire,
+        extend: base.extend,
+        release: base.release,
+        verify: async () => {
+          checks += 1;
+          throw new Error('lock model missing');
+        },
+      };
+      const r = routed(tasks, { locks });
+      if (verified) {
+        await assert.rejects(() => r.verify(), /lock model missing/, label);
+      } else {
+        await r.verify();
+      }
+      assert.equal(checks, verified ? 1 : 0, label);
+    }
   });
 });
 

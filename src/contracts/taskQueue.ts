@@ -212,6 +212,16 @@ export abstract class TaskQueue {
   servesQueue?(queue: string): boolean;
 
   /**
+   * Optional: the task queue that carries `queue`, for a queue that routes names to several
+   * backends (RoutingTaskQueue). Resolves undefined for a name it does not route; rejects when that
+   * backend cannot be built. The core asks every per-queue question of the result: its
+   * `gatesByTask`, `add`, `findActive`, `claim` and the rest, and whether the gate needs a lock
+   * store. Any task queue with this method counts as a router (the core checks the method, never
+   * the class); `servesQueue` must still answer at once, without building anything.
+   */
+  routeOf?(queue: string): Promise<TaskQueue | undefined>;
+
+  /**
    * Optional: the timing of the queue name `queue`; missing values use the defaults
    * (defaultQueueOptions). The core reads it once per name, once it is valid: an invalid timing is
    * read again on that name's next use. A task queue with one timing for every name ignores the

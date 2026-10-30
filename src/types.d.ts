@@ -159,6 +159,10 @@ export interface EnqueueIssue {
     | 'RESIZE_FORMAT_NOT_CONFIGURED' // a requested format has no encode.formats entry
     | 'RESIZE_QUEUE_NOT_SERVED' // the task queue does not serve the call's queue name
     | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)
+  // The code of the error behind the issue when that code is not one of the above, e.g.
+  // RESIZE_PEER_MISSING or a custom driver's code behind RESIZE_ENQUEUE_QUEUE_FAILED, or
+  // RESIZE_LOCKS_REQUIRED behind RESIZE_ENQUEUE_LOCK_FAILED.
+  causeCode?: string;
   message: string;
   retryable: boolean;
   previews: MissingPreview[];

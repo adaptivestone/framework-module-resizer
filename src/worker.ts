@@ -1,11 +1,14 @@
 // The worker, framework-free. `runWorker()` serves a list of Resizers (default: every registered
 // one) for ONE named queue: it runs one Consumer, the worker loop (src/consumer.ts), per distinct
-// TaskQueue those Resizers use, after verifying each of them. Every claim names the served
-// Resizers, so a task queue that filters claims never hands it another Resizer's task. Each task
-// runs with the Resizer named in it and that Resizer's coordination (the cooldown of a dead-letter,
-// and the lock store of the gate lock on a queue without gatesByTask), and its events go to that
-// Resizer's observers. The host logger is called only through logNeverThrow, so a logger that
-// throws never stops it.
+// backend that carries that queue on those Resizers' task queues (carrierOf: on a router, the
+// route of the name; otherwise the task queue itself), after checking each Resizer and each
+// Resizer's route of the name. A Resizer's own queue is checked only when it is consumed, so a
+// worker for one name starts while another name's backend cannot be used. Every claim names the
+// served Resizers, so a task queue that filters claims never hands it another Resizer's task.
+// Each task runs with the Resizer named in it and that Resizer's coordination (the cooldown of a
+// dead-letter, and the lock store of the gate lock on a backend without gatesByTask), and its
+// events go to that Resizer's observers. The host logger is called only through logNeverThrow, so
+// a logger that throws never stops it.
 // The work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
@@ -17,7 +20,7 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import type { TaskCoordination } from './coordination.ts';
-import { ResizeSetupError } from './errors.ts';
+import { ResizeError, ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import {
   getResizer,
@@ -26,7 +29,10 @@ import {
   type Resizer,
   taskCoordinationOf,
   tasksPartOf,
+  verifyRouteOf,
+  verifyServicesOf,
 } from './resizer.ts';
+import { carrierOf, unavailableReason, unavailableText } from './routing.ts';
 import { timingOf } from './timing.ts';
 import type { ResizeLogger } from './types.d.ts';
 
@@ -53,14 +59,15 @@ async function runTask(
 }
 
 /**
- * Refuse to start when a Resizer of this process that the worker does not serve uses one of
- * `consumed`, the consumed task queues that cannot filter claims: the worker would claim that
- * Resizer's tasks without running them. A task queue that filters claims never hands it such a
+ * Refuse to start when a Resizer of this process that the worker does not serve carries `queue`
+ * on one of `consumed`, the consumed backends that cannot filter claims: the worker would claim
+ * that Resizer's tasks without running them. A backend that filters claims never hands it such a
  * task, so it may be shared and is not passed here. This is an early error only; the loop never
  * runs such a task either (see runWorker). Only the task queue part of each such Resizer is
- * loaded, so a failure of its other parts cannot hide it. A task queue that cannot be loaded fails
- * startup too, since it may be one of these. Resizers constructed in other processes cannot be
- * seen here.
+ * loaded, so a failure of its other parts cannot hide it, and on a router its route of `queue` is
+ * built, so two routers whose builders return one backend are compared too. A task queue or route
+ * that cannot be loaded fails startup too, since it may be one of these. A Resizer that does not
+ * carry `queue` builds nothing. Resizers constructed in other processes cannot be seen here.
  */
 async function refuseUnservedSharers(
   queue: string,
@@ -71,15 +78,16 @@ async function refuseUnservedSharers(
   const unknown: string[] = [];
   let loadError: unknown;
   for (const resizer of unserved) {
-    let tasks: TaskQueue | undefined;
+    let carrier: TaskQueue | undefined;
     try {
-      tasks = await tasksPartOf(resizer);
+      const tasks = await tasksPartOf(resizer);
+      carrier = tasks && (await carrierOf(tasks, queue));
     } catch (err) {
       unknown.push(`'${resizer.name}'`);
       loadError ??= err;
       continue;
     }
-    if (tasks && consumed.has(tasks)) {
+    if (carrier && consumed.has(carrier)) {
       sharing.push(`'${resizer.name}'`);
     }
   }
@@ -100,6 +108,69 @@ async function refuseUnservedSharers(
       cause: loadError,
     });
   }
+}
+
+/**
+ * The backends that carry `queue` on the task queues of `served`, each once, with the task queue
+ * its timing is read on (that of the first Resizer that carries it there), and the Resizers that
+ * carry `queue`. A task queue that does not carry it (e.g. SQS without that queue URL) is skipped,
+ * so one Resizer's missing queue never stops the others. A backend that fails to build rejects,
+ * naming the queue and keeping the error's code; when nothing carries the name it is
+ * RESIZE_QUEUE_NOT_SERVED, with the reason a task queue keeps for that name.
+ */
+async function carriersOf(
+  queue: string,
+  served: Resizer[],
+  logger: ResizeLogger,
+): Promise<{ carriers: Map<TaskQueue, TaskQueue>; routing: Resizer[] }> {
+  const carriers = new Map<TaskQueue, TaskQueue>();
+  const routing: Resizer[] = [];
+  const skipped = new Set<TaskQueue>();
+  for (const resizer of served) {
+    const { tasks } = resizer;
+    if (!tasks) {
+      continue;
+    }
+    let carrier: TaskQueue | undefined;
+    try {
+      carrier = await carrierOf(tasks, queue);
+    } catch (err) {
+      throw new ResizeSetupError(
+        `resize worker: the backend of queue '${queue}' of Resizer '${resizer.name}' could not be built: ${err instanceof Error ? err.message : String(err)}`,
+        ResizeError.isResizeError(err)
+          ? { code: err.code, retryable: err.retryable, cause: err }
+          : { cause: err },
+      );
+    }
+    if (!carrier) {
+      if (!skipped.has(tasks)) {
+        skipped.add(tasks);
+        logNeverThrow(
+          logger,
+          `resize worker: a task queue does not serve queue '${queue}' — skipping it`,
+          undefined,
+          'info',
+        );
+      }
+      continue;
+    }
+    routing.push(resizer);
+    if (!carriers.has(carrier)) {
+      carriers.set(carrier, tasks);
+    }
+  }
+  if (carriers.size === 0) {
+    const reason = served
+      .map(({ tasks }) => (tasks ? unavailableReason(tasks, queue) : undefined))
+      .find((found) => found !== undefined);
+    throw new ResizeSetupError(
+      `resize worker: no task queue serves queue '${queue}'${reason ? ` (${unavailableText(reason)})` : ''}`,
+      reason
+        ? { code: 'RESIZE_QUEUE_NOT_SERVED', cause: reason.error }
+        : { code: 'RESIZE_QUEUE_NOT_SERVED' },
+    );
+  }
+  return { carriers, routing };
 }
 
 export interface RunWorkerOptions {
@@ -147,42 +218,18 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   }
   // Drivers given as functions load now, so each Resizer's task queue is known.
   await Promise.all(resizers.map((resizer) => resizer.ready()));
-  const queues = new Set<TaskQueue>();
-  for (const resizer of resizers) {
-    if (resizer.tasks) {
-      queues.add(resizer.tasks);
-    }
-  }
-  if (queues.size === 0) {
+  if (!resizers.some((resizer) => resizer.tasks)) {
     logNeverThrow(
       logger,
       'resize worker: no Resizer has a task queue (eager-only wiring)',
     );
     return;
   }
-  // A task queue that can't consume this queue name (e.g. SQS without that queue URL) is skipped,
-  // so one Resizer's missing queue never stops the others.
-  for (const tasks of [...queues]) {
-    if (tasks.servesQueue && !tasks.servesQueue(queue)) {
-      queues.delete(tasks);
-      logNeverThrow(
-        logger,
-        `resize worker: a task queue does not serve queue '${queue}' — skipping it`,
-        undefined,
-        'info',
-      );
-    }
-  }
-  if (queues.size === 0) {
-    throw new ResizeSetupError(
-      `resize worker: no task queue serves queue '${queue}'`,
-      { code: 'RESIZE_QUEUE_NOT_SERVED' },
-    );
-  }
-  // A task queue that filters claims never hands this worker an unserved Resizer's task, so it may
-  // be shared. Only the others are compared; with none, no unserved Resizer's task queue is loaded.
+  const { carriers, routing } = await carriersOf(queue, resizers, logger);
+  // A backend that filters claims never hands this worker an unserved Resizer's task, so it may be
+  // shared. Only the others are compared; with none, no unserved Resizer's task queue is loaded.
   const unfiltered = new Set(
-    [...queues].filter((tasks) => !tasks.claimFilters),
+    [...carriers.keys()].filter((carrier) => !carrier.claimFilters),
   );
   if (unfiltered.size > 0) {
     await refuseUnservedSharers(
@@ -192,9 +239,14 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     );
   }
   // Fail before claiming anything: a bad config, queue or store (e.g. a wrong mediaModelName)
-  // would otherwise surface only as per-task errors.
+  // would otherwise surface only as per-task errors. Every served Resizer is checked; the consumed
+  // name is checked on each Resizer that carries it (its timing, its backend, a lock store that
+  // backend needs), and no other name is.
   for (const resizer of resizers) {
-    await resizer.verify();
+    await verifyServicesOf(resizer);
+  }
+  for (const resizer of routing) {
+    await verifyRouteOf(resizer, queue);
   }
 
   // Tasks and events are routed by the task's Resizer name among the served Resizers. Any other
@@ -244,12 +296,14 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     await processorOf(owner).notify(event, task, error);
   };
 
-  // The Consumer of one task queue. A task of a Resizer not served is never run here. A task queue
-  // that filters claims does not hand one out. One that does not, with `release`, gives it back for
-  // a worker that serves it (`accepts`), even when other task queue objects over the same tasks hid
-  // it from the startup check. Otherwise it fails with RESIZE_NO_RESIZER, so it retries and then
-  // dead-letters. Each such Resizer is logged once per task queue, not per task.
-  const consumerOf = (tasks: TaskQueue): Consumer => {
+  // The Consumer of one backend, with the consumed name's timing read on `timingSource` (the task
+  // queue of the first served Resizer that carries the name there, as the Dispatcher reads it). A
+  // task of a Resizer not served is never run here. A backend that filters claims does not hand
+  // one out. One that does not, with `release`, gives it back for a worker that serves it
+  // (`accepts`), even when other task queue objects over the same tasks hid it from the startup
+  // check. Otherwise it fails with RESIZE_NO_RESIZER, so it retries and then dead-letters. Each
+  // such Resizer is logged once per backend, not per task.
+  const consumerOf = (tasks: TaskQueue, timingSource: TaskQueue): Consumer => {
     const givesBack =
       typeof tasks.release === 'function' && !tasks.claimFilters;
     const fate = givesBack
@@ -266,8 +320,8 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     };
     return new Consumer({
       tasks,
-      // timingOf validates the consumed queue's timing here, so invalid timing fails this loop.
-      timing: timingOf(tasks, queue),
+      // Checked at start by verifyRouteOf, so this reads the cached value.
+      timing: timingOf(timingSource, queue),
       resizers: served,
       coordinationOf,
       accepts: givesBack
@@ -299,11 +353,11 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     sharp.cache(opts.sharp.cache);
   }
 
-  // One loop per task queue, all on one stop signal. The first loop to fail is the cause; the
-  // others may then reject only because of the abort. This is for a Consumer that cannot start, or
-  // a loop that meets what it cannot guard (a claimed task that cannot be read). No test reaches
-  // it any more: the timing is validated and cached when the Resizer starts, and the loop guards
-  // its queue calls, observers and logging.
+  // One loop per backend, all on one stop signal. The first loop to fail is the cause; the others
+  // may then reject only because of the abort. This is for a Consumer that cannot start, or a loop
+  // that meets what it cannot guard (a claimed task that cannot be read). No test reaches it any
+  // more: the timing is validated and cached at start, and the loop guards its queue calls,
+  // observers and logging.
   const stop = new AbortController();
   const onAbort = () => stop.abort();
   if (opts.signal.aborted) {
@@ -313,9 +367,9 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
   let firstFailure: { error: unknown } | undefined;
   try {
     await Promise.allSettled(
-      [...queues].map(async (tasks) => {
+      [...carriers].map(async ([carrier, timingSource]) => {
         try {
-          await consumerOf(tasks).run(queue, stop.signal);
+          await consumerOf(carrier, timingSource).run(queue, stop.signal);
         } catch (err) {
           firstFailure ??= { error: err };
           stop.abort();

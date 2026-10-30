@@ -36,6 +36,8 @@ const EXPECTED_VALUE_EXPORTS = [
   'runWorker',
   'sharpToRaster',
   'TaskQueue',
+  'RoutingTaskQueue',
+  'carrierOf',
 ];
 
 // Drivers are SUBPATH-ONLY (the uniform rule 02 · §6) — they must NEVER appear on the main entry.

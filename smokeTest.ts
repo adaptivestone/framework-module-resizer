@@ -58,6 +58,8 @@ const expected = [
   'ResizeStorage',
   'SourceDecoder',
   'TaskQueue',
+  'RoutingTaskQueue',
+  'carrierOf',
   'resetResizerForTests',
   'runWorker',
   'rasterToSharp',

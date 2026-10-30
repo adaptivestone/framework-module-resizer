@@ -80,6 +80,14 @@ export {
   Resizer,
   resetResizerForTests,
 } from './resizer.ts';
+// --- queue names on several backends: a task queue that routes each name to the backend that
+// carries it, and how to find the backend of a name on any task queue ---
+export {
+  carrierOf,
+  type Route,
+  RoutingTaskQueue,
+  type RoutingTaskQueueOptions,
+} from './routing.ts';
 // --- data shapes and options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts,
 // InvalidateOpts, CoordinationOptions, …) ---
 export type * from './types.d.ts';

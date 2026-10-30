@@ -30,6 +30,7 @@ import { Processor, requireReplacePreviews } from './processor.ts';
 import { prewarmFailure, Reader } from './reader.ts';
 import { Registry } from './registry.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
+import { carrierOf, isRouter, unavailableReason } from './routing.ts';
 import { timingOf } from './timing.ts';
 import type {
   CoordinationOptions,
@@ -68,8 +69,8 @@ export interface ResizerOptions {
   storage: ResizeStorage | LazyPart<ResizeStorage>; // REQUIRED: files (originals, previews)
   media: MediaStore | LazyPart<MediaStore>; // REQUIRED: media documents and their previews
   // Locks for queued work, e.g. mongoParts(…).locks. Required beside a task queue without
-  // gatesByTask, which takes one gate lock per media, pipeline and queue it queues; eager-only
-  // hosts may omit it.
+  // gatesByTask, which takes one gate lock per media, pipeline and queue it queues; with a router,
+  // only for the queue names whose backend lacks gatesByTask. Eager-only hosts may omit it.
   locks?: LockStore | LazyPart<LockStore | undefined>;
   // Queued work (prewarm, lazy reads, the worker): where tasks wait, e.g. mongoParts(…).tasks or
   // an SqsTaskQueue. Omit (or resolve to undefined) for eager-only hosts.
@@ -93,10 +94,12 @@ export interface ResizerOptions {
 const registry = new Registry<Resizer>();
 
 // Set by the Resizer class, which alone can read its private services and parts (see
-// processorOf(), tasksPartOf() and taskCoordinationOf()).
+// processorOf(), tasksPartOf(), taskCoordinationOf(), verifyServicesOf() and verifyRouteOf()).
 let readProcessor: (resizer: Resizer) => Processor;
 let loadTasksPart: (resizer: Resizer) => Promise<TaskQueue | undefined>;
 let readTaskCoordination: (resizer: Resizer) => TaskCoordination;
+let runVerifyServices: (resizer: Resizer) => Promise<void>;
+let runVerifyRoute: (resizer: Resizer, queue: string) => Promise<void>;
 
 const PART_NAMES = ['storage', 'media', 'locks', 'tasks'] as const;
 type PartName = (typeof PART_NAMES)[number];
@@ -189,8 +192,8 @@ export class Resizer {
   #readerStale = false;
 
   static {
-    // processorOf(), tasksPartOf() and taskCoordinationOf() (below) read through these; the
-    // services stay private.
+    // processorOf(), tasksPartOf(), taskCoordinationOf(), verifyServicesOf() and verifyRouteOf()
+    // (below) read through these; the services stay private.
     readProcessor = (resizer) =>
       resizer.#builtServices?.processor ?? resizer.#notReady('processor');
     loadTasksPart = async (resizer) => {
@@ -209,6 +212,8 @@ export class Resizer {
         locks: resizer.#locks,
       };
     };
+    runVerifyServices = (resizer) => resizer.#verifyServices();
+    runVerifyRoute = (resizer, queue) => resizer.#verifyRoute(queue);
   }
 
   constructor(opts: ResizerOptions) {
@@ -346,12 +351,13 @@ export class Resizer {
    * `media`, `locks`, `tasks` or a `queueName` given as a function directly. In this order: the
    * parts load; the image config is read and validated; the queue name is read and validated; a
    * Resizer with a task queue builds its Dispatcher; the services are built. A part, config or
-   * queue name failure rejects. A Dispatcher failure (a task queue without gatesByTask and no lock
-   * store, RESIZE_LOCKS_REQUIRED, invalid queue timing, or an invalid coordination) does not: it is
+   * queue name failure rejects. A Dispatcher failure (a task queue without gatesByTask that is not
+   * a router and no lock store, RESIZE_LOCKS_REQUIRED, or an invalid coordination) does not: it is
    * logged once, reads serve stored previews and queue nothing, uploads and generate() work,
-   * prewarm() reports it and verify() rejects with it. The next call retries what failed: a part
-   * that did not load, a config or queue name that did not validate, a Dispatcher that could not
-   * be built. The parts that loaded are kept.
+   * prewarm() reports it and verify() rejects with it. A queue name's own problems (invalid
+   * timing, a backend that cannot be built) are met per call instead. The next call retries what
+   * failed: a part that did not load, a config or queue name that did not validate, a Dispatcher
+   * that could not be built. The parts that loaded are kept.
    */
   async ready(): Promise<void> {
     await this.#services();
@@ -484,19 +490,19 @@ export class Resizer {
   }
 
   /**
-   * The Dispatcher with the validated coordination. A task queue without gatesByTask needs the
-   * lock store for its gate locks, so without one it is RESIZE_LOCKS_REQUIRED; a queue that gates
-   * by task needs none. The timing of the Resizer's own queue name is validated here (another
-   * name's timing is read by the Dispatcher on that name's first call), and the coordination is
-   * read (a function is called) and validated; it is kept only when the Dispatcher is built, so a
-   * failed set-up reads it again on the next call.
+   * The Dispatcher with the validated coordination. A task queue without gatesByTask that is not
+   * a router needs the lock store for its gate locks, so without one it is RESIZE_LOCKS_REQUIRED;
+   * a queue that gates by task needs none, and a router's need is per call: a call whose carrier
+   * lacks gatesByTask queues nothing without a lock store. No timing is read here: a queue name's
+   * timing is checked by verify(), at worker start and on each call. The coordination is read (a
+   * function is called) and validated; it is kept only when the Dispatcher is built, so a failed
+   * set-up reads it again on the next call.
    */
   #buildDispatcher(tasks: TaskQueue): Dispatcher {
-    if (!this.#locks && !tasks.gatesByTask) {
+    if (!this.#locks && !tasks.gatesByTask && !isRouter(tasks)) {
       throw locksRequired(this.name);
     }
     const source = this.#coordinationSource;
-    timingOf(tasks, this.queueName);
     const coordination = fillCoordination(
       typeof source === 'function' ? source() : source,
     );
@@ -541,15 +547,31 @@ export class Resizer {
 
   /**
    * Optional startup check: load the drivers and resolve and validate the config (see ready());
-   * check that a task queue can be used (a lock store beside one without gatesByTask, its timing
-   * and the coordination); run the media store's verify() and check it has replacePreviews; run
-   * the lock store's verify(), then each decoder's optional verify(); check the task queue (its
-   * own verify(), and that it serves this Resizer's queueName). Framework hosts call it after
+   * check that the Resizer can set up its queued work (the coordination, and a lock store beside a
+   * task queue without gatesByTask that is not a router); run the media store's verify() and check
+   * it has replacePreviews; run the lock store's verify() (with a router, only when the carrier of
+   * this Resizer's queue needs it), then each decoder's optional verify(); then check this
+   * Resizer's queueName: a name whose backend is unavailable rejects with the reason, then its
+   * carrier (a backend that fails to build rejects), its timing, the carrier's own verify(), and
+   * that it is served (and, on a router, a lock store when the carrier lacks gatesByTask). Only the
+   * carrier of this Resizer's own queue is built and checked. Framework hosts call it after
    * `Server.init()` to fail at boot instead of at the first upload or read; it is the one call
-   * that rejects for a task queue that cannot be used (the read path degrades instead). The
-   * worker runs it for every Resizer before leasing.
+   * that rejects for a task queue that cannot be used (the read path degrades instead). The worker
+   * runs the same checks for the queue names it consumes.
    */
   async verify(): Promise<void> {
+    await this.#verifyServices();
+    if (this.tasks) {
+      await this.#verifyRoute(this.queueName);
+    }
+  }
+
+  /**
+   * The checks of verify() that need no queue name: the parts, the config, the Resizer-wide queue
+   * set-up, the media store, the lock store (unless the task queue is a router: its lock store is
+   * checked with a carrier that needs it) and the decoders. Builds no route and reads no timing.
+   */
+  async #verifyServices(): Promise<void> {
     // ready() resolves while the task queue cannot be used; verify() rejects with the reason.
     await this.ready();
     if (this.#queueFailure) {
@@ -557,16 +579,56 @@ export class Resizer {
     }
     await this.media.verify?.();
     requireReplacePreviews(this.media);
-    await this.locks?.verify?.();
+    // With a router, the lock store may serve no route at all (every route gates by task), so it
+    // is verified only beside a carrier that needs it.
+    if (!this.tasks || !isRouter(this.tasks)) {
+      await this.locks?.verify?.();
+    }
     await this.#decoders.verify();
-    if (this.tasks) {
-      await this.tasks.verify?.();
-      if (this.tasks.servesQueue && !this.tasks.servesQueue(this.queueName)) {
-        throw new ResizeSetupError(
-          `resize: Resizer '${this.name}' queues to '${this.queueName}' (its \`queueName\`), which its task queue does not serve`,
-          { code: 'RESIZE_QUEUE_NOT_SERVED' },
-        );
+  }
+
+  /**
+   * The checks of verify() for one queue name: its unavailable reason, then, on a router, its
+   * carrier (built now), its timing, the carrier's verify() and the lock store when the carrier
+   * lacks gatesByTask; on any other task queue, its timing, the task queue's verify() and that it
+   * serves the name. Only that name's route is built.
+   */
+  async #verifyRoute(queue: string): Promise<void> {
+    await this.ready();
+    const tasks = this.tasks;
+    if (!tasks) {
+      return;
+    }
+    const reason = unavailableReason(tasks, queue);
+    if (reason) {
+      throw reason.error;
+    }
+    const notServed = () =>
+      new ResizeSetupError(
+        queue === this.queueName
+          ? `resize: Resizer '${this.name}' queues to '${queue}' (its \`queueName\`), which its task queue does not serve`
+          : `resize: Resizer '${this.name}' cannot use queue '${queue}', which its task queue does not serve`,
+        { code: 'RESIZE_QUEUE_NOT_SERVED' },
+      );
+    if (!isRouter(tasks)) {
+      timingOf(tasks, queue);
+      await tasks.verify?.();
+      if (tasks.servesQueue && !tasks.servesQueue(queue)) {
+        throw notServed();
       }
+      return;
+    }
+    const carrier = await carrierOf(tasks, queue);
+    if (!carrier) {
+      throw notServed();
+    }
+    timingOf(tasks, queue);
+    await carrier.verify?.();
+    if (!carrier.gatesByTask) {
+      if (!this.#locks) {
+        throw locksRequired(this.name);
+      }
+      await this.#locks.verify?.();
     }
   }
 
@@ -692,6 +754,28 @@ export function tasksPartOf(resizer: Resizer): Promise<TaskQueue | undefined> {
  */
 export function taskCoordinationOf(resizer: Resizer): TaskCoordination {
   return readTaskCoordination(resizer);
+}
+
+/**
+ * The checks of verify() that need no queue name (the parts, the config, the coordination, the
+ * media store, the lock store unless the task queue is a router, the decoders): the worker runs
+ * them for every Resizer it serves. Builds no route and reads no timing. Internal: the main entry
+ * does not export it, and it may change in any release.
+ * @internal
+ */
+export function verifyServicesOf(resizer: Resizer): Promise<void> {
+  return runVerifyServices(resizer);
+}
+
+/**
+ * The checks of verify() for the queue name `queue` (its unavailable reason, its carrier, its
+ * timing, the carrier's verify(), the lock store a router's carrier needs): the worker runs them
+ * for each name it consumes, for every served Resizer whose task queue carries it. Builds only that
+ * name's route. Internal: the main entry does not export it, and it may change in any release.
+ * @internal
+ */
+export function verifyRouteOf(resizer: Resizer, queue: string): Promise<void> {
+  return runVerifyRoute(resizer, queue);
 }
 
 /**

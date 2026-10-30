@@ -26,6 +26,7 @@ import {
   type ResizerOptions,
   resetResizerForTests,
 } from './resizer.ts';
+import { markUnavailable, RoutingTaskQueue } from './routing.ts';
 import { consume } from './testHelpers/consume.ts';
 import {
   clockLocks,
@@ -36,6 +37,7 @@ import {
   ReleasingTaskQueue,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
+import { workUntil } from './testHelpers/work.ts';
 import type {
   CoordinationOptions,
   MediaLike,
@@ -360,11 +362,12 @@ test('a variant error with retryable: false fails only its variant; the task fai
 });
 
 // A Resizer named `name` on `tasks`. Its default media store has no docs, so each of its tasks is a
-// no-op complete.
+// no-op complete. `over` replaces any other option (e.g. `locks: undefined` for none).
 function queuedResizer(
   name: string,
   tasks: ResizerOptions['tasks'],
   media: ResizerOptions['media'] = fakeMedia(),
+  over: Partial<ResizerOptions> = {},
 ): Resizer {
   return new Resizer({
     name,
@@ -378,6 +381,7 @@ function queuedResizer(
     media,
     locks: memoryLocks(),
     tasks,
+    ...over,
   });
 }
 
@@ -388,40 +392,6 @@ const taskOf = (resizer: string) => ({
   pipeline: 'default',
   previews: [{ sizeKey: '10x10', format: 'webp' }],
 });
-
-/** Run the worker until `done()` (or 5 s), then stop it and wait for it to return. */
-async function workUntil(
-  opts: Omit<Parameters<typeof runWorker>[0], 'signal'>,
-  done: () => boolean,
-): Promise<void> {
-  const stop = new AbortController();
-  const working = runWorker({ ...opts, signal: stop.signal });
-  // A worker that fails before the wait ends (refused at start, say) fails the test with its error.
-  let failed: { error: unknown } | undefined;
-  working.catch((error: unknown) => {
-    failed = { error };
-  });
-  const until = Date.now() + 5000;
-  try {
-    while (!done()) {
-      if (failed) {
-        throw failed.error;
-      }
-      assert.ok(
-        Date.now() < until,
-        'the worker never reached the expected state',
-      );
-      await new Promise((r) => setTimeout(r, 5));
-    }
-  } catch (err) {
-    // A failed wait still stops the worker, so the test file can exit; the assertion is the error.
-    stop.abort();
-    await working.catch(() => {});
-    throw err;
-  }
-  stop.abort();
-  await working;
-}
 
 // A second TaskQueue object over the same rows, as two MongoTaskQueue instances on one collection
 // are: the startup check compares task queue objects, so it cannot see that they share tasks.
@@ -1299,5 +1269,391 @@ describe('dead-letter cooldown', () => {
         ),
       ),
     );
+  });
+});
+
+// One Resizer, queues on two backends through one router: 'default' on a queue that gates by task
+// (the database shape), 'bulk' on one that does not (the SQS shape), or the other way round. Each
+// worker consumes the backend that carries its queue, with that backend's gate.
+describe('a worker on a router', () => {
+  const fast = { idlePollMs: 5 };
+  const onBulk = (resizer = 'default') => ({
+    ...taskOf(resizer),
+    queue: 'bulk',
+  });
+  const unlisted = (err: unknown) =>
+    err instanceof ResizeSetupError &&
+    err.code === 'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED';
+  const sourceMedia = (id: string): MediaLike => ({
+    id,
+    original: { storageRef: { key: `o-${id}` } },
+    previews: [],
+  });
+
+  test("a worker for bulk consumes the plain route of a Resizer's router", async () => {
+    const memory = new MemoryTaskQueue({ timing: fast });
+    const plain = new PlainTaskQueue({ timing: fast });
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({ default: memory, bulk: plain }),
+    );
+    await plain.add(onBulk());
+    const [row] = plain.rows;
+    await workUntil(
+      { queue: 'bulk', logger: silent, resizers: [resizer] },
+      () => row.status === 'completed',
+    );
+    assert.deepEqual(memory.claims, []);
+  });
+
+  test('the startup check compares routes: an unserved Resizer routing bulk to the consumed plain queue is RESIZE_QUEUE_SHARED_RESIZER_UNLISTED', async () => {
+    const plain = new PlainTaskQueue({ timing: fast });
+    const a = queuedResizer(
+      'a',
+      new RoutingTaskQueue({ default: new MemoryTaskQueue(), bulk: plain }),
+    );
+    queuedResizer('b', new RoutingTaskQueue({ bulk: plain }));
+    await assert.rejects(
+      () =>
+        runWorker({
+          queue: 'bulk',
+          signal: AbortSignal.abort(),
+          logger: silent,
+          resizers: [a],
+        }),
+      (err: unknown) =>
+        unlisted(err) &&
+        /'b'/.test((err as Error).message) &&
+        /queue 'bulk'/.test((err as Error).message),
+    );
+    assert.deepEqual(plain.claims, []);
+  });
+
+  // A Resizer whose downloads fail (retried) or whose sources are over the limit (dead-lettered at
+  // once), on `default` (gates by task) and `bulk` (gate locks in `locks`) of one router.
+  function twoBackends(fails: 'retry' | 'dead') {
+    const timing = {
+      idlePollMs: 5,
+      retryBackoffMs: { base: 60_000, max: 60_000 },
+    };
+    const memory = new MemoryTaskQueue({ timing });
+    const plain = new PlainTaskQueue({ timing });
+    const locks = clockLocks();
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({ default: memory, bulk: plain }),
+      fakeMedia({ load: async (id) => sourceMedia(id) }),
+      {
+        locks,
+        coordination: { cooldownMs: 30_000 },
+        ...(fails === 'dead'
+          ? {
+              config: makeImageConfig({
+                formats: ['webp'],
+                limits: { sourcePixels: 100 },
+              }),
+            }
+          : {
+              storage: {
+                download: async () => {
+                  throw new Error('storage down');
+                },
+                upload: async () => ({ key: 'k' }),
+                publicUrl: () => '',
+              },
+            }),
+      },
+    );
+    const prewarm = (queue: string) =>
+      resizer.prewarm({
+        media: sourceMedia('m1'),
+        sizes: [{ width: 10, height: 10 }],
+        queue,
+      });
+    return { memory, plain, locks, resizer, prewarm };
+  }
+
+  test('on a router, a failed task retries on its own backend: the plain route keeps the gate lock until the retry, the gating route keeps its row active', async () => {
+    const { memory, plain, locks, resizer, prewarm } = twoBackends('retry');
+    assert.equal((await prewarm('bulk')).status, 'accepted');
+    assert.equal((await prewarm('default')).status, 'accepted');
+    const [bulkRow] = plain.rows;
+    const [defaultRow] = memory.rows;
+    const key = gateKey('default', 'bulk', 'm1', 'default');
+    await workUntil(
+      { queue: 'bulk', logger: silent, resizers: [resizer] },
+      () => bulkRow.attempts === 1 && bulkRow.status === 'pending',
+    );
+    const held = locks.entry(key);
+    assert.equal(held?.owner, bulkRow.task.gateOwner);
+    assert.ok(
+      (held?.expiresAt ?? 0) - Date.now() > 50_000,
+      'held until the retry',
+    );
+    await workUntil(
+      { queue: 'default', logger: silent, resizers: [resizer] },
+      () => defaultRow.attempts === 1 && defaultRow.status === 'pending',
+    );
+    assert.equal(defaultRow.active, true);
+    assert.equal(defaultRow.task.gateOwner, undefined);
+    assert.equal(
+      locks.entry(gateKey('default', 'default', 'm1', 'default')),
+      undefined,
+    );
+  });
+
+  test('on a router, a dead-letter cools down on its own backend: a gate lock for the plain route, the row for the gating route', async () => {
+    const { memory, plain, locks, resizer, prewarm } = twoBackends('dead');
+    await prewarm('bulk');
+    await prewarm('default');
+    const [bulkRow] = plain.rows;
+    const [defaultRow] = memory.rows;
+    await workUntil(
+      { queue: 'bulk', logger: silent, resizers: [resizer] },
+      () => bulkRow.status === 'dead',
+    );
+    const held = locks.entry(gateKey('default', 'bulk', 'm1', 'default'));
+    assert.equal(held?.owner, bulkRow.task.gateOwner);
+    const left = (held?.expiresAt ?? 0) - Date.now();
+    assert.ok(left > 29_000 && left <= 30_000, `held for ${left} ms`);
+    await workUntil(
+      { queue: 'default', logger: silent, resizers: [resizer] },
+      () => defaultRow.status === 'dead',
+    );
+    const cooling = (defaultRow.cooldownUntil ?? 0) - Date.now();
+    assert.ok(cooling > 29_000 && cooling <= 30_000, `cools for ${cooling} ms`);
+    assert.equal(
+      locks.entry(gateKey('default', 'default', 'm1', 'default')),
+      undefined,
+    );
+  });
+
+  test('on a router, a stopped worker gives a plain task back with release and keeps its gate lock', async () => {
+    const releasing = new ReleasingTaskQueue({ timing: fast });
+    const locks = clockLocks();
+    let started: () => void = () => {};
+    const running = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let stopTask: (err: Error) => void = () => {};
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({ default: new MemoryTaskQueue(), bulk: releasing }),
+      fakeMedia({
+        load: () => {
+          started();
+          return new Promise((_resolve, reject) => {
+            stopTask = reject;
+          });
+        },
+      }),
+      { locks },
+    );
+    await resizer.prewarm({
+      media: sourceMedia('m1'),
+      sizes: [{ width: 10, height: 10 }],
+      queue: 'bulk',
+    });
+    const [row] = releasing.rows;
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      const working = runWorker({
+        queue: 'bulk',
+        signal: stop.signal,
+        logger: silent,
+        resizers: [resizer],
+      });
+      await running;
+      stop.abort();
+      stopTask(new Error('stopped'));
+      await working;
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(releasing.releaseCalls, [row.id]);
+    assert.equal(row.status, 'pending');
+    assert.equal(row.attempts, 0);
+    const held = locks.entry(gateKey('default', 'bulk', 'm1', 'default'));
+    assert.equal(held?.owner, row.task.gateOwner);
+    assert.ok((held?.expiresAt ?? 0) > Date.now(), 'the gate lock is kept');
+  });
+
+  test('worker start needs a lock store for a consumed route without gatesByTask', async () => {
+    const plain = new PlainTaskQueue({ timing: fast });
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({ default: new MemoryTaskQueue(), bulk: plain }),
+      fakeMedia(),
+      { locks: undefined },
+    );
+    await assert.rejects(
+      () =>
+        runWorker({
+          queue: 'bulk',
+          signal: AbortSignal.abort(),
+          logger: silent,
+          resizers: [resizer],
+        }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError && err.code === 'RESIZE_LOCKS_REQUIRED',
+    );
+    assert.deepEqual(plain.claims, []);
+    // The gating route needs none.
+    await runWorker({
+      queue: 'default',
+      signal: AbortSignal.abort(),
+      logger: silent,
+      resizers: [resizer],
+    });
+  });
+
+  test("a worker for bulk starts although the served Resizer's own queue default cannot be used", async () => {
+    const down = new ResizeSetupError('install @aws-sdk/client-sqs', {
+      code: 'RESIZE_PEER_MISSING',
+    });
+    let builds = 0;
+    const bulk = new MemoryTaskQueue({ timing: fast });
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({
+        default: async () => {
+          builds += 1;
+          throw down;
+        },
+        bulk,
+      }),
+      fakeMedia(),
+      { locks: undefined },
+    );
+    await bulk.add(onBulk());
+    const [row] = bulk.rows;
+    await workUntil(
+      { queue: 'bulk', logger: silent, resizers: [resizer] },
+      () => row.status === 'completed',
+    );
+    assert.equal(builds, 0);
+    await assert.rejects(
+      () => resizer.verify(),
+      (err: unknown) => err === down,
+    );
+  });
+
+  test('a worker for a healthy bulk starts while default has invalid timing', async () => {
+    const broken = new MemoryTaskQueue({ timing: { leaseMs: 0 } });
+    const bulk = new MemoryTaskQueue({ timing: fast });
+    const resizer = queuedResizer(
+      'default',
+      new RoutingTaskQueue({ default: broken, bulk }),
+    );
+    await bulk.add(onBulk());
+    const [row] = bulk.rows;
+    await workUntil(
+      { queue: 'bulk', logger: silent, resizers: [resizer] },
+      () => row.status === 'completed',
+    );
+    await assert.rejects(
+      () =>
+        runWorker({
+          signal: AbortSignal.abort(),
+          logger: silent,
+          resizers: [resizer],
+        }),
+      (err: unknown) =>
+        (err as { code?: string }).code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    );
+    assert.deepEqual(broken.claims, []);
+  });
+
+  test('a worker given a name marked unavailable fails with RESIZE_QUEUE_NOT_SERVED naming the queue and the package', async () => {
+    const tasks = new MemoryTaskQueue({ queues: ['default'] });
+    markUnavailable(tasks, ['bulk'], {
+      driver: 'sqs',
+      packages: ['@aws-sdk/client-sqs'],
+      error: new ResizeSetupError('peer missing', {
+        code: 'RESIZE_PEER_MISSING',
+      }),
+    });
+    const resizer = queuedResizer('default', tasks);
+    await assert.rejects(
+      () =>
+        runWorker({
+          queue: 'bulk',
+          signal: AbortSignal.abort(),
+          logger: silent,
+          resizers: [resizer],
+        }),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_QUEUE_NOT_SERVED' &&
+        /'bulk'/.test(err.message) &&
+        /driver 'sqs' needs @aws-sdk\/client-sqs/.test(err.message),
+    );
+  });
+
+  test('two routers whose cold builders return one shared plain queue: a worker serving only the first refuses to start', async () => {
+    const start = (a: Resizer) =>
+      runWorker({
+        queue: 'bulk',
+        signal: AbortSignal.abort(),
+        logger: silent,
+        resizers: [a],
+      });
+    // b's route was never built, yet it is the same queue object.
+    const shared = new PlainTaskQueue({ queues: ['bulk'] });
+    const a = queuedResizer(
+      'a',
+      new RoutingTaskQueue({ bulk: async () => shared }),
+    );
+    queuedResizer('b', new RoutingTaskQueue({ bulk: async () => shared }));
+    await assert.rejects(
+      () => start(a),
+      (err: unknown) => unlisted(err) && /'b'/.test((err as Error).message),
+    );
+    assert.deepEqual(shared.claims, []);
+
+    // b's route cannot be built: it may be the shared queue.
+    resetResizerForTests();
+    const notUp = new Error('queue not up');
+    const a2 = queuedResizer(
+      'a',
+      new RoutingTaskQueue({ bulk: async () => shared }),
+    );
+    queuedResizer(
+      'b',
+      new RoutingTaskQueue({
+        bulk: async () => {
+          throw notUp;
+        },
+      }),
+    );
+    await assert.rejects(
+      () => start(a2),
+      (err: unknown) =>
+        unlisted(err) &&
+        /'b' failed to load/.test((err as Error).message) &&
+        /could not be determined/.test((err as Error).message) &&
+        (err as Error).cause === notUp,
+    );
+
+    // A shared queue that filters claims may be shared: b's route is never built.
+    resetResizerForTests();
+    const filtering = new MemoryTaskQueue({ queues: ['bulk'] });
+    let builds = 0;
+    const a3 = queuedResizer(
+      'a',
+      new RoutingTaskQueue({ bulk: async () => filtering }),
+    );
+    queuedResizer(
+      'b',
+      new RoutingTaskQueue({
+        bulk: async () => {
+          builds += 1;
+          return filtering;
+        },
+      }),
+    );
+    await start(a3);
+    assert.equal(builds, 0);
   });
 });

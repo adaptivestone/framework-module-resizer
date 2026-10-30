@@ -9,8 +9,10 @@ import {
   type DispatchRequest,
   noQueueResult,
 } from './dispatcher.ts';
+import { ResizeError, ResizeSetupError } from './errors.ts';
 import { canonicalizeVariants } from './images.ts';
 import { gateKey } from './lockKeys.ts';
+import { markUnavailable, RoutingTaskQueue } from './routing.ts';
 import {
   type ClockLocks,
   clockLocks,
@@ -543,7 +545,7 @@ describe('a task queue without gatesByTask', () => {
     });
     const bulk = requestFor([v300, v600], { queue: 'bulk' });
     const message =
-      "cannot queue to 'bulk': its task queue does not serve that queue (an unknown queue name, or a queue on another backend; one Resizer cannot use two backends yet)";
+      "cannot queue to 'bulk': its task queue does not serve that queue (a queue name it does not route)";
     assert.deepEqual(await d.enqueueConfirmed(bulk), {
       accepted: [],
       unconfirmed: [v300, v600],
@@ -988,5 +990,202 @@ describe('enqueueConfirmed', () => {
         label,
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A router: each call asks its questions of the backend that carries its queue
+// ---------------------------------------------------------------------------
+
+describe('a task queue that routes queue names to backends', () => {
+  test("on a router, each call gets its queue's gate: the gating route adds with no lock, the plain route takes the gate lock", async () => {
+    const memory = new MemoryTaskQueue();
+    const plain = new PlainTaskQueue();
+    const { locks, calls } = recordingLocks();
+    const d = makeDispatcher({
+      tasks: new RoutingTaskQueue({ default: memory, bulk: plain }),
+      locks,
+    });
+    const own = await d.enqueueConfirmed(requestFor([v300]));
+    assert.deepEqual(own.accepted, [v300]);
+    assert.equal(calls.filter((c) => c.op === 'acquire').length, 0);
+    const bulk = await d.enqueueConfirmed(
+      requestFor([v300], { queue: 'bulk' }),
+    );
+    assert.deepEqual(bulk.accepted, [v300]);
+    assert.deepEqual(bulk.issues, []);
+    assert.deepEqual(
+      calls.filter((c) => c.op === 'acquire').map((c) => c.key),
+      [gateKey('default', 'bulk', 'm1', 'default')],
+    );
+    assert.equal(memory.added.length, 1);
+    assert.equal(memory.added[0].gateOwner, undefined);
+    assert.equal(plain.added.length, 1);
+    assert.equal(plain.added[0].gateOwner, calls[0].owner);
+  });
+
+  test('after an in-flight add, findActive is asked of the route', async () => {
+    const memory = new MemoryTaskQueue();
+    let asked = 0;
+    const findActive = memory.findActive.bind(memory);
+    memory.findActive = (query) => {
+      asked += 1;
+      return findActive(query);
+    };
+    const router = new RoutingTaskQueue({ default: memory });
+    router.findActive = async () => assert.fail('the router was asked');
+    const d = makeDispatcher({ tasks: router });
+    const first = await d.enqueueConfirmed(requestFor([v300]));
+    const again = await d.enqueueConfirmed(requestFor([v300]));
+    assert.equal(asked, 1);
+    assert.deepEqual(again.accepted, [v300]);
+    assert.deepEqual(again.tasks, first.tasks);
+  });
+
+  test('a route whose build fails: prewarm reports its code and retryable, the read path logs it once per name, the other route still queues', async () => {
+    const cases: { error: unknown; issue: Record<string, unknown> }[] = [
+      {
+        error: new ResizeSetupError('install @aws-sdk/client-sqs', {
+          code: 'RESIZE_PEER_MISSING',
+        }),
+        issue: {
+          code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+          causeCode: 'RESIZE_PEER_MISSING',
+          message: 'install @aws-sdk/client-sqs',
+          retryable: true,
+        },
+      },
+      {
+        error: new ResizeError('no bucket', {
+          code: 'GCS_BUCKET_MISSING',
+          retryable: false,
+        }),
+        issue: {
+          code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+          causeCode: 'GCS_BUCKET_MISSING',
+          message: 'no bucket',
+          retryable: false,
+        },
+      },
+      {
+        error: new ResizeError('not here', {
+          code: 'RESIZE_QUEUE_NOT_SERVED',
+          retryable: false,
+        }),
+        issue: {
+          code: 'RESIZE_QUEUE_NOT_SERVED',
+          message: 'not here',
+          retryable: false,
+        },
+      },
+      {
+        // A setup error keeps its own retryable: no prewarm advice rule on this path.
+        error: new ResizeSetupError('wiring'),
+        issue: {
+          code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+          causeCode: 'RESIZE_SETUP',
+          message: 'wiring',
+          retryable: true,
+        },
+      },
+      {
+        error: new Error('boom'),
+        issue: {
+          code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+          message: 'boom',
+          retryable: true,
+        },
+      },
+    ];
+    for (const { error, issue } of cases) {
+      errors = [];
+      const memory = new MemoryTaskQueue();
+      const d = makeDispatcher({
+        tasks: new RoutingTaskQueue({
+          default: memory,
+          bulk: async () => {
+            throw error;
+          },
+        }),
+      });
+      const bulk = requestFor([v300, v600], { queue: 'bulk' });
+      assert.deepEqual(
+        await d.enqueueConfirmed(bulk),
+        {
+          accepted: [],
+          unconfirmed: [v300, v600],
+          tasks: [],
+          issues: [{ ...issue, previews: [v300, v600] }],
+        },
+        String(error),
+      );
+      // The read path logs it once per queue name and error, and queues nothing.
+      assert.equal(await d.enqueue(bulk), 0);
+      assert.equal(await d.enqueue(bulk), 0);
+      assert.equal(errors.length, 1, String(error));
+      assert.match(String(errors[0][0]), /cannot queue to 'bulk'/);
+      assert.equal(errors[0][1], error);
+      // The other route still queues.
+      assert.equal(await d.enqueue(requestFor([v300])), 1);
+      assert.equal(memory.added.length, 1);
+    }
+  });
+
+  test('a name marked unavailable: prewarm is RESIZE_QUEUE_NOT_SERVED, not retryable, and the message names the package; resolve logs it once', async () => {
+    const tasks = new MemoryTaskQueue({ queues: ['default'] });
+    markUnavailable(tasks, ['bulk'], {
+      driver: 'sqs',
+      packages: ['@aws-sdk/client-sqs'],
+      error: new ResizeSetupError('peer missing', {
+        code: 'RESIZE_PEER_MISSING',
+      }),
+    });
+    const d = makeDispatcher({ tasks });
+    const bulk = requestFor([v300], { queue: 'bulk' });
+    const message =
+      "cannot queue to 'bulk': its task queue does not serve that queue (its driver 'sqs' needs @aws-sdk/client-sqs, which is not installed)";
+    assert.deepEqual((await d.enqueueConfirmed(bulk)).issues, [
+      {
+        code: 'RESIZE_QUEUE_NOT_SERVED',
+        message,
+        retryable: false,
+        previews: [v300],
+      },
+    ]);
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(warnings.length, 1);
+    assert.ok(String(warnings[0][0]).includes(message));
+    assert.deepEqual(tasks.added, []);
+  });
+
+  test('a call on a plain route without a lock store reports RESIZE_ENQUEUE_LOCK_FAILED with causeCode RESIZE_LOCKS_REQUIRED; the gating route still queues', async () => {
+    const memory = new MemoryTaskQueue();
+    const plain = new PlainTaskQueue();
+    const d = makeDispatcher({
+      tasks: new RoutingTaskQueue({ default: memory, bulk: plain }),
+      locks: undefined,
+    });
+    const bulk = requestFor([v300], { queue: 'bulk' });
+    const [issue] = (await d.enqueueConfirmed(bulk)).issues;
+    assert.deepEqual(
+      {
+        code: issue.code,
+        causeCode: issue.causeCode,
+        retryable: issue.retryable,
+      },
+      {
+        code: 'RESIZE_ENQUEUE_LOCK_FAILED',
+        causeCode: 'RESIZE_LOCKS_REQUIRED',
+        retryable: false,
+      },
+    );
+    assert.match(issue.message, /'bulk'/);
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(await d.enqueue(bulk), 0);
+    assert.equal(errors.length, 1, 'logged once per queue name');
+    assert.deepEqual(plain.added, []);
+    assert.equal(await d.enqueue(requestFor([v300])), 1);
+    assert.equal(memory.added.length, 1);
   });
 });
