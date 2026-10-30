@@ -12,7 +12,7 @@ import {
 } from './errors.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { randomHex } from './helpers/random.ts';
-import { NoopMetrics } from './metrics.ts';
+import { errorCodeLabel, NoopMetrics } from './metrics.ts';
 import type {
   Original,
   OriginalFormat,
@@ -137,7 +137,7 @@ export class Uploader {
     } catch (err) {
       this.#metrics.timing('resize.upload', performance.now() - started, {
         outcome: 'rejected',
-        ...(ResizeError.isResizeError(err) ? { code: err.code } : {}),
+        ...errorCodeLabel(err),
       });
       throw err;
     }

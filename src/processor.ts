@@ -42,7 +42,7 @@ import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import type { HookBus } from './hooks.ts';
 import { previewScope, requireMediaId } from './images.ts';
-import { NoopMetrics } from './metrics.ts';
+import { errorCodeLabel, NoopMetrics } from './metrics.ts';
 import type { PipelineRegistry } from './pipelines.ts';
 import {
   decodeBox,
@@ -372,10 +372,6 @@ export interface ProcessorDeps {
 
 const noMetrics = new NoopMetrics();
 
-/** The code label of a failure: the code of a module error, none for anything else. */
-const codeLabel = (err: unknown): { code?: string } =>
-  ResizeError.isResizeError(err) ? { code: err.code } : {};
-
 /**
  * Renders the previews of one Resizer: eagerly for a caller, or for one queued task. Also fires
  * the task observers and removes stored previews.
@@ -689,16 +685,51 @@ export class Processor {
     const notStored = requested.filter(
       (v) => !existing.has(catalog.identity(scope, v)),
     );
+    // One variant on the metrics sink: its time, its outcome, and the bytes it uploaded.
+    const metrics = this.#metrics;
+    const recordVariant = (
+      identity: string,
+      format: string,
+      ms: number,
+      outcome: 'stored' | 'duplicate' | 'rendered' | 'failed',
+      extra: { code?: string; bytes?: number } = {},
+    ): void => {
+      metrics.timing(
+        'resize.variant',
+        ms,
+        {
+          pipeline: pipelineName,
+          format,
+          mode,
+          outcome,
+          ...(extra.code === undefined ? {} : { code: extra.code }),
+        },
+        {
+          mediaId,
+          identity,
+          ...(taskId === undefined ? {} : { taskId }),
+        },
+      );
+      if (extra.bytes !== undefined) {
+        metrics.count('resize.variant.bytes', extra.bytes, {
+          pipeline: pipelineName,
+          format,
+        });
+      }
+    };
     // A task payload can name any format; only configured encoders run. Every other variant fails
-    // alone, before any download.
+    // alone, before any download, so it is recorded with no time spent.
     const { configured: pending, unconfigured } =
       catalog.splitConfigured(notStored);
     for (const v of unconfigured) {
+      const identity = catalog.identity(scope, v);
+      const error = formatNotConfiguredError([v.format]);
       logger.error(
-        `resize worker: variant ${catalog.identity(scope, v)} failed for media ${mediaId}`,
-        formatNotConfiguredError([v.format]),
+        `resize worker: variant ${identity} failed for media ${mediaId}`,
+        error,
       );
       failedCount += 1;
+      recordVariant(identity, v.format, 0, 'failed', errorCodeLabel(error));
     }
     // Everything requested is already stored or cannot be encoded: no download.
     if (pending.length === 0) {
@@ -808,37 +839,6 @@ export class Processor {
     // How long each rendered variant took, from its encode to the end of its upload. It is recorded
     // once the persist says what became of the row.
     const durations = new Map<VariantPlan, number>();
-    const metrics = this.#metrics;
-    const recordVariant = (
-      plan: VariantPlan,
-      ms: number,
-      outcome: 'stored' | 'duplicate' | 'rendered' | 'failed',
-      extra: { code?: string; bytes?: number } = {},
-    ): void => {
-      const format = plan.variant.format;
-      metrics.timing(
-        'resize.variant',
-        ms,
-        {
-          pipeline: pipelineName,
-          format,
-          mode,
-          outcome,
-          ...(extra.code === undefined ? {} : { code: extra.code }),
-        },
-        {
-          mediaId,
-          identity: plan.identity,
-          ...(taskId === undefined ? {} : { taskId }),
-        },
-      );
-      if (extra.bytes !== undefined) {
-        metrics.count('resize.variant.bytes', extra.bytes, {
-          pipeline: pipelineName,
-          format,
-        });
-      }
-    };
     const renderVariant = async (plan: VariantPlan): Promise<void> => {
       const started = performance.now();
       try {
@@ -890,10 +890,11 @@ export class Processor {
         );
         failedCount += 1;
         recordVariant(
-          plan,
+          plan.identity,
+          plan.variant.format,
           performance.now() - started,
           'failed',
-          codeLabel(failure),
+          errorCodeLabel(failure),
         );
       }
     };
@@ -932,10 +933,11 @@ export class Processor {
         // Nothing this call rendered is known to be stored.
         for (const { plan } of rendered) {
           recordVariant(
-            plan,
+            plan.identity,
+            plan.variant.format,
             durations.get(plan) ?? 0,
             'failed',
-            codeLabel(err),
+            errorCodeLabel(err),
           );
         }
         throw err;
@@ -947,13 +949,17 @@ export class Processor {
       for (const { plan, row } of rendered) {
         const ms = durations.get(plan) ?? 0;
         if (kept.has(row)) {
-          recordVariant(plan, ms, 'stored', { bytes: row.bytes });
+          recordVariant(plan.identity, plan.variant.format, ms, 'stored', {
+            bytes: row.bytes,
+          });
         } else if (duplicates.has(plan.identity)) {
-          recordVariant(plan, ms, 'duplicate', { bytes: row.bytes });
+          recordVariant(plan.identity, plan.variant.format, ms, 'duplicate', {
+            bytes: row.bytes,
+          });
         } else {
           // The media store left it out and does not hold it (or the media is gone): logged by
           // the recorder, and not stored.
-          recordVariant(plan, ms, 'failed');
+          recordVariant(plan.identity, plan.variant.format, ms, 'failed');
         }
       }
       for (const preview of generated) {
@@ -961,9 +967,15 @@ export class Processor {
       }
     } else if (!persist) {
       for (const { plan, row } of rendered) {
-        recordVariant(plan, durations.get(plan) ?? 0, 'rendered', {
-          bytes: row.bytes,
-        });
+        recordVariant(
+          plan.identity,
+          plan.variant.format,
+          durations.get(plan) ?? 0,
+          'rendered',
+          {
+            bytes: row.bytes,
+          },
+        );
       }
     }
 

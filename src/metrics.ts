@@ -14,7 +14,7 @@ import {
   ResizeMetrics,
 } from './contracts/metrics.ts';
 import { RESIZE_ERROR_CODES } from './errorCodes.ts';
-import { ResizeSetupError } from './errors.ts';
+import { ResizeError, ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import type { ResizeLogger } from './types.d.ts';
 
@@ -44,6 +44,16 @@ const isThenable = (value: unknown): value is PromiseLike<unknown> =>
   (typeof value === 'object' || typeof value === 'function') &&
   value !== null &&
   typeof (value as { then?: unknown }).then === 'function';
+
+/**
+ * The `code` label of a failure, to spread into a call's labels: the raw code of a module error
+ * (told by its brand, so a duplicate copy of the package counts too), and no label for anything
+ * else. The code is passed raw: the bound sink keeps the label to the module's own codes and moves
+ * any other code to the context.
+ */
+export function errorCodeLabel(err: unknown): { code?: string } {
+  return ResizeError.isResizeError(err) ? { code: err.code } : {};
+}
 
 /** True when `value` has the count() and timing() functions of a metrics sink. */
 export function isMetrics(value: unknown): value is ResizeMetrics {

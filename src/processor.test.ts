@@ -5454,6 +5454,81 @@ describe('variant metrics', () => {
     assert.equal(byteCounts(metrics).length, 0);
   });
 
+  test('a persist that throws a module error records failed with its code', async () => {
+    const { deps, metrics } = measuredDeps();
+    deps.media = fakeMedia({
+      load: async () => mediaDoc(),
+      appendPreviews: async () => undefined as unknown as Preview[],
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({ media: mediaDoc(), sizes: twoSizes }),
+      { code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID' },
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 2);
+    for (const call of recorded) {
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'jpeg',
+        mode: 'eager',
+        outcome: 'failed',
+        code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID',
+      });
+    }
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('a row the persist leaves out that no row holds records failed with no code', async () => {
+    const { deps, metrics } = measuredDeps();
+    // The store keeps nothing and the reload holds nothing: neither stored nor a duplicate.
+    deps.media = fakeMedia({
+      load: async () => mediaDoc(),
+      appendPreviews: async () => [],
+    });
+    await assert.rejects(
+      () => new Processor(deps).processTask(task({ previews: [variant()] })),
+      { code: 'RESIZE_WORKER_INCOMPLETE' },
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'failed',
+    });
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('a task variant with an unconfigured format records failed at 0 ms with its code', async () => {
+    const { deps, metrics } = measuredDeps();
+    const gif = variant({ format: 'gif' });
+    await assert.rejects(
+      () => new Processor(deps).processTask(task({ previews: [gif] })),
+      { code: 'RESIZE_WORKER_INCOMPLETE' },
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].value, 0);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'gif',
+      mode: 'task',
+      outcome: 'failed',
+      code: 'RESIZE_FORMAT_NOT_CONFIGURED',
+    });
+    assert.deepEqual(recorded[0].context, {
+      mediaId: 'm1',
+      identity: deps.catalog.identity(
+        { resizer: 'default', pipeline: 'default' },
+        gif,
+      ),
+      taskId: 't1',
+    });
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
   test('processTask records task mode with the task id in the context', async () => {
     const { deps, metrics } = measuredDeps();
     await new Processor(deps).processTask(
