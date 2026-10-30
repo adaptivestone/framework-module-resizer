@@ -1013,10 +1013,12 @@ it has no `release`, its `findActive` asks the backend of the name, and a check 
 `await carrierOf(resizer.tasks, 'default')` (main entry), which gives the backend of a name on any
 task queue. With one available backend, `resizer.tasks` is that backend's task queue, as before.
 
-- **A backend is built when one of its names is first needed:** a call on it, `verify()` for the
-  Resizer's own queue, or a worker that consumes it. A database Resizer beside an SQS entry it
-  never uses never loads the SQS driver. With several backends, a build that fails is forgotten
-  (the next need builds again) and affects only that backend's names.
+- **With several backends, a backend is built when one of its names is first needed:** a call on
+  it, `verify()` for the Resizer's own queue, or a worker that consumes it. A database Resizer
+  beside an SQS entry it never uses never loads the SQS driver. A build that fails is forgotten
+  (the next need builds again) and affects only that backend's names. With a single available
+  backend, it is built when the task queue part loads: on the Resizer's first call of any kind,
+  `ready()` or `verify()`.
 - **Each call is gated by its queue's backend:** on a database queue the task row is the gate; on
   an SQS queue the gate lock in the Resizer's lock store (see [Coordination](#coordination)).
   Retries, the dead-letter cooldown and the shutdown give-back use the same backend's gate.

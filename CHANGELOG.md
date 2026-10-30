@@ -285,11 +285,10 @@ later release that puts the image engine behind a port.
   `canServeOriginalPublicly` is removed from `ResizeStorage` and both shipped drivers; the module
   never calls `signedUrl`: to give an owner the private original, call
   `storage.signedUrl(original.storageRef, ttlSeconds)` yourself.
-- The module no longer merges host config over its defaults and drops the `deepmerge`
-  dependency. The framework's `resize.ts` + `resize.<NODE_ENV>.ts` merge is the only merge: the
-  host `src/config/resize.ts` spreads `defaultFrameworkResizeConfig` from
-  `@adaptivestone/framework-module-resize/framework.js`, and the final value must be complete.
-  It is validated when the Resizer first reads it (a plain config object: at construction), or by
+- The module drops the `deepmerge` dependency. From `0.3.0-rc.3` it merges the image settings
+  over the package defaults itself (see "Partial framework config files" and `createResizer` under
+  Features); `storage` and the other sections are read as the files hold them. The config is
+  validated when the Resizer first reads it (a plain config object: at construction), or by
   `resizer.verify()`.
 - Config keys moved. The old keys now fail validation with `RESIZE_CONFIG_REMOVED_KEY` instead of
   being ignored:
@@ -373,8 +372,9 @@ later release that puts the image engine behind a port.
   - `SqsTaskQueue` uses plain SQS calls (ReceiveMessage, ChangeMessageVisibility, DeleteMessage,
     SendMessage), so `sqs-consumer` is no longer a peer. Retries are the core's, a dead task goes
     to `deadLetterQueueUrl` (when set) and `onTaskDeadLettered` fires for SQS too. Its timing is
-    validated by the core when the Resizer starts, like every task queue's, not when the queue is
-    constructed. Its messages carry the gate lock's owner (`gateOwner`), which the worker uses to
+    checked by the core per queue name, like every task queue's, not when the queue is
+    constructed: on the first read or call on that name, by `verify()` for the Resizer's own
+    queue, and at worker start for each name the worker consumes. Its messages carry the gate lock's owner (`gateOwner`), which the worker uses to
     extend and release that lock.
   - Re-run `resize-scaffold` after deleting the old model and command shims.
 - `ResizeTask` gains `resizer`, `queue` and `availableAt` (when the task may next be claimed)
@@ -397,8 +397,10 @@ later release that puts the image engine behind a port.
   and the task fails with `RESIZE_NO_RESIZER`.
 - The worker serves a fixed list of Resizers: `runWorker({ resizers })`, by default every Resizer
   constructed in the process when it starts. The list is resolved once, at start: a Resizer
-  constructed later is not served. A listed Resizer that cannot start (its `ready()` or `verify()`
-  rejects) makes `runWorker` reject before it claims anything. Beside a task queue the worker
+  constructed later is not served. A listed Resizer that cannot start makes `runWorker` reject before it
+  claims anything: the worker runs the checks of `verify()` that need no queue name for every
+  listed Resizer, and the checks of each queue name it consumes on every Resizer that carries
+  that name (not `verify()` itself, so a Resizer's own queue is checked only when it is consumed). Beside a task queue the worker
   consumes that cannot filter claims, the list must include every Resizer of the process that uses
   that queue (otherwise the worker would claim their tasks without running them:
   `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`, also when an unlisted Resizer's task queue cannot be
@@ -544,10 +546,11 @@ later release that puts the image engine behind a port.
 - One task queue per backend in a framework app, and each queue name is a lane on it, with its own
   timing. Every `database` entry of `queues` is one backend (the app's `ResizeTask` model), and the
   SQS entries that share `region`, `endpoint`, `deadLetterQueueUrl` and the effective
-  `waitTimeSeconds` (default 10) are one backend: one `SqsTaskQueue` for all their names (set
-  `region` (and `endpoint`) on every SQS entry or on none — an omitted `region` and an explicit one
-  equal to `AWS_REGION` count as two backends). The worker runs one loop per task queue, one task at
-  a time, each task processed with its own Resizer. `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is
+  `waitTimeSeconds` (default 10) are one backend: one `SqsTaskQueue` for all their names. From
+  `0.3.0-rc.3` names on different backends route: each call goes to the backend of its queue name,
+  so one Resizer may use queues on several backends. The worker runs one loop (Consumer) per
+  backend and queue name it consumes, one task at a time, each task processed with its own
+  Resizer. `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is
   removed: each queue name is defined once, so two files can no longer disagree about its timing.
   Without the framework, each `mongoParts()` call makes its own queue, with one timing for every
   name: call it once and spread the same parts into every Resizer.

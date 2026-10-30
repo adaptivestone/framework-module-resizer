@@ -88,8 +88,9 @@ gets the full box its steps were written for. To hand the private original to it
    model), `locks` (`FrameworkLockStore`:
    the framework `Lock` model, built only beside a task queue without `gatesByTask` — the SQS
    driver, or a custom queue without the flag — or one that routes names to several backends; the
-   database queue keeps its gate in its task rows, so it needs no `Lock` model unless the Resizer's
-   own queue is on SQS; a database Resizer beside SQS queues still needs none) and the app logger:
+   database queue keeps its gate in its task rows, so a Resizer whose own queue is a database
+   queue needs no `Lock` model, even beside SQS queues: the model is checked only for a queue on
+   SQS that the Resizer queues to or a worker consumes) and the app logger:
 
    ```ts
    import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
@@ -121,7 +122,9 @@ gets the full box its steps were written for. To hand the private original to it
    from the main entry:
 
    ```ts
+   import mongoose from 'mongoose';
    import { createResizer } from '@adaptivestone/framework-module-resize';
+   // File is your media model; its schema spreads resizeMediaSchemaFragment (…/drivers/mongo.js).
 
    export const resizer = createResizer({
      formats: ['webp', 'avif'], // image settings, merged over the package defaults
