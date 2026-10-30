@@ -137,7 +137,8 @@ test('lock settings are validated only in the core', () => {
 // 'other'), so the list of codes must follow the sources: a new code joins it, and a code no
 // source raises any more leaves it. The second scan skips errorCodes.ts, which holds every entry.
 test('every error code a shipped file uses is in RESIZE_ERROR_CODES, and every entry is used', () => {
-  // Comments are stripped; limit: a `//` in a string not after `:` cuts the rest of its line.
+  // Comments are stripped first. Limits: a `//` in a string not after `:` cuts the rest of its
+  // line, and a `/*` in a string hides the code up to the next `*/`.
   const codesIn = (files: string[]): Set<string> => {
     const codes = new Set<string>();
     for (const f of files) {

@@ -1833,7 +1833,7 @@ describe('processTask — variants', () => {
 
   // Public previews are stored with an immutable cache header, which is safe only while every
   // preview gets a new random key: a re-rendered preview must never reuse an old URL.
-  test('a stored preview has a random key under previews/', async () => {
+  test('a stored preview has a random key under previews/, new on every render', async () => {
     installApp();
     const { storage } = makeStorage(redPng);
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
@@ -1843,12 +1843,17 @@ describe('processTask — variants', () => {
       locks: makeLocks().locks,
     });
 
+    // The store never records the rows, so the second task renders the same variant again.
+    await processTask(task({ previews: [variant()] }));
     await processTask(task({ previews: [variant()] }));
 
-    assert.match(
-      refKey(appendCalls[0].previews[0].storageRef),
-      /^previews\/[0-9a-f]{32}\.\w+$/,
+    assert.equal(appendCalls.length, 2);
+    const [first, second] = appendCalls.map((call) =>
+      refKey(call.previews[0].storageRef),
     );
+    assert.match(first, /^previews\/[0-9a-f]{32}\.\w+$/);
+    assert.match(second, /^previews\/[0-9a-f]{32}\.\w+$/);
+    assert.notEqual(first, second, 'each render gets a new key');
   });
 
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {
