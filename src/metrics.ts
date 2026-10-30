@@ -310,9 +310,19 @@ export class LogMetrics extends ResizeMetrics {
 
 /** A sink that records nothing (metrics turned off). */
 export class NoopMetrics extends ResizeMetrics {
-  count(): void {}
+  count(
+    _name?: string,
+    _value?: number,
+    _labels?: MetricLabels,
+    _context?: MetricContext,
+  ): void {}
 
-  timing(): void {}
+  timing(
+    _name?: string,
+    _ms?: number,
+    _labels?: MetricLabels,
+    _context?: MetricContext,
+  ): void {}
 }
 
 type SinkMethod = 'count' | 'timing' | 'flush';

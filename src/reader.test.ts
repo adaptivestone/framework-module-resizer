@@ -29,6 +29,7 @@ import {
   MemoryTaskQueue,
   PlainTaskQueue,
   recordingMetrics,
+  refKey,
 } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import {
@@ -70,7 +71,7 @@ function makeStorage(o: Partial<ResizeStorage> = {}): ResizeStorage {
   return {
     download: async () => Buffer.alloc(0),
     upload: async () => ({ key: 'k' }),
-    publicUrl: (ref: StorageRef) => `https://cdn/${ref.key}`,
+    publicUrl: (ref: StorageRef) => `https://cdn/${refKey(ref)}`,
     ...o,
   };
 }
@@ -592,10 +593,10 @@ describe('resolve — partitioning', () => {
     const r = new FrameworkResizer({
       storage: makeStorage({
         publicUrl: (ref: StorageRef) => {
-          if (ref.key === 'legacy-origin.jpg') {
+          if (refKey(ref) === 'legacy-origin.jpg') {
             throw new Error('original bucket is no longer allowlisted');
           }
-          return `https://cdn/${ref.key}`;
+          return `https://cdn/${refKey(ref)}`;
         },
       }),
       tasks,
@@ -1286,11 +1287,11 @@ describe('resolve — the original is never served', () => {
       storage: makeStorage({
         publicUrl: (ref: StorageRef) => {
           linked.push(ref);
-          return `https://cdn/${ref.key}`;
+          return `https://cdn/${refKey(ref)}`;
         },
         signedUrl: async (ref: StorageRef) => {
           signed.push(ref);
-          return `https://signed/${ref.key}`;
+          return `https://signed/${refKey(ref)}`;
         },
       }),
     });
@@ -1349,10 +1350,10 @@ describe('resolve — never throws', () => {
   const throwingStorage = () =>
     makeStorage({
       publicUrl: (ref: StorageRef) => {
-        if (ref.key === 'p2') {
+        if (refKey(ref) === 'p2') {
           throw new Error('bucket is not allowlisted');
         }
-        return `https://cdn/${ref.key}`;
+        return `https://cdn/${refKey(ref)}`;
       },
     });
   const storedPreview = (key: string, sizeKey: string) => ({

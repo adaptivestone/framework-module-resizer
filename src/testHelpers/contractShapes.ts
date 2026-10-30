@@ -6,6 +6,7 @@ import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
+import { NoopMetrics } from '../metrics.ts';
 
 export const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -111,3 +112,9 @@ export const decoder: SourceDecoder = {
     info: { width: 1, height: 1, channels: 3 },
   }),
 };
+
+// The sink that records nothing declares its parameters optional, so the zero-argument calls
+// written before it declared them still type-check.
+export const noopMetrics = new NoopMetrics();
+noopMetrics.count();
+noopMetrics.timing();

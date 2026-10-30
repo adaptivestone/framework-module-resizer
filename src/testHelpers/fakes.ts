@@ -41,6 +41,14 @@ import type {
   StorageRef,
 } from '../types.d.ts';
 
+/**
+ * The `key` of a storage ref built by a fake storage, as text. Refs are opaque (`unknown`) to the
+ * core; a ref without a `key` gives 'undefined', as the untyped `ref.key` in a template did.
+ */
+export function refKey(ref: StorageRef): string {
+  return String((ref as { key?: unknown } | null | undefined)?.key);
+}
+
 /** A logger that drops every message. */
 export const silentLogger: ResizeLogger = {
   info() {},

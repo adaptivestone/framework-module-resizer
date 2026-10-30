@@ -20,7 +20,11 @@ import {
 } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
-import { MemoryTaskQueue, recordingMetrics } from './testHelpers/fakes.ts';
+import {
+  MemoryTaskQueue,
+  recordingMetrics,
+  refKey,
+} from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -101,7 +105,7 @@ function recordingStorage() {
       uploads.push({ ...args, body: Buffer.from(args.body) });
       return { key: args.key, bucket: 'originals' };
     },
-    publicUrl: (ref) => `/media/${ref.key}`,
+    publicUrl: (ref) => `/media/${refKey(ref)}`,
   };
   return { storage, uploads };
 }

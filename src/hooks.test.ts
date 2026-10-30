@@ -35,10 +35,12 @@ describe('taps', () => {
   test('taps seeded as a function or an array run in order, and add() appends', async () => {
     const { logger } = recorder();
     const calls: string[] = [];
-    const tap = (label: string) => (value: unknown) => {
-      calls.push(label);
-      return value;
-    };
+    const tap =
+      (label: string) =>
+      <T>(value: T): T => {
+        calls.push(label);
+        return value;
+      };
     const seeded = [tap('a'), tap('b')];
     const bus = new HookBus({
       logger,
@@ -80,7 +82,9 @@ describe('runWaterfall', () => {
   test('threads the value through taps in registration order', async () => {
     const { logger, events } = recorder();
     const bus = new HookBus({ logger, events });
+    // @ts-expect-error the bus is generic at runtime; this test threads plain numbers
     bus.add('resolveSizes', (v: number) => v + 1);
+    // @ts-expect-error the bus is generic at runtime; this test threads plain numbers
     bus.add('resolveSizes', async (v: number) => v * 2);
     const out = await bus.runWaterfall('resolveSizes', 1, {});
     assert.equal(out, 4); // (1 + 1) * 2
@@ -91,7 +95,7 @@ describe('runWaterfall', () => {
     const bus = new HookBus({ logger, events });
     const ctx = { entity: 'event' };
     let seen: unknown;
-    bus.add('beforeEnqueue', (v: unknown, c: unknown) => {
+    bus.add('beforeEnqueue', <T>(v: T, c: unknown): T => {
       seen = c;
       return v;
     });
@@ -102,10 +106,12 @@ describe('runWaterfall', () => {
   test('a throwing tap is logged and skipped (prior value kept); later taps still run', async () => {
     const { errors, logger, events } = recorder();
     const bus = new HookBus({ logger, events });
+    // @ts-expect-error the bus is generic at runtime; this test threads plain numbers
     bus.add('resolveSizes', (v: number) => v + 1);
     bus.add('resolveSizes', () => {
       throw new Error('boom');
     });
+    // @ts-expect-error the bus is generic at runtime; this test threads plain numbers
     bus.add('resolveSizes', (v: number) => v + 10);
     const out = await bus.runWaterfall('resolveSizes', 0, {});
     assert.equal(out, 11); // 0+1 → (throw → keep 1) → 1+10
