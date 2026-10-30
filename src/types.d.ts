@@ -130,11 +130,21 @@ export interface ReadyEntry {
   url: string;
   preview: Preview; // the stored preview this entry serves
   contentType: string; // preview.contentType
+  /**
+   * Set only when the stored preview is stale: made from another original, or with other image
+   * settings or pipeline version. It is still served, and its replacement is queued.
+   */
+  stale?: true;
 }
 
 export interface ReadDecision {
   ready: ReadyEntry[];
   missing: MissingPreview[];
+  /**
+   * The variants queued to replace a stale stored preview (after `beforeEnqueue`), apart from
+   * `missing`. Set only when there is one, so a fresh decision has no `stale` key.
+   */
+  stale?: MissingPreview[];
 }
 
 export type PrewarmStatus =

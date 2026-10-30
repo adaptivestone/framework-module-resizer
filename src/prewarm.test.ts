@@ -17,6 +17,7 @@ import {
   memoryLocks,
   PlainTaskQueue,
 } from './testHelpers/fakes.ts';
+import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
   MediaLike,
@@ -314,20 +315,24 @@ describe('prewarm — queue', () => {
     });
     const locks = clockLocks();
     const r = makeResizer({ tasks, lockStore: locks });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' } },
-      previews: [
-        {
-          storageRef: { key: 'p' },
-          sizeKey: '100x100',
-          format: 'jpeg',
-          contentType: 'image/jpeg',
-          resizer: 'default',
-          pipeline: 'default',
-        },
-      ],
-    };
+    await r.ready();
+    const media: MediaLike = stampFresh(
+      {
+        id: 'm1',
+        original: { storageRef: { key: 'orig.jpg' }, width: 64, height: 48 },
+        previews: [
+          {
+            storageRef: { key: 'p' },
+            sizeKey: '100x100',
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+            resizer: 'default',
+            pipeline: 'default',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     const result = await r.prewarm({
       media,
       sizes: [
@@ -377,18 +382,27 @@ describe('prewarm — skip existing & dedup', () => {
       tasks,
       lockStore,
     });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
-      previews: [
-        {
-          storageRef: { key: 'p1' },
+    await r.ready();
+    const media: MediaLike = stampFresh(
+      {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'orig.jpg' },
           contentType: 'image/jpeg',
-          sizeKey: '300x300',
-          format: 'jpeg',
+          width: 64,
+          height: 48,
         },
-      ],
-    };
+        previews: [
+          {
+            storageRef: { key: 'p1' },
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     const { accepted } = await r.prewarm({
       media,
       sizes: [{ width: 300, height: 300 }],
@@ -399,6 +413,47 @@ describe('prewarm — skip existing & dedup', () => {
       calls[0].previews.map((p) => `${p.sizeKey}:${p.format}`),
       ['300x300:webp'],
     );
+  });
+
+  test('a stale row is not ready: it is required and accepted', async () => {
+    installFakeApp();
+    const { tasks, calls } = makeTaskQueue();
+    const r = makeResizer({ tasks, lockStore: makeLocks(true).lockStore });
+    const variant = {
+      sizeKey: '300x300',
+      requestedWidth: 300,
+      requestedHeight: 300,
+      format: 'jpeg',
+    };
+    // Made with other encoder settings than the Resizer's.
+    const media = stampFresh(
+      {
+        id: 'm1',
+        original: { storageRef: { key: 'orig.jpg' }, width: 64, height: 48 },
+        previews: [
+          {
+            storageRef: { key: 'p1' },
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+          },
+        ],
+      },
+      {
+        config: makeImageConfig({
+          encode: { formats: { jpeg: { quality: 10 } } },
+        }),
+      },
+    );
+    const result = await r.prewarm({
+      media,
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.deepEqual(result.ready, []);
+    assert.deepEqual(result.accepted, [variant]);
+    assert.deepEqual(calls[0].previews, [variant]);
   });
 
   test('duplicate sizes within the request are deduped to one identity', async () => {
@@ -781,18 +836,22 @@ describe('prewarm — pipelines are part of identity', () => {
       lockStore,
       pipelines: { watermark: {} },
     });
-    const media = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' } },
-      previews: [
-        {
-          storageRef: { key: 'p.webp' },
-          sizeKey: '300x300',
-          format: 'webp',
-          contentType: 'image/webp',
-        },
-      ],
-    };
+    await r.ready();
+    const media = stampFresh(
+      {
+        id: 'm1',
+        original: { storageRef: { key: 'orig.jpg' }, width: 64, height: 48 },
+        previews: [
+          {
+            storageRef: { key: 'p.webp' },
+            sizeKey: '300x300',
+            format: 'webp',
+            contentType: 'image/webp',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     const sizes = [{ width: 300, height: 300 }];
     assert.equal(
       (await r.prewarm({ media, sizes, formats: ['webp'] })).accepted.length,

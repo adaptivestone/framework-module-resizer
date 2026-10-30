@@ -710,8 +710,17 @@ describe('a task queue the Resizer cannot use', () => {
       ...parts,
     });
     await r.ready();
+    // This test's media: the original's size, and its stored preview signed as the worker signs it.
+    const seeded = () =>
+      stampFresh(
+        {
+          ...media(),
+          original: { storageRef: { key: 'o' }, width: 40, height: 30 },
+        },
+        { config: r.config },
+      );
     for (let read = 0; read < 2; read += 1) {
-      const { decision } = await r.resolve({ media: media(), sizes });
+      const { decision } = await r.resolve({ media: seeded(), sizes });
       assert.deepEqual(
         decision.ready.map((entry) => entry.url),
         ['https://cdn/p10'],
@@ -725,7 +734,7 @@ describe('a task queue the Resizer cannot use', () => {
     const original = await r.uploadOriginal({ body, visibility: 'private' });
     assert.equal(original.format, 'png');
     const { created } = await r.generate({
-      media: media(),
+      media: seeded(),
       sizes,
       persist: false,
     });
@@ -733,7 +742,7 @@ describe('a task queue the Resizer cannot use', () => {
       created.map((preview) => preview.sizeKey),
       ['20x20'],
     );
-    const result = await r.prewarm({ media: media(), sizes });
+    const result = await r.prewarm({ media: seeded(), sizes });
     assert.equal(result.status, 'incomplete');
     assert.deepEqual(
       result.requested.map((variant) => variant.sizeKey),
@@ -820,9 +829,18 @@ describe('a task queue the Resizer cannot use', () => {
     await r.ready();
     // Building the Dispatcher reads no timing, so the first value is never read.
     assert.equal(errors.length, 0);
+    // This test's media: the original's size, and its stored preview signed as the worker signs it.
+    const seeded = () =>
+      stampFresh(
+        {
+          ...media(),
+          original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+        },
+        { config: r.config },
+      );
     timing = { maxAttempts: 0 };
-    await r.resolve({ media: media(), sizes });
-    await r.resolve({ media: media(), sizes });
+    await r.resolve({ media: seeded(), sizes });
+    await r.resolve({ media: seeded(), sizes });
     assert.equal(errors.length, 1, 'logged once per queue name');
     assert.match(
       String(errors[0][0]),
@@ -832,7 +850,7 @@ describe('a task queue the Resizer cannot use', () => {
     assert.match((errors[0][1] as Error).message, /maxAttempts/);
     assert.deepEqual(tasks.added, []);
     timing = {};
-    const { decision } = await r.resolve({ media: media(), sizes });
+    const { decision } = await r.resolve({ media: seeded(), sizes });
     assert.deepEqual(
       decision.missing.map((variant) => variant.sizeKey),
       ['20x20'],

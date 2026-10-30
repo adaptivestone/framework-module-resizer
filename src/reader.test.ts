@@ -154,6 +154,18 @@ describe('Reader', () => {
   };
 
   test('a Reader serves stored previews and queues the missing ones, with no Resizer and no media store', async () => {
+    const media = stampFresh({
+      id: 'm1',
+      original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+      previews: [
+        {
+          storageRef: { key: 'p' },
+          sizeKey: '10x10',
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+      ],
+    });
     const tasks = new MemoryTaskQueue();
     const reader = new Reader(
       readerDeps(
@@ -199,6 +211,18 @@ describe('Reader', () => {
   });
 
   test('resolve on such a queue logs once per queue name and returns its decision', async () => {
+    const media = stampFresh({
+      id: 'm1',
+      original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+      previews: [
+        {
+          storageRef: { key: 'p' },
+          sizeKey: '10x10',
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+      ],
+    });
     // A task queue that serves only 'default'.
     const tasks = new MemoryTaskQueue({ queues: ['default'] });
     const warnings: unknown[][] = [];
@@ -254,6 +278,18 @@ describe('Reader', () => {
   });
 
   test('a Reader whose task queue cannot be used serves stored previews, queues nothing, logs nothing and prewarm reports the failure', async () => {
+    const media = stampFresh({
+      id: 'm1',
+      original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+      previews: [
+        {
+          storageRef: { key: 'p' },
+          sizeKey: '10x10',
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+      ],
+    });
     const logged: unknown[][] = [];
     const deps = readerDeps(undefined);
     deps.logger = {
@@ -419,19 +455,23 @@ describe('resolve — partitioning', () => {
         },
       }),
     });
+    await r.ready();
     const { decision } = await r.resolve({
-      media: {
-        id: 'scalar',
-        original: { storageRef: 0 },
-        previews: [
-          {
-            storageRef: false,
-            contentType: 'image/jpeg',
-            sizeKey: '20x20',
-            format: 'jpeg',
-          },
-        ],
-      },
+      media: stampFresh(
+        {
+          id: 'scalar',
+          original: { storageRef: 0, width: 64, height: 48 },
+          previews: [
+            {
+              storageRef: false,
+              contentType: 'image/jpeg',
+              sizeKey: '20x20',
+              format: 'jpeg',
+            },
+          ],
+        },
+        { config: r.config },
+      ),
       sizes: [{ width: 20, height: 20 }],
       formats: ['jpeg'],
     });
@@ -441,18 +481,27 @@ describe('resolve — partitioning', () => {
   test('partitions existing previews to ready and absent ones to missing', async () => {
     installFakeApp();
     const r = new FrameworkResizer({ storage: makeStorage() });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
-      previews: [
-        {
-          storageRef: { key: 'p1' },
+    await r.ready();
+    const media: MediaLike = stampFresh(
+      {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'orig.jpg' },
           contentType: 'image/jpeg',
-          sizeKey: '300x300',
-          format: 'jpeg',
+          width: 64,
+          height: 48,
         },
-      ],
-    };
+        previews: [
+          {
+            storageRef: { key: 'p1' },
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     const { decision } = await r.resolve({
       media,
       sizes: [{ width: 300, height: 300 }],
@@ -543,24 +592,28 @@ describe('resolve — partitioning', () => {
       media: fakeMedia(),
       locks,
     });
+    await r.ready();
     const { decision } = await r.resolve({
-      media: {
-        id: 'm1',
-        original: {
-          storageRef: { key: 'legacy-origin.jpg' },
-          bucket: 'retired-bucket',
-          width: 50,
-          height: 50,
-        },
-        previews: [
-          {
-            storageRef: { key: 'public-preview.jpg' },
-            contentType: 'image/jpeg',
-            sizeKey: '300x300',
-            format: 'jpeg',
+      media: stampFresh(
+        {
+          id: 'm1',
+          original: {
+            storageRef: { key: 'legacy-origin.jpg' },
+            bucket: 'retired-bucket',
+            width: 50,
+            height: 50,
           },
-        ],
-      },
+          previews: [
+            {
+              storageRef: { key: 'public-preview.jpg' },
+              contentType: 'image/jpeg',
+              sizeKey: '300x300',
+              format: 'jpeg',
+            },
+          ],
+        },
+        { config: r.config },
+      ),
       sizes: [
         { width: 300, height: 300 },
         { width: 100, height: 100 },
@@ -585,18 +638,27 @@ describe('resolve — partitioning', () => {
   test('a filtered variant is distinct from the unfiltered same size', async () => {
     installFakeApp();
     const r = new FrameworkResizer({ storage: makeStorage() });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
-      previews: [
-        {
-          storageRef: { key: 'p1' },
+    await r.ready();
+    const media: MediaLike = stampFresh(
+      {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'orig.jpg' },
           contentType: 'image/jpeg',
-          sizeKey: '300x300',
-          format: 'jpeg',
+          width: 64,
+          height: 48,
         },
-      ],
-    };
+        previews: [
+          {
+            storageRef: { key: 'p1' },
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     const { decision } = await r.resolve({
       media,
       sizes: [
@@ -749,19 +811,28 @@ describe('resolve — enqueue wiring', () => {
       locks,
       pipelines: { photo: {} },
     });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
-      previews: [
-        {
-          storageRef: { key: 'p1' },
+    await r.ready();
+    const media: MediaLike = stampFresh(
+      {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'orig.jpg' },
           contentType: 'image/jpeg',
-          sizeKey: '300x300',
-          format: 'jpeg',
-          pipeline: 'photo', // previews are scoped by pipeline
+          width: 64,
+          height: 48,
         },
-      ],
-    };
+        previews: [
+          {
+            storageRef: { key: 'p1' },
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+            pipeline: 'photo', // previews are scoped by pipeline
+          },
+        ],
+      },
+      { config: r.config },
+    );
     await r.resolve({
       media,
       sizes: [{ width: 300, height: 300 }],
@@ -823,18 +894,27 @@ describe('resolve — enqueue wiring', () => {
       media: fakeMedia(),
       locks,
     });
-    const media: MediaLike = {
-      id: 'm1',
-      original: { storageRef: { key: 'orig.jpg' }, contentType: 'image/jpeg' },
-      previews: [
-        {
-          storageRef: { key: 'p1' },
+    await r.ready();
+    const media: MediaLike = stampFresh(
+      {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'orig.jpg' },
           contentType: 'image/jpeg',
-          sizeKey: '300x300',
-          format: 'jpeg',
+          width: 64,
+          height: 48,
         },
-      ],
-    };
+        previews: [
+          {
+            storageRef: { key: 'p1' },
+            contentType: 'image/jpeg',
+            sizeKey: '300x300',
+            format: 'jpeg',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     await r.resolve({
       media,
       sizes: [{ width: 300, height: 300 }],
@@ -1100,19 +1180,28 @@ describe('resolve — SVG raster previews', () => {
   test('stored raster preview is returned for an SVG original', async () => {
     installFakeApp();
     const r = new FrameworkResizer({ storage: makeStorage() });
+    await r.ready();
     const { decision } = await r.resolve({
-      media: {
-        id: 'm1',
-        original: { storageRef: { key: 'logo' }, format: 'svg' },
-        previews: [
-          {
-            storageRef: { key: 'logo.webp' },
-            sizeKey: '300x300',
-            format: 'webp',
-            contentType: 'image/webp',
+      media: stampFresh(
+        {
+          id: 'm1',
+          original: {
+            storageRef: { key: 'logo' },
+            format: 'svg',
+            width: 64,
+            height: 48,
           },
-        ],
-      },
+          previews: [
+            {
+              storageRef: { key: 'logo.webp' },
+              sizeKey: '300x300',
+              format: 'webp',
+              contentType: 'image/webp',
+            },
+          ],
+        },
+        { config: r.config },
+      ),
       sizes: [{ width: 300, height: 300 }],
       formats: ['webp'],
       enqueueMissing: false,
@@ -1292,8 +1381,9 @@ describe('resolve — never throws', () => {
           decision.ready.map((entry) => entry.url),
       },
     });
+    await r.ready();
     const { decision, output } = await r.resolve({
-      media: threeStored(),
+      media: stampFresh(threeStored(), { config: r.config }),
       sizes,
       formats: ['jpeg'],
       enqueueMissing: true,
@@ -1319,8 +1409,9 @@ describe('resolve — never throws', () => {
   test('a publicUrl throw without enqueueing still returns every other cell', async () => {
     const { errors } = installFakeApp();
     const r = new FrameworkResizer({ storage: throwingStorage() });
+    await r.ready();
     const { decision } = await r.resolve({
-      media: threeStored(),
+      media: stampFresh(threeStored(), { config: r.config }),
       sizes,
       formats: ['jpeg'],
       enqueueMissing: false,
@@ -1614,7 +1705,15 @@ describe('pipelines are part of preview identity', () => {
       storage: makeStorage(),
       pipelines: { watermark: {} },
     });
-    const media = { id: 'm1', previews: [stored] };
+    await r.ready();
+    const media = stampFresh(
+      {
+        id: 'm1',
+        original: { storageRef: { k: 'o' }, width: 64, height: 48 },
+        previews: [{ ...stored }],
+      },
+      { config: r.config },
+    );
     const clean = await r.resolve({ media, sizes, formats: ['webp'] });
     const watermarked = await r.resolve({
       media,
@@ -1633,10 +1732,15 @@ describe('pipelines are part of preview identity', () => {
       storage: makeStorage(),
       pipelines: { watermark: {} },
     });
-    const media = {
-      id: 'm1',
-      previews: [{ ...stored, pipeline: 'watermark' }],
-    };
+    await r.ready();
+    const media = stampFresh(
+      {
+        id: 'm1',
+        original: { storageRef: { k: 'o' }, width: 64, height: 48 },
+        previews: [{ ...stored, pipeline: 'watermark' }],
+      },
+      { config: r.config },
+    );
     const watermarked = await r.resolve({
       media,
       sizes,
@@ -1662,7 +1766,7 @@ describe('pipelines are part of preview identity', () => {
 });
 
 describe('rows written before previews recorded their metadata', () => {
-  test('rows without bytes, createdAt, origin or encodeSig are served, and nothing is queued', async () => {
+  test('rows without bytes, createdAt, origin or encodeSig are served marked stale, and queued once', async () => {
     const tasks = new MemoryTaskQueue();
     const reader = new Reader(
       readerDeps(
@@ -1705,13 +1809,30 @@ describe('rows written before previews recorded their metadata', () => {
     };
     const sizes = [{ width: 10, height: 10 }, { fit: true }];
     const { decision } = await reader.resolve({ media, sizes });
+    // Neither row recorded its signatures, so neither is proven fresh: both serve and get replaced.
+    const variants = [
+      {
+        sizeKey: '10x10',
+        requestedWidth: 10,
+        requestedHeight: 10,
+        format: 'webp',
+      },
+      { sizeKey: 'fit', format: 'webp', fit: true },
+    ];
     assert.deepEqual(
-      decision.ready.map((e) => e.url),
-      ['https://cdn/cover', 'https://cdn/fit'],
+      decision.ready.map((e) => [e.url, e.stale]),
+      [
+        ['https://cdn/cover', true],
+        ['https://cdn/fit', true],
+      ],
     );
     assert.deepEqual(decision.missing, []);
-    assert.equal((await reader.prewarm({ media, sizes })).status, 'ready');
-    assert.deepEqual(tasks.added, []);
+    assert.deepEqual(decision.stale, variants);
+    const prewarmed = await reader.prewarm({ media, sizes });
+    assert.equal(prewarmed.status, 'accepted');
+    assert.deepEqual(prewarmed.ready, []);
+    assert.deepEqual(prewarmed.accepted, variants);
+    assert.equal(tasks.rows.length, 1);
   });
 });
 
@@ -2062,5 +2183,212 @@ describe('read metrics', () => {
     } finally {
       process.off('unhandledRejection', onRejection);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Freshness on the read path: a stale row is served, marked, and its replacement queued.
+// ---------------------------------------------------------------------------
+
+describe('freshness on the read path', () => {
+  // The Reader's image config (readerDeps' own), and another one the stale rows were made with.
+  const config = makeImageConfig({ formats: ['webp'] });
+  const otherConfig = makeImageConfig({
+    formats: ['webp'],
+    encode: { formats: { webp: { quality: 50 } } },
+  });
+  const variant = {
+    sizeKey: '10x10',
+    requestedWidth: 10,
+    requestedHeight: 10,
+    format: 'webp',
+  };
+  const added = {
+    sizeKey: '20x20',
+    requestedWidth: 20,
+    requestedHeight: 20,
+    format: 'webp',
+  };
+  const sizes = [{ width: 10, height: 10 }];
+
+  // One stored 10x10 webp row of the default Resizer and `pipeline`, not yet signed.
+  function seeded(pipeline = 'default'): MediaLike {
+    return {
+      id: 'm1',
+      original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+      previews: [
+        {
+          storageRef: { key: 'p1' },
+          resizer: 'default',
+          pipeline,
+          sizeKey: '10x10',
+          format: 'webp',
+          contentType: 'image/webp',
+        },
+      ],
+    };
+  }
+
+  function freshReader(
+    opts: {
+      storage?: ResizeStorage;
+      hooks?: HookBus;
+      logger?: ResizeLogger;
+    } = {},
+  ) {
+    const tasks = new MemoryTaskQueue();
+    const sink = recordingMetrics();
+    const deps = readerDeps(
+      new Dispatcher({
+        tasks,
+        locks: undefined, // a task queue that gates by task needs none
+        coordination: defaultCoordination,
+        timingOf: (queue) => timingOf(tasks, queue),
+        name: 'default',
+        logger: silent,
+      }),
+    );
+    const reader = new Reader({
+      ...deps,
+      metrics: sink,
+      storage: opts.storage ?? deps.storage,
+      hooks: opts.hooks ?? deps.hooks,
+      logger: opts.logger ?? deps.logger,
+    });
+    const named = (name: string) =>
+      sink.calls.filter((call) => call.name === name);
+    return { reader, tasks, named };
+  }
+
+  test('a stale row is served, marked stale, and queued', async () => {
+    const { reader, tasks, named } = freshReader();
+    const media = stampFresh(seeded(), { config: otherConfig });
+    const { decision } = await reader.resolve({ media, sizes });
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].url, 'https://cdn/p1');
+    assert.equal(decision.ready[0].stale, true);
+    assert.deepEqual(decision.stale, [variant]);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(tasks.added[0].previews, [variant]);
+    const stale = named('resize.preview.stale');
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].kind, 'count');
+    assert.equal(stale[0].value, 1);
+    assert.deepEqual(stale[0].labels, { pipeline: 'default' });
+    assert.deepEqual(stale[0].context, { mediaId: 'm1' });
+    const reads = named('resize.read');
+    assert.equal(reads[0].labels.outcome, 'enqueued');
+    assert.equal(reads[0].context.stale, 1);
+  });
+
+  test('a fresh decision has no stale key', async () => {
+    const { reader, tasks, named } = freshReader();
+    const media = stampFresh(seeded(), { config });
+    const { decision } = await reader.resolve({ media, sizes });
+    assert.equal(decision.ready.length, 1);
+    assert.equal(Object.hasOwn(decision, 'stale'), false);
+    assert.equal(Object.hasOwn(decision.ready[0], 'stale'), false);
+    assert.equal(tasks.rows.length, 0);
+    assert.deepEqual(named('resize.preview.stale'), []);
+    assert.equal(named('resize.read')[0].labels.outcome, 'ready');
+    assert.equal(named('resize.read')[0].context.stale, 0);
+  });
+
+  test('stale and missing variants are queued as one task; the next read is in-flight', async () => {
+    const { reader, tasks, named } = freshReader();
+    const media = stampFresh(seeded(), { config: otherConfig });
+    const both = [...sizes, { width: 20, height: 20 }];
+    const first = await reader.resolve({ media, sizes: both });
+    assert.deepEqual(first.decision.stale, [variant]);
+    assert.deepEqual(first.decision.missing, [added]);
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(tasks.rows[0].task.previews, [variant, added]);
+    const second = await reader.resolve({ media, sizes: both });
+    assert.equal(second.decision.ready[0].stale, true);
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(
+      named('resize.read').map((call) => call.labels.outcome),
+      ['enqueued', 'in-flight'],
+    );
+  });
+
+  test('a beforeEnqueue tap that drops a stale variant keeps it served and queues nothing', async () => {
+    const hooks = new HookBus({
+      logger: silent,
+      taps: { beforeEnqueue: () => [] },
+    });
+    const { reader, tasks, named } = freshReader({ hooks });
+    const media = stampFresh(seeded(), { config: otherConfig });
+    const { decision } = await reader.resolve({ media, sizes });
+    assert.equal(Object.hasOwn(decision, 'stale'), false);
+    assert.equal(decision.ready[0].stale, true);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(tasks.rows.length, 0);
+    assert.equal(named('resize.read')[0].labels.outcome, 'suppressed');
+  });
+
+  test('a stale cell whose publicUrl throws is not served but is queued', async () => {
+    const errors: unknown[][] = [];
+    const { reader, tasks } = freshReader({
+      logger: {
+        info() {},
+        warn() {},
+        error: (...a: unknown[]) => {
+          errors.push(a);
+        },
+      },
+      storage: {
+        download: async () => Buffer.alloc(0),
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => {
+          throw new Error('bucket not allowlisted');
+        },
+      },
+    });
+    const media = stampFresh(seeded(), { config: otherConfig });
+    const { decision } = await reader.resolve({ media, sizes });
+    assert.deepEqual(decision.ready, []);
+    assert.deepEqual(decision.stale, [variant]);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(tasks.rows.length, 1);
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0][0]), /publicUrl failed/);
+  });
+
+  test('an unregistered pipeline serves its stored rows unmarked and queues nothing', async () => {
+    const { reader, tasks, named } = freshReader();
+    const media = stampFresh(seeded('retired'), { config: otherConfig });
+    const { decision } = await reader.resolve({
+      media,
+      sizes,
+      pipeline: 'retired',
+    });
+    assert.equal(decision.ready.length, 1);
+    assert.equal(Object.hasOwn(decision.ready[0], 'stale'), false);
+    assert.equal(Object.hasOwn(decision, 'stale'), false);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(tasks.rows.length, 0);
+    assert.deepEqual(named('resize.preview.stale'), []);
+    assert.equal(named('resize.read')[0].labels.outcome, 'unknown-pipeline');
+  });
+
+  test('a media without stored dimensions: its rows are served stale and queued once', async () => {
+    const { reader, tasks, named } = freshReader();
+    // Signed as the worker signs them, then the stored dimensions are gone: no row is proven fresh.
+    const media = stampFresh(seeded(), { config });
+    const original = media.original as { width?: number; height?: number };
+    delete original.width;
+    delete original.height;
+    for (let i = 0; i < 2; i++) {
+      const { decision } = await reader.resolve({ media, sizes });
+      assert.equal(decision.ready[0].stale, true);
+      assert.deepEqual(decision.stale, [variant]);
+    }
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(
+      named('resize.read').map((call) => call.labels.outcome),
+      ['enqueued', 'in-flight'],
+    );
   });
 });
