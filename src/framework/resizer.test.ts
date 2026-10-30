@@ -16,6 +16,7 @@ import { S3Storage } from '../drivers/s3.ts';
 import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
 import { sqsBackendKey } from '../helpers/queueSections.ts';
+import { LogMetrics, NoopMetrics } from '../metrics.ts';
 import {
   processorOf,
   resetResizerForTests,
@@ -127,6 +128,23 @@ test('fills config, logger, events and the media store from the app; an eager-on
   };
   await processorOf(r).notify('completed', done);
   assert.deepEqual(emitted, [['resize:afterTaskComplete', done, {}]]);
+});
+
+test('the default metrics of a FrameworkResizer write debug lines through the app logger', () => {
+  const { logger } = installApp();
+  const debug: unknown[] = [];
+  logger.debug = (msg: unknown) => {
+    debug.push(msg);
+  };
+  const r = new FrameworkResizer({ storage });
+  assert.ok(r.metrics instanceof LogMetrics);
+  r.metrics.count('x', 1);
+  assert.equal(debug.length, 1);
+  assert.ok(String(debug[0]).startsWith('resize metric x 1'), String(debug[0]));
+  // The host's sink wins.
+  resetResizerForTests();
+  const sink = new NoopMetrics();
+  assert.equal(new FrameworkResizer({ storage, metrics: sink }).metrics, sink);
 });
 
 test('storage comes from the config file: local', async () => {

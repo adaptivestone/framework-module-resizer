@@ -12,6 +12,7 @@ import type { SourceDecoder } from './contracts/decoder.ts';
 import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
+import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { TaskQueue } from './contracts/taskQueue.ts';
@@ -25,6 +26,7 @@ import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
+import { boundMetrics, isMetrics, LogMetrics } from './metrics.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { Processor, requireReplacePreviews } from './processor.ts';
 import { prewarmFailure, Reader } from './reader.ts';
@@ -65,6 +67,9 @@ export interface ResizerOptions {
   // is called and validated on first use (the framework adapter reads its config file lazily).
   config?: ResizeConfig | (() => ResizeConfig);
   logger?: ResizeLogger; // default: console
+  // Where reads, uploads, variants and task outcomes are reported; default: new LogMetrics(logger),
+  // one summary line per window and one line per task outcome. new NoopMetrics() turns it off.
+  metrics?: ResizeMetrics;
   events?: ResizeEventBus; // optional bus that also receives observers as `resize:<hook>`
   storage: ResizeStorage | LazyPart<ResizeStorage>; // REQUIRED: files (originals, previews)
   media: MediaStore | LazyPart<MediaStore>; // REQUIRED: media documents and their previews
@@ -94,8 +99,10 @@ export interface ResizerOptions {
 const registry = new Registry<Resizer>();
 
 // Set by the Resizer class, which alone can read its private services and parts (see
-// processorOf(), tasksPartOf(), taskCoordinationOf(), verifyServicesOf() and verifyRouteOf()).
+// processorOf(), tasksPartOf(), taskCoordinationOf(), verifyServicesOf(), verifyRouteOf() and
+// metricsOf()).
 let readProcessor: (resizer: Resizer) => Processor;
+let readBoundMetrics: (resizer: Resizer) => ReturnType<typeof boundMetrics>;
 let loadTasksPart: (resizer: Resizer) => Promise<TaskQueue | undefined>;
 let readTaskCoordination: (resizer: Resizer) => TaskCoordination;
 let runVerifyServices: (
@@ -190,6 +197,10 @@ export class Resizer {
   readonly #config: () => ResizeConfig;
   #resolvedConfig: ResizeConfig | undefined;
   readonly logger: ResizeLogger;
+  // The host's metrics sink (or the default LogMetrics), and the guarded view of it that labels
+  // every call with this Resizer and never throws.
+  readonly #metrics: ResizeMetrics;
+  readonly #boundMetrics: ReturnType<typeof boundMetrics>;
   // The drivers. A part given as a function stays unset until ready() has loaded it.
   readonly #sources: Pick<ResizerOptions, PartName>;
   #storage: ResizeStorage | undefined;
@@ -215,10 +226,11 @@ export class Resizer {
   #readerStale = false;
 
   static {
-    // processorOf(), tasksPartOf(), taskCoordinationOf(), verifyServicesOf() and verifyRouteOf()
-    // (below) read through these; the services stay private.
+    // processorOf(), tasksPartOf(), taskCoordinationOf(), verifyServicesOf(), verifyRouteOf() and
+    // metricsOf() (below) read through these; the services stay private.
     readProcessor = (resizer) =>
       resizer.#builtServices?.processor ?? resizer.#notReady('processor');
+    readBoundMetrics = (resizer) => resizer.#boundMetrics;
     loadTasksPart = async (resizer) => {
       await resizer.#loadTasks();
       return resizer.#tasks;
@@ -272,6 +284,13 @@ export class Resizer {
     if (!opts.media) {
       throw mediaRequired();
     }
+    // Checked by shape, not class: a sink from a duplicate package copy or a plain object works.
+    if (opts.metrics !== undefined && !isMetrics(opts.metrics)) {
+      throw new ResizeSetupError(
+        'resize: `metrics` must have count() and timing() functions — e.g. new LogMetrics(logger) or new NoopMetrics()',
+        { code: 'RESIZE_METRICS_INVALID', retryable: false },
+      );
+    }
     // Validate before registering, so a bad config never claims the name and a corrected
     // retry succeeds.
     const config = opts.config ?? defaultResizeConfig;
@@ -283,6 +302,14 @@ export class Resizer {
     }
     this.logger = opts.logger ?? console;
     this.name = name;
+    this.#metrics = opts.metrics ?? new LogMetrics(this.logger);
+    // A pipeline name the host never registered is unbounded: it is labelled 'unregistered'.
+    this.#boundMetrics = boundMetrics(this.#metrics, {
+      resizer: name,
+      logger: this.logger,
+      pipelineLabel: (pipeline) =>
+        this.hasPipeline(pipeline) ? pipeline : 'unregistered',
+    });
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#sources = {
       storage: opts.storage,
@@ -361,6 +388,11 @@ export class Resizer {
    */
   get queueName(): string {
     return this.#queueName ?? this.#notReady('queueName');
+  }
+
+  /** The metrics sink: the `metrics` option as given, or the default LogMetrics on `logger`. */
+  get metrics(): ResizeMetrics {
+    return this.#metrics;
   }
 
   #notReady(part: string): never {
@@ -762,6 +794,16 @@ export function listResizers(): Resizer[] {
  */
 export function processorOf(resizer: Resizer): Processor {
   return readProcessor(resizer);
+}
+
+/**
+ * The metrics sink of `resizer` as its services and the worker call it: labelled with the Resizer,
+ * with the pipeline and code labels bounded, never throwing. Internal: the main entry does not
+ * export it, and it may change in any release.
+ * @internal
+ */
+export function metricsOf(resizer: Resizer): ReturnType<typeof boundMetrics> {
+  return readBoundMetrics(resizer);
 }
 
 /**

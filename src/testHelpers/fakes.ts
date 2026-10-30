@@ -9,7 +9,7 @@
 // driver factory over PlainTaskQueue; fakeDatabaseParts are database parts whose task queue is a
 // MemoryTaskQueue; memoryStorage keeps files in a map; memoryStorageDriver and
 // fakeDatabaseDriver are the storage and database drivers a test registers by name;
-// silentLogger drops every message.
+// silentLogger drops every message; recordingMetrics keeps every metrics call.
 import type {
   DatabaseDriver,
   DatabaseParts,
@@ -18,6 +18,11 @@ import type {
 } from '../contracts/drivers.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
+import type {
+  MetricContext,
+  MetricLabels,
+  ResizeMetrics,
+} from '../contracts/metrics.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import {
   type ClaimedTask,
@@ -42,6 +47,47 @@ export const silentLogger: ResizeLogger = {
   warn() {},
   error() {},
 };
+
+/** One call a recordingMetrics() sink received; labels and context default to {}. */
+export interface MetricCall {
+  kind: 'count' | 'timing';
+  name: string;
+  value: number;
+  labels: MetricLabels;
+  context: MetricContext;
+}
+
+/** A metrics sink that keeps every call in `calls` and counts its flush() calls in `flushes`. */
+export function recordingMetrics(): ResizeMetrics & {
+  calls: MetricCall[];
+  flushes: number;
+} {
+  const calls: MetricCall[] = [];
+  const sink = {
+    calls,
+    flushes: 0,
+    count: (
+      name: string,
+      value: number,
+      labels: MetricLabels = {},
+      context: MetricContext = {},
+    ) => {
+      calls.push({ kind: 'count', name, value, labels, context });
+    },
+    timing: (
+      name: string,
+      value: number,
+      labels: MetricLabels = {},
+      context: MetricContext = {},
+    ) => {
+      calls.push({ kind: 'timing', name, value, labels, context });
+    },
+    flush: () => {
+      sink.flushes += 1;
+    },
+  };
+  return sink;
+}
 
 /** In-memory locks (no expiry). Owners are honoured: only the holder extends or releases a lock. */
 export function memoryLocks(): LockStore {

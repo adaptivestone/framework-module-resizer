@@ -39,6 +39,9 @@ const EXPECTED_VALUE_EXPORTS = [
   'RoutingTaskQueue',
   'carrierOf',
   'createResizer',
+  'LogMetrics',
+  'NoopMetrics',
+  'ResizeMetrics',
 ];
 
 // Drivers are SUBPATH-ONLY (the uniform rule 02 · §6) — they must NEVER appear on the main entry.

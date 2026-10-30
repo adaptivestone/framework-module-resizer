@@ -15,7 +15,8 @@
 //   locks (SQS, or a router, which needs it only for a queue on SQS); none beside the database
 //   queue, which keeps the gate in its task rows, and none for an eager-only Resizer;
 // - coordination: `coordination` in src/config/resize.ts, which the core validates;
-// - logger and events: the app's.
+// - logger and events: the app's;
+// - metrics: a LogMetrics on that logger, with its debug lines on.
 // Options win over the config files. Nothing is read from the app until first use, and the AWS
 // drivers (optional peers) are imported only when a queue or storage on them is used.
 import type { DriverRegistry } from '../contracts/drivers.ts';
@@ -29,6 +30,7 @@ import {
   type ConfigSource as FactorySource,
   type ProcessSections,
 } from '../factory/createResizer.ts';
+import { LogMetrics } from '../metrics.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -116,6 +118,9 @@ export class FrameworkResizer<D extends DriverRegistry = {}> extends Resizer {
       ...rest,
       drivers: withFrameworkDatabase(drivers),
       logger: logger ?? appLogger,
+      // The app logger decides whether debug lines are kept, so the default writes them.
+      metrics:
+        rest.metrics ?? new LogMetrics(logger ?? appLogger, { debug: true }),
       events: events ?? appEvents,
       // One queue set per process, built with the app logger, never one Resizer's. It is built
       // with the database parts of the first Resizer that needs it; FrameworkDatabase builds the

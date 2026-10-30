@@ -65,6 +65,9 @@ const expected = [
   'runWorker',
   'rasterToSharp',
   'sharpToRaster',
+  'LogMetrics',
+  'NoopMetrics',
+  'ResizeMetrics',
 ];
 for (const name of expected) {
   assert.ok(name in mod, 'main entry missing export: ' + name);

@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { RESIZE_ERROR_CODES } from './errorCodes.ts';
 import { localImports, sourceFiles } from './testHelpers/imports.ts';
 
 const CORE_FILES = sourceFiles().filter(
@@ -125,10 +126,40 @@ test('lock settings are validated only in the core', () => {
     sourceFiles().filter(
       (f) =>
         f !== 'coordination.ts' &&
+        f !== 'errorCodes.ts' &&
         /RESIZE_CONFIG_COORDINATION_INVALID/.test(read(f)),
     ),
     [],
   );
+});
+
+// The metrics sink labels a failure only with a code the module itself raises (anything else is
+// 'other'), so the list of codes must follow the sources: a new code joins it, and a code no
+// source raises any more leaves it. The second scan skips errorCodes.ts, which holds every entry.
+test('every error code a shipped file uses is in RESIZE_ERROR_CODES, and every entry is used', () => {
+  const codesIn = (files: string[]): Set<string> => {
+    const codes = new Set<string>();
+    for (const f of files) {
+      for (const match of read(f).matchAll(/'(RESIZE_[A-Z0-9_]+)'/g)) {
+        codes.add(match[1]);
+      }
+    }
+    return codes;
+  };
+  const files = sourceFiles();
+  assert.ok(files.includes('errorCodes.ts'), 'sanity check: the list is seen');
+  assert.deepEqual(
+    [...codesIn(files)].filter((code) => !RESIZE_ERROR_CODES.has(code)),
+    [],
+    'codes missing from RESIZE_ERROR_CODES',
+  );
+  const used = codesIn(files.filter((f) => f !== 'errorCodes.ts'));
+  assert.deepEqual(
+    [...RESIZE_ERROR_CODES].filter((code) => !used.has(code)),
+    [],
+    'RESIZE_ERROR_CODES entries no shipped file uses',
+  );
+  assert.ok(RESIZE_ERROR_CODES.has('RESIZE_METRICS_INVALID'));
 });
 
 // The Processor renders through the decoder port and the plan: the single Sharp path that rendered

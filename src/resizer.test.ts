@@ -14,9 +14,11 @@ import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { FrameworkLockStore } from './framework/locks.ts';
 import { FrameworkMediaStore } from './framework/media.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
+import { LogMetrics, NoopMetrics } from './metrics.ts';
 import {
   getResizer,
   listResizers,
+  metricsOf,
   Resizer,
   type ResizerOptions,
   resetResizerForTests,
@@ -31,6 +33,7 @@ import {
   MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
@@ -1480,5 +1483,81 @@ describe('resolve/generate stubs', () => {
     });
     assert.deepEqual(result.created, []);
     assert.equal(result.failed, 0);
+  });
+});
+
+describe('metrics', () => {
+  test('metrics: the default is a LogMetrics on the Resizer logger; the option wins; resizer.metrics is that sink', async () => {
+    const info: unknown[] = [];
+    const logger = {
+      info: (msg: unknown) => {
+        info.push(msg);
+      },
+      warn() {},
+      error() {},
+    };
+    const byDefault = new Resizer({
+      name: 'm1',
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      logger,
+    });
+    assert.ok(byDefault.metrics instanceof LogMetrics);
+    byDefault.metrics.timing('resize.task', 5, { outcome: 'completed' });
+    assert.equal(info.length, 1);
+    assert.match(
+      String(info[0]),
+      /^resize: task \? of media \? completed in 5 ms/,
+    );
+
+    const sink = recordingMetrics();
+    const given = new Resizer({
+      name: 'm2',
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      metrics: sink,
+      pipelines: { thumbs: {} },
+    });
+    assert.equal(given.metrics, sink);
+    // The bound sink labels every call with the Resizer and its registered pipelines.
+    const bound = metricsOf(given);
+    bound.count('resize.read', 1, { pipeline: 'thumbs' });
+    bound.count('resize.read', 1, { pipeline: 'retired' });
+    assert.deepEqual(
+      sink.calls.map((call) => [call.labels, call.context]),
+      [
+        [{ resizer: 'm2', pipeline: 'thumbs' }, {}],
+        [{ resizer: 'm2', pipeline: 'unregistered' }, { pipeline: 'retired' }],
+      ],
+    );
+    await bound.flush();
+    assert.equal(sink.flushes, 1);
+  });
+
+  test('a metrics option without count and timing is RESIZE_METRICS_INVALID, and the name stays free', () => {
+    for (const metrics of [{}, { count() {} }, null]) {
+      assert.throws(
+        () =>
+          new Resizer({
+            name: 'metered',
+            storage: fakeStorage(),
+            media: fakeMedia(),
+            metrics: metrics as never,
+          }),
+        (e: unknown) =>
+          e instanceof ResizeSetupError &&
+          e.code === 'RESIZE_METRICS_INVALID' &&
+          e.retryable === false &&
+          e.message ===
+            'resize: `metrics` must have count() and timing() functions — e.g. new LogMetrics(logger) or new NoopMetrics()',
+      );
+    }
+    const r = new Resizer({
+      name: 'metered',
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      metrics: new NoopMetrics(),
+    });
+    assert.equal(getResizer('metered'), r);
   });
 });
