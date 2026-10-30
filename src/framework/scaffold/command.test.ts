@@ -235,6 +235,17 @@ describe('runScaffold — default run', () => {
     assert.match(out, /`queues`/);
     assert.match(out, /worker\.enabled/);
   });
+
+  test('the config template shows a second backend, the repeatable --queue and PartialFrameworkResizeConfig', async () => {
+    await run([]);
+    const config = await read(CONFIG);
+    assert.match(config, /bulk: \{ driver: 'sqs', queueUrl: '…' \}/);
+    assert.match(
+      config,
+      /npm run cli ResizeWorker -- --queue=default --queue=bulk/,
+    );
+    assert.match(config, /satisfies PartialFrameworkResizeConfig/);
+  });
 });
 
 describe('runScaffold — idempotency & --force', () => {

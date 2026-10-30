@@ -22,10 +22,13 @@ those drivers with framework models and config.
 Queues are named (`'default'` unless set). A framework host defines each name once, in `queues`
 of `src/config/resize.ts`, with its own timing. There is one TaskQueue per backend (every
 `database` entry is one backend; SQS entries with the same `region`, `endpoint`,
-`deadLetterQueueUrl` and `waitTimeSeconds` are one: set `region` (and `endpoint`) on every SQS entry
-or on none — an omitted `region` and an explicit one equal to `AWS_REGION` count as two backends),
-and each name is a lane on it. A Resizer's tasks go to its `queueName` (in a framework host, its
-config file's `queue`); a call may name another queue of the same backend.
+`deadLetterQueueUrl` and `waitTimeSeconds` are one), and each name is a lane on it. Names on
+different backends are routed: when `queues` spans more than one available backend,
+`resizer.tasks` is a `RoutingTaskQueue` and each call goes to its queue's backend
+(`await carrierOf(resizer.tasks, name)` gives it; do not test `instanceof MongoTaskQueue`). A
+backend is built when first needed; a name whose driver's SDK is not installed is not served there
+(`RESIZE_QUEUE_NOT_SERVED`, naming the package). A Resizer's tasks go to its `queueName` (in a
+framework host, its config file's `queue`); a call may name any other queue of `queues`.
 
 Queued work has one gate per Resizer, media, pipeline and queue: at most one of their tasks is
 active (queued, running, waiting for a retry, or cooling down for `coordination.cooldownMs` after
@@ -84,8 +87,9 @@ gets the full box its steps were written for. To hand the private original to it
    queue is the scaffolded `ResizeTask` model), `media` (`FrameworkMediaStore`: the app's media
    model), `locks` (`FrameworkLockStore`:
    the framework `Lock` model, built only beside a task queue without `gatesByTask` — the SQS
-   driver, or a custom queue without the flag; the database queue keeps its gate in its task rows,
-   so it needs no `Lock` model) and the app logger:
+   driver, or a custom queue without the flag — or one that routes names to several backends; the
+   database queue keeps its gate in its task rows, so it needs no `Lock` model unless the Resizer's
+   own queue is on SQS; a database Resizer beside SQS queues still needs none) and the app logger:
 
    ```ts
    import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
@@ -97,8 +101,13 @@ gets the full box its steps were written for. To hand the private original to it
    anywhere, even before `Server.init()`. Options win over the config: `storage` (e.g. an
    `S3Storage` with the host's own `client`), `media`, `locks`, `tasks` (a `TaskQueue`, or
    `false` = eager only), `coordination`, `logger`, `events`, `config`, `configName`, `queueName`
-   (the queue name, a key of `queues`), `name`, `decoders` (extra source kinds, see below).
-   `resizer.queue` is gone: read `resizer.queueName`.
+   (the queue name, a key of `queues`), `name`, `decoders` (extra source kinds, see below),
+   `drivers` (custom drivers by name, e.g. `{ storage: { gcs: GcsStorage } }`; the file's
+   `storage: { driver: 'gcs', … }` then `satisfies FrameworkResizeConfig<{ storage: { gcs: typeof
+   GcsStorage } }>`; every `FrameworkResizer` of the process must pass the same `drivers.queue`
+   map, else `RESIZE_DRIVER_CONFLICT`). `resizer.queue` is gone: read `resizer.queueName`.
+   `resizer.tasks` may be a `RoutingTaskQueue` (several backends in `queues`): it has no
+   `release`; ask `carrierOf(resizer.tasks, name)` for a name's backend.
    A `queueName` option is readable at once; a name from the config file only after
    `await resizer.ready()` or the first call (`RESIZE_NOT_READY` before). A `tasks` queue in code
    skips only the choice of the queue from `queues` (the name is `queueName`, else the file's
@@ -108,14 +117,38 @@ gets the full box its steps were written for. To hand the private original to it
    in code too keeps its process-wide sections from being read: the default Resizer still reads
    the file for its own sections, and the worker process reads `worker` and `queues` from it.
 
-   Without the framework: `new Resizer({ storage, media, locks?, tasks?, coordination?,
-   queueName?, decoders? })` from the main entry (`locks` is required only beside a task queue
-   without `gatesByTask`, such as `SqsTaskQueue`, which takes one gate lock per media, pipeline
-   and queue: `verify()` rejects without it; `MongoTaskQueue` needs none), with
+   Without the framework: one config object and one call, `createResizer(config, { drivers })`
+   from the main entry:
+
+   ```ts
+   import { createResizer } from '@adaptivestone/framework-module-resize';
+
+   export const resizer = createResizer({
+     formats: ['webp', 'avif'], // image settings, merged over the package defaults
+     storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+     database: { driver: 'mongo', connection: mongoose.connection, mediaModel: File },
+     queues: { default: { driver: 'database' } }, // or { driver: 'sqs', queueUrl }
+   });
+   ```
+
+   Options win over the config (`createResizer(config, { pipelines, hooks, decoders, storage,
+   media, locks, tasks, coordination, queueName, drivers, … })`); only the drivers a section
+   selects are loaded (the AWS SDKs only for S3 or SQS sections, else `RESIZE_PEER_MISSING`); the
+   parts are built on first use; two calls build their own queues, so Resizers that share one task
+   queue are wired by hand (below). A custom driver is registered by kind and name
+   (`drivers: { storage: { gcs: GcsStorage } }`): anything with `fromConfig(section, ctx)` (a
+   queue driver: `fromConfig(entries, ctx)` for one backend's entries, with optional
+   `backendOf(section)` and `validate(entries, { where })`); host names win over built-in ones; a
+   `fromConfig` must not wait on the network (checks belong in the part's `verify()`); see the
+   README `Drivers by name` section. Or by hand: `new Resizer({ storage, media, locks?, tasks?,
+   coordination?, queueName?, decoders? })` from the main entry (`locks` is required only beside a
+   task queue without `gatesByTask`, such as `SqsTaskQueue`, which takes one gate lock per media,
+   pipeline and queue: `verify()` rejects without it; `MongoTaskQueue` needs none), with
    `@adaptivestone/framework-module-resize/drivers/mongo.js` → `...mongoParts(connection, {
    mediaModel, timing? })` (`{ media, locks, tasks }`: the host media model, and locks and the task
-   queue on the package's `ResizeLock` / `ResizeTask` models; also `MongoMediaStore`,
-   `MongoLockStore`, `MongoTaskQueue`, `createResizeModels`; call it once and spread the same parts
+   queue on the package's `ResizeLock` / `ResizeTask` models; also `MongoDatabase` (the `'mongo'`
+   database driver), `MongoMediaStore`, `MongoLockStore`, `MongoTaskQueue`, `createResizeModels`;
+   call it once and spread the same parts
    into every Resizer — each call makes its own queue),
    `…/drivers/fs.js` → `LocalFsStorage`, `…/drivers/s3.js` → `S3Storage`, `…/drivers/sqs.js` →
    `SqsTaskQueue`. Any part may be a function (sync or async) called once on first use. A custom
@@ -146,9 +179,12 @@ gets the full box its steps were written for. To hand the private original to it
 4. Import `src/resizer.ts` wherever you need the Resizer (a static import is fine). To fail at boot
    on a bad config, call `await getResizer().verify()` after `Server.init()`; otherwise a config
    error appears at the first call. A task queue passed in code that cannot be used (no lock store
-   beside a queue without `gatesByTask`, invalid `timing`), or an invalid `coordination`, does not
-   fail calls: it is logged once, reads serve stored previews and queue nothing, uploads and
-   `generate()` work, and only `verify()`, `prewarm()` and worker start report it. For a
+   beside a queue without `gatesByTask` that does not route names), or an invalid `coordination`,
+   does not fail calls: it is logged once, reads serve stored previews and queue nothing, uploads
+   and `generate()` work, and only `verify()`, `prewarm()` and worker start report it. A queue
+   name's invalid timing is checked per name instead: `verify()` rejects for the Resizer's own
+   queue, worker start for each queue it consumes, `prewarm()` reports it, and `resolve()` logs it
+   once per queue name on the first read of that queue (no longer when the Resizer starts). For a
    `FrameworkResizer` that takes its task queue from the config file, invalid timing in a `queues`
    entry of `src/config/resize.ts` (or a malformed `queues` or `worker` section) is still a config
    error at the first call, like the rest of the file; its `coordination` section degrades as
@@ -194,18 +230,20 @@ gets the full box its steps were written for. To hand the private original to it
    FrameworkResizeConfig`. An environment override (`<name>.<NODE_ENV>.ts`, e.g.
    `resize.production.ts` or `resizeListings.production.ts`), and a `resize.ts` that holds only the
    process-wide sections (no default Resizer, so no `mediaModelName`), write `satisfies
-   Partial<FrameworkResizeConfig>`. The worker reads `worker` and `queues` from
-   `src/config/resize.ts`: its `--config` flag is removed (`RESIZE_CONFIG_REMOVED_KEY`). One Resizer
-   uses one backend: moving only some queues to another backend in `resize.<NODE_ENV>.ts` (only
-   `queues.default` to SQS, say) splits them there, and calls on the other backend's queues queue
-   nothing (`RESIZE_QUEUE_NOT_SERVED`). Move all of a Resizer's queues together until routing
-   between backends ships; SQS entries with different dead-letter queues are different backends too,
-   so set `region` (and `endpoint`) on every SQS entry or on none — an omitted `region` and an
-   explicit one equal to `AWS_REGION` count as two backends. Put environment-only changes in
-   `resize.<NODE_ENV>.ts` (for example, S3 in `resize.production.ts`); the framework merges that
-   file field by field before this module reads and validates the resolved config. Do not add a
-   second runtime merge. When an environment file switches the storage driver, set `publicBaseUrl`
-   there too.
+   Partial<FrameworkResizeConfig>`; an override that leaves out nested keys (only
+   `limits.sourcePixels`, say) writes `satisfies PartialFrameworkResizeConfig` (from
+   `…/framework.js`). The worker reads `worker` and `queues` from `src/config/resize.ts`: its
+   `--config` flag is removed (`RESIZE_CONFIG_REMOVED_KEY`). Queues may be on different backends:
+   names on different backends are routed (moving only `queues.default` to SQS in
+   `resize.<NODE_ENV>.ts`, say, keeps both names working); a backend is built when first needed,
+   and a name whose driver's SDK is not installed is not served there. Put environment-only changes
+   in `resize.<NODE_ENV>.ts` (for example, S3 in `resize.production.ts`); the framework merges that
+   file field by field, then this module merges the image settings of the result over the package
+   defaults (plain objects key by key, arrays and `encode.formats` replaced whole) and validates
+   it, so a file may set only the keys it changes. Do not add a merge of your own. A driver name in
+   the files (`storage`, `queues`) is checked against the Resizer's drivers when it first reads that
+   section, not when the file is read. When an environment file switches the storage driver, set
+   `publicBaseUrl` there too.
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment
    instead of hand-writing those fields (single source of truth for schema + types). It is
@@ -273,7 +311,8 @@ gets the full box its steps were written for. To hand the private original to it
 8. Lazy / pre-warm modes: keep `queues: { default: { driver: 'database' } }` (or an SQS entry)
    and `queue: 'default'`, and set `worker: { enabled: true }` in the host `src/config/resize.ts`
    (default `false`), then run the worker as its own process — `npm run cli ResizeWorker`
-   (queue `'default'`; `npm run cli ResizeWorker -- --queue=bulk` consumes only `'bulk'`).
+   (queue `'default'`; `npm run cli ResizeWorker -- --queue=bulk` consumes only `'bulk'`, and
+   `npm run cli ResizeWorker -- --queue=default --queue=bulk` consumes both).
    The flag permits the command to run; it does not start a worker in the API. The worker consumes
    indexes prepared by the host lifecycle; it does not create them, so start it after they exist
    (step 7).
@@ -354,6 +393,9 @@ after that task ends. On a queue without `gatesByTask` (SQS) a held gate lock is
 `RESIZE_ENQUEUE_UNCONFIRMED`; an add result that is not a `TaskAddResult` (a custom queue written
 for an older version) is never counted as queued and gets the same code, not retryable, logged
 once. An unexpected internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue.
+An issue may carry an optional `causeCode`, the code of the error behind it when that code is not
+an issue code (a driver's own code or `RESIZE_PEER_MISSING` under `RESIZE_ENQUEUE_QUEUE_FAILED`,
+`RESIZE_LOCKS_REQUIRED` under `RESIZE_ENQUEUE_LOCK_FAILED`); the set of issue codes is unchanged.
 The [`prewarm()` issues table](./README.md#prewarm-issues) in `README.md` lists every issue code,
 when it happens and its `retryable`. Delivery remains at-least-once, not exactly-once.
 
@@ -458,10 +500,10 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
   a fixed per-entity catalog first (otherwise: arbitrary-resize resource abuse).
 - Construct each Resizer ONCE, at one construction site, with `new FrameworkResizer`. Most
   hosts need one (`getResizer()`); for more, give each a `name` and, if it differs, its own
-  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves one queue
-  (`--queue`, default `'default'`) for every Resizer constructed in its process before the worker
-  starts, with one consume loop per task queue (Resizers on the same backend share one), one task
-  at a time, each processed with its own Resizer. Every claim names the Resizers the worker
+  config file via `configName` (`getResizer('listings')`). The same name twice throws. Every task records its Resizer and queue; a worker serves its queues
+  (`--queue`, repeatable, default `'default'`) for every Resizer constructed in its process before
+  the worker starts, with one consume loop per backend and queue (Resizers on the same backend
+  share one), one task at a time per loop, each processed with its own Resizer. Every claim names the Resizers the worker
   serves: a task queue with `claimFilters` (the database queue) never hands it another Resizer's
   task; from one that cannot filter claims (SQS), such a task is given back to the queue (or
   retried when the queue cannot give tasks back).
@@ -483,8 +525,9 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
   `ResizeSetupError` with that code (a queued task retries, then dead-letters). When you add or
   rename a pipeline, deploy the worker before the API requests it. The worker in turn needs the
   indexes (step 7), so create them through a migration that runs before both.
-- The scaffolded `resize.ts` is complete. The framework merges environment overrides and the
-  module reads that final config without a second merge. Arrays in environment overrides replace.
+- The scaffolded `resize.ts` is complete. The framework merges environment overrides, then the
+  module merges the image settings of the result over the package defaults (arrays and
+  `encode.formats` replace); add no merge of your own. Arrays in environment overrides replace.
 - Format ids are open strings. `formats` controls generated outputs, `upload.formats` controls
   accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options. A
   per-call `formats` entry (or a variant a `beforeEnqueue` tap adds or rewrites) without an
@@ -516,19 +559,19 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
 |---|---|
 | ``resize config: `mediaModelName` is required``, `RESIZE_CONFIG_MEDIA_MODEL_MISSING` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
 | `RESIZE_APP_NOT_INITIALIZED` | a `FrameworkResizer` (or another part from `…/framework.js`) read the framework app before the `Server` was constructed — construct the Server before the first call (importing `src/resizer.ts` earlier is fine: it reads nothing until first use); in tests, install a fake app with `setAppInstance` from `@adaptivestone/framework/helpers/appInstance.js` |
-| `RESIZE_MEDIA_REQUIRED` at construction | `new Resizer()` takes its `media` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `...mongoParts(connection, { mediaModel })` |
+| `RESIZE_MEDIA_REQUIRED` at construction | `new Resizer()` takes its `media` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `...mongoParts(connection, { mediaModel })`, or a `database: { driver: 'mongo', connection, mediaModel }` section for `createResizer` (which reports a missing one on first use, naming its config) |
 | `RESIZE_STORAGE_REQUIRED` at construction or first use | `new Resizer()` got no `storage`, or a `storage` function resolved with nothing — pass a `ResizeStorage` driver (e.g. `new LocalFsStorage({ … })` from `…/drivers/fs.js`); framework hosts use `new FrameworkResizer()`, which builds it from the config file's `storage` (`RESIZE_CONFIG_STORAGE_MISSING` when that is missing) |
 | `RESIZE_NAME_INVALID` or `RESIZE_QUEUE_INVALID` at construction | the Resizer's `name` or `queueName` option is not a non-empty string — pass one, or leave it out for `'default'`. ``resize: `queue` is now `queueName` `` (`RESIZE_QUEUE_INVALID`): the old `queue` option was renamed — pass `queueName`, and read `resizer.queueName` instead of the removed `resizer.queue` |
 | `RESIZE_CONFIG_QUEUE_UNKNOWN` on first use or from `verify()` | the Resizer's queue name (its `queueName` option, or its file's `queue`, or the implied `'default'` when the file sets none) is not an entry of `queues` in `src/config/resize.ts` — add `queues.<name>` (e.g. `queues: { default: { driver: 'database' } }`), set `queue`/`queueName` to a defined name, or `queue: false` (`tasks: false` when the name came from the option) for eager only |
-| `RESIZE_LOCKS_REQUIRED` from `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it) | a Resizer whose task queue has no `gatesByTask` (e.g. `SqsTaskQueue`) has no `locks`, and it takes one gate lock per media, pipeline and queue — spread `mongoParts(connection, { mediaModel })` (its `locks`) or pass a `LockStore`, or drop `tasks` for an eager-only Resizer. `MongoTaskQueue` needs no `locks`; a `FrameworkResizer` builds `FrameworkLockStore` itself beside a task queue without `gatesByTask` (the SQS driver, or a custom queue without the flag) |
-| `RESIZE_CONFIG_QUEUE_INVALID` or `RESIZE_CONFIG_QUEUE_LEASE_INVALID` | the queue timing is invalid — fix the key the message names (in `queues.<name>` of `src/config/resize.ts`, or the task queue's `timing` / `getTiming`). The config file fails on first use with the rest of the file; a task queue's own timing fails `verify()` and worker start, while reads serve stored previews, queue nothing, and `prewarm()` reports it. On a task queue passed in code, the invalid timing of a queue used only per call is reported by that call's `prewarm()` (`RESIZE_ENQUEUE_INTERNAL_ERROR`, not retryable) and logged once per queue name by `resolve()` |
+| `RESIZE_LOCKS_REQUIRED` from `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it) | a Resizer whose task queue has no `gatesByTask` (e.g. `SqsTaskQueue`) has no `locks`, and it takes one gate lock per media, pipeline and queue — spread `mongoParts(connection, { mediaModel })` (its `locks`) or pass a `LockStore`, or drop `tasks` for an eager-only Resizer. `MongoTaskQueue` needs no `locks`; a `FrameworkResizer` builds `FrameworkLockStore` itself beside a task queue without `gatesByTask` (the SQS driver, or a custom queue without the flag). On a `RoutingTaskQueue` the need is per queue name: `verify()` rejects only when the Resizer's own queue is on a backend without `gatesByTask`, the worker only for such a queue it consumes, and a call on such a name queues nothing (the `prewarm()` issue `RESIZE_ENQUEUE_LOCK_FAILED` with `causeCode: 'RESIZE_LOCKS_REQUIRED'`) |
+| `RESIZE_CONFIG_QUEUE_INVALID` or `RESIZE_CONFIG_QUEUE_LEASE_INVALID` | the queue timing is invalid — fix the key the message names (in `queues.<name>` of `src/config/resize.ts` or of a `createResizer` config, or the task queue's `timing` / `getTiming`; for a builder route of a `RoutingTaskQueue`, the router's `getTiming` option). A config file fails on first use with the rest of the file. A task queue's own timing is checked per queue name: `verify()` rejects for the Resizer's own queue, worker start for each queue it consumes, and each call on the name fails it (`prewarm()` reports `RESIZE_ENQUEUE_INTERNAL_ERROR`, not retryable; `resolve()` logs it once per queue name, on the first read of that queue, and serves stored previews). It is no longer logged when the Resizer starts |
 | `RESIZE_MEDIA_REPLACE_MISSING` from `verify()`, at worker start, or from `invalidate` | a custom `MediaStore` has no `replacePreviews(mediaId, identities, rows)`, required since 0.3.0 — implement it (one atomic write per media; resolve `{ stored, removed }`; see the README `MediaStore` contract), or extend `MongoMediaStore` |
 | `RESIZE_MEDIA_REPLACE_RESULT_INVALID` | a custom `MediaStore.replacePreviews` resolved with something other than `{ stored, removed }` (two arrays) — resolve with the rows it stored and removed (`[]` when none), `removed` being exactly what the write removed |
 | a `findOneAndUpdate` middleware on the media model throws on an array update, or `invalidate` fails on a custom model-shaped `MongoMediaModel` | `replacePreviews` (which `invalidate` uses) sends an update pipeline: `findOneAndUpdate(filter, [ … ], { updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } })`, after casting the rows with the model's optional `castObject` — make the model and its middleware accept an array update |
 | `RESIZE_MEDIA_APPEND_RESULT_INVALID` | a custom `MediaStore.appendPreviews` resolved with something other than an array — resolve with the previews it stored (`[]` when none) |
-| `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config file named in the message, or pass `storage` to `new FrameworkResizer()` |
+| `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`, or a driver passed in `drivers`) to the config named in the message (a config file, or the config passed to `createResizer()`), or pass `storage` to `new FrameworkResizer()` or `createResizer()` |
 | `RESIZE_FS_PRIVATE_ROOT_PUBLIC` (`ResizeSecurityError`) when `LocalFsStorage` is constructed (from a config file: at first use or `verify()`) | `privateRootDir` is `rootDir` itself or inside it, so private originals would be served — put it outside `rootDir` (`storage.privateRootDir` in the config file), or leave it out for `rootDir` + `-private` |
-| `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` driver other than `'local'` or `'s3'`, a `queues` map that is not an object of names, a `queues` entry with a blank name or without driver `'database'` or `'sqs'`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), an unknown `worker` key (e.g. a misspelled `sharpConcurency`), or image settings of the wrong type (`maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`) — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use) |
+| `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` section without a driver name, a `storage` or `queues` driver name the Resizer does not have (not `'local'` / `'s3'` or `'database'` / `'sqs'`, nor a name in its `drivers`; checked when the Resizer first reads that section, so on first use or in `verify()`, and a disabled worker only logs that it is disabled), a `database` section of `createResizer` without driver `'mongo'` (or a registered one), a `'database'` queue in a `createResizer` config without a `database` section, a `queues` map that is not an object of names, a `queues` entry with a blank name or without a `driver`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), an unknown `worker` key (e.g. a misspelled `sharpConcurency`), or image settings of the wrong type (`maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`) — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use), except an unregistered driver name in it, which is reported on first use or `verify()`. With several broken `queues` entries, the first error reported may differ from `0.3.0-rc.2` |
 | `RESIZE_CONFIG_UPLOAD_INVALID`, `RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID` or `RESIZE_CONFIG_UPLOAD_FORMATS_INVALID` | `upload` is not an object, `upload.maxBytes` is not a positive safe integer, or `upload.formats` is not a non-empty list of non-empty format ids — fix that key, e.g. spread the defaults' `upload` and change one value |
 | `RESIZE_NOT_READY` | host code read `resizer.storage` / `media` / `locks` / `tasks`, or a `resizer.queueName` that comes from the config file (or from a function), before the Resizer loaded them — `await resizer.ready()` first (the Resizer's methods do this themselves). A string `queueName` option is readable at once. `resizer.queue` is gone: read `resizer.queueName` |
 | `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`; framework hosts define queues in `queues` and keep `worker` in `src/config/resize.ts`; `worker.concurrency` (in a framework config file too) moves to the top-level `concurrency` |
@@ -559,16 +602,21 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key or an old shape is still in a config file (`resize.ts`, another Resizer's file, or an environment override) — move it to the path named in the message. Among them: a `queue: { … }` object (define the queue in `queues` of `src/config/resize.ts` and set `queue` to its name), `queues.<name>.queues` (give each SQS queue its own entry), and the worker's `--config` flag or `runResizeWorker({ configName })` (removed: the worker reads `worker` and `queues` from `src/config/resize.ts`) |
 | `formats [...] have no encode.formats entry` (`RESIZE_CONFIG_FORMATS_INVALID` in the config), `RESIZE_FORMAT_NOT_CONFIGURED` | add `encode.formats.<id>` (`{}` for Sharp defaults), or request only configured ids; use `'jpeg'`, not the alias `'jpg'` |
 | `RESIZE_PIPELINE_UNKNOWN` | the pipeline is not registered in that process — register it in `src/resizer.ts`; deploy the worker before the API requests a new or renamed pipeline |
-| `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config | optional peer not installed — install the packages named, see step 1 |
+| `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config (a config file, or the config passed to `createResizer()`) | optional peer not installed — install the packages named, see step 1. A queue whose backend lacks its SDK beside another available backend is only not served in that process (`RESIZE_QUEUE_NOT_SERVED`, naming the package); `verify()` rejects with `RESIZE_PEER_MISSING` only when it is the Resizer's own queue |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
 | `Resizer '…' is not served by this worker` in worker logs, or `RESIZE_NO_RESIZER` on a task | a task queue that cannot filter claims (SQS) handed the worker a task of a Resizer it does not serve: that Resizer was not constructed in the worker process before the worker started (or not passed in `runWorker({ resizers })`). Its tasks are given back to the queue for a worker that serves it (SQS still counts each receive, so a task bounced between workers that serve different Resizers can use up its `maxAttempts` and be dead-lettered by the worker that serves it: give each set of Resizers a worker serves its own SQS queue URL), or, when the queue cannot give tasks back, fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) — construct every Resizer in `src/resizer.ts`, which both the API and the worker load. On the database queue, which filters claims, such tasks wait for a worker that serves their Resizer, and every claim on that queue reads past them (the claim index does not hold the Resizer): give a Resizer that has no worker its own queue (a log saying the queue "handed its task out although it filters claims" is a broken custom queue) |
-| `RESIZE_QUEUE_NOT_SERVED` at worker start or from `verify()` | no task queue can consume that queue (a `--queue` name that `queues` does not define, or an `SqsTaskQueue` without its URL), or a Resizer's own `queueName` is not served by the task queue passed to it in code — define the queue (add its URL), or start the worker for another queue |
-| `RESIZE_QUEUE_NOT_SERVED` in `prewarm()` issues (`retryable: false`), or the warning "cannot queue to '…': its task queue does not serve that queue" from `resolve()` (once per queue name) | the call's `queue` is unknown to the Resizer's task queue (in a framework host, not an entry of `queues`; for `SqsTaskQueue`, no URL) or is a queue on another backend: one Resizer uses one backend, so nothing is queued. Typical cause: an environment override moved only some queues to another backend (e.g. only `queues.default` to SQS) — move all of a Resizer's queues together until routing between backends ships, or call with a queue of the Resizer's own backend |
+| `RESIZE_QUEUE_NOT_SERVED` at worker start or from `verify()` | no task queue can consume that queue: a `--queue` name (with a repeated `--queue`, the message names the one that is not served) that `queues` does not define, an `SqsTaskQueue` without its URL, or a name whose backend's SDK is not installed in this process (the message names the package); or a Resizer's own `queueName` is not served by the task queue passed to it in code — define the queue (add its URL), install the package named, or start the worker for other queues. Nothing is claimed before every listed name is served. A Resizer's own queue whose SDK is missing is `RESIZE_PEER_MISSING` from `verify()` |
+| `RESIZE_QUEUE_NOT_SERVED` in `prewarm()` issues (`retryable: false`), or the warning "cannot queue to '…': its task queue does not serve that queue" from `resolve()` (once per queue name) | the call's `queue` is unknown to the Resizer's task queue (in a framework host or a `createResizer` config, not an entry of `queues`; for `SqsTaskQueue`, no URL; the message ends "(a queue name it does not route)"), or that queue's backend lacks its optional SDK in this process (the message ends "(its driver 'sqs' needs @aws-sdk/client-sqs, which is not installed)"), so nothing is queued — define the queue, or install the package in that process. A queue on another backend of `queues` is routed and needs no change |
+| `RESIZE_ENQUEUE_QUEUE_FAILED` or `RESIZE_ENQUEUE_LOCK_FAILED` in `prewarm()` issues with a `causeCode` | `RESIZE_ENQUEUE_QUEUE_FAILED` with `causeCode`: the backend of the call's queue failed to build (a queue driver's `fromConfig` threw: the driver's own code, or `RESIZE_PEER_MISSING`), with the error's own `retryable`; `resolve()` logs it once per queue name and message, and the next call builds again — fix what the message names. A built error whose code is already an issue code keeps it as the issue's code. `RESIZE_ENQUEUE_LOCK_FAILED` with `causeCode: 'RESIZE_LOCKS_REQUIRED'` (`retryable: false`): the call's queue is on a backend without `gatesByTask` (SQS) and the Resizer has no lock store — pass `locks`, or give a `FrameworkResizer` the framework `Lock` model |
+| `RESIZE_QUEUE_ROUTES_INVALID` from `new RoutingTaskQueue()` | the routes are not a non-empty plain object, an object route lacks one of `add`, `claim`, `renew`, `complete`, `fail` or does not serve its own name, or a route is neither a task queue nor a function (the message names the route) — pass a task queue or an `async () => TaskQueue` builder per name |
+| `RESIZE_DRIVER_INVALID` at construction or first use | at construction (the Resizer's name stays free): the `drivers` option is not an object, has a kind other than `storage`, `database` or `queue`, or an entry has no `fromConfig` function (a queue driver's `backendOf` and `validate` must be functions when given) — the message names `drivers.<kind>.<name>`. On first use: a driver's `fromConfig` returned something that is not the part (a storage needs `upload`, `download`, `publicUrl`; a media store `loadMedia`, `appendPreviews`, `replacePreviews`; a task queue the five required methods and every name of its entries), or a `RoutingTaskQueue` builder resolved something that is not a task queue — fix the driver |
+| `RESIZE_DRIVER_CONFLICT` from `new FrameworkResizer()` | every `FrameworkResizer` of the process shares one task queue set, so each must pass the same `drivers.queue` map (the same names, the same driver objects): this one passes another driver, an extra name, or no map where an earlier one passed one (or the reverse). Eager-only Resizers and Resizers with `tasks` in code are compared too; the Resizer's name stays free — pass every `FrameworkResizer` the same `drivers.queue` (e.g. one shared object). A host that passes no `drivers` anywhere is unaffected, and storage drivers may differ per Resizer |
 | `RESIZE_SQS_QUEUE_URL_REQUIRED` at construction | `new SqsTaskQueue()` with neither `queueUrl` nor a `queues` entry — pass the `'default'` queue's URL, or name every queue it serves in `queues` (`queueUrl` is optional beside `queues`; a framework `queues` entry with driver `'sqs'` and no `queueUrl` fails with `RESIZE_CONFIG_INVALID` instead) |
 | `RESIZE_SQS_QUEUE_UNKNOWN` | a direct `SqsTaskQueue` call (`add`, `claim`) named a queue it has no URL for — add the URL to `queues`. A Resizer never gets it: its call on such a name is `RESIZE_QUEUE_NOT_SERVED` before any gate lock or `add()` (see that row) |
 | `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED` at worker start | `runWorker({ resizers })` does not list a Resizer of the process that uses a task queue the worker consumes and that cannot filter claims, e.g. SQS (the message names the queue and the Resizers; a queue with `claimFilters` may be shared); the worker would claim their tasks without running them — list them too, or give them their own task queue. When the message says a task queue failed to load, the worker could not compare that unlisted Resizer's task queue (the load error is the cause) — fix that task queue |
 | `RESIZE_DUPLICATE_RESIZER` at worker start, "the `resizers` list names '…' twice" | two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
+| `RESIZE_QUEUE_INVALID` at worker start | `runWorker({ queue })` (or `runResizeWorker`) got an empty list, or a list entry or a single name that is blank or not a string (`queue: ''` is refused too) — pass a queue name or a list of names; `--queue` may be repeated |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>`. The gate is per queue: such a task blocks new tasks for its media and pipeline on that queue only, never reads on another queue |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |

@@ -28,11 +28,17 @@ export default {
   queues: { default: { driver: 'database' } },
   // or { driver: 'sqs', queueUrl: '…' } (npm i @aws-sdk/client-sqs), one SQS queue per name;
   // beside SQS, the framework Lock model holds a gate lock per Resizer, media, pipeline and queue.
+  // A queue may use another backend than its neighbours, for example
+  //   bulk: { driver: 'sqs', queueUrl: '…' } beside the database `default`
+  // (needs @aws-sdk/client-sqs; without it `bulk` is not served in that process). One worker can
+  // consume several queues: npm run cli ResizeWorker -- --queue=default --queue=bulk
   // The coordination defaults (see README "Coordination"):
   // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 },
   // enabled: true lets `npm run cli ResizeWorker` run; start it as its own process.
   worker: { ...defaultWorkerOptions, enabled: false },
 } satisfies FrameworkResizeConfig;
 // resize.<NODE_ENV>.ts holds only what it changes, so it ends with
-// `satisfies Partial<FrameworkResizeConfig>`. Likewise, a resize.ts that holds only the
+// `satisfies Partial<FrameworkResizeConfig>` when it leaves out only top-level keys, or with
+// `satisfies PartialFrameworkResizeConfig` (a type from the same framework.js) when it leaves out
+// nested keys, for example only limits.sourcePixels. Likewise, a resize.ts that holds only the
 // process-wide sections (no default Resizer) writes `satisfies Partial<FrameworkResizeConfig>`.
