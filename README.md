@@ -271,7 +271,7 @@ once (two Resizers under one name: `RESIZE_DUPLICATE_RESIZER`). Beside
 a task queue the worker consumes that cannot filter claims, the list must also include every
 Resizer of the process that uses that queue: otherwise the worker would claim their tasks without
 running them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. With `queues` on more
-than one backend, every `FrameworkResizer` that takes its task queue from the config file shares
+than one available backend, every `FrameworkResizer` that takes its task queue from the config file shares
 one router that reaches every name, so a list for a worker that consumes a queue on SQS must name
 all of them, whatever their own queue (`0.3.0-rc.2` did not ask this; `npm run cli ResizeWorker`
 serves every Resizer). For a Resizer it does not
