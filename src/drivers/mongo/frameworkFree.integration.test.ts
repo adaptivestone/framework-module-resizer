@@ -14,6 +14,7 @@ import sharp from 'sharp';
 import defaultResizeConfig from '../../config/resize.ts';
 import type { MediaStore } from '../../contracts/media.ts';
 import { createResizer, Resizer, resetResizerForTests } from '../../index.ts';
+import { encodeSignature } from '../../signatures.ts';
 import { memoryStorage } from '../../testHelpers/fakes.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { runWorker } from '../../worker.ts';
@@ -316,4 +317,51 @@ test('createResizer: a config object and one call on MongoDB, with no framework 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('a stale preview is replaced in the media document', async () => {
+  resetAppInstance();
+  const File = connection.model(
+    'StaleFile',
+    new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
+  );
+  await File.init();
+  const { storage } = memoryStorage();
+  const resizerAt = (quality: number) =>
+    createResizer(
+      {
+        formats: ['webp'],
+        encode: { formats: { webp: { quality } } },
+        database: { driver: 'mongo', connection, mediaModel: File },
+      },
+      { name: 'stale', logger: silent, storage },
+    );
+  const sizes = [{ width: 16, height: 16 }];
+  const identity = 'stale:default:16x16:webp:none';
+
+  const before = resizerAt(80);
+  const original = await before.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  const file = await File.create({ original, previews: [] });
+  const { created: old } = await before.generate({ media: file, sizes });
+  assert.equal(old.length, 1);
+  resetResizerForTests();
+
+  const after = resizerAt(70);
+  const media = (await File.findById(file.id)) as unknown as MediaLike;
+  const { created, replaced } = await after.generate({ media, sizes });
+  assert.equal(created.length, 1);
+  assert.deepEqual(replaced, [old[0].storageRef]);
+  const rows = (
+    (await File.findById(file.id).lean()) as unknown as { previews: Preview[] }
+  ).previews.filter((row) => row.identity === identity);
+  assert.equal(rows.length, 1);
+  assert.equal(
+    rows[0].encodeSig,
+    encodeSignature(after.config, { format: 'webp', fit: false }),
+  );
+  assert.notEqual(rows[0].encodeSig, old[0].encodeSig);
+  assert.deepEqual(rows[0].storageRef, created[0].storageRef);
 });

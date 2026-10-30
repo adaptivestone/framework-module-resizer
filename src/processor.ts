@@ -1,17 +1,19 @@
 // The resize core, owned by `Processor`, shared by both generation modes:
 //   - processTask() = the core for one queued task, run by the worker
 //   - generate()    = the core for eager `resizer.generate`
-// #renderPending() renders the variants not stored yet: download the original once; a decoder
+// #renderPending() renders the variants not stored fresh yet (a stored row made with other settings
+// or from another original is stale, and is rendered again): download the original once; a decoder
 // identifies its bytes and renders them ONCE, at the largest box the plan needs; beforeSteps run
 // once on that raster, which is then reduced to the box of the plan made from their result; each
 // exact size is resized once and each format encoded from it, then uploaded (bounded by
-// config.concurrency); one PreviewRecorder write stores the rows, and onPreviewGenerated fires over
-// the rows it kept. The sizes come from the pure plan (plan.ts), the pixel work from render.ts, and
-// a source kind needs only a decoder: the Processor itself imports no image engine. It also fires
-// the task observers, and invalidate() removes stored previews for `resizer.invalidate` (one media
-// store write). It takes no locks: the queue leases a task to one worker at a time, the lease token
-// fences the task's writes, and the media store keeps one row per preview identity when an expired
-// lease lets two workers render the same variant. Each variant is timed from its encode to the end
+// config.concurrency); one PreviewRecorder persist appends the new rows and replaces the stale ones
+// in one write each, and onPreviewGenerated fires over the rows it kept. The sizes come from the
+// pure plan (plan.ts), the pixel work from render.ts, and a source kind needs only a decoder: the
+// Processor itself imports no image engine. It also fires the task observers, and invalidate()
+// removes stored previews for `resizer.invalidate` (one media store write). It takes no locks: the
+// queue leases a task to one worker at a time, the lease token fences the task's writes, and the
+// media store keeps one row per preview identity when an expired lease lets two workers render the
+// same variant. Each variant is timed from its encode to the end
 // of its upload and recorded on the metrics sink once the persist says what became of it. It takes
 // its parts explicitly and knows no Resizer.
 import type { Catalog } from './catalog.ts';
@@ -23,7 +25,7 @@ import type {
   SourceInfo,
 } from './contracts/decoder.ts';
 import type { ObserverName } from './contracts/hooks.ts';
-import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
+import type { MediaStore } from './contracts/media.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask, TaskEvent } from './contracts/taskQueue.ts';
@@ -36,6 +38,7 @@ import {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
+import { storedDims } from './freshness.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow } from './helpers/log.ts';
@@ -52,7 +55,12 @@ import {
   planVariants,
   type VariantPlan,
 } from './plan.ts';
-import { PreviewRecorder, type RecordResult } from './previewRecorder.ts';
+import {
+  checkReplaced,
+  PreviewRecorder,
+  type RecordResult,
+  requireReplacePreviews,
+} from './previewRecorder.ts';
 import { checkRaster } from './raster.ts';
 import {
   type EncodedVariant,
@@ -62,7 +70,7 @@ import {
   SizedRasters,
   straightAlpha,
 } from './render.ts';
-import { encodeSignature, previewOrigin } from './signatures.ts';
+import { previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
   GenerateResult,
@@ -99,28 +107,6 @@ function requirePipeline(
       { code: 'RESIZE_PIPELINE_UNKNOWN' },
     );
   }
-}
-
-/**
- * A media store written before replacePreviews existed cannot remove rows. invalidate() and the
- * Resizer's verify() check it, with one message.
- */
-export function requireReplacePreviews(media: MediaStore): void {
-  if (typeof media.replacePreviews !== 'function') {
-    throw new ResizeSetupError(
-      'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
-      { code: 'RESIZE_MEDIA_REPLACE_MISSING' },
-    );
-  }
-}
-
-/** A replacePreviews result the core can read: an object with the two lists of rows. */
-function isReplacedPreviews(result: unknown): result is ReplacedPreviews {
-  if (typeof result !== 'object' || result === null) {
-    return false;
-  }
-  const { stored, removed } = result as Partial<ReplacedPreviews>;
-  return Array.isArray(stored) && Array.isArray(removed);
 }
 
 /** A per-call argument names an unconfigured format: a wiring error at the call site. */
@@ -317,7 +303,8 @@ function previewRow(
   if (v.requestedHeight !== undefined) {
     row.requestedHeight = Math.round(v.requestedHeight);
   }
-  if (v.fit) {
+  // The rule that signs the row (catalog.encodeSig): only `true` makes a fit row.
+  if (v.fit === true) {
     row.fit = true;
   }
   return row;
@@ -352,8 +339,14 @@ interface RenderPendingResult {
   // Previews this call stored (or, with persist:false, produced).
   generated: Preview[];
   failedCount: number;
-  // Identities the media store already held from another worker: covered, not failed.
-  alreadyStored: string[];
+  // The stored rows the persist replaced (outdated, or a concurrent row of the same identity), and
+  // the identities of the stored previews that replaced them.
+  removed: Preview[];
+  replaced: Set<string>;
+  // The size every row was signed with, once the original was measured.
+  originDims?: { width: number; height: number };
+  // The dimensions the persist recorded on a media that had none stored.
+  backfilled?: { width: number; height: number };
 }
 
 export interface ProcessorDeps {
@@ -380,6 +373,10 @@ export class Processor {
   readonly #deps: ProcessorDeps;
   readonly #recorder: PreviewRecorder;
   readonly #metrics: ResizeMetrics;
+  // Pipelines whose task found every requested preview already fresh: warned once each.
+  readonly #warnedAllFresh = new Set<string>();
+  // Whether a media store that dropped the dimension backfill was warned about.
+  #warnedBackfill = false;
 
   constructor(deps: ProcessorDeps) {
     this.#deps = deps;
@@ -425,22 +422,23 @@ export class Processor {
       ctx,
     )) as SizeInput[];
 
-    // Expand sizes × formats; skip unbuildable sizes + existing identities (idempotent).
+    // Expand sizes × formats; skip unbuildable sizes + fresh stored identities (idempotent).
     const requested = catalog.missing(media, sizes, formats, {
       resizer: name,
       pipeline,
     });
 
     const persist = opts.persist !== false;
-    const { generated, failedCount } = await this.#renderPending({
-      media,
-      mediaId,
-      requested,
-      pipeline,
-      ctx,
-      persist,
-      mode: 'eager',
-    });
+    const { generated, failedCount, removed, replaced, backfilled } =
+      await this.#renderPending({
+        media,
+        mediaId,
+        requested,
+        pipeline,
+        ctx,
+        persist,
+        mode: 'eager',
+      });
 
     if (requested.length > 0 && generated.length === 0 && failedCount > 0) {
       throw new ResizeGenerateError({
@@ -450,13 +448,53 @@ export class Processor {
       });
     }
 
-    // Persist is a $push; also append onto the caller's in-memory doc so a same-request
-    // resolve() sees the new rows without a reload.
+    // The store appended and replaced the rows; the caller's in-memory doc gets the same swap (the
+    // rows of a replaced identity leave, the new rows are appended), so a same-request resolve()
+    // sees the new rows without a reload.
     if (persist && generated.length > 0) {
-      media.previews = [...(media.previews ?? []), ...generated];
+      media.previews = [
+        ...(media.previews ?? []).filter(
+          (row) =>
+            !(typeof row.identity === 'string' && replaced.has(row.identity)),
+        ),
+        ...generated,
+      ];
+    }
+    if (backfilled) {
+      this.#setDims(media, mediaId, backfilled);
     }
 
-    return { created: generated, failed: failedCount };
+    return {
+      created: generated,
+      failed: failedCount,
+      ...(removed.length > 0
+        ? { replaced: removed.map((row) => row.storageRef) }
+        : {}),
+    };
+  }
+
+  /**
+   * The dimensions the persist recorded, set on the caller's in-memory original too, so a
+   * same-request resolve() can prove the new rows fresh. The store has them already, so an
+   * original that cannot be changed (a frozen one, say) is only logged.
+   */
+  #setDims(
+    media: MediaLike,
+    mediaId: string,
+    dims: { width: number; height: number },
+  ): void {
+    try {
+      const original = media.original as Original;
+      original.width = dims.width;
+      original.height = dims.height;
+    } catch (err) {
+      logNeverThrow(
+        this.#deps.logger,
+        `resize: generate() recorded the original's dimensions of media ${mediaId} in the media store but could not set them on the caller's media.original, so a same-request resolve() finds its previews stale`,
+        err,
+        'warn',
+      );
+    }
   }
 
   /**
@@ -488,17 +526,9 @@ export class Processor {
       return [];
     }
     requireReplacePreviews(mediaStore);
-    const result: unknown = await mediaStore.replacePreviews(
-      mediaId,
-      [...identities],
-      [],
+    const result = checkReplaced(
+      await mediaStore.replacePreviews(mediaId, [...identities], []),
     );
-    if (!isReplacedPreviews(result)) {
-      throw new ResizeSetupError(
-        "resize: the media store's replacePreviews resolved with something other than { stored, removed } — resolve with the rows it stored and removed ([] when none)",
-        { code: 'RESIZE_MEDIA_REPLACE_RESULT_INVALID' },
-      );
-    }
     // Off the caller's in-memory doc too, so a same-request resolve() does not serve the rows. The
     // store has already removed them, so an array that cannot be changed (a frozen one, say) is
     // only logged, and through logNeverThrow, so a throwing logger cannot lose them either: the
@@ -525,8 +555,8 @@ export class Processor {
   }
 
   /**
-   * One queued task: the core, then a check that every requested identity is stored. The worker
-   * loop (src/consumer.ts) runs it through the worker; it SUCCEEDS by returning and FAILS by
+   * One queued task: the core, then a check that every requested identity is stored fresh. The
+   * worker loop (src/consumer.ts) runs it through the worker; it SUCCEEDS by returning and FAILS by
    * throwing (which engages the queue's retry → dead-letter). It takes no locks: the lease keeps
    * the task to one worker at a time, and the media store keeps one row per preview identity.
    */
@@ -561,8 +591,9 @@ export class Processor {
       }
     }
     const requested = [...requestedByIdentity.values()];
-    const { generated, failedCount, alreadyStored } = await this.#renderPending(
-      {
+    this.#warnIfAllFresh(task, media, scope, requested);
+    const { generated, failedCount, originDims, backfilled } =
+      await this.#renderPending({
         media,
         mediaId: task.mediaId,
         requested,
@@ -572,14 +603,14 @@ export class Processor {
         signal: opts.signal,
         mode: 'task',
         taskId: task.taskId,
-      },
-    );
+      });
 
-    // A queued task is complete only when every requested identity is now persisted. Re-read once
-    // so the rows of a concurrent worker running the same task (after an expired lease) count: a
-    // variant that failed here may be stored there. Our own generated rows are included too:
-    // appendPreviews returned successfully before #renderPending returned, and so are the
-    // identities the media store reported as already stored by another worker.
+    // A queued task is complete only when every requested identity is now persisted fresh. Re-read
+    // once so the rows of a concurrent worker running the same task (after an expired lease) count:
+    // a variant that failed here may be stored there. Our own generated rows are included too:
+    // the persist returned successfully before #renderPending returned. A row of the identity with
+    // other signatures (another worker's, made with other settings) does not count, so the task
+    // fails and its retry replaces that row.
     const refreshed = await mediaStore.loadMedia(task.mediaId);
     if (!refreshed) {
       logger.info(
@@ -587,19 +618,28 @@ export class Processor {
       );
       return;
     }
-    const covered = new Set<string>([
-      ...alreadyStored,
-      ...catalog.storedIdentities(
-        {
-          previews: [
-            ...(media.previews ?? []),
-            ...(refreshed.previews ?? []),
-            ...generated,
-          ],
-        },
-        scope,
-      ),
-    ]);
+    if (
+      backfilled &&
+      !storedDims(refreshed.original) &&
+      !this.#warnedBackfill
+    ) {
+      this.#warnedBackfill = true;
+      logger.warn(
+        `resize worker: the media store did not record the original's dimensions of media ${task.mediaId} — every read of such a media queues a task that downloads the original; a MediaStore must save backfillDims in appendPreviews`,
+      );
+    }
+    const covered = catalog.freshIdentities(
+      {
+        original: refreshed.original,
+        previews: [
+          ...(media.previews ?? []),
+          ...(refreshed.previews ?? []),
+          ...generated,
+        ],
+      },
+      scope,
+      originDims,
+    );
     const missing = requested.filter(
       (preview) => !covered.has(catalog.identity(scope, preview)),
     );
@@ -615,6 +655,38 @@ export class Processor {
         message: `resize worker: task for media ${task.mediaId} is incomplete; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
         code: 'RESIZE_WORKER_INCOMPLETE',
       });
+    }
+  }
+
+  /**
+   * The worker judges freshness by its own settings, so a variant a reader queued that is fresh
+   * here is skipped. A first delivery that finds every requested preview fresh on a media with
+   * stored dimensions most likely comes from a reader with other settings: warned once per
+   * registered pipeline. It can also follow an eager generate() that filled the variants first,
+   * hence "if this repeats".
+   */
+  #warnIfAllFresh(
+    task: LeasedTask,
+    media: MediaLike,
+    scope: PreviewScope,
+    requested: MissingPreview[],
+  ): void {
+    const { catalog, logger, pipelines } = this.#deps;
+    if (
+      task.attempts !== 1 ||
+      requested.length === 0 ||
+      !pipelines.has(task.pipeline) ||
+      this.#warnedAllFresh.has(task.pipeline) ||
+      storedDims(media.original) === undefined
+    ) {
+      return;
+    }
+    const fresh = catalog.freshIdentities(media, scope);
+    if (requested.every((p) => fresh.has(catalog.identity(scope, p)))) {
+      this.#warnedAllFresh.add(task.pipeline);
+      logger.warn(
+        `resize worker: task ${task.taskId} of media ${task.mediaId} found every requested preview of pipeline '${task.pipeline}' already fresh — if this repeats, the API and the worker may run different image settings or pipeline versions, or resolve() was given the media without its stored original (storageRef, width, height)`,
+      );
     }
   }
 
@@ -664,26 +736,35 @@ export class Processor {
 
     let generated: Preview[] = [];
     let failedCount = 0;
-    const alreadyStored: string[] = [];
+    let removed: Preview[] = [];
+    const replaced = new Set<string>();
+    const nothing = (): RenderPendingResult => ({
+      generated,
+      failedCount,
+      removed,
+      replaced,
+    });
 
-    // Nothing requested (e.g. eager re-run where everything already exists) → no download.
+    // Nothing requested (e.g. eager re-run where everything is already fresh) → no download.
     if (requested.length === 0) {
-      return { generated, failedCount, alreadyStored };
+      return nothing();
     }
 
     const original = media.original;
     if (original?.storageRef == null) {
       // Callers guard this, but never assume — a media without an original has nothing to
       // resize from.
-      return { generated, failedCount, alreadyStored };
+      return nothing();
     }
 
-    // Existing-preview set (the DB check that makes re-runs idempotent). Stored previews keep
-    // their own scope, so another pipeline's rendering never counts as done here.
+    // The fresh stored identities are done (the DB check that makes re-runs idempotent); a stale
+    // one renders again. Stored previews keep their own scope, so another pipeline's rendering
+    // never counts as done here. Without stored dimensions no row is proven fresh yet: the
+    // measured original decides below.
     const scope: PreviewScope = { resizer: name, pipeline: pipelineName };
-    const existing = catalog.storedIdentities(media, scope);
-    const notStored = requested.filter(
-      (v) => !existing.has(catalog.identity(scope, v)),
+    const freshAtLoad = catalog.freshIdentities(media, scope);
+    const notFresh = requested.filter(
+      (v) => !freshAtLoad.has(catalog.identity(scope, v)),
     );
     // One variant on the metrics sink: its time, its outcome, and the bytes it uploaded.
     const metrics = this.#metrics;
@@ -719,8 +800,8 @@ export class Processor {
     };
     // A task payload can name any format; only configured encoders run. Every other variant fails
     // alone, before any download, so it is recorded with no time spent.
-    const { configured: pending, unconfigured } =
-      catalog.splitConfigured(notStored);
+    const { configured, unconfigured } = catalog.splitConfigured(notFresh);
+    let pending = configured;
     for (const v of unconfigured) {
       const identity = catalog.identity(scope, v);
       const error = formatNotConfiguredError([v.format]);
@@ -731,9 +812,9 @@ export class Processor {
       failedCount += 1;
       recordVariant(identity, v.format, 0, 'failed', errorCodeLabel(error));
     }
-    // Everything requested is already stored or cannot be encoded: no download.
+    // Everything requested is already fresh or cannot be encoded: no download.
     if (pending.length === 0) {
-      return { generated, failedCount, alreadyStored };
+      return nothing();
     }
 
     let source: LoadedSource | undefined = await loadSource(
@@ -743,19 +824,44 @@ export class Processor {
     );
     const { info } = source;
 
-    // The dimensions the media holds: the stored pair, or, when the original never recorded it,
-    // the decoded source's display size (which the persist below backfills). Every row's origin is
-    // signed with them, persisted or not, so the rows of one original always share one origin.
-    const storedDims =
-      original.width !== undefined && original.height !== undefined
-        ? { width: original.width, height: original.height }
-        : undefined;
+    // The dimensions the media holds: the stored pair (both numbers, as the read path counts
+    // them), or, when the original never recorded it, the decoded source's display size (which
+    // the persist below backfills). Every row's origin is signed with them, persisted or not, so
+    // the rows of one original always share one origin.
+    const stored = storedDims(original);
     // At least one pixel a side, as the plan rounds sides: a vector source may be fractional.
-    const mediaDims = storedDims ?? {
+    const mediaDims = stored ?? {
       width: Math.max(1, Math.round(info.width)),
       height: Math.max(1, Math.round(info.height)),
     };
+    const backfillDims =
+      stored === undefined && persist ? mediaDims : undefined;
     const origin = previewOrigin(original.storageRef, mediaDims);
+    if (stored === undefined) {
+      // Measured now, before any pixel decode: the rows signed with this size are fresh after all.
+      const fresh = catalog.freshIdentities(media, scope, mediaDims);
+      pending = pending.filter((v) => !fresh.has(catalog.identity(scope, v)));
+      if (pending.length === 0) {
+        // Nothing to render, but the dimensions are recorded, so the next read proves the rows
+        // fresh without this download.
+        if (backfillDims) {
+          await this.#recorder.record(mediaId, scope, [], backfillDims);
+        }
+        return {
+          ...nothing(),
+          originDims: mediaDims,
+          ...(backfillDims ? { backfilled: backfillDims } : {}),
+        };
+      }
+    }
+    // The pending identities a stored row holds (stale, or from before rows were signed): the
+    // persist replaces those rows instead of appending beside them.
+    const storedIds = catalog.storedIdentities(media, scope);
+    const replacing = new Set(
+      pending
+        .map((v) => catalog.identity(scope, v))
+        .filter((identity) => storedIds.has(identity)),
+    );
 
     const pipeline = pipelines.get(pipelineName);
     const beforeSteps = pipeline.beforeSteps ?? [];
@@ -873,11 +979,11 @@ export class Processor {
           previewRow(plan, encoded, ref, {
             scope,
             origin,
-            encodeSig: encodeSignature(config, {
-              format: plan.variant.format,
-              fit: plan.variant.fit === true,
-              version: pipeline.version,
-            }),
+            encodeSig: catalog.encodeSig(
+              pipelineName,
+              plan.variant.format,
+              plan.variant.fit === true,
+            ),
           }),
         );
       } catch (err) {
@@ -916,11 +1022,10 @@ export class Processor {
     });
     generated = rendered.map(({ row }) => row);
 
-    // ONE atomic persist for everything generated (+ display-dim backfill when the original
-    // never carried dims; previewRecorder.ts), then fire onPreviewGenerated per stored preview
-    // (ctx {}).
-    if (persist && generated.length > 0) {
-      const backfillDims = storedDims === undefined ? mediaDims : undefined;
+    // ONE persist for everything generated: one append of the new rows (+ display-dim backfill
+    // when the original never carried dims) and one replace of the stale ones
+    // (previewRecorder.ts), then fire onPreviewGenerated per stored preview (ctx {}).
+    if (persist && (generated.length > 0 || backfillDims)) {
       let recorded: RecordResult;
       try {
         recorded = await this.#recorder.record(
@@ -928,6 +1033,8 @@ export class Processor {
           scope,
           generated,
           backfillDims,
+          replacing,
+          mediaDims,
         );
       } catch (err) {
         // Nothing this call rendered is known to be stored.
@@ -943,9 +1050,16 @@ export class Processor {
         throw err;
       }
       generated = recorded.stored;
-      alreadyStored.push(...recorded.alreadyStored);
+      removed = recorded.removed;
+      for (const row of generated) {
+        const identity = catalog.identity(scope, row);
+        if (replacing.has(identity)) {
+          replaced.add(identity);
+        }
+      }
       const kept = new Set(generated);
       const duplicates = new Set(recorded.alreadyStored);
+      const blocked = new Set(recorded.blocked);
       for (const { plan, row } of rendered) {
         const ms = durations.get(plan) ?? 0;
         if (kept.has(row)) {
@@ -955,6 +1069,13 @@ export class Processor {
         } else if (duplicates.has(plan.identity)) {
           recordVariant(plan.identity, plan.variant.format, ms, 'duplicate', {
             bytes: row.bytes,
+          });
+        } else if (blocked.has(plan.identity)) {
+          // Another worker's row with other signatures holds the identity: not covered, so the
+          // variant failed (its task retries and replaces that row).
+          failedCount += 1;
+          recordVariant(plan.identity, plan.variant.format, ms, 'failed', {
+            code: 'RESIZE_WORKER_INCOMPLETE',
           });
         } else {
           // The media store left it out and does not hold it (or the media is gone): logged by
@@ -979,6 +1100,13 @@ export class Processor {
       }
     }
 
-    return { generated, failedCount, alreadyStored };
+    return {
+      generated,
+      failedCount,
+      removed,
+      replaced,
+      originDims: mediaDims,
+      ...(backfillDims ? { backfilled: backfillDims } : {}),
+    };
   }
 }

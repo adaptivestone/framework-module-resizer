@@ -254,10 +254,15 @@ export interface GenerateOpts {
 }
 
 // `created` is only the rows THIS call produced. Empty + `failed === 0` is success
-// (already stored or an empty catalog). Total failure throws.
+// (already stored and fresh, or an empty catalog). A stored preview made with other settings or
+// from another original is outdated: it is rendered again and replaced. Total failure throws.
 export interface GenerateResult {
   created: Preview[];
   failed: number;
+  // The storage refs of the outdated stored previews that `created` replaced (one write). Set only
+  // when there are any, so never with `persist: false`. Their files are not deleted: that is the
+  // host's job.
+  replaced?: StorageRef[];
 }
 
 // Options for `invalidate`: which of this Resizer's stored previews of a media to remove.

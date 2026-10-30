@@ -93,16 +93,20 @@ test('storedPreviews keeps the later of two rows with one identity', () => {
 });
 
 test('missing skips stored identities and sizes without a key', () => {
-  const media: MediaLike = {
-    previews: [
-      {
-        storageRef: { key: 'a.jpg' },
-        sizeKey: '10x10',
-        format: 'jpeg',
-        contentType: 'image/jpeg',
-      },
-    ],
-  };
+  const media: MediaLike = stampFresh(
+    {
+      original: { storageRef: { key: 'o' }, width: 10, height: 10 },
+      previews: [
+        {
+          storageRef: { key: 'a.jpg' },
+          sizeKey: '10x10',
+          format: 'jpeg',
+          contentType: 'image/jpeg',
+        },
+      ],
+    },
+    { config },
+  );
   const missing = catalog.missing(
     media,
     [{ width: 10, height: 10 }, {}, { width: 30 }],
@@ -112,6 +116,20 @@ test('missing skips stored identities and sizes without a key', () => {
   assert.deepEqual(
     missing.map((variant) => variant.sizeKey),
     ['30w'],
+  );
+  // A stored identity whose row is stale is still missing: it renders again.
+  const stale = structuredClone(media);
+  delete stale.previews?.[0].encodeSig;
+  assert.deepEqual(
+    catalog
+      .missing(
+        stale,
+        [{ width: 10, height: 10 }, {}, { width: 30 }],
+        ['jpeg'],
+        scope,
+      )
+      .map((variant) => variant.sizeKey),
+    ['10x10', '30w'],
   );
   // expand ignores what is stored.
   assert.deepEqual(

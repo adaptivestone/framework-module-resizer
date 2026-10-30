@@ -6,7 +6,6 @@ import { expectedOrigin, isFreshRow } from './freshness.ts';
 import {
   canonicalizeVariants,
   configuredFormats,
-  expandMissingPreviews,
   expandPreviewRequests,
   getPreviewIdentity,
   splitConfigured,
@@ -62,14 +61,20 @@ export class Catalog {
     return expandPreviewRequests(sizes, formats, scope);
   }
 
-  /** What `expand` returns, less the identities already stored on `media` for `scope`. */
+  /**
+   * What `expand` returns, less the identities stored FRESH on `media` for `scope` (by its stored
+   * dimensions): a stale stored identity is still to render.
+   */
   missing(
     media: MediaLike,
     sizes: SizeInput[],
     formats: PreviewFormat[],
     scope: PreviewScope,
   ): MissingPreview[] {
-    return expandMissingPreviews(media, sizes, formats, scope);
+    const fresh = this.freshIdentities(media, scope);
+    return expandPreviewRequests(sizes, formats, scope).filter(
+      (preview) => !fresh.has(this.identity(scope, preview)),
+    );
   }
 
   /** The usable stored previews of `scope` by identity; a later row wins. */

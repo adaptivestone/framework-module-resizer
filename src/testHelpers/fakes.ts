@@ -159,6 +159,40 @@ export function clockLocks(now: () => number = () => Date.now()): ClockLocks {
 }
 
 /**
+ * The replacePreviews contract over one media's rows, in place (a test that holds the array sees
+ * the swap): remove every row whose stored `identity` is in `identities` or is the identity of one
+ * of `previews`, then store `previews` (of rows sharing an identity, only the first).
+ */
+function replaceRows(
+  media: Preview[],
+  identities: string[],
+  previews: Preview[],
+): { stored: Preview[]; removed: Preview[] } {
+  const stored: Preview[] = [];
+  const seen = new Set<string>();
+  for (const preview of previews) {
+    if (preview.identity !== undefined) {
+      if (seen.has(preview.identity)) {
+        continue;
+      }
+      seen.add(preview.identity);
+    }
+    stored.push(preview);
+  }
+  const remove = new Set([...identities, ...seen]);
+  const kept: Preview[] = [];
+  const removed: Preview[] = [];
+  for (const row of media) {
+    (row.identity !== undefined && remove.has(row.identity)
+      ? removed
+      : kept
+    ).push(row);
+  }
+  media.splice(0, media.length, ...kept, ...stored);
+  return { stored, removed };
+}
+
+/**
  * A MediaStore from optional parts; missing parts are harmless in-memory stand-ins. The default
  * appendPreviews and replacePreviews follow the media contract on `previews` (rows per media id;
  * pass a map to seed or inspect it; every media id counts as present). appendPreviews keeps one
@@ -197,31 +231,9 @@ export function fakeMedia(
     identities: string[],
     previews: Preview[],
   ) => {
-    const stored: Preview[] = [];
-    const seen = new Set<string>();
-    for (const preview of previews) {
-      if (preview.identity !== undefined) {
-        if (seen.has(preview.identity)) {
-          continue;
-        }
-        seen.add(preview.identity);
-      }
-      stored.push(preview);
-    }
     const media = rows.get(mediaId) ?? [];
     rows.set(mediaId, media);
-    const remove = new Set([...identities, ...seen]);
-    const kept: Preview[] = [];
-    const removed: Preview[] = [];
-    for (const row of media) {
-      (row.identity !== undefined && remove.has(row.identity)
-        ? removed
-        : kept
-      ).push(row);
-    }
-    // In place, like appendPreviews: a test that holds the seeded array sees the swap.
-    media.splice(0, media.length, ...kept, ...stored);
-    return { stored, removed };
+    return replaceRows(media, identities, previews);
   };
   return {
     loadMedia: parts.load ?? (async () => null),
@@ -703,18 +715,48 @@ export function memoryStorageDriver(): StorageDriver & {
   };
 }
 
+/** The calls a docMedia() store received, in order. */
+export interface DocMediaCalls {
+  appendCalls: Array<{
+    mediaId: string;
+    previews: Preview[];
+    backfillDims?: { width: number; height: number };
+  }>;
+  replaceCalls: Array<{
+    mediaId: string;
+    identities: string[];
+    rows: Preview[];
+  }>;
+}
+
 /**
  * A MediaStore over the media documents in `docs`: loadMedia returns the document, and stored
  * previews land on its `previews` (one row per preview identity), so a test that holds the
- * document sees what a worker stored.
+ * document sees what a worker stored. appendPreviews sets `backfillDims` on the document's
+ * original before it stores any row, also when it stores none, as MongoMediaStore does;
+ * replacePreviews follows the media contract on the document. Every call is kept in
+ * `appendCalls` and `replaceCalls`.
  */
-export function docMedia(docs: Map<string, MediaLike>): MediaStore {
-  return fakeMedia({
+export function docMedia(
+  docs: Map<string, MediaLike>,
+): MediaStore & DocMediaCalls {
+  const appendCalls: DocMediaCalls['appendCalls'] = [];
+  const replaceCalls: DocMediaCalls['replaceCalls'] = [];
+  const store = fakeMedia({
     load: async (id) => docs.get(id) ?? null,
-    appendPreviews: async (id, previews: Preview[]) => {
+    appendPreviews: async (id, previews: Preview[], backfillDims) => {
+      appendCalls.push({
+        mediaId: id,
+        previews,
+        ...(backfillDims ? { backfillDims } : {}),
+      });
       const doc = docs.get(id);
       if (!doc) {
         return [];
+      }
+      if (backfillDims && doc.original) {
+        doc.original.width = backfillDims.width;
+        doc.original.height = backfillDims.height;
       }
       const rows = doc.previews ?? [];
       const stored = previews.filter(
@@ -725,7 +767,17 @@ export function docMedia(docs: Map<string, MediaLike>): MediaStore {
       doc.previews = [...rows, ...stored];
       return stored;
     },
+    replacePreviews: async (id, identities, rows) => {
+      replaceCalls.push({ mediaId: id, identities, rows });
+      const doc = docs.get(id);
+      if (!doc) {
+        return { stored: [], removed: [] };
+      }
+      doc.previews ??= [];
+      return replaceRows(doc.previews, identities, rows);
+    },
   });
+  return Object.assign(store, { appendCalls, replaceCalls });
 }
 
 /**

@@ -260,9 +260,9 @@ export function storedIdentities(
 
 /**
  * Expand `sizes × formats` into a deduped `MissingPreview[]`, skipping any size whose key can't
- * be built (`getSizeKey` throws) and any identity already stored for `scope`. Eager `generate`
- * and `prewarm` expand the whole catalog up front this way. The read path does not: its
- * per-cell loop interleaves expansion with serving the ready cells.
+ * be built (`getSizeKey` throws) and any identity already stored for `scope`, fresh or stale.
+ * isCatalogCovered uses it; eager `generate` skips only fresh identities (Catalog.missing). The
+ * read path does not: its per-cell loop interleaves expansion with serving the ready cells.
  */
 export function expandMissingPreviews(
   media: MediaLike,
