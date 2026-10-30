@@ -19,14 +19,18 @@ import {
 } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { HookBus } from './hooks.ts';
+import { NoopMetrics } from './metrics.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { prewarmFailure, Reader, type ReaderDeps } from './reader.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
+import { RoutingTaskQueue } from './routing.ts';
 import {
   fakeMedia,
   MemoryTaskQueue,
   PlainTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
+import { stampFresh } from './testHelpers/fresh.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -931,7 +935,7 @@ describe('resolve — enqueue wiring', () => {
     assert.equal(decision.missing.length, 1);
     assert.equal(calls.length, 0);
     assert.equal(acquired.length, 0);
-    assert.equal(info.length, 1);
+    assert.equal(info.length, 0);
   });
 
   test('an absent original leaves variants missing without enqueueing or locking', async () => {
@@ -952,7 +956,7 @@ describe('resolve — enqueue wiring', () => {
     assert.equal(decision.missing.length, 1);
     assert.equal(calls.length, 0);
     assert.equal(acquired.length, 0);
-    assert.equal(info.length, 1);
+    assert.equal(info.length, 0);
   });
 });
 
@@ -1708,5 +1712,355 @@ describe('rows written before previews recorded their metadata', () => {
     assert.deepEqual(decision.missing, []);
     assert.equal((await reader.prewarm({ media, sizes })).status, 'ready');
     assert.deepEqual(tasks.added, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read metrics: one `resize.read` per resolve(), and the logs a read writes once.
+// ---------------------------------------------------------------------------
+
+describe('read metrics', () => {
+  function recordingLogger() {
+    const info: unknown[][] = [];
+    const warn: unknown[][] = [];
+    const error: unknown[][] = [];
+    const logger: ResizeLogger = {
+      info: (...a: unknown[]) => {
+        info.push(a);
+      },
+      warn: (...a: unknown[]) => {
+        warn.push(a);
+      },
+      error: (...a: unknown[]) => {
+        error.push(a);
+      },
+    };
+    return { logger, info, warn, error };
+  }
+  // One stored jpeg preview of Resizer `resizer`, 300x300; stamp it fresh before reading.
+  const storedMedia = (resizer = 'default'): MediaLike => ({
+    id: 'm1',
+    original: { storageRef: { key: 'orig.jpg' }, width: 4000, height: 3000 },
+    previews: [
+      {
+        storageRef: { key: 'p1' },
+        resizer,
+        contentType: 'image/jpeg',
+        sizeKey: '300x300',
+        format: 'jpeg',
+      },
+    ],
+  });
+  const stored = [{ width: 300, height: 300 }];
+  const withMissing = [
+    { width: 300, height: 300 },
+    { width: 600, height: 600 },
+  ];
+  const readsOf = (sink: ReturnType<typeof recordingMetrics>) =>
+    sink.calls.filter((call) => call.name === 'resize.read');
+
+  test('each resolve() counts one read with its outcome', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      name: 'reads',
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      metrics: sink,
+      logger: silent,
+    });
+    await r.ready();
+    const media = stampFresh(storedMedia('reads'), { config: r.config });
+    const read = { media, formats: ['jpeg'] };
+    await r.resolve({ ...read, sizes: stored });
+    await r.resolve({ ...read, sizes: withMissing });
+    await r.resolve({ ...read, sizes: withMissing });
+    await r.resolve({ ...read, sizes: withMissing, enqueueMissing: false });
+    await r.resolve({ media: { id: 'm2' }, sizes: stored, formats: ['jpeg'] });
+    await r.resolve({ ...read, sizes: withMissing, pipeline: 'retired' });
+
+    const tapped = new Resizer({
+      name: 'tapped',
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      metrics: sink,
+      logger: silent,
+      hooks: { beforeEnqueue: () => [] },
+    });
+    await tapped.resolve({ ...read, sizes: withMissing });
+
+    const eagerLog = recordingLogger();
+    const eager = new Resizer({
+      name: 'eager',
+      storage: makeStorage(),
+      media: fakeMedia(),
+      metrics: sink,
+      logger: eagerLog.logger,
+    });
+    await eager.resolve({ ...read, sizes: withMissing });
+    assert.equal(eagerLog.warn.length, 0);
+    await eager.resolve({ ...read, sizes: withMissing, enqueueMissing: true });
+    assert.equal(eagerLog.warn.length, 1);
+
+    // No lock store beside a task queue that does not gate by task: it cannot be used.
+    const plain = new Resizer({
+      name: 'plain',
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new PlainTaskQueue(),
+      metrics: sink,
+      logger: silent,
+    });
+    await plain.resolve({ ...read, sizes: withMissing });
+
+    const reads = readsOf(sink);
+    assert.deepEqual(
+      reads.map((call) => [call.labels.resizer, call.labels.outcome]),
+      [
+        ['reads', 'ready'],
+        ['reads', 'enqueued'],
+        ['reads', 'in-flight'],
+        ['reads', 'suppressed'],
+        ['reads', 'no-original'],
+        ['reads', 'unknown-pipeline'],
+        ['tapped', 'suppressed'],
+        ['eager', 'eager-only'],
+        ['eager', 'eager-only'],
+        ['plain', 'failed'],
+      ],
+    );
+    assert.ok(reads.every((call) => call.kind === 'count' && call.value === 1));
+    assert.deepEqual(reads[0].labels, {
+      resizer: 'reads',
+      pipeline: 'default',
+      outcome: 'ready',
+    });
+    assert.deepEqual(reads[0].context, {
+      mediaId: 'm1',
+      ready: 1,
+      missing: 0,
+      stale: 0,
+    });
+    assert.deepEqual(reads[1].context, {
+      mediaId: 'm1',
+      ready: 1,
+      missing: 1,
+      stale: 0,
+    });
+    assert.equal(reads[5].labels.pipeline, 'unregistered');
+    assert.equal(reads[5].context.pipeline, 'retired');
+  });
+
+  test('a route whose build fails: resolve() serves the stored previews, logs once, and counts failed', async () => {
+    const sink = recordingMetrics();
+    const log = recordingLogger();
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new RoutingTaskQueue({
+        default: new MemoryTaskQueue(),
+        bulk: async () => {
+          throw new Error('boom');
+        },
+      }),
+      metrics: sink,
+      logger: log.logger,
+    });
+    await r.ready();
+    const media = stampFresh(storedMedia(), { config: r.config });
+    for (let i = 0; i < 2; i++) {
+      const { decision } = await r.resolve({
+        media,
+        sizes: withMissing,
+        formats: ['jpeg'],
+        queue: 'bulk',
+      });
+      assert.deepEqual(
+        decision.ready.map((entry) => entry.url),
+        ['https://cdn/p1'],
+      );
+      assert.equal(decision.missing.length, 1);
+    }
+    assert.equal(log.error.length, 1);
+    assert.match(String(log.error[0][0]), /its backend could not be built/);
+    assert.deepEqual(
+      readsOf(sink).map((call) => call.labels.outcome),
+      ['failed', 'failed'],
+    );
+  });
+
+  test('a read on a media without original logs nothing', async () => {
+    const sink = recordingMetrics();
+    const log = recordingLogger();
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      metrics: sink,
+      logger: log.logger,
+    });
+    for (let i = 0; i < 3; i++) {
+      await r.resolve({
+        media: { id: 'm1' },
+        sizes: stored,
+        formats: ['jpeg'],
+      });
+    }
+    assert.deepEqual(log.info, []);
+    assert.deepEqual(log.warn, []);
+    assert.deepEqual(log.error, []);
+    assert.deepEqual(
+      readsOf(sink).map((call) => call.labels.outcome),
+      ['no-original', 'no-original', 'no-original'],
+    );
+  });
+
+  test('an unregistered pipeline is logged once per name, and at most 100 names', async () => {
+    const log = recordingLogger();
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      metrics: new NoopMetrics(),
+      logger: log.logger,
+    });
+    const read = { media: { id: 'm1' }, sizes: stored, formats: ['jpeg'] };
+    await r.resolve({ ...read, pipeline: 'retired' });
+    await r.resolve({ ...read, pipeline: 'retired' });
+    await r.resolve({ ...read, pipeline: 'old' });
+    assert.equal(log.error.length, 2);
+    assert.match(String(log.error[0][0]), /'retired'/);
+    assert.match(String(log.error[1][0]), /'old'/);
+
+    const manyLog = recordingLogger();
+    const many = new Resizer({
+      name: 'many',
+      storage: makeStorage(),
+      media: fakeMedia(),
+      metrics: new NoopMetrics(),
+      logger: manyLog.logger,
+    });
+    for (let i = 0; i < 150; i++) {
+      await many.resolve({ ...read, pipeline: `p${i}` });
+    }
+    assert.equal(manyLog.error.length, 100);
+  });
+
+  test('the eager-only warning is written once', async () => {
+    const log = recordingLogger();
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      metrics: new NoopMetrics(),
+      logger: log.logger,
+    });
+    await r.ready();
+    const media = stampFresh(storedMedia(), { config: r.config });
+    for (let i = 0; i < 3; i++) {
+      await r.resolve({
+        media,
+        sizes: withMissing,
+        formats: ['jpeg'],
+        enqueueMissing: true,
+      });
+    }
+    assert.equal(log.warn.length, 1);
+  });
+
+  test('a dropped per-call format list is logged once per list', async () => {
+    const log = recordingLogger();
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      metrics: new NoopMetrics(),
+      logger: log.logger,
+    });
+    const read = { media: { id: 'm1' }, sizes: stored };
+    await r.resolve({ ...read, formats: ['jpg'] });
+    await r.resolve({ ...read, formats: ['jpg'] });
+    await r.resolve({ ...read, formats: ['bmp'] });
+    assert.equal(log.error.length, 2);
+    assert.match(String(log.error[0][0]), /"jpg"/);
+    assert.match(String(log.error[1][0]), /"bmp"/);
+  });
+
+  test('a metrics sink that throws or rejects never breaks a read', async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onRejection);
+    try {
+      const sinks = {
+        throwing: {
+          count() {
+            throw new Error('x');
+          },
+          timing() {
+            throw new Error('x');
+          },
+        },
+        rejecting: {
+          async count() {
+            throw new Error('y');
+          },
+          async timing() {
+            throw new Error('y');
+          },
+        },
+        baseline: new NoopMetrics(),
+      };
+      const results: Record<string, unknown> = {};
+      const errors: Record<string, unknown[][]> = {};
+      for (const [name, metrics] of Object.entries(sinks)) {
+        const log = recordingLogger();
+        errors[name] = log.error;
+        const r = new Resizer({
+          name,
+          storage: makeStorage(),
+          media: fakeMedia(),
+          tasks: new MemoryTaskQueue(),
+          metrics,
+          logger: log.logger,
+        });
+        await r.ready();
+        const media = stampFresh(storedMedia(name), { config: r.config });
+        const reads = [];
+        for (let i = 0; i < 2; i++) {
+          const { decision, output } = await r.resolve({
+            media,
+            sizes: withMissing,
+            formats: ['jpeg'],
+          });
+          reads.push({
+            ready: decision.ready.map((entry) => entry.url),
+            missing: decision.missing,
+            output,
+          });
+        }
+        results[name] = reads;
+      }
+      // Let the rejections settle before looking.
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        (results.baseline as { ready: string[] }[]).map((read) => read.ready),
+        [['https://cdn/p1'], ['https://cdn/p1']],
+      );
+      assert.deepEqual(results.throwing, results.baseline);
+      assert.deepEqual(results.rejecting, results.baseline);
+      assert.deepEqual(errors.baseline, []);
+      for (const name of ['throwing', 'rejecting']) {
+        assert.equal(errors[name].length, 1, name);
+        assert.match(
+          String(errors[name][0][0]),
+          new RegExp(
+            `the metrics sink of Resizer '${name}' failed on 'resize\\.read'`,
+          ),
+        );
+      }
+      assert.deepEqual(rejections, []);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
   });
 });

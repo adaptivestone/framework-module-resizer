@@ -514,6 +514,7 @@ export class Resizer {
       logger: this.logger,
       name: this.name,
       queueName: this.queueName,
+      metrics: this.#boundMetrics,
     });
   }
 
@@ -716,6 +717,13 @@ export class Resizer {
         this.logger,
         'resize resolve: the Resizer could not start — returning the safe empty decision',
         err,
+      );
+      // Counted like a read that failed inside the Reader; `opts` may be missing (a JS host).
+      this.#boundMetrics.count(
+        'resize.read',
+        1,
+        { pipeline: opts?.pipeline ?? 'default', outcome: 'failed' },
+        { ready: 0, missing: 0, stale: 0 },
       );
       return { decision: { ready: [], missing: [] }, output: undefined };
     }
