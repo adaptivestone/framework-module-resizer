@@ -79,7 +79,9 @@ test('s3 storage without @aws-sdk/client-s3: first use and verify() reject with 
         media: { id: 'm1', original: { storageRef: { key: 'k' }, format: 'png' } },
         sizes,
       });
-      console.log(JSON.stringify({ ready, verify, decision: read.decision, driverFiles }));
+      const { builtinDrivers, probeDriver } = await import(${href('./builtins.ts')});
+      const probe = probeDriver(builtinDrivers.storage.s3, 's3', 'the test');
+      console.log(JSON.stringify({ ready, verify, decision: read.decision, driverFiles, missing: probe.missing }));
     `,
   );
   for (const error of [seen.ready, seen.verify] as Array<{
@@ -92,6 +94,8 @@ test('s3 storage without @aws-sdk/client-s3: first use and verify() reject with 
     assert.ok(error.message.includes('@aws-sdk/s3-request-presigner'));
   }
   assert.deepEqual(seen.decision, { ready: [], missing: [] });
+  // Only the package that cannot be found is reported missing, not every peer of the driver.
+  assert.deepEqual(seen.missing, ['@aws-sdk/client-s3']);
   // The probe needs no driver module.
   assert.deepEqual(seen.driverFiles, []);
 });
@@ -183,8 +187,10 @@ test('a database Resizer beside an sqs queue without its SDK: database reads, en
   assert.ok(bulkWorker.message.includes("'bulk'"));
   assert.ok(bulkWorker.message.includes('@aws-sdk/client-sqs'));
   assert.deepEqual(seen.driverFiles, []);
-  // Only the probe asked for the SDK.
-  assert.deepEqual(seen.sqsResolved, ['@aws-sdk/client-sqs']);
+  // Only the probe asked for the SDK (by name, through the resolver), and nothing else of AWS.
+  const asked = seen.sqsResolved as string[];
+  assert.ok(asked.length > 0);
+  assert.deepEqual([...new Set(asked)], ['@aws-sdk/client-sqs']);
 });
 
 test('an sqs own queue without its SDK beside a database queue: a worker for the database queue starts; verify() rejects with RESIZE_PEER_MISSING', async () => {

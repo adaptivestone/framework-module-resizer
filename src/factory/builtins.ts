@@ -93,24 +93,36 @@ const PEERS = new Map<object, readonly string[]>([
 ]);
 
 /** The optional packages `driver` needs (none for a host driver or a peer-free built-in). */
-export function peersOf(driver: object): readonly string[] {
+function peersOf(driver: object): readonly string[] {
   return PEERS.get(driver) ?? [];
 }
 
+/** A driver whose optional packages are not all installed. */
+export interface PeerProbe {
+  error: ResizeSetupError; // RESIZE_PEER_MISSING, naming the driver, its packages and `where`
+  missing: readonly string[]; // the packages the resolver cannot find
+}
+
+const resolveHere = (specifier: string): string =>
+  import.meta.resolve(specifier);
+
 /**
- * The RESIZE_PEER_MISSING error when an optional package of `driver` (registered as `name`,
- * selected in `where`) cannot be resolved from here; undefined when all of them resolve or it
- * needs none. Nothing is loaded.
+ * What is missing when an optional package of `driver` (registered as `name`, selected in
+ * `where`) cannot be resolved from here; undefined when all of them resolve or it needs none.
+ * Nothing is loaded.
  */
 export function probeDriver(
   driver: object,
   name: string,
   where: string,
-): ResizeSetupError | undefined {
+): PeerProbe | undefined {
   const peers = peersOf(driver);
-  return peers.length === 0
-    ? undefined
-    : probePeers(peers, name, where, (specifier) =>
-        import.meta.resolve(specifier),
-      );
+  const error = probePeers(peers, name, where, resolveHere);
+  if (!error) {
+    return undefined;
+  }
+  const missing = peers.filter(
+    (peer) => probePeers([peer], name, where, resolveHere) !== undefined,
+  );
+  return { error, missing };
 }

@@ -827,3 +827,49 @@ test('configuredOptions: eagerDatabase gives media (and locks beside tasks in co
   await d.ready();
   assert.notStrictEqual(d.tasks, a.tasks);
 });
+
+test('eagerDatabase with an async driver that rejects: construction does not crash, and first use rejects with its error', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    let builds = 0;
+    const down = {
+      fromConfig: async (): Promise<never> => {
+        builds += 1;
+        throw new Error('db down');
+      },
+    };
+    const source: ConfigSource = {
+      own: () => ({ image: {} }),
+      process: () => ({
+        queues: [],
+        coordination: undefined,
+        validated: new Set(),
+      }),
+      database: () => ({ driver: 'down' }),
+      eagerDatabase: true,
+      where: { own: 'the own file', process: 'the shared file' },
+      storageAdvice: 'or pass `storage` to the test',
+    };
+    const resizer = new Resizer(
+      configuredOptions(source, {
+        drivers: { database: { down } },
+        storage: memoryStorage().storage,
+        logger: silentLogger,
+      }),
+    );
+    // Started at construction; its rejection must not be left unhandled.
+    assert.equal(builds, 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(unhandled, []);
+    // First use builds again and rejects with the driver's error.
+    await assert.rejects(resizer.ready(), /db down/);
+    assert.equal(builds, 2);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});

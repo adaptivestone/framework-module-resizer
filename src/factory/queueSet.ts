@@ -16,7 +16,7 @@ import {
   type UnavailableReason,
 } from '../routing.ts';
 import type { ResizeLogger } from '../types.d.ts';
-import { peersOf, probeDriver } from './builtins.ts';
+import { probeDriver } from './builtins.ts';
 
 /** Keeps one build per key: built once, its promise kept, a rejected build forgotten. */
 export type ShareFn = <V>(key: string, build: () => Promise<V>) => Promise<V>;
@@ -74,15 +74,19 @@ export function planQueueSet(
   const unavailable: Array<{ names: string[]; reason: UnavailableReason }> = [];
   for (const backend of backends.values()) {
     const { driver, driverName, entries: own } = backend;
-    const error = probeDriver(
+    const probe = probeDriver(
       driver,
       driverName,
       `\`queues.${own[0].name}\` in ${ctx.where}`,
     );
-    if (error) {
+    if (probe) {
       unavailable.push({
         names: own.map((entry) => entry.name),
-        reason: { driver: driverName, packages: peersOf(driver), error },
+        reason: {
+          driver: driverName,
+          packages: probe.missing,
+          error: probe.error,
+        },
       });
     } else {
       available.push(backend);

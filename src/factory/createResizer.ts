@@ -294,7 +294,9 @@ export function configuredOptions(
     try {
       const started = startParts();
       if (isThenable(started)) {
-        keep(Promise.resolve(started));
+        // Nothing awaits it before first use: a rejection is forgotten here (the build runs
+        // again then and rejects there), never left unhandled.
+        keep(Promise.resolve(started)).catch(() => {});
       } else {
         eager = { parts: started };
       }
@@ -484,7 +486,7 @@ async function storageOf(
   const [name, driver] = selected(section, drivers, 'storage', ctx.where);
   const missing = probeDriver(driver, name, ctx.where);
   if (missing) {
-    throw missing;
+    throw missing.error;
   }
   const built: unknown = await driver.fromConfig(
     section as { driver: string },
@@ -513,7 +515,7 @@ function databasePartsOf(
   const [name, driver] = selected(section, drivers, 'database', ctx.where);
   const missing = probeDriver(driver, name, ctx.where);
   if (missing) {
-    throw missing;
+    throw missing.error;
   }
   const check = (parts: unknown): DatabaseParts => {
     if (

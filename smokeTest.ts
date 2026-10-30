@@ -291,13 +291,16 @@ const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-re
 import {
   type CreateResizerOptions,
   createResizer,
+  type DriverRegistry,
   type InvalidateOpts,
   LockStore,
   MediaStore,
   type Preview,
   type QueueConfig,
+  type QueueDriver,
   type ReplacedPreviews,
   type ResizerConfig,
+  type StorageDriver,
   type StorageRef,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
@@ -415,6 +418,39 @@ const factoryConfig = {
 } satisfies ResizerConfig;
 const factoryOptions: CreateResizerOptions = { name: 'factory', media: plainMedia };
 const viaFactory = (): Resizer => createResizer(factoryConfig, factoryOptions);
+// Host drivers registered by name: their sections type-check through the registry generics.
+interface MemoryStorageSection { driver: 'memory'; prefix: string }
+const memoryStorageDriver: StorageDriver<MemoryStorageSection> = {
+  fromConfig: (section) => ({
+    download: async () => Buffer.alloc(0),
+    upload: async () => ({ key: section.prefix }),
+    publicUrl: () => section.prefix,
+  }),
+};
+interface RedisQueueSection { driver: 'redis'; url: string }
+const redisQueueDriver: QueueDriver<RedisQueueSection> = {
+  fromConfig: () => {
+    throw new Error('never built here');
+  },
+};
+const hostDrivers = {
+  storage: { memory: memoryStorageDriver },
+  queue: { redis: redisQueueDriver },
+} satisfies DriverRegistry;
+const viaHostDrivers = (): Resizer =>
+  createResizer(
+    {
+      storage: { driver: 'memory', prefix: '/m' },
+      queues: { default: { driver: 'database' }, bulk: { driver: 'redis', url: 'redis://r' } },
+    },
+    { drivers: hostDrivers, media: plainMedia },
+  );
+const missingPrefix = (): Resizer =>
+  // @ts-expect-error a registered storage section keeps its own required keys
+  createResizer({ storage: { driver: 'memory' } }, { drivers: hostDrivers, media: plainMedia });
+const unregistered = (): Resizer =>
+  // @ts-expect-error a section whose driver is not registered is refused
+  createResizer({ storage: { driver: 'gcs' } }, { media: plainMedia });
 // A core construction site (never called here: it would register a Resizer).
 const core = () =>
   new Resizer({
@@ -429,6 +465,9 @@ void [
   media,
   core,
   viaFactory,
+  viaHostDrivers,
+  missingPrefix,
+  unregistered,
   invalidated,
   FrameworkMediaStore,
   FrameworkLockStore,
