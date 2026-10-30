@@ -82,8 +82,8 @@ function geometry(
   const rw = v.requestedWidth;
   const rh = v.requestedHeight;
 
-  // Fit: inside maxSize, never enlarged.
-  if (v.fit) {
+  // Fit: inside maxSize, never enlarged. Only `true` is a fit variant, as the row is signed.
+  if (v.fit === true) {
     const d = calculateResizedDimensions(
       w,
       h,

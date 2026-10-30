@@ -1996,6 +1996,36 @@ describe('processTask — persistence & failure handling', () => {
     assert.equal(appendCalls.length, 0);
   });
 
+  test('poison variant with zero successes on a media without dimensions → the measured dimensions are recorded, and processTask THROWS', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const pipeline: Pipeline = {
+      variantSteps: [
+        async () => {
+          throw new Error('poison');
+        },
+      ],
+    };
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+      pipelines: { default: pipeline },
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeGenerateError &&
+        err.code === 'RESIZE_WORKER_INCOMPLETE',
+    );
+    assert.equal(uploads.length, 0);
+    // The download measured the original: its dimensions are recorded, with no row.
+    assert.deepEqual(appendCalls, [
+      { mediaId: 'm1', previews: [], backfillDims: { width: 64, height: 48 } },
+    ]);
+  });
+
   test('partial success persists the good preview but throws so the task is retried', async () => {
     installApp();
     const { storage, uploads } = makeStorage(redPng);
@@ -5754,5 +5784,163 @@ describe('variant metrics', () => {
       ),
       taskId: 'task-7',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Freshness in the worker and in eager generate(): the warnings, the caller's dimensions, a
+// persist that fails between its two writes, and a store that cannot replace.
+// ---------------------------------------------------------------------------
+
+describe('regenerating stale previews', () => {
+  const dims = { width: 64, height: 48 };
+
+  /** A 20x20 jpeg row of `pipeline`, as the worker stores it (not yet signed). */
+  function storedRow(pipeline = 'default', key = 'previews/stored.jpeg') {
+    return {
+      storageRef: { key },
+      identity: `default:${pipeline}:20x20:jpeg:none`,
+      resizer: 'default',
+      pipeline,
+      sizeKey: '20x20',
+      requestedWidth: 20,
+      requestedHeight: 20,
+      format: 'jpeg',
+      contentType: 'image/jpeg',
+    };
+  }
+
+  /** processorDeps() whose media holds a fresh 20x20 row of default and of wm, with a logger. */
+  function allFreshDeps() {
+    const deps = processorDeps();
+    deps.pipelines = new PipelineRegistry({ wm: {} });
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    deps.media = fakeMedia({
+      load: async () =>
+        stampFresh(
+          mediaDoc({
+            original: dims,
+            previews: [storedRow('default'), storedRow('wm')],
+          }),
+          { config: deps.config },
+        ),
+    });
+    const allFresh = () =>
+      logs.warn.filter((args) => /already fresh/.test(String(args[0])));
+    return { deps, allFresh };
+  }
+
+  test('the all-fresh warning is logged once per pipeline', async () => {
+    const { deps, allFresh } = allFreshDeps();
+    const processor = new Processor(deps);
+    await processor.processTask(task({ taskId: 't1', previews: [variant()] }));
+    await processor.processTask(task({ taskId: 't2', previews: [variant()] }));
+    assert.equal(allFresh().length, 1);
+    assert.equal(
+      allFresh()[0][0],
+      "resize worker: task t1 of media m1 found every requested preview of pipeline 'default' already fresh — if this repeats, the API and the worker may run different image settings or pipeline versions, or resolve() was given the media without its stored original (storageRef, width, height)",
+    );
+    await processor.processTask(
+      task({ taskId: 't3', pipeline: 'wm', previews: [variant()] }),
+    );
+    assert.equal(allFresh().length, 2);
+    assert.match(String(allFresh()[1][0]), /task t3 .* pipeline 'wm'/);
+  });
+
+  test('no all-fresh warning on a later delivery', async () => {
+    const { deps, allFresh } = allFreshDeps();
+    await new Processor(deps).processTask(
+      task({ attempts: 2, previews: [variant()] }),
+    );
+    assert.deepEqual(allFresh(), []);
+  });
+
+  test('generate() on a frozen media.original warns that it could not set the dimensions, and still returns its rows', async () => {
+    const deps = processorDeps();
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    const media = mediaDoc();
+    media.original = Object.freeze({ ...(media.original as Original) });
+    const { created } = await new Processor(deps).generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.equal(created.length, 1);
+    assert.equal(media.original?.width, undefined);
+    assert.equal(logs.warn.length, 1);
+    assert.equal(
+      logs.warn[0][0],
+      "resize: generate() recorded the original's dimensions of media m1 in the media store but could not set them on the caller's media.original, so a same-request resolve() finds its previews stale",
+    );
+    assert.ok(logs.warn[0][1] instanceof TypeError);
+  });
+
+  test('a replace that fails after the append stored rows records those as stored and the rest as failed', async () => {
+    const deps = processorDeps();
+    const metrics = recordingMetrics();
+    deps.metrics = metrics;
+    const db = new Error('db');
+    const appended: Preview[][] = [];
+    deps.media = fakeMedia({
+      load: async () => mediaDoc({ original: dims, previews: [storedRow()] }),
+      appendPreviews: async (_mediaId, previews) => {
+        appended.push(previews);
+        return previews;
+      },
+      replacePreviews: async () => {
+        throw db;
+      },
+    });
+    // 20x20 is stale (unsigned), so it is replaced; 10x10 is new, so it is appended.
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({
+          media: mediaDoc({ original: dims, previews: [storedRow()] }),
+          sizes: [
+            { width: 20, height: 20 },
+            { width: 10, height: 10 },
+          ],
+        }),
+      (err: unknown) => err === db,
+    );
+    assert.deepEqual(
+      appended.map((rows) => rows.map((row) => row.sizeKey)),
+      [['10x10']],
+    );
+    const outcomes = metrics.calls
+      .filter((c) => c.kind === 'timing' && c.name === 'resize.variant')
+      .map((c) => [String(c.context.identity), c.labels.outcome]);
+    assert.deepEqual(outcomes, [
+      ['default:default:20x20:jpeg:none', 'failed'],
+      ['default:default:10x10:jpeg:none', 'stored'],
+    ]);
+    const bytes = metrics.calls.filter(
+      (c) => c.kind === 'count' && c.name === 'resize.variant.bytes',
+    );
+    assert.equal(bytes.length, 1);
+  });
+
+  test('eager generate() on a store without replacePreviews fails before any upload when a row is stale', async () => {
+    const deps = processorDeps();
+    const { storage, uploads } = makeStorage(redPng);
+    deps.storage = storage;
+    deps.media = {
+      loadMedia: async () => null,
+      appendPreviews: async (_mediaId: string, previews: Preview[]) => previews,
+    } as unknown as MediaStore;
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({
+          media: mediaDoc({ original: dims, previews: [storedRow()] }),
+          sizes: [{ width: 20, height: 20 }],
+        }),
+      {
+        code: 'RESIZE_MEDIA_REPLACE_MISSING',
+        message:
+          'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
+      },
+    );
+    assert.equal(uploads.length, 0);
   });
 });

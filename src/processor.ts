@@ -58,7 +58,6 @@ import {
 import {
   checkReplaced,
   PreviewRecorder,
-  type RecordResult,
   requireReplacePreviews,
 } from './previewRecorder.ts';
 import { checkRaster } from './raster.ts';
@@ -440,6 +439,7 @@ export class Processor {
         mode: 'eager',
       });
 
+    // When the call throws, the caller's media keeps no dimensions, even if the store recorded them.
     if (requested.length > 0 && generated.length === 0 && failedCount > 0) {
       throw new ResizeGenerateError({
         mediaId,
@@ -845,7 +845,12 @@ export class Processor {
         // Nothing to render, but the dimensions are recorded, so the next read proves the rows
         // fresh without this download.
         if (backfillDims) {
-          await this.#recorder.record(mediaId, scope, [], backfillDims);
+          const recorded = await this.#recorder.record(mediaId, scope, [], {
+            backfillDims,
+          });
+          if (recorded.failure) {
+            throw recorded.failure.error;
+          }
         }
         return {
           ...nothing(),
@@ -862,6 +867,10 @@ export class Processor {
         .map((v) => catalog.identity(scope, v))
         .filter((identity) => storedIds.has(identity)),
     );
+    // A store that cannot replace fails here, before any decode or upload.
+    if (persist && replacing.size > 0) {
+      requireReplacePreviews(this.#deps.media);
+    }
 
     const pipeline = pipelines.get(pipelineName);
     const beforeSteps = pipeline.beforeSteps ?? [];
@@ -1026,28 +1035,33 @@ export class Processor {
     // when the original never carried dims) and one replace of the stale ones
     // (previewRecorder.ts), then fire onPreviewGenerated per stored preview (ctx {}).
     if (persist && (generated.length > 0 || backfillDims)) {
-      let recorded: RecordResult;
-      try {
-        recorded = await this.#recorder.record(
-          mediaId,
-          scope,
-          generated,
-          backfillDims,
-          replacing,
-          mediaDims,
-        );
-      } catch (err) {
-        // Nothing this call rendered is known to be stored.
-        for (const { plan } of rendered) {
-          recordVariant(
-            plan.identity,
-            plan.variant.format,
-            durations.get(plan) ?? 0,
-            'failed',
-            errorCodeLabel(err),
-          );
+      const recorded = await this.#recorder.record(mediaId, scope, generated, {
+        backfillDims,
+        replacing,
+        originDims: mediaDims,
+      });
+      if (recorded.failure) {
+        // A write failed (logged by the recorder). What an earlier write of this persist stored
+        // (the append before a failed replace) is stored; nothing else this call rendered is.
+        const { error } = recorded.failure;
+        const stored = new Set(recorded.stored);
+        for (const { plan, row } of rendered) {
+          const ms = durations.get(plan) ?? 0;
+          if (stored.has(row)) {
+            recordVariant(plan.identity, plan.variant.format, ms, 'stored', {
+              bytes: row.bytes,
+            });
+          } else {
+            recordVariant(
+              plan.identity,
+              plan.variant.format,
+              ms,
+              'failed',
+              errorCodeLabel(error),
+            );
+          }
         }
-        throw err;
+        throw error;
       }
       generated = recorded.stored;
       removed = recorded.removed;

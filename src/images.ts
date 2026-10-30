@@ -378,8 +378,10 @@ function normalizeVariant(variant: MissingPreview): MissingPreview {
   if (variant.requestedHeight !== undefined) {
     normalized.requestedHeight = variant.requestedHeight;
   }
+  // Only `true` makes a fit variant, the rule that signs and stores a fit row: a tap's `fit: 1`
+  // is a cover variant everywhere.
   if (variant.fit !== undefined) {
-    normalized.fit = variant.fit;
+    normalized.fit = variant.fit === true;
   }
   return normalized;
 }

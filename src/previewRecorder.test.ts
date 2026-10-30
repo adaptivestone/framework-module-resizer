@@ -95,12 +95,15 @@ test('a store that resolves undefined is RESIZE_MEDIA_APPEND_RESULT_INVALID', as
     media,
     logger,
   });
-  await assert.rejects(
-    () => recorder.record('m1', scope, [preview('40x40', 'mine.jpg')]),
-    (err: unknown) =>
-      (err as { code?: string }).code === 'RESIZE_MEDIA_APPEND_RESULT_INVALID',
+  const result = await recorder.record('m1', scope, [
+    preview('40x40', 'mine.jpg'),
+  ]);
+  assert.equal(
+    (result.failure?.error as { code?: string } | undefined)?.code,
+    'RESIZE_MEDIA_APPEND_RESULT_INVALID',
   );
-  // The caller reports the rejection; the recorder itself logs nothing for it.
+  assert.deepEqual(result.stored, []);
+  // The caller rethrows and reports it; the recorder itself logs nothing for it.
   assert.deepEqual(logs, { info: [], warn: [], error: [] });
 });
 
@@ -150,13 +153,9 @@ test('record() appends new rows, then replaces the rows in replacing, and return
   const { recorder, logs } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
   const added = preview('40x40', 'added.jpg');
-  const result = await recorder.record(
-    'm1',
-    scope,
-    [replacement, added],
-    undefined,
-    new Set([replacement.identity as string]),
-  );
+  const result = await recorder.record('m1', scope, [replacement, added], {
+    replacing: new Set([replacement.identity as string]),
+  });
   assert.deepEqual(calls, [
     { write: 'append', previews: [added] },
     { write: 'replace', identities: [], rows: [replacement] },
@@ -184,13 +183,10 @@ test('an all-replacement batch with backfillDims calls appendPreviews(id, [], di
   const { recorder } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
   const dims = { width: 64, height: 48 };
-  const result = await recorder.record(
-    'm1',
-    scope,
-    [replacement],
-    dims,
-    new Set([replacement.identity as string]),
-  );
+  const result = await recorder.record('m1', scope, [replacement], {
+    backfillDims: dims,
+    replacing: new Set([replacement.identity as string]),
+  });
   assert.deepEqual(calls, [
     { write: 'append', previews: [], dims },
     { write: 'replace', identities: [], rows: [replacement] },
@@ -210,16 +206,15 @@ test('a replace on a store without replacePreviews is RESIZE_MEDIA_REPLACE_MISSI
   } as unknown as MediaStore;
   const { recorder } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
-  await assert.rejects(
-    () =>
-      recorder.record(
-        'm1',
-        scope,
-        [replacement, preview('40x40', 'added.jpg')],
-        undefined,
-        new Set([replacement.identity as string]),
-      ),
-    { code: 'RESIZE_MEDIA_REPLACE_MISSING' },
+  const result = await recorder.record(
+    'm1',
+    scope,
+    [replacement, preview('40x40', 'added.jpg')],
+    { replacing: new Set([replacement.identity as string]) },
+  );
+  assert.equal(
+    (result.failure?.error as { code?: string } | undefined)?.code,
+    'RESIZE_MEDIA_REPLACE_MISSING',
   );
   // It fails before any write.
   assert.equal(appended, false);
@@ -231,24 +226,18 @@ test('a replace result that is not { stored, removed } is RESIZE_MEDIA_REPLACE_R
   });
   const { recorder } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
-  await assert.rejects(
-    () =>
-      recorder.record(
-        'm1',
-        scope,
-        [replacement],
-        undefined,
-        new Set([replacement.identity as string]),
-      ),
-    {
-      code: 'RESIZE_MEDIA_REPLACE_RESULT_INVALID',
-      message:
-        "resize: the media store's replacePreviews resolved with something other than { stored, removed } — resolve with the rows it stored and removed ([] when none)",
-    },
+  const result = await recorder.record('m1', scope, [replacement], {
+    replacing: new Set([replacement.identity as string]),
+  });
+  const error = result.failure?.error as { code?: string; message?: string };
+  assert.equal(error.code, 'RESIZE_MEDIA_REPLACE_RESULT_INVALID');
+  assert.equal(
+    error.message,
+    "resize: the media store's replacePreviews resolved with something other than { stored, removed } — resolve with the rows it stored and removed ([] when none)",
   );
 });
 
-test('a rejected replace logs the unrecorded refs and rethrows', async () => {
+test('a rejected replace logs the unrecorded refs and returns the error, with what the append stored', async () => {
   const old = preview('20x20', 'old.jpg');
   const db = new Error('db');
   const media = fakeMedia({
@@ -260,17 +249,13 @@ test('a rejected replace logs the unrecorded refs and rethrows', async () => {
   });
   const { recorder, logs } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
-  await assert.rejects(
-    () =>
-      recorder.record(
-        'm1',
-        scope,
-        [replacement],
-        undefined,
-        new Set([replacement.identity as string]),
-      ),
-    (err: unknown) => err === db,
-  );
+  const added = preview('40x40', 'added.jpg');
+  const result = await recorder.record('m1', scope, [replacement, added], {
+    replacing: new Set([replacement.identity as string]),
+  });
+  assert.equal(result.failure?.error, db);
+  // The append before the failed replace stored its row.
+  assert.deepEqual(result.stored, [added]);
   assert.equal(logs.error.length, 1);
   assert.equal(
     logs.error[0][0],
@@ -285,13 +270,9 @@ test('a replace that stores and removes nothing means the media is gone: one war
   });
   const { recorder, logs } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
-  const result = await recorder.record(
-    'm1',
-    scope,
-    [replacement],
-    undefined,
-    new Set([replacement.identity as string]),
-  );
+  const result = await recorder.record('m1', scope, [replacement], {
+    replacing: new Set([replacement.identity as string]),
+  });
   assert.deepEqual(result, {
     stored: [],
     alreadyStored: [],
@@ -313,13 +294,9 @@ test('no replaced line when nothing was removed', async () => {
   const { media } = recordingStore(rows);
   const { recorder, logs } = recorderOver(media);
   const replacement = preview('20x20', 'new.jpg');
-  const result = await recorder.record(
-    'm1',
-    scope,
-    [replacement],
-    undefined,
-    new Set([replacement.identity as string]),
-  );
+  const result = await recorder.record('m1', scope, [replacement], {
+    replacing: new Set([replacement.identity as string]),
+  });
   assert.deepEqual(result.stored, [replacement]);
   assert.deepEqual(result.removed, []);
   assert.deepEqual(rows.get('m1'), [identityLess, replacement]);
@@ -344,4 +321,24 @@ test("a row left out for another worker's row with other signatures is blocked, 
   );
   assert.match(String(logs.warn[0][0]), /mine\.jpg/);
   assert.deepEqual(logs.error, []);
+});
+
+test('a failed append of the dimensions alone is logged as such, and returned', async () => {
+  const db = new Error('db');
+  const media = fakeMedia({
+    appendPreviews: async () => {
+      throw db;
+    },
+  });
+  const { recorder, logs } = recorderOver(media);
+  const result = await recorder.record('m1', scope, [], {
+    backfillDims: { width: 64, height: 48 },
+  });
+  assert.equal(result.failure?.error, db);
+  assert.equal(logs.error.length, 1);
+  assert.equal(
+    logs.error[0][0],
+    "resize: recording the original's dimensions failed for media m1 (64×48); no uploaded preview is affected",
+  );
+  assert.equal(logs.error[0][1], db);
 });

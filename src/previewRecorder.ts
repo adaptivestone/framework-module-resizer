@@ -5,9 +5,10 @@
 // be left out because another worker stored the same identity first, or because the media is
 // gone. A row left out for a fresh row of another worker is covered; one left out for a row with
 // other signatures is blocked, so the variant is not covered and its task retries (the retry
-// replaces that row). A failed write is logged with the uploads no row points at and rethrown. It
-// renders nothing and fires no observer: the Processor fires onPreviewGenerated over the rows it
-// returns.
+// replaces that row). A failed write is logged with the uploads no row points at and returned as
+// the result's `failure`, beside what an earlier write of the same persist stored, so the caller
+// can tell which variants were stored before it rethrows. It renders nothing and fires no
+// observer: the Processor fires onPreviewGenerated over the rows it returns.
 import type { Catalog } from './catalog.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import { ResizeSetupError } from './errors.ts';
@@ -65,9 +66,20 @@ export interface PreviewRecorderDeps {
   logger: ResizeLogger;
 }
 
+/** What record() writes besides the previews. */
+export interface RecordOptions {
+  // The original's dimensions, recorded by the append (one of no rows when nothing else is).
+  backfillDims?: { width: number; height: number };
+  // Identities whose stored rows the previews of that identity replace, in one replace write.
+  replacing?: ReadonlySet<string>;
+  // The size the previews were signed with (default: the stored dimensions), so a row another
+  // worker stored can be told fresh or stale.
+  originDims?: { width: number; height: number };
+}
+
 export interface RecordResult {
   // The generated previews whose identity the media store kept (the generated objects, not the
-  // rows the store resolved with, which may be driver documents).
+  // rows the store resolved with, which may be driver documents), in the order given.
   stored: Preview[];
   // Identities the media store already held from another worker in a fresh row: covered, not
   // failed.
@@ -77,6 +89,9 @@ export interface RecordResult {
   blocked: string[];
   // The stored rows the replacement removed (their files are not deleted).
   removed: Preview[];
+  // Set when a write failed (already logged): the caller rethrows `error`. `stored` then holds
+  // only what an earlier write of this persist stored (the append before a failed replace).
+  failure?: { error: unknown };
 }
 
 /** Records the generated previews of one media in at most one append and one replace. */
@@ -88,57 +103,71 @@ export class PreviewRecorder {
   }
 
   /**
-   * Append the `previews` (all of `scope`) whose identity is not in `replacing` in one write, with
-   * `backfillDims` when the original never carried dims (an append of no rows when there are only
-   * dims to record), then replace the stored rows of the identities in `replacing` with the rest
-   * in one write, and resolve with what the store kept. `originDims` is the size the previews were
-   * signed with (default: the stored dimensions), so a row another worker stored can be told fresh
-   * or stale. A failed write is logged and rethrown.
+   * Append the `previews` (all of `scope`) whose identity is not in `opts.replacing` in one write,
+   * with `opts.backfillDims` when the original never carried dims (an append of no rows when there
+   * are only dims to record), then replace the stored rows of the identities in `opts.replacing`
+   * with the rest in one write, and resolve with what the store kept. It never rejects: a failed
+   * write is logged and returned as `failure`, for the caller to rethrow.
    */
   async record(
     mediaId: string,
     scope: PreviewScope,
     previews: Preview[],
-    backfillDims?: { width: number; height: number },
-    replacing?: ReadonlySet<string>,
-    originDims?: { width: number; height: number },
+    opts: RecordOptions = {},
   ): Promise<RecordResult> {
-    const { catalog } = this.#deps;
-    const scopedIdentity = (p: Preview): string => catalog.identity(scope, p);
-    const replacements = replacing?.size
-      ? previews.filter((p) => replacing.has(scopedIdentity(p)))
-      : [];
+    const { backfillDims, replacing, originDims } = opts;
+    const isReplacement = (p: Preview): boolean =>
+      replacing?.has(this.#identity(scope, p)) === true;
+    const replacements = replacing?.size ? previews.filter(isReplacement) : [];
     const appends =
       replacements.length > 0
-        ? previews.filter((p) => !replacing?.has(scopedIdentity(p)))
+        ? previews.filter((p) => !isReplacement(p))
         : previews;
-    // A store that cannot replace fails before any write.
-    if (replacements.length > 0) {
-      requireReplacePreviews(this.#deps.media);
-    }
-    const appended =
-      appends.length > 0 || backfillDims
-        ? await this.#append(
-            mediaId,
-            scope,
-            appends,
-            replacements,
-            backfillDims,
-            originDims,
-          )
-        : { stored: [], alreadyStored: [], blocked: [] };
-    const replaced =
-      replacements.length > 0
-        ? await this.#replace(mediaId, scope, replacements)
-        : { stored: [], removed: [] };
-    const kept = new Set([...appended.stored, ...replaced.stored]);
-    return {
-      // In the order given, whichever write stored them.
-      stored: previews.filter((p) => kept.has(p)),
-      alreadyStored: appended.alreadyStored,
-      blocked: appended.blocked,
-      removed: replaced.removed,
+    const result: RecordResult = {
+      stored: [],
+      alreadyStored: [],
+      blocked: [],
+      removed: [],
     };
+    const kept = new Set<Preview>();
+    // In the order given, whichever write stored them.
+    const settle = (): RecordResult => ({
+      ...result,
+      stored: previews.filter((p) => kept.has(p)),
+    });
+    try {
+      // A store that cannot replace fails before any write.
+      if (replacements.length > 0) {
+        requireReplacePreviews(this.#deps.media);
+      }
+      if (appends.length > 0 || backfillDims) {
+        const appended = await this.#append(mediaId, scope, appends, {
+          pending: replacements,
+          backfillDims,
+          originDims,
+        });
+        for (const p of appended.stored) {
+          kept.add(p);
+        }
+        result.alreadyStored = appended.alreadyStored;
+        result.blocked = appended.blocked;
+      }
+      if (replacements.length > 0) {
+        const replaced = await this.#replace(mediaId, scope, replacements);
+        for (const p of replaced.stored) {
+          kept.add(p);
+        }
+        result.removed = replaced.removed;
+      }
+    } catch (error) {
+      result.failure = { error };
+    }
+    return settle();
+  }
+
+  /** The identity of a generated preview (every one belongs to `scope`). */
+  #identity(scope: PreviewScope, preview: Preview): string {
+    return this.#deps.catalog.identity(scope, preview);
   }
 
   /**
@@ -153,22 +182,48 @@ export class PreviewRecorder {
     }
   }
 
+  /** Uploads not recorded because the media is gone. */
+  #warnGone(mediaId: string, rows: Preview[]): void {
+    this.#deps.logger.warn(
+      `resize: media ${mediaId} no longer exists; ${rows.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(rows)}`,
+    );
+  }
+
+  /** Uploads the store left out although it does not hold their identity. */
+  #errorLost(mediaId: string, rows: Preview[]): void {
+    this.#deps.logger.error(
+      `resize: the media store left out ${rows.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(rows)}`,
+    );
+  }
+
   /** The append write and its reconciliation; `pending` are the replacements still to write. */
   async #append(
     mediaId: string,
     scope: PreviewScope,
     appends: Preview[],
-    pending: Preview[],
-    backfillDims: { width: number; height: number } | undefined,
-    originDims: { width: number; height: number } | undefined,
-  ): Promise<Omit<RecordResult, 'removed'>> {
+    opts: {
+      pending: Preview[];
+      backfillDims: { width: number; height: number } | undefined;
+      originDims: { width: number; height: number } | undefined;
+    },
+  ): Promise<Pick<RecordResult, 'stored' | 'alreadyStored' | 'blocked'>> {
     const { catalog, logger, media: mediaStore } = this.#deps;
-    const scopedIdentity = (p: Preview): string => catalog.identity(scope, p);
+    const { pending, backfillDims, originDims } = opts;
+    const identity = (p: Preview): string => this.#identity(scope, p);
     const alreadyStored: string[] = [];
     const blocked: string[] = [];
     const stored = await mediaStore
       .appendPreviews(mediaId, appends, backfillDims)
       .catch(async (err: unknown) => {
+        const total = appends.length + pending.length;
+        if (total === 0) {
+          // Only the dimensions were to be written: no upload is affected.
+          logger.error(
+            `resize: recording the original's dimensions failed for media ${mediaId}${backfillDims ? ` (${backfillDims.width}×${backfillDims.height})` : ''}; no uploaded preview is affected`,
+            err,
+          );
+          throw err;
+        }
         // The write may have stopped part-way (a driver can store one row at a time). Name
         // only the uploads no row points at, so an operator can find (or delete) them; a file
         // a stored row references is never offered. The replacements were never written.
@@ -178,11 +233,10 @@ export class PreviewRecorder {
           : reloaded;
         const unrecorded = [
           ...(recorded
-            ? appends.filter((p) => !recorded.has(scopedIdentity(p)))
+            ? appends.filter((p) => !recorded.has(identity(p)))
             : appends),
           ...pending,
         ];
-        const total = appends.length + pending.length;
         logger.error(
           `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${total} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
           err,
@@ -202,51 +256,44 @@ export class PreviewRecorder {
     // reload says why a row was left out: the media is gone, or another worker stored the same
     // identity first, in a fresh row (covered) or a row with other signatures (blocked).
     const kept = catalog.storedIdentities({ previews: stored }, scope);
-    const leftOut = appends.filter((p) => !kept.has(scopedIdentity(p)));
+    const leftOut = appends.filter((p) => !kept.has(identity(p)));
     if (leftOut.length > 0) {
       const reloaded = await this.#reload(mediaId);
       if (reloaded === null) {
-        logger.warn(
-          `resize: media ${mediaId} no longer exists; ${leftOut.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(leftOut)}`,
-        );
+        this.#warnGone(mediaId, leftOut);
       } else {
         // A failed reload trusts the store's answer: the rows are another worker's.
         const recorded = reloaded && catalog.storedIdentities(reloaded, scope);
         const fresh =
           reloaded && catalog.freshIdentities(reloaded, scope, originDims);
         const duplicates = leftOut.filter(
-          (p) => !fresh || fresh.has(scopedIdentity(p)),
+          (p) => !fresh || fresh.has(identity(p)),
         );
         const others = leftOut.filter(
-          (p) =>
-            fresh &&
-            !fresh.has(scopedIdentity(p)) &&
-            recorded?.has(scopedIdentity(p)),
+          (p) => fresh && !fresh.has(identity(p)) && recorded?.has(identity(p)),
         );
         const lost = leftOut.filter(
-          (p) => recorded && !recorded.has(scopedIdentity(p)),
+          (p) => recorded && !recorded.has(identity(p)),
         );
         if (duplicates.length > 0) {
           logger.warn(
             `resize: ${duplicates.length} preview(s) for media ${mediaId} were already stored by another worker; uploaded but not recorded storage refs: ${describeRefs(duplicates)}`,
           );
-          alreadyStored.push(...duplicates.map(scopedIdentity));
+          alreadyStored.push(...duplicates.map(identity));
         }
         if (others.length > 0) {
           logger.warn(
             `resize: ${others.length} preview(s) for media ${mediaId} were not recorded because another worker stored their identity with other settings or from another original, so they are not covered and a retry replaces that row; uploaded but not recorded storage refs: ${describeRefs(others)}`,
           );
-          blocked.push(...others.map(scopedIdentity));
+          blocked.push(...others.map(identity));
         }
         if (lost.length > 0) {
-          logger.error(
-            `resize: the media store left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
-          );
+          this.#errorLost(mediaId, lost);
         }
       }
     }
     return {
-      stored: appends.filter((p) => kept.has(scopedIdentity(p))),
+      stored: appends.filter((p) => kept.has(identity(p))),
       alreadyStored,
       blocked,
     };
@@ -259,7 +306,6 @@ export class PreviewRecorder {
     rows: Preview[],
   ): Promise<{ stored: Preview[]; removed: Preview[] }> {
     const { catalog, logger, media: mediaStore } = this.#deps;
-    const scopedIdentity = (p: Preview): string => catalog.identity(scope, p);
     let result: ReplacedPreviews;
     try {
       result = checkReplaced(
@@ -279,17 +325,13 @@ export class PreviewRecorder {
     }
     const { removed } = result;
     if (result.stored.length === 0 && removed.length === 0) {
-      logger.warn(
-        `resize: media ${mediaId} no longer exists; ${rows.length} uploaded preview(s) are not recorded: storage refs ${describeRefs(rows)}`,
-      );
+      this.#warnGone(mediaId, rows);
       return { stored: [], removed: [] };
     }
     const kept = catalog.storedIdentities({ previews: result.stored }, scope);
-    const lost = rows.filter((p) => !kept.has(scopedIdentity(p)));
+    const lost = rows.filter((p) => !kept.has(this.#identity(scope, p)));
     if (lost.length > 0) {
-      logger.error(
-        `resize: the media store left out ${lost.length} preview(s) for media ${mediaId} that it does not hold; uploaded but not recorded storage refs: ${describeRefs(lost)}`,
-      );
+      this.#errorLost(mediaId, lost);
     }
     if (removed.length > 0) {
       logger.info(
@@ -297,7 +339,7 @@ export class PreviewRecorder {
       );
     }
     return {
-      stored: rows.filter((p) => kept.has(scopedIdentity(p))),
+      stored: rows.filter((p) => kept.has(this.#identity(scope, p))),
       removed,
     };
   }

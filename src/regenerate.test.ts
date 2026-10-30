@@ -611,3 +611,44 @@ test('a stale row whose regeneration keeps failing stays served', async () => {
   // The dead task holds the gate for its cooldown: nothing more is queued.
   assert.equal(w.tasks.rows.length, 1);
 });
+
+test("a beforeEnqueue tap's `fit: 1` is a cover variant: queued, rendered, stored and signed as one", async () => {
+  const w = world();
+  const config = webpConfig(80);
+  const r = new Resizer({
+    config,
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    media: w.store,
+    tasks: w.tasks,
+    hooks: {
+      // A tap written in plain JavaScript can hand back any truthy value.
+      beforeEnqueue: (missing) =>
+        missing.map((v) => ({ ...v, fit: 1 as unknown as boolean })),
+    },
+  });
+  const original = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+
+  const { decision } = await w.read(r, structuredClone(doc));
+  assert.equal(decision.missing.length, 1);
+  assert.equal(w.tasks.added.length, 1);
+  assert.deepEqual(
+    w.tasks.added[0].previews.map((v) => v.fit),
+    [false],
+  );
+
+  await w.work(r);
+  const [row] = rowsOf(doc);
+  assert.equal(row.fit, undefined);
+  assert.equal(
+    row.encodeSig,
+    encodeSignature(config, { format: 'webp', fit: false }),
+  );
+  // The cover size, not the whole 64×64 source a fit variant would keep.
+  assert.deepEqual([row.actualWidth, row.actualHeight], [20, 20]);
+  const again = await w.read(r, structuredClone(doc));
+  assert.equal(again.decision.ready.length, 1);
+  assert.equal(again.decision.ready[0].stale, undefined);
+});
