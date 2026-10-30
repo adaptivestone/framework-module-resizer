@@ -5,17 +5,18 @@
 // the process is read only from src/config/resize.ts and rejected in any other file: `queues`
 // (every queue, by name, with its timing), `worker` (the worker command's settings) and
 // `coordination` (passed to every Resizer as it is: the core validates it).
-import { ResizeConfigError, ResizeError } from '../errors.ts';
+import type { QueueEntry } from '../contracts/drivers.ts';
+import { ResizeConfigError } from '../errors.ts';
+import { resolveQueueEntries } from '../factory/queues.ts';
+import { validateSqsEntries } from '../helpers/queueSections.ts';
 import { validateResizeConfig } from '../resizeConfig.ts';
-import { fillTiming, LOCK_TTL_MOVES } from '../timing.ts';
 import type {
   CoordinationOptions,
   FrameworkResizeConfig,
-  FrameworkStorageConfig,
   FrameworkWorkerConfig,
   QueueConfig,
-  QueueTimingOptions,
   ResizeConfig,
+  StorageConfig,
 } from '../types.d.ts';
 import { getApp } from './app.ts';
 import { defaultWorkerOptions } from './defaults.ts';
@@ -31,18 +32,16 @@ export interface ConfigSource {
 export interface ResolvedFrameworkConfig {
   image: ResizeConfig; // the Resizer's config
   mediaModelName: string;
-  storage: FrameworkStorageConfig | undefined; // the file's `storage`, if any
+  storage: StorageConfig | undefined; // the file's `storage`, if any
   // The name of the queue the Resizer's tasks go to; false: eager only; undefined: not set.
   queue: string | false | undefined;
 }
 
-/** One `queues` entry of src/config/resize.ts, validated. */
-export interface ResolvedQueue {
-  name: string;
-  section: QueueConfig; // the entry as the file holds it
-  timing: QueueTimingOptions; // its timing keys over the defaults
-  backend: string; // backendKey(section): the entries with one key share one task queue
-}
+/**
+ * One `queues` entry of src/config/resize.ts, validated, with its backend: backendKey(section), the
+ * entries with one key share one task queue.
+ */
+export type ResolvedQueue = QueueEntry<QueueConfig> & { backend: string };
 
 /** The process-wide sections of src/config/resize.ts, validated. */
 export interface ResolvedProcessConfig {
@@ -193,7 +192,7 @@ export function resolveFrameworkConfig(
   const result: ResolvedFrameworkConfig = {
     image: validateResizeConfig(image),
     mediaModelName,
-    storage: storage as FrameworkStorageConfig | undefined,
+    storage: storage as StorageConfig | undefined,
     queue: queue as string | false | undefined,
   };
   let bySource = resolvedFiles.get(raw);
@@ -234,94 +233,33 @@ export function resolveProcessConfig(raw: unknown): ResolvedProcessConfig {
 }
 
 /**
- * The `queues` map: every entry needs a driver; an SQS entry needs its own queueUrl. An entry set
- * to undefined is not defined: the framework's merge keeps the key of an environment file that
- * removes a queue that way.
+ * The `queues` map, through the core's checks of every entry; the adapter builds only its two
+ * drivers, so any other driver name is refused here, and the SQS entries get the SQS driver's own
+ * checks.
  */
 function resolveQueues(
   value: unknown,
   where: string,
 ): ReadonlyMap<string, ResolvedQueue> {
-  const queues = new Map<string, ResolvedQueue>();
-  if (value === undefined) {
-    return queues;
-  }
-  if (!isRecord(value)) {
+  const entries = resolveQueueEntries(value, where);
+  const unknown = entries.find(
+    (entry) => !QUEUE_DRIVERS.includes(entry.section.driver),
+  );
+  if (unknown) {
     throw invalid(
-      `\`queues\` in ${where} must be an object of queue names, e.g. queues: { default: { driver: 'database' } }`,
+      `\`queues.${unknown.name}\` in ${where} needs driver 'database' or 'sqs'`,
     );
   }
-  // An SQS queue URL → the entry that uses it.
-  const urls = new Map<string, string>();
-  for (const [name, entry] of Object.entries(value)) {
-    if (entry === undefined) {
-      continue;
-    }
-    if (name.trim().length === 0) {
-      throw invalid(
-        `\`queues\` in ${where} has a blank queue name — name each queue, e.g. queues: { default: { driver: 'database' } }`,
-      );
-    }
-    // Checked before fillTiming, which rejects lockTtlMs too, but without naming the entry.
-    if (isRecord(entry) && Object.hasOwn(entry, 'lockTtlMs')) {
-      throw removed(
-        `\`queues.${name}.lockTtlMs\` in ${where} is no longer supported — set coordination in the same file instead: { gateTtlMs, cooldownMs } (${LOCK_TTL_MOVES})`,
-      );
-    }
-    if (isRecord(entry) && Object.hasOwn(entry, 'queues')) {
-      throw removed(
-        `\`queues.${name}.queues\` in ${where} is no longer supported — give each SQS queue its own entry in \`queues\`, e.g. bulk: { driver: 'sqs', queueUrl: '…' }`,
-      );
-    }
-    if (!isRecord(entry) || !QUEUE_DRIVERS.includes(entry.driver as string)) {
-      throw invalid(
-        `\`queues.${name}\` in ${where} needs driver 'database' or 'sqs'`,
-      );
-    }
-    if (entry.driver === 'sqs') {
-      const url = entry.queueUrl;
-      if (typeof url !== 'string' || url.length === 0) {
-        throw invalid(
-          `\`queues.${name}.queueUrl\` in ${where} is required for the 'sqs' driver`,
-        );
-      }
-      // One SQS queue would carry the tasks of both names, and each name's worker would take them.
-      const other = urls.get(url);
-      if (other !== undefined) {
-        throw invalid(
-          `\`queues.${other}\` and \`queues.${name}\` in ${where} have the same queueUrl ${url} — give each queue name its own SQS queue`,
-        );
-      }
-      urls.set(url, name);
-    }
-    const section = entry as unknown as QueueConfig;
-    queues.set(name, {
-      name,
-      section,
-      timing: entryTiming(section, name, where),
-      backend: backendKey(section),
-    });
+  validateSqsEntries(
+    entries.filter((entry) => entry.section.driver === 'sqs'),
+    { where },
+  );
+  const queues = new Map<string, ResolvedQueue>();
+  for (const entry of entries) {
+    const section = entry.section as QueueConfig;
+    queues.set(entry.name, { ...entry, section, backend: backendKey(section) });
   }
   return queues;
-}
-
-/** An entry's timing; an invalid one keeps its code and names the entry. */
-function entryTiming(
-  section: QueueConfig,
-  name: string,
-  where: string,
-): QueueTimingOptions {
-  try {
-    return fillTiming(section);
-  } catch (err) {
-    if (ResizeError.isResizeError(err)) {
-      throw new ResizeConfigError(
-        `resize config: \`queues.${name}\` in ${where}: ${err.message.replace(/^resize queue options: /, '')}`,
-        { code: err.code, retryable: err.retryable, cause: err },
-      );
-    }
-    throw err;
-  }
 }
 
 /** The `worker` section over defaultWorkerOptions: a missing key takes its default. */

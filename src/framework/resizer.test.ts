@@ -14,6 +14,7 @@ import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
 import { S3Storage } from '../drivers/s3.ts';
 import { SqsTaskQueue } from '../drivers/sqs.ts';
 import { ResizeConfigError, ResizeSetupError } from '../errors.ts';
+import { sqsBackendKey } from '../helpers/queueSections.ts';
 import {
   processorOf,
   resetResizerForTests,
@@ -1163,29 +1164,12 @@ test('SQS entries with the same connection settings share one SqsTaskQueue; a di
   assert.equal(audit.tasks.servesQueue('default'), false);
 });
 
-test('backendKey: one database backend; SQS by region, endpoint, dead-letter queue and effective long poll', () => {
+// The SQS keys are tested beside sqsBackendKey (src/helpers/helpers.test.ts).
+test('backendKey: one database backend; an SQS entry has its sqsBackendKey', () => {
   assert.equal(backendKey({ driver: 'database', leaseMs: 1 }), 'database');
   const sqs = { driver: 'sqs' as const, queueUrl: 'https://sqs.example/a' };
+  assert.equal(backendKey(sqs), sqsBackendKey(sqs));
   assert.equal(backendKey(sqs), 'sqs:[null,null,null,10]');
-  assert.equal(
-    backendKey({
-      ...sqs,
-      queueUrl: 'https://sqs.example/b',
-      maxAttempts: 3,
-      waitTimeSeconds: 10,
-    }),
-    backendKey(sqs),
-  );
-  assert.equal(
-    backendKey({
-      ...sqs,
-      region: 'eu-west-1',
-      endpoint: 'http://localhost:4566',
-      deadLetterQueueUrl: 'https://sqs.example/dead',
-      waitTimeSeconds: 20,
-    }),
-    'sqs:["eu-west-1","http://localhost:4566","https://sqs.example/dead",20]',
-  );
 });
 
 // In a child process, where the SQS driver has not been imported yet: its first import fails.

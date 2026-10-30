@@ -5,6 +5,8 @@
 // of its own backend: a call that names a queue on another backend is refused by the core.
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
+import { importDriver } from '../helpers/peers.ts';
+import { sqsBackendKey } from '../helpers/queueSections.ts';
 import { sharedPart } from '../resizer.ts';
 import type {
   QueueConfig,
@@ -13,12 +15,6 @@ import type {
 } from '../types.d.ts';
 import { appLogger, getApp } from './app.ts';
 import type { ResolvedProcessConfig, ResolvedQueue } from './config.ts';
-import { importDriver } from './peers.ts';
-
-// SqsTaskQueue's long poll when `waitTimeSeconds` is not set. Keep in step with the driver's own
-// default (`this.#opts.waitTimeSeconds ?? 10` in SqsTaskQueue.claim, src/drivers/sqs.ts), which is
-// not imported here: that module loads the optional AWS SDK.
-const SQS_DEFAULT_WAIT_TIME_SECONDS = 10;
 
 // The file the queues are defined in, as configFile('resize') in ./config.ts names it (that module
 // imports this one, so it is not imported back).
@@ -31,11 +27,7 @@ const QUEUES_FILE =
  * the settings one SqsTaskQueue holds for all its names.
  */
 export function backendKey(section: QueueConfig): string {
-  if (section.driver !== 'sqs') {
-    return 'database';
-  }
-  const { region, endpoint, deadLetterQueueUrl, waitTimeSeconds } = section;
-  return `sqs:${JSON.stringify([region ?? null, endpoint ?? null, deadLetterQueueUrl ?? null, waitTimeSeconds ?? SQS_DEFAULT_WAIT_TIME_SECONDS])}`;
+  return section.driver === 'sqs' ? sqsBackendKey(section) : 'database';
 }
 
 /**

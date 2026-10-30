@@ -19,6 +19,18 @@ export {
   SourceDecoder,
   type SourceInfo,
 } from './contracts/decoder.ts';
+// The driver factories: how a config section becomes a part (`fromConfig` on a registered driver).
+export type {
+  DatabaseDriver,
+  DatabaseParts,
+  DriverContext,
+  DriverRegistry,
+  QueueDriver,
+  QueueDriverContext,
+  QueueEntry,
+  QueueSection,
+  StorageDriver,
+} from './contracts/drivers.ts';
 export type {
   HookFn,
   HookName,
@@ -62,6 +74,8 @@ export {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
+// --- the config a Resizer is built from: image settings over the defaults, and its sections ---
+export type { ResizerConfig } from './factory/types.ts';
 // --- public URL formatting and size catalog helpers ---
 export { formatPictureUrls } from './formatPictureUrls.ts';
 export {

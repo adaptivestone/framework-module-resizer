@@ -5,7 +5,9 @@
 // media, pipeline and queue, and a dead task holds the gate until its cooldown ends), filters
 // claims by Resizer, gives tasks back with `release` and answers findActive. PlainTaskQueue has
 // the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it. observedQueue
-// wraps one so a test can stop an idle worker once its work is handled.
+// wraps one so a test can stop an idle worker once its work is handled. fakeQueueDriver is a queue
+// driver factory over PlainTaskQueue.
+import type { QueueDriver } from '../contracts/drivers.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
@@ -527,5 +529,19 @@ export function sigtermOnceClaimed(
       sent = true;
       process.emit('SIGTERM');
     }
+  };
+}
+
+/**
+ * A queue driver with the given `validate` (none by default): its `fromConfig` builds a
+ * PlainTaskQueue serving exactly the names of the entries it is given.
+ */
+export function fakeQueueDriver(
+  validate?: QueueDriver['validate'],
+): QueueDriver {
+  return {
+    ...(validate ? { validate } : {}),
+    fromConfig: (entries) =>
+      new PlainTaskQueue({ queues: entries.map((entry) => entry.name) }),
   };
 }

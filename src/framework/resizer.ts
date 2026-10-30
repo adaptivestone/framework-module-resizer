@@ -20,6 +20,7 @@ import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
 import { ResizeConfigError } from '../errors.ts';
+import { importDriver } from '../helpers/peers.ts';
 import { Resizer, type ResizerOptions } from '../resizer.ts';
 import type {
   CoordinationOptions,
@@ -40,7 +41,6 @@ import {
 } from './config.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
-import { importDriver } from './peers.ts';
 import { taskQueueOf } from './queue.ts';
 
 export interface FrameworkResizerOptions
