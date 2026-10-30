@@ -237,8 +237,7 @@ export class Consumer {
         await sleep(idlePollMs, signal);
         continue;
       }
-      // Delivered more often than allowed (its workers kept crashing mid-task): dead, not retried,
-      // and it never ran, so its outcome records 0 ms.
+      // Delivered more often than allowed (its workers kept crashing mid-task): dead, not retried.
       if (task.attempts > maxAttempts) {
         await this.#finish(
           task,
@@ -247,7 +246,7 @@ export class Consumer {
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
             { code: 'RESIZE_TASK_MAX_ATTEMPTS' },
           ),
-          { forceDead: true },
+          { forceDead: true, runStart: claimedAt },
         );
         waitStart = performance.now();
         continue;
@@ -445,17 +444,17 @@ export class Consumer {
 
   /**
    * A task's outcome, once the queue took it: recorded on its Resizer's metrics sink, timed from
-   * `runStart` (none: a task that never ran, 0 ms), then sent to the observers.
+   * `runStart` (performance.now() at its claim), then sent to the observers.
    */
   async #report(
     event: TaskEvent,
     task: ClaimedTask,
-    error?: unknown,
-    runStart?: number,
+    error: unknown,
+    runStart: number,
   ): Promise<void> {
     this.#deps.metricsOf?.(toLeasedTask(task))?.timing(
       'resize.task',
-      runStart === undefined ? 0 : performance.now() - runStart,
+      performance.now() - runStart,
       {
         queue: task.queue,
         pipeline: task.pipeline,
@@ -485,8 +484,8 @@ export class Consumer {
    * Retry the task after its backoff, or dead-letter it (forced, not retryable, last attempt) with
    * its Resizer's cooldown. Its gate lock is then held until the retry is due plus one lease, or
    * for the cooldown: the task's final gate action (see #finalGate), whose call waits until
-   * `opts.gateDeadline` at most (default: one gate bound). `opts.runStart` times its outcome (see
-   * #report).
+   * `opts.gateDeadline` at most (default: one gate bound). `opts.runStart` (performance.now() at
+   * its claim) times its outcome (see #report).
    */
   async #finish(
     task: ClaimedTask,
@@ -496,8 +495,8 @@ export class Consumer {
       forceDead?: boolean;
       gateDeadline?: number;
       run?: GateRun;
-      runStart?: number;
-    } = {},
+      runStart: number;
+    },
   ): Promise<void> {
     const { tasks, timing, logger } = this.#deps;
     const dead =

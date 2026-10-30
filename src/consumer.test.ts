@@ -2023,14 +2023,19 @@ describe('a late answer never undoes the end of a task', () => {
     const releaseLanded = new Promise<void>((resolve) => {
       markReleased = resolve;
     });
+    let landed = false;
     const locks: LockStore = {
       acquire: base.acquire,
       extend: base.extend,
       release: async (lockKey, owner) => {
-        await sleepMs(20);
-        const released = await base.release(lockKey, owner);
-        markReleased();
-        return released;
+        try {
+          await sleepMs(20);
+          const released = await base.release(lockKey, owner);
+          landed = true;
+          return released;
+        } finally {
+          markReleased();
+        }
       },
     };
     const tasks = new PlainTaskQueue({ timing: lateTiming });
@@ -2063,6 +2068,7 @@ describe('a late answer never undoes the end of a task', () => {
         logger: { info() {}, warn: record, error: record },
       },
     );
+    assert.equal(landed, false, 'the worker stopped before the release landed');
     await releaseLanded; // the release lands after the worker stopped waiting for it
     assert.deepEqual(
       events.map((e) => e.event),
@@ -2412,10 +2418,16 @@ describe('Consumer metrics', () => {
     }
   });
 
-  test('a task delivered past maxAttempts records dead in 0 ms', async () => {
+  test('a task delivered past maxAttempts records dead, timed from its claim', async () => {
     const tasks = new MemoryTaskQueue({ timing: fastTiming });
     await tasks.add(newTask());
     tasks.rows[0].attempts = 3;
+    // The dead-letter call takes a while: the outcome's time includes it.
+    const fail = tasks.fail.bind(tasks);
+    tasks.fail = async (...args: Parameters<typeof fail>) => {
+      await sleepMs(30);
+      return fail(...args);
+    };
     const rec = recordingMetrics();
     let handled = 0;
     await runUntil(
@@ -2427,9 +2439,13 @@ describe('Consumer metrics', () => {
       { metricsOf: () => rec },
     );
     assert.equal(handled, 0);
-    assert.deepEqual(callsOf(rec, 'resize.task'), [
+    const outcomes = callsOf(rec, 'resize.task');
+    assert.equal(outcomes.length, 1);
+    const [ms] = outcomes[0];
+    assert.ok(Number.isFinite(ms) && ms >= 25, `recorded ${ms} ms`);
+    assert.deepEqual(outcomes, [
       [
-        0,
+        ms,
         {
           queue: 'default',
           pipeline: 'default',
@@ -2470,6 +2486,32 @@ describe('Consumer metrics', () => {
       rec.calls.map((call) => call.name),
       ['resize.claim'],
     );
+  });
+
+  test('a failed claim does not restart the wait: it spans the failure and the retry delay', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, idlePollMs: 60 },
+    });
+    await tasks.add(newTask());
+    const claim = tasks.claim.bind(tasks);
+    let claims = 0;
+    tasks.claim = async (...args: Parameters<typeof claim>) => {
+      claims += 1;
+      if (claims === 1) {
+        throw new Error('database down');
+      }
+      return claim(...args);
+    };
+    const rec = recordingMetrics();
+    await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      { metricsOf: () => rec },
+    );
+    const [claimed] = callsOf(rec, 'resize.claim');
+    assert.ok(claimed, 'the claim is recorded');
+    assert.ok(claimed[0] >= 50, `waited ${claimed[0]} ms`);
   });
 
   test('a claim records the wait since the previous task ended, across empty polls', async () => {

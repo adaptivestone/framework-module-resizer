@@ -239,12 +239,15 @@ async function flushMetrics(resizers: Resizer[]): Promise<void> {
   await Promise.all(flushes);
 }
 
-/** `flush`, or METRICS_FLUSH_TIMEOUT_MS, whichever comes first; the timer keeps no process alive. */
+/**
+ * `flush`, or METRICS_FLUSH_TIMEOUT_MS, whichever comes first. The stop awaits this wait, so its
+ * timer stays ref'd, as the Consumer's awaited waits do: the process lives until the flush settles
+ * or the bound ends, and the timer is cleared as soon as the flush settles.
+ */
 async function withinFlushTimeout(flush: Promise<void>): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, METRICS_FLUSH_TIMEOUT_MS);
-    timer.unref?.();
   });
   try {
     await Promise.race([flush, late]);
