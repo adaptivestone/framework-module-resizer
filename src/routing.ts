@@ -17,7 +17,12 @@ import { type ResizeError, ResizeSetupError } from './errors.ts';
 import { timingOf } from './timing.ts';
 import type { EnqueueReceipt, QueueTimingOptions } from './types.d.ts';
 
-/** A route: the task queue that carries a name, or a function that builds it on first need. */
+/**
+ * A route: the task queue that carries a name, or a function that builds it on first need. A
+ * builder must not wait on the network or on a server: it imports what it needs, builds its
+ * clients and returns; connecting and checking belong in the task queue's verify(). A builder that
+ * never settles stalls every call on its queue names.
+ */
 export type Route = TaskQueue | (() => Promise<TaskQueue>);
 
 export interface RoutingTaskQueueOptions {

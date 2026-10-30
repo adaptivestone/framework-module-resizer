@@ -1,0 +1,58 @@
+// MongoDatabase: the 'mongo' database driver. From a config's `database` section (a Mongoose
+// connection and the host's media model on it) it builds the parts that share that connection, as
+// mongoParts() does: the media store, the locks and the task queue on the package's ResizeLock and
+// ResizeTask models. Mongoose is used only through the connection and model it is given.
+import type { DatabaseParts, DriverContext } from '../../contracts/drivers.ts';
+import { invalidConfigValue } from '../../helpers/configSection.ts';
+import type { MongoDatabaseConfig } from '../../types.d.ts';
+import { MongoLockStore } from './locks.ts';
+import { type MongoMediaModel, MongoMediaStore } from './media.ts';
+import { createResizeModels } from './models.ts';
+import { MongoTaskQueue } from './taskQueue.ts';
+
+// biome-ignore lint/complexity/noStaticOnlyClass: a driver is registered as a class with a static fromConfig, like the storage and queue drivers
+export class MongoDatabase {
+  /**
+   * The parts on `section.connection`. The package's models are registered on that connection
+   * (with autoIndex off: create their indexes through your migration process). It sends nothing
+   * to the server: checks that need it belong to verify().
+   */
+  static fromConfig(
+    section: MongoDatabaseConfig,
+    ctx: DriverContext,
+  ): DatabaseParts {
+    const { connection, mediaModel } = section;
+    if (
+      typeof connection !== 'object' ||
+      connection === null ||
+      typeof (connection as { model?: unknown }).model !== 'function'
+    ) {
+      throw invalidConfigValue(
+        'database.connection',
+        ctx.where,
+        'a Mongoose connection (with a model() function)',
+      );
+    }
+    if (
+      mediaModel === null ||
+      (typeof mediaModel !== 'object' && typeof mediaModel !== 'function')
+    ) {
+      throw invalidConfigValue(
+        'database.mediaModel',
+        ctx.where,
+        'the host media model (an object or function)',
+      );
+    }
+    const media = mediaModel as MongoMediaModel;
+    const { ResizeTask, ResizeLock } = createResizeModels(
+      connection as Parameters<typeof createResizeModels>[0],
+      media.modelName ? { mediaModelName: media.modelName } : {},
+    );
+    return {
+      media: new MongoMediaStore({ model: media }),
+      locks: new MongoLockStore({ model: ResizeLock }),
+      taskQueue: ({ queues, getTiming, logger }) =>
+        new MongoTaskQueue({ model: ResizeTask, queues, getTiming, logger }),
+    };
+  }
+}

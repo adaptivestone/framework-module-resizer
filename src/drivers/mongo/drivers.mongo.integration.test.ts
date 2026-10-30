@@ -1,12 +1,15 @@
 // The framework-free Mongo drivers against a real MongoDB: models and indexes, locks, and the
-// mongoParts wiring.
+// mongoParts wiring, and MongoDatabase.fromConfig.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { ResizeConfigError } from '../../errors.ts';
 import { timingOf } from '../../timing.ts';
+import type { MongoDatabaseConfig } from '../../types.d.ts';
 import {
   createResizeModels,
+  MongoDatabase,
   MongoLockStore,
   MongoMediaStore,
   MongoTaskQueue,
@@ -320,6 +323,93 @@ describe('mongoParts', () => {
       assert.equal(ResizeLock.schema.options.autoIndex, false);
     } finally {
       await fresh.close();
+    }
+  });
+});
+
+describe('MongoDatabase.fromConfig', () => {
+  const silent = { info() {}, warn() {}, error() {} };
+  const ctx = { logger: silent, where: 'the config passed to createResizer()' };
+
+  test('MongoDatabase.fromConfig gives media, locks and a task queue over the package models', async () => {
+    const parts = MongoDatabase.fromConfig(
+      { driver: 'mongo', connection, mediaModel: Media() },
+      ctx,
+    );
+    assert.ok(parts.media instanceof MongoMediaStore);
+    assert.equal(typeof parts.media.replacePreviews, 'function');
+    assert.ok(parts.locks instanceof MongoLockStore);
+    assert.equal(await parts.locks.acquire('db1', 'A', 1000), true);
+    assert.equal(
+      (await connection.models.ResizeLock.findById('db1').lean())?.owner,
+      'A',
+    );
+    const timing: Record<string, { maxAttempts: number }> = {
+      bulk: { maxAttempts: 9 },
+    };
+    const tasks = parts.taskQueue?.({
+      queues: ['default', 'bulk'],
+      getTiming: (queue) => timing[queue],
+      logger: silent,
+    });
+    assert.ok(tasks instanceof MongoTaskQueue);
+    assert.equal(tasks.servesQueue('default'), true);
+    assert.equal(tasks.servesQueue('bulk'), true);
+    assert.equal(tasks.servesQueue('other'), false);
+    assert.equal(tasks.gatesByTask, true);
+    assert.equal(timingOf(tasks, 'bulk').maxAttempts, 9);
+    // Its task queue is on the package's ResizeTask model of that connection.
+    await connection.models.ResizeTask.createIndexes();
+    const media = await Media().create({});
+    const added = await tasks.add({
+      resizer: 'default',
+      queue: 'bulk',
+      mediaId: String(media._id),
+      pipeline: 'default',
+      previews: [{ sizeKey: '10x10', format: 'jpeg' }],
+    });
+    assert.equal(added.status, 'added');
+    assert.equal(
+      await connection.models.ResizeTask.countDocuments({
+        fileId: media._id,
+        queue: 'bulk',
+      }),
+      1,
+    );
+  });
+
+  test('MongoDatabase.fromConfig rejects a connection without model() and a missing mediaModel', () => {
+    const invalid = (key: string, what: string) => (err: unknown) =>
+      err instanceof ResizeConfigError &&
+      err.code === 'RESIZE_CONFIG_INVALID' &&
+      err.message ===
+        `resize config: \`database.${key}\` in the config passed to createResizer() must be ${what}`;
+    for (const bad of [undefined, null, 'mongodb://x', {}, { model: 1 }]) {
+      assert.throws(
+        () =>
+          MongoDatabase.fromConfig(
+            {
+              driver: 'mongo',
+              connection: bad,
+              mediaModel: Media(),
+            } as MongoDatabaseConfig,
+            ctx,
+          ),
+        invalid(
+          'connection',
+          'a Mongoose connection (with a model() function)',
+        ),
+      );
+    }
+    for (const bad of [undefined, null, 'File', 3]) {
+      assert.throws(
+        () =>
+          MongoDatabase.fromConfig(
+            { driver: 'mongo', connection, mediaModel: bad },
+            ctx,
+          ),
+        invalid('mediaModel', 'the host media model (an object or function)'),
+      );
     }
   });
 });

@@ -91,7 +91,12 @@ export interface QueueDriver<S extends QueueSection = QueueSection> {
    * compare them. Throws a ResizeConfigError naming `ctx.where`.
    */
   validate?(entries: readonly QueueEntry<S>[], ctx: { where: string }): void;
-  /** The entries of ONE backend → that backend's task queue, serving exactly their names. */
+  /**
+   * The entries of ONE backend → that backend's task queue, serving exactly their names. It must
+   * not wait on the network or on a server: it builds its clients and returns; connecting and
+   * checking belong in the task queue's verify(). A fromConfig that never settles stalls every
+   * call on the backend's queue names.
+   */
   fromConfig(
     entries: readonly QueueEntry<S>[],
     ctx: QueueDriverContext,

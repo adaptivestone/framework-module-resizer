@@ -6,8 +6,9 @@
 // claims by Resizer, gives tasks back with `release` and answers findActive. PlainTaskQueue has
 // the SQS shape and stores every task; ReleasingTaskQueue adds `release` to it. observedQueue
 // wraps one so a test can stop an idle worker once its work is handled. fakeQueueDriver is a queue
-// driver factory over PlainTaskQueue.
-import type { QueueDriver } from '../contracts/drivers.ts';
+// driver factory over PlainTaskQueue; fakeDatabaseParts are database parts whose task queue is a
+// MemoryTaskQueue.
+import type { DatabaseParts, QueueDriver } from '../contracts/drivers.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import {
@@ -543,5 +544,35 @@ export function fakeQueueDriver(
     ...(validate ? { validate } : {}),
     fromConfig: (entries) =>
       new PlainTaskQueue({ queues: entries.map((entry) => entry.name) }),
+  };
+}
+
+/** What DatabaseParts.taskQueue is given. */
+export type DatabaseTaskQueueOptions = Parameters<
+  NonNullable<DatabaseParts['taskQueue']>
+>[0];
+
+/**
+ * Database parts over fakeMedia and memoryLocks. `taskQueue` builds a MemoryTaskQueue serving
+ * exactly the names it is given and records each call's options in `taskQueueCalls`, with the
+ * queue it built in `built`.
+ */
+export function fakeDatabaseParts(): DatabaseParts & {
+  taskQueueCalls: DatabaseTaskQueueOptions[];
+  built: MemoryTaskQueue[];
+} {
+  const taskQueueCalls: DatabaseTaskQueueOptions[] = [];
+  const built: MemoryTaskQueue[] = [];
+  return {
+    media: fakeMedia(),
+    locks: memoryLocks(),
+    taskQueueCalls,
+    built,
+    taskQueue(opts) {
+      taskQueueCalls.push(opts);
+      const tasks = new MemoryTaskQueue({ queues: opts.queues });
+      built.push(tasks);
+      return tasks;
+    },
   };
 }

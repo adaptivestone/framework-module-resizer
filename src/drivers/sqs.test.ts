@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
-import type { SQSClient } from '@aws-sdk/client-sqs';
+import { SQSClient } from '@aws-sdk/client-sqs';
+import { defaultQueueOptions } from '../config/resize.ts';
+import type { QueueEntry } from '../contracts/drivers.ts';
 import type {
   ClaimedTask,
   LeasedTask,
@@ -8,13 +10,18 @@ import type {
   TaskEventHandler,
 } from '../contracts/taskQueue.ts';
 import { ResizeSetupError } from '../errors.ts';
+import { resolveQueueEntries } from '../factory/queues.ts';
 import { gateKey } from '../lockKeys.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { consume } from '../testHelpers/consume.ts';
 import { clockLocks, fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
-import type { MissingPreview, QueueTimingOptions } from '../types.d.ts';
+import type {
+  MissingPreview,
+  QueueTimingOptions,
+  SqsQueueConfig,
+} from '../types.d.ts';
 import { SqsTaskQueue } from './sqs.ts';
 
 // No live AWS or test-only driver seam: the public `client` option accepts this recording fake.
@@ -1265,5 +1272,79 @@ describe('SqsTaskQueue options', () => {
       new SqsTaskQueue({ queueUrl: 'q' }).getTiming('default'),
       {},
     );
+  });
+});
+
+describe('SqsTaskQueue.fromConfig', () => {
+  test("one queue for one backend's entries, each name with its URL and timing", async (t) => {
+    const { errors, logger } = recordingLogger();
+    // The factory has grouped these entries into one backend (same connection settings) and
+    // checked their URLs; the driver takes the first entry's connection settings.
+    const entries = resolveQueueEntries(
+      {
+        a: {
+          driver: 'sqs',
+          queueUrl: 'https://sqs.example/a',
+          deadLetterQueueUrl: 'https://sqs.example/dead',
+          waitTimeSeconds: 3,
+          region: 'eu-west-1',
+          maxAttempts: 7,
+        },
+        b: {
+          driver: 'sqs',
+          queueUrl: 'https://sqs.example/b',
+          deadLetterQueueUrl: 'https://sqs.example/dead',
+          waitTimeSeconds: 3,
+          region: 'eu-west-1',
+          leaseMs: 45_000,
+        },
+      },
+      'src/config/resize.ts',
+    ) as QueueEntry<SqsQueueConfig>[];
+    const tasks = SqsTaskQueue.fromConfig(entries, {
+      logger,
+      where: 'src/config/resize.ts',
+      database: undefined,
+    });
+    assert.ok(tasks instanceof SqsTaskQueue);
+    assert.equal(tasks.servesQueue('a'), true);
+    assert.equal(tasks.servesQueue('b'), true);
+    assert.equal(tasks.servesQueue('c'), false);
+    assert.equal(tasks.servesQueue('default'), false);
+    assert.equal(timingOf(tasks, 'a').maxAttempts, 7);
+    assert.equal(
+      timingOf(tasks, 'b').maxAttempts,
+      defaultQueueOptions.maxAttempts,
+    );
+    assert.equal(timingOf(tasks, 'b').leaseMs, 45_000);
+    assert.deepEqual(tasks.getTiming('c'), {});
+    // The client the driver builds itself (no `client` key in a config): its sends are recorded.
+    const sent: Array<{ name: string; input: Record<string, unknown> }> = [];
+    let region: unknown;
+    t.mock.method(
+      SQSClient.prototype,
+      'send',
+      async function (this: SQSClient, command: FakeCommand) {
+        region = await this.config.region();
+        sent.push({ name: command.constructor.name, input: command.input });
+        return command.constructor.name === 'ReceiveMessageCommand'
+          ? { Messages: [message({ Body: 'not json' })] }
+          : { MessageId: 'm' };
+      },
+    );
+    await tasks.add(newTask({ queue: 'b' }));
+    assert.equal(await tasks.claim('a', 30_000), null);
+    assert.equal(region, 'eu-west-1');
+    assert.deepEqual(
+      sent.map(({ name, input }) => [name, input.QueueUrl]),
+      [
+        ['SendMessageCommand', 'https://sqs.example/b'],
+        ['ReceiveMessageCommand', 'https://sqs.example/a'],
+        ['SendMessageCommand', 'https://sqs.example/dead'],
+        ['DeleteMessageCommand', 'https://sqs.example/a'],
+      ],
+    );
+    assert.equal(sent[1].input.WaitTimeSeconds, 3);
+    assert.equal(errors.length, 1, 'the context logger gets the driver logs');
   });
 });

@@ -388,8 +388,8 @@ export interface SqsQueueConfig extends Partial<QueueTimingOptions> {
 // entries' `section`) and adds `{ driver: <the name it is registered under> }`.
 // ---------------------------------------------------------------------------
 
-/** A driver registry as the section helpers read it. */
-export interface DriverRegistryShape {
+/** A driver registry as the section helpers read it (internal to this file). */
+interface DriverRegistryShape {
   storage?: Record<string, { fromConfig(section: never, ctx: never): unknown }>;
   database?: Record<
     string,
@@ -476,3 +476,6 @@ export interface FrameworkResizeConfig<D extends DriverRegistryShape = {}>
 // biome-ignore lint/complexity/noBannedTypes: `{}` is the empty registry, the default when a host registers no driver
 export type PartialFrameworkResizeConfig<D extends DriverRegistryShape = {}> =
   DeepPartial<FrameworkResizeConfig<D>>;
+
+// biome-ignore lint/complexity/noUselessEmptyExport: in a declaration file every top-level declaration is exported unless the file has an empty export; this one keeps DriverRegistryShape (not marked `export`) private
+export {};

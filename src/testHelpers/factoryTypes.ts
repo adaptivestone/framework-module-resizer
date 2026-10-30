@@ -1,21 +1,31 @@
 // Compiled by `npm run types:check` (tsconfig.test-helpers.json), never run. It pins the config
 // types: the core section types and their deprecated framework names, the sections a registered
-// custom driver adds, and the nested partial a file that overrides part of a config writes.
+// custom driver adds, the nested partial a file that overrides part of a config writes, and the
+// shipped drivers as drivers of their own sections.
 import type {
+  DatabaseDriver,
   DriverContext,
   DriverRegistry,
   QueueDriver,
   StorageDriver,
 } from '../contracts/drivers.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
+import { LocalFsStorage } from '../drivers/fs.ts';
+import { MongoDatabase } from '../drivers/mongo/index.ts';
+import { S3Storage } from '../drivers/s3.ts';
+import { SqsTaskQueue } from '../drivers/sqs.ts';
+import { databaseQueueDriver } from '../factory/databaseQueue.ts';
 import type { ResizerConfig } from '../factory/types.ts';
 import { defaultFrameworkResizeConfig } from '../framework/defaults.ts';
-import { validateSqsEntries } from '../helpers/queueSections.ts';
+import { sqsBackendKey, validateSqsEntries } from '../helpers/queueSections.ts';
 import type {
+  DatabaseQueueConfig,
   FrameworkLocalStorageConfig,
   FrameworkResizeConfig,
   LocalStorageConfig,
+  MongoDatabaseConfig,
   PartialFrameworkResizeConfig,
+  S3StorageConfig,
   SqsQueueConfig,
 } from '../types.d.ts';
 import { storage } from './contractShapes.ts';
@@ -138,4 +148,28 @@ export const memoryStorage: StorageDriver<{ driver: 'memory' }> = {
 export const allDrivers: DriverRegistry = {
   storage: { memory: memoryStorage, memoryClass: MemoryStorageDriver },
   queue: { redis: redisQueue, sqs: sqsQueue },
+};
+
+// The shipped drivers are drivers of their own sections, so the built-in table can hold them.
+export const shippedDrivers: {
+  local: StorageDriver<LocalStorageConfig>;
+  s3: StorageDriver<S3StorageConfig>;
+  mongo: DatabaseDriver<MongoDatabaseConfig>;
+  database: QueueDriver<DatabaseQueueConfig>;
+  sqs: QueueDriver<SqsQueueConfig>;
+} = {
+  local: LocalFsStorage,
+  s3: S3Storage,
+  mongo: MongoDatabase,
+  database: databaseQueueDriver,
+  sqs: {
+    backendOf: sqsBackendKey,
+    validate: validateSqsEntries,
+    fromConfig: SqsTaskQueue.fromConfig,
+  },
+};
+export const shippedRegistry: DriverRegistry = {
+  storage: { local: LocalFsStorage, s3: S3Storage },
+  database: { mongo: MongoDatabase },
+  queue: { database: databaseQueueDriver, sqs: SqsTaskQueue },
 };

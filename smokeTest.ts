@@ -80,6 +80,7 @@ for (const driver of [
   'MongoLockStore',
   'MongoTaskQueue',
   'mongoParts',
+  'MongoDatabase',
   'SqsTaskQueue',
   'S3Storage',
   'LocalFsStorage',
@@ -128,6 +129,7 @@ const safe = [
   ['/drivers/mongo.js', 'MongoMediaStore'],
   ['/drivers/mongo.js', 'MongoLockStore'],
   ['/drivers/mongo.js', 'MongoTaskQueue'],
+  ['/drivers/mongo.js', 'MongoDatabase'],
   ['/drivers/mongo.js', 'createResizeModels'],
   ['/drivers/mongo.js', 'resizeMediaSchemaFragment'],
   ['/drivers/mongo.js', 'resizeMediaPaths'],
@@ -235,6 +237,8 @@ new mongo.MongoLockStore({
   },
 });
 assert.equal(typeof mongo.mongoParts, 'function');
+assert.equal(typeof mongo.MongoDatabase.fromConfig, 'function');
+assert.equal(typeof fs.LocalFsStorage.fromConfig, 'function');
 console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; custom drivers extend MediaStore and LockStore');
 let frameworkErr = null;
 try {
