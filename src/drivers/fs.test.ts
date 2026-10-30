@@ -3,7 +3,9 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { describe, test } from 'node:test';
-import { ResizeSecurityError } from '../errors.ts';
+import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
+import { silentLogger } from '../testHelpers/fakes.ts';
+import type { LocalStorageConfig } from '../types.d.ts';
 import { LocalFsStorage } from './fs.ts';
 
 const fresh = () => mkdtemp(join(tmpdir(), 'resize-fs-'));
@@ -214,5 +216,80 @@ describe('LocalFsStorage', () => {
       () => s.publicUrl({ path: 'previews/a#b.jpg', visibility: 'public' }),
       /invalid logical key/,
     );
+  });
+});
+
+describe('LocalFsStorage.fromConfig', () => {
+  const ctx = { logger: silentLogger, where: 'src/config/resize.ts' };
+
+  test("builds from its own keys and ignores another driver's", async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    // An environment file that switched drivers leaves the other driver's keys in the merged
+    // section; they never reach the constructor.
+    const section = {
+      driver: 'local',
+      rootDir: join(dir, 'media'),
+      publicBaseUrl: '/media',
+      privateRootDir: undefined,
+      bucketPublic: 'x',
+    } as LocalStorageConfig;
+    const s = LocalFsStorage.fromConfig(section, ctx);
+    assert.ok(s instanceof LocalFsStorage);
+    const ref = await s.upload(uploadArgs('previews/a.jpg', 'public'));
+    assert.equal(s.publicUrl(ref), '/media/previews/a.jpg');
+    const original = await s.upload(uploadArgs('originals/a.jpg', 'private'));
+    assert.deepEqual(
+      await readFile(join(dir, 'media-private', 'originals/a.jpg')),
+      await s.download(original),
+    );
+    const own = LocalFsStorage.fromConfig(
+      {
+        driver: 'local',
+        rootDir: join(dir, 'media'),
+        publicBaseUrl: '/media',
+        privateRootDir: join(dir, 'vault'),
+      },
+      ctx,
+    );
+    await own.upload(uploadArgs('originals/b.jpg', 'private'));
+    assert.ok(await readFile(join(dir, 'vault', 'originals/b.jpg')));
+  });
+
+  test('rejects a missing rootDir with RESIZE_CONFIG_INVALID naming where', () => {
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ publicBaseUrl: '/media' }, '`storage.rootDir`'],
+      [{ rootDir: 7, publicBaseUrl: '/media' }, '`storage.rootDir`'],
+      [{ rootDir: '/srv/media' }, '`storage.publicBaseUrl`'],
+      [
+        { rootDir: '/srv/media', publicBaseUrl: '/media', privateRootDir: 1 },
+        '`storage.privateRootDir`',
+      ],
+    ];
+    for (const [keys, key] of cases) {
+      assert.throws(
+        () =>
+          LocalFsStorage.fromConfig(
+            { driver: 'local', ...keys } as unknown as LocalStorageConfig,
+            ctx,
+          ),
+        (err: unknown) =>
+          err instanceof ResizeConfigError &&
+          err.code === 'RESIZE_CONFIG_INVALID' &&
+          err.message ===
+            `resize config: ${key} in src/config/resize.ts must be a string`,
+      );
+    }
+  });
+
+  test('an empty publicBaseUrl is accepted as on rc.2 and gives root-relative URLs', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = LocalFsStorage.fromConfig(
+      { driver: 'local', rootDir: join(dir, 'media'), publicBaseUrl: '' },
+      ctx,
+    );
+    const ref = await s.upload(uploadArgs('previews/a.jpg', 'public'));
+    assert.equal(s.publicUrl(ref), '/previews/a.jpg');
   });
 });

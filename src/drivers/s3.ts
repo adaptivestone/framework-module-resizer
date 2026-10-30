@@ -18,9 +18,11 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import type { DriverContext } from '../contracts/drivers.ts';
 import { ResizeStorage } from '../contracts/storage.ts';
 import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
-import type { StorageRef } from '../types.d.ts';
+import { optionalString, requiredString } from '../helpers/configSection.ts';
+import type { S3StorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
 interface S3StorageRef {
@@ -56,6 +58,49 @@ export class S3Storage extends ResizeStorage {
     super();
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
+  }
+
+  /**
+   * The storage of a config's `storage` section (driver 's3'). Only this driver's keys are read:
+   * an environment file that switched the driver leaves the other driver's keys (e.g. rootDir) in
+   * the merged section. A key set to `undefined` is left out, so the SDK's defaults apply. A
+   * missing or empty bucketPublic, or an optional key set to something other than a string, is
+   * RESIZE_CONFIG_INVALID naming `ctx.where`; '' passes as before (`publicBaseUrl: ''` means no
+   * CDN base: the bucket URL), and `forcePathStyle` is passed on as given. Credentials come from
+   * the AWS provider chain; a host that needs its own client constructs S3Storage itself.
+   */
+  static fromConfig(section: S3StorageConfig, ctx: DriverContext): S3Storage {
+    const { where } = ctx;
+    const bucketPublic = requiredString(
+      section.bucketPublic,
+      'storage.bucketPublic',
+      where,
+    );
+    const bucketPrivate = optionalString(
+      section.bucketPrivate,
+      'storage.bucketPrivate',
+      where,
+    );
+    const publicBaseUrl = optionalString(
+      section.publicBaseUrl,
+      'storage.publicBaseUrl',
+      where,
+    );
+    const region = optionalString(section.region, 'storage.region', where);
+    const endpoint = optionalString(
+      section.endpoint,
+      'storage.endpoint',
+      where,
+    );
+    const { forcePathStyle } = section;
+    return new S3Storage({
+      bucketPublic,
+      ...(bucketPrivate === undefined ? {} : { bucketPrivate }),
+      ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
+      ...(region === undefined ? {} : { region }),
+      ...(endpoint === undefined ? {} : { endpoint }),
+      ...(forcePathStyle === undefined ? {} : { forcePathStyle }),
+    });
   }
 
   #getClient(): S3Client {

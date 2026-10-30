@@ -40,8 +40,9 @@ export default class ResizeWorker {
     return {
       queue: {
         type: 'string',
+        multiple: true,
         description:
-          "Queue to consume (default 'default'). Tasks on other queues are left for their own workers.",
+          "Queue to consume (default 'default'); repeat it to consume several queues in one worker. Tasks on other queues are left for their own workers.",
       },
       // Still declared, so that the parser accepts it and run() names the fix.
       config: {
@@ -54,14 +55,19 @@ export default class ResizeWorker {
 
   async run(): Promise<boolean> {
     const { queue, config } =
-      (this.args as { queue?: string; config?: string } | undefined) ?? {};
+      (this.args as
+        | { queue?: string | readonly string[]; config?: string }
+        | undefined) ?? {};
     if (config !== undefined) {
       throw new ResizeConfigError(
         'resize worker: `--config` is removed — the worker reads `worker` and `queues` from src/config/resize.ts',
         { code: 'RESIZE_CONFIG_REMOVED_KEY' },
       );
     }
-    await runResizeWorker(queue === undefined ? {} : { queue });
+    // The parser gives a list (`--queue` may be repeated); a caller may still pass one name. One
+    // name is passed as itself, as before; runWorker checks the names.
+    const names = Array.isArray(queue) && queue.length === 1 ? queue[0] : queue;
+    await runResizeWorker(names === undefined ? {} : { queue: names });
     return true;
   }
 }

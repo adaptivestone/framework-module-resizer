@@ -1,7 +1,11 @@
 // A host without @adaptivestone/framework: explicit config and drivers, no framework app. Eager
 // generation uses hand-written in-memory drivers (any object of the contract's shape works); the
-// queued flow uses only the shipped Mongo drivers, so a plain Node app writes no driver code.
+// queued flow uses only the shipped Mongo drivers, so a plain Node app writes no driver code; and
+// createResizer builds the same from one config object.
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, afterEach, before, test } from 'node:test';
 import { resetAppInstance } from '@adaptivestone/framework/helpers/appInstance.js';
 import { MongoMemoryServer } from 'mongodb-memory-server';
@@ -9,8 +13,8 @@ import mongoose from 'mongoose';
 import sharp from 'sharp';
 import defaultResizeConfig from '../../config/resize.ts';
 import type { MediaStore } from '../../contracts/media.ts';
-import type { ResizeStorage } from '../../contracts/storage.ts';
-import { Resizer, resetResizerForTests } from '../../index.ts';
+import { createResizer, Resizer, resetResizerForTests } from '../../index.ts';
+import { memoryStorage } from '../../testHelpers/fakes.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { runWorker } from '../../worker.ts';
 import { mongoParts } from './index.ts';
@@ -23,27 +27,6 @@ const png = await sharp({
   .toBuffer();
 
 const silent = { info() {}, warn() {}, error() {} };
-
-function memoryStorage(): ResizeStorage {
-  const objects = new Map<string, Buffer>();
-  let next = 0;
-  return {
-    download: async (ref) => {
-      const bytes = objects.get((ref as { id: string }).id);
-      if (!bytes) {
-        throw new Error('not found');
-      }
-      return bytes;
-    },
-    upload: async ({ body }) => {
-      next += 1;
-      const id = `o${next}`;
-      objects.set(id, Buffer.from(body));
-      return { id };
-    },
-    publicUrl: (ref) => `/m/${(ref as { id: string }).id}`,
-  };
-}
 
 function memoryMedia(docs: Map<string, MediaLike>): MediaStore {
   return {
@@ -69,7 +52,7 @@ test('eager: upload, generate and resolve with no framework app', async () => {
   const resizer = new Resizer({
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
-    storage: memoryStorage(),
+    storage: memoryStorage().storage,
     media: memoryMedia(docs),
   });
   const media: MediaLike = {
@@ -86,7 +69,7 @@ test('eager: upload, generate and resolve with no framework app', async () => {
   assert.equal(created.length, 1);
   const { decision } = await resizer.resolve({ media, sizes });
   assert.equal(decision.ready.length, 1);
-  assert.match(decision.ready[0].url, /^\/m\/o\d+$/);
+  assert.match(decision.ready[0].url, /^\/m\/.+\.webp$/);
 });
 
 let server: MongoMemoryServer;
@@ -127,7 +110,7 @@ test('queued: the shipped Mongo drivers and the core worker, no framework app', 
   const resizer = new Resizer({
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
-    storage: memoryStorage(),
+    storage: memoryStorage().storage,
     ...parts,
   });
   const original = await resizer.uploadOriginal({
@@ -198,7 +181,7 @@ test('invalidate on MongoDB removes one pipeline in one write; the next resolve 
     name: 'invalidating',
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
-    storage: memoryStorage(),
+    storage: memoryStorage().storage,
     pipelines: { wm: {} },
     ...parts,
   });
@@ -256,4 +239,81 @@ test('invalidate on MongoDB removes one pipeline in one write; the next resolve 
     tasks.map((task) => [task.resizer, task.pipeline, task.previews.length]),
     [['invalidating', 'wm', 2]],
   );
+});
+
+test('createResizer: a config object and one call on MongoDB, with no framework app', async () => {
+  resetAppInstance();
+  const File = connection.model(
+    'FactoryFile',
+    new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
+  );
+  await File.init();
+  const root = await mkdtemp(join(tmpdir(), 'resize-factory-'));
+  try {
+    const resizer = createResizer(
+      {
+        formats: ['webp'],
+        storage: {
+          driver: 'local',
+          rootDir: join(root, 'public'),
+          publicBaseUrl: '/media',
+        },
+        database: { driver: 'mongo', connection, mediaModel: File },
+        queues: {
+          default: { driver: 'database', idlePollMs: 20, leaseMs: 5000 },
+        },
+      },
+      { name: 'factory', logger: silent },
+    );
+    // The database parts register the package models on first use; the host creates the indexes.
+    await resizer.ready();
+    await connection.models.ResizeTask.createIndexes();
+    await resizer.verify();
+    assert.equal(resizer.locks, undefined); // the database queue keeps its gate in its rows
+
+    const original = await resizer.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    const file = await File.create({ original, previews: [] });
+    const sizes = [{ width: 16, height: 16 }];
+    const warm = await resizer.prewarm({ media: file, sizes });
+    assert.equal(warm.status, 'accepted');
+
+    const { ResizeTask } = connection.models;
+    const stop = new AbortController();
+    const worker = runWorker({
+      signal: stop.signal,
+      logger: silent,
+      resizers: [resizer],
+    });
+    let stored = await File.findById(file.id);
+    try {
+      const until = Date.now() + 20_000;
+      while (
+        (stored?.previews?.length ?? 0) === 0 ||
+        (await ResizeTask.findOne({ fileId: file._id }).lean())?.status !==
+          'completed'
+      ) {
+        assert.ok(
+          Date.now() < until,
+          'the worker did not complete the preview task',
+        );
+        await new Promise((r) => setTimeout(r, 20));
+        stored = await File.findById(file.id);
+      }
+    } finally {
+      stop.abort();
+      await worker;
+    }
+    const { decision } = await resizer.resolve({
+      media: stored as unknown as MediaLike,
+      sizes,
+    });
+    assert.equal(decision.ready.length, 1);
+    assert.deepEqual(decision.missing, []);
+    assert.match(decision.ready[0].url, /^\/media\/.+\.webp$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

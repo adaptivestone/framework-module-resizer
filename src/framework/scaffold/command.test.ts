@@ -186,7 +186,10 @@ describe('runScaffold — default run', () => {
     assert.strictEqual(resolved.image.encode, scaffoldedConfig.encode);
     const processConfig = getProcessConfig();
     assert.deepEqual([...processConfig.queues.keys()], ['default']);
-    assert.equal(processConfig.queues.get('default')?.backend, 'database');
+    assert.equal(
+      processConfig.queues.get('default')?.section.driver,
+      'database',
+    );
     assert.deepEqual(processConfig.worker, scaffoldedConfig.worker);
     assert.equal(processConfig.coordination, undefined);
   });
@@ -231,6 +234,17 @@ describe('runScaffold — default run', () => {
     const { out } = await run(['--help']);
     assert.match(out, /`queues`/);
     assert.match(out, /worker\.enabled/);
+  });
+
+  test('the config template shows a second backend, the repeatable --queue and PartialFrameworkResizeConfig', async () => {
+    await run([]);
+    const config = await read(CONFIG);
+    assert.match(config, /bulk: \{ driver: 'sqs', queueUrl: '…' \}/);
+    assert.match(
+      config,
+      /npm run cli ResizeWorker -- --queue=default --queue=bulk/,
+    );
+    assert.match(config, /satisfies PartialFrameworkResizeConfig/);
   });
 });
 

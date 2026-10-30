@@ -8,11 +8,13 @@
 // coordination.gateTtlMs and hands the owner to the task as `gateOwner`; the worker then holds
 // that lock until the task ends. When the queue does not say it stored the task, the lock is
 // shortened to one lease of the call's queue, or gateTtlMs when that is shorter (see #dispatch).
-// A call on a queue name the task queue does not serve, or whose timing is invalid, queues
-// nothing. The read path never throws and counts only an added task; prewarm accepts only what the
-// new task, or the active one, holds. A Dispatcher needs only the task queue, the lock store
-// (beside a queue without gatesByTask), the coordination, the timing of each queue name, its
-// Resizer's name and a logger.
+// Each call asks these questions of the backend that carries its queue (carrierOf): on a router,
+// one name may be on a queue that gates by task and another on one that needs the gate lock. A
+// call on a queue name nothing carries, whose backend cannot be built, whose timing is invalid, or
+// whose backend needs a gate lock with no lock store, queues nothing. The read path never throws
+// and counts only an added task; prewarm accepts only what the new task, or the active one, holds.
+// A Dispatcher needs only the task queue, the lock store (beside a backend without gatesByTask),
+// the coordination, the timing of each queue name, its Resizer's name and a logger.
 import type { LockStore } from './contracts/locks.ts';
 import type {
   NewTask,
@@ -20,10 +22,17 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import type { Coordination } from './coordination.ts';
+import { ResizeError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { gateKey } from './lockKeys.ts';
+import {
+  carrierOf,
+  type UnavailableReason,
+  unavailableReason,
+  unavailableText,
+} from './routing.ts';
 import type { QueueTiming } from './timing.ts';
 import type {
   EnqueueIssue,
@@ -34,8 +43,8 @@ import type {
 } from './types.d.ts';
 
 export interface DispatcherDeps {
-  tasks: TaskQueue;
-  locks: LockStore | undefined; // the gate locks, beside a task queue without gatesByTask
+  tasks: TaskQueue; // the Resizer's task queue; each call uses the carrier of its queue on it
+  locks: LockStore | undefined; // the gate locks, beside a carrier without gatesByTask
   coordination: Coordination; // the validated policy: a gate lock lasts gateTtlMs
   // The timing of a queue name (timingOf(tasks, queue)); throws when it is invalid. Its lease is
   // how long a call's gate lock is kept when the queue may or may not have stored the task (never
@@ -83,21 +92,86 @@ export function noQueueResult(
   };
 }
 
-/** What one dispatch did: the add result, or why nothing was added. */
-type DispatchOutcome =
+/** What `add` on the carrier did: its result, a throw, or a result in none of the shapes. */
+type AddOutcome =
   | TaskAddResult
-  | { status: 'not-served' } // the task queue does not serve the request's queue
-  | { status: 'timing-invalid'; error: unknown } // the request's queue has invalid timing
   | { status: 'add-failed'; error: unknown } // `add` threw
-  | { status: 'gate-held' } // another request holds the gate lock
-  | { status: 'gate-failed'; error: unknown } // the gate lock could not be acquired
   // `add` resolved something that is not a TaskAddResult; `stored`: its status still says
   // 'added' (e.g. with an empty task id), so the queue may hold the task.
   | { status: 'invalid'; stored: boolean };
 
-/** Why a call on `queue` queues nothing when the task queue does not serve that name. */
-const notServed = (queue: string): string =>
-  `cannot queue to '${queue}': its task queue does not serve that queue (an unknown queue name, or a queue on another backend; one Resizer cannot use two backends yet)`;
+/** What one dispatch did: the add result, or why nothing was added. */
+type DispatchOutcome =
+  | Exclude<AddOutcome, { status: 'in-flight' }>
+  // Another task holds the gate; `carrier` is the backend to ask which variants it holds.
+  | { status: 'in-flight'; taskId?: string; carrier: TaskQueue }
+  // Nothing carries the request's queue; `reason`, when the name's backend is unavailable.
+  | { status: 'not-served'; reason: UnavailableReason | undefined }
+  | { status: 'route-failed'; error: unknown } // the backend of the request's queue failed to build
+  | { status: 'timing-invalid'; error: unknown } // the request's queue has invalid timing
+  | { status: 'locks-missing' } // the carrier needs the gate lock and there is no lock store
+  | { status: 'gate-held' } // another request holds the gate lock
+  | { status: 'gate-failed'; error: unknown }; // the gate lock could not be acquired
+
+/** Why a call on `queue` queues nothing when nothing carries that name. */
+const notServed = (
+  queue: string,
+  reason: UnavailableReason | undefined,
+): string =>
+  `cannot queue to '${queue}': its task queue does not serve that queue (${reason ? unavailableText(reason) : 'a queue name it does not route'})`;
+
+/** Why a call on `queue` queues nothing: its backend needs the gate lock and there is no store. */
+const locksMissing = (queue: string, name: string): string =>
+  `cannot queue to '${queue}': its backend has no gatesByTask, so the gate needs a lock store, and Resizer '${name}' has no \`locks\``;
+
+// The issue codes prewarm reports: a backend's build error with one of them keeps it; any other
+// code travels in `causeCode`.
+const ISSUE_CODES: ReadonlySet<string> = new Set(
+  Object.keys({
+    RESIZE_ENQUEUE_NO_ORIGINAL: true,
+    RESIZE_ENQUEUE_NO_QUEUE: true,
+    RESIZE_ENQUEUE_LOCK_CONTENDED: true,
+    RESIZE_ENQUEUE_LOCK_FAILED: true,
+    RESIZE_ENQUEUE_QUEUE_FAILED: true,
+    RESIZE_ENQUEUE_UNCONFIRMED: true,
+    RESIZE_ENQUEUE_CONFIRM_FAILED: true,
+    RESIZE_ENQUEUE_VARIANT_CONFLICT: true,
+    RESIZE_TASK_IN_FLIGHT: true,
+    RESIZE_PIPELINE_UNKNOWN: true,
+    RESIZE_FORMAT_NOT_CONFIGURED: true,
+    RESIZE_QUEUE_NOT_SERVED: true,
+    RESIZE_ENQUEUE_INTERNAL_ERROR: true,
+  } satisfies Record<EnqueueIssue['code'], true>),
+);
+
+function isIssueCode(code: string): code is EnqueueIssue['code'] {
+  return ISSUE_CODES.has(code);
+}
+
+/**
+ * The issue of a backend that failed to build, without its previews: an error of this package (by
+ * its brand) keeps its code when it is an issue code, else the code is RESIZE_ENQUEUE_QUEUE_FAILED
+ * and the error's code is `causeCode`; either way with the error's own `retryable`. Any other error
+ * is RESIZE_ENQUEUE_QUEUE_FAILED and retryable.
+ */
+function routeFailureIssue(error: unknown): Omit<EnqueueIssue, 'previews'> {
+  if (ResizeError.isResizeError(error)) {
+    const { code, message, retryable } = error;
+    return isIssueCode(code)
+      ? { code, message, retryable }
+      : {
+          code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+          causeCode: code,
+          message,
+          retryable,
+        };
+  }
+  return {
+    code: 'RESIZE_ENQUEUE_QUEUE_FAILED',
+    message: error instanceof Error ? error.message : String(error),
+    retryable: true,
+  };
+}
 
 const TASK_ADD_RESULT =
   "TaskAddResult ({ status: 'added', taskId } | { status: 'in-flight', taskId? } | { status: 'unconfirmed' })";
@@ -127,10 +201,14 @@ export class Dispatcher {
   // An `unconfirmed` add on the read path is logged once, then again only after an add was
   // confirmed: a queue that cannot store tasks (e.g. an outdated model) would log every read.
   #loggedUnconfirmed = false;
-  // The queue names a read found not served, or with invalid timing: each is logged once, since
-  // every later read on that name meets the same answer.
+  // The queue names a read found not served, with invalid timing, or on a backend that needs a
+  // lock store there is not: each is logged once, since every later read on that name meets the
+  // same answer. A backend that failed to build is logged once per name and message, so a
+  // different failure is logged too.
   readonly #loggedNotServed = new Set<string>();
   readonly #loggedTimingInvalid = new Set<string>();
+  readonly #loggedLocksMissing = new Set<string>();
+  readonly #loggedRouteFailed = new Set<string>();
 
   constructor(deps: DispatcherDeps) {
     this.#deps = deps;
@@ -140,12 +218,12 @@ export class Dispatcher {
    * The read path's best-effort enqueue (prewarm uses enqueueConfirmed instead): queue the missing
    * variants, one per identity, as one task. Returns the number of variants in the task it added;
    * 0 when nothing was added: a task of this media, pipeline and queue is in flight, its gate lock
-   * is held, the add or the lock failed (logged), or the task queue does not serve the queue or
-   * its timing is invalid (logged once per queue name). resolve() ignores the count. Never throws,
-   * unless the task queue's own servesQueue throws.
+   * is held, the add or the lock failed (logged), or nothing carries the queue, its backend failed
+   * to build, its timing is invalid or its backend needs a lock store there is not (each logged
+   * once per queue name). resolve() ignores the count. Never throws.
    */
   async enqueue(req: DispatchRequest): Promise<number> {
-    const { logger } = this.#deps;
+    const { logger, name } = this.#deps;
     const { mediaId } = req;
     // Canonical first, so equivalent nested filter objects and list permutations reach the task
     // queue in one stable form; then one variant per identity.
@@ -162,9 +240,31 @@ export class Dispatcher {
           this.#loggedNotServed.add(req.queue);
           logNeverThrow(
             logger,
-            `resize enqueue: Resizer '${this.#deps.name}' ${notServed(req.queue)} — nothing is queued (logged once per queue name)`,
+            `resize enqueue: Resizer '${name}' ${notServed(req.queue, outcome.reason)} — nothing is queued (logged once per queue name)`,
             undefined,
             'warn',
+          );
+        }
+        return 0;
+      case 'route-failed': {
+        const { message } = routeFailureIssue(outcome.error);
+        const key = `${req.queue}\u0000${message}`;
+        if (!this.#loggedRouteFailed.has(key)) {
+          this.#loggedRouteFailed.add(key);
+          logNeverThrow(
+            logger,
+            `resize enqueue: Resizer '${name}' cannot queue to '${req.queue}': its backend could not be built — nothing is queued (logged once per queue name and error)`,
+            outcome.error,
+          );
+        }
+        return 0;
+      }
+      case 'locks-missing':
+        if (!this.#loggedLocksMissing.has(req.queue)) {
+          this.#loggedLocksMissing.add(req.queue);
+          logNeverThrow(
+            logger,
+            `resize enqueue: ${locksMissing(req.queue, name)} — nothing is queued (logged once per queue name)`,
           );
         }
         return 0;
@@ -235,16 +335,19 @@ export class Dispatcher {
     }
 
     // Nothing confirmed: every requested variant unconfirmed, with one issue.
-    const none = (
-      code: EnqueueIssue['code'],
-      message: string,
-      retryable = true,
+    const failed = (
+      issue: Omit<EnqueueIssue, 'previews'>,
     ): ConfirmedEnqueueResult => ({
       accepted: [],
       unconfirmed: [...requested, ...conflicts],
       tasks: [],
-      issues: [...issues, { code, message, retryable, previews: requested }],
+      issues: [...issues, { ...issue, previews: requested }],
     });
+    const none = (
+      code: EnqueueIssue['code'],
+      message: string,
+      retryable = true,
+    ): ConfirmedEnqueueResult => failed({ code, message, retryable });
 
     const outcome = await this.#dispatch(req, requested);
     switch (outcome.status) {
@@ -256,7 +359,21 @@ export class Dispatcher {
           issues,
         };
       case 'not-served':
-        return none('RESIZE_QUEUE_NOT_SERVED', notServed(req.queue), false);
+        return none(
+          'RESIZE_QUEUE_NOT_SERVED',
+          notServed(req.queue, outcome.reason),
+          false,
+        );
+      case 'route-failed':
+        // No prewarm advice here: the error says itself whether a retry can help.
+        return failed(routeFailureIssue(outcome.error));
+      case 'locks-missing':
+        return failed({
+          code: 'RESIZE_ENQUEUE_LOCK_FAILED',
+          causeCode: 'RESIZE_LOCKS_REQUIRED',
+          message: locksMissing(req.queue, this.#deps.name),
+          retryable: false,
+        });
       case 'timing-invalid':
         // No issue here: the caller reports the error as for a task queue that cannot be used.
         return {
@@ -267,7 +384,13 @@ export class Dispatcher {
           timingError: outcome.error,
         };
       case 'in-flight':
-        return this.#confirmActive(req, requested, conflicts, issues);
+        return this.#confirmActive(
+          outcome.carrier,
+          req,
+          requested,
+          conflicts,
+          issues,
+        );
       case 'unconfirmed':
         return none(
           'RESIZE_ENQUEUE_UNCONFIRMED',
@@ -312,11 +435,13 @@ export class Dispatcher {
 
   /**
    * One dispatch of `variants` (canonical, one per identity) for the request's media, pipeline and
-   * queue. First the queue name: one the task queue does not serve is `not-served`, and only then
-   * is its timing read, so a name that is not served never enters the timing cache; invalid timing
-   * is `timing-invalid`. Neither takes a lock or calls `add`.
-   * On a queue with gatesByTask it is one `add`. Without it: acquire the gate lock with a fresh
-   * owner for gateTtlMs, then `add` the task carrying that owner. The lock, by outcome:
+   * queue. First the carrier of the queue name: a backend that fails to build is `route-failed`,
+   * a name nothing carries is `not-served` (with the name's unavailable reason, if any), and only
+   * then is its timing read, so a name that is not served never enters the timing cache; invalid
+   * timing is `timing-invalid`. None of them takes a lock or calls `add`.
+   * On a carrier with gatesByTask it is one `add`. Without it, the gate is a lock: with no lock
+   * store that is `locks-missing`; else acquire the gate lock with a fresh owner for gateTtlMs,
+   * then `add` the task carrying that owner. The lock, by outcome:
    * - held by another request, or the acquire failed: this call never had it;
    * - `added`, even with an unusable task id: kept for gateTtlMs (a worker extends it once it
    *   claims the task), so no second task is queued;
@@ -325,16 +450,25 @@ export class Dispatcher {
    *   shortened to one lease of the request's queue, not released, and never kept longer than an
    *   added task's (min(leaseMs, gateTtlMs)). A stored task is claimed and its lock extended within
    *   that time; otherwise the lock lapses and a later read queues the task.
-   * Never rejects, unless the task queue's own servesQueue throws.
+   * An `in-flight` outcome carries the carrier, which prewarm asks for the active task. Never
+   * rejects.
    */
   async #dispatch(
     req: DispatchRequest,
     variants: MissingPreview[],
   ): Promise<DispatchOutcome> {
     const { tasks, locks, coordination, name } = this.#deps;
-    // Read as verify() and the worker read it: any answer but a truthy one is not served.
-    if (tasks.servesQueue && !tasks.servesQueue(req.queue)) {
-      return { status: 'not-served' };
+    let carrier: TaskQueue | undefined;
+    try {
+      carrier = await carrierOf(tasks, req.queue);
+    } catch (error) {
+      return { status: 'route-failed', error };
+    }
+    if (!carrier) {
+      return {
+        status: 'not-served',
+        reason: unavailableReason(tasks, req.queue),
+      };
     }
     let timing: QueueTiming;
     try {
@@ -349,8 +483,11 @@ export class Dispatcher {
       pipeline: req.pipeline,
       previews: canonicalizeVariants(variants),
     };
-    if (tasks.gatesByTask) {
-      const outcome = await this.#add(task);
+    // An in-flight add names the carrier, so prewarm asks it which variants the active task holds.
+    const routed = (outcome: AddOutcome): DispatchOutcome =>
+      outcome.status === 'in-flight' ? { ...outcome, carrier } : outcome;
+    if (carrier.gatesByTask) {
+      const outcome = await this.#add(carrier, task);
       // Rare by design (the gate changed hands while add ran), constant when a unique index on the
       // gate keys lacks its partial filter: every add after a completed task then meets that row.
       if (
@@ -366,15 +503,10 @@ export class Dispatcher {
           'warn',
         );
       }
-      return outcome;
+      return routed(outcome);
     }
     if (!locks) {
-      return {
-        status: 'gate-failed',
-        error: new Error(
-          `resize: Resizer '${name}' has no lock store for the gate lock of its task queue`,
-        ),
-      };
+      return { status: 'locks-missing' };
     }
     const key = gateKey(name, req.queue, req.mediaId, req.pipeline);
     const owner = randomHex();
@@ -385,7 +517,7 @@ export class Dispatcher {
     } catch (error) {
       return { status: 'gate-failed', error };
     }
-    const outcome = await this.#add({ ...task, gateOwner: owner });
+    const outcome = await this.#add(carrier, { ...task, gateOwner: owner });
     const stored =
       outcome.status === 'added' ||
       (outcome.status === 'invalid' && outcome.stored);
@@ -406,14 +538,14 @@ export class Dispatcher {
         );
       }
     }
-    return outcome;
+    return routed(outcome);
   }
 
-  /** `tasks.add(task)`: its result, a throw, or a result in none of the TaskAddResult shapes. */
-  async #add(task: NewTask): Promise<DispatchOutcome> {
+  /** `carrier.add(task)`: its result, a throw, or a result in none of the TaskAddResult shapes. */
+  async #add(carrier: TaskQueue, task: NewTask): Promise<AddOutcome> {
     let result: unknown;
     try {
-      result = await this.#deps.tasks.add(task);
+      result = await carrier.add(task);
     } catch (error) {
       return { status: 'add-failed', error };
     }
@@ -441,17 +573,18 @@ export class Dispatcher {
   /**
    * After an `in-flight` add: accept the variants the active task holds with the same canonical
    * payload, with that task as their receipt. A requested identity for which the active task holds
-   * two payloads is a conflict; the rest wait for the active task (RESIZE_TASK_IN_FLIGHT). Without
-   * findActive, or when it finds no active task (a dead one that is cooling down), nothing is
-   * accepted.
+   * two payloads is a conflict; the rest wait for the active task (RESIZE_TASK_IN_FLIGHT). The
+   * carrier of the request's queue is asked, not a router over it. Without its findActive, or
+   * when it finds no active task (a dead one that is cooling down), nothing is accepted.
    */
   async #confirmActive(
+    carrier: TaskQueue,
     req: DispatchRequest,
     requested: MissingPreview[],
     conflicts: MissingPreview[],
     issues: EnqueueIssue[],
   ): Promise<ConfirmedEnqueueResult> {
-    const { tasks: taskQueue, name, logger } = this.#deps;
+    const { name, logger } = this.#deps;
     const { mediaId, pipeline, queue } = req;
     const scope = this.#scope(req);
     const unresolved = new Map(
@@ -459,10 +592,10 @@ export class Dispatcher {
     );
     const receipts: EnqueueReceipt[] = [];
     const receiptConflicts = new Map<string, MissingPreview>();
-    if (taskQueue.findActive) {
+    if (carrier.findActive) {
       let active: EnqueueReceipt[];
       try {
-        active = await taskQueue.findActive({
+        active = await carrier.findActive({
           resizer: name,
           mediaId,
           pipeline,

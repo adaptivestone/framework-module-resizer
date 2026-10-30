@@ -7,9 +7,13 @@
 // - plan.ts (the pure size plan) reaches no sharp at runtime and imports no port but the decoder
 //   and pipeline types;
 // - helpers and contracts are leaves: they import only each other, errors and types;
-// - resizer.ts is the composition root: only the entry points (index.ts, worker.ts) and the
-//   framework adapter import it, and nothing it reaches imports it back, not even as a type;
-//   nor does any other file import the main entry, which re-exports the Resizer.
+// - resizer.ts is the composition root: only the entry points (index.ts, worker.ts), the factory
+//   that builds a Resizer from a config (factory/createResizer.ts) and the framework adapter
+//   import it, and nothing it reaches imports it back, not even as a type; nor does any other
+//   file import the main entry, which re-exports the Resizer;
+// - outside the drivers, only factory/builtins.ts imports a driver module dynamically (the
+//   framework adapter builds its drivers through it too), so a driver's optional SDK loads only
+//   when a config selects it.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -246,13 +250,14 @@ test('the framework adapter is reachable from its own entry', () => {
   );
 });
 
-test('only index.ts, worker.ts and the framework adapter import resizer.ts', () => {
+test('only index.ts, worker.ts, factory/createResizer.ts and the framework adapter import resizer.ts', () => {
   assert.ok(
     localImports('index.ts', { types: true }).includes('resizer.ts'),
     'sanity check: the listing does see index.ts importing resizer.ts',
   );
   const allowed = (f: string) =>
-    ['index.ts', 'worker.ts'].includes(f) || f.startsWith('framework/');
+    ['index.ts', 'worker.ts', 'factory/createResizer.ts'].includes(f) ||
+    f.startsWith('framework/');
   assert.deepEqual(
     sourceFiles()
       .filter(
@@ -263,6 +268,16 @@ test('only index.ts, worker.ts and the framework adapter import resizer.ts', () 
       .map((f) => `${f} → resizer.ts`),
     [],
   );
+});
+
+test('only src/factory/builtins.ts imports a driver dynamically, the framework adapter included', () => {
+  const dynamicDriver = /import\(\s*['"][^'"]*drivers\//;
+  const importers = sourceFiles().filter(
+    (f) =>
+      !f.startsWith('drivers/') &&
+      dynamicDriver.test(readFileSync(resolve(SRC, f), 'utf8')),
+  );
+  assert.deepEqual(importers, ['factory/builtins.ts']);
 });
 
 test('only tests and the framework adapter import the main entry (it re-exports the Resizer)', () => {

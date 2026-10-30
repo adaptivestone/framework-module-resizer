@@ -19,6 +19,18 @@ export {
   SourceDecoder,
   type SourceInfo,
 } from './contracts/decoder.ts';
+// The driver factories: how a config section becomes a part (`fromConfig` on a registered driver).
+export type {
+  DatabaseDriver,
+  DatabaseParts,
+  DriverContext,
+  DriverRegistry,
+  QueueDriver,
+  QueueDriverContext,
+  QueueEntry,
+  QueueSection,
+  StorageDriver,
+} from './contracts/drivers.ts';
 export type {
   HookFn,
   HookName,
@@ -62,6 +74,14 @@ export {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
+// --- the config a Resizer is built from: image settings over the defaults, and its sections;
+// createResizer builds a Resizer from it, each section through a built-in driver or one the host
+// registers by name (the built-in drivers' modules load only when a config selects them) ---
+export {
+  type CreateResizerOptions,
+  createResizer,
+} from './factory/createResizer.ts';
+export type { ResizerConfig } from './factory/types.ts';
 // --- public URL formatting and size catalog helpers ---
 export { formatPictureUrls } from './formatPictureUrls.ts';
 export {
@@ -80,6 +100,14 @@ export {
   Resizer,
   resetResizerForTests,
 } from './resizer.ts';
+// --- queue names on several backends: a task queue that routes each name to the backend that
+// carries it, and how to find the backend of a name on any task queue ---
+export {
+  carrierOf,
+  type Route,
+  RoutingTaskQueue,
+  type RoutingTaskQueueOptions,
+} from './routing.ts';
 // --- data shapes and options (types.d.ts: ResolveOpts, PrewarmOpts, GenerateOpts,
 // InvalidateOpts, CoordinationOptions, …) ---
 export type * from './types.d.ts';

@@ -58,6 +58,9 @@ const expected = [
   'ResizeStorage',
   'SourceDecoder',
   'TaskQueue',
+  'RoutingTaskQueue',
+  'carrierOf',
+  'createResizer',
   'resetResizerForTests',
   'runWorker',
   'rasterToSharp',
@@ -78,6 +81,7 @@ for (const driver of [
   'MongoLockStore',
   'MongoTaskQueue',
   'mongoParts',
+  'MongoDatabase',
   'SqsTaskQueue',
   'S3Storage',
   'LocalFsStorage',
@@ -126,6 +130,7 @@ const safe = [
   ['/drivers/mongo.js', 'MongoMediaStore'],
   ['/drivers/mongo.js', 'MongoLockStore'],
   ['/drivers/mongo.js', 'MongoTaskQueue'],
+  ['/drivers/mongo.js', 'MongoDatabase'],
   ['/drivers/mongo.js', 'createResizeModels'],
   ['/drivers/mongo.js', 'resizeMediaSchemaFragment'],
   ['/drivers/mongo.js', 'resizeMediaPaths'],
@@ -233,7 +238,32 @@ new mongo.MongoLockStore({
   },
 });
 assert.equal(typeof mongo.mongoParts, 'function');
+assert.equal(typeof mongo.MongoDatabase.fromConfig, 'function');
+assert.equal(typeof fs.LocalFsStorage.fromConfig, 'function');
 console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; custom drivers extend MediaStore and LockStore');
+// createResizer builds the local storage through its built-in driver, imported on first use.
+const factory = mod.createResizer(
+  { formats: ['webp'], storage: { driver: 'local', rootDir: './var/factory', publicBaseUrl: '/factory' } },
+  { name: 'factory', media: new MemoryMedia(), logger: { info() {}, warn() {}, error() {} } },
+);
+await factory.ready();
+assert.equal(factory.storage.constructor.name, 'LocalFsStorage');
+assert.deepEqual(factory.config.formats, ['webp']);
+// Without the AWS SDK, an s3 section is RESIZE_PEER_MISSING naming the package, not a crash.
+const s3Factory = mod.createResizer(
+  { storage: { driver: 's3', bucketPublic: 'cdn' } },
+  { name: 's3Factory', media: new MemoryMedia(), logger: { info() {}, warn() {}, error() {} } },
+);
+let peerErr = null;
+try {
+  await s3Factory.ready();
+} catch (e) {
+  peerErr = e;
+}
+assert.ok(peerErr, 'an s3 storage without its SDK should fail first use');
+assert.equal(peerErr.code, 'RESIZE_PEER_MISSING');
+assert.ok(String(peerErr.message).includes('@aws-sdk/client-s3'));
+console.log('  ok  createResizer builds the local storage, and names the missing AWS SDK for s3');
 let frameworkErr = null;
 try {
   await import(PKG + '/framework.js');
@@ -259,12 +289,18 @@ console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classe
 // installed tarball. These imports intentionally avoid the optional AWS-backed subpaths.
 const CHECK_TYPES = `import { Resizer } from '@adaptivestone/framework-module-resize';
 import {
+  type CreateResizerOptions,
+  createResizer,
+  type DriverRegistry,
   type InvalidateOpts,
   LockStore,
   MediaStore,
   type Preview,
   type QueueConfig,
+  type QueueDriver,
   type ReplacedPreviews,
+  type ResizerConfig,
+  type StorageDriver,
   type StorageRef,
   type TaskQueue,
 } from '@adaptivestone/framework-module-resize';
@@ -374,6 +410,47 @@ const plainMedia: MediaStore = {
   appendPreviews: async (_id, previews) => previews,
   replacePreviews: async () => ({ stored: [], removed: [] }),
 };
+// createResizer: one config object, each section through a built-in or registered driver.
+const factoryConfig = {
+  formats: ['webp'],
+  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+  queues: { default: { driver: 'database' } },
+} satisfies ResizerConfig;
+const factoryOptions: CreateResizerOptions = { name: 'factory', media: plainMedia };
+const viaFactory = (): Resizer => createResizer(factoryConfig, factoryOptions);
+// Host drivers registered by name: their sections type-check through the registry generics.
+interface MemoryStorageSection { driver: 'memory'; prefix: string }
+const memoryStorageDriver: StorageDriver<MemoryStorageSection> = {
+  fromConfig: (section) => ({
+    download: async () => Buffer.alloc(0),
+    upload: async () => ({ key: section.prefix }),
+    publicUrl: () => section.prefix,
+  }),
+};
+interface RedisQueueSection { driver: 'redis'; url: string }
+const redisQueueDriver: QueueDriver<RedisQueueSection> = {
+  fromConfig: () => {
+    throw new Error('never built here');
+  },
+};
+const hostDrivers = {
+  storage: { memory: memoryStorageDriver },
+  queue: { redis: redisQueueDriver },
+} satisfies DriverRegistry;
+const viaHostDrivers = (): Resizer =>
+  createResizer(
+    {
+      storage: { driver: 'memory', prefix: '/m' },
+      queues: { default: { driver: 'database' }, bulk: { driver: 'redis', url: 'redis://r' } },
+    },
+    { drivers: hostDrivers, media: plainMedia },
+  );
+const missingPrefix = (): Resizer =>
+  // @ts-expect-error a registered storage section keeps its own required keys
+  createResizer({ storage: { driver: 'memory' } }, { drivers: hostDrivers, media: plainMedia });
+const unregistered = (): Resizer =>
+  // @ts-expect-error a section whose driver is not registered is refused
+  createResizer({ storage: { driver: 'gcs' } }, { media: plainMedia });
 // A core construction site (never called here: it would register a Resizer).
 const core = () =>
   new Resizer({
@@ -387,6 +464,10 @@ const invalidated = (): Promise<StorageRef[]> => core().invalidate(invalidateOpt
 void [
   media,
   core,
+  viaFactory,
+  viaHostDrivers,
+  missingPrefix,
+  unregistered,
   invalidated,
   FrameworkMediaStore,
   FrameworkLockStore,

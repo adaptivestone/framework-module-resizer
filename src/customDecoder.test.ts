@@ -7,7 +7,6 @@ import { afterEach, test } from 'node:test';
 import sharp from 'sharp';
 import defaultResizeConfig from './config/resize.ts';
 import type { DecodeBox, SourceDecoder } from './contracts/decoder.ts';
-import type { ResizeStorage } from './contracts/storage.ts';
 import type { LeasedTask } from './contracts/taskQueue.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
@@ -16,40 +15,16 @@ import {
   type ResizerOptions,
   resetResizerForTests,
 } from './resizer.ts';
-import { fakeMedia } from './testHelpers/fakes.ts';
+import { fakeMedia, memoryStorage } from './testHelpers/fakes.ts';
 import { fakePdf, TestPdfDecoder } from './testHelpers/pdfDecoder.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
-import type { MediaLike, Preview, StorageRef } from './types.d.ts';
+import type { MediaLike, Preview } from './types.d.ts';
 import { processTask } from './worker.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
 const RED: [number, number, number] = [200, 30, 30];
 
 afterEach(resetResizerForTests);
-
-/** In-memory storage: uploads are kept by key and downloaded back. */
-function memoryStorage(): {
-  storage: ResizeStorage;
-  files: Map<string, Buffer>;
-} {
-  const files = new Map<string, Buffer>();
-  const keyOf = (ref: StorageRef) => (ref as { key: string }).key;
-  const storage: ResizeStorage = {
-    download: async (ref) => {
-      const body = files.get(keyOf(ref));
-      if (body === undefined) {
-        throw new Error(`no file ${keyOf(ref)}`);
-      }
-      return body;
-    },
-    upload: async ({ key, body }) => {
-      files.set(key, Buffer.from(body));
-      return { key };
-    },
-    publicUrl: (ref) => `/m/${keyOf(ref)}`,
-  };
-  return { storage, files };
-}
 
 /** A media document in memory: load returns it, and stored previews land on it. */
 function mediaOf(doc: MediaLike) {

@@ -58,6 +58,7 @@ import {
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  observedQueue,
   PlainTaskQueue,
 } from './testHelpers/fakes.ts';
 import { fakePdf, TestPdfDecoder } from './testHelpers/pdfDecoder.ts';
@@ -4332,26 +4333,6 @@ describe('a source smaller than the box', () => {
 // ---------------------------------------------------------------------------
 // runResizeWorker
 // ---------------------------------------------------------------------------
-
-// Stop idle test queues deterministically after their queued work has been handled. A test whose
-// unserved task must fail, not be given back, passes PlainTaskQueue (a queue without release).
-function observedQueue(
-  onIdle: () => void = () => process.emit('SIGTERM'),
-  Queue: typeof MemoryTaskQueue | typeof PlainTaskQueue = MemoryTaskQueue,
-) {
-  const tasks = new Queue({ timing: { idlePollMs: 1 } });
-  const claimedQueues: string[] = [];
-  const claim = tasks.claim.bind(tasks);
-  tasks.claim = async (queue, leaseMs) => {
-    claimedQueues.push(queue);
-    const next = await claim(queue, leaseMs);
-    if (!next) {
-      onIdle();
-    }
-    return next;
-  };
-  return { tasks, claimedQueues };
-}
 
 async function addTask(
   tasks: MemoryTaskQueue | PlainTaskQueue,

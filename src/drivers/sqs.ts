@@ -16,6 +16,7 @@ import {
   SendMessageCommand,
   SQSClient,
 } from '@aws-sdk/client-sqs';
+import type { QueueDriverContext, QueueEntry } from '../contracts/drivers.ts';
 import {
   type ClaimedTask,
   type ClaimOptions,
@@ -28,6 +29,7 @@ import type {
   MissingPreview,
   QueueTimingOptions,
   ResizeLogger,
+  SqsQueueConfig,
 } from '../types.d.ts';
 
 export interface SqsTaskQueueOptions {
@@ -90,6 +92,34 @@ export class SqsTaskQueue extends TaskQueue {
     }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
+  }
+
+  /**
+   * The task queue of one SQS backend: `entries` are the `queues` entries that share its
+   * connection settings (region, endpoint, dead-letter queue and long poll), already checked to
+   * have one queueUrl each. Each name is served from its own queueUrl with its own timing; the
+   * connection settings are read from the first entry, as every entry carries the same ones.
+   * It builds no client and sends nothing: the client is made on first use, and connection checks
+   * belong to verify().
+   */
+  static fromConfig(
+    entries: readonly QueueEntry<SqsQueueConfig>[],
+    ctx: QueueDriverContext,
+  ): SqsTaskQueue {
+    const timing = new Map(entries.map((entry) => [entry.name, entry.timing]));
+    const first: Partial<SqsQueueConfig> = entries[0]?.section ?? {};
+    const { deadLetterQueueUrl, waitTimeSeconds, region, endpoint } = first;
+    return new SqsTaskQueue({
+      queues: Object.fromEntries(
+        entries.map((entry) => [entry.name, entry.section.queueUrl]),
+      ),
+      ...(deadLetterQueueUrl ? { deadLetterQueueUrl } : {}),
+      ...(waitTimeSeconds === undefined ? {} : { waitTimeSeconds }),
+      ...(region ? { region } : {}),
+      ...(endpoint ? { endpoint } : {}),
+      getTiming: (queue) => timing.get(queue),
+      logger: ctx.logger,
+    });
   }
 
   get #logger(): ResizeLogger {

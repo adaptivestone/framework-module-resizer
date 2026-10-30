@@ -1,9 +1,11 @@
 // Local filesystem driver. Each persisted ref identifies both a relative path and its root.
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import type { DriverContext } from '../contracts/drivers.ts';
 import { ResizeStorage } from '../contracts/storage.ts';
 import { ResizeSecurityError } from '../errors.ts';
-import type { StorageRef } from '../types.d.ts';
+import { optionalString, stringValue } from '../helpers/configSection.ts';
+import type { LocalStorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
 export interface LocalFsStorageOptions {
@@ -69,6 +71,35 @@ export class LocalFsStorage extends ResizeStorage {
       );
     }
     this.#publicBaseUrl = opts.publicBaseUrl;
+  }
+
+  /**
+   * The storage of a config's `storage` section (driver 'local'). Only this driver's keys are read:
+   * an environment file that switched the driver leaves the other driver's keys (e.g. bucketPublic)
+   * in the merged section. A missing key, or a key that is not a string, is RESIZE_CONFIG_INVALID
+   * naming `ctx.where`; '' is accepted as before (`publicBaseUrl: ''` gives root-relative URLs).
+   */
+  static fromConfig(
+    section: LocalStorageConfig,
+    ctx: DriverContext,
+  ): LocalFsStorage {
+    const { where } = ctx;
+    const rootDir = stringValue(section.rootDir, 'storage.rootDir', where);
+    const publicBaseUrl = stringValue(
+      section.publicBaseUrl,
+      'storage.publicBaseUrl',
+      where,
+    );
+    const privateRootDir = optionalString(
+      section.privateRootDir,
+      'storage.privateRootDir',
+      where,
+    );
+    return new LocalFsStorage({
+      rootDir,
+      publicBaseUrl,
+      ...(privateRootDir === undefined ? {} : { privateRootDir }),
+    });
   }
 
   #ref(value: StorageRef): LocalFsStorageRef {

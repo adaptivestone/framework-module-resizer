@@ -287,7 +287,7 @@ test('PlainTaskQueue stores every add and declares no gate, no claim filter and 
   assert.equal(claimed?.resizer, 'default');
 });
 
-test('the in-memory task queues record every claim, serve their listed names and read timing per name', async () => {
+test('the in-memory task queues record every claim and every lease, serve their listed names and read timing per name', async () => {
   for (const Queue of [MemoryTaskQueue, PlainTaskQueue]) {
     const timing = { leaseMs: 90_000 };
     const tasks = new Queue({
@@ -302,11 +302,14 @@ test('the in-memory task queues record every claim, serve their listed names and
     assert.equal(tasks.getTiming('default'), timing);
     await tasks.add(newTask({ queue: 'bulk' }));
     assert.equal(await tasks.claim('default', 1000), null);
-    assert.equal((await tasks.claim('bulk', 30_000))?.queue, 'bulk');
+    const leased = await tasks.claim('bulk', 30_000);
+    assert.equal(leased?.queue, 'bulk');
     assert.deepEqual(tasks.claims, [
       { queue: 'default', leaseMs: 1000 },
       { queue: 'bulk', leaseMs: 30_000 },
     ]);
+    // Only the claim that handed a task out is a lease.
+    assert.deepEqual(tasks.leases, [leased]);
   }
   // Without a list every name is served; without timing every name has none of its own.
   const plain = new PlainTaskQueue();

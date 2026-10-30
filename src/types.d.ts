@@ -7,7 +7,9 @@
 // HookTaps, HookFn). ResizerOptions stays beside the Resizer in resizer.ts.
 
 // Recursive partial for environment-specific config overrides. Arrays stay whole because
-// the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts.
+// the framework replaces them while merging resize.ts with resize.<NODE_ENV>.ts. Objects are
+// partial at every depth, `encode.formats` entries too, although the module's merge replaces
+// `encode.formats` whole: an override that sets it must hold every format it generates.
 export type DeepPartial<T> = T extends readonly (infer _U)[]
   ? T
   : T extends object
@@ -159,6 +161,10 @@ export interface EnqueueIssue {
     | 'RESIZE_FORMAT_NOT_CONFIGURED' // a requested format has no encode.formats entry
     | 'RESIZE_QUEUE_NOT_SERVED' // the task queue does not serve the call's queue name
     | 'RESIZE_ENQUEUE_INTERNAL_ERROR'; // prewarm caught an unexpected error (see message)
+  // The code of the error behind the issue when that code is not one of the above, e.g.
+  // RESIZE_PEER_MISSING or a custom driver's code behind RESIZE_ENQUEUE_QUEUE_FAILED, or
+  // RESIZE_LOCKS_REQUIRED behind RESIZE_ENQUEUE_LOCK_FAILED.
+  causeCode?: string;
   message: string;
   retryable: boolean;
   previews: MissingPreview[];
@@ -320,15 +326,16 @@ export interface FrameworkWorkerConfig {
   sharpCache: boolean; // default false — sharp.cache()
 }
 
-// Where a FrameworkResizer keeps files: the config file's `storage` section. Credentials are not
-// config: the AWS SDK reads them from its default provider chain.
-export interface FrameworkLocalStorageConfig {
+// Where a Resizer keeps files: the config's `storage` section (createResizer's config, or a
+// framework host's config file). Credentials are not config: the AWS SDK reads them from its
+// default provider chain.
+export interface LocalStorageConfig {
   driver: 'local'; // LocalFsStorage
   rootDir: string; // public previews; serve only this directory
   publicBaseUrl: string; // URL prefix, e.g. '/media'
   privateRootDir?: string; // private originals; default rootDir + '-private'
 }
-export interface FrameworkS3StorageConfig {
+export interface S3StorageConfig {
   driver: 's3'; // S3Storage (needs @aws-sdk/client-s3 and @aws-sdk/s3-request-presigner)
   bucketPublic: string; // previews
   bucketPrivate?: string; // originals; must differ from bucketPublic
@@ -337,9 +344,21 @@ export interface FrameworkS3StorageConfig {
   endpoint?: string; // S3-compatible: MinIO / localstack / R2
   forcePathStyle?: boolean;
 }
-export type FrameworkStorageConfig =
-  | FrameworkLocalStorageConfig
-  | FrameworkS3StorageConfig;
+export type StorageConfig = LocalStorageConfig | S3StorageConfig;
+/** @deprecated The same type under its core name: use LocalStorageConfig. */
+export type FrameworkLocalStorageConfig = LocalStorageConfig;
+/** @deprecated The same type under its core name: use S3StorageConfig. */
+export type FrameworkS3StorageConfig = S3StorageConfig;
+/** @deprecated The same type under its core name: use StorageConfig. */
+export type FrameworkStorageConfig = StorageConfig;
+
+// The database a Resizer's media store (and its gate locks and database queue) lives in: the
+// config's `database` section.
+export interface MongoDatabaseConfig {
+  driver: 'mongo'; // MongoDatabase (…/drivers/mongo.js)
+  connection: unknown; // a Mongoose connection; the driver checks it
+  mediaModel: unknown; // the host's media model on that connection; the driver checks it
+}
 
 /**
  * One named queue: where its tasks wait, and that queue's timing (any QueueTimingOptions key; the
@@ -364,23 +383,103 @@ export interface SqsQueueConfig extends Partial<QueueTimingOptions> {
   endpoint?: string;
 }
 
+// ---------------------------------------------------------------------------
+// The sections a registered custom driver adds. The driver registry (DriverRegistry, beside the
+// driver contracts) fits this structural shape, so the helpers below need no import. Each reads the
+// section type off a registered driver's `fromConfig` parameter (for a queue driver, off its
+// entries' `section`) and adds `{ driver: <the name it is registered under> }`.
+// ---------------------------------------------------------------------------
+
+/** A driver registry as the section helpers read it (internal to this file). */
+interface DriverRegistryShape {
+  storage?: Record<string, { fromConfig(section: never, ctx: never): unknown }>;
+  database?: Record<
+    string,
+    { fromConfig(section: never, ctx: never): unknown }
+  >;
+  queue?: Record<string, { fromConfig(entries: never, ctx: never): unknown }>;
+}
+
+/** The `storage` sections of the storage drivers registered in `D`. */
+export type StorageSectionOf<D extends DriverRegistryShape> = {
+  [K in keyof NonNullable<D['storage']> & string]: (NonNullable<
+    D['storage']
+  >[K] extends { fromConfig(section: infer S, ctx: never): unknown }
+    ? S
+    : never) & { driver: K };
+}[keyof NonNullable<D['storage']> & string];
+
+/** The `database` sections of the database drivers registered in `D`. */
+export type DatabaseSectionOf<D extends DriverRegistryShape> = {
+  [K in keyof NonNullable<D['database']> & string]: (NonNullable<
+    D['database']
+  >[K] extends { fromConfig(section: infer S, ctx: never): unknown }
+    ? S
+    : never) & { driver: K };
+}[keyof NonNullable<D['database']> & string];
+
+/** The `queues` entries of the queue drivers registered in `D`. */
+export type QueueSectionOf<D extends DriverRegistryShape> = {
+  [K in keyof NonNullable<D['queue']> & string]: (NonNullable<
+    D['queue']
+  >[K] extends {
+    fromConfig(entries: readonly { section: infer S }[], ctx: never): unknown;
+  }
+    ? S
+    : never) & { driver: K };
+}[keyof NonNullable<D['queue']> & string];
+
+/**
+ * The sections of a Resizer's config beside its image settings (createResizer's config). `D` is the
+ * registry of the host's own drivers: each adds its sections to the built-in ones.
+ */
+// biome-ignore lint/complexity/noBannedTypes: `{}` is the empty registry, the default when a host registers no driver
+export interface ResizerSections<D extends DriverRegistryShape = {}> {
+  storage?: StorageConfig | StorageSectionOf<D>;
+  database?: MongoDatabaseConfig | DatabaseSectionOf<D>;
+  /**
+   * The queue name of this Resizer's tasks (a key of `queues`), or false for eager only. Missing:
+   * 'default' when `queues` has entries, else eager only.
+   */
+  queue?: string | false;
+  /** Every queue, by name. */
+  queues?: Record<string, QueueConfig | QueueSectionOf<D>>;
+  coordination?: CoordinationOptions;
+}
+
 // A config file a framework host writes: `src/config/resize.ts`, or another Resizer's file
 // (`configName`). The image settings, `mediaModelName`, `storage` and `queue` belong to that
 // Resizer. `queues`, `worker` and `coordination` are process-wide: the adapter reads them only from
 // src/config/resize.ts and rejects them in any other file. resize.<NODE_ENV>.ts overrides any of
-// them per environment.
-export interface FrameworkResizeConfig extends ResizeConfig {
+// them per environment. `D` is the registry of the host's own drivers (the `drivers` option): each
+// adds its `storage` and `queues` sections.
+// biome-ignore lint/complexity/noBannedTypes: `{}` is the empty registry, the default when a host registers no driver
+export interface FrameworkResizeConfig<D extends DriverRegistryShape = {}>
+  extends ResizeConfig {
   mediaModelName: string; // host media model, e.g. 'File' or 'Media'
-  storage?: FrameworkStorageConfig; // required unless the code passes `storage`
+  storage?: StorageConfig | StorageSectionOf<D>; // required unless the code passes `storage`
   /**
    * The queue name of this Resizer's tasks (a key of `queues`), or false for eager only. Missing:
    * 'default' when `queues` has entries, else eager only.
    */
   queue?: string | false;
   /** Process-wide: every queue, by name. */
-  queues?: Record<string, QueueConfig>;
+  queues?: Record<string, QueueConfig | QueueSectionOf<D>>;
   /** Process-wide; a missing key takes defaultWorkerOptions. */
   worker?: Partial<FrameworkWorkerConfig>;
   /** Process-wide; default: defaultCoordination. */
   coordination?: CoordinationOptions;
 }
+
+/**
+ * A file that overrides part of a config, e.g. resize.<NODE_ENV>.ts: every object key by key, at any
+ * depth; arrays stay whole, as the framework's merge replaces them. The type leaves the entries
+ * of `encode.formats` partial too, but at run time the module replaces `encode.formats` whole: an
+ * override that sets it must hold every format it generates.
+ */
+// biome-ignore lint/complexity/noBannedTypes: `{}` is the empty registry, the default when a host registers no driver
+export type PartialFrameworkResizeConfig<D extends DriverRegistryShape = {}> =
+  DeepPartial<FrameworkResizeConfig<D>>;
+
+// biome-ignore lint/complexity/noUselessEmptyExport: in a declaration file every top-level declaration is exported unless the file has an empty export; this one keeps DriverRegistryShape (not marked `export`) private
+export {};

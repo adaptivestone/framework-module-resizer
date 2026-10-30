@@ -75,7 +75,7 @@ describe('getResizeConfig', () => {
     assert.equal(defaultResizeConfig.concurrency, 4);
   });
 
-  test('returns the final framework config without merging another defaults object', () => {
+  test('returns a complete framework config as it is: the merge over the package defaults keeps its objects', () => {
     const config = makeResizeConfig({
       formats: ['webp'],
       storage: { driver: 'local', rootDir: './m', publicBaseUrl: '/m' },
@@ -94,7 +94,11 @@ describe('getResizeConfig', () => {
     const entry = processConfig.queues.get('default');
     assert.strictEqual(entry?.section, config.queues?.default);
     assert.equal(entry?.name, 'default');
-    assert.equal(entry?.backend, 'database');
+    assert.deepEqual(Object.keys(entry ?? {}).sort(), [
+      'name',
+      'section',
+      'timing',
+    ]);
     assert.equal(entry?.timing.maxAttempts, 3);
     assert.equal(entry?.timing.leaseMs, defaultQueueOptions.leaseMs);
   });
@@ -144,14 +148,9 @@ describe('getResizeConfig', () => {
     assert.deepEqual(getResizeConfig().image.upload.formats, ['tiff', 'heif']);
   });
 
-  test('rejects a partial host config because the framework config must be complete', () => {
+  test('merges a partial host config over the package defaults', () => {
     install({ mediaModelName: 'File' });
-    assert.throws(
-      () => getResizeConfig(),
-      (error: unknown) =>
-        error instanceof ResizeConfigError &&
-        error.code === 'RESIZE_CONFIG_UPLOAD_INVALID',
-    );
+    assert.deepEqual(getResizeConfig().image, defaultResizeConfig);
   });
 
   test('rejects missing mediaModelName, empty format lists, and blank ids', () => {
@@ -292,22 +291,15 @@ describe('config split: core validation vs framework loading', () => {
     assert.equal(processConfig.coordination, undefined);
   });
 
-  test('queues entries need a driver; an SQS entry needs queueUrl', () => {
+  // Each entry check is tested once, beside the core helper that makes it
+  // (src/factory/queues.test.ts, src/helpers/helpers.test.ts); this case pins that the adapter
+  // runs them and the SQS checks. Any driver name passes here: a Resizer checks it against its
+  // own drivers when it reads the queues.
+  test('queues resolve through the core checks; any driver name passes the file read', () => {
     const noDriver = `\`queues.bulk\` in src/config/resize.ts ${OVERRIDE} needs driver 'database' or 'sqs'`;
     for (const [queues, ...parts] of [
       [{ bulk: {} }, noDriver],
-      [{ bulk: { driver: 'redis' } }, noDriver],
-      [{ bulk: 'database' }, noDriver],
-      [{ bulk: null }, noDriver],
       [{ bulk: { driver: 'sqs' } }, '`queues.bulk.queueUrl`', 'required'],
-      [
-        { bulk: { driver: 'sqs', queueUrl: '' } },
-        '`queues.bulk.queueUrl`',
-        'required',
-      ],
-      [[{ driver: 'database' }], '`queues`', 'must be an object'],
-      ['database', '`queues`', 'must be an object'],
-      [{ ' ': { driver: 'database' } }, '`queues`', 'blank'],
     ] as Array<[unknown, ...string[]]>) {
       assert.throws(
         () => resolveProcessConfig({ queues }),
@@ -315,119 +307,26 @@ describe('config split: core validation vs framework loading', () => {
         JSON.stringify(queues),
       );
     }
+    assert.throws(
+      () =>
+        resolveProcessConfig({
+          queues: { bulk: { driver: 'database', leaseMs: 0 } },
+        }),
+      configError('RESIZE_CONFIG_QUEUE_LEASE_INVALID', /queues\.bulk/),
+    );
     const resolved = resolveProcessConfig({
       queues: {
         default: { driver: 'database' },
         bulk: { driver: 'sqs', queueUrl: 'https://sqs.example/bulk' },
+        gone: undefined,
       },
     });
     assert.deepEqual([...resolved.queues.keys()], ['default', 'bulk']);
-    assert.equal(resolved.queues.get('default')?.backend, 'database');
-    // An environment file removes an entry by setting it to undefined: the framework's merge
-    // keeps the key, and the entry counts as not defined.
-    assert.deepEqual(
-      [
-        ...resolveProcessConfig({
-          queues: { default: { driver: 'database' }, bulk: undefined },
-        }).queues.keys(),
-      ],
-      ['default'],
-    );
     assert.equal(
-      resolved.queues.get('bulk')?.backend,
-      'sqs:[null,null,null,10]',
-    );
-  });
-
-  test('queues.<name>.lockTtlMs and queues.<name>.queues are RESIZE_CONFIG_REMOVED_KEY naming the entry', () => {
-    for (const value of [{ failed: 600_000 }, undefined]) {
-      assert.throws(
-        () =>
-          resolveProcessConfig({
-            queues: { bulk: { driver: 'database', lockTtlMs: value } },
-          }),
-        configError(
-          'RESIZE_CONFIG_REMOVED_KEY',
-          '`queues.bulk.lockTtlMs`',
-          `src/config/resize.ts ${OVERRIDE}`,
-          'coordination in the same file',
-          'lockTtlMs.failed → cooldownMs',
-          'lockTtlMs.dispatch → gateTtlMs',
-          'drop lockTtlMs.worker',
-        ),
-        JSON.stringify(value),
-      );
-    }
-    assert.throws(
-      () =>
-        resolveProcessConfig({
-          queues: {
-            default: {
-              driver: 'sqs',
-              queueUrl: 'https://sqs.example/resize',
-              queues: { bulk: 'https://sqs.example/bulk' },
-            },
-          },
-        }),
-      configError(
-        'RESIZE_CONFIG_REMOVED_KEY',
-        '`queues.default.queues`',
-        `src/config/resize.ts ${OVERRIDE}`,
-        'its own entry',
-      ),
-    );
-  });
-
-  test("a queue entry's invalid timing names the entry and keeps the timing code", () => {
-    let error: unknown;
-    try {
       resolveProcessConfig({
-        queues: {
-          default: { driver: 'database' },
-          bulk: { driver: 'database', leaseMs: 0 },
-        },
-      });
-    } catch (err) {
-      error = err;
-    }
-    assert.ok(
-      configError(
-        'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
-        /queues\.bulk/,
-        `src/config/resize.ts ${OVERRIDE}`,
-        'leaseMs must be a positive safe integer',
-      )(error),
-      String(error),
-    );
-    const cause = (error as Error).cause;
-    assert.ok(
-      cause instanceof ResizeConfigError &&
-        cause.code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
-    );
-    assert.throws(
-      () =>
-        resolveProcessConfig({
-          queues: { slow: { driver: 'database', maxAttempts: 0 } },
-        }),
-      configError('RESIZE_CONFIG_QUEUE_INVALID', /queues\.slow/),
-    );
-  });
-
-  test('two SQS entries with one queueUrl are RESIZE_CONFIG_INVALID', () => {
-    assert.throws(
-      () =>
-        resolveProcessConfig({
-          queues: {
-            default: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
-            bulk: { driver: 'sqs', queueUrl: 'https://sqs.example/resize' },
-          },
-        }),
-      configError(
-        'RESIZE_CONFIG_INVALID',
-        '`queues.default`',
-        '`queues.bulk`',
-        'https://sqs.example/resize',
-      ),
+        queues: { bulk: { driver: 'redis' } },
+      }).queues.get('bulk')?.section.driver,
+      'redis',
     );
   });
 

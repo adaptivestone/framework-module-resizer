@@ -36,6 +36,9 @@ const EXPECTED_VALUE_EXPORTS = [
   'runWorker',
   'sharpToRaster',
   'TaskQueue',
+  'RoutingTaskQueue',
+  'carrierOf',
+  'createResizer',
 ];
 
 // Drivers are SUBPATH-ONLY (the uniform rule 02 · §6) — they must NEVER appear on the main entry.
@@ -85,6 +88,7 @@ describe('public API surface (src/index.ts)', () => {
 
   test('the helpers + registry accessors are functions', () => {
     for (const name of [
+      'createResizer',
       'getResizer',
       'resetResizerForTests',
       'runWorker',

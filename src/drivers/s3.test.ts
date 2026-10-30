@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { S3Client } from '@aws-sdk/client-s3';
-import { ResizeSecurityError } from '../errors.ts';
+import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
+import { silentLogger } from '../testHelpers/fakes.ts';
+import type { S3StorageConfig } from '../types.d.ts';
 import { S3Storage } from './s3.ts';
 
 function fakeClient() {
@@ -308,5 +310,133 @@ describe('S3Storage', () => {
     assert.match(url, /priv/);
     assert.match(url, /users\/u1\/originals\/a.jpg/);
     assert.match(url, /X-Amz-Expires=900/);
+  });
+});
+
+describe('S3Storage.fromConfig', () => {
+  const ctx = {
+    logger: silentLogger,
+    where: 'src/config/resize.production.ts',
+  };
+  const ref = { bucket: 'pub', key: 'previews/a.jpg' };
+  const invalid = (key: string, what: string) => (err: unknown) =>
+    err instanceof ResizeConfigError &&
+    err.code === 'RESIZE_CONFIG_INVALID' &&
+    err.message ===
+      `resize config: \`storage.${key}\` in src/config/resize.production.ts must be ${what}`;
+
+  test('needs bucketPublic and drops undefined keys', () => {
+    // The local driver's keys stay in a section an environment file switched to S3, and undefined
+    // values never reach the driver: no endpoint means the AWS URL, not path style.
+    const s = S3Storage.fromConfig(
+      {
+        driver: 's3',
+        bucketPublic: 'pub',
+        bucketPrivate: undefined,
+        publicBaseUrl: undefined,
+        region: 'eu-west-1',
+        endpoint: undefined,
+        forcePathStyle: undefined,
+        rootDir: '/srv/media',
+      } as S3StorageConfig,
+      ctx,
+    );
+    assert.ok(s instanceof S3Storage);
+    assert.equal(
+      s.publicUrl(ref),
+      'https://pub.s3.eu-west-1.amazonaws.com/previews/a.jpg',
+    );
+    assert.equal(
+      S3Storage.fromConfig(
+        {
+          driver: 's3',
+          bucketPublic: 'pub',
+          endpoint: 'http://localhost:9000',
+          forcePathStyle: true,
+        },
+        ctx,
+      ).publicUrl(ref),
+      'http://localhost:9000/pub/previews/a.jpg',
+    );
+    assert.equal(
+      S3Storage.fromConfig(
+        {
+          driver: 's3',
+          bucketPublic: 'pub',
+          publicBaseUrl: 'https://cdn.example.com',
+        },
+        ctx,
+      ).publicUrl(ref),
+      'https://cdn.example.com/previews/a.jpg',
+    );
+    for (const keys of [{}, { bucketPublic: '' }, { bucketPublic: 1 }]) {
+      assert.throws(
+        () =>
+          S3Storage.fromConfig(
+            { driver: 's3', ...keys } as unknown as S3StorageConfig,
+            ctx,
+          ),
+        invalid('bucketPublic', 'a non-empty string'),
+      );
+    }
+    for (const key of [
+      'bucketPrivate',
+      'publicBaseUrl',
+      'region',
+      'endpoint',
+    ]) {
+      assert.throws(
+        () =>
+          S3Storage.fromConfig(
+            {
+              driver: 's3',
+              bucketPublic: 'pub',
+              [key]: 5,
+            } as unknown as S3StorageConfig,
+            ctx,
+          ),
+        invalid(key, 'a string'),
+      );
+    }
+  });
+
+  test('accepts what rc.2 accepted: an empty publicBaseUrl and forcePathStyle as given', () => {
+    // '' is no CDN base: the bucket URL.
+    assert.equal(
+      S3Storage.fromConfig(
+        {
+          driver: 's3',
+          bucketPublic: 'pub',
+          publicBaseUrl: '',
+          region: 'eu-west-1',
+        },
+        ctx,
+      ).publicUrl(ref),
+      'https://pub.s3.eu-west-1.amazonaws.com/previews/a.jpg',
+    );
+    // Passed on unchecked, as the framework adapter did: a truthy string turns path style on.
+    assert.equal(
+      S3Storage.fromConfig(
+        {
+          driver: 's3',
+          bucketPublic: 'pub',
+          region: 'eu-west-1',
+          forcePathStyle: 'true',
+        } as unknown as S3StorageConfig,
+        ctx,
+      ).publicUrl(ref),
+      'https://s3.eu-west-1.amazonaws.com/pub/previews/a.jpg',
+    );
+  });
+
+  test('a private upload goes to bucketPrivate from the section', async () => {
+    const s = S3Storage.fromConfig(
+      { driver: 's3', bucketPublic: 'pub', bucketPrivate: 'priv' },
+      ctx,
+    );
+    assert.throws(
+      () => s.publicUrl({ bucket: 'priv', key: 'originals/a.jpg' }),
+      ResizeSecurityError,
+    );
   });
 });

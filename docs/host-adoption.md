@@ -43,9 +43,27 @@ npm i @adaptivestone/framework-module-resize@next
 
 `0.3.0-rc.1` holds every host-facing shape of 0.3.0: the config, the option and type names, the
 import paths, the preview fields and `invalidate`. `0.3.0-rc.2` changes the `beforeSteps`
-signature and adds decoders (see [Changed in `0.3.0-rc.2`](#changed-in-030-rc2)); later release
-candidates change nothing a host sees. `CHANGELOG.md` (`# 0.3.0`) has the details of everything
-below.
+signature and adds decoders (see [Changed in `0.3.0-rc.2`](#changed-in-030-rc2)).
+
+`0.3.0-rc.3` only adds APIs a host may choose to use: `createResizer` (a Resizer from one config
+object, without the framework), drivers registered by name (the `drivers` option, `fromConfig`),
+`RoutingTaskQueue` and `carrierOf`, a worker that consumes several queues
+(`--queue=default --queue=bulk`), and partial config files (`PartialFrameworkResizeConfig`). It
+requires no host change. Three things a host may notice without changing anything:
+
+- when `queues` spans two available backends (a database entry and an SQS entry whose SDK is
+  installed), `resizer.tasks` is a `RoutingTaskQueue`, not the backend's own task queue (no
+  `release`; an `instanceof MongoTaskQueue` check fails: ask `carrierOf(resizer.tasks, name)`);
+- a call on a queue of another backend now queues there, where `0.3.0-rc.2` reported
+  `RESIZE_QUEUE_NOT_SERVED`;
+- with those two backends, every `FrameworkResizer` that takes its task queue from the config
+  file can queue to every name, so a custom `runWorker({ resizers })` that consumes a queue on SQS
+  must list all of them, whatever their own queue (else `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`;
+  `0.3.0-rc.2` accepted `runWorker({ resizers: [b], queue: 'bulk' })` beside a Resizer `a` on the
+  database queue). `npm run cli ResizeWorker` serves every Resizer and is not affected.
+
+Release candidates after `0.3.0-rc.3` change only internals. `CHANGELOG.md` (`# 0.3.0`) has the
+details of everything below.
 
 ## Named queues: from `queue: { … }` to `queues`
 
@@ -141,9 +159,10 @@ export default {
   go to every entry they applied to. A `queue` object, in any file, now fails with
   `RESIZE_CONFIG_REMOVED_KEY`, and so does `queues.<name>.queues`.
 - A name is defined once, so two Resizers that used `'default'` on different backends now need
-  two names (`default` and `listings` above). A worker consumes one queue name, so every new name
-  needs its own worker process, `npm run cli ResizeWorker -- --queue=<name>`
-  (`--queue=listings` above), or its tasks stay pending.
+  two names (`default` and `listings` above). A worker consumes only the queues it is given, so
+  every new name needs a worker: `npm run cli ResizeWorker -- --queue=<name>` (`--queue=listings`
+  above), or one worker for several, `npm run cli ResizeWorker -- --queue=default
+  --queue=listings`; otherwise its tasks stay pending.
 - `queue` is a name. Without `queue`, a Resizer uses `'default'` when `queues` has entries and is
   eager only when there are none; `queue: false` is eager only. A name that `queues` does not
   define (the implied `'default'` too) is `RESIZE_CONFIG_QUEUE_UNKNOWN`.
@@ -156,17 +175,18 @@ export default {
   `worker: { ...defaultFrameworkResizeConfig.worker, enabled: true }` no longer type-checks.
 - Every config file writes `satisfies FrameworkResizeConfig`. An environment override
   (`resize.<NODE_ENV>.ts`), and a `resize.ts` that holds only the process-wide sections (no
-  default Resizer, so no `mediaModelName`), write `satisfies Partial<FrameworkResizeConfig>`. The
+  default Resizer, so no `mediaModelName`), write `satisfies Partial<FrameworkResizeConfig>`; an
+  override that leaves out nested keys (only `limits.sourcePixels`, say) may write
+  `satisfies PartialFrameworkResizeConfig` instead. From `0.3.0-rc.3` the image settings of every
+  file are merged over the package defaults, so a file may set only the keys it changes. The
   queue entry types are `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (main entry,
   re-exported by `…/framework.js`); `FrameworkQueueConfig`, `FrameworkDatabaseQueueConfig` and
   `FrameworkSqsQueueConfig` are removed.
 - Every `database` entry shares one task queue, and so do the SQS entries with the same `region`,
   `endpoint`, `deadLetterQueueUrl` and `waitTimeSeconds`: one task queue per backend, and each name
-  is a lane on it with its own timing. So set `region` (and `endpoint`) on every SQS entry or on
-  none — an omitted `region` and an explicit one equal to `AWS_REGION` count as two backends.
+  is a lane on it with its own timing. Names on different backends are routed (statement 5 below).
   `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is gone: a queue is defined once, so two files can no longer
-  disagree about its timing. Calls on a queue of another backend queue nothing
-  (`RESIZE_QUEUE_NOT_SERVED`, statement 5 below).
+  disagree about its timing.
 
 ## Six things to know after the upgrade
 
@@ -198,12 +218,15 @@ export default {
    - A string `queueName` option is readable at once.
    - A name from the config file is known only after `await resizer.ready()` or the first call;
      before that, `resizer.queueName` throws `RESIZE_NOT_READY`.
-5. **Mixed backends from an environment override.** Moving only some queues to another backend
-   in `resize.<NODE_ENV>.ts` (for example only `queues.default` to SQS, while `queues.bulk` stays
-   on the database) splits them in that environment: there, those calls fail with
-   `RESIZE_QUEUE_NOT_SERVED` (`prewarm()` reports it, `resolve()` logs it once per queue name). So
-   move all of a Resizer's queues together until routing between backends ships. The same goes for
-   SQS entries with different dead-letter queues.
+5. **Mixed backends from an environment override now route.** Moving only some queues to another
+   backend in `resize.<NODE_ENV>.ts` (for example only `queues.default` to SQS, while
+   `queues.bulk` stays on the database) keeps every name working: each call goes to its queue's
+   backend, gated there (a database task row, or a gate lock in the framework `Lock` model for
+   SQS), and one worker can consume both (`--queue=default --queue=bulk`). A backend is built when
+   one of its names is first needed, so an SQS entry no Resizer uses never loads the SQS SDK, and a
+   name whose backend's SDK is not installed is not served in that process
+   (`RESIZE_QUEUE_NOT_SERVED`, naming the package). With two backends, `resizer.tasks` is a
+   `RoutingTaskQueue`: use `carrierOf(resizer.tasks, name)` instead of an `instanceof` check.
 6. **Old preview rows.**
    - Rows written before `0.3.0-rc.1` (no `origin` or `encodeSig`) are served for now. They will
      be regenerated once a later release's freshness check ships, so plan the storage cost.

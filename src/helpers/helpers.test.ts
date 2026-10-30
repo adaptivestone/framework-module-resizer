@@ -1,12 +1,17 @@
-// Direct unit coverage for the five INTERNAL generic helpers. Behavior these express is also
+// Direct unit coverage for the INTERNAL generic helpers. Behavior these express is also
 // exercised through images/uploader/processor/consumer/mongo tests; we pin the utilities themselves
-// (guards edge cases, hex shape, abortable sleep, bounded pool + abort, never-throwing logging)
-// directly.
+// (guards edge cases, hex shape, abortable sleep, bounded pool + abort, never-throwing logging, the
+// SQS queue-entry checks and backend key) directly.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { defaultQueueOptions } from '../config/resize.ts';
+import type { QueueEntry, QueueSection } from '../contracts/drivers.ts';
+import { ResizeConfigError } from '../errors.ts';
+import type { SqsQueueConfig } from '../types.d.ts';
 import { runBounded } from './concurrency.ts';
 import { isPositiveFinite } from './guards.ts';
 import { logNeverThrow } from './log.ts';
+import { sqsBackendKey, validateSqsEntries } from './queueSections.ts';
 import { randomHex } from './random.ts';
 import { sleep } from './sleep.ts';
 
@@ -163,6 +168,95 @@ describe('logNeverThrow', () => {
     assert.deepEqual(
       fallback.mock.calls.map((call) => call.arguments),
       [['stopped']],
+    );
+  });
+});
+
+describe('validateSqsEntries', () => {
+  const WHERE = 'src/config/resize.ts (or its resize.<NODE_ENV>.ts override)';
+  const entry = (
+    name: string,
+    section: QueueSection & Partial<SqsQueueConfig>,
+  ): QueueEntry => ({
+    name,
+    section,
+    timing: defaultQueueOptions,
+  });
+  const invalid = (message: string) => (err: unknown) =>
+    err instanceof ResizeConfigError &&
+    err.code === 'RESIZE_CONFIG_INVALID' &&
+    err.message === message;
+
+  test('each entry needs its own non-empty queueUrl', () => {
+    const sections: Array<QueueSection & Partial<SqsQueueConfig>> = [
+      { driver: 'sqs' },
+      { driver: 'sqs', queueUrl: '' },
+    ];
+    for (const section of sections) {
+      assert.throws(
+        () => validateSqsEntries([entry('bulk', section)], { where: WHERE }),
+        invalid(
+          `resize config: \`queues.bulk.queueUrl\` in ${WHERE} is required for the 'sqs' driver`,
+        ),
+        JSON.stringify(section),
+      );
+    }
+  });
+
+  test('two names with one queueUrl are RESIZE_CONFIG_INVALID', () => {
+    const url = 'https://sqs.example/resize';
+    assert.throws(
+      () =>
+        validateSqsEntries(
+          [
+            entry('default', { driver: 'sqs', queueUrl: url }),
+            entry('bulk', { driver: 'sqs', queueUrl: url }),
+          ],
+          { where: WHERE },
+        ),
+      invalid(
+        `resize config: \`queues.default\` and \`queues.bulk\` in ${WHERE} have the same queueUrl ${url} — give each queue name its own SQS queue`,
+      ),
+    );
+  });
+
+  test('entries with their own URLs pass', () => {
+    validateSqsEntries(
+      [
+        entry('default', { driver: 'sqs', queueUrl: 'https://sqs.example/a' }),
+        entry('bulk', { driver: 'sqs', queueUrl: 'https://sqs.example/b' }),
+      ],
+      { where: WHERE },
+    );
+    validateSqsEntries([], { where: WHERE });
+  });
+});
+
+describe('sqsBackendKey', () => {
+  test('SQS entries share a backend by region, endpoint, dead-letter queue and effective long poll', () => {
+    const sqs: SqsQueueConfig = {
+      driver: 'sqs',
+      queueUrl: 'https://sqs.example/a',
+    };
+    assert.equal(sqsBackendKey(sqs), 'sqs:[null,null,null,10]');
+    // The default long poll written out, another URL and other timing: the same backend.
+    const same: SqsQueueConfig = {
+      ...sqs,
+      queueUrl: 'https://sqs.example/b',
+      maxAttempts: 3,
+      waitTimeSeconds: 10,
+    };
+    assert.equal(sqsBackendKey(same), sqsBackendKey(sqs));
+    const other: SqsQueueConfig = {
+      ...sqs,
+      region: 'eu-west-1',
+      endpoint: 'http://localhost:4566',
+      deadLetterQueueUrl: 'https://sqs.example/dead',
+      waitTimeSeconds: 20,
+    };
+    assert.equal(
+      sqsBackendKey(other),
+      'sqs:["eu-west-1","http://localhost:4566","https://sqs.example/dead",20]',
     );
   });
 });

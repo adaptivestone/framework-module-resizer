@@ -5,10 +5,21 @@ import {
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import { ResizeConfigError } from '../errors.ts';
+import { resetResizerForTests } from '../resizer.ts';
+import {
+  fakeMedia,
+  memoryLocks,
+  observedQueue,
+  sigtermOnceClaimed,
+} from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import ResizeWorker from './ResizeWorkerCommand.ts';
+import { FrameworkResizer } from './resizer.ts';
 
-afterEach(resetAppInstance);
+afterEach(() => {
+  resetAppInstance();
+  resetResizerForTests();
+});
 
 // A fake app recording which config files the command reads.
 function installApp(): string[] {
@@ -41,6 +52,36 @@ describe('ResizeWorker CLI contract', () => {
       assert.deepEqual(asked, ['resize']);
     });
   }
+
+  test('--queue may be repeated; one --queue passes a single name', {
+    timeout: 10_000,
+  }, async () => {
+    assert.equal(ResizeWorker.commandArguments.queue.type, 'string');
+    assert.equal(ResizeWorker.commandArguments.queue.multiple, true);
+    for (const queue of [['default', 'bulk'], ['bulk']]) {
+      resetResizerForTests();
+      resetAppInstance();
+      setAppInstance({
+        getConfig: () => makeResizeConfig({ worker: { enabled: true } }),
+        getModel: () => ({}),
+        logger: { info() {}, warn() {}, error() {} },
+      } as never);
+      const { tasks, claimedQueues } = observedQueue(sigtermOnceClaimed(queue));
+      new FrameworkResizer({
+        storage: {
+          download: async () => Buffer.alloc(0),
+          upload: async () => ({ key: 'k' }),
+          publicUrl: () => '',
+        },
+        media: fakeMedia(),
+        locks: memoryLocks(),
+        tasks,
+      });
+      const command = new ResizeWorker(undefined, undefined, { queue });
+      assert.equal(await command.run(), true);
+      assert.deepEqual([...new Set(claimedQueues)].sort(), [...queue].sort());
+    }
+  });
 
   test('--config is RESIZE_CONFIG_REMOVED_KEY', async () => {
     const asked = installApp();

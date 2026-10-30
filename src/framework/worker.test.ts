@@ -6,6 +6,12 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import defaultResizeConfig from '../config/resize.ts';
 import { resetResizerForTests } from '../resizer.ts';
+import {
+  fakeMedia,
+  memoryLocks,
+  observedQueue,
+  sigtermOnceClaimed,
+} from '../testHelpers/fakes.ts';
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { defaultWorkerOptions } from './defaults.ts';
 import { FrameworkResizer } from './resizer.ts';
@@ -59,6 +65,20 @@ describe('runResizeWorker', () => {
     );
   });
 
+  test('a disabled worker logs that it is disabled, even beside a queue driver no Resizer registers', async () => {
+    const lines: string[] = [];
+    setAppInstance({
+      getConfig: () => ({
+        worker: { enabled: false },
+        queues: { default: { driver: 'redis' } },
+      }),
+      getModel: () => undefined,
+      logger: { info: (m: string) => lines.push(m), warn() {}, error() {} },
+    } as never);
+    await runResizeWorker();
+    assert.match(lines.join('\n'), /resize worker disabled/);
+  });
+
   test('configName (the old --config) is RESIZE_CONFIG_REMOVED_KEY, before any config is read', async () => {
     const asked: string[] = [];
     setAppInstance({
@@ -81,6 +101,26 @@ describe('runResizeWorker', () => {
       },
     );
     assert.deepEqual(asked, []);
+  });
+
+  test('runResizeWorker passes a queue list to runWorker', {
+    timeout: 10_000,
+  }, async () => {
+    installApp(true);
+    const queues = ['default', 'bulk'];
+    const { tasks, claimedQueues } = observedQueue(sigtermOnceClaimed(queues));
+    new FrameworkResizer({
+      storage: {
+        download: async () => Buffer.alloc(0),
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      tasks,
+    });
+    await runResizeWorker({ queue: queues });
+    assert.deepEqual([...new Set(claimedQueues)].sort(), ['bulk', 'default']);
   });
 
   test('names the command fix when the worker process built no Resizer', async () => {

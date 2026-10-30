@@ -9,9 +9,11 @@ import type {
 } from './contracts/taskQueue.ts';
 import { gateKey } from './lockKeys.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
+import { RoutingTaskQueue } from './routing.ts';
 import {
   clockLocks,
   fakeMedia,
+  MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
 } from './testHelpers/fakes.ts';
@@ -265,7 +267,7 @@ describe('prewarm — queue', () => {
       {
         code: 'RESIZE_QUEUE_NOT_SERVED',
         message:
-          "cannot queue to 'bulk': its task queue does not serve that queue (an unknown queue name, or a queue on another backend; one Resizer cannot use two backends yet)",
+          "cannot queue to 'bulk': its task queue does not serve that queue (a queue name it does not route)",
         retryable: false,
         previews: result.requested,
       },
@@ -283,6 +285,26 @@ describe('prewarm — queue', () => {
     });
     assert.equal(own.status, 'accepted');
     assert.equal(tasks.added.length, 1);
+  });
+
+  test('prewarm({ queue }) on the other backend of a router is accepted, not RESIZE_QUEUE_NOT_SERVED', async () => {
+    installFakeApp();
+    const memory = new MemoryTaskQueue();
+    const plain = new PlainTaskQueue();
+    const r = makeResizer({
+      tasks: new RoutingTaskQueue({ default: memory, bulk: plain }),
+    });
+    const result = await r.prewarm({
+      media: { id: 'm1', original: { storageRef: { key: 'orig.jpg' } } },
+      sizes: [{ width: 300, height: 300 }],
+      formats: ['jpeg'],
+      queue: 'bulk',
+    });
+    assert.equal(result.status, 'accepted');
+    assert.deepEqual(result.issues, []);
+    assert.equal(plain.added.length, 1);
+    assert.equal(plain.added[0].queue, 'bulk');
+    assert.deepEqual(memory.added, []);
   });
 
   test('prewarm on a queue with invalid timing reports RESIZE_ENQUEUE_INTERNAL_ERROR, as for its own queue, and queues nothing', async () => {
