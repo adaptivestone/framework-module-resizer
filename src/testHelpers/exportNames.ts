@@ -214,92 +214,107 @@ export function fenceProblems(markdown: string): string[] {
 // `import"`, `import*` and `import ` start one; `imports`, `$import` and `loader.import` do not.
 // Each look-around reads one character, so the search is linear.
 const STATEMENT_KEYWORD = /(?<![\w$.])(import|export)(?![\w$])/g;
+// What must follow `export` for a re-export (`export {`, `export *`, `export type {`): a local
+// `export const|function|default` starts no statement. Sticky, so it reads only from the keyword.
+const REEXPORT_HEAD = /\s*(?:type(?![\w$])\s*)?[{*]/y;
 
 const IDENT_CHAR = /[\w$]/;
 const SPACE = /\s/;
 
-// What follows a scan position up to its first quote or `;` (at `text.length` when there is
-// neither): the specifier when that is a quote closed by the same quote on its line, the last
-// non-space character before it (`from - 1` when there is none from `from` on), and where a
-// `from` keyword right before the quote begins. A keyword whose clause starts at or after `from`
-// and at or before `at` shares this answer, so each part of the text is walked a bounded number of
-// times.
-interface Terminator {
-  at: number;
-  specifier?: { value: string; end: number }; // end: the index after the closing quote
-  lastNonSpace: number;
-  fromAt?: number;
-}
+// The index of the character that ends the string opened by the quote at `open`: the same quote
+// when the string closes on its line, else the first other quote, line break or the text's end.
+const stringEnd = (code: string, open: number): number => {
+  let end = open + 1;
+  while (end < code.length && !`'"\n`.includes(code[end])) {
+    end += 1;
+  }
+  return end;
+};
 
-function terminatorFrom(code: string, from: number): Terminator {
-  let at = from;
-  while (at < code.length && !`'";`.includes(code[at])) {
-    at += 1;
-  }
-  if (at === code.length || code[at] === ';') {
-    return { at, lastNonSpace: from - 1 };
-  }
-  let close = at + 1;
-  while (close < code.length && !`'"\n`.includes(code[close])) {
-    close += 1;
-  }
-  let lastNonSpace = at - 1;
-  while (lastNonSpace >= from && SPACE.test(code[lastNonSpace])) {
-    lastNonSpace -= 1;
-  }
-  // `from` > 0 (a keyword precedes it), so `fromAt - 1` is a character of the text.
-  const fromAt = lastNonSpace - 3;
-  const endsInFrom =
-    fromAt >= from &&
-    code.slice(fromAt, lastNonSpace + 1) === 'from' &&
-    !IDENT_CHAR.test(code[fromAt - 1]);
-  return {
-    at,
-    ...(code[close] === code[at] && close > at + 1
-      ? { specifier: { value: code.slice(at + 1, close), end: close + 1 } }
-      : {}),
-    lastNonSpace,
-    ...(endsInFrom ? { fromAt } : {}),
-  };
-}
-
-// Every `import … from '…'`, `import '…'` and `export … from '…'` in a fence body whose comments
-// are already stripped, with its clause (the text between the keyword and `from`; undefined for a
-// side-effect import) and its statement text up to the closing quote. From the keyword the scan
-// walks to the first quote or `;`: a `;` first means no specifier, and a clause that does not end
-// in `from` names no module this way (a dynamic `import(…)`, `import.meta`, `export const`). What
-// follows the quote (`with { type: 'json' }`, `;`) is not read. Linear in the body's length.
+// Every `import … from '…'`, `import '…'` and `export {…}|* … from '…'` in a fence body whose
+// comments are already stripped, with its clause (the text between the keyword and `from`;
+// undefined for a side-effect import) and its statement text up to the closing quote. From the
+// keyword the scan walks forward, counting braces: a `;` means no specifier; a quote inside an
+// open `{` is a string import name (`{ "a-b" as x }`) and belongs to the clause; a quote outside
+// braces opens the specifier, and a clause that then does not end in `from` names no module this
+// way (a dynamic `import(…)`, `import.meta`). Another statement keyword met on the way starts the
+// statement again there, so a local `export` or an unfinished line never swallows the import after
+// it. What follows the specifier (`with { type: 'json' }`, `;`) is not read. One forward pass:
+// linear in the body's length.
 function moduleStatements(
   code: string,
 ): { clause: string | undefined; specifier: string; text: string }[] {
-  const statements: ReturnType<typeof moduleStatements> = [];
-  const keyword = new RegExp(STATEMENT_KEYWORD.source, 'g');
-  let terminator: Terminator | undefined;
-  for (
-    let match = keyword.exec(code);
-    match !== null;
-    match = keyword.exec(code)
-  ) {
+  const starts: { index: number; clauseStart: number; isImport: boolean }[] =
+    [];
+  for (const match of code.matchAll(STATEMENT_KEYWORD)) {
     const clauseStart = match.index + match[1].length;
-    if (terminator === undefined || terminator.at < clauseStart) {
-      terminator = terminatorFrom(code, clauseStart);
+    REEXPORT_HEAD.lastIndex = clauseStart;
+    if (match[1] === 'import' || REEXPORT_HEAD.test(code)) {
+      starts.push({
+        index: match.index,
+        clauseStart,
+        isImport: match[1] === 'import',
+      });
     }
-    const { specifier, lastNonSpace, fromAt } = terminator;
-    if (specifier === undefined) {
-      continue;
+  }
+  const statements: ReturnType<typeof moduleStatements> = [];
+  let next = 0; // the first start not yet taken or passed
+  const passTo = (index: number) => {
+    while (next < starts.length && starts[next].index < index) {
+      next += 1;
     }
-    let clause: string | undefined;
-    if (fromAt !== undefined && fromAt >= clauseStart) {
-      clause = code.slice(clauseStart, fromAt);
-    } else if (lastNonSpace >= clauseStart || match[1] === 'export') {
-      continue;
+  };
+  while (next < starts.length) {
+    const { index, clauseStart, isImport } = starts[next];
+    next += 1;
+    let depth = 0;
+    let lastNonSpace = clauseStart - 1;
+    let at = clauseStart;
+    for (; at < code.length; at += 1) {
+      if (next < starts.length && starts[next].index === at) {
+        break; // a later keyword: the statement starts again there
+      }
+      const char = code[at];
+      if (char === ';') {
+        passTo(at + 1);
+        break;
+      }
+      if (char === "'" || char === '"') {
+        const end = stringEnd(code, at);
+        const closed = code[end] === char;
+        if (depth > 0 && closed) {
+          lastNonSpace = end;
+          at = end;
+          passTo(end + 1);
+          continue;
+        }
+        if (closed && depth === 0 && end > at + 1) {
+          // `clauseStart` > 0 (a keyword precedes it), so `fromAt - 1` is a character of the text.
+          const fromAt = lastNonSpace - 3;
+          const endsInFrom =
+            fromAt >= clauseStart &&
+            code.slice(fromAt, lastNonSpace + 1) === 'from' &&
+            !IDENT_CHAR.test(code[fromAt - 1]);
+          if (endsInFrom || (isImport && lastNonSpace < clauseStart)) {
+            statements.push({
+              clause: endsInFrom ? code.slice(clauseStart, fromAt) : undefined,
+              specifier: code.slice(at + 1, end),
+              text: code.slice(index, end + 1),
+            });
+          }
+        }
+        passTo(closed ? end + 1 : end);
+        break;
+      }
+      if (char === '{') {
+        depth += 1;
+      } else if (char === '}' && depth > 0) {
+        depth -= 1;
+      }
+      if (!SPACE.test(char)) {
+        lastNonSpace = at;
+      }
     }
-    statements.push({
-      clause,
-      specifier: specifier.value,
-      text: code.slice(match.index, specifier.end),
-    });
-    keyword.lastIndex = specifier.end;
   }
   return statements;
 }
@@ -313,22 +328,28 @@ function parseClause(
     rest = rest.replace(/^type\s+/, '');
   }
   const named: DocImport['named'] = [];
-  const braces = /\{([^}]*)\}/.exec(rest);
-  if (braces) {
-    for (const item of braces[1].split(',')) {
+  // The first `{` and the first `}` after it, found with indexOf: a pattern over the braces would
+  // retry every `{` of a clause that never closes.
+  const open = rest.indexOf('{');
+  const close = open < 0 ? -1 : rest.indexOf('}', open + 1);
+  if (close >= 0) {
+    for (const item of rest.slice(open + 1, close).split(',')) {
       const spec = item.trim();
       if (spec.length === 0) {
         continue;
       }
+      // A name, or a string import name: `"a-b" as x`.
       const m =
-        /^(type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+[A-Za-z_$][\w$]*)?$/.exec(
+        /^(type\s+)?(?:([A-Za-z_$][\w$]*)|"([^"]*)"|'([^']*)')(?:\s+as\s+[A-Za-z_$][\w$]*)?$/.exec(
           spec,
         );
       named.push(
-        m ? { name: m[2], type: !!m[1] } : { name: spec, type: false },
+        m
+          ? { name: m[2] ?? m[3] ?? m[4], type: !!m[1] }
+          : { name: spec, type: false },
       );
     }
-    rest = rest.replace(braces[0], '');
+    rest = rest.slice(0, open) + rest.slice(close + 1);
   }
   const result: ReturnType<typeof parseClause> = { typeOnly, named };
   for (const part of rest.split(',')) {
@@ -348,7 +369,7 @@ function parseClause(
  * single or double quotes; default, named, namespace and side-effect imports and their combinations;
  * `import type` and inline `type` specifiers; `{ default as X }` (named `default`); statements
  * over several lines, with comments, several on one line, or with no space after the keyword
- * (`import{ X }from '…'`). Re-exports (`export { X } from '…'`, `export type { X } from '…'`,
+ * (`import{ X }from '…'`), and string import names (`{ "X" as Y }`). Re-exports (`export { X } from '…'`, `export type { X } from '…'`,
  * `export * from '…'`, `export * as ns from '…'`) are read as imports of the same names. Comments
  * are stripped first, so a commented-out import is not read. Imports of other packages, dynamic
  * `import('…')` (its subpath is checked with the other specifiers) and imports outside fences are

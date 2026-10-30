@@ -415,20 +415,62 @@ test('a keyword that is part of a longer word, or names no module, is not a stat
   }
 });
 
+test('a local `export` without a quote or `;` does not swallow the import after it', async () => {
+  for (const head of [
+    'export const x = {}',
+    'export function f() {}',
+    'export { X }',
+    'export default {}',
+  ]) {
+    await assertOneProblem(
+      `${head}\nimport { MissingExport } from '${PKG}';`,
+      'MissingExport',
+    );
+  }
+  const [imp] = docImports(
+    fenced(`export { NotThere }\nimport { Resizer } from '${PKG}';`),
+  );
+  assert.deepEqual(imp?.named, [{ name: 'Resizer', type: false }]);
+});
+
+test('a string import name (ES2022) is read and checked', async () => {
+  await assertOneProblem(
+    `import {"MissingExport" as X} from '${PKG}';`,
+    'MissingExport',
+  );
+  await assertOneProblem(
+    `import { Resizer, 'MissingExport' as X } from '${PKG}';`,
+    'MissingExport',
+  );
+  const valid = docImports(
+    fenced(`import { "Resizer" as R, 'import' as I } from '${PKG}';`),
+  );
+  assert.deepEqual(valid[0]?.named, [
+    { name: 'Resizer', type: false },
+    { name: 'import', type: false },
+  ]);
+});
+
 // A doc edit must fail the guard, never hang `npm test`, and node:test cannot interrupt a
 // synchronous scan: so the scan runs in a child process with a deadline. Each input is read in
 // well under the budget only when the scan is linear in the fence length.
-test('the scan is linear on a long statement without a specifier, or a comment that never closes', () => {
+// The open braces never close, so that input is checked for its time only.
+test('the scan is linear on a long statement without a specifier, a comment that never closes, or many open braces', () => {
   const url = new URL('./exportNames.ts', import.meta.url).href;
   const script = `import { docImports } from ${JSON.stringify(url)};
 const spaces = ' '.repeat(100000);
-const inputs = { semicolon: 'import' + spaces + ';', unterminated: 'import' + spaces, comments: '/* '.repeat(50000) };
+const inputs = [
+  ['semicolon', 'import' + spaces + ';', true],
+  ['unterminated', 'import' + spaces, true],
+  ['comments', '/* '.repeat(50000), true],
+  ['braces', 'import ' + '{'.repeat(100000) + " from '${PKG}'", false],
+];
 const slow = [];
-for (const [name, body] of Object.entries(inputs)) {
+for (const [name, body, none] of inputs) {
   const start = performance.now();
   const found = docImports('\`\`\`ts\\n' + body + '\\n\`\`\`');
   const ms = performance.now() - start;
-  if (found.length !== 0 || ms > 200) slow.push(name + ': ' + found.length + ' imports in ' + ms.toFixed(0) + ' ms');
+  if ((none && found.length !== 0) || ms > 200) slow.push(name + ': ' + found.length + ' imports in ' + ms.toFixed(0) + ' ms');
 }
 if (slow.length > 0) { console.error(slow.join('\\n')); process.exit(1); }`;
   const result = spawnSync(

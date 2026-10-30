@@ -198,12 +198,13 @@ const taskPathFiles = (): string[] => [
 // A comment as spaces, its line breaks kept, so every index of the text stays on its line.
 const blank = (comment: string): string => comment.replace(/[^\n]/g, ' ');
 
-// The codes of the object literals in `file` that also hold `retryable: false`: a 'RESIZE_…'
-// literal, or a module constant of the same file that holds one. Comments are blanked first, so
-// a commented-out literal does not count. Every `retryable: false` the scan cannot tie to a code
-// (in an object with a nested object or a `${…}`, or beside a template literal, a helper call or
-// a property read) is returned as `file:line` in `unread`, so a shape the scan does not know fails
-// the guard instead of being skipped.
+// The codes of the object literals in `file` that also hold `retryable: false`: a `code:` whose
+// whole value is a 'RESIZE_…' literal, or the bare name of a module constant of the same file
+// bound to one. Comments are blanked first, so a commented-out literal does not count. Every
+// `retryable: false` the scan cannot tie to a code (in an object with a nested object or a `${…}`,
+// or beside an expression, a template literal, a helper call or a property read) is returned as
+// `file:line` in `unread`, so a shape the scan does not know fails the guard instead of being
+// skipped.
 const terminalScan = (
   file: string,
 ): { codes: Set<string>; read: number; unread: string[] } => {
@@ -213,10 +214,11 @@ const terminalScan = (
       /(^|[^:])(\/\/.*)$/gm,
       (_, before: string, comment: string) => before + blank(comment),
     );
+  // Module constants bound to a string literal and nothing more (`const X = 'RESIZE_…';`).
   const constants = new Map(
     [
       ...text.matchAll(
-        /const\s+([A-Z_][A-Z0-9_]*)\s*=\s*'(RESIZE_[A-Z0-9_]+)'/g,
+        /const\s+([A-Z_][A-Z0-9_]*)\s*=\s*'(RESIZE_[A-Z0-9_]+)'\s*(?:;|$)/gm,
       ),
     ].map((m) => [m[1], m[2]]),
   );
@@ -227,9 +229,11 @@ const terminalScan = (
     if (flags.length === 0) {
       continue;
     }
-    const code = /code:\s*(?:'(RESIZE_[A-Z0-9_]+)'|([A-Z_][A-Z0-9_]*))/.exec(
-      literal[0],
-    );
+    // The whole `code:` value, up to the next `,` or the literal's `}`, must be the string literal
+    // or the constant's bare name: `UNSUPPORTED + '_NEW'`, a call, a template literal or a
+    // property read leaves the flag unread.
+    const raw = /code:([^,}]*)/.exec(literal[0])?.[1].trim() ?? '';
+    const code = /^(?:'(RESIZE_[A-Z0-9_]+)'|([A-Z_][A-Z0-9_]*))$/.exec(raw);
     const value = code?.[1] ?? (code?.[2] && constants.get(code[2]));
     if (value) {
       codes.add(value);
@@ -274,15 +278,15 @@ test('the README lists exactly the codes a task is dead-lettered with at once', 
   ];
   const files = taskPathFiles();
   assert.ok(files.length >= 25, `only ${files.length} task-path files`);
-  assert.deepEqual(
-    [...terminalScan('decoderSet.ts').codes],
-    ['RESIZE_SOURCE_FORMAT_UNSUPPORTED'],
-  );
   const scans = files.map(terminalScan);
   assert.deepEqual(
     scans.flatMap((scan) => scan.unread),
     [],
     'a `retryable: false` the scan cannot tie to a code',
+  );
+  assert.deepEqual(
+    [...terminalScan('decoderSet.ts').codes],
+    ['RESIZE_SOURCE_FORMAT_UNSUPPORTED'],
   );
   const sites = scans.reduce((sum, scan) => sum + scan.read, 0);
   assert.ok(sites >= 12, `only ${sites} \`retryable: false\` sites read`);
