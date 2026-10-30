@@ -261,3 +261,40 @@ test('an unclosed fence at the end of a file is read and reported, not dropped',
   ]);
   assert.deepEqual(fenceProblems(fixture), []);
 });
+
+// A doc edit must fail the guard, never hang `npm test`: the scan runs in linear time on an
+// `import` followed by comment lines and no `from`.
+test('`import` before many comment lines and a `;` is scanned quickly', {
+  timeout: 2_000,
+}, () => {
+  const md = fenced(
+    [
+      'import',
+      ...Array.from(
+        { length: 10 },
+        (_, i) => `// comment line ${i} without any quote character in it`,
+      ),
+      ';',
+    ].join('\n'),
+  );
+  assert.deepEqual(docImports(md), []);
+});
+
+test('the word "import" in a comment does not swallow the next import', async () => {
+  const md = fenced(
+    [
+      '// import the resizer first',
+      `import Gone, { Resizer } from '${PKG}';`,
+    ].join('\n'),
+  );
+  const imports = docImports(md);
+  assert.equal(imports.length, 1);
+  assert.equal(imports[0].defaultName, 'Gone');
+  const problems = importProblems(
+    imports,
+    await packageEntries(),
+    exportKeys(),
+  );
+  assert.equal(problems.length, 1, problems.join('\n'));
+  assert.ok(problems[0].includes("'Gone'"), problems[0]);
+});

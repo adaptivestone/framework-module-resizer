@@ -31,10 +31,13 @@ export function exportKeys(): string[] {
   return Object.keys(exportsMap());
 }
 
-// The source text with block comments and `//` comments removed (a `//` right after `:` stays, so
-// a URL in a string survives).
+// The text with block comments and `//` comments removed (a `//` right after `:` stays, so a URL
+// in a string survives). Both patterns run in linear time: a block comment ends at its first `*/`,
+// a line comment at the end of its line.
 const stripComments = (text: string): string =>
-  text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  text
+    .replace(/\/\*(?:[^*]|\*(?!\/))*\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
 
 const readSource = (source: string): string =>
   stripComments(readFileSync(resolve(SRC, source), 'utf8'));
@@ -194,19 +197,17 @@ export function fenceProblems(markdown: string): string[] {
 }
 
 // One statement from `import` to the specifier's closing quote, anywhere on a line (not after a
-// `.` or an identifier character); what follows the quote (`with { type: 'json' }`, `;`) is not
-// read. Outside its `//` and `/* */` comments the clause holds no quote and no semicolon, so a
-// match cannot run from one statement into the next, and a quote in a comment does not end it.
+// `.` or an identifier character), in a fence body whose comments are already stripped; what
+// follows the quote (`with { type: 'json' }`, `;`) is not read. The clause holds no quote and no
+// semicolon, so a match cannot run from one statement into the next. With no comment alternative
+// the pattern cannot backtrack exponentially.
 const IMPORT_STATEMENT =
-  /(?<![\w$.])import\s+(?:((?:[^'";/]|\/\/[^\n]*|\/\*[\s\S]*?\*\/|\/(?![/*]))*?)\s*\bfrom\s*)?(['"])([^'"\n]+)\2/g;
+  /(?<![\w$.])import\s+(?:([^'";]*?)\s*\bfrom\s*)?(['"])([^'"\n]+)\2/g;
 
 function parseClause(
   clause: string,
 ): Pick<DocImport, 'typeOnly' | 'defaultName' | 'namespace' | 'named'> {
-  let rest = clause
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/[^\n]*/g, '')
-    .trim();
+  let rest = clause.trim();
   const typeOnly = /^type\s/.test(rest);
   if (typeOnly) {
     rest = rest.replace(/^type\s+/, '');
@@ -246,13 +247,14 @@ function parseClause(
  * Every import of the package in the markdown's code fences (``` or ~~~, indented fences too):
  * single or double quotes; default, named, namespace and side-effect imports and their combinations;
  * `import type` and inline `type` specifiers; `{ default as X }` (named `default`); statements
- * over several lines, with comments, or several on one line. Imports of other packages and imports
- * outside fences are ignored; an unclosed fence is read too (`fenceProblems` reports it).
+ * over several lines, with comments, or several on one line. Comments are stripped first, so a
+ * commented-out import is not read. Imports of other packages and imports outside fences are
+ * ignored; an unclosed fence is read too (`fenceProblems` reports it).
  */
 export function docImports(markdown: string): DocImport[] {
   const imports: DocImport[] = [];
   for (const body of scanFences(markdown).bodies) {
-    for (const match of body.matchAll(IMPORT_STATEMENT)) {
+    for (const match of stripComments(body).matchAll(IMPORT_STATEMENT)) {
       const [statement, clause, , specifier] = match;
       if (specifier !== PKG_NAME && !specifier.startsWith(`${PKG_NAME}/`)) {
         continue;
