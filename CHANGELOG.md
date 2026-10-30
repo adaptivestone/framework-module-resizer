@@ -745,8 +745,8 @@ later release that puts the image engine behind a port.
   waits to a `ResizeMetrics` sink (`count`, `timing`, optional `flush`; each may be `async`, and the
   4th argument carries per-event context for logs), given as the `metrics` option of `new
   Resizer`, `createResizer` and `new FrameworkResizer` and read back as `resizer.metrics`. The
-  default is `LogMetrics` on the Resizer's logger (with debug lines on, on the app logger, for a
-  `FrameworkResizer`); `NoopMetrics` records nothing. The Resizer adds the `resizer` label, bounds
+  default is `LogMetrics` on the Resizer's logger (for a `FrameworkResizer`: with debug lines on,
+  on its `logger` option, else the app logger); `NoopMetrics` records nothing. The Resizer adds the `resizer` label, bounds
   the `pipeline` and `code` labels (`'unregistered'`, `'other'`; the raw value goes to the
   context), and never lets the sink throw or reject into a read or a task. The worker flushes the
   sinks when it stops, waiting at most 5 s. A sink that is not one (`metrics: null` too) is
@@ -757,7 +757,6 @@ later release that puts the image engine behind a port.
 - New fields: `decision.stale` and `ReadyEntry.stale` (stale rows served and their queued
   replacements), `GenerateResult.replaced` (the storage refs of the rows `generate()` replaced) and
   the optional `ResizeLogger.debug`.
-
 - The framework is optional. `@adaptivestone/framework` and `mongoose` are optional peers, so
   npm no longer installs them into a plain Node app; the core needs only `sharp`. A plain Node app
   with MongoDB writes no driver code: `mongoParts(connection, { mediaModel })` gives the media

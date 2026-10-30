@@ -107,10 +107,10 @@ gets the full box its steps were written for. To hand the private original to it
    `storage: { driver: 'gcs', … }` then `satisfies FrameworkResizeConfig<{ storage: { gcs: typeof
    GcsStorage } }>`; every `FrameworkResizer` of the process must pass the same `drivers.queue`
    map, else `RESIZE_DRIVER_CONFLICT`), `metrics` (a `ResizeMetrics` sink for reads, uploads,
-   variants and task outcomes; default a `LogMetrics` on the app logger with debug lines on: one
-   summary `info` line per window and one per task outcome; `new NoopMetrics()` turns it off; only
-   `undefined` means the default, `null` is `RESIZE_METRICS_INVALID`; see the README `Metrics`
-   section). `resizer.queue` is gone: read `resizer.queueName`.
+   variants and task outcomes; default a `LogMetrics` on its `logger` option, else the app logger,
+   with debug lines on: one summary `info` line per window and one per task outcome;
+   `new NoopMetrics()` turns it off; only `undefined` means the default, `null` is
+   `RESIZE_METRICS_INVALID`; see the README `Metrics` section). `resizer.queue` is gone: read `resizer.queueName`.
    `resizer.tasks` may be a `RoutingTaskQueue` (several backends in `queues`): it has no
    `release`; ask `carrierOf(resizer.tasks, name)` for a name's backend.
    A `queueName` option is readable at once; a name from the config file only after

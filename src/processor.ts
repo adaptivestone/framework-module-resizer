@@ -951,8 +951,9 @@ export class Processor {
     };
     // Each variant's stored row, by plan; read back in request order after the pool.
     const rows = new Map<VariantPlan, Preview>();
-    // How long each rendered variant took, from its encode to the end of its upload. It is recorded
-    // once the persist says what became of the row.
+    // How long each rendered variant took, from the wait for its size's resized pixels (one resize,
+    // shared by the formats of that size) through its encode to the end of its upload. It is
+    // recorded once the persist says what became of the row.
     const durations = new Map<VariantPlan, number>();
     const renderVariant = async (plan: VariantPlan): Promise<void> => {
       const started = performance.now();

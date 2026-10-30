@@ -192,8 +192,8 @@ store over `mediaModel`, and the lock store and the database queue on the packag
 and `ResizeTask` models, as `mongoParts` builds them), `queue` (the Resizer's queue name: a key of
 `queues`, or `false`), `queues` (each name with its driver and timing) and `coordination`. Options
 win over the config: `opts` takes every `new Resizer` option (`pipelines`, `hooks`, `decoders`,
-`name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager only),
-`coordination` and `queueName`, each of which replaces what the config would build, and `drivers`
+`name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager
+only), `coordination` and `queueName`, each of which replaces what the config would build, and `drivers`
 (see [Drivers by name](#drivers-by-name)). Only the drivers the config selects are loaded, so the
 AWS SDKs are needed only when a section names S3 or SQS (`RESIZE_PEER_MISSING`, naming the
 packages, otherwise). An object config is merged and validated at once, a function config on first
@@ -1151,8 +1151,8 @@ and it catches what they throw or reject.
 `new FrameworkResizer({ metrics })` take the sink; `resizer.metrics` returns it as given. Left out
 (only `undefined` means the default), `new Resizer` and `createResizer` use
 `new LogMetrics(logger)` on the Resizer's logger, and `FrameworkResizer` uses
-`new LogMetrics(appLogger, { debug: true })`, so the app logger decides whether the debug lines
-are kept. `new NoopMetrics()` turns metrics off. The sink is checked by shape at construction,
+`new LogMetrics(logger, { debug: true })` on its `logger` option, else the app logger, so that
+logger decides whether the debug lines are kept. `new NoopMetrics()` turns metrics off. The sink is checked by shape at construction,
 before the Resizer's name is taken: `metrics: null`, or an object without `count()` and `timing()`
 functions, is `ResizeSetupError` `RESIZE_METRICS_INVALID` (`retryable: false`).
 
@@ -1172,7 +1172,7 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 |---|---|---|---|---|
 | `resize.read` | count | 1 per `resolve()` | `pipeline`, `outcome` | `mediaId`, `ready`, `missing`, `stale` |
 | `resize.preview.stale` | count | the stale previews one read found | `pipeline` | `mediaId` |
-| `resize.upload` | timing | ms of `uploadOriginal()` | `outcome`: `stored` or `rejected`; `format` (stored); `code` (rejected) | — |
+| `resize.upload` | timing | ms of `uploadOriginal()` | `outcome`: `stored` or `rejected`; `format` (stored); `code` (rejected, for a module error) | — |
 | `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
 | `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode) |
 | `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
@@ -1184,7 +1184,8 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
   after `beforeEnqueue` and the dropped formats, or the caller passed `enqueueMissing: false`),
   `no-original` (the media has no `original.storageRef`), `eager-only` (no task queue), then what
   the task queue said: `enqueued` (a task was added), `in-flight` (a task of the media, pipeline and
-  queue is already active) or `failed` (it could not take the task, or the read itself failed, or
+  queue is already active, or, on a queue without `gatesByTask` such as SQS, its gate lock is
+  held) or `failed` (it could not take the task, or the read itself failed, or
   the Resizer could not start, or its task queue cannot be used).
 - **What a read counts.** A read that found every cell fresh counts `ready`, even when a
   `beforeEnqueue` tap added a variant and it was queued: the tap's work shows in `resize.task`. In
@@ -1230,9 +1231,10 @@ that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
   `await resizer.metrics.flush?.()` at shutdown, or the open window's counts are lost.
 - **`debug: true`** also writes every call as one `debug` line, `resize metric <name> <value>
   <labels JSON> <context JSON>`, when the logger has a `debug` method (`ResizeLogger.debug` is
-  optional). It costs two `JSON.stringify` calls per event. The app logger of a framework app always
-  has `debug`, so the default sink of a `FrameworkResizer` pays that cost even when the app drops
-  debug lines: pass `metrics: new LogMetrics(logger)` to skip it.
+  optional). It costs two `JSON.stringify` calls per event. The default sink of a
+  `FrameworkResizer` writes to its `logger` option, else the app logger, which always has `debug`,
+  so it pays that cost even when the app drops debug lines: pass `metrics: new LogMetrics(logger)`
+  to skip it.
 
 **`NoopMetrics`** records nothing.
 
@@ -1244,7 +1246,8 @@ import { type MetricLabels, ResizeMetrics } from '@adaptivestone/framework-modul
 
 const labelNames = ['event', 'resizer', 'pipeline', 'outcome', 'format', 'mode', 'queue', 'code'];
 const counts = new Counter({ name: 'resize_events_total', help: 'resize events', labelNames });
-const timings = new Histogram({ name: 'resize_duration_ms', help: 'resize timings', labelNames });
+const buckets = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]; // ms, not prom-client's seconds
+const timings = new Histogram({ name: 'resize_duration_ms', help: 'resize timings (ms)', labelNames, buckets });
 
 export class PromMetrics extends ResizeMetrics {
   count(name: string, value: number, labels: MetricLabels = {}) { counts.inc({ event: name, ...labels }, value); }
@@ -1422,13 +1425,14 @@ await ResizeTask.updateOne(
   (plan the storage cost and the cleanup). Rows without an `identity` (written before 0.3.0) are
   never removed by `invalidate` or `replacePreviews`: delete their files yourself.
 - **What a read logs:** a read writes a log line only for what an operator must fix, and only once
-  per Resizer (once more after its task queue is set up again): an unregistered pipeline name (`error`, once
-  per name, for at most 100 names), a format list without `encode.formats` entries (`error`, once
-  per list, for at most 100 lists), and, when the caller passed `enqueueMissing: true` to a Resizer
-  without a task queue, one `warn`. A media without an original logs nothing. Every read is counted
-  instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A stored preview whose
-  `publicUrl` throws, and an enqueue that throws, are still logged on every read. `prewarm()` logs
-  as before.
+  per Resizer (once more after its task queue is set up again): an unregistered pipeline name
+  (`error`, once per name, for at most 100 names), a format list without `encode.formats` entries
+  (`error`, once per list, for at most 100 lists), and, when the caller passed
+  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. A media without an original
+  logs nothing.
+  Every read is counted instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A
+  stored preview whose `publicUrl` throws, and an enqueue that throws, are still logged on every
+  read. `prewarm()` logs as before.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the
