@@ -28,6 +28,7 @@ import {
   MemoryTaskQueue,
   PlainTaskQueue,
   ReleasingTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
 import { timingOf } from './timing.ts';
 
@@ -122,7 +123,10 @@ async function runUntil(
   tasks: MemoryTaskQueue | PlainTaskQueue,
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>,
   done: () => boolean,
-  opts: Pick<ConsumeOptions, 'logger' | 'resizers' | 'coordinationOf'> = {},
+  opts: Pick<
+    ConsumeOptions,
+    'logger' | 'resizers' | 'coordinationOf' | 'metricsOf'
+  > = {},
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -2015,12 +2019,18 @@ describe('a late answer never undoes the end of a task', () => {
 
   test('a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store', async () => {
     const base = clockLocks();
+    let markReleased!: () => void;
+    const releaseLanded = new Promise<void>((resolve) => {
+      markReleased = resolve;
+    });
     const locks: LockStore = {
       acquire: base.acquire,
       extend: base.extend,
       release: async (lockKey, owner) => {
         await sleepMs(20);
-        return base.release(lockKey, owner);
+        const released = await base.release(lockKey, owner);
+        markReleased();
+        return released;
       },
     };
     const tasks = new PlainTaskQueue({ timing: lateTiming });
@@ -2053,7 +2063,7 @@ describe('a late answer never undoes the end of a task', () => {
         logger: { info() {}, warn: record, error: record },
       },
     );
-    await sleepMs(40); // the release lands after the worker stopped waiting for it
+    await releaseLanded; // the release lands after the worker stopped waiting for it
     assert.deepEqual(
       events.map((e) => e.event),
       ['completed'],
@@ -2307,6 +2317,184 @@ test('a throwing logger never stops the loop or fails a task', async (t) => {
   assert.equal(tasks.rows[0].status, 'completed');
   // The claim failure and the observer failure, each written to the console instead.
   assert.equal(fallback.mock.callCount(), 2);
+});
+
+describe('Consumer metrics', () => {
+  // The calls of one metric, as [value, labels, context].
+  const callsOf = (sink: ReturnType<typeof recordingMetrics>, name: string) =>
+    sink.calls
+      .filter((call) => call.name === name)
+      .map((call) => [call.value, call.labels, call.context] as const);
+
+  test('a claimed task records its wait, and its completion records the run', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const rec = recordingMetrics();
+    await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'completed',
+      { metricsOf: () => rec },
+    );
+    assert.deepEqual(
+      rec.calls.map((call) => [
+        call.kind,
+        call.name,
+        call.labels,
+        call.context,
+      ]),
+      [
+        ['timing', 'resize.claim', { queue: 'default' }, { taskId: 'task-1' }],
+        [
+          'timing',
+          'resize.task',
+          { queue: 'default', pipeline: 'default', outcome: 'completed' },
+          { taskId: 'task-1', mediaId: 'm1', attempts: 1, variants: 1 },
+        ],
+      ],
+    );
+    for (const call of rec.calls) {
+      assert.ok(Number.isFinite(call.value) && call.value >= 0, call.name);
+    }
+  });
+
+  test('a retried task records failed with the error code, its last attempt records dead', async () => {
+    const timing = {
+      ...fastTiming,
+      maxAttempts: 2,
+      retryBackoffMs: { base: 1, max: 1 },
+    };
+    const branded = new MemoryTaskQueue({ timing });
+    await branded.add(newTask());
+    const rec = recordingMetrics();
+    await runUntil(
+      branded,
+      async () => {
+        throw new ResizeMediaError('x', {
+          code: 'RESIZE_SOURCE_DECODE_FAILED',
+        });
+      },
+      () => branded.rows[0].status === 'dead',
+      { metricsOf: () => rec },
+    );
+    assert.deepEqual(
+      callsOf(rec, 'resize.task').map(([, labels, context]) => [
+        labels.outcome,
+        labels.code,
+        context.attempts,
+      ]),
+      [
+        ['failed', 'RESIZE_SOURCE_DECODE_FAILED', 1],
+        ['dead', 'RESIZE_SOURCE_DECODE_FAILED', 2],
+      ],
+    );
+    assert.equal(callsOf(rec, 'resize.claim').length, 2);
+
+    // An error without the brand has no code label.
+    const plain = new MemoryTaskQueue({ timing });
+    await plain.add(newTask());
+    const plainRec = recordingMetrics();
+    await runUntil(
+      plain,
+      async () => {
+        throw new Error('sharp exploded');
+      },
+      () => plain.rows[0].status === 'dead',
+      { metricsOf: () => plainRec },
+    );
+    const outcomes = callsOf(plainRec, 'resize.task');
+    assert.deepEqual(
+      outcomes.map(([, labels]) => labels.outcome),
+      ['failed', 'dead'],
+    );
+    for (const [, labels] of outcomes) {
+      assert.equal('code' in labels, false);
+    }
+  });
+
+  test('a task delivered past maxAttempts records dead in 0 ms', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    tasks.rows[0].attempts = 3;
+    const rec = recordingMetrics();
+    let handled = 0;
+    await runUntil(
+      tasks,
+      async () => {
+        handled += 1;
+      },
+      () => tasks.rows[0].status === 'dead',
+      { metricsOf: () => rec },
+    );
+    assert.equal(handled, 0);
+    assert.deepEqual(callsOf(rec, 'resize.task'), [
+      [
+        0,
+        {
+          queue: 'default',
+          pipeline: 'default',
+          outcome: 'dead',
+          code: 'RESIZE_TASK_MAX_ATTEMPTS',
+        },
+        { taskId: 'task-1', mediaId: 'm1', attempts: 4, variants: 1 },
+      ],
+    ]);
+  });
+
+  test('a task given back at shutdown records no outcome', async () => {
+    const tasks = new ReleasingTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const rec = recordingMetrics();
+    const stop = new AbortController();
+    let started = false;
+    const loop = consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => {
+        started = true;
+        return stoppedByShutdown(task, opts);
+      },
+      logger: silent,
+      metricsOf: () => rec,
+    });
+    const until = Date.now() + 5000;
+    while (!started && Date.now() < until) {
+      await sleepMs(2);
+    }
+    stop.abort();
+    await loop;
+    assert.equal(started, true, 'the handler started');
+    assert.deepEqual(tasks.releaseCalls, ['task-1']);
+    // The claim is recorded (the sink is wired); the give-back records no outcome.
+    assert.deepEqual(
+      rec.calls.map((call) => call.name),
+      ['resize.claim'],
+    );
+  });
+
+  test('a claim records the wait since the previous task ended, across empty polls', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    const rec = recordingMetrics();
+    const stop = new AbortController();
+    const loop = consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: async () => {},
+      logger: silent,
+      metricsOf: () => rec,
+    });
+    await sleepMs(60); // several empty polls
+    await tasks.add(newTask());
+    const until = Date.now() + 5000;
+    while (tasks.rows[0].status !== 'completed' && Date.now() < until) {
+      await sleepMs(2);
+    }
+    stop.abort();
+    await loop;
+    const [claim] = callsOf(rec, 'resize.claim');
+    assert.ok(claim, 'the claim is recorded');
+    assert.ok(claim[0] >= 50, `waited ${claim[0]} ms`);
+  });
 });
 
 describe('backoffMs', () => {

@@ -37,6 +37,7 @@ import {
   memoryLocks,
   PlainTaskQueue,
   ReleasingTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import { workUntil } from './testHelpers/work.ts';
@@ -1973,6 +1974,192 @@ describe('a worker for several queues', () => {
       await b.verify();
       assert.equal(carrierVerifies, 3, label);
       assert.equal(lockVerifies, 3, label);
+    }
+  });
+});
+
+describe('worker metrics', () => {
+  const fast = { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } };
+
+  /** A logger that keeps each level's first arguments. */
+  const recordingLogger = () => {
+    const lines = {
+      info: [] as string[],
+      warn: [] as string[],
+      error: [] as string[],
+    };
+    return {
+      lines,
+      info: (msg: unknown) => {
+        lines.info.push(String(msg));
+      },
+      warn: (msg: unknown) => {
+        lines.warn.push(String(msg));
+      },
+      error: (msg: unknown) => {
+        lines.error.push(String(msg));
+      },
+    };
+  };
+
+  /** A Resizer on `tasks` whose media m1 has an original, with `opts` on top. */
+  const resizerOn = (
+    tasks: TaskQueue,
+    opts: Partial<ResizerOptions> & { failDownloads?: boolean } = {},
+  ) => {
+    const { failDownloads, ...rest } = opts;
+    return new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => {
+          if (failDownloads) {
+            throw new ResizeStorageError('resize: the bucket did not answer');
+          }
+          return png;
+        },
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia({
+        load: async () => ({
+          id: 'm1',
+          original: { storageRef: { key: 'o' } },
+          previews: [],
+        }),
+      }),
+      locks: memoryLocks(),
+      tasks,
+      ...rest,
+    });
+  };
+
+  const addTask = (
+    tasks: MemoryTaskQueue,
+    over: { resizer?: string; pipeline?: string } = {},
+  ) =>
+    tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: [webp10],
+      ...over,
+    });
+
+  test('with the default metrics each task outcome writes one info line', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const logger = recordingLogger();
+    const resizer = resizerOn(tasks, { logger });
+    await addTask(tasks);
+    await workUntil(
+      { logger: silent, resizers: [resizer] },
+      () => tasks.rows[0].status === 'completed',
+    );
+    const taskLines = logger.lines.info.filter((line) =>
+      /^resize: task \S+ of media m1 completed in \d+ ms/.test(line),
+    );
+    assert.equal(taskLines.length, 1, logger.lines.info.join('\n'));
+
+    resetResizerForTests();
+    const failing = new MemoryTaskQueue({
+      timing: { ...fast, maxAttempts: 2 },
+    });
+    const failingLogger = recordingLogger();
+    const broken = resizerOn(failing, {
+      logger: failingLogger,
+      failDownloads: true,
+    });
+    await addTask(failing);
+    await workUntil(
+      { logger: silent, resizers: [broken] },
+      () => failing.rows[0].status === 'dead',
+    );
+    const outcomes = failingLogger.lines.info
+      .filter((line) => line.startsWith('resize: task '))
+      .map((line) => /of media m1 (\w+) in \d+ ms/.exec(line)?.[1]);
+    assert.deepEqual(outcomes, ['failed', 'dead']);
+  });
+
+  test('a task of an unregistered pipeline is labelled unregistered', async () => {
+    const tasks = new MemoryTaskQueue({ timing: { ...fast, maxAttempts: 1 } });
+    const rec = recordingMetrics();
+    const resizer = resizerOn(tasks, { metrics: rec });
+    await addTask(tasks, { pipeline: 'ghost' });
+    await workUntil(
+      { logger: silent, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    const outcomes = rec.calls.filter((call) => call.name === 'resize.task');
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0].labels.pipeline, 'unregistered');
+    assert.equal(outcomes[0].labels.outcome, 'dead');
+    assert.equal(outcomes[0].context.pipeline, 'ghost');
+  });
+
+  test("the worker awaits each served sink's flush once when it stops", async () => {
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const rec = recordingMetrics();
+    let flushed = false;
+    rec.flush = () => {
+      rec.flushes += 1;
+      return new Promise<void>((resolve) => {
+        setTimeout(() => {
+          flushed = true;
+          resolve();
+        }, 20);
+      });
+    };
+    const a = resizerOn(tasks, { metrics: rec });
+    const b = resizerOn(tasks, { name: 'b', metrics: rec });
+    await addTask(tasks);
+    await workUntil(
+      { logger: silent, resizers: [a, b] },
+      () => tasks.rows[0].status === 'completed',
+    );
+    assert.equal(rec.flushes, 1);
+    assert.equal(flushed, true, 'the stop waited for the flush');
+  });
+
+  test('a metrics sink that throws or rejects never stops the worker', async () => {
+    const rejections: unknown[] = [];
+    const record = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', record);
+    try {
+      const tasks = new MemoryTaskQueue({ timing: fast });
+      const logger = recordingLogger();
+      const resizer = resizerOn(tasks, {
+        logger,
+        metrics: {
+          count() {
+            throw new Error('count down');
+          },
+          async timing() {
+            throw new Error('timing down');
+          },
+          async flush() {
+            throw new Error('flush down');
+          },
+        },
+      });
+      await addTask(tasks);
+      await workUntil(
+        { logger: silent, resizers: [resizer] },
+        () => tasks.rows[0].status === 'completed',
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      assert.deepEqual(rejections, []);
+      const sinkErrors = logger.lines.error.filter((line) =>
+        line.startsWith("resize: the metrics sink of Resizer 'default' failed"),
+      );
+      assert.deepEqual(
+        sinkErrors
+          .map((line) => /of (\w+)\(\) are not logged/.exec(line)?.[1])
+          .sort(),
+        ['count', 'flush', 'timing'],
+      );
+    } finally {
+      process.off('unhandledRejection', record);
     }
   });
 });
