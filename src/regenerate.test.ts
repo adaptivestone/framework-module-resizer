@@ -866,3 +866,58 @@ test('the original locator changed in place while it downloads: the row records 
   const { decision } = await w.read(r, doc);
   assert.equal(decision.ready[0].stale, true);
 });
+
+test('a locator with its own toJSON (a Mongoose sub-document, say): the row is signed as the read path signs it, so the next read is fresh', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  // A sub-document whose schema gives toObject() and toJSON() different options (virtuals in one,
+  // say): the origin signature reads the JSON form, so the worker's copy must be that form too.
+  const subdoc = {
+    key,
+    toObject: () => ({ key, region: 'virtual' }),
+    toJSON: () => ({ key }),
+  };
+  const doc: MediaLike = {
+    id: 'm1',
+    original: { ...red, storageRef: subdoc },
+    previews: [],
+  };
+  w.docs.set('m1', doc);
+
+  await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+  const [row] = rowsOf(doc);
+  assert.equal(row.origin, previewOrigin({ key }, { width: 64, height: 64 }));
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(
+    decision.ready.map((served) => served.stale ?? false),
+    [false],
+  );
+  assert.deepEqual(decision.missing, []);
+});
+
+test('a locator holding a Buffer: the row is signed as the read path signs it, so the next read is fresh', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  // A deep copy turns a Buffer into a Uint8Array, whose JSON form differs from the Buffer's.
+  const storageRef = { key, etag: Buffer.from('v1') };
+  const doc: MediaLike = {
+    id: 'm1',
+    original: { ...red, storageRef },
+    previews: [],
+  };
+  w.docs.set('m1', doc);
+
+  await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+  const [row] = rowsOf(doc);
+  assert.equal(
+    row.origin,
+    previewOrigin(storageRef, { width: 64, height: 64 }),
+  );
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
+});

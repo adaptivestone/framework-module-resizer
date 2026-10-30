@@ -192,8 +192,9 @@ interface LoadedSource {
 }
 
 /**
- * A deep copy of a storage locator, so a locator the host changes in place does not change it. A
- * Mongoose sub-document is copied through its plain form (`toObject()`).
+ * A deep copy of a storage locator for the storage driver, so a locator the host changes in place
+ * does not change the download or the upload's parent. A Mongoose sub-document is copied through
+ * its plain form (`toObject()`).
  */
 function copyLocator(ref: StorageRef): StorageRef {
   const plain =
@@ -204,19 +205,39 @@ function copyLocator(ref: StorageRef): StorageRef {
     return structuredClone(plain);
   } catch {
     // A locator structuredClone cannot copy (one holding a function, say) is kept as it is: the
-    // render then reads it live, as it did before it was copied.
+    // driver then reads it live, as it did before it was copied. The origin is signed from
+    // signedLocator(), never from this copy.
     return plain;
   }
 }
 
-/** A copy of what a render reads of the original: its locator, stored format and dimensions. */
-function snapshotOriginal(original: Original): Original {
+/**
+ * The locator in the form the origin signature reads (its JSON form, `toJSON()` included), taken
+ * now. Signing this form gives exactly what the read path computes from the live locator, and a
+ * JSON form cannot change in place or fail to copy.
+ */
+function signedLocator(ref: StorageRef): StorageRef {
+  return JSON.parse(JSON.stringify(ref)) as StorageRef;
+}
+
+/**
+ * What a render reads of the original, taken once: `original` holds the driver's copy of the
+ * locator (download and upload parent), `signed` the same original with the locator in the form
+ * every signature of this render is computed from.
+ */
+function snapshotOriginal(original: Original): {
+  original: Original;
+  signed: Original;
+} {
   const { format, width, height } = original;
-  return {
-    storageRef: copyLocator(original.storageRef),
+  const rest = {
     ...(format === undefined ? {} : { format }),
     ...(width === undefined ? {} : { width }),
     ...(height === undefined ? {} : { height }),
+  };
+  return {
+    original: { storageRef: copyLocator(original.storageRef), ...rest },
+    signed: { storageRef: signedLocator(original.storageRef), ...rest },
   };
 }
 
@@ -787,8 +808,8 @@ export class Processor {
     // The original as the render found it, read once before any await: the host may replace it
     // while its bytes download, and the download, the origin every row records, the stored
     // dimensions and the upload's parent must all describe the bytes that were rendered.
-    const original = snapshotOriginal(media.original);
-    const atStart: MediaLike = { original, previews: media.previews };
+    const { original, signed } = snapshotOriginal(media.original);
+    const atStart: MediaLike = { original: signed, previews: media.previews };
 
     // The fresh stored identities are done (the DB check that makes re-runs idempotent); a stale
     // one renders again. Stored previews keep their own scope, so another pipeline's rendering
@@ -876,7 +897,7 @@ export class Processor {
     };
     const backfillDims =
       stored === undefined && persist ? mediaDims : undefined;
-    const origin = previewOrigin(original.storageRef, mediaDims);
+    const origin = previewOrigin(signed.storageRef, mediaDims);
     if (stored === undefined) {
       // Measured now, before any pixel decode: the rows signed with this size are fresh after all.
       const fresh = catalog.freshIdentities(atStart, scope, mediaDims);
