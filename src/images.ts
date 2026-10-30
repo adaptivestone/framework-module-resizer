@@ -202,32 +202,50 @@ export function getPreviewIdentity(
 }
 
 /**
- * The usable stored previews of `scope`, keyed by identity; of two rows with one identity the later
- * wins. A row's identity comes from its own fields (its scope, size key, format and filters), so
- * another Resizer's or pipeline's rendering never matches. The one rule for which stored rows
- * count: the read path, prewarm, eager generate and the worker all use it.
+ * Every usable stored row of `scope`, grouped by identity, each group in store order. A row's
+ * identity comes from its own fields (its scope, size key, format and filters), so another
+ * Resizer's or pipeline's rendering never matches. The one rule for which stored rows count: the
+ * read path, prewarm, eager generate and the worker all use it, through this or storedPreviews.
  */
-export function storedPreviews(
+export function storedPreviewRows(
   media: MediaLike,
   scope: PreviewScope,
-): Map<string, Preview> {
-  const byIdentity = new Map<string, Preview>();
+): Map<string, Preview[]> {
+  const byIdentity = new Map<string, Preview[]>();
   for (const preview of media.previews ?? []) {
     if (!isUsablePreview(preview)) {
       continue;
     }
     const own = previewScope(preview);
     if (own.resizer === scope.resizer && own.pipeline === scope.pipeline) {
-      byIdentity.set(
-        getPreviewIdentity(
-          own,
-          preview.sizeKey,
-          preview.format,
-          preview.filters,
-        ),
-        preview,
+      const identity = getPreviewIdentity(
+        own,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
       );
+      const rows = byIdentity.get(identity);
+      if (rows) {
+        rows.push(preview);
+      } else {
+        byIdentity.set(identity, [preview]);
+      }
     }
+  }
+  return byIdentity;
+}
+
+/**
+ * The usable stored previews of `scope`, keyed by identity; of two rows with one identity the later
+ * wins (see storedPreviewRows).
+ */
+export function storedPreviews(
+  media: MediaLike,
+  scope: PreviewScope,
+): Map<string, Preview> {
+  const byIdentity = new Map<string, Preview>();
+  for (const [identity, rows] of storedPreviewRows(media, scope)) {
+    byIdentity.set(identity, rows[rows.length - 1]);
   }
   return byIdentity;
 }

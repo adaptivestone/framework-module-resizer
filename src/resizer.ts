@@ -472,7 +472,12 @@ export class Resizer {
     this.#ensureDispatcher();
     if (!this.#builtServices) {
       const { storage, media } = this;
-      const catalog = new Catalog({ config });
+      // The pipeline's version is read on every call, as the worker reads it when it signs a row.
+      const catalog = new Catalog({
+        config,
+        versionOf: (p) =>
+          this.#pipelines.has(p) ? this.#pipelines.get(p).version : undefined,
+      });
       this.#builtServices = {
         catalog,
         uploader: new Uploader({
