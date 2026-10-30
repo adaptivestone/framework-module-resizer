@@ -14,6 +14,7 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import {
+  ResizeError,
   ResizeGenerateError,
   ResizeMediaError,
   ResizeSecurityError,
@@ -1563,6 +1564,50 @@ describe('a worker on a router', () => {
         (err as { code?: string }).code === 'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
     assert.deepEqual(broken.claims, []);
+  });
+
+  test('a worker whose consumed backend fails to build rejects with that very error, logged once naming the queue, and claims nothing', async () => {
+    const downs = [
+      new Error('sdk not up'),
+      new ResizeError('no bucket', {
+        code: 'GCS_BUCKET_MISSING',
+        retryable: false,
+      }),
+    ];
+    for (const down of downs) {
+      resetResizerForTests();
+      const memory = new MemoryTaskQueue({ timing: fast });
+      const resizer = queuedResizer(
+        'default',
+        new RoutingTaskQueue({
+          default: memory,
+          bulk: async () => {
+            throw down;
+          },
+        }),
+      );
+      const errors: unknown[][] = [];
+      await assert.rejects(
+        () =>
+          runWorker({
+            queue: 'bulk',
+            signal: AbortSignal.abort(),
+            logger: { ...silent, error: (...args) => errors.push(args) },
+            resizers: [resizer],
+          }),
+        (err: unknown) => err === down,
+      );
+      assert.equal(errors.length, 1);
+      assert.match(
+        String(errors[0][0]),
+        /queue 'bulk' of Resizer 'default': its backend could not be built/,
+      );
+      assert.equal(errors[0][1], down);
+      assert.deepEqual(memory.claims, []);
+    }
+    // The branded error keeps its own code and retryable.
+    assert.equal((downs[1] as ResizeError).code, 'GCS_BUCKET_MISSING');
+    assert.equal((downs[1] as ResizeError).retryable, false);
   });
 
   test('a worker given a name marked unavailable fails with RESIZE_QUEUE_NOT_SERVED naming the queue and the package', async () => {

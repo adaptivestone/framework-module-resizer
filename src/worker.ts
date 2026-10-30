@@ -20,7 +20,7 @@ import type {
   TaskQueue,
 } from './contracts/taskQueue.ts';
 import type { TaskCoordination } from './coordination.ts';
-import { ResizeError, ResizeSetupError } from './errors.ts';
+import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import {
   getResizer,
@@ -114,8 +114,8 @@ async function refuseUnservedSharers(
  * The backends that carry `queue` on the task queues of `served`, each once, with the task queue
  * its timing is read on (that of the first Resizer that carries it there), and the Resizers that
  * carry `queue`. A task queue that does not carry it (e.g. SQS without that queue URL) is skipped,
- * so one Resizer's missing queue never stops the others. A backend that fails to build rejects,
- * naming the queue and keeping the error's code; when nothing carries the name it is
+ * so one Resizer's missing queue never stops the others. A backend that fails to build rejects
+ * with that error (logged once, naming the queue); when nothing carries the name it is
  * RESIZE_QUEUE_NOT_SERVED, with the reason a task queue keeps for that name.
  */
 async function carriersOf(
@@ -135,12 +135,13 @@ async function carriersOf(
     try {
       carrier = await carrierOf(tasks, queue);
     } catch (err) {
-      throw new ResizeSetupError(
-        `resize worker: the backend of queue '${queue}' of Resizer '${resizer.name}' could not be built: ${err instanceof Error ? err.message : String(err)}`,
-        ResizeError.isResizeError(err)
-          ? { code: err.code, retryable: err.retryable, cause: err }
-          : { cause: err },
+      // The build error itself, as verify() rejects with it; the log line names the queue.
+      logNeverThrow(
+        logger,
+        `resize worker: queue '${queue}' of Resizer '${resizer.name}': its backend could not be built`,
+        err,
       );
+      throw err;
     }
     if (!carrier) {
       if (!skipped.has(tasks)) {
