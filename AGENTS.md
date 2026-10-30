@@ -270,6 +270,7 @@ gets the full box its steps were written for. To hand the private original to it
    sub-documents must also give them `identity`, `origin` and `encodeSig` (each
    `{ type: String }`), or `verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED`: the media store
    keeps one row per preview identity, and the two signatures record what each row was made from.
+   Give them `fit` (`{ type: Boolean }`) too; `verify()` logs one warning without it.
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model
    declares its indexes (and so does the framework's `Lock` model, used only beside a task queue
@@ -514,8 +515,8 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
 Rolling out a change of image settings or of a pipeline `version`: the API and the workers must
 run the same settings. Deploy every worker at once, or change the settings only after the old
 workers have stopped. While two worker versions with different settings run side by side, each
-re-makes the other's rows: one render, one upload and one orphaned file per read after a task
-ends. The module never deletes the old files.
+re-makes the other's rows: every read after a task ends queues them again, and each replaced
+preview costs one render, one upload and one orphaned file. The module never deletes the old files.
 
 Metrics: the default sink writes log lines. To send them elsewhere, or to turn them off:
 
@@ -622,7 +623,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_METRICS_INVALID` at construction | the `metrics` option is not a sink (`null`, or no `count()` and `timing()` functions), or `new LogMetrics(logger, { summaryIntervalMs })` got an interval that is not a positive safe integer — pass `new LogMetrics(logger)`, `new NoopMetrics()` or your own `ResizeMetrics`, or leave `metrics` out for the default |
 | previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or before `0.3.0-rc.1` is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep preview objects no row references. The wave shares the queue with new uploads' previews: plan worker capacity |
 | one task per read that renders nothing, and the warning "found every requested preview … already fresh" | the API and the worker run different image settings or pipeline versions (deploy them together), or `resolve()` got the media without its stored original (a projection that drops `original.width` / `height`, or a reshaped `storageRef`) — pass `original` as stored |
-| previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: one render, one upload and one orphaned file per read after a task ends — deploy every worker at once, or change settings only after the old workers have stopped |
+| previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: every read after a task ends queues them again, and each replaced preview costs one render, one upload and one orphaned file — deploy every worker at once, or change settings only after the old workers have stopped |
 | the warning "the media store did not record the original's dimensions" | a custom `MediaStore` drops `backfillDims` in `appendPreviews` (also with `previews: []`), so every read of such a media queues a task that downloads the original — make it save the dimensions on the original |
 | `RESIZE_MONGO_LOCK_MODEL_OUTDATED` from `verify()` or at worker start | the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |

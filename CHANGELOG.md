@@ -717,8 +717,9 @@ later release that puts the image engine behind a port.
   calls `generate()`.
 - **Roll out settings with every worker at once.** The API and the workers must run the same image
   settings and pipeline versions: deploy every worker together, or change settings only after the
-  old workers have stopped. Two worker versions with different settings re-make each other's rows,
-  each costing one render, one upload and one orphaned file per read after a task ends.
+  old workers have stopped. Two worker versions with different settings re-make each other's rows:
+  every read after a task ends queues them again, and each replaced preview costs one render, one
+  upload and one orphaned file.
 - **A media without stored dimensions** (or with a stored `null`) takes one task that downloads and
   inspects the original and records its dimensions; no row of it can be proven fresh before. A
   `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`; a store that
@@ -738,6 +739,11 @@ later release that puts the image engine behind a port.
   now a cover row: only `fit: true` makes a fit row. On the database queue such a variant used to
   render as a fit row (Mongoose cast `1` to `true`); fit rows already stored stay fresh and are not
   regenerated. Typed hosts are unaffected.
+- **A stored row whose `fit` is not a boolean** (from a store that does not keep the field: a
+  strict Mongoose row schema without it, a table without the column) is fresh when its
+  `encodeSig` matches either the fit or the cover signature, so such a store does not regenerate
+  its fit previews on every read. `MongoMediaStore.verify()` logs one warning (it does not throw)
+  when strict preview rows lack `fit`: declare it as `{ type: Boolean }`.
 
 **Features**
 
@@ -754,9 +760,12 @@ later release that puts the image engine behind a port.
 - **The freshness check.** The read path, `prewarm()`, `generate()` and the worker compare each
   stored row's `origin` and `encodeSig` with the current settings; stale rows are served while the
   worker replaces them in one write. See "Freshness" in `README.md`.
-- New fields: `decision.stale` and `ReadyEntry.stale` (stale rows served and their queued
-  replacements), `GenerateResult.replaced` (the storage refs of the rows `generate()` replaced) and
-  the optional `ResizeLogger.debug`.
+- New fields: `decision.stale` and `ReadyEntry.stale` (the stale variants a read asks to replace,
+  as left after `beforeEnqueue`, and the stale rows served), `GenerateResult.replaced` (the storage
+  refs of the rows `generate()` replaced) and the optional `ResizeLogger.debug`.
+- `MongoMediaStoreOptions.logger` (default `console`), where `verify()` writes its warning;
+  `mongoParts()` and the `'mongo'` database driver pass their logger, `FrameworkMediaStore` the
+  app logger.
 - The framework is optional. `@adaptivestone/framework` and `mongoose` are optional peers, so
   npm no longer installs them into a plain Node app; the core needs only `sharp`. A plain Node app
   with MongoDB writes no driver code: `mongoParts(connection, { mediaModel })` gives the media

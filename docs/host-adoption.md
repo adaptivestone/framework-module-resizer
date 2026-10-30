@@ -72,7 +72,8 @@ regenerate on their next read. So:
 - clean up the old files, which the module never deletes (from the "resize: replaced …
   outdated preview(s)" log line, or with a sweep of preview objects no row references);
 - roll out image settings and pipeline versions with every worker at once (or after the old
-  workers have stopped): two worker versions with different settings re-make each other's rows;
+  workers have stopped): two worker versions with different settings re-make each other's rows,
+  and each replaced preview costs one render, one upload and one orphaned file;
 - a custom `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`.
 
 Release candidates after `0.3.0-rc.4` change only internals. `CHANGELOG.md` (`# 0.3.0`) has the
@@ -304,9 +305,10 @@ export default {
   without `gatesByTask` (SQS). Set it to your worst queue wait, not to the old
   dispatch value.
 - A hand-written media schema that declares preview rows as strict sub-documents must declare
-  `identity`, `origin` and `encodeSig` in them, each `{ type: String }` (the fragment already has
-  them, with `bytes` and `createdAt`); `resizer.verify()` throws
-  `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without them. Rows written earlier have no identity and are
+  `identity`, `origin` and `encodeSig` in them, each `{ type: String }`, and `fit` as
+  `{ type: Boolean }` (the fragment already has them, with `bytes` and `createdAt`);
+  `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first three, and logs
+  one warning without `fit`. Rows written earlier have no identity and are
   not migrated. A custom model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate`
   (and optionally `castObject`), and must accept an update pipeline (statement 2). A
   `findOneAndUpdate` middleware on the media model runs once per preview write (and once for the

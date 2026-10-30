@@ -408,7 +408,9 @@ cast rejects with Mongoose's `ValidationError` before anything is written; `stor
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
 sub-documents without `identity`, `origin` or `encodeSig` (a mixed or plain `previews` array, or
-rows with `strict: false`, pass; `bytes` and `createdAt` are not checked), `MongoLockStore.verify()`
+rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and logs one warning
+when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
+`logger` option, default `console`), `MongoLockStore.verify()`
 with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock schema has no `owner` field (for example
 a `ResizeLock` model registered on the connection before this version), and
 `MongoTaskQueue.verify()` with `RESIZE_MONGO_MODEL_OUTDATED` when the `ResizeTask` schema lacks a
@@ -1134,8 +1136,8 @@ shape:
 
 ```ts
 abstract class ResizeMetrics {
-  count(name: string, value: number, labels?: MetricLabels, context?: MetricContext): void | Promise<void>;
-  timing(name: string, ms: number, labels?: MetricLabels, context?: MetricContext): void | Promise<void>;
+  abstract count(name: string, value: number, labels?: MetricLabels, context?: MetricContext): void | Promise<void>;
+  abstract timing(name: string, ms: number, labels?: MetricLabels, context?: MetricContext): void | Promise<void>;
   flush?(): void | Promise<void>; // write what is pending now
 }
 ```
@@ -1174,9 +1176,9 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 | `resize.preview.stale` | count | the stale previews one read found | `pipeline` | `mediaId` |
 | `resize.upload` | timing | ms of `uploadOriginal()` | `outcome`: `stored` or `rejected`; `format` (stored); `code` (rejected, for a module error) | — |
 | `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
-| `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode) |
+| `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode), `rawFormat` (`format: 'unconfigured'`) |
 | `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
-| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants` |
+| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `payloadQueue` (when the task names another queue) |
 | `resize.claim` | timing | ms the worker's loop waited for this task | `queue` | `taskId` |
 
 - **`resize.read` outcomes**, in the order a read decides them: `unknown-pipeline` (the pipeline is
@@ -1197,20 +1199,25 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
   worker stored first in a fresh row, `rendered` a `generate({ persist: false })` variant. A
   variant left out because a row with other signatures holds its identity is `failed` with
   `RESIZE_WORKER_INCOMPLETE`: that row does not cover it, so the task fails and its retry replaces
-  the row. When the persist itself fails, every variant it held is `failed` with the error's code.
-- `format` is a configured format, or a decoder id for uploads; `queue` is a consumed queue name.
+  the row. When the persist itself fails, a variant the store kept before the failure (the append
+  before a failed replace, or the part of a failed append that the reloaded media holds) is
+  `stored`; every other variant it held is `failed` with the error's code.
+- `format` is a configured format, or a decoder id for uploads. A task variant whose format has no
+  encoder settings (an old or foreign payload) is `failed` with `format: 'unconfigured'`, its own
+  format in `context.rawFormat`. `queue` is the queue the worker consumes; a task whose payload
+  names another queue (a replayed or malformed message) keeps that name in `context.payloadQueue`.
   The queue latency (from due to claim) is not measured: `resize.claim` is the worker's own wait.
 
 **`LogMetrics`** (the default) writes metrics as log lines on a logger: `new LogMetrics(logger, {
 summaryIntervalMs?, debug? })` (`LogMetricsOptions`; defaults `60000` and `false`). An interval
 that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
 - **Summed** per Resizer, never a line of their own: the reads by outcome, the stale previews
-  served, the uploads (stored and rejected, with their bytes), the variants stored, duplicate or
+  found, the uploads (stored and rejected, with their bytes), the variants stored, duplicate or
   rendered (with their bytes) and the claims (with their total wait). Once per window, one `info`
   line per Resizer that counted something:
 
   ```text
-  resize: Resizer 'default' over 60 s: reads 1200 (ready 1150, enqueued 12, in-flight 38), stale previews served 40, uploads 25 (31457280 bytes), variants 75 (5242880 bytes), claims 12 (average wait 840 ms)
+  resize: Resizer 'default' over 60 s: reads 1200 (ready 1150, enqueued 12, in-flight 38), stale previews found 40, uploads 25 (31457280 bytes), variants 75 (5242880 bytes), claims 12 (average wait 840 ms)
   ```
 
   Empty sections are left out; an upload section with nothing stored reads `uploads 3 (rejected
@@ -1277,8 +1284,10 @@ A stale row is served while its replacement is made; the replacement takes its p
 `ReadyEntry`, and queues its replacement: stale and missing variants form one list, in cell order,
 for `beforeEnqueue`, and one task. After the hook, a variant whose stored row was stale is in
 `decision.stale`, every other one in `decision.missing` (`stale` is set only when there is one, so
-a fresh decision has no `stale` key). A stale row whose `publicUrl` throws is not served but is
-still queued: the replacement gets a new ref. A pipeline that is not registered serves every stored
+a fresh decision has no `stale` key). `decision.stale` lists the replacements the read asks for,
+as left after the hook: it does not confirm that they were queued (an eager-only Resizer, a task
+queue that cannot be used, `enqueueMissing: false`) or that each old row was served. A stale row
+whose `publicUrl` throws is not served but is still queued: the replacement gets a new ref. A pipeline that is not registered serves every stored
 row as fresh, since nothing can replace it. `prewarm()` reports only fresh rows as `ready`; stale
 ones are required and queued like missing ones.
 
@@ -1320,7 +1329,9 @@ width, height)". It may fire once after an eager `generate()` filled variants a 
 pipeline versions. Change them with every worker at once: deploy all workers together, or drain
 (stop) the old workers before the new ones start. While two worker versions with different
 settings run side by side (a rolling deploy, a canary), each sees the other's rows as stale and
-makes them again: every read after a task ends costs one render, one upload and one orphaned file.
+makes them again: every read after a task ends queues the previews it finds stale again, and each
+replaced preview costs one render, one upload and one orphaned file (a task replacing several
+previews costs that several times).
 An API ahead of its workers queues tasks that render nothing (the warning above). After a change,
 every stored preview that the change touches regenerates as it is read; that wave shares the queue
 with the previews of new uploads, which wait behind it, so plan worker capacity and storage.
