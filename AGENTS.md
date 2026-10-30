@@ -208,10 +208,10 @@ gets the full box its steps were written for. To hand the private original to it
    file:
    - `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or
      `{ driver: 's3', bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?,
-     forcePathStyle? }` (S3 is imported only when selected; credentials from the AWS chain;
-     every public object `S3Storage` uploads (previews and public raster originals, and a host's
-     own direct uploads) gets `Cache-Control: public, max-age=31536000, immutable`; give your own
-     direct uploads new keys, and purge the CDN when you delete one);
+     forcePathStyle? }` (S3 is imported only when selected; credentials from the AWS chain).
+     S3: every public object `S3Storage` uploads (previews and public raster originals, and a
+     host's own direct uploads) gets `Cache-Control: public, max-age=31536000, immutable`; give
+     your own direct uploads new keys, and purge the CDN when you delete one;
    - `queue`: the name of a `queues` entry (the scaffold writes `queue: 'default'`), or `false` =
      eager only. Missing: `'default'` when `queues` has entries, else eager only. A name that
      `queues` does not define (the implied `'default'` too) is `RESIZE_CONFIG_QUEUE_UNKNOWN`.

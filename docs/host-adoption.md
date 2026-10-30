@@ -76,10 +76,12 @@ regenerate on their next read. So:
   and each replaced preview costs one render, one upload and one orphaned file;
 - a custom `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`.
 
-`0.3.0-rc.5` changes no API: every public object `S3Storage` uploads (previews and public raster
-originals, and your own direct uploads, which must use new keys) carries
-`Cache-Control: public, max-age=31536000, immutable`, so purge your CDN when you delete one that
-must disappear sooner. Release candidates after `0.3.0-rc.5` change only internals.
+`0.3.0-rc.5` removes and renames nothing: it widens two types (the `NoopMetrics` parameters, and
+the timing keys of a custom queue driver's `queues` entry; see Fixes in `CHANGELOG.md`), and every
+public object `S3Storage` uploads (previews and public raster originals, and your own direct
+uploads, which must use new keys) carries `Cache-Control: public, max-age=31536000, immutable`, so
+purge your CDN when you delete one that must disappear sooner. Release candidates after
+`0.3.0-rc.5` change only internals.
 `CHANGELOG.md` (`# 0.3.0`) has the details of everything below.
 
 ## Named queues: from `queue: { … }` to `queues`

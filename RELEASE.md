@@ -15,7 +15,8 @@ Run from a clean working tree on `main`:
 ```bash
 npm ci                 # reproducible install from the lockfile
 node --run types:check # tsc: the shipped code, then the tests (tsconfig.tests.json)
-node --run types:check:src # the shipped code and the type pins (tsconfig.type-pins.json), as CI runs it against the minimum peers
+node --run types:check:src
+                       # shipped code + type pins (CI also runs it on the minimum peers)
 node --run check       # biome
 node --run build       # preBuild → tsc → postBuild (emits dist/)
 npm test               # node --experimental-strip-types --test  (the full node:test suite)
