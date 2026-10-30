@@ -25,6 +25,9 @@ import { optionalString, requiredString } from '../helpers/configSection.ts';
 import type { S3StorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
+// The Cache-Control header of every public object (see `upload` for why it is safe).
+const PUBLIC_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+
 interface S3StorageRef {
   bucket: string;
   key: string;
@@ -163,6 +166,11 @@ export class S3Storage extends ResizeStorage {
 
   // Upload a NEW object. Route by visibility (NO per-object ACL — public access is a
   // bucket policy). The driver owns the physical bucket; returns the ref to persist.
+  // Every public object this driver uploads (previews, public raster originals, and a host's
+  // own direct uploads) is cacheable for a year and immutable: every key the module writes is
+  // new and random, so an object never changes under its URL. A host that calls `upload`
+  // directly must give each object a new key, as the contract says; a host that deletes a
+  // public object purges its CDN, which may keep serving the URL until then.
   async upload({
     key,
     body,
@@ -226,6 +234,9 @@ export class S3Storage extends ResizeStorage {
         Key: physicalKey,
         Body: body,
         ContentType: contentType,
+        ...(visibility === 'public'
+          ? { CacheControl: PUBLIC_CACHE_CONTROL }
+          : {}),
         ...(contentType === 'image/svg+xml'
           ? { ContentDisposition: 'attachment' }
           : {}),
