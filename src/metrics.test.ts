@@ -395,6 +395,35 @@ describe('boundMetrics', () => {
     ]);
   });
 
+  test("boundMetrics never changes the caller's labels or context: the sink gets new objects", () => {
+    const sink = recordingMetrics();
+    const logger = recordingLogger();
+    const bound = boundMetrics(sink, { resizer: 'r1', logger, pipelineLabel });
+    const labels = Object.freeze({ pipeline: 'retired', code: 'HOST_X' });
+    const context = Object.freeze({ mediaId: 'm1' });
+    bound.count('x', 1, labels, context);
+    bound.timing('y', 2, labels, context);
+    // Frozen inputs: a write to either would have thrown, and been logged as a sink failure.
+    assert.deepEqual(logger.lines.error, []);
+    assert.deepEqual(labels, { pipeline: 'retired', code: 'HOST_X' });
+    assert.deepEqual(context, { mediaId: 'm1' });
+    assert.equal(sink.calls.length, 2);
+    for (const call of sink.calls) {
+      assert.notEqual(call.labels, labels);
+      assert.notEqual(call.context, context);
+      assert.deepEqual(call.labels, {
+        resizer: 'r1',
+        pipeline: 'unregistered',
+        code: 'other',
+      });
+      assert.deepEqual(call.context, {
+        mediaId: 'm1',
+        pipeline: 'retired',
+        code: 'HOST_X',
+      });
+    }
+  });
+
   test('without pipelineLabel the pipeline label passes unchanged', () => {
     const sink = recordingMetrics();
     boundMetrics(sink, { resizer: 'r1', logger: recordingLogger() }).count(

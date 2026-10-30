@@ -118,9 +118,12 @@ export class FrameworkResizer<D extends DriverRegistry = {}> extends Resizer {
       ...rest,
       drivers: withFrameworkDatabase(drivers),
       logger: logger ?? appLogger,
-      // The app logger decides whether debug lines are kept, so the default writes them.
+      // The app logger decides whether debug lines are kept, so the default writes them. Only an
+      // option left out takes it: any other value, null included, goes to the core's check.
       metrics:
-        rest.metrics ?? new LogMetrics(logger ?? appLogger, { debug: true }),
+        rest.metrics === undefined
+          ? new LogMetrics(logger ?? appLogger, { debug: true })
+          : rest.metrics,
       events: events ?? appEvents,
       // One queue set per process, built with the app logger, never one Resizer's. It is built
       // with the database parts of the first Resizer that needs it; FrameworkDatabase builds the

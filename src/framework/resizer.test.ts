@@ -147,6 +147,20 @@ test('the default metrics of a FrameworkResizer write debug lines through the ap
   assert.equal(new FrameworkResizer({ storage, metrics: sink }).metrics, sink);
 });
 
+test('a FrameworkResizer rejects metrics: null as new Resizer does; only undefined means the default', () => {
+  installApp();
+  assert.throws(
+    () => new FrameworkResizer({ storage, metrics: null as never }),
+    (e: unknown) =>
+      e instanceof ResizeSetupError &&
+      e.code === 'RESIZE_METRICS_INVALID' &&
+      e.retryable === false,
+  );
+  // The name stays free, and an undefined option is the default.
+  const r = new FrameworkResizer({ storage, metrics: undefined });
+  assert.ok(r.metrics instanceof LogMetrics);
+});
+
 test('storage comes from the config file: local', async () => {
   installApp({
     resize: makeResizeConfig({
