@@ -132,7 +132,9 @@ export interface ReadyEntry {
   contentType: string; // preview.contentType
   /**
    * Set only when the stored preview is stale: made from another original, or with other image
-   * settings or pipeline version. It is still served, and its replacement is queued.
+   * settings or pipeline version, or it cannot be proven fresh (written before previews recorded
+   * their signatures, or its media has no stored dimensions or no original). It is still served,
+   * and its replacement is requested like a missing variant (see `ReadDecision.stale`).
    */
   stale?: true;
 }
@@ -141,8 +143,10 @@ export interface ReadDecision {
   ready: ReadyEntry[];
   missing: MissingPreview[];
   /**
-   * The variants queued to replace a stale stored preview (after `beforeEnqueue`), apart from
-   * `missing`. Set only when there is one, so a fresh decision has no `stale` key.
+   * The variants that replace a stale stored preview (after `beforeEnqueue`), apart from
+   * `missing`. Like `missing`, they are requested, and queued only when the read queues (not
+   * with `enqueueMissing: false`, without an original, or without a usable task queue). Set only
+   * when there is one, so a fresh decision has no `stale` key.
    */
   stale?: MissingPreview[];
 }

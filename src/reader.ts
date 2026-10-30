@@ -315,7 +315,7 @@ export class Reader {
   }
 
   /**
-   * Queue the variants a read found missing, and say what became of them. By default a Resizer
+   * Queue the variants a read found missing or stale, and say what became of them. By default a Resizer
    * with a task queue (so a Dispatcher) queues them; one without serves what is stored, and warns
    * once only when the caller asked to queue. A task queue that cannot be used queues nothing; the
    * Resizer logged why when it started.
@@ -340,7 +340,7 @@ export class Reader {
       if (opts.enqueueMissing === true && !this.#loggedEagerOnly) {
         this.#loggedEagerOnly = true;
         logger.warn(
-          'resize resolve: missing previews but no task queue is configured — they stay placeholders (eager-only host? give the Resizer `tasks` for lazy mode; logged once)',
+          'resize resolve: missing or stale previews but no task queue is configured — missing ones stay placeholders and stale ones are not replaced (eager-only host? give the Resizer `tasks` for lazy mode; logged once)',
         );
       }
       return 'eager-only';
@@ -406,14 +406,14 @@ export class Reader {
 
   /**
    * Pre-warm the catalog at UPLOAD: queue every missing or stale variant (only a fresh stored
-   * preview is ready) without blocking on image work, and report each requested variant (ready / accepted / not required / unconfirmed, with task
-   * receipts and issues): every missing identity is either confirmed by a task receipt or
-   * explicit. A task already in flight for the media, pipeline and queue confirms only the
-   * variants it holds (the queue's findActive() reports them); a held gate lock never counts as
-   * queued. Uses
-   * the read path's `resolveSizes` / `beforeEnqueue` waterfalls. NEVER throws: an upload
-   * must not fail because pre-warming hiccuped, so an unexpected error becomes
-   * `status: 'incomplete'` with a RESIZE_ENQUEUE_INTERNAL_ERROR issue.
+   * preview is ready) without blocking on image work, and report each requested variant (ready /
+   * accepted / not required / unconfirmed, with task receipts and issues): every missing or stale
+   * identity is either confirmed by a task receipt or explicit. A task already in flight for the
+   * media, pipeline and queue confirms only the variants it holds (the queue's findActive()
+   * reports them); a held gate lock never counts as queued. Uses the read path's `resolveSizes` /
+   * `beforeEnqueue` waterfalls. NEVER throws: an upload must not fail because pre-warming
+   * hiccuped, so an unexpected error becomes `status: 'incomplete'` with a
+   * RESIZE_ENQUEUE_INTERNAL_ERROR issue.
    */
   async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
     const { catalog, dispatcher, hooks, pipelines, logger, name } = this.#deps;

@@ -561,6 +561,16 @@ describe('resolve — partitioning', () => {
 
     assert.equal(decision.ready.length, 1);
     assert.equal(decision.ready[0].url, 'https://cdn/cached.jpg');
+    // Without an original no row can be proven fresh: it is served stale, and nothing is queued.
+    assert.equal(decision.ready[0].stale, true);
+    assert.deepEqual(decision.stale, [
+      {
+        sizeKey: '300x300',
+        format: 'jpeg',
+        requestedWidth: 300,
+        requestedHeight: 300,
+      },
+    ]);
     assert.deepEqual(decision.missing, [
       {
         sizeKey: '300x300',
@@ -2326,11 +2336,41 @@ describe('freshness on the read path', () => {
     assert.deepEqual(decision.missing, []);
     assert.equal(tasks.rows.length, 0);
     assert.equal(named('resize.read')[0].labels.outcome, 'suppressed');
+    // Counted before the hook: the read found it stale, whatever the tap kept.
+    assert.deepEqual(
+      named('resize.preview.stale').map((call) => call.value),
+      [1],
+    );
+    assert.equal(named('resize.read')[0].context.stale, 1);
+  });
+
+  test('a stale identity requested as two cells is served twice, queued once and counted once', async () => {
+    const { reader, tasks, named } = freshReader();
+    const media = stampFresh(seeded(), { config: otherConfig });
+    const { decision } = await reader.resolve({
+      media,
+      sizes: [...sizes, ...sizes],
+    });
+    assert.deepEqual(
+      decision.ready.map((entry) => [entry.url, entry.stale]),
+      [
+        ['https://cdn/p1', true],
+        ['https://cdn/p1', true],
+      ],
+    );
+    assert.deepEqual(decision.stale, [variant]);
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(tasks.rows[0].task.previews, [variant]);
+    assert.deepEqual(
+      named('resize.preview.stale').map((call) => call.value),
+      [1],
+    );
+    assert.equal(named('resize.read')[0].context.stale, 1);
   });
 
   test('a stale cell whose publicUrl throws is not served but is queued', async () => {
     const errors: unknown[][] = [];
-    const { reader, tasks } = freshReader({
+    const { reader, tasks, named } = freshReader({
       logger: {
         info() {},
         warn() {},
@@ -2354,6 +2394,13 @@ describe('freshness on the read path', () => {
     assert.equal(tasks.rows.length, 1);
     assert.equal(errors.length, 1);
     assert.match(String(errors[0][0]), /publicUrl failed/);
+    // Counted though not served: its replacement is queued.
+    assert.deepEqual(
+      named('resize.preview.stale').map((call) => call.value),
+      [1],
+    );
+    assert.equal(named('resize.read')[0].context.stale, 1);
+    assert.equal(named('resize.read')[0].context.ready, 0);
   });
 
   test('an unregistered pipeline serves its stored rows unmarked and queues nothing', async () => {
