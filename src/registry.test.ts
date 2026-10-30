@@ -52,19 +52,50 @@ test('list() returns every item in registration order', () => {
   assert.deepEqual(registry.list(), [a, b]);
 });
 
-test('reset() forgets every item and runs every onReset hook', () => {
+test('shared() builds once per key and hands every caller the same promise', async () => {
   const registry = new Registry<{ name: string }>();
-  const order: string[] = [];
-  registry.onReset(() => {
-    order.push(`first, ${registry.list().length} left`);
-  });
-  registry.onReset(() => {
-    order.push('second');
-  });
+  let builds = 0;
+  const part = {};
+  const build = async () => {
+    builds += 1;
+    return part;
+  };
+  const first = registry.shared('k', build);
+  const second = registry.shared('k', build);
+  assert.equal(first, second);
+  assert.equal(await first, part);
+  assert.equal(await second, part);
+  assert.equal(builds, 1);
+});
+
+test('a rejected shared build is forgotten, so the next call builds again', async () => {
+  const registry = new Registry<{ name: string }>();
+  let builds = 0;
+  const build = async () => {
+    builds += 1;
+    if (builds === 1) {
+      throw new Error('the first build fails');
+    }
+    return builds;
+  };
+  await assert.rejects(registry.shared('k', build), /the first build fails/);
+  assert.equal(await registry.shared('k', build), 2);
+  assert.equal(await registry.shared('k', build), 2);
+  assert.equal(builds, 2);
+});
+
+test('reset() forgets every item and shared part', async () => {
+  const registry = new Registry<{ name: string }>();
+  let builds = 0;
+  const build = async () => {
+    builds += 1;
+    return builds;
+  };
   registry.register({ name: 'a' });
+  assert.equal(await registry.shared('k', build), 1);
   registry.reset();
   assert.deepEqual(registry.list(), []);
-  assert.deepEqual(order, ['first, 0 left', 'second']);
+  assert.equal(await registry.shared('k', build), 2);
   // A forgotten name can be registered again.
   const again = { name: 'a' };
   registry.register(again);

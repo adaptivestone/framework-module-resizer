@@ -16,10 +16,10 @@ import { FrameworkResizer } from './framework/resizer.ts';
 import {
   getResizer,
   listResizers,
-  onResetResizerForTests,
   Resizer,
   type ResizerOptions,
   resetResizerForTests,
+  sharedPart,
   taskCoordinationOf,
 } from './resizer.ts';
 import {
@@ -1225,22 +1225,16 @@ describe('Resizer registry', () => {
     assert.throws(() => getResizer('listings'), /no Resizer named 'listings'/);
   });
 
-  test('resetResizerForTests() runs every onResetResizerForTests hook', () => {
-    // A hook cannot be removed, so it counts only while this test runs: every later reset (each
-    // afterEach) leaves it a no-op.
-    let active = true;
-    let resets = 0;
-    onResetResizerForTests(() => {
-      if (active) {
-        resets += 1;
-      }
-    });
-    try {
-      resetResizerForTests();
-    } finally {
-      active = false;
-    }
-    assert.equal(resets, 1);
+  test('resetResizerForTests() forgets the shared parts', async () => {
+    let builds = 0;
+    const build = async () => {
+      builds += 1;
+      return builds;
+    };
+    assert.equal(await sharedPart('k', build), 1);
+    assert.equal(await sharedPart('k', build), 1);
+    resetResizerForTests();
+    assert.equal(await sharedPart('k', build), 2);
   });
 });
 

@@ -5,7 +5,7 @@
 // of its own backend: a call that names a queue on another backend is refused by the core.
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { MongoTaskQueue } from '../drivers/mongo/taskQueue.ts';
-import { onResetResizerForTests } from '../resizer.ts';
+import { sharedPart } from '../resizer.ts';
 import type {
   QueueConfig,
   QueueTimingOptions,
@@ -38,42 +38,20 @@ export function backendKey(section: QueueConfig): string {
   return `sqs:${JSON.stringify([region ?? null, endpoint ?? null, deadLetterQueueUrl ?? null, waitTimeSeconds ?? SQS_DEFAULT_WAIT_TIME_SECONDS])}`;
 }
 
-// The task queue of each backend, per app. A build that failed is forgotten, so the next call
-// retries it.
-let built = new WeakMap<object, Map<string, Promise<TaskQueue>>>();
-
-onResetResizerForTests(() => {
-  built = new WeakMap();
-});
-
 /**
- * The task queue of `queue`'s backend, built once per process (per app) for every name on that
- * backend, each with its own timing from `processConfig`. The SQS driver is imported only when an
- * SQS backend is built (RESIZE_PEER_MISSING when @aws-sdk/client-sqs is not installed).
+ * The task queue of `queue`'s backend, built once per process for every name on that backend, each
+ * with its own timing from `processConfig`. It is kept in the process registry, so
+ * resetResizerForTests() forgets it with the Resizers, and a build that failed is built again on
+ * the next call. The SQS driver is imported only when an SQS backend is built (RESIZE_PEER_MISSING
+ * when @aws-sdk/client-sqs is not installed).
  */
 export function taskQueueOf(
   queue: ResolvedQueue,
   processConfig: ResolvedProcessConfig,
 ): Promise<TaskQueue> {
-  const app = getApp();
-  let byBackend = built.get(app);
-  if (!byBackend) {
-    byBackend = new Map();
-    built.set(app, byBackend);
-  }
-  const queues = byBackend;
-  const existing = queues.get(queue.backend);
-  if (existing) {
-    return existing;
-  }
-  const building = buildTaskQueue(queue, processConfig);
-  queues.set(queue.backend, building);
-  building.catch(() => {
-    if (queues.get(queue.backend) === building) {
-      queues.delete(queue.backend);
-    }
-  });
-  return building;
+  return sharedPart(`framework:queue:${queue.backend}`, () =>
+    buildTaskQueue(queue, processConfig),
+  );
 }
 
 async function buildTaskQueue(

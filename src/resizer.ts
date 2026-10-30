@@ -695,14 +695,20 @@ export function taskCoordinationOf(resizer: Resizer): TaskCoordination {
 }
 
 /**
- * Run `reset` on every resetResizerForTests(): for per-process state an adapter keeps beside the
- * registry (the framework adapter's shared task queues).
+ * The part shared in this process under `key` (e.g. the framework adapter's task queue of one
+ * backend): built once by `build`, forgotten with the Resizers by resetResizerForTests(). A build
+ * that rejects is built again on the next call. Internal: the main entry does not export it, and
+ * it may change in any release.
+ * @internal
  */
-export function onResetResizerForTests(reset: () => void): void {
-  registry.onReset(reset);
+export function sharedPart<V>(
+  key: string,
+  build: () => Promise<V>,
+): Promise<V> {
+  return registry.shared(key, build);
 }
 
-/** TEST-ONLY: forget every constructed Resizer so a test can construct fresh ones. */
+/** TEST-ONLY: forget every constructed Resizer and shared part so a test can construct fresh ones. */
 export function resetResizerForTests(): void {
   registry.reset();
 }
