@@ -180,7 +180,7 @@ async function carriersOf(
  * The queue names a worker consumes, each once, in the order given: one name or a list of them;
  * default 'default'. An empty list, or a name that is not a non-empty string, is
  * RESIZE_QUEUE_INVALID, so a typo in the list is never consumed as a name of its own. The message
- * shows the value with inspect(), which formats any value (JSON.stringify throws on a bigint).
+ * shows the value (see shownValue).
  */
 function queueNamesOf(queue: string | readonly string[] | undefined): string[] {
   const names = typeof queue === 'string' ? [queue] : (queue ?? ['default']);
@@ -193,12 +193,24 @@ function queueNamesOf(queue: string | readonly string[] | undefined): string[] {
   for (const name of names) {
     if (typeof name !== 'string' || name.trim().length === 0) {
       throw new ResizeSetupError(
-        `resize worker: every queue name must be a non-empty string (got ${inspect(name)})`,
+        `resize worker: every queue name must be a non-empty string (got ${shownValue(name)})`,
         { code: 'RESIZE_QUEUE_INVALID' },
       );
     }
   }
   return [...new Set<string>(names)];
+}
+
+/**
+ * A host value as an error message shows it, never throwing: inspect() without the value's own
+ * inspector (JSON.stringify throws on a bigint, a host inspector may throw), else its type.
+ */
+function shownValue(value: unknown): string {
+  try {
+    return inspect(value, { customInspect: false });
+  } catch {
+    return `a value of type ${typeof value}`;
+  }
 }
 
 export interface RunWorkerOptions {

@@ -6,7 +6,6 @@
 // on a task queue that filters claims, and runs each task with its own Resizer's coordination.
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
-import { inspect } from 'node:util';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
 import type {
@@ -1839,7 +1838,10 @@ describe('a worker for several queues', () => {
   test('an empty queue list, or a blank name in it, is RESIZE_QUEUE_INVALID', async () => {
     const memory = new MemoryTaskQueue({ timing: fast });
     const resizer = queuedResizer('default', memory);
-    for (const queue of [
+    const fail = () => {
+      throw new Error('not formattable');
+    };
+    const cases = [
       [],
       ['default', ''],
       ['  '],
@@ -1847,7 +1849,25 @@ describe('a worker for several queues', () => {
       ['default', 42],
       [1n],
       [Object.create(null)],
-    ]) {
+      // A host value whose own inspector throws: it is never called.
+      [{ [Symbol.for('nodejs.util.inspect.custom')]: fail }],
+      // A value that even inspect() cannot read (a prototype whose every trap throws).
+      [
+        Object.create(
+          new Proxy(
+            {},
+            {
+              get: fail,
+              getOwnPropertyDescriptor: fail,
+              getPrototypeOf: fail,
+              has: fail,
+              ownKeys: fail,
+            },
+          ),
+        ),
+      ],
+    ];
+    for (const [index, queue] of cases.entries()) {
       await assert.rejects(
         () =>
           runWorker({
@@ -1859,7 +1879,7 @@ describe('a worker for several queues', () => {
         (err: unknown) =>
           err instanceof ResizeSetupError &&
           err.code === 'RESIZE_QUEUE_INVALID',
-        inspect(queue),
+        `case ${index}`,
       );
     }
     assert.deepEqual(memory.claims, []);
