@@ -191,11 +191,29 @@ interface LoadedSource {
   info: SourceInfo;
 }
 
+/**
+ * A deep copy of a storage locator, so a locator the host changes in place does not change it. A
+ * Mongoose sub-document is copied through its plain form (`toObject()`).
+ */
+function copyLocator(ref: StorageRef): StorageRef {
+  const plain =
+    typeof (ref as { toObject?: unknown } | null)?.toObject === 'function'
+      ? (ref as { toObject(): unknown }).toObject()
+      : ref;
+  try {
+    return structuredClone(plain);
+  } catch {
+    // A locator structuredClone cannot copy (one holding a function, say) is kept as it is: the
+    // render then reads it live, as it did before it was copied.
+    return plain;
+  }
+}
+
 /** A copy of what a render reads of the original: its locator, stored format and dimensions. */
 function snapshotOriginal(original: Original): Original {
-  const { storageRef, format, width, height } = original;
+  const { format, width, height } = original;
   return {
-    storageRef,
+    storageRef: copyLocator(original.storageRef),
     ...(format === undefined ? {} : { format }),
     ...(width === undefined ? {} : { width }),
     ...(height === undefined ? {} : { height }),
@@ -894,19 +912,23 @@ export class Processor {
       requireReplacePreviews(this.#deps.media);
     }
 
-    // The steps and the signature each row records, taken together before any pixel work: a
-    // pipeline version, step set or encode setting changed while the variants render or upload
-    // must not be credited to pixels made before it, or the row would read fresh for good.
+    // The settings, the steps and the signature each row records, taken together before any pixel
+    // work, with no await between them: the render uses only these, so a pipeline version, step
+    // set or image setting changed while it runs (even changed and changed back) never makes a row
+    // signed with one set of settings out of pixels made with another. The settings are plain
+    // data; the steps are kept by reference, their lists copied.
+    const settings = structuredClone(config);
+    const { limits: renderLimits } = settings;
     const pipeline = pipelines.get(pipelineName);
-    const beforeSteps = pipeline.beforeSteps ?? [];
-    const variantSteps = pipeline.variantSteps ?? [];
+    const beforeSteps = [...(pipeline.beforeSteps ?? [])];
+    const variantSteps = [...(pipeline.variantSteps ?? [])];
     const encodeSigs = new Map(
       pending.map((v) => [
         catalog.identity(scope, v),
         catalog.encodeSig(pipelineName, v.format, v.fit === true),
       ]),
     );
-    const rules = planRules(config, scope, pipeline);
+    const rules = planRules(settings, scope, { beforeSteps, variantSteps });
     let plans = planVariants(info, pending, rules);
 
     // ONE decode per task, at the largest box the plan needs; with beforeSteps at least the
@@ -915,10 +937,10 @@ export class Processor {
       source,
       decodeBox(info, plans, { atLeastOwnSize: beforeSteps.length > 0 }),
       {
-        limits,
+        limits: renderLimits,
         signal,
         source: info,
-        frames: framesToDecode(info, plans, limits),
+        frames: framesToDecode(info, plans, renderLimits),
       },
       mediaId,
     );
@@ -934,7 +956,7 @@ export class Processor {
         raster,
         beforeSteps,
         { media, source: info, ctx },
-        limits,
+        renderLimits,
       );
       // While the steps run, runBeforeSteps holds the only reference to the decoded raster, so
       // it is freed as soon as the first step resolves.
@@ -944,7 +966,10 @@ export class Processor {
       // the full-size step result is freed once reduceToBox below has replaced it.
       stepping = undefined;
       const { width, height } = raster.info;
-      if (width * height > Math.min(limits.sourcePixels, limits.inputPixels)) {
+      if (
+        width * height >
+        Math.min(renderLimits.sourcePixels, renderLimits.inputPixels)
+      ) {
         throw new ResizeMediaError(
           `resize: processed source exceeds pixel limits for media ${mediaId}`,
           { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
@@ -967,19 +992,19 @@ export class Processor {
       raster = await reduceToBox(
         raster,
         decodeBox(planned, plans, { atLeastOwnSize: false }),
-        limits,
+        renderLimits,
       );
     }
 
     // From here only `sized` holds the raster; it is cleared once the variants are done, so the
     // persist and the observers below do not keep the pixels alive.
-    const sized = new SizedRasters(raster, plans, limits);
+    const sized = new SizedRasters(raster, plans, renderLimits);
     raster = undefined;
     const encodeOptions = {
       variantSteps,
       ctx,
-      encode: config.encode,
-      limits,
+      encode: settings.encode,
+      limits: renderLimits,
     };
     // Each variant's stored row, by plan; read back in request order after the pool.
     const rows = new Map<VariantPlan, Preview>();
@@ -1049,7 +1074,7 @@ export class Processor {
     // ones if the lease was lost (best-effort — correctness holds via the fencing token).
     await runBounded(
       groupBySize(plans),
-      config.concurrency,
+      settings.concurrency,
       signal,
       renderVariant,
     );

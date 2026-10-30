@@ -772,3 +772,97 @@ test('a store that drops `fit` from the rows it stores: the fit row is fresh aft
   assert.equal(again.decision.ready[0].stale, undefined);
   assert.equal(w.tasks.rows.length, 1);
 });
+
+test('settings flipped and restored while a render runs: the preview is made with the settings it is signed with', async () => {
+  const w = world();
+  // jpeg is flattened on white by default.
+  const config = makeImageConfig({ formats: ['jpeg'] });
+  const variantCalls: string[] = [];
+  const pipeline: Pipeline = {
+    beforeSteps: [
+      async (raster) => {
+        // Another deploy's settings land while the render is under way.
+        config.encode.flatten.background = '#000000';
+        pipeline.variantSteps?.push(async (img) => {
+          variantCalls.push('added');
+          return img;
+        });
+        return raster;
+      },
+    ],
+    variantSteps: [],
+  };
+  const r = w.resizer(config, undefined, { default: pipeline });
+  const transparent = await sharp({
+    create: {
+      width: 64,
+      height: 64,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .png()
+    .toBuffer();
+  const original = await r.uploadOriginal({
+    body: transparent,
+    visibility: 'private',
+  });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+
+  await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['jpeg'],
+  });
+  // ...and the old settings come back.
+  config.encode.flatten.background = '#ffffff';
+  const [row] = rowsOf(doc, 'default:default:20x20:jpeg:none');
+  const file = w.files.get(keyOf(row));
+  assert.ok(file);
+  const { data } = await sharp(file)
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  assert.ok(data[0] > 200, `flattened on white, got ${data[0]}`);
+  // The step added mid-render did not run: the render keeps the step set it started with.
+  assert.deepEqual(variantCalls, []);
+  const { decision } = await r.resolve({
+    media: doc,
+    sizes: cell,
+    formats: ['jpeg'],
+  });
+  assert.equal(decision.ready[0].stale, undefined);
+});
+
+test('the original locator changed in place while it downloads: the row records the old one, so the next read regenerates it', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const oldRef = structuredClone(red.storageRef);
+  const doc: MediaLike = { id: 'm1', original: red, previews: [] };
+  w.docs.set('m1', doc);
+  const media = structuredClone(doc);
+  const download = w.storage.download;
+  w.storage.download = async (ref) => {
+    const bytes = await download(ref);
+    // The host rewrites the locator's key in place while the old bytes are being read.
+    for (const m of [media, doc]) {
+      (m.original?.storageRef as { key: string }).key = 'originals/other.png';
+    }
+    return bytes;
+  };
+  const parents: unknown[] = [];
+  const upload = w.storage.upload;
+  w.storage.upload = async (args) => {
+    parents.push(structuredClone(args.parentRef));
+    return upload(args);
+  };
+
+  await r.generate({ media, sizes: cell, formats: ['webp'] });
+  const [row] = rowsOf(doc);
+  assert.equal(row.origin, previewOrigin(oldRef, { width: 64, height: 64 }));
+  assert.deepEqual(parents, [oldRef]);
+  w.storage.download = download;
+  const { decision } = await w.read(r, doc);
+  assert.equal(decision.ready[0].stale, true);
+});
