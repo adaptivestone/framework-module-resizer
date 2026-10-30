@@ -340,7 +340,9 @@ export function configuredOptions(
     mergeImageConfig(own.image) as ResizeConfig;
   return {
     ...rest,
-    config: source.eager ? imageOf(source.own()) : () => imageOf(readOwn()),
+    // A config read at construction has its storage driver checked then too, even when the
+    // storage is given in code.
+    config: source.eager ? imageOf(readOwn()) : () => imageOf(readOwn()),
     storage:
       storage ??
       (() =>

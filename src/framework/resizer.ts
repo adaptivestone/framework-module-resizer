@@ -29,7 +29,12 @@ import {
   type ConfigSource as FactorySource,
   type ProcessSections,
 } from '../factory/createResizer.ts';
-import { Resizer, type ResizerOptions, sharedValue } from '../resizer.ts';
+import {
+  Resizer,
+  type ResizerOptions,
+  recordedValue,
+  sharedValue,
+} from '../resizer.ts';
 import type {
   CoordinationOptions,
   FrameworkResizeConfig,
@@ -120,9 +125,12 @@ export class FrameworkResizer<D extends DriverRegistry = {}> extends Resizer {
       queueLogger: appLogger,
     });
     // After the drivers are checked and before the name is taken: the shared queue set is built
-    // with the first Resizer's queue drivers, so every Resizer must name the same ones.
-    checkQueueDrivers(rest.name ?? 'default', drivers);
+    // with the first Resizer's queue drivers, so every Resizer must name the same ones. They are
+    // recorded only once this construction succeeds, as they are now.
+    const queueDrivers = queueDriversOf(drivers);
+    checkQueueDrivers(rest.name ?? 'default', queueDrivers);
     super(options);
+    sharedValue(QUEUE_DRIVERS_KEY, queueDrivers);
   }
 }
 
@@ -197,13 +205,26 @@ function withFrameworkDatabase(drivers: unknown): DriverRegistry {
 }
 
 /**
- * Record the queue drivers of the first FrameworkResizer in the process and compare a later
- * Resizer's with them, name by name and by driver identity: a difference is
- * RESIZE_DRIVER_CONFLICT, whichever Resizer came first.
+ * The `drivers.queue` map as passed now: a shallow copy, so a host that changes its object later
+ * changes nothing that is compared.
  */
-function checkQueueDrivers(resizer: string, drivers: unknown): void {
-  const own = isRecord(drivers) && isRecord(drivers.queue) ? drivers.queue : {};
-  const first = sharedValue<Record<string, unknown>>(QUEUE_DRIVERS_KEY, own);
+function queueDriversOf(drivers: unknown): Record<string, unknown> {
+  return isRecord(drivers) && isRecord(drivers.queue)
+    ? { ...drivers.queue }
+    : {};
+}
+
+/**
+ * Compare a Resizer's queue drivers with those recorded by the first FrameworkResizer constructed
+ * in the process (none yet: nothing to compare), name by name and by driver identity: a
+ * difference is RESIZE_DRIVER_CONFLICT, whichever Resizer came first.
+ */
+function checkQueueDrivers(
+  resizer: string,
+  own: Record<string, unknown>,
+): void {
+  const first =
+    recordedValue<Record<string, unknown>>(QUEUE_DRIVERS_KEY) ?? own;
   const names = new Set([...Object.keys(first), ...Object.keys(own)]);
   const differs = [...names].find((name) => first[name] !== own[name]);
   if (differs !== undefined) {

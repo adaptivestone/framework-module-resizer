@@ -102,11 +102,13 @@ test('reset() forgets every item and shared part', async () => {
   assert.equal(registry.get('a'), again);
 });
 
-test('sharedValue() records the first value per key and returns it; reset() forgets it', () => {
+test('sharedValue() records the first value per key and returns it; recordedValue() reads it without recording; reset() forgets it', () => {
   const registry = new Registry<{ name: string }>();
   const first = { kind: 'first' };
   const second = { kind: 'second' };
+  assert.equal(registry.recordedValue('k'), undefined);
   assert.equal(registry.sharedValue('k', first), first);
+  assert.equal(registry.recordedValue('k'), first);
   assert.equal(registry.sharedValue('k', second), first);
   assert.equal(registry.sharedValue('other', second), second);
   registry.reset();

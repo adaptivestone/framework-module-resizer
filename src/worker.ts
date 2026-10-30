@@ -13,6 +13,7 @@
 // The work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
+import { inspect } from 'node:util';
 import sharp from 'sharp';
 import { Consumer } from './consumer.ts';
 import type {
@@ -178,7 +179,8 @@ async function carriersOf(
 /**
  * The queue names a worker consumes, each once, in the order given: one name or a list of them;
  * default 'default'. An empty list, or a name that is not a non-empty string, is
- * RESIZE_QUEUE_INVALID, so a typo in the list is never consumed as a name of its own.
+ * RESIZE_QUEUE_INVALID, so a typo in the list is never consumed as a name of its own. The message
+ * shows the value with inspect(), which formats any value (JSON.stringify throws on a bigint).
  */
 function queueNamesOf(queue: string | readonly string[] | undefined): string[] {
   const names = typeof queue === 'string' ? [queue] : (queue ?? ['default']);
@@ -191,7 +193,7 @@ function queueNamesOf(queue: string | readonly string[] | undefined): string[] {
   for (const name of names) {
     if (typeof name !== 'string' || name.trim().length === 0) {
       throw new ResizeSetupError(
-        `resize worker: every queue name must be a non-empty string (got ${JSON.stringify(name)})`,
+        `resize worker: every queue name must be a non-empty string (got ${inspect(name)})`,
         { code: 'RESIZE_QUEUE_INVALID' },
       );
     }

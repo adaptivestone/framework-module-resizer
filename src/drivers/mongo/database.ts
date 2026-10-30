@@ -43,14 +43,21 @@ export class MongoDatabase {
         'a Mongoose connection (with a model() function)',
       );
     }
+    // What the media store calls: anything else would fail on first use with a TypeError.
+    const model = mediaModel as {
+      findById?: unknown;
+      findOneAndUpdate?: unknown;
+    } | null;
     if (
-      mediaModel === null ||
-      (typeof mediaModel !== 'object' && typeof mediaModel !== 'function')
+      model === null ||
+      (typeof model !== 'object' && typeof model !== 'function') ||
+      typeof model.findById !== 'function' ||
+      typeof model.findOneAndUpdate !== 'function'
     ) {
       throw invalidConfigValue(
         'database.mediaModel',
         ctx.where,
-        'the host media model (an object or function)',
+        'the host media model (with findById() and findOneAndUpdate() functions)',
       );
     }
     const media = mediaModel as MongoMediaModel;

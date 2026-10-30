@@ -73,6 +73,11 @@ export class Registry<T extends { readonly name: string }> {
     return this.#values.get(key) as V;
   }
 
+  /** The value recorded under `key` by sharedValue(), if any; records nothing. */
+  recordedValue<V>(key: string): V | undefined {
+    return this.#values.get(key) as V | undefined;
+  }
+
   /** Forget every item, every shared part and every shared value. */
   reset(): void {
     this.#items.clear();

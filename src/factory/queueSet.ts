@@ -62,7 +62,8 @@ export function planQueueSet(
       typeof driver.backendOf === 'function'
         ? driver.backendOf(entry.section)
         : '';
-    const key = `${driverName}:${backend}`;
+    // A tuple, so no driver name and backend pair reads as another ('a' + 'b:c' vs 'a:b' + 'c').
+    const key = JSON.stringify([driverName, backend]);
     const group = backends.get(key);
     if (group) {
       group.entries.push(entry);
@@ -117,7 +118,8 @@ export function planQueueSet(
 
 /** A RoutingTaskQueue over the backends: each name to its backend's builder, with its timing. */
 function routerOf(backends: Backend[], ctx: QueueSetContext): TaskQueue {
-  const routes: Record<string, () => Promise<TaskQueue>> = {};
+  // No prototype, so a queue named '__proto__' is a route like any other.
+  const routes: Record<string, () => Promise<TaskQueue>> = Object.create(null);
   const timing = new Map<string, QueueEntry['timing']>();
   for (const backend of backends) {
     const build = () => buildBackend(backend, ctx);

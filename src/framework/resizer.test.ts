@@ -1353,6 +1353,28 @@ test('a custom storage driver named in the config file', async () => {
   );
 });
 
+test('an unregistered storage driver in the `config` option throws at construction, as in rc.2, even with every part in code', () => {
+  installApp();
+  const config = makeResizeConfig({ storage: { driver: 'gcs' } as never });
+  const unregistered = configError(
+    'RESIZE_CONFIG_INVALID',
+    "resize config: `storage` in the config passed to new FrameworkResizer() needs driver 'local' or 's3'",
+  );
+  assert.throws(() => new FrameworkResizer({ config }), unregistered);
+  assert.throws(
+    () =>
+      new FrameworkResizer({
+        config,
+        storage,
+        tasks: new MemoryTaskQueue(),
+        queueName: 'default',
+      }),
+    unregistered,
+  );
+  // The name stays free.
+  assert.equal(new FrameworkResizer({ storage }).name, 'default');
+});
+
 test('a partial config file is merged over the package defaults; a complete one reaches the Resizer with the same objects', async () => {
   const complete = makeResizeConfig({ storage: localStorage });
   installApp({
@@ -1496,5 +1518,28 @@ test('two FrameworkResizers share one queue set built with the app logger; a dif
   assert.throws(
     () => new FrameworkResizer({ name: 'd', drivers: { queue: { sqs } } }),
     conflict('sqs'),
+  );
+});
+
+test('the queue drivers are recorded only by a construction that succeeds, as they were passed then', () => {
+  installApp();
+  const sqs = fakeQueueDriver();
+  // A construction that fails after the drivers are checked records nothing.
+  assert.throws(
+    () => new FrameworkResizer({ name: '', drivers: { queue: { sqs } } }),
+    (err: unknown) =>
+      err instanceof ResizeSetupError && err.code === 'RESIZE_NAME_INVALID',
+  );
+  assert.equal(new FrameworkResizer({ storage }).name, 'default');
+  resetResizerForTests();
+
+  // A host that changes its map object later changes nothing that is compared.
+  const queue: Record<string, unknown> = { sqs };
+  new FrameworkResizer({ drivers: { queue } as never });
+  queue.sqs = fakeQueueDriver();
+  queue.plain = fakeQueueDriver();
+  assert.equal(
+    new FrameworkResizer({ name: 'b', drivers: { queue: { sqs } } }).name,
+    'b',
   );
 });

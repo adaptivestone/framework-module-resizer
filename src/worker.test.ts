@@ -6,6 +6,7 @@
 // on a task queue that filters claims, and runs each task with its own Resizer's coordination.
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
+import { inspect } from 'node:util';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
 import type {
@@ -1838,7 +1839,15 @@ describe('a worker for several queues', () => {
   test('an empty queue list, or a blank name in it, is RESIZE_QUEUE_INVALID', async () => {
     const memory = new MemoryTaskQueue({ timing: fast });
     const resizer = queuedResizer('default', memory);
-    for (const queue of [[], ['default', ''], ['  '], '', ['default', 42]]) {
+    for (const queue of [
+      [],
+      ['default', ''],
+      ['  '],
+      '',
+      ['default', 42],
+      [1n],
+      [Object.create(null)],
+    ]) {
       await assert.rejects(
         () =>
           runWorker({
@@ -1850,7 +1859,7 @@ describe('a worker for several queues', () => {
         (err: unknown) =>
           err instanceof ResizeSetupError &&
           err.code === 'RESIZE_QUEUE_INVALID',
-        JSON.stringify(queue),
+        inspect(queue),
       );
     }
     assert.deepEqual(memory.claims, []);

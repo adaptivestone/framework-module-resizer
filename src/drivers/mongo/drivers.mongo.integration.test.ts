@@ -381,7 +381,7 @@ describe('MongoDatabase.fromConfig', () => {
     );
   });
 
-  test('MongoDatabase.fromConfig rejects a connection without model() and a missing mediaModel', () => {
+  test('MongoDatabase.fromConfig rejects a connection without model() and a mediaModel that is not a model', () => {
     const invalid = (key: string, what: string) => (err: unknown) =>
       err instanceof ResizeConfigError &&
       err.code === 'RESIZE_CONFIG_INVALID' &&
@@ -413,14 +413,26 @@ describe('MongoDatabase.fromConfig', () => {
         ),
       );
     }
-    for (const bad of [undefined, null, 'File', 3]) {
+    for (const bad of [
+      undefined,
+      null,
+      'File',
+      3,
+      {},
+      () => {},
+      { findById() {} },
+      { findOneAndUpdate() {} },
+    ]) {
       assert.throws(
         () =>
           MongoDatabase.fromConfig(
             { driver: 'mongo', connection, mediaModel: bad },
             ctx,
           ),
-        invalid('mediaModel', 'the host media model (an object or function)'),
+        invalid(
+          'mediaModel',
+          'the host media model (with findById() and findOneAndUpdate() functions)',
+        ),
       );
     }
   });

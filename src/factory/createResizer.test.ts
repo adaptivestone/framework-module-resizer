@@ -23,6 +23,7 @@ import {
   fakeMedia,
   fakeQueueDriver,
   MemoryTaskQueue,
+  memoryLocks,
   memoryStorage,
   memoryStorageDriver,
   PlainTaskQueue,
@@ -164,6 +165,67 @@ test('a custom queue driver registered by name: queues on two backends route, an
     queue: 'bulk',
   });
   assert.equal(plain.built.length, 1);
+});
+
+test('backends are told apart by driver and backend, whatever characters their names hold', async () => {
+  // Driver 'a' with backend 'b:c' and driver 'a:b' with backend 'c' are two backends.
+  const backendOf = (section: { backend?: unknown }) => String(section.backend);
+  const a = { ...fakeQueueDriver(), backendOf };
+  const ab = { ...fakeQueueDriver(), backendOf };
+  const resizer = createResizer(
+    {
+      storage: { driver: 'memory' },
+      queues: {
+        default: { driver: 'a', backend: 'b:c' },
+        bulk: { driver: 'a:b', backend: 'c' },
+      },
+    } as never,
+    {
+      drivers: {
+        storage: { memory: memoryStorageDriver() },
+        queue: { a, 'a:b': ab },
+      },
+      media: fakeMedia(),
+      locks: memoryLocks(),
+      logger: silentLogger,
+    },
+  );
+  await resizer.ready();
+  assert.ok(resizer.tasks instanceof RoutingTaskQueue);
+  assert.strictEqual(await carrierOf(resizer.tasks, 'default'), a.built[0]);
+  assert.strictEqual(await carrierOf(resizer.tasks, 'bulk'), ab.built[0]);
+  assert.equal(a.built.length, 1);
+  assert.equal(ab.built.length, 1);
+});
+
+test("a queue named '__proto__' routes like any other name", async () => {
+  const fake = fakeDatabaseDriver();
+  const plain = fakeQueueDriver();
+  const resizer = createResizer(
+    JSON.parse(
+      '{"storage":{"driver":"memory"},"database":{"driver":"fake"},"queues":{"default":{"driver":"database"},"__proto__":{"driver":"plain"}}}',
+    ),
+    {
+      drivers: {
+        storage: { memory: memoryStorageDriver() },
+        database: { fake },
+        queue: { plain },
+      },
+      logger: silentLogger,
+    },
+  );
+  await resizer.ready();
+  assert.ok(resizer.tasks instanceof RoutingTaskQueue);
+  assert.equal(resizer.tasks.servesQueue('__proto__'), true);
+  assert.equal(resizer.tasks.servesQueue('default'), true);
+  assert.strictEqual(
+    await carrierOf(resizer.tasks, '__proto__'),
+    plain.built[0],
+  );
+  assert.strictEqual(
+    await carrierOf(resizer.tasks, 'default'),
+    fake.built[0].built[0],
+  );
 });
 
 test("a database-only Resizer gets no lock store; a router gets the database parts' lock store", async () => {
@@ -437,22 +499,43 @@ test('lanes: no queue is default when queues exist; an unknown name is RESIZE_CO
 });
 
 test('an unregistered storage or queue driver is RESIZE_CONFIG_INVALID listing the registered names; resolve() still never throws', async () => {
+  const unregistered = fails(
+    ResizeConfigError,
+    'RESIZE_CONFIG_INVALID',
+    `resize config: \`storage\` in ${WHERE} needs driver 'local', 's3' or 'memory'`,
+  );
+  const drivers = { storage: { memory: memoryStorageDriver() } };
+  // A config object is checked at construction, even with every part given in code; the name
+  // stays free.
+  assert.throws(
+    () =>
+      createResizer(
+        { storage: { driver: 'gcs' } as never },
+        { drivers, media: fakeMedia(), logger: silentLogger },
+      ),
+    unregistered,
+  );
+  assert.throws(
+    () =>
+      createResizer(
+        { storage: { driver: 'gcs' } as never },
+        {
+          drivers,
+          storage: memoryStorage().storage,
+          media: fakeMedia(),
+          tasks: new MemoryTaskQueue(),
+          queueName: 'default',
+          logger: silentLogger,
+        },
+      ),
+    unregistered,
+  );
+  // A config function is read on first use.
   const resizer = createResizer(
-    { storage: { driver: 'gcs' } as never },
-    {
-      drivers: { storage: { memory: memoryStorageDriver() } },
-      media: fakeMedia(),
-      logger: silentLogger,
-    },
+    () => ({ storage: { driver: 'gcs' } as never }),
+    { drivers, media: fakeMedia(), logger: silentLogger },
   );
-  await assert.rejects(
-    resizer.ready(),
-    fails(
-      ResizeConfigError,
-      'RESIZE_CONFIG_INVALID',
-      `resize config: \`storage\` in ${WHERE} needs driver 'local', 's3' or 'memory'`,
-    ),
-  );
+  await assert.rejects(resizer.ready(), unregistered);
   const media: MediaLike = {
     id: 'm1',
     original: { storageRef: { key: 'k' }, format: 'png' },
@@ -817,7 +900,7 @@ test('configuredOptions: eagerDatabase gives media (and locks beside tasks in co
   };
   assert.strictEqual(await sharedPart('test:queues', notShared), a.tasks);
   assert.strictEqual(
-    await sharedPart('test:backend:plain:', notShared),
+    await sharedPart('test:backend:["plain",""]', notShared),
     plain.built[0],
   );
   // Without shareQueues, each Resizer keeps its own set.

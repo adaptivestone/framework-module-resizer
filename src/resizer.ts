@@ -844,6 +844,15 @@ export function sharedValue<V>(key: string, value: V): V {
 }
 
 /**
+ * The value sharedValue() recorded in this process under `key`, if any; records nothing, so a
+ * caller can compare its own value before it commits to recording it. Internal, like sharedValue.
+ * @internal
+ */
+export function recordedValue<V>(key: string): V | undefined {
+  return registry.recordedValue<V>(key);
+}
+
+/**
  * TEST-ONLY: forget every constructed Resizer, shared part and shared value so a test can construct
  * fresh ones. The framework adapter's task queues are such shared parts, kept per process: a test
  * that installs another fake app without calling this keeps the task queues built for the previous
