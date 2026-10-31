@@ -319,25 +319,34 @@ const IMAGE_SETTING_KEYS = [
 ] as const satisfies ReadonlyArray<keyof ResizeConfig>;
 
 /**
- * The config as one render reads it, taken now: a shallow copy whose image settings are deep
- * copies, so a setting changed in place while the render runs does not reach it. Any other key
- * (the config may carry host keys) is kept by reference, and a setting that cannot be copied (one
- * holding a function, say) is kept as it is.
+ * The config as one render reads it, taken now: an object whose prototype is the config, with a
+ * copy of each image setting as an own property, so a setting changed in place while the render
+ * runs does not reach it. Each setting is read through the config, so one the config inherits
+ * (`Object.create(defaults)`, a getter on a class) is copied too, and is copied as copyValue()
+ * copies a locator: plain objects and arrays key by key, every other value (a function a host
+ * keeps beside the settings, say) by reference. Any other key, own or inherited, is read through
+ * the prototype, as the config holds it.
  */
 function snapshotSettings(config: ResizeConfig): ResizeConfig {
-  const settings = { ...config };
-  const writable = settings as unknown as Record<string, unknown>;
+  const settings: Record<string, unknown> = Object.create(config);
+  const seen = new Map<object, unknown>();
   for (const key of IMAGE_SETTING_KEYS) {
-    if (!Object.hasOwn(settings, key)) {
+    let copy: unknown;
+    try {
+      copy = copyValue(config[key], seen);
+    } catch {
+      // Not copied (a getter that throws, say): the render reads it through the prototype, live,
+      // as it did before settings were copied.
       continue;
     }
-    try {
-      writable[key] = structuredClone(settings[key]);
-    } catch {
-      // Kept as it is: the render then reads it live, as it did before settings were copied.
-    }
+    Object.defineProperty(settings, key, {
+      value: copy,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
-  return settings;
+  return settings as unknown as ResizeConfig;
 }
 
 /**
@@ -1070,8 +1079,8 @@ export class Processor {
     // work, with no await between them: the render uses only these, so a pipeline version, step
     // set or image setting changed while it runs (even changed and changed back) never makes a row
     // signed with one set of settings out of pixels made with another. The image settings are
-    // plain data (other keys of the config are kept by reference); the steps are kept by
-    // reference, their lists copied.
+    // copied (other keys of the config, and values in a setting that are not plain data, are kept
+    // by reference); the steps are kept by reference, their lists copied.
     const settings = snapshotSettings(config);
     const { limits: renderLimits } = settings;
     const pipeline = pipelines.get(pipelineName);
