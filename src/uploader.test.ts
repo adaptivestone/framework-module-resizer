@@ -20,7 +20,7 @@ import {
 } from './errors.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
 import { resetResizerForTests } from './resizer.ts';
-import { MemoryTaskQueue } from './testHelpers/fakes.ts';
+import { MemoryTaskQueue, recordingMetrics } from './testHelpers/fakes.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -818,5 +818,79 @@ describe('uploadOriginal — typed failures', () => {
       visibility: 'private',
     });
     assert.equal(original.storageRef, 0);
+  });
+});
+
+describe('upload metrics', () => {
+  /** An Uploader with recording storage and a recording metrics sink. */
+  function measuredUploader() {
+    const { storage } = recordingStorage();
+    const metrics = recordingMetrics();
+    const uploader = new Uploader({
+      storage,
+      decoders: createDecoderSet(),
+      config: makeImageConfig(),
+      metrics,
+    });
+    return { uploader, metrics };
+  }
+
+  test('a stored upload records its time and its bytes', async () => {
+    const { uploader, metrics } = measuredUploader();
+    const body = await sharp({
+      create: {
+        width: 20,
+        height: 20,
+        channels: 3,
+        background: { r: 9, g: 9, b: 9 },
+      },
+    })
+      .png()
+      .toBuffer();
+    await uploader.upload({ body, visibility: 'private' });
+    assert.equal(metrics.calls.length, 2);
+    const [timing, bytes] = metrics.calls;
+    assert.deepEqual(
+      { kind: timing.kind, name: timing.name, labels: timing.labels },
+      {
+        kind: 'timing',
+        name: 'resize.upload',
+        labels: { outcome: 'stored', format: 'png' },
+      },
+    );
+    assert.ok(timing.value >= 0);
+    assert.deepEqual(
+      {
+        kind: bytes.kind,
+        name: bytes.name,
+        value: bytes.value,
+        labels: bytes.labels,
+      },
+      {
+        kind: 'count',
+        name: 'resize.upload.bytes',
+        value: body.length,
+        labels: { format: 'png' },
+      },
+    );
+  });
+
+  test('a rejected upload records its code and still throws', async () => {
+    const { uploader, metrics } = measuredUploader();
+    await assert.rejects(
+      () => uploader.upload({ body: Buffer.alloc(0), visibility: 'private' }),
+      { code: 'RESIZE_ORIGINAL_EMPTY' },
+    );
+    assert.equal(metrics.calls.length, 1);
+    const [timing] = metrics.calls;
+    assert.deepEqual(
+      { kind: timing.kind, name: timing.name, labels: timing.labels },
+      {
+        kind: 'timing',
+        name: 'resize.upload',
+        labels: { outcome: 'rejected', code: 'RESIZE_ORIGINAL_EMPTY' },
+      },
+    );
+    assert.ok(timing.value >= 0);
   });
 });

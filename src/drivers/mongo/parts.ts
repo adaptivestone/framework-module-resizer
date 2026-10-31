@@ -35,7 +35,10 @@ export function mongoParts(
       : {}),
   });
   return {
-    media: new MongoMediaStore({ model: opts.mediaModel }),
+    media: new MongoMediaStore({
+      model: opts.mediaModel,
+      ...(opts.logger ? { logger: opts.logger } : {}),
+    }),
     locks: new MongoLockStore({ model: ResizeLock }),
     tasks: new MongoTaskQueue({
       model: ResizeTask,

@@ -4,7 +4,7 @@
 // one write per call that removes and stores rows by identity together.
 import { MediaStore, type ReplacedPreviews } from '../../contracts/media.ts';
 import { ResizeSetupError } from '../../errors.ts';
-import type { MediaLike, Preview } from '../../types.d.ts';
+import type { MediaLike, Preview, ResizeLogger } from '../../types.d.ts';
 import { resolveModelOption } from './modelOption.ts';
 
 /** The `findOneAndUpdate` options the store passes (Mongoose query options). */
@@ -40,6 +40,7 @@ export interface MongoMediaStoreOptions {
   // The host media model, or a getter called on each use (for a model registered later).
   model?: MongoMediaModel;
   getModel?: () => MongoMediaModel | null | undefined;
+  logger?: ResizeLogger; // default: console
 }
 
 // Each append asks for the matched document's id only, not the whole media document.
@@ -94,7 +95,120 @@ function removedRows(
 // The part of a Mongoose schema verify() reads (types only: no mongoose import).
 interface SchemaLike {
   path(path: string): unknown;
+  pathType?(path: string): string;
   options: { strict?: unknown };
+}
+
+/** What keeps a strict `original` from storing the measured dimensions as numbers. */
+interface OriginalDims {
+  /** The dimensions it does not declare (`width`, `height`). */
+  missing: string[];
+  /** The dimensions it declares with a type that does not read back as a number, with that type. */
+  mistyped: Array<{ dim: string; type: string }>;
+  /** Whether its strict mode is `'throw'`: Mongoose rejects the update instead of dropping them. */
+  rejects: boolean;
+}
+
+// The schema types of a dimension that keep the backfilled number a JS number on read: Mixed keeps
+// it as given, and Int32 casts and reads back as a number (Double and Decimal128 read back as bson
+// objects on a document, which freshness cannot read).
+const NUMERIC_DIM_TYPES = new Set(['Number', 'Int32', 'Mixed']);
+
+/**
+ * How an `original` keeps the backfill `$set` of the measured dimensions from storing them as
+ * numbers: `original` declared as nested paths (the root schema's strict mode applies), or as a
+ * single sub-schema (its own strict mode applies). Unless that mode is `strict: false`, an
+ * undeclared dimension is dropped, or rejected under `strict: 'throw'`. Whatever the mode, a
+ * dimension declared with a type that does not read back as a number (NUMERIC_DIM_TYPES) is cast
+ * to it, or rejected when it cannot be cast. A Mixed `original`, one not declared, or a model
+ * without a schema gives nothing.
+ */
+function originalDims(model: MongoMediaModel): OriginalDims | undefined {
+  const schema = (model as { schema?: Partial<SchemaLike> }).schema;
+  if (typeof schema?.path !== 'function') {
+    return undefined;
+  }
+  let owner: Partial<SchemaLike>;
+  let prefix: string;
+  if (
+    typeof schema.pathType === 'function' &&
+    schema.pathType('original') === 'nested'
+  ) {
+    owner = schema;
+    prefix = 'original.';
+  } else {
+    const sub = (
+      schema.path('original') as { schema?: Partial<SchemaLike> } | undefined
+    )?.schema;
+    if (typeof sub?.path !== 'function') {
+      return undefined;
+    }
+    owner = sub;
+    prefix = '';
+  }
+  const strict = owner.options?.strict;
+  const found: OriginalDims = {
+    missing: [],
+    mistyped: [],
+    rejects: strict === 'throw',
+  };
+  for (const dim of ['width', 'height']) {
+    const path = owner.path?.(`${prefix}${dim}`) as
+      | { instance?: unknown }
+      | undefined;
+    if (!path) {
+      // A loose schema stores an undeclared dimension as given.
+      if (strict !== false) {
+        found.missing.push(dim);
+      }
+    } else if (
+      typeof path.instance === 'string' &&
+      !NUMERIC_DIM_TYPES.has(path.instance)
+    ) {
+      found.mistyped.push({ dim, type: path.instance });
+    }
+  }
+  return found.missing.length > 0 || found.mistyped.length > 0
+    ? found
+    : undefined;
+}
+
+/** The verify() warning for what originalDims() found. */
+function originalDimsWarning(
+  modelName: string | undefined,
+  { missing, mistyped, rejects }: OriginalDims,
+): string {
+  const named = (dims: string[]) =>
+    dims.map((dim) => `original.${dim}`).join(' and ');
+  const problems: string[] = [];
+  const effects: string[] = [];
+  if (missing.length > 0) {
+    problems.push(
+      `has no ${named(missing)} field${missing.length > 1 ? 's' : ''}`,
+    );
+    effects.push(
+      rejects
+        ? "Mongoose rejects the update that records the original's dimensions the worker measures (its strict: 'throw'), so such a task fails and is retried without storing its previews"
+        : "Mongoose drops the original's dimensions the worker measures",
+    );
+  }
+  if (mistyped.length > 0) {
+    const types = [...new Set(mistyped.map(({ type }) => type))];
+    const declared =
+      types.length === 1
+        ? `${named(mistyped.map(({ dim }) => dim))} as ${types[0]}`
+        : mistyped
+            .map(({ dim, type }) => `original.${dim} as ${type}`)
+            .join(' and ');
+    problems.push(`declares ${declared}, not Number`);
+    effects.push(
+      `Mongoose either stores the dimensions the worker measures as ${types.join(' and ')} or, when it cannot cast them to that type, rejects the update that records them, so such a task fails and is retried without storing its previews; either way freshness cannot read them as numbers`,
+    );
+  }
+  const fix = [...missing, ...mistyped.map(({ dim }) => dim)]
+    .map((dim) => `${dim}: { type: Number }`)
+    .join(' and ');
+  return `resize: the media model ${modelName ? `'${modelName}' ` : ''}${problems.join(' and ')}, so ${effects.join('; ')}, and every read queues a task that downloads the original again — spread the current resizeMediaSchemaFragment into the media model's schema, or ${mistyped.length > 0 ? `declare ${fix} in` : `add ${fix} to`} its original`;
 }
 
 // The preview row schema of a media model: the sub-document schema of its `previews` array, or
@@ -175,6 +289,9 @@ const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
 
 export class MongoMediaStore extends MediaStore {
   readonly #model: () => MongoMediaModel;
+  readonly #logger: ResizeLogger;
+  #warnedFit = false;
+  #warnedOriginal = false;
 
   constructor(opts: MongoMediaStoreOptions) {
     super();
@@ -185,6 +302,7 @@ export class MongoMediaStore extends MediaStore {
       missing:
         'resize: the media model does not resolve — check the model name',
     });
+    this.#logger = opts.logger ?? console;
   }
 
   protected mediaModel(): MongoMediaModel {
@@ -197,10 +315,21 @@ export class MongoMediaStore extends MediaStore {
    * (Mongoose strict mode strips an undeclared field from every row: without `identity` every
    * worker that renders a variant would add its own row, and without the signatures no row could
    * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
-   * field. `bytes` and `createdAt` are informational and not checked.
+   * field. Such rows without `fit` only get a warning, once per store: freshness still holds
+   * without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
+   * without `width` or `height`, or any `original` declaring one with a type that does not read
+   * back as a number (not Number, Int32 or Mixed), also gets one warning per store (it does not
+   * throw, so a setup that passed before keeps passing): Mongoose drops the dimensions the worker
+   * measures (rejects them under `strict: 'throw'`), stores them with that type, or rejects them
+   * when it cannot cast them, so every read queues a task that downloads the original again.
    */
   verify(): void {
     const model = this.mediaModel();
+    const dims = originalDims(model);
+    if (dims && !this.#warnedOriginal) {
+      this.#warnedOriginal = true;
+      this.#logger.warn(originalDimsWarning(model.modelName, dims));
+    }
     const rows = previewRowSchema(model);
     if (!rows?.path || rows.options?.strict === false) {
       return;
@@ -216,6 +345,12 @@ export class MongoMediaStore extends MediaStore {
       throw new ResizeSetupError(
         `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no ${named}, so Mongoose would drop ${missing.length > 1 ? 'them' : 'it'} and ${lost} — spread the current resizeMediaSchemaFragment into the media model's schema`,
         { code: 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' },
+      );
+    }
+    if (!rows.path('fit') && !this.#warnedFit) {
+      this.#warnedFit = true;
+      this.#logger.warn(
+        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no previews.fit field, so Mongoose drops it and a stored row no longer says whether it is a fit preview — spread the current resizeMediaSchemaFragment into the media model's schema, or add fit: { type: Boolean } to its preview rows`,
       );
     }
   }

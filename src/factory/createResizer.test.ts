@@ -11,8 +11,10 @@ import {
   type ResizeError,
   ResizeSetupError,
 } from '../errors.ts';
+import { LogMetrics } from '../metrics.ts';
 import {
   getResizer,
+  metricsOf,
   Resizer,
   resetResizerForTests,
   sharedPart,
@@ -27,6 +29,7 @@ import {
   memoryStorage,
   memoryStorageDriver,
   PlainTaskQueue,
+  recordingMetrics,
   silentLogger,
 } from '../testHelpers/fakes.ts';
 import { workUntil } from '../testHelpers/work.ts';
@@ -834,6 +837,29 @@ test('options win over the config: storage, media, tasks: false, queueName', asy
   await given.ready();
   assert.strictEqual(given.tasks, tasks);
   assert.equal(fake.built.at(-1)?.taskQueueCalls.length, 0);
+});
+
+test('a metrics option reaches the Resizer; without one it is a LogMetrics on its logger', () => {
+  const memory = memoryStorageDriver();
+  const config = { storage: { driver: 'memory' } };
+  const sink = recordingMetrics();
+  const metered = createResizer(config, {
+    name: 'metered',
+    drivers: { storage: { memory } },
+    media: fakeMedia(),
+    metrics: sink,
+    logger: silentLogger,
+  });
+  assert.strictEqual(metered.metrics, sink);
+  metricsOf(metered).count('resize.read', 1);
+  assert.deepEqual(sink.calls[0].labels, { resizer: 'metered' });
+
+  const plain = createResizer(config, {
+    drivers: { storage: { memory } },
+    media: fakeMedia(),
+    logger: silentLogger,
+  });
+  assert.ok(plain.metrics instanceof LogMetrics);
 });
 
 test('configuredOptions: eagerDatabase gives media (and locks beside tasks in code) at once; shareQueues keeps the queue set and each backend in the registry', async () => {

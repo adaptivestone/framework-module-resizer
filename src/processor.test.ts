@@ -60,7 +60,9 @@ import {
   memoryLocks,
   observedQueue,
   PlainTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
+import { stampFresh } from './testHelpers/fresh.ts';
 import { fakePdf, TestPdfDecoder } from './testHelpers/pdfDecoder.ts';
 import {
   makeImageConfig,
@@ -734,8 +736,13 @@ describe('decoding the source', () => {
     assert.equal(recordingSvg.renders.length, 1);
     assert.equal(renders(), 1);
     assert.equal(uploads.length, 2);
-    assert.equal(logs.warn.length, 1);
-    assert.match(String(logs.warn[0][0]), /stored as 'png'.*bytes are 'svg'/);
+    // The media store here drops the backfilled dimensions, which is warned about too.
+    const warnings = logs.warn.filter(
+      (args) =>
+        !/did not record the original's dimensions/.test(String(args[0])),
+    );
+    assert.equal(warnings.length, 1);
+    assert.match(String(warnings[0][0]), /stored as 'png'.*bytes are 'svg'/);
   });
 
   test('an original stored under an alias renders, with one warning', async () => {
@@ -1627,14 +1634,17 @@ describe('processTask — variants', () => {
       storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
-    const { mediaStore, appendCalls } = makeMediaStore(
-      mediaDoc({ previews: [existing] }),
-    );
-    new FrameworkResizer({
+    const doc = mediaDoc({
+      original: { width: 64, height: 48 },
+      previews: [existing],
+    });
+    const { mediaStore, appendCalls } = makeMediaStore(doc);
+    const r = new FrameworkResizer({
       storage,
       media: mediaStore,
       locks: makeLocks().locks,
     });
+    stampFresh(doc, { config: r.config });
     await processTask(task({ previews: [variant()] }));
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
@@ -1649,12 +1659,17 @@ describe('processTask — variants', () => {
       storageRef: { key: 'e' },
       contentType: 'image/jpeg',
     } as unknown as Preview;
-    const { mediaStore } = makeMediaStore(mediaDoc({ previews: [existing] }));
-    new FrameworkResizer({
+    const doc = mediaDoc({
+      original: { width: 64, height: 48 },
+      previews: [existing],
+    });
+    const { mediaStore } = makeMediaStore(doc);
+    const r = new FrameworkResizer({
       storage,
       media: mediaStore,
       locks: makeLocks().locks,
     });
+    stampFresh(doc, { config: r.config });
     await processTask(
       task({ previews: [variant(), variant({ format: 'webp' })] }),
     );
@@ -1963,7 +1978,10 @@ describe('processTask — persistence & failure handling', () => {
         },
       ],
     };
-    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    // Stored dimensions: nothing to backfill, so nothing at all to persist.
+    const { mediaStore, appendCalls } = makeMediaStore(
+      mediaDoc({ original: { width: 64, height: 48 } }),
+    );
     new FrameworkResizer({
       storage,
       media: mediaStore,
@@ -1976,6 +1994,36 @@ describe('processTask — persistence & failure handling', () => {
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
+  });
+
+  test('poison variant with zero successes on a media without dimensions → the measured dimensions are recorded, and processTask THROWS', async () => {
+    installApp();
+    const { storage, uploads } = makeStorage(redPng);
+    const pipeline: Pipeline = {
+      variantSteps: [
+        async () => {
+          throw new Error('poison');
+        },
+      ],
+    };
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+      pipelines: { default: pipeline },
+    });
+    await assert.rejects(
+      () => processTask(task({ previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeGenerateError &&
+        err.code === 'RESIZE_WORKER_INCOMPLETE',
+    );
+    assert.equal(uploads.length, 0);
+    // The download measured the original: its dimensions are recorded, with no row.
+    assert.deepEqual(appendCalls, [
+      { mediaId: 'm1', previews: [], backfillDims: { width: 64, height: 48 } },
+    ]);
   });
 
   test('partial success persists the good preview but throws so the task is retried', async () => {
@@ -2077,11 +2125,17 @@ describe('processTask — persistence & failure handling', () => {
       sizeKey: '20x20',
       format: 'jpeg' as const,
     };
-    // A fresh document per read: the first has no previews, later ones the other worker's row.
+    // A fresh document per read: the first has no previews, later ones the other worker's row,
+    // which is fresh.
     const mediaStore = fakeMedia({
       load: async () => {
         loads++;
-        return mediaDoc({ previews: loads >= 2 ? [concurrent] : [] });
+        return stampFresh(
+          mediaDoc({
+            original: { width: 64, height: 48 },
+            previews: loads >= 2 ? [{ ...concurrent }] : [],
+          }),
+        );
       },
     });
     new FrameworkResizer({
@@ -2332,7 +2386,10 @@ describe('generate (eager)', () => {
     const { mediaStore, appendCalls } = makeMediaStore(null);
     const r = new FrameworkResizer({ storage, media: mediaStore });
     const result = await r.generate({
-      media: mediaDoc({ previews: [existing] }),
+      media: stampFresh(
+        mediaDoc({ original: { width: 64, height: 48 }, previews: [existing] }),
+        { config: r.config },
+      ),
       sizes: [{ width: 20, height: 20 }],
       formats: ['jpeg'],
     });
@@ -4012,12 +4069,22 @@ describe('one preview row per identity', () => {
     contentType: 'image/webp',
   };
 
+  /** The media with stored dimensions and `previews`, stamped fresh (the other worker's rows). */
+  function storedDoc(previews: Preview[]): MediaLike {
+    return stampFresh(
+      mediaDoc({
+        original: { width: 64, height: 48 },
+        previews: previews.map((row) => ({ ...row })),
+      }),
+    );
+  }
+
   /** The media without previews on the first read, with the other worker's row afterwards. */
   function racedMedia() {
     let loads = 0;
     return () => {
       loads += 1;
-      return mediaDoc({ previews: loads === 1 ? [] : [otherWorkersWebp] });
+      return storedDoc(loads === 1 ? [] : [otherWorkersWebp]);
     };
   }
 
@@ -4061,7 +4128,7 @@ describe('one preview row per identity', () => {
     const { storage, uploads } = makeStorage(redPng);
     // Eager generate never loads first: every read is the reload after the write.
     const { mediaStore } = partialMedia(
-      () => mediaDoc({ previews: [otherWorkersWebp] }),
+      () => storedDoc([otherWorkersWebp]),
       (p) => p.format === 'jpeg',
     );
     const fired: Preview[] = [];
@@ -4907,7 +4974,13 @@ describe('scoped generation', () => {
       media: mediaStore,
       pipelines: { watermark: {} },
     });
-    const media = mediaDoc({ previews: [cleanPreview] });
+    const media = stampFresh(
+      mediaDoc({
+        original: { width: 64, height: 48 },
+        previews: [{ ...cleanPreview }],
+      }),
+      { config: r.config },
+    );
     const same = await r.generate({
       media,
       sizes: [{ width: 20, height: 20 }],
@@ -4994,8 +5067,14 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
       previews: Preview[];
       backfillDims?: { width: number; height: number };
     }> = [];
+    const pipelines = over.pipelines ?? new PipelineRegistry();
     const deps: ProcessorDeps = {
-      catalog: new Catalog({ config }),
+      // The pipeline versions reach the Catalog, as a Resizer wires them.
+      catalog: new Catalog({
+        config,
+        versionOf: (p) =>
+          pipelines.has(p) ? pipelines.get(p).version : undefined,
+      }),
       media:
         over.media ??
         fakeMedia({
@@ -5006,7 +5085,7 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
         }),
       storage,
       decoders: createDecoderSet(),
-      pipelines: over.pipelines ?? new PipelineRegistry(),
+      pipelines,
       hooks: new HookBus({ logger: silent }),
       config,
       logger: silent,
@@ -5195,9 +5274,9 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
     assert.notEqual(created[0].encodeSig, plain[0].encodeSig);
   });
 
-  test('a task treats rows written before this version as stored and renders nothing for them', async () => {
+  test('a task re-renders rows written before this version: the identity row is replaced, the identity-less row gets a new row beside it', async () => {
     // Rows from before previews recorded bytes, createdAt, origin and encodeSig: one with its
-    // identity, one from before rows carried an identity.
+    // identity, one from before rows carried an identity. Neither can be proven fresh.
     const oldRows: Preview[] = [
       {
         storageRef: { key: 'previews/old-cover.jpeg' },
@@ -5221,13 +5300,27 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
       },
     ];
     let downloads = 0;
-    const appendCalls: Preview[][] = [];
+    const appendCalls: Array<{
+      mediaId: string;
+      previews: Preview[];
+      backfillDims?: { width: number; height: number };
+    }> = [];
+    const replaceCalls: Array<{
+      mediaId: string;
+      identities: string[];
+      rows: Preview[];
+    }> = [];
     const { deps, uploads } = rowDeps(redPng, {
       media: fakeMedia({
+        // A new document per read, without stored dimensions: the reload has none either.
         load: async () => mediaDoc({ previews: oldRows }),
-        appendPreviews: async (_mediaId, previews) => {
-          appendCalls.push(previews);
+        appendPreviews: async (mediaId, previews, backfillDims) => {
+          appendCalls.push({ mediaId, previews, backfillDims });
           return previews;
+        },
+        replacePreviews: async (mediaId, identities, rows) => {
+          replaceCalls.push({ mediaId, identities, rows });
+          return { stored: rows, removed: [oldRows[0]] };
         },
       }),
     });
@@ -5236,11 +5329,672 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
       downloads += 1;
       return download(ref);
     };
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
     await new Processor(deps).processTask(
       task({ previews: [variant(), fitVariant] }),
     );
-    assert.equal(downloads, 0);
+    assert.equal(downloads, 1);
+    assert.equal(uploads.length, 2);
+    // Both identities are stored (the fit row's is derived from its fields), so both new rows
+    // go to one replace; the measured dimensions go to one append of no rows.
+    assert.equal(replaceCalls.length, 1);
+    assert.deepEqual(
+      replaceCalls[0].identities,
+      replaceCalls[0].rows.map((row) => row.identity),
+    );
+    assert.deepEqual(
+      replaceCalls[0].rows.map((row) => row.sizeKey),
+      ['20x20', 'fit'],
+    );
+    assert.deepEqual(appendCalls, [
+      { mediaId: 'm1', previews: [], backfillDims: { width: 64, height: 48 } },
+    ]);
+    // The reload still has no dimensions: the store dropped them, which is warned about once.
+    assert.equal(
+      logs.warn.filter((args) =>
+        /did not record the original's dimensions of media m1/.test(
+          String(args[0]),
+        ),
+      ).length,
+      1,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Each variant is timed from its encode to the end of its upload, and recorded with its outcome
+// once the persist has said what became of it.
+// ---------------------------------------------------------------------------
+
+describe('variant metrics', () => {
+  /** processorDeps() with a recording metrics sink and recording storage. */
+  function measuredDeps() {
+    const deps = processorDeps();
+    const metrics = recordingMetrics();
+    deps.metrics = metrics;
+    const { storage, uploads } = makeStorage(redPng);
+    deps.storage = storage;
+    return { deps, metrics, uploads };
+  }
+
+  const timings = (metrics: ReturnType<typeof recordingMetrics>) =>
+    metrics.calls.filter(
+      (c) => c.kind === 'timing' && c.name === 'resize.variant',
+    );
+  const byteCounts = (metrics: ReturnType<typeof recordingMetrics>) =>
+    metrics.calls.filter(
+      (c) => c.kind === 'count' && c.name === 'resize.variant.bytes',
+    );
+
+  const twoSizes: SizeInput[] = [
+    { width: 20, height: 20 },
+    { width: 10, height: 10 },
+  ];
+
+  test('generate() records each stored variant in eager mode, with its bytes', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { created } = await new Processor(deps).generate({
+      media: mediaDoc(),
+      sizes: twoSizes,
+    });
+    assert.equal(created.length, 2);
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 2);
+    for (const call of recorded) {
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'jpeg',
+        mode: 'eager',
+        outcome: 'stored',
+      });
+      assert.ok(call.value >= 0);
+    }
+    assert.deepEqual(
+      recorded.map((c) => c.context),
+      created.map((row) => ({ mediaId: 'm1', identity: row.identity })),
+    );
+    const bytes = byteCounts(metrics);
+    assert.deepEqual(
+      bytes.map((c) => ({ value: c.value, labels: c.labels })),
+      created.map((row) => ({
+        value: row.bytes,
+        labels: { pipeline: 'default', format: 'jpeg' },
+      })),
+    );
+  });
+
+  test('persist: false records rendered variants', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { created } = await new Processor(deps).generate({
+      media: mediaDoc(),
+      sizes: twoSizes,
+      persist: false,
+    });
+    assert.equal(created.length, 2);
+    assert.deepEqual(
+      timings(metrics).map((c) => c.labels.outcome),
+      ['rendered', 'rendered'],
+    );
+    assert.deepEqual(
+      byteCounts(metrics).map((c) => c.value),
+      created.map((row) => row.bytes),
+    );
+  });
+
+  test('a failed variant records failed with its code and is still logged at error', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    deps.pipelines = new PipelineRegistry({
+      default: {
+        variantSteps: [
+          (img, { variant: v }) => {
+            if (v.sizeKey === '10x10') {
+              throw new ResizeMediaError('the step refuses', {
+                code: 'RESIZE_PIPELINE_STEP_INVALID',
+              });
+            }
+            return img;
+          },
+        ],
+      },
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: mediaDoc(),
+      sizes: twoSizes,
+    });
+    assert.equal(created.length, 1);
+    assert.equal(failed, 1);
+    const failedCalls = timings(metrics).filter(
+      (c) => c.labels.outcome === 'failed',
+    );
+    assert.equal(failedCalls.length, 1);
+    assert.deepEqual(failedCalls[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'eager',
+      outcome: 'failed',
+      code: 'RESIZE_PIPELINE_STEP_INVALID',
+    });
+    const identity = String(failedCalls[0].context.identity);
+    assert.match(identity, /:10x10:/);
+    assert.deepEqual(failedCalls[0].context, { mediaId: 'm1', identity });
+    assert.ok(
+      logs.error.some((a) =>
+        String(a[0]).includes(`variant ${identity} failed for media m1`),
+      ),
+    );
+    // A failed variant uploaded nothing: only the stored one counts bytes.
+    assert.deepEqual(
+      byteCounts(metrics).map((c) => c.value),
+      [created[0].bytes],
+    );
+  });
+
+  test('a variant another worker stored first records duplicate', async () => {
+    const { deps, metrics } = measuredDeps();
+    const scope = { resizer: 'default', pipeline: 'default' };
+    const identity = deps.catalog.identity(scope, variant());
+    const dims = { width: 64, height: 48 };
+    // The other worker's row carries the signatures this worker would record, so it is fresh.
+    const stored = stampFresh(
+      mediaDoc({
+        original: dims,
+        previews: [
+          {
+            storageRef: { key: 'previews/other-worker.jpeg' },
+            identity,
+            resizer: 'default',
+            pipeline: 'default',
+            sizeKey: '20x20',
+            requestedWidth: 20,
+            requestedHeight: 20,
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+          },
+        ],
+      }),
+      { config: deps.config },
+    );
+    let appended = false;
+    deps.media = fakeMedia({
+      load: async () => (appended ? stored : mediaDoc({ original: dims })),
+      appendPreviews: async () => {
+        appended = true;
+        return [];
+      },
+    });
+    await new Processor(deps).processTask(task({ previews: [variant()] }));
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'duplicate',
+    });
+    assert.deepEqual(recorded[0].context, {
+      mediaId: 'm1',
+      identity,
+      taskId: 't1',
+    });
+    assert.equal(byteCounts(metrics).length, 1);
+  });
+
+  test('a concurrent row with other signatures does not cover the variant: the task fails incomplete', async () => {
+    const { deps, metrics } = measuredDeps();
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    const scope = { resizer: 'default', pipeline: 'default' };
+    const identity = deps.catalog.identity(scope, variant());
+    const dims = { width: 64, height: 48 };
+    // The other worker's row of the identity was made with other settings: stale here.
+    const theirs = stampFresh(
+      mediaDoc({
+        original: dims,
+        previews: [
+          {
+            storageRef: { key: 'previews/other-settings.jpeg' },
+            identity,
+            resizer: 'default',
+            pipeline: 'default',
+            sizeKey: '20x20',
+            requestedWidth: 20,
+            requestedHeight: 20,
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+          },
+        ],
+      }),
+      {
+        config: makeImageConfig({
+          encode: { formats: { jpeg: { quality: 11 } } },
+        }),
+      },
+    );
+    let appended = false;
+    deps.media = fakeMedia({
+      load: async () => (appended ? theirs : mediaDoc({ original: dims })),
+      // The store keeps its row of the identity and leaves this one out.
+      appendPreviews: async () => {
+        appended = true;
+        return [];
+      },
+    });
+    await assert.rejects(
+      () => new Processor(deps).processTask(task({ previews: [variant()] })),
+      (err: unknown) =>
+        err instanceof ResizeGenerateError &&
+        err.code === 'RESIZE_WORKER_INCOMPLETE' &&
+        err.missing.includes(identity),
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'failed',
+      code: 'RESIZE_WORKER_INCOMPLETE',
+    });
+    assert.deepEqual(recorded[0].context, {
+      mediaId: 'm1',
+      identity,
+      taskId: 't1',
+    });
+    // Uploaded, not recorded: no bytes counted, and the upload is named.
+    assert.equal(byteCounts(metrics).length, 0);
+    assert.equal(logs.warn.length, 1);
+    assert.match(
+      String(logs.warn[0][0]),
+      /with other settings or from another original/,
+    );
+  });
+
+  test("eager: a variant left out for another worker's row with other signatures counts as failed", async () => {
+    const { deps, metrics } = measuredDeps();
+    const scope = { resizer: 'default', pipeline: 'default' };
+    const identity = deps.catalog.identity(scope, variant());
+    const dims = { width: 64, height: 48 };
+    const theirs = stampFresh(
+      mediaDoc({
+        original: dims,
+        previews: [
+          {
+            storageRef: { key: 'previews/other-settings.jpeg' },
+            identity,
+            resizer: 'default',
+            pipeline: 'default',
+            sizeKey: '20x20',
+            requestedWidth: 20,
+            requestedHeight: 20,
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+          },
+        ],
+      }),
+      {
+        config: makeImageConfig({
+          encode: { formats: { jpeg: { quality: 11 } } },
+        }),
+      },
+    );
+    deps.media = fakeMedia({
+      load: async () => theirs,
+      // The store keeps its row of 20x20 and stores 10x10.
+      appendPreviews: async (_mediaId, previews) =>
+        previews.filter((row) => row.sizeKey === '10x10'),
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: mediaDoc({ original: dims }),
+      sizes: twoSizes,
+    });
+    assert.deepEqual(
+      created.map((row) => row.sizeKey),
+      ['10x10'],
+    );
+    assert.equal(failed, 1);
+    assert.deepEqual(
+      timings(metrics).map((c) => [c.labels.outcome, c.labels.code]),
+      [
+        ['failed', 'RESIZE_WORKER_INCOMPLETE'],
+        ['stored', undefined],
+      ],
+    );
+  });
+
+  test('a persist that throws records failed for every rendered variant and rethrows', async () => {
+    const { deps, metrics } = measuredDeps();
+    const db = new Error('db');
+    deps.media = fakeMedia({
+      load: async () => mediaDoc(),
+      appendPreviews: async () => {
+        throw db;
+      },
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({ media: mediaDoc(), sizes: twoSizes }),
+      (err: unknown) => err === db,
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 2);
+    for (const call of recorded) {
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'jpeg',
+        mode: 'eager',
+        outcome: 'failed',
+      });
+    }
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('a persist that throws a module error records failed with its code', async () => {
+    const { deps, metrics } = measuredDeps();
+    deps.media = fakeMedia({
+      load: async () => mediaDoc(),
+      appendPreviews: async () => undefined as unknown as Preview[],
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({ media: mediaDoc(), sizes: twoSizes }),
+      { code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID' },
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 2);
+    for (const call of recorded) {
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'jpeg',
+        mode: 'eager',
+        outcome: 'failed',
+        code: 'RESIZE_MEDIA_APPEND_RESULT_INVALID',
+      });
+    }
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('an append that throws after storing part of its rows records those as stored, the rest failed', async () => {
+    const { deps, metrics } = measuredDeps();
+    const doc = mediaDoc();
+    const db = new Error('db');
+    deps.media = fakeMedia({
+      load: async () => doc,
+      // A driver that writes one row at a time and fails on the second.
+      appendPreviews: async (_mediaId, previews) => {
+        doc.previews = [...(doc.previews ?? []), previews[0]];
+        throw db;
+      },
+    });
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({ media: mediaDoc(), sizes: twoSizes }),
+      (err: unknown) => err === db,
+    );
+    assert.deepEqual(
+      timings(metrics).map((c) => [c.labels.outcome, c.context?.identity]),
+      [
+        ['stored', doc.previews?.[0]?.identity],
+        [
+          'failed',
+          deps.catalog.identity(
+            { resizer: 'default', pipeline: 'default' },
+            variant({
+              sizeKey: '10x10',
+              requestedWidth: 10,
+              requestedHeight: 10,
+            }),
+          ),
+        ],
+      ],
+    );
+    assert.equal(byteCounts(metrics).length, 1);
+  });
+
+  test('a row the persist leaves out that no row holds records failed with no code', async () => {
+    const { deps, metrics } = measuredDeps();
+    // The store keeps nothing and the reload holds nothing: neither stored nor a duplicate.
+    deps.media = fakeMedia({
+      load: async () => mediaDoc(),
+      appendPreviews: async () => [],
+    });
+    await assert.rejects(
+      () => new Processor(deps).processTask(task({ previews: [variant()] })),
+      { code: 'RESIZE_WORKER_INCOMPLETE' },
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'failed',
+    });
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('a task variant with an unconfigured format records failed at 0 ms with its code, labelled unconfigured', async () => {
+    const { deps, metrics } = measuredDeps();
+    // A payload can name any format: one label value for all of them, the raw one in the context.
+    const formats = ['gif', 'x-made-up', 'tiff2'];
+    const unconfigured = formats.map((format) => variant({ format }));
+    await assert.rejects(
+      () => new Processor(deps).processTask(task({ previews: unconfigured })),
+      { code: 'RESIZE_WORKER_INCOMPLETE' },
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 3);
+    for (const call of recorded) {
+      assert.equal(call.value, 0);
+      assert.deepEqual(call.labels, {
+        pipeline: 'default',
+        format: 'unconfigured',
+        mode: 'task',
+        outcome: 'failed',
+        code: 'RESIZE_FORMAT_NOT_CONFIGURED',
+      });
+    }
+    assert.deepEqual(
+      recorded
+        .map((c) => c.context)
+        .sort((a, b) =>
+          String(a?.rawFormat).localeCompare(String(b?.rawFormat)),
+        ),
+      unconfigured
+        .map((v) => ({
+          mediaId: 'm1',
+          identity: deps.catalog.identity(
+            { resizer: 'default', pipeline: 'default' },
+            v,
+          ),
+          taskId: 't1',
+          rawFormat: v.format,
+        }))
+        .sort((a, b) => a.rawFormat.localeCompare(b.rawFormat)),
+    );
+    assert.equal(byteCounts(metrics).length, 0);
+  });
+
+  test('processTask records task mode with the task id in the context', async () => {
+    const { deps, metrics } = measuredDeps();
+    await new Processor(deps).processTask(
+      task({ taskId: 'task-7', previews: [variant()] }),
+    );
+    const recorded = timings(metrics);
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].labels, {
+      pipeline: 'default',
+      format: 'jpeg',
+      mode: 'task',
+      outcome: 'stored',
+    });
+    assert.deepEqual(recorded[0].context, {
+      mediaId: 'm1',
+      identity: deps.catalog.identity(
+        { resizer: 'default', pipeline: 'default' },
+        variant(),
+      ),
+      taskId: 'task-7',
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Freshness in the worker and in eager generate(): the warnings, the caller's dimensions, a
+// persist that fails between its two writes, and a store that cannot replace.
+// ---------------------------------------------------------------------------
+
+describe('regenerating stale previews', () => {
+  const dims = { width: 64, height: 48 };
+
+  /** A 20x20 jpeg row of `pipeline`, as the worker stores it (not yet signed). */
+  function storedRow(pipeline = 'default', key = 'previews/stored.jpeg') {
+    return {
+      storageRef: { key },
+      identity: `default:${pipeline}:20x20:jpeg:none`,
+      resizer: 'default',
+      pipeline,
+      sizeKey: '20x20',
+      requestedWidth: 20,
+      requestedHeight: 20,
+      format: 'jpeg',
+      contentType: 'image/jpeg',
+    };
+  }
+
+  /** processorDeps() whose media holds a fresh 20x20 row of default and of wm, with a logger. */
+  function allFreshDeps() {
+    const deps = processorDeps();
+    deps.pipelines = new PipelineRegistry({ wm: {} });
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    deps.media = fakeMedia({
+      load: async () =>
+        stampFresh(
+          mediaDoc({
+            original: dims,
+            previews: [storedRow('default'), storedRow('wm')],
+          }),
+          { config: deps.config },
+        ),
+    });
+    const allFresh = () =>
+      logs.warn.filter((args) => /already fresh/.test(String(args[0])));
+    return { deps, allFresh };
+  }
+
+  test('the all-fresh warning is logged once per pipeline', async () => {
+    const { deps, allFresh } = allFreshDeps();
+    const processor = new Processor(deps);
+    await processor.processTask(task({ taskId: 't1', previews: [variant()] }));
+    await processor.processTask(task({ taskId: 't2', previews: [variant()] }));
+    assert.equal(allFresh().length, 1);
+    assert.equal(
+      allFresh()[0][0],
+      "resize worker: task t1 of media m1 found every requested preview of pipeline 'default' already fresh — if this repeats, the API and the worker may run different image settings or pipeline versions, or resolve() was given the media without its stored original (storageRef, width, height)",
+    );
+    await processor.processTask(
+      task({ taskId: 't3', pipeline: 'wm', previews: [variant()] }),
+    );
+    assert.equal(allFresh().length, 2);
+    assert.match(String(allFresh()[1][0]), /task t3 .* pipeline 'wm'/);
+  });
+
+  test('no all-fresh warning on a later delivery', async () => {
+    const { deps, allFresh } = allFreshDeps();
+    await new Processor(deps).processTask(
+      task({ attempts: 2, previews: [variant()] }),
+    );
+    assert.deepEqual(allFresh(), []);
+  });
+
+  test('generate() on a frozen media.original warns that it could not set the dimensions, and still returns its rows', async () => {
+    const deps = processorDeps();
+    const { logger, logs } = recordingLogger();
+    deps.logger = logger;
+    const media = mediaDoc();
+    media.original = Object.freeze({ ...(media.original as Original) });
+    const { created } = await new Processor(deps).generate({
+      media,
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.equal(created.length, 1);
+    assert.equal(media.original?.width, undefined);
+    assert.equal(logs.warn.length, 1);
+    assert.equal(
+      logs.warn[0][0],
+      "resize: generate() recorded the original's dimensions of media m1 in the media store but could not set them on the caller's media.original, so a same-request resolve() finds its previews stale",
+    );
+    assert.ok(logs.warn[0][1] instanceof TypeError);
+  });
+
+  test('a replace that fails after the append stored rows records those as stored and the rest as failed', async () => {
+    const deps = processorDeps();
+    const metrics = recordingMetrics();
+    deps.metrics = metrics;
+    const db = new Error('db');
+    const appended: Preview[][] = [];
+    deps.media = fakeMedia({
+      load: async () => mediaDoc({ original: dims, previews: [storedRow()] }),
+      appendPreviews: async (_mediaId, previews) => {
+        appended.push(previews);
+        return previews;
+      },
+      replacePreviews: async () => {
+        throw db;
+      },
+    });
+    // 20x20 is stale (unsigned), so it is replaced; 10x10 is new, so it is appended.
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({
+          media: mediaDoc({ original: dims, previews: [storedRow()] }),
+          sizes: [
+            { width: 20, height: 20 },
+            { width: 10, height: 10 },
+          ],
+        }),
+      (err: unknown) => err === db,
+    );
+    assert.deepEqual(
+      appended.map((rows) => rows.map((row) => row.sizeKey)),
+      [['10x10']],
+    );
+    const outcomes = metrics.calls
+      .filter((c) => c.kind === 'timing' && c.name === 'resize.variant')
+      .map((c) => [String(c.context.identity), c.labels.outcome]);
+    assert.deepEqual(outcomes, [
+      ['default:default:20x20:jpeg:none', 'failed'],
+      ['default:default:10x10:jpeg:none', 'stored'],
+    ]);
+    const bytes = metrics.calls.filter(
+      (c) => c.kind === 'count' && c.name === 'resize.variant.bytes',
+    );
+    assert.equal(bytes.length, 1);
+  });
+
+  test('eager generate() on a store without replacePreviews fails before any upload when a row is stale', async () => {
+    const deps = processorDeps();
+    const { storage, uploads } = makeStorage(redPng);
+    deps.storage = storage;
+    deps.media = {
+      loadMedia: async () => null,
+      appendPreviews: async (_mediaId: string, previews: Preview[]) => previews,
+    } as unknown as MediaStore;
+    await assert.rejects(
+      () =>
+        new Processor(deps).generate({
+          media: mediaDoc({ original: dims, previews: [storedRow()] }),
+          sizes: [{ width: 20, height: 20 }],
+        }),
+      {
+        code: 'RESIZE_MEDIA_REPLACE_MISSING',
+        message:
+          'resize: the media store has no replacePreviews(mediaId, identities, rows) — a custom MediaStore needs it since 0.3.0',
+      },
+    );
     assert.equal(uploads.length, 0);
-    assert.equal(appendCalls.length, 0);
   });
 });

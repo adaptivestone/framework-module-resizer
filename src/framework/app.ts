@@ -40,6 +40,14 @@ export const appLogger: ResizeLogger = {
   info: (msg, ...rest) => getApp().logger.info(msg, ...rest),
   warn: (msg, ...rest) => getApp().logger.warn(msg, ...rest),
   error: (msg, ...rest) => getApp().logger.error(msg, ...rest),
+  // Always present, so the default metrics of a FrameworkResizer can write debug lines; an app
+  // logger without a debug function drops them.
+  debug: (msg: string, ...rest: unknown[]) => {
+    const { logger } = getApp();
+    if (typeof logger.debug === 'function') {
+      logger.debug(msg, ...rest);
+    }
+  },
 };
 
 /** An event bus that resolves the app's bus at emit time (a missing bus drops the event). */

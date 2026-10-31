@@ -8,8 +8,9 @@
 // another Resizer's task.
 // Each task runs with the Resizer named in it and that Resizer's coordination (the cooldown of a
 // dead-letter, and the lock store of the gate lock on a backend without gatesByTask), and its
-// events go to that Resizer's observers. The host logger is called only through logNeverThrow, so
-// a logger that throws never stops it.
+// events go to that Resizer's observers; its claim wait and outcome go to that Resizer's metrics
+// sink, and each served sink is flushed once when the worker stops. The host logger is called only
+// through logNeverThrow, so a logger that throws never stops it.
 // The work itself is the Resizer's Processor (src/processor.ts).
 // Framework hosts start it through `runResizeWorker()` (src/framework/worker.ts), which adds the
 // `worker.enabled` switch, process signals and the app logger.
@@ -27,6 +28,7 @@ import { logNeverThrow } from './helpers/log.ts';
 import {
   getResizer,
   listResizers,
+  metricsOf,
   processorOf,
   type Resizer,
   taskCoordinationOf,
@@ -213,6 +215,47 @@ function shownValue(value: unknown): string {
   }
 }
 
+// The longest the stop waits for one metrics sink's flush(): a sink that hangs must not keep the
+// worker from returning.
+const METRICS_FLUSH_TIMEOUT_MS = 5_000;
+
+/**
+ * Flush the metrics of `resizers` once per distinct sink (Resizers given one sink share it), each
+ * waited for until it settles or METRICS_FLUSH_TIMEOUT_MS has passed. Never rejects: the bound
+ * sink logs a failing flush.
+ */
+async function flushMetrics(resizers: Resizer[]): Promise<void> {
+  const seen = new Set<object>();
+  const flushes: Promise<void>[] = [];
+  for (const resizer of resizers) {
+    if (seen.has(resizer.metrics)) {
+      continue;
+    }
+    seen.add(resizer.metrics);
+    flushes.push(
+      withinFlushTimeout(Promise.resolve(metricsOf(resizer).flush())),
+    );
+  }
+  await Promise.all(flushes);
+}
+
+/**
+ * `flush`, or METRICS_FLUSH_TIMEOUT_MS, whichever comes first. The stop awaits this wait, so its
+ * timer stays ref'd, as the Consumer's awaited waits do: the process lives until the flush settles
+ * or the bound ends, and the timer is cleared as soon as the flush settles.
+ */
+async function withinFlushTimeout(flush: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, METRICS_FLUSH_TIMEOUT_MS);
+  });
+  try {
+    await Promise.race([flush, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface RunWorkerOptions {
   // The queue(s) to consume: one name or a list (a name listed twice is consumed once); default
   // 'default'. Every name must be served, else the worker does not start.
@@ -384,6 +427,11 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       timing: timingOf(timingSource, queue),
       resizers: served,
       coordinationOf,
+      // A task of a Resizer not served records nothing.
+      metricsOf: (task) => {
+        const owner = ownerOf(task);
+        return owner ? metricsOf(owner) : undefined;
+      },
       accepts: givesBack
         ? (task) => {
             if (ownerOf(task)) {
@@ -443,6 +491,9 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     );
   } finally {
     opts.signal.removeEventListener('abort', onAbort);
+    // What the sinks still hold (LogMetrics: the open summary window) is written before the worker
+    // returns, as a process often exits right after.
+    await flushMetrics(resizers);
   }
   if (firstFailure) {
     throw firstFailure.error;

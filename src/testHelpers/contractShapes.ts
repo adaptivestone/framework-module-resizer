@@ -6,6 +6,7 @@ import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
+import type { ResizeLogger } from '../types.d.ts';
 
 export const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -111,3 +112,19 @@ export const decoder: SourceDecoder = {
     info: { width: 1, height: 1, channels: 3 },
   }),
 };
+
+// A host logger whose `debug` is not a function (a flag, say) is still a ResizeLogger, as it was
+// before `debug` was declared: LogMetrics calls `debug` only when it is a function.
+export const flagDebugLogger: ResizeLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug: false,
+};
+const hostLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug: 'verbose',
+};
+export const hostDebugLogger: ResizeLogger = hostLogger;

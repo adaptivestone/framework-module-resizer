@@ -202,32 +202,50 @@ export function getPreviewIdentity(
 }
 
 /**
- * The usable stored previews of `scope`, keyed by identity; of two rows with one identity the later
- * wins. A row's identity comes from its own fields (its scope, size key, format and filters), so
- * another Resizer's or pipeline's rendering never matches. The one rule for which stored rows
- * count: the read path, prewarm, eager generate and the worker all use it.
+ * Every usable stored row of `scope`, grouped by identity, each group in store order. A row's
+ * identity comes from its own fields (its scope, size key, format and filters), so another
+ * Resizer's or pipeline's rendering never matches. The one rule for which stored rows count: the
+ * read path, prewarm, eager generate and the worker all use it, through this or storedPreviews.
  */
-export function storedPreviews(
+export function storedPreviewRows(
   media: MediaLike,
   scope: PreviewScope,
-): Map<string, Preview> {
-  const byIdentity = new Map<string, Preview>();
+): Map<string, Preview[]> {
+  const byIdentity = new Map<string, Preview[]>();
   for (const preview of media.previews ?? []) {
     if (!isUsablePreview(preview)) {
       continue;
     }
     const own = previewScope(preview);
     if (own.resizer === scope.resizer && own.pipeline === scope.pipeline) {
-      byIdentity.set(
-        getPreviewIdentity(
-          own,
-          preview.sizeKey,
-          preview.format,
-          preview.filters,
-        ),
-        preview,
+      const identity = getPreviewIdentity(
+        own,
+        preview.sizeKey,
+        preview.format,
+        preview.filters,
       );
+      const rows = byIdentity.get(identity);
+      if (rows) {
+        rows.push(preview);
+      } else {
+        byIdentity.set(identity, [preview]);
+      }
     }
+  }
+  return byIdentity;
+}
+
+/**
+ * The usable stored previews of `scope`, keyed by identity; of two rows with one identity the later
+ * wins (see storedPreviewRows).
+ */
+export function storedPreviews(
+  media: MediaLike,
+  scope: PreviewScope,
+): Map<string, Preview> {
+  const byIdentity = new Map<string, Preview>();
+  for (const [identity, rows] of storedPreviewRows(media, scope)) {
+    byIdentity.set(identity, rows[rows.length - 1]);
   }
   return byIdentity;
 }
@@ -242,9 +260,9 @@ export function storedIdentities(
 
 /**
  * Expand `sizes × formats` into a deduped `MissingPreview[]`, skipping any size whose key can't
- * be built (`getSizeKey` throws) and any identity already stored for `scope`. Eager `generate`
- * and `prewarm` expand the whole catalog up front this way. The read path does not: its
- * per-cell loop interleaves expansion with serving the ready cells.
+ * be built (`getSizeKey` throws) and any identity already stored for `scope`, fresh or stale.
+ * isCatalogCovered uses it; eager `generate` skips only fresh identities (Catalog.missing). The
+ * read path does not: its per-cell loop interleaves expansion with serving the ready cells.
  */
 export function expandMissingPreviews(
   media: MediaLike,
@@ -322,8 +340,10 @@ export function toMissingPreview(
 
 /**
  * True when every `sizes × formats` identity of `scope` (default: the default Resizer and
- * pipeline) is already stored on `media.previews`. Hosts use this to skip a no-op
- * `generate` / `prewarm`.
+ * pipeline) is already stored on `media.previews`. It checks presence by identity only, not
+ * freshness: a stale row counts as stored. So it must not decide whether to skip `generate()` or
+ * `prewarm()` where freshness matters; `generate()` is idempotent and renders only what is
+ * missing or stale.
  */
 export function isCatalogCovered(
   media: MediaLike,
@@ -360,8 +380,10 @@ function normalizeVariant(variant: MissingPreview): MissingPreview {
   if (variant.requestedHeight !== undefined) {
     normalized.requestedHeight = variant.requestedHeight;
   }
+  // Only `true` makes a fit variant, the rule that signs and stores a fit row: a tap's `fit: 1`
+  // is a cover variant everywhere.
   if (variant.fit !== undefined) {
-    normalized.fit = variant.fit;
+    normalized.fit = variant.fit === true;
   }
   return normalized;
 }

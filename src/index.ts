@@ -41,6 +41,11 @@ export type {
 } from './contracts/hooks.ts';
 export { LockStore } from './contracts/locks.ts';
 export { MediaStore, type ReplacedPreviews } from './contracts/media.ts';
+export {
+  type MetricContext,
+  type MetricLabels,
+  ResizeMetrics,
+} from './contracts/metrics.ts';
 export type {
   BeforeStep,
   Pipeline,
@@ -89,6 +94,13 @@ export {
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';
+// --- metrics sinks: LogMetrics (the default: summary lines on the Resizer's logger) and
+// NoopMetrics (off); a host's own sink extends ResizeMetrics ---
+export {
+  LogMetrics,
+  type LogMetricsOptions,
+  NoopMetrics,
+} from './metrics.ts';
 // --- the Raster helpers: a Sharp-based beforeStep wraps the raster it receives and reads its
 // result back (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))`) ---
 export { rasterToSharp, sharpToRaster } from './raster.ts';

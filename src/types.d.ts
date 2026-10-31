@@ -24,6 +24,10 @@ export interface ResizeLogger {
   info(msg: string, ...rest: unknown[]): void;
   warn(msg: string, ...rest: unknown[]): void;
   error(msg: string, ...rest: unknown[]): void;
+  // Optional: LogMetrics writes its per-call lines here when asked to (`debug: true`), as
+  // `debug(msg: string)`. Any value is accepted, as before this member was declared: LogMetrics
+  // calls it only when it is a function, and otherwise drops those lines.
+  debug?: unknown;
 }
 
 export interface ResizeEventBus {
@@ -128,11 +132,26 @@ export interface ReadyEntry {
   url: string;
   preview: Preview; // the stored preview this entry serves
   contentType: string; // preview.contentType
+  /**
+   * Set only when the stored preview is stale: made from another original, or with other image
+   * settings or pipeline version, or it cannot be proven fresh (written before previews recorded
+   * their signatures, or its media has no stored dimensions or no original). It is still served,
+   * and its replacement is requested like a missing variant (see `ReadDecision.stale`).
+   */
+  stale?: true;
 }
 
 export interface ReadDecision {
   ready: ReadyEntry[];
   missing: MissingPreview[];
+  /**
+   * The variants that replace a stale stored preview (after `beforeEnqueue`), apart from
+   * `missing`. Like `missing`, they are requested, and queued only when the read queues (not
+   * with `enqueueMissing: false`, without an original, or without a usable task queue), so it does
+   * not confirm a queued task; nor that the stale preview was served (a cell whose `publicUrl`
+   * threw is not). Set only when there is one, so a fresh decision has no `stale` key.
+   */
+  stale?: MissingPreview[];
 }
 
 export type PrewarmStatus =
@@ -238,10 +257,16 @@ export interface GenerateOpts {
 }
 
 // `created` is only the rows THIS call produced. Empty + `failed === 0` is success
-// (already stored or an empty catalog). Total failure throws.
+// (already stored and fresh, or an empty catalog). A stored preview made with other settings or
+// from another original is outdated: it is rendered again and replaced. Total failure throws.
 export interface GenerateResult {
   created: Preview[];
   failed: number;
+  // The storage refs of the stored rows the write that stored `created` removed (one write): the
+  // outdated rows, or a row of the same identity another worker stored meanwhile. Set only when
+  // there are any, so never with `persist: false`. Their files are not deleted: that is the host's
+  // job.
+  replaced?: StorageRef[];
 }
 
 // Options for `invalidate`: which of this Resizer's stored previews of a media to remove.

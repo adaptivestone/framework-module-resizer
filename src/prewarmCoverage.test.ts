@@ -13,6 +13,7 @@ import {
   MemoryTaskQueue,
   memoryLocks,
 } from './testHelpers/fakes.ts';
+import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
   EnqueueReceipt,
@@ -207,19 +208,27 @@ describe('prewarm — explicit coverage', () => {
       tasks,
       lockStore: locks().lockStore,
     });
+    await ready.ready();
     const readyResult = await ready.prewarm({
-      media: {
-        id: 'm1',
-        original: { storageRef: { key: 'original.jpg' } },
-        previews: [
-          {
-            storageRef: { key: 'ready.jpg' },
-            sizeKey: '300x300',
-            format: 'jpeg',
-            contentType: 'image/jpeg',
+      media: stampFresh(
+        {
+          id: 'm1',
+          original: {
+            storageRef: { key: 'original.jpg' },
+            width: 64,
+            height: 48,
           },
-        ],
-      },
+          previews: [
+            {
+              storageRef: { key: 'ready.jpg' },
+              sizeKey: '300x300',
+              format: 'jpeg',
+              contentType: 'image/jpeg',
+            },
+          ],
+        },
+        { config: ready.config },
+      ),
       sizes: [{ width: 300, height: 300 }],
       formats: ['jpeg'],
     });
@@ -643,18 +652,26 @@ describe('prewarm — pipeline scope is part of preview identity', () => {
       lockStore: locks().lockStore,
       pipelines: { watermark: {} },
     });
-    const media = {
-      id: 'm1',
-      original: { storageRef: { key: 'original.jpg' } },
-      previews: [
-        {
-          storageRef: { key: 'p.jpg' },
-          sizeKey: '300x300',
-          format: 'jpeg',
-          contentType: 'image/jpeg',
+    await r.ready();
+    const media = stampFresh(
+      {
+        id: 'm1',
+        original: {
+          storageRef: { key: 'original.jpg' },
+          width: 64,
+          height: 48,
         },
-      ],
-    };
+        previews: [
+          {
+            storageRef: { key: 'p.jpg' },
+            sizeKey: '300x300',
+            format: 'jpeg',
+            contentType: 'image/jpeg',
+          },
+        ],
+      },
+      { config: r.config },
+    );
     const sizes = [{ width: 300, height: 300 }];
     const clean = await r.prewarm({ media, sizes, formats: ['jpeg'] });
     assert.equal(clean.status, 'ready');

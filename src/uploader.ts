@@ -1,6 +1,8 @@
 // Stores an original as uploaded. The decoders measure it (format, size, frames) to check the
 // upload rules; the bytes go to storage unchanged. It needs only the storage, the decoders and the
-// image config; it creates no media, queues no work and logs nothing.
+// image config; it creates no media, queues no work and logs nothing. Each upload is timed and
+// counted on the metrics sink, stored or rejected.
+import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { DecoderSet, IdentifiedSource } from './decoderSet.ts';
 import {
@@ -10,6 +12,7 @@ import {
 } from './errors.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { randomHex } from './helpers/random.ts';
+import { errorCodeLabel, NoopMetrics } from './metrics.ts';
 import type {
   Original,
   OriginalFormat,
@@ -102,21 +105,55 @@ export interface UploaderDeps {
   storage: ResizeStorage;
   decoders: DecoderSet;
   config: ResizeConfig;
+  // Where each upload is recorded (a Resizer passes its bound sink); default: nothing is recorded.
+  metrics?: ResizeMetrics;
 }
+
+const noMetrics = new NoopMetrics();
 
 export class Uploader {
   readonly #storage: ResizeStorage;
   readonly #decoders: DecoderSet;
   readonly #config: ResizeConfig;
+  readonly #metrics: ResizeMetrics;
 
   constructor(deps: UploaderDeps) {
     this.#storage = deps.storage;
     this.#decoders = deps.decoders;
     this.#config = deps.config;
+    this.#metrics = deps.metrics ?? noMetrics;
   }
 
-  /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
+  /**
+   * Store an untouched, byte-sniffed original. Does not create media or queue work. The upload is
+   * timed from here to its return or its throw: a stored one with its format and bytes, a rejected
+   * one with its code.
+   */
   async upload(opts: UploadOriginalOpts): Promise<Original> {
+    const started = performance.now();
+    let original: Original & { format: string; size: number };
+    try {
+      original = await this.#store(opts);
+    } catch (err) {
+      this.#metrics.timing('resize.upload', performance.now() - started, {
+        outcome: 'rejected',
+        ...errorCodeLabel(err),
+      });
+      throw err;
+    }
+    const format = { format: original.format };
+    this.#metrics.timing('resize.upload', performance.now() - started, {
+      outcome: 'stored',
+      ...format,
+    });
+    this.#metrics.count('resize.upload.bytes', original.size, format);
+    return original;
+  }
+
+  /** The upload itself: check, measure and store the original, or throw why it was refused. */
+  async #store(
+    opts: UploadOriginalOpts,
+  ): Promise<Original & { format: string; size: number }> {
     if (
       !opts ||
       (!Buffer.isBuffer(opts.body) && !(opts.body instanceof Uint8Array))

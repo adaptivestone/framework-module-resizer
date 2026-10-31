@@ -44,7 +44,8 @@ published with the npm tag `next` (§3), so `latest` stays on the last stable re
 final `X.Y.0`. 0.3.0 ships this way: `0.3.0-rc.1` holds every host-facing shape, `0.3.0-rc.2` the
 `beforeSteps` signature and the decoder port, `0.3.0-rc.3` additions only (`createResizer`, drivers
 by name, routing between backends, a worker queue list, partial config files; no required host
-change), later rcs internal changes only. All of them stay under the one
+change), `0.3.0-rc.4` metrics and the freshness check (additions, and outdated previews regenerate
+on read; no required host change), later rcs internal changes only. All of them stay under the one
 `# 0.3.0` heading of `CHANGELOG.md` (its **Prereleases** note says what each rc holds); the
 final `0.3.0` is a bump from the last rc with no new heading.
 

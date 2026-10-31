@@ -14,9 +14,11 @@ import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { FrameworkLockStore } from './framework/locks.ts';
 import { FrameworkMediaStore } from './framework/media.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
+import { LogMetrics, NoopMetrics } from './metrics.ts';
 import {
   getResizer,
   listResizers,
+  metricsOf,
   Resizer,
   type ResizerOptions,
   resetResizerForTests,
@@ -31,7 +33,9 @@ import {
   MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
+  recordingMetrics,
 } from './testHelpers/fakes.ts';
+import { stampFresh } from './testHelpers/fresh.ts';
 import {
   makeImageConfig,
   makeResizeConfig,
@@ -706,8 +710,17 @@ describe('a task queue the Resizer cannot use', () => {
       ...parts,
     });
     await r.ready();
+    // This test's media: the original's size, and its stored preview signed as the worker signs it.
+    const seeded = () =>
+      stampFresh(
+        {
+          ...media(),
+          original: { storageRef: { key: 'o' }, width: 40, height: 30 },
+        },
+        { config: r.config },
+      );
     for (let read = 0; read < 2; read += 1) {
-      const { decision } = await r.resolve({ media: media(), sizes });
+      const { decision } = await r.resolve({ media: seeded(), sizes });
       assert.deepEqual(
         decision.ready.map((entry) => entry.url),
         ['https://cdn/p10'],
@@ -721,7 +734,7 @@ describe('a task queue the Resizer cannot use', () => {
     const original = await r.uploadOriginal({ body, visibility: 'private' });
     assert.equal(original.format, 'png');
     const { created } = await r.generate({
-      media: media(),
+      media: seeded(),
       sizes,
       persist: false,
     });
@@ -729,7 +742,7 @@ describe('a task queue the Resizer cannot use', () => {
       created.map((preview) => preview.sizeKey),
       ['20x20'],
     );
-    const result = await r.prewarm({ media: media(), sizes });
+    const result = await r.prewarm({ media: seeded(), sizes });
     assert.equal(result.status, 'incomplete');
     assert.deepEqual(
       result.requested.map((variant) => variant.sizeKey),
@@ -816,9 +829,18 @@ describe('a task queue the Resizer cannot use', () => {
     await r.ready();
     // Building the Dispatcher reads no timing, so the first value is never read.
     assert.equal(errors.length, 0);
+    // This test's media: the original's size, and its stored preview signed as the worker signs it.
+    const seeded = () =>
+      stampFresh(
+        {
+          ...media(),
+          original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+        },
+        { config: r.config },
+      );
     timing = { maxAttempts: 0 };
-    await r.resolve({ media: media(), sizes });
-    await r.resolve({ media: media(), sizes });
+    await r.resolve({ media: seeded(), sizes });
+    await r.resolve({ media: seeded(), sizes });
     assert.equal(errors.length, 1, 'logged once per queue name');
     assert.match(
       String(errors[0][0]),
@@ -828,7 +850,7 @@ describe('a task queue the Resizer cannot use', () => {
     assert.match((errors[0][1] as Error).message, /maxAttempts/);
     assert.deepEqual(tasks.added, []);
     timing = {};
-    const { decision } = await r.resolve({ media: media(), sizes });
+    const { decision } = await r.resolve({ media: seeded(), sizes });
     assert.deepEqual(
       decision.missing.map((variant) => variant.sizeKey),
       ['20x20'],
@@ -1480,5 +1502,219 @@ describe('resolve/generate stubs', () => {
     });
     assert.deepEqual(result.created, []);
     assert.equal(result.failed, 0);
+  });
+});
+
+describe('metrics', () => {
+  test('metrics: the default is a LogMetrics on the Resizer logger; the option wins; resizer.metrics is that sink', async () => {
+    const info: unknown[] = [];
+    const logger = {
+      info: (msg: unknown) => {
+        info.push(msg);
+      },
+      warn() {},
+      error() {},
+    };
+    const byDefault = new Resizer({
+      name: 'm1',
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      logger,
+    });
+    assert.ok(byDefault.metrics instanceof LogMetrics);
+    byDefault.metrics.timing('resize.task', 5, { outcome: 'completed' });
+    assert.equal(info.length, 1);
+    assert.match(
+      String(info[0]),
+      /^resize: task \? of media \? completed in 5 ms/,
+    );
+
+    const sink = recordingMetrics();
+    const given = new Resizer({
+      name: 'm2',
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      metrics: sink,
+      pipelines: { thumbs: {} },
+    });
+    assert.equal(given.metrics, sink);
+    // The bound sink labels every call with the Resizer and its registered pipelines.
+    const bound = metricsOf(given);
+    bound.count('resize.read', 1, { pipeline: 'thumbs' });
+    bound.count('resize.read', 1, { pipeline: 'retired' });
+    assert.deepEqual(
+      sink.calls.map((call) => [call.labels, call.context]),
+      [
+        [{ resizer: 'm2', pipeline: 'thumbs' }, {}],
+        [{ resizer: 'm2', pipeline: 'unregistered' }, { pipeline: 'retired' }],
+      ],
+    );
+    await bound.flush();
+    assert.equal(sink.flushes, 1);
+  });
+
+  test('a metrics option without count and timing is RESIZE_METRICS_INVALID, and the name stays free', () => {
+    for (const metrics of [{}, { count() {} }, null]) {
+      assert.throws(
+        () =>
+          new Resizer({
+            name: 'metered',
+            storage: fakeStorage(),
+            media: fakeMedia(),
+            metrics: metrics as never,
+          }),
+        (e: unknown) =>
+          e instanceof ResizeSetupError &&
+          e.code === 'RESIZE_METRICS_INVALID' &&
+          e.retryable === false &&
+          e.message ===
+            'resize: `metrics` must have count() and timing() functions — e.g. new LogMetrics(logger) or new NoopMetrics()',
+      );
+    }
+    const r = new Resizer({
+      name: 'metered',
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      metrics: new NoopMetrics(),
+    });
+    assert.equal(getResizer('metered'), r);
+  });
+
+  test('with the default metrics, 50 warm reads write no info line until the summary', async (t) => {
+    // Restored by the test context when the test ends.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const info: unknown[] = [];
+    const logger = {
+      info: (msg: unknown) => {
+        info.push(msg);
+      },
+      warn() {},
+      error() {},
+    };
+    const r = new Resizer({
+      storage: { ...fakeStorage(), publicUrl: () => 'https://cdn/p' },
+      media: fakeMedia(),
+      logger,
+    });
+    await r.ready();
+    const media = stampFresh(
+      {
+        id: 'm1',
+        original: { storageRef: { key: 'o' }, width: 64, height: 48 },
+        previews: [
+          {
+            storageRef: { key: 'p' },
+            contentType: 'image/webp',
+            sizeKey: '10x10',
+            format: 'webp',
+          },
+        ],
+      },
+      { config: r.config },
+    );
+    for (let i = 0; i < 50; i++) {
+      const { decision } = await r.resolve({
+        media,
+        sizes: [{ width: 10, height: 10 }],
+        formats: ['webp'],
+      });
+      assert.equal(decision.ready.length, 1);
+    }
+    assert.equal(info.length, 0);
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(info, [
+      "resize: Resizer 'default' over 60 s: reads 50 (ready 50)",
+    ]);
+  });
+
+  test('resolve() on a Resizer that cannot start counts one failed read', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      storage: async () => {
+        throw new Error('storage down');
+      },
+      media: fakeMedia(),
+      metrics: sink,
+      logger: { info() {}, warn() {}, error() {} },
+      pipelines: { thumbs: {} },
+    });
+    const sizes = [{ width: 10, height: 10 }];
+    const { decision } = await r.resolve({
+      media: { id: 'm1' },
+      sizes,
+      pipeline: 'thumbs',
+    });
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    await r.resolve({ media: { id: 'm1' }, sizes, pipeline: 'retired' });
+    await r.resolve(undefined as never);
+    assert.deepEqual(
+      sink.calls.map((call) => [call.name, call.labels, call.context]),
+      [
+        [
+          'resize.read',
+          { resizer: 'default', pipeline: 'thumbs', outcome: 'failed' },
+          { ready: 0, missing: 0, stale: 0 },
+        ],
+        [
+          'resize.read',
+          { resizer: 'default', pipeline: 'unregistered', outcome: 'failed' },
+          { ready: 0, missing: 0, stale: 0, pipeline: 'retired' },
+        ],
+        [
+          'resize.read',
+          { resizer: 'default', pipeline: 'default', outcome: 'failed' },
+          { ready: 0, missing: 0, stale: 0 },
+        ],
+      ],
+    );
+  });
+
+  test('resolve() on a Resizer that cannot start never throws, even when reading the options throws', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      storage: async () => {
+        throw new Error('storage down');
+      },
+      media: fakeMedia(),
+      metrics: sink,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const opts = {
+      media: { id: 'm1' },
+      sizes: [{ width: 10, height: 10 }],
+      get pipeline(): string {
+        throw new Error('getter down');
+      },
+    };
+    const { decision } = await r.resolve(opts);
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.deepEqual(
+      sink.calls.map((call) => call.labels),
+      [{ resizer: 'default', pipeline: 'default', outcome: 'failed' }],
+    );
+  });
+
+  test('resolve() never throws when reading the options throws inside the read', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      metrics: sink,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const opts = {
+      media: { id: 'm1' },
+      sizes: [{ width: 10, height: 10 }],
+      get pipeline(): string {
+        throw new Error('getter down');
+      },
+    };
+    const { decision, output } = await r.resolve(opts);
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(output, undefined);
+    assert.deepEqual(
+      sink.calls.map((call) => call.labels),
+      [{ resizer: 'default', pipeline: 'default', outcome: 'failed' }],
+    );
   });
 });

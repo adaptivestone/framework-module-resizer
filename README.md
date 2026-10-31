@@ -192,8 +192,8 @@ store over `mediaModel`, and the lock store and the database queue on the packag
 and `ResizeTask` models, as `mongoParts` builds them), `queue` (the Resizer's queue name: a key of
 `queues`, or `false`), `queues` (each name with its driver and timing) and `coordination`. Options
 win over the config: `opts` takes every `new Resizer` option (`pipelines`, `hooks`, `decoders`,
-`name`, `logger`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager only),
-`coordination` and `queueName`, each of which replaces what the config would build, and `drivers`
+`name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager
+only), `coordination` and `queueName`, each of which replaces what the config would build, and `drivers`
 (see [Drivers by name](#drivers-by-name)). Only the drivers the config selects are loaded, so the
 AWS SDKs are needed only when a section names S3 or SQS (`RESIZE_PEER_MISSING`, naming the
 packages, otherwise). An object config is merged and validated at once, a function config on first
@@ -295,7 +295,7 @@ Resizers that `src/resizer.ts` constructs.
 
 | Import | Contents |
 |---|---|
-| `@adaptivestone/framework-module-resize` | `Resizer`, `createResizer`, `getResizer`, `resetResizerForTests`, `runWorker`, `RoutingTaskQueue`, `carrierOf`, the contracts (`ResizeStorage`, `MediaStore`, `LockStore`, `TaskQueue`, `SourceDecoder`), helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `rasterToSharp`, `sharpToRaster`), errors, types (among them `InvalidateOpts`, `ReplacedPreviews`, the queue entry types `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`, the decoder types `SourceInfo`, `Raster`, `RasterInfo`, `DecodeBox`, `RenderOptions`, `ResizeLimits`, the factory types `ResizerConfig`, `CreateResizerOptions`, `ResizerSections`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`, `MongoDatabaseConfig`, `PartialFrameworkResizeConfig`, the driver types `DriverRegistry`, `DriverContext`, `StorageDriver`, `DatabaseDriver`, `DatabaseParts`, `QueueDriver`, `QueueDriverContext`, `QueueEntry`, `QueueSection`, and the routing types `Route`, `RoutingTaskQueueOptions`) |
+| `@adaptivestone/framework-module-resize` | `Resizer`, `createResizer`, `getResizer`, `resetResizerForTests`, `runWorker`, `RoutingTaskQueue`, `carrierOf`, the contracts (`ResizeStorage`, `MediaStore`, `LockStore`, `TaskQueue`, `SourceDecoder`, `ResizeMetrics`), the metrics sinks `LogMetrics` and `NoopMetrics`, helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `rasterToSharp`, `sharpToRaster`), errors, types (among them `InvalidateOpts`, `ReplacedPreviews`, the metrics types `MetricLabels`, `MetricContext`, `LogMetricsOptions`, the queue entry types `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`, the decoder types `SourceInfo`, `Raster`, `RasterInfo`, `DecodeBox`, `RenderOptions`, `ResizeLimits`, the factory types `ResizerConfig`, `CreateResizerOptions`, `ResizerSections`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`, `MongoDatabaseConfig`, `PartialFrameworkResizeConfig`, the driver types `DriverRegistry`, `DriverContext`, `StorageDriver`, `DatabaseDriver`, `DatabaseParts`, `QueueDriver`, `QueueDriverContext`, `QueueEntry`, `QueueSection`, and the routing types `Route`, `RoutingTaskQueueOptions`) |
 | `…/config/resize.js` | The framework-free core defaults: the default core config (default export), `defaultQueueOptions`, `defaultCoordination` |
 | `…/drivers/fs.js` | `LocalFsStorage` (the `'local'` storage driver) |
 | `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) |
@@ -408,7 +408,9 @@ cast rejects with Mongoose's `ValidationError` before anything is written; `stor
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
 sub-documents without `identity`, `origin` or `encodeSig` (a mixed or plain `previews` array, or
-rows with `strict: false`, pass; `bytes` and `createdAt` are not checked), `MongoLockStore.verify()`
+rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and logs one warning
+when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
+`logger` option, default `console`), `MongoLockStore.verify()`
 with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock schema has no `owner` field (for example
 a `ResizeLock` model registered on the connection before this version), and
 `MongoTaskQueue.verify()` with `RESIZE_MONGO_MODEL_OUTDATED` when the `ResizeTask` schema lacks a
@@ -486,9 +488,18 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     must resolve with the previews it stored (`[]` when none); resolving with something other than
     an array (e.g. `undefined`) fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.
     Of the previews left out,
-    one whose identity is already stored counts as covered: another worker stored it first, so the
-    core logs it as a warning with its storage ref, does not count it as created and sends no
-    `onPreviewGenerated` event. Any other is not recorded.
+    one whose identity is already stored in a fresh row counts as covered: another worker stored
+    it first, so the core logs it as a warning with its storage ref, does not count it as created
+    and sends no `onPreviewGenerated` event. One whose identity is stored in a stale row is not
+    covered (the task's retry replaces that row). Any other is not recorded.
+  - `appendPreviews` must save `dims` (`backfillDims`) on the original when it is given, whether
+    or not it stores a preview (also for `previews: []`): the freshness check needs the original's
+    dimensions, and a store that drops them makes every read of such a media queue a task that
+    downloads the original (see [Freshness](#freshness)). The shipped `MongoMediaStore` drops them
+    when the media schema declares a strict `original` without `width` and `height` (rejects them
+    under `strict: 'throw'`), and stores them with the wrong type (or rejects them when it cannot
+    cast them) when it declares them as a type that does not read back as a number (not Number,
+    Int32 or Mixed); its `verify()` warns once about it.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -798,10 +809,9 @@ created; a config function (the framework adapter passes one) on first use (`rea
 
 **Pipelines** (`pipelines` of `new Resizer` or `new FrameworkResizer`, fixed at construction) are
 `{ beforeSteps?, variantSteps?, version? }`. `version` is an optional string that is part of every
-preview row's `encodeSig` (see [Operations](#operations)): bump it when a step's output changes, to
-mark the pipeline's stored previews as made with older settings. They are not regenerated yet; a
-later release's freshness check will regenerate them. It is not validated, and `''` signs
-differently from an absent version.
+preview row's `encodeSig`: bump it when a step's output changes, and the pipeline's stored
+previews are regenerated on their next read, `prewarm()` or `generate()` (see
+[Freshness](#freshness)). It is not validated, and `''` signs differently from an absent version.
 
 A `beforeStep` is `(raster, { media, source, scale, ctx }) => Raster` (or a promise of one). It
 runs once per task, before any resize, on the decoded first frame as a `Raster` (`{ data, info }`:
@@ -1122,6 +1132,235 @@ that cannot be used (see `ready()` under [Drivers](#drivers)), in a config file 
 `null` is invalid, not the defaults. No value depends on the queue's lease. Each dead-letter gets
 the `cooldownMs` of the task's own Resizer.
 
+## Metrics
+
+A Resizer reports what it does to a metrics sink: reads, uploads, rendered variants, task outcomes
+and the worker's waits. A sink extends `ResizeMetrics` (main entry), or is any object of the same
+shape:
+
+```ts
+abstract class ResizeMetrics {
+  abstract count(name: string, value: number, labels?: MetricLabels, context?: MetricContext): void | Promise<void>;
+  abstract timing(name: string, ms: number, labels?: MetricLabels, context?: MetricContext): void | Promise<void>;
+  flush?(): void | Promise<void>; // write what is pending now
+}
+```
+
+Each event is one call: `timing` for an event with a duration, `count` otherwise. `labels`
+(`MetricLabels`, string values) are the few low-cardinality values a backend may group by;
+`context` (`MetricContext`, strings and numbers), the 4th argument, carries per-event details
+(media and task ids, identities) for logs, never for labels. A sink written with three parameters
+per method still conforms. A method may be `async`: the module never awaits `count` or `timing`,
+and it catches what they throw or reject.
+
+**The `metrics` option.** `new Resizer({ metrics })`, `createResizer(config, { metrics })` and
+`new FrameworkResizer({ metrics })` take the sink; `resizer.metrics` returns it as given. Left out
+(only `undefined` means the default), `new Resizer` and `createResizer` use
+`new LogMetrics(logger)` on the Resizer's logger, and `FrameworkResizer` uses
+`new LogMetrics(logger, { debug: true })` on its `logger` option, else the app logger, so that
+logger decides whether the debug lines are kept. `new NoopMetrics()` turns metrics off. The sink is checked by shape at construction,
+before the Resizer's name is taken: `metrics: null`, or an object without `count()` and `timing()`
+functions, is `ResizeSetupError` `RESIZE_METRICS_INVALID` (`retryable: false`).
+
+The Resizer puts a guard in front of its sink, and every call goes through it:
+- it adds the `resizer` label (the Resizer's name) to every call;
+- a `pipeline` label that is not a pipeline registered on the Resizer becomes `'unregistered'`,
+  and a `code` label that is not one of the module's error codes becomes `'other'`; the raw value
+  moves to `context.pipeline` or `context.code`. Host names and codes are unbounded, and a metrics
+  backend keeps one series per label value;
+- it never throws and never rejects into a read or a task: a throw or a rejection of the sink is
+  caught, and the first failure of each method is logged once per Resizer ("resize: the metrics
+  sink of Resizer '…' failed on '…' — further failures of count() are not logged").
+
+**The events.**
+
+| Name | Call | Value | Labels (besides `resizer`) | Context |
+|---|---|---|---|---|
+| `resize.read` | count | 1 per `resolve()` | `pipeline`, `outcome` | `mediaId`, `ready`, `missing`, `stale` |
+| `resize.preview.stale` | count | the stale previews one read found | `pipeline` | `mediaId` |
+| `resize.upload` | timing | ms of `uploadOriginal()` | `outcome`: `stored` or `rejected`; `format` (stored); `code` (rejected, for a module error) | — |
+| `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
+| `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode), `rawFormat` (`format: 'unconfigured'`) |
+| `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
+| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `payloadQueue` (when the task names another queue) |
+| `resize.claim` | timing | ms the worker's loop waited for this task | `queue` | `taskId` |
+
+- **`resize.read` outcomes**, in the order a read decides them: `unknown-pipeline` (the pipeline is
+  not registered), `ready` (nothing was missing or stale), `suppressed` (nothing was left to queue
+  after `beforeEnqueue` and the dropped formats, or the caller passed `enqueueMissing: false`),
+  `no-original` (the media has no `original.storageRef`), `eager-only` (no task queue), then what
+  the task queue said: `enqueued` (a task was added), `in-flight` (a task of the media, pipeline and
+  queue is already active, or, on a queue without `gatesByTask` such as SQS, its gate lock is
+  held) or `failed` (it could not take the task, or the read itself failed, or
+  the Resizer could not start, or its task queue cannot be used).
+- **What a read counts.** A read that found every cell fresh counts `ready`, even when a
+  `beforeEnqueue` tap added a variant and it was queued: the tap's work shows in `resize.task`. In
+  the context, `ready` counts the cells served, stale ones included (so `ready` and `stale`
+  overlap), while `missing` and `stale` count distinct variants. Stale variants are counted before
+  `beforeEnqueue`, so a variant a tap drops still counts as stale.
+- **`resize.variant`** is one variant's time: the wait for its size's resized pixels (one resize,
+  shared by the formats of that size), its encode and its upload. `duplicate` is a variant another
+  worker stored first in a fresh row, `rendered` a `generate({ persist: false })` variant. A
+  variant left out because a row with other signatures holds its identity is `failed` with
+  `RESIZE_WORKER_INCOMPLETE`: that row does not cover it, so the task fails and its retry replaces
+  the row. When the persist itself fails, a variant the store kept before the failure (the append
+  before a failed replace, or the part of a failed append that the reloaded media holds) is
+  `stored`; every other variant it held is `failed` with the error's code.
+- `format` is a configured format, or a decoder id for uploads. A task variant whose format has no
+  encoder settings (an old or foreign payload) is `failed` with `format: 'unconfigured'`, its own
+  format in `context.rawFormat`. `queue` is the queue the worker consumes; a task whose payload
+  names another queue (a replayed or malformed message) keeps that name in `context.payloadQueue`.
+  The queue latency (from due to claim) is not measured: `resize.claim` is the worker's own wait.
+
+**`LogMetrics`** (the default) writes metrics as log lines on a logger: `new LogMetrics(logger, {
+summaryIntervalMs?, debug? })` (`LogMetricsOptions`; defaults `60000` and `false`). An interval
+that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
+- **Summed** per Resizer, never a line of their own: the reads by outcome, the stale previews
+  found, the uploads (stored and rejected, with their bytes), the variants stored, duplicate or
+  rendered (with their bytes) and the claims (with their total wait). Once per window, one `info`
+  line per Resizer that counted something:
+
+  ```text
+  resize: Resizer 'default' over 60 s: reads 1200 (ready 1150, enqueued 12, in-flight 38), stale previews found 40, uploads 25 (31457280 bytes), variants 75 (5242880 bytes), claims 12 (average wait 840 ms)
+  ```
+
+  Empty sections are left out; an upload section with nothing stored reads `uploads 3 (rejected
+  3)`.
+- **Written at once**, one `info` line each, because they are rare and worth reading alone:
+
+  ```text
+  resize: task <taskId> of media <mediaId> <completed|failed|dead> in <ms> ms (Resizer '<r>', queue '<q>', pipeline '<p>', attempt <n>, variants <n>[, code <code>])
+  resize: variant <identity> of media <mediaId> failed in <ms> ms (Resizer '<r>', pipeline '<p>', format '<f>'[, code <code>])
+  ```
+
+  A missing value prints as `?`; a code reduced to `'other'` prints the raw code.
+- **The window** opens with the first summed event and closes when it is written, after
+  `summaryIntervalMs`. Its timer is `unref`ed, so it never keeps a process alive, and no timer runs
+  between windows. `flush()` writes the open window now. The worker flushes the sink of every
+  Resizer it serves when it stops (once per distinct sink), waiting at most 5 s for each; that wait
+  keeps the process alive until the flush settles or the 5 s end. An API process should call
+  `await resizer.metrics.flush?.()` at shutdown, or the open window's counts are lost.
+- **`debug: true`** also writes every call as one `debug` line, `resize metric <name> <value>
+  <labels JSON> <context JSON>`, when the logger has a `debug` method (`ResizeLogger.debug` is
+  optional). It costs two `JSON.stringify` calls per event. The default sink of a
+  `FrameworkResizer` writes to its `logger` option, else the app logger, which always has `debug`,
+  so it pays that cost even when the app drops debug lines: pass `metrics: new LogMetrics(logger)`
+  to skip it.
+
+**`NoopMetrics`** records nothing.
+
+**A custom sink** groups by labels only. A Prometheus sketch with `prom-client`:
+
+```ts
+import { Counter, Histogram } from 'prom-client';
+import { type MetricLabels, ResizeMetrics } from '@adaptivestone/framework-module-resize';
+
+const labelNames = ['event', 'resizer', 'pipeline', 'outcome', 'format', 'mode', 'queue', 'code'];
+const counts = new Counter({ name: 'resize_events_total', help: 'resize events', labelNames });
+const buckets = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]; // ms, not prom-client's seconds
+const timings = new Histogram({ name: 'resize_duration_ms', help: 'resize timings (ms)', labelNames, buckets });
+
+export class PromMetrics extends ResizeMetrics {
+  count(name: string, value: number, labels: MetricLabels = {}) { counts.inc({ event: name, ...labels }, value); }
+  timing(name: string, ms: number, labels: MetricLabels = {}) { timings.observe({ event: name, ...labels }, ms); }
+}
+```
+
+## Freshness
+
+Every preview row records two signatures (see **Preview rows** under [Operations](#operations)):
+`origin`, the original it was made from, and `encodeSig`, the settings it was encoded with. A row
+is **fresh** when both equal what the current settings would record now, and **stale** otherwise.
+A stale row is served while its replacement is made; the replacement takes its place in one write.
+
+**What makes a row stale:**
+- a change in the encode inputs of its row: its format's `encode.formats` entry, the
+  `encode.sharpen` flag of its fit mode, the flatten background (flattened formats), `maxSize`
+  (fit rows) and `limits.resultDimension`. For webp and gif rows also `animated`,
+  `limits.animationFrames` and the animation pixel budget, which is the SMALLER of
+  `limits.sourcePixels` and `limits.inputPixels`: changing the smaller one changes those
+  signatures, changing only the larger one changes nothing;
+- a change of the pipeline's `version`;
+- another `original.storageRef`, or other stored dimensions of the original;
+- a row without signatures (written before `0.3.0-rc.1`).
+
+New bytes under the same `original.storageRef` and at the same size are not detected: after
+replacing an original in place, call `invalidate()` for that media.
+
+**On read.** `resolve()` serves a stale row like a fresh one, with `stale: true` on its
+`ReadyEntry`, and queues its replacement: stale and missing variants form one list, in cell order,
+for `beforeEnqueue`, and one task. After the hook, a variant whose stored row was stale is in
+`decision.stale`, every other one in `decision.missing` (`stale` is set only when there is one, so
+a fresh decision has no `stale` key). `decision.stale` lists the replacements the read asks for,
+as left after the hook: it does not confirm that they were queued (an eager-only Resizer, a task
+queue that cannot be used, `enqueueMissing: false`) or that each old row was served. A stale row
+whose `publicUrl` throws is not served but is still queued: the replacement gets a new ref. A pipeline that is not registered serves every stored
+row as fresh, since nothing can replace it. `prewarm()` reports only fresh rows as `ready`; stale
+ones are required and queued like missing ones.
+
+**The worker and `generate()`** render the stale variants again and count only fresh rows as done.
+The worker judges freshness by its own settings: a queued variant that is fresh for it is skipped
+(nothing is uploaded) and counts as covered. The new rows of a stale identity replace the old ones
+in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists
+the storage refs of the rows the write of `generate()` removed (set only when there are some):
+the outdated rows, or a row of the same identity another worker stored meanwhile. `generate()`
+swaps the rows in the caller's `media.previews` too. Each replacing write logs one `info` line:
+"resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs
+<refs>". Its count and refs are the rows that write removed, so they can include such a
+concurrent copy too.
+
+**Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
+preview objects no row references. A row without an `identity` (written before 0.3.0) stays beside
+its replacement and keeps its file referenced, so a sweep never finds that file: delete such rows
+(and their files) yourself.
+
+**A media without stored dimensions** (`original.width` and `original.height` must both be numbers;
+a stored `null` counts as missing) has no row the read path can prove fresh, since it cannot
+measure the original. Its first read queues one task that downloads and inspects the original (no
+pixel decode, no upload when its rows turn out fresh) and records the dimensions; later reads find
+the rows fresh. A `MediaStore` must therefore save `backfillDims` in `appendPreviews`, also when
+`previews` is empty. A store that drops them makes every read of such a media queue a task that
+downloads the original; the worker then warns once: "resize worker: the media store did not record
+the original's dimensions of media <m> — …". The shipped `MongoMediaStore` drops them too when the
+media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`)
+without `original.width` and `original.height`: Mongoose strips them from the update. Declared
+with a type that does not read back as a number (not Number, Int32 or Mixed; `String`, say, also
+under `strict: false`), they are stored as that type, which the freshness check does not read as
+dimensions. Under `strict: 'throw'`, or with a type Mongoose cannot cast them to (`Boolean`,
+`ObjectId`), the symptom differs: the update is rejected, so the task fails with Mongoose's error,
+is retried and is dead-lettered after `maxAttempts`, and no preview is stored. Its `verify()` warns
+once about such a schema, naming the cause; spread `resizeMediaSchemaFragment`, or declare `width`
+and `height` as `{ type: Number }` in `original`.
+
+**`resolve()` must receive `original` as stored**: the same `storageRef` and dimensions. A
+projection that drops `original.width` and `original.height`, or a ref reshaped by a DTO, makes
+every row stale and queues a task per read that renders nothing. The worker then warns, once per
+pipeline: "resize worker: task <id> of media <m> found every requested preview of pipeline '<p>'
+already fresh — if this repeats, the API and the worker may run different image settings or
+pipeline versions, or resolve() was given the media without its stored original (storageRef,
+width, height)". It may fire once after an eager `generate()` filled variants a read had queued.
+
+**An eager-only host** (no task queue) never regenerates on read: its stale rows are served with
+`stale: true` until it calls `generate()` for that media.
+
+**Rolling out a settings change.** The API and the workers must run the same image settings and
+pipeline versions. Change them with every worker at once: deploy all workers together, or drain
+(stop) the old workers before the new ones start. While two worker versions with different
+settings run side by side (a rolling deploy, a canary), each sees the other's rows as stale and
+makes them again: every read after a task ends queues the previews it finds stale again, and each
+replaced preview costs one render, one upload and one orphaned file (a task replacing several
+previews costs that several times).
+An API ahead of its workers queues tasks that render nothing (the warning above). After a change,
+every stored preview that the change touches regenerates as it is read; that wave shares the queue
+with the previews of new uploads, which wait behind it, so plan worker capacity and storage.
+
+**`isCatalogCovered`** checks identities only, not freshness: a stale row covers its variant
+there. Call `generate()` to bring a catalog up to date; it is idempotent and renders only what is
+missing or stale.
+
+**Mongo `_id`.** Rows that `replacePreviews` writes carry no sub-document `_id`, so a replaced row
+loses the `_id` it had: key preview rows by `identity`, never by `_id`.
+
 ## Operations
 
 - **Task states (Mongo):** `pending → processing → completed`. A row's `active` is `true` from
@@ -1173,9 +1412,9 @@ the `cooldownMs` of the task's own Resizer.
   allocated it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`,
   `retryable: false`). Steps are host code.
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that
-  already exist, and the media store keeps one row per preview identity, so a repeat never
+  already exist fresh, and the media store keeps one row per preview identity, so a repeat never
   duplicates them. A task completes only when every requested
-  variant is stored. When an attempt is only partly successful, its previews are saved and the
+  variant is stored fresh. When an attempt is only partly successful, its previews are saved and the
   next attempt makes only the missing ones.
 - **Retrying a dead task:** after fixing the cause, call `prewarm()` for that media once the
   cooldown (`coordination.cooldownMs`, 10 minutes by default) has ended: on Mongo its `add()` then
@@ -1208,11 +1447,21 @@ await ResizeTask.updateOne(
   which also caps the frames at the larger of the source's and the preview's size), the
   result-dimension cap, the fit box (for fit rows) and the
   pipeline `version`). The worker and `generate()` record them on every row from `0.3.0-rc.1` on,
-  and `resizeMediaSchemaFragment` declares them. The read path does not check them yet. Rows
-  written earlier have no `origin` or `encodeSig`: they are served for now, and a later release's
-  freshness check will regenerate them, so plan the storage cost of rendering them again. Rows
-  without an `identity` (written before 0.3.0) are never removed by `invalidate` or
-  `replacePreviews`: delete their files yourself.
+  and `resizeMediaSchemaFragment` declares them. The read path, `prewarm()`, `generate()` and the
+  worker compare them with what the current settings would record (see [Freshness](#freshness)).
+  Rows written earlier have no `origin` or `encodeSig`, so they are stale: each is served until
+  its replacement is stored, regenerated on its next read, and its old file stays in storage
+  (plan the storage cost and the cleanup). Rows without an `identity` (written before 0.3.0) are
+  never removed by `invalidate` or `replacePreviews`: delete their files yourself.
+- **What a read logs:** a read writes a log line only for what an operator must fix, and only once
+  per Resizer (once more after its task queue is set up again): an unregistered pipeline name
+  (`error`, once per name, for at most 100 names), a format list without `encode.formats` entries
+  (`error`, once per list, for at most 100 lists), and, when the caller passed
+  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. A media without an original
+  logs nothing.
+  Every read is counted instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A
+  stored preview whose `publicUrl` throws, and an enqueue that throws, are still logged on every
+  read. `prewarm()` logs as before.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the

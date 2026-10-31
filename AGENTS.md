@@ -106,7 +106,11 @@ gets the full box its steps were written for. To hand the private original to it
    `drivers` (custom drivers by name, e.g. `{ storage: { gcs: GcsStorage } }`; the file's
    `storage: { driver: 'gcs', … }` then `satisfies FrameworkResizeConfig<{ storage: { gcs: typeof
    GcsStorage } }>`; every `FrameworkResizer` of the process must pass the same `drivers.queue`
-   map, else `RESIZE_DRIVER_CONFLICT`). `resizer.queue` is gone: read `resizer.queueName`.
+   map, else `RESIZE_DRIVER_CONFLICT`), `metrics` (a `ResizeMetrics` sink for reads, uploads,
+   variants and task outcomes; default a `LogMetrics` on its `logger` option, else the app logger,
+   with debug lines on: one summary `info` line per window and one per task outcome;
+   `new NoopMetrics()` turns it off; only `undefined` means the default, `null` is
+   `RESIZE_METRICS_INVALID`; see the README `Metrics` section). `resizer.queue` is gone: read `resizer.queueName`.
    `resizer.tasks` may be a `RoutingTaskQueue` (several backends in `queues`): it has no
    `release`; ask `carrierOf(resizer.tasks, name)` for a name's backend.
    A `queueName` option is readable at once; a name from the config file only after
@@ -266,6 +270,7 @@ gets the full box its steps were written for. To hand the private original to it
    sub-documents must also give them `identity`, `origin` and `encodeSig` (each
    `{ type: String }`), or `verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED`: the media store
    keeps one row per preview identity, and the two signatures record what each row was made from.
+   Give them `fit` (`{ type: Boolean }`) too; `verify()` logs one warning without it.
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model
    declares its indexes (and so does the framework's `Lock` model, used only beside a task queue
@@ -362,7 +367,13 @@ update host models, DTOs, custom drivers, and API/worker processes together. No 
 record reader or migration is included.
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
-variants are enqueued and the decision is returned immediately:
+variants are enqueued and the decision is returned immediately. A stale stored preview (made from
+another original, or with other image settings or pipeline `version`) is still served, with
+`stale: true` on its `ReadyEntry`, and its replacement is requested with the missing variants (both
+go through `beforeEnqueue`); after the hook the replacements are in `decision.stale` (set only when
+there is one), the rest in `decision.missing`. Being listed there does not confirm a task was
+queued (the gate, a cooldown or a queue error can leave it unqueued). A read logs only what an operator must fix, once per
+Resizer; every read is counted as the `resize.read` metric with its outcome:
 
 ```ts
 import { formatPictureUrls, getResizer } from '@adaptivestone/framework-module-resize';
@@ -455,8 +466,10 @@ import { resizeMediaPaths } from '@adaptivestone/framework-module-resize/framewo
 File.find().select(['mediaType', ...resizeMediaPaths]);
 ```
 
-Remove a media's stored previews (e.g. after a pipeline's output changed, or before deleting the
-media). `invalidate` never deletes files and never queues: delete the returned refs yourself:
+Remove a media's stored previews (e.g. after a pipeline's output changed, after replacing an
+original in place, or before deleting the media). New bytes under the same `original.storageRef`
+and at the same size are not detected as stale, so call `invalidate` after such a replacement.
+`invalidate` never deletes files and never queues: delete the returned refs yourself:
 
 ```ts
 const refs = await getResizer().invalidate({ media: fileDoc, pipeline: 'default' }); // omit pipeline: every pipeline
@@ -474,11 +487,15 @@ without it: `RESIZE_MEDIA_REPLACE_MISSING`). A custom model-shaped `MongoMediaMo
 an update pipeline: `replacePreviews` calls `findOneAndUpdate` with an array update and
 `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`
 (after an optional `castObject`; `storageRef` and `filters` are stored as given), and a
-`findOneAndUpdate` middleware on the media model sees that call too. Old rows: rows written before
-`0.3.0-rc.1` have no `origin` or `encodeSig`; they are served for now and will be regenerated once
-a later release's freshness check ships (plan the storage cost). Rows without an `identity`
-(written before 0.3.0) are never removed by `invalidate` or `replacePreviews`: the host deletes
-their files itself.
+`findOneAndUpdate` middleware on the media model sees that call too. A custom `MediaStore` must
+also save `backfillDims` in `appendPreviews` whenever it is given, also with `previews: []`: the
+freshness check needs the original's dimensions. Old rows: rows written before `0.3.0-rc.1` have
+no `origin` or `encodeSig`, so they are stale: served until replaced, regenerated on their next
+read, and their old files stay in storage (clean up from the "replaced … outdated preview(s)" log
+line, or sweep preview objects no row references; see the README `Freshness` section). Rows
+without an `identity` (written before 0.3.0) are never removed by `invalidate` or
+`replacePreviews`, and a sweep never finds their files: the host deletes those rows and files
+itself.
 
 Hooks are typed — register at construction (`hooks:`) or later via `getResizer().hook(name, fn)`.
 Waterfalls (read path, real `ctx`): `resolveSizes`, `beforeEnqueue`, `formatPublicUrls`.
@@ -490,11 +507,27 @@ Pipelines: `beforeSteps` run once on the decoded first frame, as a `Raster` in a
 pixels, not a library object, so the engine stays replaceable); `variantSteps` run on each size's
 pixels as a Sharp instance (its `metadata()` reports the preview's size, `format: 'raw'` and no
 EXIF), before encode. An optional pipeline `version` (string) is part of each preview row's
-`encodeSig`: bump it when a step's output changes (stored previews are not regenerated yet).
+`encodeSig`: bump it when a step's output changes, and the pipeline's stored previews are
+regenerated on their next read.
 
 ```ts
 import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
 // beforeSteps: [async (r) => sharpToRaster(rasterToSharp(r).blur(5))]
+```
+
+Rolling out a change of image settings or of a pipeline `version`: the API and the workers must
+run the same settings. Deploy every worker at once, or change the settings only after the old
+workers have stopped. While two worker versions with different settings run side by side, each
+re-makes the other's rows: every read after a task ends queues them again, and each replaced
+preview costs one render, one upload and one orphaned file. The module never deletes the old files.
+
+Metrics: the default sink writes log lines. To send them elsewhere, or to turn them off:
+
+```ts
+import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize';
+// new FrameworkResizer({ metrics: new NoopMetrics() })                    // off
+// new FrameworkResizer({ metrics: new LogMetrics(logger) })               // no debug lines
+// API shutdown: await getResizer().metrics.flush?.()                      // write the open summary
 ```
 
 ## Rules (violations cause real incidents)
@@ -568,7 +601,7 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
 | `RESIZE_CONFIG_QUEUE_UNKNOWN` on first use or from `verify()` | the Resizer's queue name (its `queueName` option, or its file's `queue`, or the implied `'default'` when the file sets none) is not an entry of `queues` in `src/config/resize.ts` — add `queues.<name>` (e.g. `queues: { default: { driver: 'database' } }`), set `queue`/`queueName` to a defined name, or `queue: false` (`tasks: false` when the name came from the option) for eager only |
 | `RESIZE_LOCKS_REQUIRED` from `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it) | a Resizer whose task queue has no `gatesByTask` (e.g. `SqsTaskQueue`) has no `locks`, and it takes one gate lock per media, pipeline and queue — spread `mongoParts(connection, { mediaModel })` (its `locks`) or pass a `LockStore`, or drop `tasks` for an eager-only Resizer. `MongoTaskQueue` needs no `locks`; a `FrameworkResizer` builds `FrameworkLockStore` itself beside a task queue without `gatesByTask` (the SQS driver, or a custom queue without the flag). On a `RoutingTaskQueue` the need is per queue name: `verify()` rejects only when the Resizer's own queue is on a backend without `gatesByTask`, the worker only for such a queue it consumes, and a call on such a name queues nothing (the `prewarm()` issue `RESIZE_ENQUEUE_LOCK_FAILED` with `causeCode: 'RESIZE_LOCKS_REQUIRED'`) |
 | `RESIZE_CONFIG_QUEUE_INVALID` or `RESIZE_CONFIG_QUEUE_LEASE_INVALID` | the queue timing is invalid — fix the key the message names (in `queues.<name>` of `src/config/resize.ts` or of a `createResizer` config, or the task queue's `timing` / `getTiming`; for a builder route of a `RoutingTaskQueue`, the router's `getTiming` option). A config file fails on first use with the rest of the file. A task queue's own timing is checked per queue name: `verify()` rejects for the Resizer's own queue, worker start for each queue it consumes, and each call on the name fails it (`prewarm()` reports `RESIZE_ENQUEUE_INTERNAL_ERROR`, not retryable; `resolve()` logs it once per queue name, on the first read of that queue, and serves stored previews). It is no longer logged when the Resizer starts |
-| `RESIZE_MEDIA_REPLACE_MISSING` from `verify()`, at worker start, or from `invalidate` | a custom `MediaStore` has no `replacePreviews(mediaId, identities, rows)`, required since 0.3.0 — implement it (one atomic write per media; resolve `{ stored, removed }`; see the README `MediaStore` contract), or extend `MongoMediaStore` |
+| `RESIZE_MEDIA_REPLACE_MISSING` from `verify()`, at worker start, or from `invalidate`, or from `generate()` and the worker when a stale preview is replaced | a custom `MediaStore` has no `replacePreviews(mediaId, identities, rows)`, required since 0.3.0 — implement it (one atomic write per media; resolve `{ stored, removed }`; see the README `MediaStore` contract), or extend `MongoMediaStore` |
 | `RESIZE_MEDIA_REPLACE_RESULT_INVALID` | a custom `MediaStore.replacePreviews` resolved with something other than `{ stored, removed }` (two arrays) — resolve with the rows it stored and removed (`[]` when none), `removed` being exactly what the write removed |
 | a `findOneAndUpdate` middleware on the media model throws on an array update, or `invalidate` fails on a custom model-shaped `MongoMediaModel` | `replacePreviews` (which `invalidate` uses) sends an update pipeline: `findOneAndUpdate(filter, [ … ], { updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } })`, after casting the rows with the model's optional `castObject` — make the model and its middleware accept an array update |
 | `RESIZE_MEDIA_APPEND_RESULT_INVALID` | a custom `MediaStore.appendPreviews` resolved with something other than an array — resolve with the previews it stored (`[]` when none) |
@@ -588,8 +621,13 @@ import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-re
 | `RESIZE_MONGO_MODEL_OUTDATED` from `verify()`, at worker start, or logged once by `add()` (every add is then unconfirmed and queues nothing until the model is fixed; claims reject with it), or `resize-scaffold --check` reports drift in `src/models/ResizeTask.ts` | a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `availableAt`, `active` or `cooldownUntil` fields: port them (and the `{ queue, status, availableAt }` index and the gate index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx resize-scaffold --eject`. Right after the upgrade `--check` also reports every ejected model without `startedAt` and `finishedAt` — intended (such a model keeps working; the times are dropped and `RESIZE_MONGO_MODEL_OUTDATED` does not list them): add both as `{ type: Date }`, or move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`, then restore your customizations (re-running `--eject` alone never overwrites the file) |
 | `resize-scaffold --check` reports drift in `src/config/resize.ts` or a `resize.<NODE_ENV>.ts` override ("uses the old config shape") right after the upgrade | intended, for every config scaffolded by an earlier version: a top-level `queue: { … }` object (a `queue` entry inside `queues` is fine), or `defaultFrameworkResizeConfig` imported from `…/config/resize.js` (only full-line `//` comments are skipped) — rewrite it to the new shape (step 5), or move it aside, re-run `npx resize-scaffold` and copy your settings back. The config file is never diffed, and a second Resizer's `configName` file is not checked: review it yourself |
 | `RESIZE_MONGO_NOT_CONNECTED` from `verify()` or at worker start | the Mongoose connection of the `ResizeTask` model is closed (never opened, or disconnected: at once), or failed to open (after the driver's `serverSelectionTimeoutMS`, 30 s by default; the message names the driver's error) — call `verify()` after the connection has opened (after `Server.init()` in a framework host); an opening connection is awaited |
-| `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` from `verify()` or at worker start | the media schema declares preview rows as strict sub-documents without `identity`, `origin` or `encodeSig` (the message names them; a mixed or plain `previews` array, or rows with `strict: false`, pass) — spread the current `resizeMediaSchemaFragment`, or add each missing field to the row as `{ type: String }` |
-| previews written before `0.3.0-rc.1` (no `origin` / `encodeSig`), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are served for now and will be regenerated once a later release's freshness check ships (plan the storage cost); rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews` — delete their files yourself |
+| `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` from `verify()` or at worker start | the media schema declares preview rows as strict sub-documents without `identity`, `origin` or `encodeSig` (the message names them; a mixed or plain `previews` array, or rows with `strict: false`, pass) — spread the current `resizeMediaSchemaFragment`, or add each missing field to the row as `{ type: String }`. A strict row schema without `fit` does not throw: it logs one warning (fit rows then lose their flag and are judged by either signature); add `fit: { type: Boolean }` |
+| previews written before `0.3.0-rc.1` (no `origin` / `encodeSig`), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are stale — served until replaced and regenerated on their next read; their old files stay (clean up from the "replaced … outdated preview(s)" log line, or sweep preview objects no row references). Rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a sweep never finds their files — delete those rows and files yourself |
+| `RESIZE_METRICS_INVALID` at construction | the `metrics` option is not a sink (`null`, or no `count()` and `timing()` functions), or `new LogMetrics(logger, { summaryIntervalMs })` got an interval that is not a positive safe integer — pass `new LogMetrics(logger)`, `new NoopMetrics()` or your own `ResizeMetrics`, or leave `metrics` out for the default |
+| previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or before `0.3.0-rc.1` is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep preview objects no row references. The wave shares the queue with new uploads' previews: plan worker capacity |
+| one task per read that renders nothing, and the warning "found every requested preview … already fresh" | the API and the worker run different image settings or pipeline versions (deploy them together), or `resolve()` got the media without its stored original (a projection that drops `original.width` / `height`, or a reshaped `storageRef`) — pass `original` as stored |
+| previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: every read after a task ends queues them again, and each replaced preview costs one render, one upload and one orphaned file — deploy every worker at once, or change settings only after the old workers have stopped |
+| the warning "the media store did not record the original's dimensions", or tasks that fail with a Mongoose `StrictModeError` or `CastError`, are retried and dead-lettered with no previews | a custom `MediaStore` drops `backfillDims` in `appendPreviews` (also with `previews: []`), so every read of such a media queues a task that downloads the original — make it save the dimensions on the original. The shipped `MongoMediaStore` drops them too when the media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`) without `width` and `height`, or stores them with the wrong type when they are declared as a type that does not read back as a number (not Number, Int32 or Mixed). Under `strict: 'throw'`, or with a type Mongoose cannot cast them to (`Boolean`, `ObjectId`), the backfill is rejected instead: the task fails, is retried and is dead-lettered after `maxAttempts`. In each case its `verify()` warns once, naming the cause — spread `resizeMediaSchemaFragment`, or declare `width` and `height` as `{ type: Number }` in `original` |
 | `RESIZE_MONGO_LOCK_MODEL_OUTDATED` from `verify()` or at worker start | the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
 | `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |

@@ -1,12 +1,18 @@
 // The read path. `resolve` partitions the requested size×format grid into ready (served from a
 // stored preview) vs missing (handed to the Dispatcher), threading three host waterfalls
-// (resolveSizes / beforeEnqueue / formatPublicUrls) and never throwing into the caller's read.
+// (resolveSizes / beforeEnqueue / formatPublicUrls) and never throwing into the caller's read. A
+// stale stored preview (made from another original or with other settings) is still served,
+// marked stale, and its replacement is queued with the missing ones.
 // `prewarm` is the request half of pre-warming at upload: it expands the catalog through the same
-// waterfalls and hands what is missing to the Dispatcher, which confirms what was queued. The
-// original itself is never served: an original smaller than the box still gets a preview, made by
-// the worker at the original's own size. Every URL comes from the PURE, I/O-free
+// waterfalls and hands what is missing or stale to the Dispatcher, which confirms what was
+// queued. The original itself is never served: an original smaller than the box still gets a
+// preview, made by the worker at the original's own size. Every URL comes from the PURE, I/O-free
 // storage.publicUrl of a stored preview. A Reader takes its parts explicitly and knows no Resizer.
+// Every resolve() counts one `resize.read` with its outcome. A read writes a log line only for what
+// an operator must fix, and only once per Reader: an unregistered pipeline name, a dropped format
+// list, a missing task queue the caller asked to queue to.
 import type { Catalog } from './catalog.ts';
+import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import {
   type Dispatcher,
@@ -18,9 +24,11 @@ import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import type { HookBus } from './hooks.ts';
 import { getSizeKey, requireMediaId, toMissingPreview } from './images.ts';
+import { NoopMetrics } from './metrics.ts';
 import type { PipelineRegistry } from './pipelines.ts';
 import type {
   MissingPreview,
+  Preview,
   PreviewScope,
   PrewarmOpts,
   PrewarmResult,
@@ -44,46 +52,89 @@ export interface ReaderDeps {
   logger: ResizeLogger;
   name: string; // the Resizer's name: part of every preview identity
   queueName: string; // the Resizer's queue for missing variants, unless a call names its own
+  // Where each read is counted (a Resizer passes its bound sink); default: nothing is recorded.
+  metrics?: ResizeMetrics;
 }
+
+/**
+ * What became of one read, in the order resolve() decides it: the pipeline is not registered;
+ * every requested cell was served; nothing was left to queue (a beforeEnqueue tap, unconfigured
+ * formats, or `enqueueMissing: false`); the media has no stored original; there is no task queue;
+ * a task was added; a task of the media, pipeline and queue is already active; or the task queue
+ * could not take it (or the read itself failed).
+ */
+export type ReadOutcome =
+  | 'ready'
+  | 'enqueued'
+  | 'in-flight'
+  | 'suppressed'
+  | 'eager-only'
+  | 'no-original'
+  | 'unknown-pipeline'
+  | 'failed';
+
+// What one read counts: its media, and the distinct variants it found missing and stale.
+interface ReadCounts {
+  mediaId?: string;
+  missing: number;
+  stale: number;
+}
+
+// A once-log keeps at most this many keys: host input (pipeline names, format lists) is unbounded.
+const ONCE_LOG_KEYS = 100;
+
+const noMetrics = new NoopMetrics();
 
 /** Serves the stored previews of one Resizer and requests the missing ones. Never throws. */
 export class Reader {
   readonly #deps: ReaderDeps;
+  readonly #metrics: ResizeMetrics;
+  // The logs a read writes once per Reader: each would repeat on every read until the host
+  // changes its code or config, so the read metrics count the reads instead.
+  readonly #loggedPipelines = new Set<string>();
+  readonly #loggedFormats = new Set<string>();
+  #loggedEagerOnly = false;
 
   constructor(deps: ReaderDeps) {
     this.#deps = deps;
+    this.#metrics = deps.metrics ?? noMetrics;
   }
 
   /**
-   * Partition the requested grid into ready vs missing, queue the missing set, and let the host
-   * shape the response. The ENTIRE body runs inside one try/catch (the never-throw guarantee): on
-   * any unexpected internal error it logs and returns the safe value
+   * Partition the requested grid into ready vs missing, queue the missing and stale set, and let
+   * the host shape the response. The ENTIRE body runs inside one try/catch (the never-throw
+   * guarantee): on any unexpected internal error it logs and returns the safe value
    * `{ decision: { ready-so-far, missing: [] }, output: undefined }` instead of rejecting into the
-   * caller's read.
+   * caller's read. Either way the read is counted once, with its outcome.
    */
   async resolve(
     opts: ResolveOpts,
   ): Promise<{ decision: ReadDecision; output: unknown }> {
-    const { catalog, dispatcher, hooks, pipelines, storage, logger, name } =
-      this.#deps;
+    const { catalog, hooks, pipelines, storage, logger, name } = this.#deps;
     // Built incrementally so the never-throw catch can still return what was produced.
     const ready: ReadyEntry[] = [];
     const decision: ReadDecision = { ready, missing: [] };
+    // What the read counts. `opts` may be missing (a JS host): the catch below counts it too.
+    const read: ReadCounts = { missing: 0, stale: 0 };
+    // The pipeline the catch below counts: read once, inside the guard (a getter may throw).
+    let pipelineLabel = 'default';
 
     try {
       // Inside the guard, so a missing options object also returns the safe empty decision.
       const { media } = opts;
       const ctx = opts.ctx ?? {};
       const pipeline = opts.pipeline ?? 'default';
+      pipelineLabel = pipeline;
       // Inside the never-throw try: a media with no id/_id logs + returns the safe empty decision
       // rather than enqueueing under the literal 'undefined' key.
       const mediaId = requireMediaId(media);
+      read.mediaId = mediaId;
       // A pipeline this process does not know (e.g. registered only in another process) has
       // unknown steps: serve what is already stored for it, but no task can be trusted to render it.
       const knownPipeline = pipelines.has(pipeline);
-      if (!knownPipeline) {
+      if (!knownPipeline && firstTime(this.#loggedPipelines, pipeline)) {
         logger.error(
-          `resize resolve: pipeline '${pipeline}' is not registered on Resizer '${name}' — serving stored previews only, nothing is queued`,
+          `resize resolve: pipeline '${pipeline}' is not registered on Resizer '${name}' — serving stored previews only, nothing is queued (logged once per pipeline name)`,
         );
       }
 
@@ -98,15 +149,30 @@ export class Reader {
       const { formats, dropped } = catalog.configuredFormats(
         opts.formats ?? undefined,
       );
-      logUnconfiguredFormats(logger, 'resize resolve', dropped, '');
+      logUnconfiguredFormats(
+        logger,
+        'resize resolve',
+        dropped,
+        '',
+        this.#loggedFormats,
+      );
 
-      // The usable stored previews of this scope, by identity. Stored previews keep the scope
-      // they were rendered in, so another pipeline or Resizer never matches them.
+      // The usable stored previews of this scope, by identity, fresh or stale. Stored previews
+      // keep the scope they were rendered in, so another pipeline or Resizer never matches them.
+      // An unregistered pipeline serves every stored row as fresh: nothing can replace it.
       const scope: PreviewScope = { resizer: name, pipeline };
-      const previewMap = catalog.storedPreviews(media, scope);
+      const { fresh: previewMap, stale: staleMap } = knownPipeline
+        ? catalog.splitStored(media, scope)
+        : {
+            fresh: catalog.storedPreviews(media, scope),
+            stale: new Map<string, Preview>(),
+          };
 
-      const missing: MissingPreview[] = [];
-      const missingSeen = new Set<string>();
+      // Missing and stale variants, in cell order: one list for the hook and one task.
+      const toQueue: MissingPreview[] = [];
+      const queuedIdentities = new Set<string>();
+      const staleIdentities = new Set<string>();
+      let missingCount = 0;
 
       // Per requested size × format.
       for (const size of sizes) {
@@ -122,16 +188,24 @@ export class Reader {
             format,
             filters: size.filters,
           });
-          const existing = previewMap.get(identity);
+          const fresh = previewMap.get(identity);
+          const existing = fresh ?? staleMap.get(identity);
+          // A stale row joins the queue before its URL is built: when the driver rejects its ref,
+          // the replacement still gets a new one.
+          if (!fresh && existing && !queuedIdentities.has(identity)) {
+            queuedIdentities.add(identity);
+            staleIdentities.add(identity);
+            toQueue.push(toMissingPreview(size, sizeKey, format));
+          }
           if (existing) {
-            // exists → serve the generated preview.
+            // exists → serve the generated preview, stale or not.
             let url: string;
             try {
               url = storage.publicUrl(existing.storageRef);
             } catch (err) {
               // A ref the driver rejects (e.g. a bucket no longer allowlisted) loses only this
-              // cell. It is neither ready nor missing: the preview is stored, so queueing it again
-              // would not help.
+              // cell. A fresh one is neither ready nor missing: the preview is stored, so queueing
+              // it again would not help.
               logger.error(
                 `resize resolve: publicUrl failed for stored preview ${identity} of media ${mediaId} — skipping it`,
                 err,
@@ -148,6 +222,9 @@ export class Reader {
             if (size.filters) {
               entry.filters = size.filters;
             }
+            if (!fresh) {
+              entry.stale = true;
+            }
             ready.push(entry);
             continue;
           }
@@ -156,61 +233,62 @@ export class Reader {
           }
 
           // missing → deduped by identity, whatever the original's size or the reader's ctx.
-          if (missingSeen.has(identity)) {
+          if (queuedIdentities.has(identity)) {
             continue;
           }
-          missingSeen.add(identity);
-          missing.push(toMissingPreview(size, sizeKey, format));
+          queuedIdentities.add(identity);
+          missingCount += 1;
+          toQueue.push(toMissingPreview(size, sizeKey, format));
         }
       }
+      read.missing = missingCount;
+      read.stale = staleIdentities.size;
+      this.#countStale(pipeline, mediaId, read.stale);
+      // Decided before the tap runs: a tap may change the list in place, and an emptied list
+      // still means the read found work to do.
+      const workNeeded = toQueue.length > 0;
 
-      // beforeEnqueue — REASSIGN the (post-hook) missing set so the enqueue below and the host's
-      // formatPublicUrls both see exactly what was enqueued. An unknown pipeline skips the hook,
-      // so a tap cannot add variants that would be queued for it; a variant the tap added or
+      // beforeEnqueue — REASSIGN the (post-hook) queue list so the enqueue below and the host's
+      // formatPublicUrls both see exactly what was enqueued: a variant whose identity was stale
+      // goes to `decision.stale`, the rest to `decision.missing`. An unknown pipeline skips the
+      // hook, so a tap cannot add variants that would be queued for it; a variant the tap added or
       // rewrote to an unconfigured format is dropped.
+      let queued: MissingPreview[] = [];
       if (knownPipeline) {
         const { configured, unconfigured } = catalog.splitConfigured(
           (await hooks.runWaterfall(
             'beforeEnqueue',
-            missing,
+            toQueue,
             ctx,
           )) as MissingPreview[],
         );
-        logUnconfiguredTapFormats(logger, 'resize resolve', unconfigured);
-        decision.missing = configured;
+        logUnconfiguredTapFormats(
+          logger,
+          'resize resolve',
+          unconfigured,
+          this.#loggedFormats,
+        );
+        queued = configured;
+        const split = splitStale(configured, staleIdentities, (variant) =>
+          catalog.identity(scope, variant),
+        );
+        decision.missing = split.missing;
+        if (split.stale.length > 0) {
+          decision.stale = split.stale;
+        }
       }
 
-      // Enqueue the missing variants. Default follows construction: a task queue (so a
-      // Dispatcher) means lazy mode (enqueue), none means eager-only (do not log-on-every-read).
-      // A task queue that cannot be used queues nothing; the Resizer logged why when it started.
-      const enqueueMissing = opts.enqueueMissing ?? dispatcher !== undefined;
-      if (enqueueMissing && decision.missing.length > 0) {
-        if (media.original?.storageRef == null) {
-          logger.info(
-            `resize resolve: media ${mediaId} has no original storage ref — nothing enqueued`,
-          );
-        } else if (!dispatcher) {
-          if (!this.#deps.queueFailure) {
-            logger.warn(
-              'resize resolve: missing previews but no task queue is configured — they stay placeholders (eager-only host? give the Resizer `tasks` for lazy mode)',
-            );
-          }
-        } else {
-          try {
-            await dispatcher.enqueue({
-              mediaId,
-              pipeline,
-              previews: decision.missing,
-              queue: opts.queue ?? this.#deps.queueName,
-            });
-          } catch (err) {
-            // enqueue is internally guarded and should never reach here; belt-and-suspenders.
-            logger.error(
-              'resize resolve: enqueue threw unexpectedly (read continues)',
-              err,
-            );
-          }
-        }
+      let outcome: ReadOutcome = 'unknown-pipeline';
+      if (knownPipeline) {
+        const result = await this.#queueMissing(
+          opts,
+          mediaId,
+          pipeline,
+          queued,
+        );
+        // Every requested cell was served fresh; a variant a tap added (queued above) does not
+        // change it.
+        outcome = workNeeded ? result : 'ready';
       }
 
       // The host turns the decision into its response shape. No tap / tap throws →
@@ -222,6 +300,7 @@ export class Reader {
         'optional',
       );
 
+      this.#countRead(pipeline, outcome, read, ready.length);
       return { decision, output };
     } catch (err) {
       // Never-throw guarantee: the read must not break on an internal error.
@@ -230,21 +309,112 @@ export class Reader {
         'resize resolve: unexpected internal error — returning the safe empty decision',
         err,
       );
+      this.#countRead(pipelineLabel, 'failed', read, ready.length);
       const safe: ReadDecision = { ready, missing: [] };
       return { decision: safe, output: undefined };
     }
   }
 
   /**
-   * Pre-warm the catalog at UPLOAD: queue every missing variant without blocking on image work,
-   * and report each requested variant (ready / accepted / not required / unconfirmed, with task
-   * receipts and issues): every missing identity is either confirmed by a task receipt or
-   * explicit. A task already in flight for the media, pipeline and queue confirms only the
-   * variants it holds (the queue's findActive() reports them); a held gate lock never counts as
-   * queued. Uses
-   * the read path's `resolveSizes` / `beforeEnqueue` waterfalls. NEVER throws: an upload
-   * must not fail because pre-warming hiccuped, so an unexpected error becomes
-   * `status: 'incomplete'` with a RESIZE_ENQUEUE_INTERNAL_ERROR issue.
+   * Queue the variants a read found missing or stale, and say what became of them. By default a Resizer
+   * with a task queue (so a Dispatcher) queues them; one without serves what is stored, and warns
+   * once only when the caller asked to queue. A task queue that cannot be used queues nothing; the
+   * Resizer logged why when it started.
+   */
+  async #queueMissing(
+    opts: ResolveOpts,
+    mediaId: string,
+    pipeline: string,
+    previews: MissingPreview[],
+  ): Promise<ReadOutcome> {
+    const { dispatcher, queueFailure, logger } = this.#deps;
+    if (previews.length === 0 || opts.enqueueMissing === false) {
+      return 'suppressed';
+    }
+    if (opts.media.original?.storageRef == null) {
+      return 'no-original';
+    }
+    if (!dispatcher) {
+      if (queueFailure) {
+        return 'failed';
+      }
+      if (opts.enqueueMissing === true && !this.#loggedEagerOnly) {
+        this.#loggedEagerOnly = true;
+        logger.warn(
+          'resize resolve: missing or stale previews but no task queue is configured — missing ones stay placeholders and stale ones are not replaced (eager-only host? give the Resizer `tasks` for lazy mode; logged once)',
+        );
+      }
+      return 'eager-only';
+    }
+    try {
+      const { outcome } = await dispatcher.enqueueWithOutcome({
+        mediaId,
+        pipeline,
+        previews,
+        queue: opts.queue ?? this.#deps.queueName,
+      });
+      return outcome;
+    } catch (err) {
+      // enqueueWithOutcome is internally guarded and should never reach here; belt-and-suspenders.
+      logger.error(
+        'resize resolve: enqueue threw unexpectedly (read continues)',
+        err,
+      );
+      return 'failed';
+    }
+  }
+
+  /** Count one read. The sink a Resizer passes never throws; a bare one must not break the read. */
+  #countRead(
+    pipeline: string,
+    outcome: ReadOutcome,
+    read: ReadCounts,
+    ready: number,
+  ): void {
+    try {
+      this.#metrics.count(
+        'resize.read',
+        1,
+        { pipeline, outcome },
+        {
+          ...(read.mediaId === undefined ? {} : { mediaId: read.mediaId }),
+          ready,
+          missing: read.missing,
+          stale: read.stale,
+        },
+      );
+    } catch {
+      // A Reader built by hand with a sink that throws loses only the count.
+    }
+  }
+
+  /** Count the stale previews one read found, when it found any; guarded like #countRead. */
+  #countStale(pipeline: string, mediaId: string, stale: number): void {
+    if (stale === 0) {
+      return;
+    }
+    try {
+      this.#metrics.count(
+        'resize.preview.stale',
+        stale,
+        { pipeline },
+        { mediaId },
+      );
+    } catch {
+      // A Reader built by hand with a sink that throws loses only the count.
+    }
+  }
+
+  /**
+   * Pre-warm the catalog at UPLOAD: queue every missing or stale variant (only a fresh stored
+   * preview is ready) without blocking on image work, and report each requested variant (ready /
+   * accepted / not required / unconfirmed, with task receipts and issues): every missing or stale
+   * identity is either confirmed by a task receipt or explicit. A task already in flight for the
+   * media, pipeline and queue confirms only the variants it holds (the queue's findActive()
+   * reports them); a held gate lock never counts as queued. Uses the read path's `resolveSizes` /
+   * `beforeEnqueue` waterfalls. NEVER throws: an upload must not fail because pre-warming
+   * hiccuped, so an unexpected error becomes `status: 'incomplete'` with a
+   * RESIZE_ENQUEUE_INTERNAL_ERROR issue.
    */
   async prewarm(opts: PrewarmOpts): Promise<PrewarmResult> {
     const { catalog, dispatcher, hooks, pipelines, logger, name } = this.#deps;
@@ -310,7 +480,8 @@ export class Reader {
         });
       }
 
-      const readyIdentities = catalog.storedIdentities(media, scope);
+      // Only a fresh stored preview is ready: a stale one is required and queued like a missing one.
+      const readyIdentities = catalog.freshIdentities(media, scope);
       const ready = requestedBeforePolicy.filter((preview) =>
         readyIdentities.has(identityOf(preview)),
       );
@@ -519,19 +690,26 @@ function withUnconfiguredFormats(
 /**
  * Name the requested formats without an `encode.formats` entry in one logged error. Per-call
  * formats are open strings, so an alias such as 'jpg' or an arbitrary id is dropped, never
- * queued or encoded without the configured options.
+ * queued or encoded without the configured options. With `seen`, each list is logged once (a
+ * read repeats the same list on every request).
  */
 function logUnconfiguredFormats(
   logger: ResizeLogger,
   label: string,
   formats: readonly unknown[],
   origin: string,
+  seen?: Set<string>,
 ): void {
-  if (formats.length > 0) {
-    logger.error(
-      `${label}: formats ${JSON.stringify(formats)}${origin} have no encode.formats entry — skipped (use a configured Sharp format id, e.g. 'jpeg', not 'jpg')`,
-    );
+  if (formats.length === 0) {
+    return;
   }
+  const list = JSON.stringify(formats);
+  if (seen && !firstTime(seen, `${label}${origin} ${list}`)) {
+    return;
+  }
+  logger.error(
+    `${label}: formats ${list}${origin} have no encode.formats entry — skipped (use a configured Sharp format id, e.g. 'jpeg', not 'jpg')`,
+  );
 }
 
 /**
@@ -543,11 +721,54 @@ function logUnconfiguredTapFormats(
   logger: ResizeLogger,
   label: string,
   unconfigured: readonly MissingPreview[],
+  seen?: Set<string>,
 ): void {
   logUnconfiguredFormats(
     logger,
     label,
     [...new Set(unconfigured.map((variant) => variant?.format))],
     ' from a beforeEnqueue tap',
+    seen,
   );
+}
+
+/**
+ * Split the variants a read queues: one whose identity was stale on this read is a replacement,
+ * every other one is missing. A variant whose identity cannot be built (a malformed tap result)
+ * counts as missing.
+ */
+function splitStale(
+  variants: readonly MissingPreview[],
+  staleIdentities: ReadonlySet<string>,
+  identityOf: (variant: MissingPreview) => string,
+): { stale: MissingPreview[]; missing: MissingPreview[] } {
+  const stale: MissingPreview[] = [];
+  const missing: MissingPreview[] = [];
+  for (const variant of variants) {
+    let identity: string | undefined;
+    if (staleIdentities.size > 0) {
+      try {
+        identity = identityOf(variant);
+      } catch {
+        identity = undefined;
+      }
+    }
+    (identity !== undefined && staleIdentities.has(identity)
+      ? stale
+      : missing
+    ).push(variant);
+  }
+  return { stale, missing };
+}
+
+/**
+ * True the first time `key` is seen, which it then records, while `seen` holds fewer than
+ * ONCE_LOG_KEYS keys: past that, nothing new is logged.
+ */
+function firstTime(seen: Set<string>, key: string): boolean {
+  if (seen.has(key) || seen.size >= ONCE_LOG_KEYS) {
+    return false;
+  }
+  seen.add(key);
+  return true;
 }

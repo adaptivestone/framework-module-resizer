@@ -220,21 +220,39 @@ export class Dispatcher {
    * 0 when nothing was added: a task of this media, pipeline and queue is in flight, its gate lock
    * is held, the add or the lock failed (logged), or nothing carries the queue, its backend failed
    * to build, its timing is invalid or its backend needs a lock store there is not (each logged
-   * once per queue name). resolve() ignores the count. Never throws.
+   * once per queue name). Never throws.
    */
   async enqueue(req: DispatchRequest): Promise<number> {
+    return (await this.enqueueWithOutcome(req)).added;
+  }
+
+  /**
+   * enqueue(), also saying what became of the request, as a read counts it: `enqueued` (a task
+   * was added), `in-flight` (a task of this media, pipeline and queue is active, or another
+   * request holds its gate lock), `suppressed` (no variant to queue) or `failed` (nothing was
+   * added for any other reason, logged as enqueue() logs it). Never throws.
+   */
+  async enqueueWithOutcome(req: DispatchRequest): Promise<{
+    added: number;
+    outcome: 'enqueued' | 'in-flight' | 'suppressed' | 'failed';
+  }> {
     const { logger, name } = this.#deps;
     const { mediaId } = req;
+    const failed = { added: 0, outcome: 'failed' } as const;
     // Canonical first, so equivalent nested filter objects and list permutations reach the task
     // queue in one stable form; then one variant per identity.
     const variants = [...firstPerIdentity(req.previews, this.#scope(req))];
     if (variants.length === 0) {
-      return 0;
+      return { added: 0, outcome: 'suppressed' };
     }
     const outcome = await this.#dispatch(req, variants);
     switch (outcome.status) {
       case 'added':
-        return variants.length;
+        return { added: variants.length, outcome: 'enqueued' };
+      case 'in-flight':
+      case 'gate-held':
+        // Normal: the active task, or the request that holds the gate lock, covers the media.
+        return { added: 0, outcome: 'in-flight' };
       case 'not-served':
         if (!this.#loggedNotServed.has(req.queue)) {
           this.#loggedNotServed.add(req.queue);
@@ -245,7 +263,7 @@ export class Dispatcher {
             'warn',
           );
         }
-        return 0;
+        return failed;
       case 'route-failed': {
         const { message } = routeFailureIssue(outcome.error);
         const key = `${req.queue}\u0000${message}`;
@@ -257,7 +275,7 @@ export class Dispatcher {
             outcome.error,
           );
         }
-        return 0;
+        return failed;
       }
       case 'locks-missing':
         if (!this.#loggedLocksMissing.has(req.queue)) {
@@ -267,7 +285,7 @@ export class Dispatcher {
             `resize enqueue: ${locksMissing(req.queue, name)} — nothing is queued (logged once per queue name)`,
           );
         }
-        return 0;
+        return failed;
       case 'timing-invalid':
         if (!this.#loggedTimingInvalid.has(req.queue)) {
           this.#loggedTimingInvalid.add(req.queue);
@@ -277,7 +295,7 @@ export class Dispatcher {
             outcome.error,
           );
         }
-        return 0;
+        return failed;
       case 'unconfirmed':
         if (!this.#loggedUnconfirmed) {
           this.#loggedUnconfirmed = true;
@@ -285,22 +303,22 @@ export class Dispatcher {
             `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it (further unconfirmed adds are not logged until one is confirmed)`,
           );
         }
-        return 0;
+        return failed;
       case 'add-failed':
         logger.error(
           `resize enqueue: adding the task threw for media ${mediaId} — a later read queues it`,
           outcome.error,
         );
-        return 0;
+        return failed;
       case 'gate-failed':
         logger.error(
           `resize enqueue: the gate lock of media ${mediaId} could not be acquired — nothing queued`,
           outcome.error,
         );
-        return 0;
+        return failed;
       default:
-        // in-flight and a held gate lock are normal; an invalid result was logged once.
-        return 0;
+        // An add result in none of the TaskAddResult shapes, logged once.
+        return failed;
     }
   }
 
