@@ -95,7 +95,38 @@ function removedRows(
 // The part of a Mongoose schema verify() reads (types only: no mongoose import).
 interface SchemaLike {
   path(path: string): unknown;
+  pathType?(path: string): string;
   options: { strict?: unknown };
+}
+
+/**
+ * The `original.width` / `original.height` paths a strict `original` does not declare, so a
+ * `$set` of the measured dimensions would be dropped: `original` declared as nested paths (strict
+ * unless the schema is `strict: false`), or as a single sub-schema that is not `strict: false`.
+ * A Mixed `original`, one not declared, or a model without a schema gives none.
+ */
+function undeclaredDims(model: MongoMediaModel): string[] {
+  const schema = (model as { schema?: Partial<SchemaLike> }).schema;
+  if (typeof schema?.path !== 'function') {
+    return [];
+  }
+  const dims = ['width', 'height'];
+  if (
+    typeof schema.pathType === 'function' &&
+    schema.pathType('original') === 'nested'
+  ) {
+    if (schema.options?.strict === false) {
+      return [];
+    }
+    return dims.filter((dim) => !schema.path?.(`original.${dim}`));
+  }
+  const sub = (
+    schema.path('original') as { schema?: Partial<SchemaLike> } | undefined
+  )?.schema;
+  if (typeof sub?.path !== 'function' || sub.options?.strict === false) {
+    return [];
+  }
+  return dims.filter((dim) => !sub.path?.(dim));
 }
 
 // The preview row schema of a media model: the sub-document schema of its `previews` array, or
@@ -178,6 +209,7 @@ export class MongoMediaStore extends MediaStore {
   readonly #model: () => MongoMediaModel;
   readonly #logger: ResizeLogger;
   #warnedFit = false;
+  #warnedOriginal = false;
 
   constructor(opts: MongoMediaStoreOptions) {
     super();
@@ -202,10 +234,21 @@ export class MongoMediaStore extends MediaStore {
    * worker that renders a variant would add its own row, and without the signatures no row could
    * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
    * field. Such rows without `fit` only get a warning, once per store: freshness still holds
-   * without it. `bytes` and `createdAt` are informational and not checked.
+   * without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
+   * without `width` or `height` also gets one warning per store (it does not throw, so a setup
+   * that passed before keeps passing): Mongoose drops the dimensions the worker measures, so every
+   * read queues a task that downloads the original again.
    */
   verify(): void {
     const model = this.mediaModel();
+    const dims = undeclaredDims(model);
+    if (dims.length > 0 && !this.#warnedOriginal) {
+      this.#warnedOriginal = true;
+      const fields = dims.map((dim) => `original.${dim}`);
+      this.#logger.warn(
+        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no ${fields.join(' and ')} field${fields.length > 1 ? 's' : ''}, so Mongoose drops the original's dimensions the worker measures and every read queues a task that downloads the original again — spread the current resizeMediaSchemaFragment into the media model's schema, or add ${dims.map((dim) => `${dim}: { type: Number }`).join(' and ')} to its original`,
+      );
+    }
     const rows = previewRowSchema(model);
     if (!rows?.path || rows.options?.strict === false) {
       return;

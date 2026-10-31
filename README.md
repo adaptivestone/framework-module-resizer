@@ -495,7 +495,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
   - `appendPreviews` must save `dims` (`backfillDims`) on the original when it is given, whether
     or not it stores a preview (also for `previews: []`): the freshness check needs the original's
     dimensions, and a store that drops them makes every read of such a media queue a task that
-    downloads the original (see [Freshness](#freshness)).
+    downloads the original (see [Freshness](#freshness)). The shipped `MongoMediaStore` drops them
+    when the media schema declares a strict `original` without `width` and `height`; its
+    `verify()` warns once about it.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -1312,7 +1314,11 @@ pixel decode, no upload when its rows turn out fresh) and records the dimensions
 the rows fresh. A `MediaStore` must therefore save `backfillDims` in `appendPreviews`, also when
 `previews` is empty. A store that drops them makes every read of such a media queue a task that
 downloads the original; the worker then warns once: "resize worker: the media store did not record
-the original's dimensions of media <m> — …".
+the original's dimensions of media <m> — …". The shipped `MongoMediaStore` drops them too when the
+media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`)
+without `original.width` and `original.height`: Mongoose strips them from the update. Its
+`verify()` warns once about such a schema; spread `resizeMediaSchemaFragment`, or add `width` and
+`height` as `{ type: Number }` to `original`.
 
 **`resolve()` must receive `original` as stored**: the same `storageRef` and dimensions. A
 projection that drops `original.width` and `original.height`, or a ref reshaped by a DTO, makes
