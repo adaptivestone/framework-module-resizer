@@ -259,6 +259,40 @@ function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
   return copy;
 }
 
+// The image settings a render reads (planRules, the decode limits, the encoder, the pool size), and
+// the rest of ResizeConfig: each is copied for the render.
+const IMAGE_SETTING_KEYS = [
+  'formats',
+  'upload',
+  'maxSize',
+  'animated',
+  'encode',
+  'limits',
+  'concurrency',
+] as const satisfies ReadonlyArray<keyof ResizeConfig>;
+
+/**
+ * The config as one render reads it, taken now: a shallow copy whose image settings are deep
+ * copies, so a setting changed in place while the render runs does not reach it. Any other key
+ * (the config may carry host keys) is kept by reference, and a setting that cannot be copied (one
+ * holding a function, say) is kept as it is.
+ */
+function snapshotSettings(config: ResizeConfig): ResizeConfig {
+  const settings = { ...config };
+  const writable = settings as unknown as Record<string, unknown>;
+  for (const key of IMAGE_SETTING_KEYS) {
+    if (!Object.hasOwn(settings, key)) {
+      continue;
+    }
+    try {
+      writable[key] = structuredClone(settings[key]);
+    } catch {
+      // Kept as it is: the render then reads it live, as it did before settings were copied.
+    }
+  }
+  return settings;
+}
+
 /**
  * The locator in the form the origin signature reads, taken now: its JSON form under the same
  * `storageRef` key the recipe serializes it under (`toJSON('storageRef')` included). Signing this
@@ -988,9 +1022,10 @@ export class Processor {
     // The settings, the steps and the signature each row records, taken together before any pixel
     // work, with no await between them: the render uses only these, so a pipeline version, step
     // set or image setting changed while it runs (even changed and changed back) never makes a row
-    // signed with one set of settings out of pixels made with another. The settings are plain
-    // data; the steps are kept by reference, their lists copied.
-    const settings = structuredClone(config);
+    // signed with one set of settings out of pixels made with another. The image settings are
+    // plain data (other keys of the config are kept by reference); the steps are kept by
+    // reference, their lists copied.
+    const settings = snapshotSettings(config);
     const { limits: renderLimits } = settings;
     const pipeline = pipelines.get(pipelineName);
     const beforeSteps = [...(pipeline.beforeSteps ?? [])];

@@ -834,6 +834,25 @@ test('settings flipped and restored while a render runs: the preview is made wit
   assert.equal(decision.ready[0].stale, undefined);
 });
 
+test('a config carrying an extra key that cannot be cloned (a function): generate() still renders', async () => {
+  const w = world();
+  const config = Object.assign(webpConfig(80), {
+    hostHelper: () => 'not image data',
+  });
+  const r = w.resizer(config);
+  const original = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+
+  const result = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+  assert.equal(result.created.length, 1);
+  assert.equal(rowsOf(doc).length, 1);
+});
+
 test('the original locator changed in place while it downloads: the row records the old one, so the next read regenerates it', async () => {
   const w = world();
   const r = w.resizer(webpConfig(80));
