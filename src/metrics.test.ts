@@ -24,7 +24,7 @@ function recordingLogger(): ResizeLogger & {
     info: (...a) => lines.info.push(a),
     warn: (...a) => lines.warn.push(a),
     error: (...a) => lines.error.push(a),
-    debug: (...a) => lines.debug.push(a),
+    debug: (...a: unknown[]) => lines.debug.push(a),
   };
 }
 

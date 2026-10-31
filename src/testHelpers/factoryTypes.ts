@@ -1,8 +1,9 @@
-// Compiled by `npm run types:check` (tsconfig.test-helpers.json), never run. It pins the config
+// Compiled by `npm run types:check:src` (`tsconfig.type-pins.json`, which the minimum-peers CI
+// job runs) and by `npm run types:check` (`tsconfig.tests.json`), never run. It pins the config
 // types: the core section types and their deprecated framework names, the sections a registered
-// custom driver adds, the nested partial a file that overrides part of a config writes, the
-// shipped drivers as drivers of their own sections, and FrameworkResizer's `drivers` and `config`
-// options.
+// custom driver adds, custom queue entries with and without timing keys, the nested partial a
+// file that overrides part of a config writes, the shipped drivers as drivers of their own
+// sections, and FrameworkResizer's `drivers` and `config` options.
 import type {
   DatabaseDriver,
   DriverContext,
@@ -130,6 +131,23 @@ export const withRedis = {
     bulk: { driver: 'redis', url: 'redis://r' },
   },
 } satisfies ResizerConfig<{ queue: { redis: typeof redisQueue } }>;
+// A custom queue entry may carry the timing keys the core reads from every entry.
+export const withRedisTiming = {
+  queues: {
+    bulk: {
+      driver: 'redis',
+      url: 'redis://r',
+      maxAttempts: 3,
+      leaseMs: 60_000,
+    },
+  },
+} satisfies ResizerConfig<{ queue: { redis: typeof redisQueue } }>;
+export const redisTimingWrongType: ResizerConfig<{
+  queue: { redis: typeof redisQueue };
+}> = {
+  // @ts-expect-error a timing key keeps its type
+  queues: { bulk: { driver: 'redis', url: 'redis://r', maxAttempts: '3' } },
+};
 export const redisWithoutUrl: ResizerConfig<{
   queue: { redis: typeof redisQueue };
 }> = {

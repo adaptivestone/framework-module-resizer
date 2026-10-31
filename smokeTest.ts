@@ -9,19 +9,21 @@
 //
 // Repo tooling (like preBuild.ts / postBuild.ts): plain TS, run with type-stripping via
 // `node smokeTest.ts` (the `smoke` npm script). Top-level await, no test framework. It is
-// a ROOT file (outside tsconfig's `src` rootDir, same as preBuild/postBuild) — biome lints
-// it, tsc does not type-check it.
+// a ROOT file (outside tsconfig's `src` rootDir, same as preBuild/postBuild): biome lints
+// it, and `tsconfig.tests.json` type-checks it.
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -297,7 +299,9 @@ import {
   type DriverRegistry,
   type InvalidateOpts,
   LockStore,
+  type MediaLike,
   MediaStore,
+  NoopMetrics,
   type Preview,
   type QueueConfig,
   type QueueDriver,
@@ -392,6 +396,18 @@ const typedMediaStore = () => {
   );
   return [new MongoMediaStore({ model: File }), mongoParts(mongoose.connection, { mediaModel: File })];
 };
+// A strict host passes a loaded Mongoose document as the MediaLike the Resizer takes (README,
+// "Without the framework").
+const resolveDocument = async (resizer: Resizer) => {
+  const File = mongoose.model(
+    'File',
+    new mongoose.Schema({ ...resizeMediaSchemaFragment }, { minimize: false }),
+  );
+  const doc = await File.findById('x').orFail();
+  const lean = await File.findById('x').lean().orFail();
+  await resizer.resolve({ media: lean as MediaLike, sizes: [{ width: 300 }] });
+  return resizer.resolve({ media: doc as MediaLike, sizes: [{ width: 300 }] });
+};
 
 class MemoryMedia extends MediaStore {
   async loadMedia(): Promise<null> { return null; }
@@ -444,7 +460,12 @@ const viaHostDrivers = (): Resizer =>
   createResizer(
     {
       storage: { driver: 'memory', prefix: '/m' },
-      queues: { default: { driver: 'database' }, bulk: { driver: 'redis', url: 'redis://r' } },
+      queues: {
+        default: { driver: 'database' },
+        bulk: { driver: 'redis', url: 'redis://r' },
+        // A custom queue's entry takes the timing keys the core reads from every entry.
+        timed: { driver: 'redis', url: 'redis://r', maxAttempts: 3 },
+      },
     },
     { drivers: hostDrivers, media: plainMedia },
   );
@@ -464,6 +485,10 @@ const core = () =>
 // Removing a media's previews of one pipeline resolves with the storage refs for the host to delete.
 const invalidateOpts: InvalidateOpts = { media: { id: 'm1' }, pipeline: 'watermark' };
 const invalidated = (): Promise<StorageRef[]> => core().invalidate(invalidateOpts);
+// NoopMetrics takes the ResizeMetrics arguments, and still takes none.
+new NoopMetrics().count();
+new NoopMetrics().timing();
+new NoopMetrics().count('resize.read', 1, { outcome: 'ready' });
 void [
   media,
   core,
@@ -481,6 +506,7 @@ void [
   mediaSchema,
   mediaPaths,
   typedMediaStore,
+  resolveDocument,
 ];
 
 type Equal<A, B> =
@@ -587,22 +613,23 @@ try {
       `repository TypeScript compiler is missing: ${typescriptCompiler}`,
     );
   }
+  const consumerCompilerOptions = {
+    lib: ['ESNext'],
+    module: 'NodeNext',
+    moduleResolution: 'NodeNext',
+    noEmit: true,
+    skipLibCheck: false,
+    strict: true,
+    target: 'ES2022',
+    typeRoots: [join(ROOT, 'node_modules', '@types')],
+    types: ['node'],
+  };
   writeFileSync(join(consumer, 'checkTypes.mts'), CHECK_TYPES);
   writeFileSync(
     join(consumer, 'tsconfig.smoke.json'),
     JSON.stringify(
       {
-        compilerOptions: {
-          lib: ['ESNext'],
-          module: 'NodeNext',
-          moduleResolution: 'NodeNext',
-          noEmit: true,
-          skipLibCheck: false,
-          strict: true,
-          target: 'ES2022',
-          typeRoots: [join(ROOT, 'node_modules', '@types')],
-          types: ['node'],
-        },
+        compilerOptions: consumerCompilerOptions,
         files: ['./checkTypes.mts'],
       },
       null,
@@ -663,6 +690,100 @@ try {
   console.log('  ok  scaffold wrote the AGENTS.md pointer');
   run('npx', ['--no-install', 'resize-scaffold', '--check'], scaffoldDir);
   console.log('  ok  resize-scaffold --check exited 0');
+
+  // (d2) the emitted files compile against the installed package and peers, as in a framework
+  // host. The consumer's own `npm init -y` package is CommonJS, so each scaffold directory gets
+  // an ESM package.json; the worker command imports `../resizer.ts`, hence
+  // allowImportingTsExtensions.
+  const writeEsmPackage = (dir: string): void => {
+    writeFileSync(
+      join(dir, 'package.json'),
+      `${JSON.stringify({ type: 'module' }, null, 2)}\n`,
+    );
+  };
+  const compileScaffold = (dir: string): void => {
+    writeFileSync(
+      join(dir, 'tsconfig.json'),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            ...consumerCompilerOptions,
+            allowImportingTsExtensions: true,
+          },
+          include: ['src/**/*.ts'],
+        },
+        null,
+        2,
+      ),
+    );
+    run(
+      process.execPath,
+      [typescriptCompiler, '--project', 'tsconfig.json'],
+      dir,
+    );
+  };
+  writeEsmPackage(scaffoldDir);
+  compileScaffold(scaffoldDir);
+  console.log(
+    '  ok  the default scaffold compiles against the installed package',
+  );
+
+  // (d3) `--eager`: only the construction site and the config, then its own --check.
+  const eagerDir = join(consumer, 'scaffold-eager');
+  mkdirSync(eagerDir);
+  writeEsmPackage(eagerDir);
+  run(
+    'npx',
+    ['--no-install', 'resize-scaffold', '--eager', '--agents', 'skip'],
+    eagerDir,
+  );
+  const eagerSrc = join(eagerDir, 'src');
+  const eagerFiles = readdirSync(eagerSrc, { recursive: true })
+    .map(String)
+    .filter((rel) => statSync(join(eagerSrc, rel)).isFile())
+    .map((rel) => rel.split(sep).join('/'))
+    .sort();
+  const expectedEagerFiles = ['config/resize.ts', 'resizer.ts'];
+  if (JSON.stringify(eagerFiles) !== JSON.stringify(expectedEagerFiles)) {
+    throw new Error(
+      `resize-scaffold --eager emitted ${JSON.stringify(eagerFiles)}, expected ${JSON.stringify(expectedEagerFiles)}`,
+    );
+  }
+  run(
+    'npx',
+    ['--no-install', 'resize-scaffold', '--check', '--eager'],
+    eagerDir,
+  );
+  compileScaffold(eagerDir);
+  console.log('  ok  an --eager scaffold passes --check --eager and compiles');
+
+  // (d4) `--eject`: the full editable ResizeTask model, then --check.
+  const ejectDir = join(consumer, 'scaffold-eject');
+  mkdirSync(ejectDir);
+  writeEsmPackage(ejectDir);
+  run(
+    'npx',
+    ['--no-install', 'resize-scaffold', '--eject', '--agents', 'skip'],
+    ejectDir,
+  );
+  // The same four files as the default form, with the full model in place of the shim.
+  for (const rel of scaffoldFiles) {
+    if (!existsSync(join(ejectDir, rel))) {
+      throw new Error(`resize-scaffold --eject did not emit ${rel}`);
+    }
+  }
+  if (
+    !readFileSync(join(ejectDir, 'src/models/ResizeTask.ts'), 'utf8').includes(
+      'extends BaseModel',
+    )
+  ) {
+    throw new Error(
+      'resize-scaffold --eject did not emit the full model: src/models/ResizeTask.ts does not contain `extends BaseModel`',
+    );
+  }
+  run('npx', ['--no-install', 'resize-scaffold', '--check'], ejectDir);
+  compileScaffold(ejectDir);
+  console.log('  ok  an --eject scaffold passes --check and compiles');
 
   // (e) install the AWS SDKs, then the sqs/s3 subpaths must import and expose their classes.
   console.log('→ Installing the AWS SDKs, re-checking the optional subpaths');

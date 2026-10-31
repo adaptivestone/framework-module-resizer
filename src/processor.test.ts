@@ -61,6 +61,7 @@ import {
   observedQueue,
   PlainTaskQueue,
   recordingMetrics,
+  refKey,
 } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import { fakePdf, TestPdfDecoder } from './testHelpers/pdfDecoder.ts';
@@ -301,7 +302,7 @@ function makeStorage(
       onUpload?.();
       return { bucket: 'previews', key };
     },
-    publicUrl: (ref) => `https://cdn/${ref.key}`,
+    publicUrl: (ref) => `https://cdn/${refKey(ref)}`,
   };
   return { storage, uploads };
 }
@@ -1086,7 +1087,12 @@ describe('decoding the source', () => {
     );
   });
 
-  for (const { name, svg, limits, width } of [
+  const svgBudgetCases: {
+    name: string;
+    svg: string;
+    limits: { sourcePixels: number; inputPixels?: number };
+    width: number;
+  }[] = [
     {
       name: '10×11 at sourcePixels 150',
       svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="11"><rect width="10" height="11" fill="red"/></svg>',
@@ -1111,7 +1117,8 @@ describe('decoding the source', () => {
       limits: { sourcePixels: 841, inputPixels: 1000 },
       width: 30,
     },
-  ]) {
+  ];
+  for (const { name, svg, limits, width } of svgBudgetCases) {
     test(`an SVG whose rounded raster would pass the pixel budget renders within it (${name}), eager and queued`, async () => {
       const recording = new RecordingDecoder(new SvgDecoder());
       const rasters: number[] = [];
@@ -1427,13 +1434,13 @@ describe('processTask — source handling', () => {
     installApp();
     const base = makeStorage(redPng);
     let downloadCalls = 0;
-    const storage: ResizeStorage = {
-      ...base.storage,
+    const storage: ResizeStorage = Object.assign({}, base.storage, {
       download: async () => {
         downloadCalls += 1;
         return redPng;
       },
-    };
+    });
+    // @ts-expect-error a JS host may store an original without a storageRef
     const { mediaStore } = makeMediaStore({
       id: 'm1',
       original: {},
@@ -1822,6 +1829,31 @@ describe('processTask — variants', () => {
     assert.equal(uploads[0].contentType, 'image/avif');
     assert.equal(appendCalls[0].previews[0].format, 'heif');
     assert.equal(appendCalls[0].previews[0].contentType, 'image/avif');
+  });
+
+  // Public previews are stored with an immutable cache header, which is safe only while every
+  // preview gets a new random key: a re-rendered preview must never reuse an old URL.
+  test('a stored preview has a random key under previews/, new on every render', async () => {
+    installApp();
+    const { storage } = makeStorage(redPng);
+    const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
+    new FrameworkResizer({
+      storage,
+      media: mediaStore,
+      locks: makeLocks().locks,
+    });
+
+    // The store never records the rows, so the second task renders the same variant again.
+    await processTask(task({ previews: [variant()] }));
+    await processTask(task({ previews: [variant()] }));
+
+    assert.equal(appendCalls.length, 2);
+    const [first, second] = appendCalls.map((call) =>
+      refKey(call.previews[0].storageRef),
+    );
+    assert.match(first, /^previews\/[0-9a-f]{32}\.\w+$/);
+    assert.match(second, /^previews\/[0-9a-f]{32}\.\w+$/);
+    assert.notEqual(first, second, 'each render gets a new key');
   });
 
   test('transparent PNG → jpeg variant is flattened onto the background (not black)', async () => {
@@ -2612,6 +2644,7 @@ describe('generate (eager)', () => {
         r.generate({
           media: {
             id: 'm1',
+            // @ts-expect-error a JS host may store an original without a storageRef
             original: {},
           },
           sizes: [{ width: 20, height: 20 }],
@@ -2730,13 +2763,12 @@ describe('unknown pipeline', () => {
   function countingStorage(fixture: Buffer) {
     const base = makeStorage(fixture);
     let downloads = 0;
-    const storage: ResizeStorage = {
-      ...base.storage,
+    const storage: ResizeStorage = Object.assign({}, base.storage, {
       download: async () => {
         downloads += 1;
         return fixture;
       },
-    };
+    });
     return { storage, uploads: base.uploads, downloads: () => downloads };
   }
 
@@ -3239,13 +3271,12 @@ describe('unconfigured formats', () => {
     installApp();
     let downloads = 0;
     const base = makeStorage(alphaPng);
-    const storage: ResizeStorage = {
-      ...base.storage,
+    const storage: ResizeStorage = Object.assign({}, base.storage, {
       download: async () => {
         downloads += 1;
         return alphaPng;
       },
-    };
+    });
     const { mediaStore } = makeMediaStore(null);
     const r = new FrameworkResizer({ storage, media: mediaStore });
     await assert.rejects(

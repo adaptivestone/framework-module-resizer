@@ -719,6 +719,7 @@ describe('runScaffold — --check', () => {
       const line = out
         .split('\n')
         .find((l) => l.includes('resize.production.ts'));
+      assert.ok(line !== undefined, out);
       assert.ok(
         line?.includes('then delete the old queue: { … } object'),
         line,

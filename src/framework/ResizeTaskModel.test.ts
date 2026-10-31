@@ -163,10 +163,11 @@ describe('ResizeTaskModel.initHooks — the five indexes (spec/08 §12)', () => 
     assert.ok(idx);
     assert.deepEqual(idx[1], {});
     // The claim no longer orders by createdAt, and every claim filters by queue.
-    for (const old of [
+    const oldLeaseIndexes: Record<string, number>[] = [
       { queue: 1, status: 1, createdAt: 1 },
       { status: 1, createdAt: 1 },
-    ]) {
+    ];
+    for (const old of oldLeaseIndexes) {
       assert.equal(byFields(buildIndexes(), old), undefined);
     }
   });

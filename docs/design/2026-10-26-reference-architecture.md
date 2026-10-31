@@ -1,6 +1,10 @@
 # Reference architecture: narrow ports, explicit dependencies, task-row gate
 
-Status: **proposed** 2026-10-26, decisions taken by the owner the same day. Follows
+Status: **implemented** in phases S1–S6 for 0.3.0 (branches
+`refactor/s1-ports-and-composition-root`, `refactor/s2-gate-and-coordination`,
+`refactor/s2b-host-shapes`, `refactor/s3-decoder-port`, `refactor/s4-config-factory`,
+`refactor/s5-metrics-freshness` and `refactor/s6-hygiene`); proposed and decided by the owner on
+2026-10-26. Follows
 [database, queue and framework wrapper](./2026-10-05-database-queue-framework-wrapper.md) (R1–R2,
 merged). Pre-release: breaking changes are fine; hosts migrate their own data.
 
@@ -232,11 +236,16 @@ host's job). Rows without the fields are stale.
 **F10. Hygiene bundled into the phases.** `resizeMediaSchemaFragment` moves to
 `…/drivers/mongo.js` (re-exported by `…/framework.js`); `defaultFrameworkResizeConfig` and the
 worker defaults move to `…/framework.js`; the `queue` option becomes `queueName`; `processTask`
-is exported for push-delivered tasks; S3 previews get `Cache-Control: public, max-age=31536000,
-immutable`; the per-read logs for media without original or with an unknown pipeline become
-metrics; the 2026-10-02 and 2026-10-05 design docs get superseded notes; README's terminal-error
-list is corrected.
-Test files are outside `types:check` (about 65 pre-existing type errors in tests, none added in S1/S2): add a tests tsconfig to `types:check`, fix them, keep them clean.
+stays internal in 0.3.0: run alone, it would skip the lease, the retries, the dead-letters and
+the gate, which a push-delivery API must run for each delivered task, so push delivery is planned
+for 0.4.0 (owner ruling R-S6-2; it replaces the earlier plan to export `processTask`); S3 previews
+get `Cache-Control: public, max-age=31536000, immutable`; the per-read logs for media without
+original or with an unknown pipeline become metrics; the 2026-10-02 and 2026-10-05 design docs
+get superseded notes; README's terminal-error list is corrected.
+Test files were outside `types:check` (about 65 pre-existing type errors in tests, none added in
+S1/S2). Done in S6: `tsconfig.tests.json` type-checks the tests and the root tooling,
+`types:check` runs it after `tsc --noEmit`, the errors are fixed, and the CI `min-versions` job
+runs `types:check:src` instead (the shipped code and the type pins against the minimum peers).
 
 ## Target usage
 

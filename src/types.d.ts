@@ -451,7 +451,8 @@ export type QueueSectionOf<D extends DriverRegistryShape> = {
     fromConfig(entries: readonly { section: infer S }[], ctx: never): unknown;
   }
     ? S
-    : never) & { driver: K };
+    : never) &
+    Partial<QueueTimingOptions> & { driver: K };
 }[keyof NonNullable<D['queue']> & string];
 
 /**

@@ -590,12 +590,11 @@ describe('a task queue without gatesByTask', () => {
     const tasks = new PlainTaskQueue();
     tasks.add = async () => ({ status: 'unconfirmed' });
     const base = clockLocks(() => now);
-    const locks: LockStore = {
-      ...base,
+    const locks: LockStore = Object.assign({}, base, {
       extend: async () => {
         throw new Error('lock store down');
       },
-    };
+    });
     const coordination = { gateTtlMs: 123_456, cooldownMs: 1_000 };
     const d = makeDispatcher({ tasks, locks, coordination });
     assert.equal(await d.enqueue(requestFor([v300])), 0);

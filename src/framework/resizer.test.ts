@@ -1292,6 +1292,7 @@ test('resetResizerForTests forgets the per-backend task queues', async () => {
   assert.ok(next.tasks);
   assert.notEqual(next.tasks, first.tasks);
   assert.equal(timingOf(next.tasks, 'default').maxAttempts, 4);
+  assert.ok(nextSqs.tasks);
   assert.ok((await carrierOf(nextSqs.tasks, 'sqs')) instanceof SqsTaskQueue);
   assert.notEqual(nextSqs.tasks, firstSqs.tasks);
 });

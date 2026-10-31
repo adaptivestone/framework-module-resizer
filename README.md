@@ -204,6 +204,10 @@ is `RESIZE_CONFIG_STORAGE_MISSING`; without a `database` section or a `media` op
 `RESIZE_MEDIA_REQUIRED`; a `'database'` queue without a `database` section is
 `RESIZE_CONFIG_INVALID`.
 
+With strict types, a loaded Mongoose document is not a `MediaLike` (Mongoose types the nested
+fields as nullable): pass it as `media: doc as MediaLike` (`import type { MediaLike }` from the
+main entry), or type the model's `original` and `previews` paths with `Original` and `Preview`.
+
 Wired by hand, the same Resizer is:
 
 ```ts
@@ -295,14 +299,64 @@ Resizers that `src/resizer.ts` constructs.
 
 | Import | Contents |
 |---|---|
-| `@adaptivestone/framework-module-resize` | `Resizer`, `createResizer`, `getResizer`, `resetResizerForTests`, `runWorker`, `RoutingTaskQueue`, `carrierOf`, the contracts (`ResizeStorage`, `MediaStore`, `LockStore`, `TaskQueue`, `SourceDecoder`, `ResizeMetrics`), the metrics sinks `LogMetrics` and `NoopMetrics`, helpers (`formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `rasterToSharp`, `sharpToRaster`), errors, types (among them `InvalidateOpts`, `ReplacedPreviews`, the metrics types `MetricLabels`, `MetricContext`, `LogMetricsOptions`, the queue entry types `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`, the decoder types `SourceInfo`, `Raster`, `RasterInfo`, `DecodeBox`, `RenderOptions`, `ResizeLimits`, the factory types `ResizerConfig`, `CreateResizerOptions`, `ResizerSections`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`, `MongoDatabaseConfig`, `PartialFrameworkResizeConfig`, the driver types `DriverRegistry`, `DriverContext`, `StorageDriver`, `DatabaseDriver`, `DatabaseParts`, `QueueDriver`, `QueueDriverContext`, `QueueEntry`, `QueueSection`, and the routing types `Route`, `RoutingTaskQueueOptions`) |
+| `@adaptivestone/framework-module-resize` | The core; every name is listed below |
 | `…/config/resize.js` | The framework-free core defaults: the default core config (default export), `defaultQueueOptions`, `defaultCoordination` |
-| `…/drivers/fs.js` | `LocalFsStorage` (the `'local'` storage driver) |
-| `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) |
-| `…/drivers/mongo.js` | `mongoParts`, `MongoDatabase` (the `'mongo'` database driver), `MongoMediaStore`, `MongoLockStore`, `MongoTaskQueue`, `createResizeModels`, the schemas, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
-| `…/drivers/sqs.js` | `SqsTaskQueue` (the `'sqs'` queue driver) |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig` (and their deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`), `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported). `FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every config type |
-| `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim |
+| `…/drivers/fs.js` | `LocalFsStorage` (the `'local'` storage driver) and its options type `LocalFsStorageOptions` |
+| `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) and its options type `S3StorageOptions` |
+| `…/drivers/mongo.js` | `mongoParts` (and its types `MongoParts`, `MongoPartsOptions`), `MongoDatabase` (the `'mongo'` database driver), `MongoMediaStore` (and `MongoMediaModel`, `MongoMediaStoreOptions`, `MongoMediaUpdateOptions`), `MongoLockStore` (and `MongoLockModel`, `MongoLockStoreOptions`), `MongoTaskQueue` (and `MongoTaskQueueOptions`), `createResizeModels` (and `CreateResizeModelsOptions`), the schemas `resizeTaskFields`, `resizeTaskIndexes`, `resizeLockFields`, `resizeLockIndexes` and `resizeSchemaOptions`, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
+| `…/drivers/sqs.js` | `SqsTaskQueue` (the `'sqs'` queue driver) and its options type `SqsTaskQueueOptions` |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig` (and their deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`), `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported) |
+| `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim, and its document type `TResizeTask` |
+| `…/package.json` | The package manifest (a JSON module, default export only; import it `with { type: 'json' }`), for tools that read the installed version |
+
+**The main entry** exports:
+- the Resizer and its registry: `Resizer` (its options `ResizerOptions`), `getResizer`, and the
+  test-only `resetResizerForTests`;
+- `createResizer`, which builds a Resizer from one config, and its types `ResizerConfig` and
+  `CreateResizerOptions`;
+- `runWorker`, the framework-free worker, and its options `RunWorkerOptions`;
+- routing: `RoutingTaskQueue` (each queue name goes to the backend that carries it), `carrierOf`,
+  and the types `Route` and `RoutingTaskQueueOptions`;
+- the contracts a driver extends, with their types: `ResizeStorage` (`StorageUploadArgs`),
+  `MediaStore` (`ReplacedPreviews`), `LockStore`, and `TaskQueue` (`NewTask`, `TaskAddResult`,
+  `ClaimOptions`, `ClaimedTask`, `LeasedTask`, `FailOptions`, `TaskEvent`, `TaskEventHandler`);
+- the decoder contract `SourceDecoder` and the decoder types `SourceInfo`, `Raster`, `RasterInfo`,
+  `DecodeBox`, `RenderOptions`;
+- metrics: the contract `ResizeMetrics`, the sinks `LogMetrics` (its options `LogMetricsOptions`)
+  and `NoopMetrics`, and the types `MetricLabels` and `MetricContext`;
+- the errors: `ResizeError`, `ResizeConfigError`, `ResizeSetupError`, `ResizeMediaError`,
+  `ResizeNoOriginalError`, `ResizeOriginalError`, `ResizeGenerateError`, `ResizeStorageError`,
+  `ResizeSecurityError`, and their options `ResizeErrorOptions`;
+- the helpers: `formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`,
+  `rasterToSharp`, `sharpToRaster`;
+- the hook and pipeline types: `HookName`, `HookFn`, `HookSignatures`, `HookTaps`, `WaterfallName`,
+  `ObserverName`, `Pipeline`, `BeforeStep`, `VariantStep`;
+- the driver-factory types (how a config section becomes a part): `DriverRegistry`,
+  `DriverContext`, `StorageDriver`, `DatabaseDriver`, `DatabaseParts`, `QueueDriver`,
+  `QueueDriverContext`, `QueueEntry`, `QueueSection`;
+- the data shapes and options (`src/types.d.ts`):
+  - the Resizer calls: for `resolve()`, `ResolveOpts`, `SizeInput`, `ReadDecision`, `ReadyEntry`
+    and `MissingPreview`; for `prewarm()`, `PrewarmOpts`, `PrewarmResult`, `PrewarmStatus`,
+    `EnqueueReceipt` and `EnqueueIssue`; for `generate()`, `GenerateOpts` and `GenerateResult`;
+    for `invalidate()`, `InvalidateOpts`; for `uploadOriginal()`, `UploadOriginalOpts`; and
+    `PictureUrls`, what `formatPictureUrls` makes of a decision;
+  - the media and preview shapes: `MediaLike`, `Original`, `OriginalFormat`, `Preview`,
+    `PreviewFormat`, `PreviewScope`, `Filters`, `StorageRef`;
+  - the config sections: the image settings `ResizeConfig` and `ResizeLimits`, and `DeepPartial`
+    for overrides; storage `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`; database
+    `MongoDatabaseConfig`; coordination `CoordinationOptions`; worker `FrameworkWorkerConfig`; the
+    framework config `FrameworkResizeConfig` and `PartialFrameworkResizeConfig`; the Resizer's
+    other sections, `ResizerSections`, and the sections that registered drivers add,
+    `StorageSectionOf`, `DatabaseSectionOf`, `QueueSectionOf`;
+  - the queue entries and timing: `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`,
+    `QueueTimingOptions`;
+  - the logger, the event bus and a part built on first use: `ResizeLogger`, `ResizeEventBus`,
+    `LazyPart`;
+  - the deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
+    `FrameworkS3StorageConfig`, each the same type under its core name.
+
+`FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every
+config type; `…/framework.js` re-exports only the config types its row names.
 
 ## Drivers
 
@@ -363,7 +417,10 @@ and keeps the parts that loaded.
 | `privateRootDir` | optional | Private originals; default `rootDir` + `-private`, and never inside `rootDir` |
 
 The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Do not put
-symlinks into the public tree.
+symlinks into the public tree. Serve `rootDir` with a long-lived cache too, for example
+`express.static(rootDir, { immutable: true, maxAge: '1y' })`: every file name the module writes
+there is new (previews and public raster originals), so a file never changes under its URL; if you
+write your own files under `rootDir`, give each a new name.
 
 **`S3Storage`**
 
@@ -381,6 +438,14 @@ bucket policy, not a per-object ACL. Without `publicBaseUrl`, URLs are virtual-h
 `forcePathStyle` (`<endpoint>/<bucket>/<key>`; without an endpoint,
 `https://s3.<region>.amazonaws.com/<bucket>/<key>`). China regions (`cn-…`) use
 `amazonaws.com.cn` in both forms. SVG objects are uploaded with `Content-Disposition: attachment`.
+
+Every public object `S3Storage` uploads (previews and public raster originals, and a host's own
+direct uploads) carries `Cache-Control: public, max-age=31536000, immutable`. Every key the module
+writes is new, so an object never changes under its URL; if you call `S3Storage.upload` yourself,
+give every upload a new key, as the `ResizeStorage.upload` contract requires (the driver does not
+check). CDNs and browsers keep these objects up to a year, so purge your CDN when you delete one
+that must disappear sooner (browsers that already have it may keep it until it expires). Private
+objects get no cache header.
 
 **`mongoParts(connection, { mediaModel, timing?, logger? })`** returns `{ media, locks, tasks }`
 to spread into a Resizer: a `MongoMediaStore` over your media model, and a `MongoLockStore` and a
@@ -1416,6 +1481,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   duplicates them. A task completes only when every requested
   variant is stored fresh. When an attempt is only partly successful, its previews are saved and the
   next attempt makes only the missing ones.
+- **Push delivery** (an SQS-triggered Lambda) is not supported in 0.3.0: run the worker as a
+  long-lived process (`runWorker`, or `npm run cli ResizeWorker`). The worker runs each task's
+  lifecycle (lease renewal, retries, dead-letters, the gate lock), which a pushed task would skip.
 - **Retrying a dead task:** after fixing the cause, call `prewarm()` for that media once the
   cooldown (`coordination.cooldownMs`, 10 minutes by default) has ended: on Mongo its `add()` then
   takes the dead row over and queues a new task. Until then `prewarm()` reports the retryable
@@ -1520,7 +1588,10 @@ exhaustive.
 `npm test` runs the `node:test` suite. Core tests construct `new Resizer({ … })` with fakes and
 need no framework app. Framework-adapter tests install a fake app with `setAppInstance()`.
 `src/importGraph.test.ts` fails if the main entry ever reaches framework code. Before a release,
-run `npm run build` and `npm run smoke`.
+run `npm run build` and `npm run smoke`. `npm run types:check` checks the shipped code
+(`tsconfig.json`), then the tests, the test helpers and the root tooling (`tsconfig.tests.json`).
+`npm run types:check:src` checks the shipped code and the type pins (`tsconfig.type-pins.json`);
+CI runs it against the minimum peer versions.
 `node --experimental-strip-types bench/renderOnce.ts [rounds] [--single-thread]` benchmarks the
 render path (3 sizes × JPEG and WebP from one 24 MP JPEG) against a "resize once per size"
 baseline, with an A/A control, and exits 0 (PASS: within 5% of the baseline in wall and CPU

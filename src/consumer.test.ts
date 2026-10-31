@@ -2017,11 +2017,19 @@ describe('a late answer never undoes the end of a task', () => {
     );
   });
 
-  test('a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store', async () => {
+  test('a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store', {
+    timeout: 10_000,
+  }, async () => {
     const base = clockLocks();
     let markReleased!: () => void;
     const releaseLanded = new Promise<void>((resolve) => {
       markReleased = resolve;
+    });
+    // The release waits for the test, not for a timer: the check that the worker stopped before
+    // it landed cannot race the stop under load.
+    let letRelease!: () => void;
+    const allowRelease = new Promise<void>((r) => {
+      letRelease = r;
     });
     let landed = false;
     const locks: LockStore = {
@@ -2029,7 +2037,7 @@ describe('a late answer never undoes the end of a task', () => {
       extend: base.extend,
       release: async (lockKey, owner) => {
         try {
-          await sleepMs(20);
+          await allowRelease;
           const released = await base.release(lockKey, owner);
           landed = true;
           return released;
@@ -2068,33 +2076,42 @@ describe('a late answer never undoes the end of a task', () => {
         logger: { info() {}, warn: record, error: record },
       },
     );
-    assert.equal(landed, false, 'the worker stopped before the release landed');
-    await releaseLanded; // the release lands after the worker stopped waiting for it
-    assert.deepEqual(
-      events.map((e) => e.event),
-      ['completed'],
-    );
-    assert.ok(
-      lines.some((line) =>
-        /the lease renewal of task task-1 did not answer within 200 ms — the task ends without its answer; no time left after the lease renewal/.test(
-          line,
+    try {
+      assert.equal(
+        landed,
+        false,
+        'the worker stopped before the release landed',
+      );
+      letRelease();
+      await releaseLanded; // the release lands after the worker stopped waiting for it
+      assert.deepEqual(
+        events.map((e) => e.event),
+        ['completed'],
+      );
+      assert.ok(
+        lines.some((line) =>
+          /the lease renewal of task task-1 did not answer within 200 ms — the task ends without its answer; no time left after the lease renewal/.test(
+            line,
+          ),
         ),
-      ),
-      lines.join('\n'),
-    );
-    assert.ok(
-      lines.some((line) =>
-        /releasing the gate lock of task task-1 was sent with no time left to wait for it/.test(
-          line,
+        lines.join('\n'),
+      );
+      assert.ok(
+        lines.some((line) =>
+          /releasing the gate lock of task task-1 was sent with no time left to wait for it/.test(
+            line,
+          ),
         ),
-      ),
-      lines.join('\n'),
-    );
-    assert.equal(
-      lines.some((line) => /gave up waiting after 0 ms/.test(line)),
-      false,
-    );
-    assert.equal(base.entry(key), undefined, 'released all the same');
+        lines.join('\n'),
+      );
+      assert.equal(
+        lines.some((line) => /gave up waiting after 0 ms/.test(line)),
+        false,
+      );
+      assert.equal(base.entry(key), undefined, 'released all the same');
+    } finally {
+      letRelease();
+    }
   });
 
   test('nothing is made again once a renewal reported the lease lost', async () => {

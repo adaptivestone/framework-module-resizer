@@ -4,6 +4,9 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/testHelpers/**/*.ts"],
+  "include": [
+    "src/testHelpers/contractShapes.ts",
+    "src/testHelpers/factoryTypes.ts"
+  ],
   "exclude": []
 }

@@ -208,7 +208,11 @@ gets the full box its steps were written for. To hand the private original to it
    file:
    - `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or
      `{ driver: 's3', bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?,
-     forcePathStyle? }` (S3 is imported only when selected; credentials from the AWS chain);
+     forcePathStyle? }` (S3 is imported only when selected; credentials from the AWS chain).
+     S3: every public object `S3Storage` uploads (previews and public raster originals, and a
+     host's own direct uploads) gets `Cache-Control: public, max-age=31536000, immutable`; give
+     your own direct uploads new keys, and purge your CDN when you delete one that must disappear
+     sooner (browsers that already have it may keep it until it expires);
    - `queue`: the name of a `queues` entry (the scaffold writes `queue: 'default'`), or `false` =
      eager only. Missing: `'default'` when `queues` has entries, else eager only. A name that
      `queues` does not define (the implied `'default'` too) is `RESIZE_CONFIG_QUEUE_UNKNOWN`.
@@ -271,6 +275,9 @@ gets the full box its steps were written for. To hand the private original to it
    `{ type: String }`), or `verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED`: the media store
    keeps one row per preview identity, and the two signatures record what each row was made from.
    Give them `fit` (`{ type: Boolean }`) too; `verify()` logs one warning without it.
+   With strict types, pass a loaded Mongoose document as `media: doc as MediaLike`
+   (`import type { MediaLike }`), or type the model's `original`/`previews` paths with
+   `Original`/`Preview` (framework hosts: `TsTypeOverride`).
 
 7. Prepare queue infrastructure outside the resizer runtime. The package's `ResizeTask` model
    declares its indexes (and so does the framework's `Lock` model, used only beside a task queue
@@ -324,6 +331,8 @@ gets the full box its steps were written for. To hand the private original to it
    The flag permits the command to run; it does not start a worker in the API. The worker consumes
    indexes prepared by the host lifecycle; it does not create them, so start it after they exist
    (step 7).
+   Push delivery (an SQS-triggered Lambda) is not supported in 0.3.0: run the worker as a
+   long-lived process.
    Eager mode needs no worker.
 
 ## Use
@@ -661,6 +670,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>`. The gate is per queue: such a task blocks new tasks for its media and pipeline on that queue only, never reads on another queue |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
 | previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
+| a deleted preview is still served by the CDN | every public object `S3Storage` uploads is cached for a year (`immutable`): purge the CDN path (browsers that already have it may keep it until it expires) |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |
 

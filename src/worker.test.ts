@@ -1943,12 +1943,11 @@ describe('a worker for several queues', () => {
   test('Resizers that share a router or a task queue verify its carrier and their lock store once at worker start', async () => {
     let carrierVerifies = 0;
     let lockVerifies = 0;
-    const locks: LockStore = {
-      ...memoryLocks(),
+    const locks: LockStore = Object.assign({}, memoryLocks(), {
       verify: async () => {
         lockVerifies += 1;
       },
-    };
+    });
     const plain = new PlainTaskQueue({ timing: fast });
     plain.verify = async () => {
       carrierVerifies += 1;

@@ -291,6 +291,31 @@ test('a fit row is judged with the fit settings', () => {
   );
 });
 
+test("a fit row's signature holds the fit mode's sharpen flag; a cover row's does not", () => {
+  const on = makeImageConfig({
+    encode: { sharpen: { cover: true, fit: true } },
+  });
+  const off = makeImageConfig({
+    encode: { sharpen: { cover: true, fit: false } },
+  });
+  const fit = stampFresh(freshMedia({ formats: [], fit: true }), {
+    config: on,
+  });
+  const cover = stampFresh(freshMedia({ formats: ['jpeg'] }), { config: on });
+  assert.deepEqual(
+    [...new Catalog({ config: on }).freshIdentities(fit, scope)],
+    ['default:default:fit:jpeg:none'],
+  );
+  assert.deepEqual(
+    [...new Catalog({ config: off }).splitStored(fit, scope).stale.keys()],
+    ['default:default:fit:jpeg:none'],
+  );
+  assert.deepEqual(
+    [...new Catalog({ config: off }).freshIdentities(cover, scope)],
+    ['default:default:10x10:jpeg:none'],
+  );
+});
+
 test('the live pipeline version and config are read on every call', () => {
   const liveConfig = makeImageConfig();
   const pipeline: { version?: string } = { version: 'v1' };

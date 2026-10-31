@@ -9,7 +9,9 @@
 // driver factory over PlainTaskQueue; fakeDatabaseParts are database parts whose task queue is a
 // MemoryTaskQueue; memoryStorage keeps files in a map; memoryStorageDriver and
 // fakeDatabaseDriver are the storage and database drivers a test registers by name;
-// silentLogger drops every message; recordingMetrics keeps every metrics call.
+// silentLogger drops every message; recordingMetrics keeps every metrics call; refKey reads the
+// key of a fake storage ref; asS3Client types a recording fake as the S3 SDK client.
+import type { S3Client } from '@aws-sdk/client-s3';
 import type {
   DatabaseDriver,
   DatabaseParts,
@@ -40,6 +42,24 @@ import type {
   ResizeLogger,
   StorageRef,
 } from '../types.d.ts';
+
+/**
+ * The `key` of a storage ref built by a fake storage, as text. Refs are opaque (`unknown`) to the
+ * core; a ref without a `key` gives 'undefined', as the untyped `ref.key` in a template did.
+ */
+export function refKey(ref: StorageRef): string {
+  return String((ref as { key?: unknown } | null | undefined)?.key);
+}
+
+/**
+ * A recording fake typed as the SDK client. S3Storage only ever calls `send`, so the fake has no
+ * other member; the type import is erased, so this file loads no SDK.
+ */
+export function asS3Client(fake: {
+  send(command: never): Promise<unknown>;
+}): S3Client {
+  return fake as unknown as S3Client;
+}
 
 /** A logger that drops every message. */
 export const silentLogger: ResizeLogger = {

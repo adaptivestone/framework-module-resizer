@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { S3Client } from '@aws-sdk/client-s3';
 import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
-import { silentLogger } from '../testHelpers/fakes.ts';
+import { asS3Client, silentLogger } from '../testHelpers/fakes.ts';
 import type { S3StorageConfig } from '../types.d.ts';
 import { S3Storage } from './s3.ts';
 
@@ -25,7 +25,7 @@ function fakeClient() {
       return {};
     },
   };
-  return { client, sent };
+  return { client: asS3Client(client), sent };
 }
 
 const args = (key: string, visibility: 'public' | 'private') => ({
@@ -198,7 +198,7 @@ describe('S3Storage', () => {
     });
   });
 
-  test('non-SVG uploads keep their original PutObject input without a disposition', async () => {
+  test('non-SVG public uploads carry the cache header and no disposition', async () => {
     const { client, sent } = fakeClient();
     const s = new S3Storage({ bucketPublic: 'pub', client });
     for (const contentType of ['image/jpeg', 'image/png', 'image/webp']) {
@@ -209,8 +209,30 @@ describe('S3Storage', () => {
         Key: upload.key,
         Body: upload.body,
         ContentType: contentType,
+        CacheControl: 'public, max-age=31536000, immutable',
       });
     }
+  });
+
+  test('public uploads are cacheable for a year and immutable; private uploads carry no cache header', async () => {
+    const { client, sent } = fakeClient();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    await s.upload(args('previews/a.webp', 'public'));
+    assert.equal(
+      sent[0].input.CacheControl,
+      'public, max-age=31536000, immutable',
+    );
+    await s.upload(args('originals/a.jpg', 'private'));
+    assert.equal('CacheControl' in sent[1].input, false);
+    await s.upload(args('originals/b.jpg', 'public'));
+    assert.equal(
+      sent[2].input.CacheControl,
+      'public, max-age=31536000, immutable',
+    );
   });
 
   test('refuses private URL, unknown bucket, missing bucket and invalid refs', async () => {
@@ -429,7 +451,7 @@ describe('S3Storage.fromConfig', () => {
     );
   });
 
-  test('a private upload goes to bucketPrivate from the section', async () => {
+  test("a section's bucketPrivate is the private bucket: publicUrl refuses it", async () => {
     const s = S3Storage.fromConfig(
       { driver: 's3', bucketPublic: 'pub', bucketPrivate: 'priv' },
       ctx,

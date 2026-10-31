@@ -1,6 +1,6 @@
 {
   "name": "@adaptivestone/framework-module-resize",
-  "version": "0.3.0-rc.4",
+  "version": "0.3.0-rc.5",
   "description": "Adaptive stone node js framework module: image resize (sharp)",
   "main": "./dist/index.js",
   "type": "module",
@@ -39,7 +39,8 @@
   "scripts": {
     "prepublishOnly": "npm run build",
     "build": "node preBuild.ts && tsc && node postBuild.ts",
-    "types:check": "tsc --noEmit && tsc -p tsconfig.test-helpers.json",
+    "types:check": "tsc --noEmit && tsc -p tsconfig.tests.json",
+    "types:check:src": "tsc --noEmit && tsc -p tsconfig.type-pins.json",
     "test": "node --experimental-strip-types --test",
     "check": "biome check",
     "check:fix": "biome check --write",

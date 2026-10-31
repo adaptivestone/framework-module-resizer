@@ -855,8 +855,10 @@ describe('a task queue the Resizer cannot use', () => {
       decision.missing.map((variant) => variant.sizeKey),
       ['20x20'],
     );
+    // Read through a call: the deepEqual(tasks.added, []) above narrowed `tasks.added` to never[].
+    const added = () => tasks.added;
     assert.deepEqual(
-      tasks.added.map((task) => task.previews.map((v) => v.sizeKey)),
+      added().map((task) => task.previews.map((v) => v.sizeKey)),
       [['20x20']],
     );
     await r.verify();
@@ -1592,7 +1594,9 @@ describe('metrics', () => {
       error() {},
     };
     const r = new Resizer({
-      storage: { ...fakeStorage(), publicUrl: () => 'https://cdn/p' },
+      storage: Object.assign({}, fakeStorage(), {
+        publicUrl: () => 'https://cdn/p',
+      }),
       media: fakeMedia(),
       logger,
     });

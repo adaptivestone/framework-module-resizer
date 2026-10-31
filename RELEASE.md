@@ -14,7 +14,9 @@ Run from a clean working tree on `main`:
 
 ```bash
 npm ci                 # reproducible install from the lockfile
-node --run types:check # tsc --noEmit
+node --run types:check # tsc: the shipped code, then the tests (tsconfig.tests.json)
+node --run types:check:src
+                       # shipped code + type pins (CI also runs it on the minimum peers)
 node --run check       # biome
 node --run build       # preBuild → tsc → postBuild (emits dist/)
 npm test               # node --experimental-strip-types --test  (the full node:test suite)
@@ -45,7 +47,8 @@ final `X.Y.0`. 0.3.0 ships this way: `0.3.0-rc.1` holds every host-facing shape,
 `beforeSteps` signature and the decoder port, `0.3.0-rc.3` additions only (`createResizer`, drivers
 by name, routing between backends, a worker queue list, partial config files; no required host
 change), `0.3.0-rc.4` metrics and the freshness check (additions, and outdated previews regenerate
-on read; no required host change), later rcs internal changes only. All of them stay under the one
+on read; no required host change), `0.3.0-rc.5` a cache header on S3 public objects (no host
+change), later rcs internal changes only. All of them stay under the one
 `# 0.3.0` heading of `CHANGELOG.md` (its **Prereleases** note says what each rc holds); the
 final `0.3.0` is a bump from the last rc with no new heading.
 

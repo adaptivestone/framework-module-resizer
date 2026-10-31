@@ -68,8 +68,11 @@ before(async () => {
     statics: LockModel.modelStatics,
   });
   LockModel.initHooks(lockSchema);
-  taskModel = connection.model('ResizeTask', taskSchema);
-  lockModel = connection.model('Lock', lockSchema);
+  taskModel = connection.model<Record<string, unknown>>(
+    'ResizeTask',
+    taskSchema,
+  );
+  lockModel = connection.model<Record<string, unknown>>('Lock', lockSchema);
   await Promise.all([taskModel.init(), lockModel.init()]);
 });
 
