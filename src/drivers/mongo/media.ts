@@ -99,34 +99,111 @@ interface SchemaLike {
   options: { strict?: unknown };
 }
 
+/** What keeps a strict `original` from storing the measured dimensions as numbers. */
+interface OriginalDims {
+  /** The dimensions it does not declare (`width`, `height`). */
+  missing: string[];
+  /** The dimensions it declares with a type other than Number or Mixed, with that type. */
+  mistyped: Array<{ dim: string; type: string }>;
+  /** Whether its strict mode is `'throw'`: Mongoose rejects the update instead of dropping them. */
+  rejects: boolean;
+}
+
 /**
- * The `original.width` / `original.height` paths a strict `original` does not declare, so a
- * `$set` of the measured dimensions would be dropped: `original` declared as nested paths (strict
- * unless the schema is `strict: false`), or as a single sub-schema that is not `strict: false`.
- * A Mixed `original`, one not declared, or a model without a schema gives none.
+ * How a strict `original` keeps the backfill `$set` of the measured dimensions from storing them
+ * as numbers: `original` declared as nested paths (strict unless the schema is `strict: false`;
+ * the root schema's strict mode applies), or as a single sub-schema that is not `strict: false`
+ * (its own strict mode applies). An undeclared dimension is dropped, or rejected under
+ * `strict: 'throw'`; one declared with another type than Number (or Mixed) is cast to it. A Mixed
+ * `original`, one not declared, or a model without a schema gives nothing.
  */
-function undeclaredDims(model: MongoMediaModel): string[] {
+function originalDims(model: MongoMediaModel): OriginalDims | undefined {
   const schema = (model as { schema?: Partial<SchemaLike> }).schema;
   if (typeof schema?.path !== 'function') {
-    return [];
+    return undefined;
   }
-  const dims = ['width', 'height'];
+  let owner: Partial<SchemaLike>;
+  let prefix: string;
   if (
     typeof schema.pathType === 'function' &&
     schema.pathType('original') === 'nested'
   ) {
-    if (schema.options?.strict === false) {
-      return [];
+    owner = schema;
+    prefix = 'original.';
+  } else {
+    const sub = (
+      schema.path('original') as { schema?: Partial<SchemaLike> } | undefined
+    )?.schema;
+    if (typeof sub?.path !== 'function') {
+      return undefined;
     }
-    return dims.filter((dim) => !schema.path?.(`original.${dim}`));
+    owner = sub;
+    prefix = '';
   }
-  const sub = (
-    schema.path('original') as { schema?: Partial<SchemaLike> } | undefined
-  )?.schema;
-  if (typeof sub?.path !== 'function' || sub.options?.strict === false) {
-    return [];
+  const strict = owner.options?.strict;
+  if (strict === false) {
+    return undefined;
   }
-  return dims.filter((dim) => !sub.path?.(dim));
+  const found: OriginalDims = {
+    missing: [],
+    mistyped: [],
+    rejects: strict === 'throw',
+  };
+  for (const dim of ['width', 'height']) {
+    const path = owner.path?.(`${prefix}${dim}`) as
+      | { instance?: unknown }
+      | undefined;
+    if (!path) {
+      found.missing.push(dim);
+    } else if (
+      typeof path.instance === 'string' &&
+      path.instance !== 'Number' &&
+      path.instance !== 'Mixed'
+    ) {
+      found.mistyped.push({ dim, type: path.instance });
+    }
+  }
+  return found.missing.length > 0 || found.mistyped.length > 0
+    ? found
+    : undefined;
+}
+
+/** The verify() warning for what originalDims() found. */
+function originalDimsWarning(
+  modelName: string | undefined,
+  { missing, mistyped, rejects }: OriginalDims,
+): string {
+  const named = (dims: string[]) =>
+    dims.map((dim) => `original.${dim}`).join(' and ');
+  const problems: string[] = [];
+  const effects: string[] = [];
+  if (missing.length > 0) {
+    problems.push(
+      `has no ${named(missing)} field${missing.length > 1 ? 's' : ''}`,
+    );
+    effects.push(
+      rejects
+        ? "Mongoose rejects the update that records the original's dimensions the worker measures (its strict: 'throw'), so such a task fails and is retried without storing its previews"
+        : "Mongoose drops the original's dimensions the worker measures",
+    );
+  }
+  if (mistyped.length > 0) {
+    const types = [...new Set(mistyped.map(({ type }) => type))];
+    const declared =
+      types.length === 1
+        ? `${named(mistyped.map(({ dim }) => dim))} as ${types[0]}`
+        : mistyped
+            .map(({ dim, type }) => `original.${dim} as ${type}`)
+            .join(' and ');
+    problems.push(`declares ${declared}, not Number`);
+    effects.push(
+      `Mongoose stores the dimensions the worker measures as ${types.join(' and ')}`,
+    );
+  }
+  const fix = [...missing, ...mistyped.map(({ dim }) => dim)]
+    .map((dim) => `${dim}: { type: Number }`)
+    .join(' and ');
+  return `resize: the media model ${modelName ? `'${modelName}' ` : ''}${problems.join(' and ')}, so ${effects.join('; ')}, and every read queues a task that downloads the original again — spread the current resizeMediaSchemaFragment into the media model's schema, or ${mistyped.length > 0 ? `declare ${fix} in` : `add ${fix} to`} its original`;
 }
 
 // The preview row schema of a media model: the sub-document schema of its `previews` array, or
@@ -235,19 +312,17 @@ export class MongoMediaStore extends MediaStore {
    * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
    * field. Such rows without `fit` only get a warning, once per store: freshness still holds
    * without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
-   * without `width` or `height` also gets one warning per store (it does not throw, so a setup
-   * that passed before keeps passing): Mongoose drops the dimensions the worker measures, so every
-   * read queues a task that downloads the original again.
+   * without `width` or `height`, or declaring one with another type than Number, also gets one
+   * warning per store (it does not throw, so a setup that passed before keeps passing): Mongoose
+   * drops the dimensions the worker measures (rejects them under `strict: 'throw'`) or stores
+   * them with that type, so every read queues a task that downloads the original again.
    */
   verify(): void {
     const model = this.mediaModel();
-    const dims = undeclaredDims(model);
-    if (dims.length > 0 && !this.#warnedOriginal) {
+    const dims = originalDims(model);
+    if (dims && !this.#warnedOriginal) {
       this.#warnedOriginal = true;
-      const fields = dims.map((dim) => `original.${dim}`);
-      this.#logger.warn(
-        `resize: the media model ${model.modelName ? `'${model.modelName}' ` : ''}has no ${fields.join(' and ')} field${fields.length > 1 ? 's' : ''}, so Mongoose drops the original's dimensions the worker measures and every read queues a task that downloads the original again — spread the current resizeMediaSchemaFragment into the media model's schema, or add ${dims.map((dim) => `${dim}: { type: Number }`).join(' and ')} to its original`,
-      );
+      this.#logger.warn(originalDimsWarning(model.modelName, dims));
     }
     const rows = previewRowSchema(model);
     if (!rows?.path || rows.options?.strict === false) {

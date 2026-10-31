@@ -197,16 +197,19 @@ interface LoadedSource {
  * its plain form (`toObject()`). The copy keeps the value types a driver reads: plain objects and
  * arrays are copied key by key, a `Buffer` stays a `Buffer` (any other typed array keeps its
  * type) and a `Date` a `Date`; every other value (a class instance such as a bson `ObjectId`, a
- * function) is the same value, as the driver got it before the locator was copied. The origin is
- * signed from signedLocator(), never from this copy.
+ * function) is the same value, as the driver got it before the locator was copied. A Buffer path
+ * of a Mongoose sub-document, which `toObject()` turns into a bson `Binary`, becomes a `Buffer` of
+ * its bytes again, as the live sub-document gives it; a `Binary` in a plain locator stays as it
+ * is. The origin is signed from signedLocator(), never from this copy.
  */
 function copyLocator(ref: StorageRef): StorageRef {
-  const plain =
-    typeof (ref as { toObject?: unknown } | null)?.toObject === 'function'
-      ? (ref as { toObject(): unknown }).toObject()
-      : ref;
+  const fromDocument =
+    typeof (ref as { toObject?: unknown } | null)?.toObject === 'function';
+  const plain = fromDocument
+    ? (ref as { toObject(): unknown }).toObject()
+    : ref;
   try {
-    return copyValue(plain, new Map()) as StorageRef;
+    return copyValue(plain, new Map(), fromDocument) as StorageRef;
   } catch {
     // A locator that cannot be read through (a getter that throws, say) is kept as it is: the
     // driver then reads it live, as it did before it was copied.
@@ -214,8 +217,36 @@ function copyLocator(ref: StorageRef): StorageRef {
   }
 }
 
-/** One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts. */
-function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
+/**
+ * The bytes of a bson `Binary` (duck-typed: no bson import) as a new `Buffer`, or undefined when
+ * the value is not one or does not expose its bytes as `buffer` (filled up to `position`).
+ */
+function binaryBytes(value: object): Buffer | undefined {
+  const { _bsontype, buffer, position } = value as {
+    _bsontype?: unknown;
+    buffer?: unknown;
+    position?: unknown;
+  };
+  if (_bsontype !== 'Binary' || !ArrayBuffer.isView(buffer)) {
+    return undefined;
+  }
+  const length =
+    typeof position === 'number'
+      ? Math.min(position, buffer.byteLength)
+      : buffer.byteLength;
+  return Buffer.from(new Uint8Array(buffer.buffer, buffer.byteOffset, length));
+}
+
+/**
+ * One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts.
+ * `fromDocument`: the value comes from a Mongoose `toObject()`, so a bson `Binary` in it was a
+ * Buffer path and becomes a `Buffer` again.
+ */
+function copyValue(
+  value: unknown,
+  seen: Map<object, unknown>,
+  fromDocument = false,
+): unknown {
   if (typeof value !== 'object' || value === null) {
     return value;
   }
@@ -242,9 +273,14 @@ function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
     const copy: unknown[] = [];
     seen.set(value, copy);
     for (const item of value) {
-      copy.push(copyValue(item, seen));
+      copy.push(copyValue(item, seen, fromDocument));
     }
     return copy;
+  }
+  const bytes = fromDocument ? binaryBytes(value) : undefined;
+  if (bytes) {
+    seen.set(value, bytes);
+    return bytes;
   }
   const proto = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) {
@@ -254,7 +290,18 @@ function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
   const copy: Record<string, unknown> = Object.create(proto);
   seen.set(value, copy);
   for (const key of Object.keys(value)) {
-    copy[key] = copyValue((value as Record<string, unknown>)[key], seen);
+    // An own data property, never an assignment: an own `__proto__` key (JSON.parse makes one)
+    // stays a key instead of becoming the copy's prototype.
+    Object.defineProperty(copy, key, {
+      value: copyValue(
+        (value as Record<string, unknown>)[key],
+        seen,
+        fromDocument,
+      ),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return copy;
 }
@@ -272,25 +319,34 @@ const IMAGE_SETTING_KEYS = [
 ] as const satisfies ReadonlyArray<keyof ResizeConfig>;
 
 /**
- * The config as one render reads it, taken now: a shallow copy whose image settings are deep
- * copies, so a setting changed in place while the render runs does not reach it. Any other key
- * (the config may carry host keys) is kept by reference, and a setting that cannot be copied (one
- * holding a function, say) is kept as it is.
+ * The config as one render reads it, taken now: an object whose prototype is the config, with a
+ * copy of each image setting as an own property, so a setting changed in place while the render
+ * runs does not reach it. Each setting is read through the config, so one the config inherits
+ * (`Object.create(defaults)`, a getter on a class) is copied too, and is copied as copyValue()
+ * copies a locator: plain objects and arrays key by key, every other value (a function a host
+ * keeps beside the settings, say) by reference. Any other key, own or inherited, is read through
+ * the prototype, as the config holds it.
  */
 function snapshotSettings(config: ResizeConfig): ResizeConfig {
-  const settings = { ...config };
-  const writable = settings as unknown as Record<string, unknown>;
+  const settings: Record<string, unknown> = Object.create(config);
+  const seen = new Map<object, unknown>();
   for (const key of IMAGE_SETTING_KEYS) {
-    if (!Object.hasOwn(settings, key)) {
+    let copy: unknown;
+    try {
+      copy = copyValue(config[key], seen);
+    } catch {
+      // Not copied (a getter that throws, say): the render reads it through the prototype, live,
+      // as it did before settings were copied.
       continue;
     }
-    try {
-      writable[key] = structuredClone(settings[key]);
-    } catch {
-      // Kept as it is: the render then reads it live, as it did before settings were copied.
-    }
+    Object.defineProperty(settings, key, {
+      value: copy,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
-  return settings;
+  return settings as unknown as ResizeConfig;
 }
 
 /**
@@ -1023,8 +1079,8 @@ export class Processor {
     // work, with no await between them: the render uses only these, so a pipeline version, step
     // set or image setting changed while it runs (even changed and changed back) never makes a row
     // signed with one set of settings out of pixels made with another. The image settings are
-    // plain data (other keys of the config are kept by reference); the steps are kept by
-    // reference, their lists copied.
+    // copied (other keys of the config, and values in a setting that are not plain data, are kept
+    // by reference); the steps are kept by reference, their lists copied.
     const settings = snapshotSettings(config);
     const { limits: renderLimits } = settings;
     const pipeline = pipelines.get(pipelineName);

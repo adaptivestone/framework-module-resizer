@@ -960,6 +960,113 @@ describe('MongoMediaStore.verify(): a strict original without width and height',
     };
     assert.equal('width' in stored.original, false);
   });
+
+  // A media model with the given `original` and schema options (registered once per name).
+  const modelWithOptions = (
+    name: string,
+    original: unknown,
+    options: Record<string, unknown>,
+  ) =>
+    connection.models[name] ??
+    connection.model(
+      name,
+      new mongoose.Schema(
+        { original, previews: resizeMediaSchemaFragment.previews } as never,
+        { minimize: false, ...options },
+      ),
+    );
+
+  test("under strict: 'throw' the warning says the update is rejected, and the backfill really rejects", async () => {
+    for (const [name, model] of [
+      [
+        'NoDimsThrowMedia',
+        modelWithOptions('NoDimsThrowMedia', noDims, { strict: 'throw' }),
+      ],
+      [
+        'NoDimsThrowSubMedia',
+        modelWithOriginal(
+          'NoDimsThrowSubMedia',
+          new mongoose.Schema(noDims, { strict: 'throw' }),
+        ),
+      ],
+    ] as const) {
+      const { warnings, logger } = recording();
+      const store = new MongoMediaStore({ model, logger });
+      store.verify();
+      assert.equal(warnings.length, 1, name);
+      const text = String(warnings[0][0]);
+      assert.match(text, /original\.width and original\.height/, name);
+      assert.match(text, /rejects/, name);
+      assert.match(text, /strict: 'throw'/, name);
+      assert.match(text, /resizeMediaSchemaFragment/, name);
+      assert.match(text, /width: \{ type: Number \}/, name);
+
+      const doc = await model.create({
+        original: { storageRef: { path: 'o.png' }, format: 'png' },
+        previews: [],
+      });
+      await assert.rejects(
+        store.appendPreviews(String(doc._id), [], { width: 64, height: 32 }),
+        { name: 'StrictModeError' },
+        name,
+      );
+    }
+  });
+
+  test('dimensions declared with another type than Number warn, naming the type; Mixed dimensions do not', async () => {
+    const asString = { ...noDims, width: String, height: String };
+    for (const [name, original, named] of [
+      ['StringDimsMedia', asString, /original\.width and original\.height/],
+      [
+        'StringWidthSubMedia',
+        new mongoose.Schema({ ...noDims, width: String, height: Number }),
+        /original\.width as String/,
+      ],
+    ] as const) {
+      const { warnings, logger } = recording();
+      const store = new MongoMediaStore({
+        model: modelWithOriginal(name, original),
+        logger,
+      });
+      store.verify();
+      store.verify();
+      assert.equal(warnings.length, 1, name);
+      const text = String(warnings[0][0]);
+      assert.match(text, named, name);
+      assert.match(text, /String/, name);
+      assert.match(text, /not Number/, name);
+      assert.match(text, /downloads the original/, name);
+      assert.match(text, /width: \{ type: Number \}/, name);
+      if (name === 'StringWidthSubMedia') {
+        assert.doesNotMatch(text, /height/, name);
+      }
+    }
+
+    const model = modelWithOriginal('StringDimsBackfillMedia', asString);
+    const doc = await model.create({
+      original: { storageRef: { path: 'o.png' }, format: 'png' },
+      previews: [],
+    });
+    await new MongoMediaStore({
+      model,
+      logger: recording().logger,
+    }).appendPreviews(String(doc._id), [], { width: 64, height: 32 });
+    const stored = (await model.findById(doc._id).lean()) as {
+      original: Record<string, unknown>;
+    };
+    assert.equal(stored.original.width, '64');
+
+    const mixed = recording();
+    new MongoMediaStore({
+      model: modelWithOriginal('MixedDimsMedia', {
+        ...noDims,
+        width: mongoose.Schema.Types.Mixed,
+        height: {},
+      }),
+      logger: mixed.logger,
+    }).verify();
+    assert.deepEqual(mixed.warnings, []);
+  });
 });
 
 describe('MongoMediaStore options', () => {
