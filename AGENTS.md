@@ -466,8 +466,10 @@ import { resizeMediaPaths } from '@adaptivestone/framework-module-resize/framewo
 File.find().select(['mediaType', ...resizeMediaPaths]);
 ```
 
-Remove a media's stored previews (e.g. after a pipeline's output changed, or before deleting the
-media). `invalidate` never deletes files and never queues: delete the returned refs yourself:
+Remove a media's stored previews (e.g. after a pipeline's output changed, after replacing an
+original in place, or before deleting the media). New bytes under the same `original.storageRef`
+and at the same size are not detected as stale, so call `invalidate` after such a replacement.
+`invalidate` never deletes files and never queues: delete the returned refs yourself:
 
 ```ts
 const refs = await getResizer().invalidate({ media: fileDoc, pipeline: 'default' }); // omit pipeline: every pipeline

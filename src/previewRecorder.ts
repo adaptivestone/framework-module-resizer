@@ -357,6 +357,8 @@ export class PreviewRecorder {
       this.#errorLost(mediaId, lost);
     }
     if (removed.length > 0) {
+      // The rows this write removed: the outdated ones, or a row of the same identity another
+      // worker stored meanwhile.
       logger.info(
         `resize: replaced ${removed.length} outdated preview(s) of media ${mediaId}; their files are not deleted: storage refs ${describeRefs(removed)}`,
       );

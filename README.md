@@ -1282,6 +1282,9 @@ A stale row is served while its replacement is made; the replacement takes its p
 - another `original.storageRef`, or other stored dimensions of the original;
 - a row without signatures (written before `0.3.0-rc.1`).
 
+New bytes under the same `original.storageRef` and at the same size are not detected: after
+replacing an original in place, call `invalidate()` for that media.
+
 **On read.** `resolve()` serves a stale row like a fresh one, with `stale: true` on its
 `ReadyEntry`, and queues its replacement: stale and missing variants form one list, in cell order,
 for `beforeEnqueue`, and one task. After the hook, a variant whose stored row was stale is in
@@ -1297,10 +1300,12 @@ ones are required and queued like missing ones.
 The worker judges freshness by its own settings: a queued variant that is fresh for it is skipped
 (nothing is uploaded) and counts as covered. The new rows of a stale identity replace the old ones
 in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists
-the storage refs of the rows `generate()` replaced (set only when there are some), and
-`generate()` swaps the rows in the caller's `media.previews` too. Each replacing write logs one
-`info` line: "resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted:
-storage refs <refs>".
+the storage refs of the rows the write of `generate()` removed (set only when there are some):
+the outdated rows, or a row of the same identity another worker stored meanwhile. `generate()`
+swaps the rows in the caller's `media.previews` too. Each replacing write logs one `info` line:
+"resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs
+<refs>". Its count and refs are the rows that write removed, so they can include such a
+concurrent copy too.
 
 **Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
 preview objects no row references. A row without an `identity` (written before 0.3.0) stays beside
