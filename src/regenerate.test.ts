@@ -867,6 +867,71 @@ test('the original locator changed in place while it downloads: the row records 
   assert.equal(decision.ready[0].stale, true);
 });
 
+test('a locator holding a Buffer, a class instance, a Date and a nested array: the driver gets them with their types, and a change in place does not reach it', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  /** Stands in for a bson ObjectId: a class instance a driver calls methods on. */
+  class Handle {
+    readonly id: string;
+    constructor(id: string) {
+      this.id = id;
+    }
+    toHexString(): string {
+      return this.id;
+    }
+  }
+  const handle = new Handle('abc123');
+  const locator = {
+    key,
+    etag: Buffer.from('etag'),
+    owner: handle,
+    savedAt: new Date(1_000),
+    parts: [{ name: 'a' }, ['b']],
+  };
+  const doc: MediaLike = {
+    id: 'm1',
+    original: { ...red, storageRef: locator },
+    previews: [],
+  };
+  w.docs.set('m1', doc);
+  type Seen = typeof locator;
+  const check = (seen: Seen, where: string) => {
+    assert.notEqual(seen, locator, `${where}: a copy`);
+    assert.equal(Buffer.isBuffer(seen.etag), true, `${where}: a Buffer`);
+    assert.equal(seen.etag.toString(), 'etag', where);
+    assert.equal(seen.owner, handle, `${where}: the instance itself`);
+    assert.equal(seen.owner.toHexString(), 'abc123', where);
+    assert.ok(seen.savedAt instanceof Date, `${where}: a Date`);
+    assert.equal(seen.savedAt.getTime(), 1_000, where);
+    assert.deepEqual(seen.parts, [{ name: 'a' }, ['b']], where);
+    assert.ok(Array.isArray(seen.parts[1]), where);
+  };
+  const download = w.storage.download;
+  w.storage.download = async (ref) => {
+    const seen = ref as Seen;
+    check(seen, 'download');
+    const bytes = await download(ref);
+    // The host changes the live locator in place while the old bytes are being read.
+    locator.etag.write('xxxx');
+    locator.savedAt.setTime(2_000);
+    (locator.parts[0] as { name: string }).name = 'changed';
+    (locator.parts[1] as string[]).push('c');
+    return bytes;
+  };
+  const parents: Seen[] = [];
+  const upload = w.storage.upload;
+  w.storage.upload = async (args) => {
+    parents.push(args.parentRef as Seen);
+    return upload(args);
+  };
+
+  await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+  assert.equal(parents.length, 1);
+  check(parents[0], 'parentRef');
+});
+
 test('a locator with its own toJSON (a Mongoose sub-document, say): the row is signed as the read path signs it, so the next read is fresh', async () => {
   const w = world();
   const r = w.resizer(webpConfig(80));

@@ -194,7 +194,11 @@ interface LoadedSource {
 /**
  * A deep copy of a storage locator for the storage driver, so a locator the host changes in place
  * does not change the download or the upload's parent. A Mongoose sub-document is copied through
- * its plain form (`toObject()`).
+ * its plain form (`toObject()`). The copy keeps the value types a driver reads: plain objects and
+ * arrays are copied key by key, a `Buffer` stays a `Buffer` (any other typed array keeps its
+ * type) and a `Date` a `Date`; every other value (a class instance such as a bson `ObjectId`, a
+ * function) is the same value, as the driver got it before the locator was copied. The origin is
+ * signed from signedLocator(), never from this copy.
  */
 function copyLocator(ref: StorageRef): StorageRef {
   const plain =
@@ -202,13 +206,57 @@ function copyLocator(ref: StorageRef): StorageRef {
       ? (ref as { toObject(): unknown }).toObject()
       : ref;
   try {
-    return structuredClone(plain);
+    return copyValue(plain, new Map()) as StorageRef;
   } catch {
-    // A locator structuredClone cannot copy (one holding a function, say) is kept as it is: the
-    // driver then reads it live, as it did before it was copied. The origin is signed from
-    // signedLocator(), never from this copy.
+    // A locator that cannot be read through (a getter that throws, say) is kept as it is: the
+    // driver then reads it live, as it did before it was copied.
     return plain;
   }
+}
+
+/** One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts. */
+function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const known = seen.get(value);
+  if (known !== undefined) {
+    return known;
+  }
+  if (Buffer.isBuffer(value)) {
+    const copy = Buffer.from(value);
+    seen.set(value, copy);
+    return copy;
+  }
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+    const copy = (value as unknown as { slice(): unknown }).slice();
+    seen.set(value, copy);
+    return copy;
+  }
+  if (value instanceof Date) {
+    const copy = new Date(value.getTime());
+    seen.set(value, copy);
+    return copy;
+  }
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    for (const item of value) {
+      copy.push(copyValue(item, seen));
+    }
+    return copy;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    // A class instance (an ObjectId, say) is kept by reference.
+    return value;
+  }
+  const copy: Record<string, unknown> = Object.create(proto);
+  seen.set(value, copy);
+  for (const key of Object.keys(value)) {
+    copy[key] = copyValue((value as Record<string, unknown>)[key], seen);
+  }
+  return copy;
 }
 
 /**
