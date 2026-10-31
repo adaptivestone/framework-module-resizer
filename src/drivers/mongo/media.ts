@@ -103,19 +103,25 @@ interface SchemaLike {
 interface OriginalDims {
   /** The dimensions it does not declare (`width`, `height`). */
   missing: string[];
-  /** The dimensions it declares with a type other than Number or Mixed, with that type. */
+  /** The dimensions it declares with a type that does not read back as a number, with that type. */
   mistyped: Array<{ dim: string; type: string }>;
   /** Whether its strict mode is `'throw'`: Mongoose rejects the update instead of dropping them. */
   rejects: boolean;
 }
 
+// The schema types of a dimension that keep the backfilled number a JS number on read: Mixed keeps
+// it as given, and Int32 casts and reads back as a number (Double and Decimal128 read back as bson
+// objects on a document, which freshness cannot read).
+const NUMERIC_DIM_TYPES = new Set(['Number', 'Int32', 'Mixed']);
+
 /**
- * How a strict `original` keeps the backfill `$set` of the measured dimensions from storing them
- * as numbers: `original` declared as nested paths (strict unless the schema is `strict: false`;
- * the root schema's strict mode applies), or as a single sub-schema that is not `strict: false`
- * (its own strict mode applies). An undeclared dimension is dropped, or rejected under
- * `strict: 'throw'`; one declared with another type than Number (or Mixed) is cast to it. A Mixed
- * `original`, one not declared, or a model without a schema gives nothing.
+ * How an `original` keeps the backfill `$set` of the measured dimensions from storing them as
+ * numbers: `original` declared as nested paths (the root schema's strict mode applies), or as a
+ * single sub-schema (its own strict mode applies). Unless that mode is `strict: false`, an
+ * undeclared dimension is dropped, or rejected under `strict: 'throw'`. Whatever the mode, a
+ * dimension declared with a type that does not read back as a number (NUMERIC_DIM_TYPES) is cast
+ * to it, or rejected when it cannot be cast. A Mixed `original`, one not declared, or a model
+ * without a schema gives nothing.
  */
 function originalDims(model: MongoMediaModel): OriginalDims | undefined {
   const schema = (model as { schema?: Partial<SchemaLike> }).schema;
@@ -141,9 +147,6 @@ function originalDims(model: MongoMediaModel): OriginalDims | undefined {
     prefix = '';
   }
   const strict = owner.options?.strict;
-  if (strict === false) {
-    return undefined;
-  }
   const found: OriginalDims = {
     missing: [],
     mistyped: [],
@@ -154,11 +157,13 @@ function originalDims(model: MongoMediaModel): OriginalDims | undefined {
       | { instance?: unknown }
       | undefined;
     if (!path) {
-      found.missing.push(dim);
+      // A loose schema stores an undeclared dimension as given.
+      if (strict !== false) {
+        found.missing.push(dim);
+      }
     } else if (
       typeof path.instance === 'string' &&
-      path.instance !== 'Number' &&
-      path.instance !== 'Mixed'
+      !NUMERIC_DIM_TYPES.has(path.instance)
     ) {
       found.mistyped.push({ dim, type: path.instance });
     }
@@ -197,7 +202,7 @@ function originalDimsWarning(
             .join(' and ');
     problems.push(`declares ${declared}, not Number`);
     effects.push(
-      `Mongoose stores the dimensions the worker measures as ${types.join(' and ')}`,
+      `Mongoose either stores the dimensions the worker measures as ${types.join(' and ')} or, when it cannot cast them to that type, rejects the update that records them, so such a task fails and is retried without storing its previews; either way freshness cannot read them as numbers`,
     );
   }
   const fix = [...missing, ...mistyped.map(({ dim }) => dim)]
@@ -312,10 +317,11 @@ export class MongoMediaStore extends MediaStore {
    * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
    * field. Such rows without `fit` only get a warning, once per store: freshness still holds
    * without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
-   * without `width` or `height`, or declaring one with another type than Number, also gets one
-   * warning per store (it does not throw, so a setup that passed before keeps passing): Mongoose
-   * drops the dimensions the worker measures (rejects them under `strict: 'throw'`) or stores
-   * them with that type, so every read queues a task that downloads the original again.
+   * without `width` or `height`, or any `original` declaring one with a type that does not read
+   * back as a number (not Number, Int32 or Mixed), also gets one warning per store (it does not
+   * throw, so a setup that passed before keeps passing): Mongoose drops the dimensions the worker
+   * measures (rejects them under `strict: 'throw'`), stores them with that type, or rejects them
+   * when it cannot cast them, so every read queues a task that downloads the original again.
    */
   verify(): void {
     const model = this.mediaModel();
