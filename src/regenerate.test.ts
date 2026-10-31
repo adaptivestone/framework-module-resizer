@@ -7,6 +7,7 @@
 // queue; resetResizerForTests() between two Resizers of one name stands in for a redeploy.
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
+import mongoose from 'mongoose';
 import sharp from 'sharp';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
@@ -949,6 +950,157 @@ test('a locator holding a Buffer, a class instance, a Date and a nested array: t
   await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
   assert.equal(parents.length, 1);
   check(parents[0], 'parentRef');
+});
+
+test('a locator with an own __proto__ key (parsed from JSON): the driver gets it as an own key, with a plain prototype', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  const json = `{"key":${JSON.stringify(key)},"__proto__":{"region":"x"}}`;
+  const locator = JSON.parse(json) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(locator, '__proto__'), true);
+  const doc: MediaLike = {
+    id: 'm1',
+    original: { ...red, storageRef: locator },
+    previews: [],
+  };
+  w.docs.set('m1', doc);
+  const check = (seen: unknown, where: string) => {
+    assert.notEqual(seen, locator, `${where}: a copy`);
+    assert.equal(
+      Object.hasOwn(seen as object, '__proto__'),
+      true,
+      `${where}: an own __proto__ key`,
+    );
+    assert.equal(
+      Object.getPrototypeOf(seen),
+      Object.prototype,
+      `${where}: a plain prototype`,
+    );
+    assert.equal((seen as { region?: unknown }).region, undefined, where);
+    assert.equal(JSON.stringify(seen), json, where);
+  };
+  const seen: unknown[] = [];
+  const download = w.storage.download;
+  w.storage.download = async (ref) => {
+    seen.push(ref);
+    return download(ref);
+  };
+  const parents: unknown[] = [];
+  const upload = w.storage.upload;
+  w.storage.upload = async (args) => {
+    parents.push(args.parentRef);
+    return upload(args);
+  };
+
+  await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+  assert.equal(seen.length, 1);
+  check(seen[0], 'download');
+  assert.equal(parents.length, 1);
+  check(parents[0], 'parentRef');
+});
+
+test('a Mongoose sub-document locator with a Buffer path: the driver gets a Buffer with the same bytes, not a bson Binary', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  const owner = new mongoose.Types.ObjectId();
+  // A connection that never connects: the documents are only hydrated, never saved.
+  const connection = mongoose.createConnection();
+  const sub = new mongoose.Schema(
+    { key: String, etag: Buffer, owner: mongoose.Schema.Types.ObjectId },
+    { _id: false },
+  );
+  const models = [
+    connection.model(
+      'LocatorSubSchemaMedia',
+      new mongoose.Schema({ original: { storageRef: sub } }),
+    ),
+    connection.model(
+      'LocatorNestedMedia',
+      new mongoose.Schema({
+        original: {
+          storageRef: {
+            key: String,
+            etag: Buffer,
+            owner: mongoose.Schema.Types.ObjectId,
+          },
+        },
+      }),
+    ),
+  ];
+  for (const Model of models) {
+    const hydrated = new Model({
+      original: { storageRef: { key, etag: Buffer.from('etag'), owner } },
+    }) as unknown as { original: { storageRef: unknown } };
+    const { storageRef } = hydrated.original;
+    assert.equal(
+      typeof (storageRef as { toObject?: unknown }).toObject,
+      'function',
+      `${Model.modelName}: a Mongoose sub-document`,
+    );
+    const doc: MediaLike = {
+      id: 'm1',
+      original: { ...red, storageRef },
+      previews: [],
+    };
+    w.docs.set('m1', doc);
+    type Seen = { key: string; etag: unknown; owner: unknown };
+    const check = (ref: unknown, where: string) => {
+      const seen = ref as Seen;
+      assert.equal(seen.key, key, where);
+      assert.equal(Buffer.isBuffer(seen.etag), true, `${where}: a Buffer`);
+      assert.equal((seen.etag as Buffer).toString(), 'etag', where);
+      assert.ok(seen.owner instanceof mongoose.Types.ObjectId, where);
+      assert.equal(String(seen.owner), String(owner), where);
+    };
+    const download = w.storage.download;
+    const downloads: unknown[] = [];
+    w.storage.download = async (ref) => {
+      downloads.push(ref);
+      return download(ref);
+    };
+    const parents: unknown[] = [];
+    const upload = w.storage.upload;
+    w.storage.upload = async (args) => {
+      parents.push(args.parentRef);
+      return upload(args);
+    };
+
+    await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+    w.storage.download = download;
+    w.storage.upload = upload;
+    assert.equal(downloads.length, 1, Model.modelName);
+    check(downloads[0], `${Model.modelName} download`);
+    assert.equal(parents.length, 1, Model.modelName);
+    check(parents[0], `${Model.modelName} parentRef`);
+  }
+});
+
+test('a bson Binary the host put into a plain locator reaches the driver as it is', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  const binary = new mongoose.mongo.Binary(Buffer.from('etag'));
+  const doc: MediaLike = {
+    id: 'm1',
+    original: { ...red, storageRef: { key, etag: binary } },
+    previews: [],
+  };
+  w.docs.set('m1', doc);
+  const seen: unknown[] = [];
+  const download = w.storage.download;
+  w.storage.download = async (ref) => {
+    seen.push((ref as { etag: unknown }).etag);
+    return download(ref);
+  };
+
+  await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+  assert.deepEqual(seen.length, 1);
+  assert.equal(seen[0], binary);
 });
 
 test('a locator with its own toJSON (a Mongoose sub-document, say): the row is signed as the read path signs it, so the next read is fresh', async () => {

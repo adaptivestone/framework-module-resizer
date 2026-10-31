@@ -197,16 +197,19 @@ interface LoadedSource {
  * its plain form (`toObject()`). The copy keeps the value types a driver reads: plain objects and
  * arrays are copied key by key, a `Buffer` stays a `Buffer` (any other typed array keeps its
  * type) and a `Date` a `Date`; every other value (a class instance such as a bson `ObjectId`, a
- * function) is the same value, as the driver got it before the locator was copied. The origin is
- * signed from signedLocator(), never from this copy.
+ * function) is the same value, as the driver got it before the locator was copied. A Buffer path
+ * of a Mongoose sub-document, which `toObject()` turns into a bson `Binary`, becomes a `Buffer` of
+ * its bytes again, as the live sub-document gives it; a `Binary` in a plain locator stays as it
+ * is. The origin is signed from signedLocator(), never from this copy.
  */
 function copyLocator(ref: StorageRef): StorageRef {
-  const plain =
-    typeof (ref as { toObject?: unknown } | null)?.toObject === 'function'
-      ? (ref as { toObject(): unknown }).toObject()
-      : ref;
+  const fromDocument =
+    typeof (ref as { toObject?: unknown } | null)?.toObject === 'function';
+  const plain = fromDocument
+    ? (ref as { toObject(): unknown }).toObject()
+    : ref;
   try {
-    return copyValue(plain, new Map()) as StorageRef;
+    return copyValue(plain, new Map(), fromDocument) as StorageRef;
   } catch {
     // A locator that cannot be read through (a getter that throws, say) is kept as it is: the
     // driver then reads it live, as it did before it was copied.
@@ -214,8 +217,36 @@ function copyLocator(ref: StorageRef): StorageRef {
   }
 }
 
-/** One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts. */
-function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
+/**
+ * The bytes of a bson `Binary` (duck-typed: no bson import) as a new `Buffer`, or undefined when
+ * the value is not one or does not expose its bytes as `buffer` (filled up to `position`).
+ */
+function binaryBytes(value: object): Buffer | undefined {
+  const { _bsontype, buffer, position } = value as {
+    _bsontype?: unknown;
+    buffer?: unknown;
+    position?: unknown;
+  };
+  if (_bsontype !== 'Binary' || !ArrayBuffer.isView(buffer)) {
+    return undefined;
+  }
+  const length =
+    typeof position === 'number'
+      ? Math.min(position, buffer.byteLength)
+      : buffer.byteLength;
+  return Buffer.from(new Uint8Array(buffer.buffer, buffer.byteOffset, length));
+}
+
+/**
+ * One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts.
+ * `fromDocument`: the value comes from a Mongoose `toObject()`, so a bson `Binary` in it was a
+ * Buffer path and becomes a `Buffer` again.
+ */
+function copyValue(
+  value: unknown,
+  seen: Map<object, unknown>,
+  fromDocument = false,
+): unknown {
   if (typeof value !== 'object' || value === null) {
     return value;
   }
@@ -242,9 +273,14 @@ function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
     const copy: unknown[] = [];
     seen.set(value, copy);
     for (const item of value) {
-      copy.push(copyValue(item, seen));
+      copy.push(copyValue(item, seen, fromDocument));
     }
     return copy;
+  }
+  const bytes = fromDocument ? binaryBytes(value) : undefined;
+  if (bytes) {
+    seen.set(value, bytes);
+    return bytes;
   }
   const proto = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) {
@@ -254,7 +290,18 @@ function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
   const copy: Record<string, unknown> = Object.create(proto);
   seen.set(value, copy);
   for (const key of Object.keys(value)) {
-    copy[key] = copyValue((value as Record<string, unknown>)[key], seen);
+    // An own data property, never an assignment: an own `__proto__` key (JSON.parse makes one)
+    // stays a key instead of becoming the copy's prototype.
+    Object.defineProperty(copy, key, {
+      value: copyValue(
+        (value as Record<string, unknown>)[key],
+        seen,
+        fromDocument,
+      ),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return copy;
 }
