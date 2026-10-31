@@ -24,8 +24,10 @@ export interface ResizeLogger {
   info(msg: string, ...rest: unknown[]): void;
   warn(msg: string, ...rest: unknown[]): void;
   error(msg: string, ...rest: unknown[]): void;
-  // Optional: LogMetrics writes its per-call lines here when asked to (`debug: true`).
-  debug?(msg: string, ...rest: unknown[]): void;
+  // Optional: LogMetrics writes its per-call lines here when asked to (`debug: true`), as
+  // `debug(msg: string)`. Any value is accepted, as before this member was declared: LogMetrics
+  // calls it only when it is a function, and otherwise drops those lines.
+  debug?: unknown;
 }
 
 export interface ResizeEventBus {

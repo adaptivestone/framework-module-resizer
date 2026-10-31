@@ -229,6 +229,13 @@ describe('LogMetrics', () => {
     assert.doesNotThrow(() =>
       new LogMetrics(withoutDebug, { debug: true }).count('resize.read', 1),
     );
+    // A logger whose debug is not a function (a flag) loses only the debug lines.
+    assert.doesNotThrow(() =>
+      new LogMetrics({ ...withoutDebug, debug: false }, { debug: true }).count(
+        'resize.read',
+        1,
+      ),
+    );
     const throwing = recordingLogger();
     throwing.debug = () => {
       throw new Error('debug down');
