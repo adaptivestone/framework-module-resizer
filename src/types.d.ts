@@ -24,8 +24,10 @@ export interface ResizeLogger {
   info(msg: string, ...rest: unknown[]): void;
   warn(msg: string, ...rest: unknown[]): void;
   error(msg: string, ...rest: unknown[]): void;
-  // Optional: LogMetrics writes its per-call lines here when asked to (`debug: true`).
-  debug?(msg: string, ...rest: unknown[]): void;
+  // Optional: LogMetrics writes its per-call lines here when asked to (`debug: true`), as
+  // `debug(msg: string)`. Any value is accepted, as before this member was declared: LogMetrics
+  // calls it only when it is a function, and otherwise drops those lines.
+  debug?: unknown;
 }
 
 export interface ResizeEventBus {
@@ -260,9 +262,10 @@ export interface GenerateOpts {
 export interface GenerateResult {
   created: Preview[];
   failed: number;
-  // The storage refs of the outdated stored previews that `created` replaced (one write). Set only
-  // when there are any, so never with `persist: false`. Their files are not deleted: that is the
-  // host's job.
+  // The storage refs of the stored rows the write that stored `created` removed (one write): the
+  // outdated rows, or a row of the same identity another worker stored meanwhile. Set only when
+  // there are any, so never with `persist: false`. Their files are not deleted: that is the host's
+  // job.
   replaced?: StorageRef[];
 }
 

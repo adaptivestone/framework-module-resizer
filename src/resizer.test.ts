@@ -1672,4 +1672,53 @@ describe('metrics', () => {
       ],
     );
   });
+
+  test('resolve() on a Resizer that cannot start never throws, even when reading the options throws', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      storage: async () => {
+        throw new Error('storage down');
+      },
+      media: fakeMedia(),
+      metrics: sink,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const opts = {
+      media: { id: 'm1' },
+      sizes: [{ width: 10, height: 10 }],
+      get pipeline(): string {
+        throw new Error('getter down');
+      },
+    };
+    const { decision } = await r.resolve(opts);
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.deepEqual(
+      sink.calls.map((call) => call.labels),
+      [{ resizer: 'default', pipeline: 'default', outcome: 'failed' }],
+    );
+  });
+
+  test('resolve() never throws when reading the options throws inside the read', async () => {
+    const sink = recordingMetrics();
+    const r = new Resizer({
+      storage: fakeStorage(),
+      media: fakeMedia(),
+      metrics: sink,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const opts = {
+      media: { id: 'm1' },
+      sizes: [{ width: 10, height: 10 }],
+      get pipeline(): string {
+        throw new Error('getter down');
+      },
+    };
+    const { decision, output } = await r.resolve(opts);
+    assert.deepEqual(decision, { ready: [], missing: [] });
+    assert.equal(output, undefined);
+    assert.deepEqual(
+      sink.calls.map((call) => call.labels),
+      [{ resizer: 'default', pipeline: 'default', outcome: 'failed' }],
+    );
+  });
 });

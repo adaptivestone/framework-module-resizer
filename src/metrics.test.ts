@@ -24,7 +24,7 @@ function recordingLogger(): ResizeLogger & {
     info: (...a) => lines.info.push(a),
     warn: (...a) => lines.warn.push(a),
     error: (...a) => lines.error.push(a),
-    debug: (...a) => lines.debug.push(a),
+    debug: (...a: unknown[]) => lines.debug.push(a),
   };
 }
 
@@ -228,6 +228,13 @@ describe('LogMetrics', () => {
     const { debug: _debug, ...withoutDebug } = recordingLogger();
     assert.doesNotThrow(() =>
       new LogMetrics(withoutDebug, { debug: true }).count('resize.read', 1),
+    );
+    // A logger whose debug is not a function (a flag) loses only the debug lines.
+    assert.doesNotThrow(() =>
+      new LogMetrics({ ...withoutDebug, debug: false }, { debug: true }).count(
+        'resize.read',
+        1,
+      ),
     );
     const throwing = recordingLogger();
     throwing.debug = () => {

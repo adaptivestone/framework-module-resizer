@@ -853,6 +853,115 @@ describe('MongoMediaStore: the preview metadata', () => {
   });
 });
 
+describe('MongoMediaStore.verify(): a strict original without width and height', () => {
+  // A media model whose `original` path is declared as given (registered once per name).
+  const modelWithOriginal = (
+    name: string,
+    original: unknown,
+    previews: unknown = resizeMediaSchemaFragment.previews,
+  ) =>
+    connection.models[name] ??
+    connection.model(
+      name,
+      new mongoose.Schema({ original, previews } as never, {
+        minimize: false,
+      }),
+    );
+  const recording = () => {
+    const warnings: unknown[][] = [];
+    const logger = {
+      info() {},
+      warn: (...args: unknown[]) => void warnings.push(args),
+      error() {},
+    };
+    return { warnings, logger };
+  };
+  const {
+    width: _w,
+    height: _h,
+    ...noDims
+  } = resizeMediaSchemaFragment.original;
+
+  test('a nested original without them warns once, naming the fix, also when the preview rows are not checked', () => {
+    for (const [name, previews] of [
+      ['NoDimsMedia', resizeMediaSchemaFragment.previews],
+      ['NoDimsMixedRowsMedia', [mongoose.Schema.Types.Mixed]],
+    ] as const) {
+      const { warnings, logger } = recording();
+      const store = new MongoMediaStore({
+        model: modelWithOriginal(name, noDims, previews),
+        logger,
+      });
+      assert.doesNotThrow(() => store.verify());
+      assert.doesNotThrow(() => store.verify());
+      assert.equal(warnings.length, 1, name);
+      const text = String(warnings[0][0]);
+      assert.match(text, new RegExp(`media model '${name}'`));
+      assert.match(text, /original\.width and original\.height/);
+      assert.match(text, /resizeMediaSchemaFragment/);
+      assert.match(text, /width: \{ type: Number \}/);
+      assert.match(text, /downloads the original/);
+    }
+  });
+
+  test('a strict single sub-schema original without height warns; a loose one does not', () => {
+    const { height: _height, ...noHeight } = resizeMediaSchemaFragment.original;
+    const strict = recording();
+    new MongoMediaStore({
+      model: modelWithOriginal(
+        'NoHeightSubMedia',
+        new mongoose.Schema(noHeight),
+      ),
+      logger: strict.logger,
+    }).verify();
+    assert.equal(strict.warnings.length, 1);
+    assert.match(String(strict.warnings[0][0]), /original\.height field/);
+
+    const loose = recording();
+    new MongoMediaStore({
+      model: modelWithOriginal(
+        'LooseSubMedia',
+        new mongoose.Schema(noDims, { strict: false }),
+      ),
+      logger: loose.logger,
+    }).verify();
+    assert.equal(loose.warnings.length, 0);
+  });
+
+  test('the fragment, a Mixed original and a sub-schema with the dimensions do not warn', () => {
+    const { warnings, logger } = recording();
+    for (const [name, original] of [
+      ['DimsFragmentMedia', resizeMediaSchemaFragment.original],
+      ['MixedOriginalMedia', mongoose.Schema.Types.Mixed],
+      [
+        'DimsSubMedia',
+        new mongoose.Schema({ ...resizeMediaSchemaFragment.original }),
+      ],
+    ] as const) {
+      new MongoMediaStore({
+        model: modelWithOriginal(name, original),
+        logger,
+      }).verify();
+    }
+    new MongoMediaStore({ model: Media(), logger }).verify();
+    assert.deepEqual(warnings, []);
+  });
+
+  test('a nested original without them really drops the backfilled dimensions', async () => {
+    const model = modelWithOriginal('NoDimsBackfillMedia', noDims);
+    const doc = await model.create({
+      original: { storageRef: { path: 'o.png' }, format: 'png' },
+      previews: [],
+    });
+    const store = new MongoMediaStore({ model, logger: recording().logger });
+    await store.appendPreviews(String(doc._id), [], { width: 64, height: 32 });
+    const stored = (await model.findById(doc._id).lean()) as {
+      original: Record<string, unknown>;
+    };
+    assert.equal('width' in stored.original, false);
+  });
+});
+
 describe('MongoMediaStore options', () => {
   test('getModel is resolved on use, not at construction', async () => {
     let calls = 0;

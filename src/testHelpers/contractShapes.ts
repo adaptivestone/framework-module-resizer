@@ -1,14 +1,16 @@
 // Compiled by `npm run types:check:src` (`tsconfig.type-pins.json`, which the minimum-peers CI
 // job runs) and by `npm run types:check` (`tsconfig.tests.json`), never run. It pins the promise
 // that each contract is an abstract class, yet a plain object of the same shape still
-// type-checks as that contract, and that `NoopMetrics` still takes zero-argument calls. A
-// contract change that breaks plain objects fails CI here.
+// type-checks as that contract, that `NoopMetrics` still takes zero-argument calls, and that a
+// host logger with any `debug` value is a `ResizeLogger`. A contract change that breaks plain
+// objects fails CI here.
 import type { SourceDecoder } from '../contracts/decoder.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { NoopMetrics } from '../metrics.ts';
+import type { ResizeLogger } from '../types.d.ts';
 
 export const storage: ResizeStorage = {
   download: async () => Buffer.alloc(0),
@@ -120,3 +122,19 @@ export const decoder: SourceDecoder = {
 export const noopMetrics = new NoopMetrics();
 noopMetrics.count();
 noopMetrics.timing();
+
+// A host logger whose `debug` is not a function (a flag, say) is still a ResizeLogger, as it was
+// before `debug` was declared: LogMetrics calls `debug` only when it is a function.
+export const flagDebugLogger: ResizeLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug: false,
+};
+const hostLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug: 'verbose',
+};
+export const hostDebugLogger: ResizeLogger = hostLogger;

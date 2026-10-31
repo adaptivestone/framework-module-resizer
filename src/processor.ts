@@ -194,7 +194,11 @@ interface LoadedSource {
 /**
  * A deep copy of a storage locator for the storage driver, so a locator the host changes in place
  * does not change the download or the upload's parent. A Mongoose sub-document is copied through
- * its plain form (`toObject()`).
+ * its plain form (`toObject()`). The copy keeps the value types a driver reads: plain objects and
+ * arrays are copied key by key, a `Buffer` stays a `Buffer` (any other typed array keeps its
+ * type) and a `Date` a `Date`; every other value (a class instance such as a bson `ObjectId`, a
+ * function) is the same value, as the driver got it before the locator was copied. The origin is
+ * signed from signedLocator(), never from this copy.
  */
 function copyLocator(ref: StorageRef): StorageRef {
   const plain =
@@ -202,13 +206,91 @@ function copyLocator(ref: StorageRef): StorageRef {
       ? (ref as { toObject(): unknown }).toObject()
       : ref;
   try {
-    return structuredClone(plain);
+    return copyValue(plain, new Map()) as StorageRef;
   } catch {
-    // A locator structuredClone cannot copy (one holding a function, say) is kept as it is: the
-    // driver then reads it live, as it did before it was copied. The origin is signed from
-    // signedLocator(), never from this copy.
+    // A locator that cannot be read through (a getter that throws, say) is kept as it is: the
+    // driver then reads it live, as it did before it was copied.
     return plain;
   }
+}
+
+/** One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts. */
+function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const known = seen.get(value);
+  if (known !== undefined) {
+    return known;
+  }
+  if (Buffer.isBuffer(value)) {
+    const copy = Buffer.from(value);
+    seen.set(value, copy);
+    return copy;
+  }
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+    const copy = (value as unknown as { slice(): unknown }).slice();
+    seen.set(value, copy);
+    return copy;
+  }
+  if (value instanceof Date) {
+    const copy = new Date(value.getTime());
+    seen.set(value, copy);
+    return copy;
+  }
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    for (const item of value) {
+      copy.push(copyValue(item, seen));
+    }
+    return copy;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    // A class instance (an ObjectId, say) is kept by reference.
+    return value;
+  }
+  const copy: Record<string, unknown> = Object.create(proto);
+  seen.set(value, copy);
+  for (const key of Object.keys(value)) {
+    copy[key] = copyValue((value as Record<string, unknown>)[key], seen);
+  }
+  return copy;
+}
+
+// The image settings a render reads (planRules, the decode limits, the encoder, the pool size), and
+// the rest of ResizeConfig: each is copied for the render.
+const IMAGE_SETTING_KEYS = [
+  'formats',
+  'upload',
+  'maxSize',
+  'animated',
+  'encode',
+  'limits',
+  'concurrency',
+] as const satisfies ReadonlyArray<keyof ResizeConfig>;
+
+/**
+ * The config as one render reads it, taken now: a shallow copy whose image settings are deep
+ * copies, so a setting changed in place while the render runs does not reach it. Any other key
+ * (the config may carry host keys) is kept by reference, and a setting that cannot be copied (one
+ * holding a function, say) is kept as it is.
+ */
+function snapshotSettings(config: ResizeConfig): ResizeConfig {
+  const settings = { ...config };
+  const writable = settings as unknown as Record<string, unknown>;
+  for (const key of IMAGE_SETTING_KEYS) {
+    if (!Object.hasOwn(settings, key)) {
+      continue;
+    }
+    try {
+      writable[key] = structuredClone(settings[key]);
+    } catch {
+      // Kept as it is: the render then reads it live, as it did before settings were copied.
+    }
+  }
+  return settings;
 }
 
 /**
@@ -940,9 +1022,10 @@ export class Processor {
     // The settings, the steps and the signature each row records, taken together before any pixel
     // work, with no await between them: the render uses only these, so a pipeline version, step
     // set or image setting changed while it runs (even changed and changed back) never makes a row
-    // signed with one set of settings out of pixels made with another. The settings are plain
-    // data; the steps are kept by reference, their lists copied.
-    const settings = structuredClone(config);
+    // signed with one set of settings out of pixels made with another. The image settings are
+    // plain data (other keys of the config are kept by reference); the steps are kept by
+    // reference, their lists copied.
+    const settings = snapshotSettings(config);
     const { limits: renderLimits } = settings;
     const pipeline = pipelines.get(pipelineName);
     const beforeSteps = [...(pipeline.beforeSteps ?? [])];

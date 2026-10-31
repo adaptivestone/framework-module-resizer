@@ -560,7 +560,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
   - `appendPreviews` must save `dims` (`backfillDims`) on the original when it is given, whether
     or not it stores a preview (also for `previews: []`): the freshness check needs the original's
     dimensions, and a store that drops them makes every read of such a media queue a task that
-    downloads the original (see [Freshness](#freshness)).
+    downloads the original (see [Freshness](#freshness)). The shipped `MongoMediaStore` drops them
+    when the media schema declares a strict `original` without `width` and `height`; its
+    `verify()` warns once about it.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -1345,6 +1347,9 @@ A stale row is served while its replacement is made; the replacement takes its p
 - another `original.storageRef`, or other stored dimensions of the original;
 - a row without signatures (written before `0.3.0-rc.1`).
 
+New bytes under the same `original.storageRef` and at the same size are not detected: after
+replacing an original in place, call `invalidate()` for that media.
+
 **On read.** `resolve()` serves a stale row like a fresh one, with `stale: true` on its
 `ReadyEntry`, and queues its replacement: stale and missing variants form one list, in cell order,
 for `beforeEnqueue`, and one task. After the hook, a variant whose stored row was stale is in
@@ -1360,10 +1365,12 @@ ones are required and queued like missing ones.
 The worker judges freshness by its own settings: a queued variant that is fresh for it is skipped
 (nothing is uploaded) and counts as covered. The new rows of a stale identity replace the old ones
 in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists
-the storage refs of the rows `generate()` replaced (set only when there are some), and
-`generate()` swaps the rows in the caller's `media.previews` too. Each replacing write logs one
-`info` line: "resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted:
-storage refs <refs>".
+the storage refs of the rows the write of `generate()` removed (set only when there are some):
+the outdated rows, or a row of the same identity another worker stored meanwhile. `generate()`
+swaps the rows in the caller's `media.previews` too. Each replacing write logs one `info` line:
+"resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs
+<refs>". Its count and refs are the rows that write removed, so they can include such a
+concurrent copy too.
 
 **Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
 preview objects no row references. A row without an `identity` (written before 0.3.0) stays beside
@@ -1377,7 +1384,11 @@ pixel decode, no upload when its rows turn out fresh) and records the dimensions
 the rows fresh. A `MediaStore` must therefore save `backfillDims` in `appendPreviews`, also when
 `previews` is empty. A store that drops them makes every read of such a media queue a task that
 downloads the original; the worker then warns once: "resize worker: the media store did not record
-the original's dimensions of media <m> — …".
+the original's dimensions of media <m> — …". The shipped `MongoMediaStore` drops them too when the
+media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`)
+without `original.width` and `original.height`: Mongoose strips them from the update. Its
+`verify()` warns once about such a schema; spread `resizeMediaSchemaFragment`, or add `width` and
+`height` as `{ type: Number }` to `original`.
 
 **`resolve()` must receive `original` as stored**: the same `storageRef` and dimensions. A
 projection that drops `original.width` and `original.height`, or a ref reshaped by a DTO, makes

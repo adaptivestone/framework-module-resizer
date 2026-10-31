@@ -726,11 +726,18 @@ export class Resizer {
         'resize resolve: the Resizer could not start — returning the safe empty decision',
         err,
       );
-      // Counted like a read that failed inside the Reader; `opts` may be missing (a JS host).
+      // Counted like a read that failed inside the Reader; `opts` may be missing (a JS host), and
+      // reading it may throw (a getter): the label then falls back to 'default'.
+      let pipeline = 'default';
+      try {
+        pipeline = opts?.pipeline ?? 'default';
+      } catch {
+        // Kept as 'default'.
+      }
       this.#boundMetrics.count(
         'resize.read',
         1,
-        { pipeline: opts?.pipeline ?? 'default', outcome: 'failed' },
+        { pipeline, outcome: 'failed' },
         { ready: 0, missing: 0, stale: 0 },
       );
       return { decision: { ready: [], missing: [] }, output: undefined };

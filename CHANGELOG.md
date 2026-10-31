@@ -746,6 +746,22 @@ later release that puts the image engine behind a port.
   `encodeSig` matches either the fit or the cover signature, so such a store does not regenerate
   its fit previews on every read. `MongoMediaStore.verify()` logs one warning (it does not throw)
   when strict preview rows lack `fit`: declare it as `{ type: Boolean }`.
+- **`MongoMediaStore.verify()` also warns once** (it does not throw) when the media schema declares
+  `original` strictly (nested paths, or a sub-schema without `strict: false`) without
+  `original.width` or `original.height`: Mongoose drops the measured dimensions, so every read of
+  such a media queues a task that downloads the original. Spread `resizeMediaSchemaFragment`, or
+  add both as `{ type: Number }`.
+- **A render copies what it reads, keeping the types.** The storage driver gets its own copy of
+  the original's locator: plain objects and arrays copied, a `Buffer` still a `Buffer`, a `Date` a
+  `Date`, and class instances (a bson `ObjectId`, say) and functions the same values as before. A
+  config with extra host keys that cannot be copied (a function) still renders: only the image
+  settings are copied.
+- **`ResizeLogger.debug` accepts any value**, as before it was declared; `LogMetrics` writes its
+  debug lines only through a function.
+- **`resolve()` never throws** when reading the caller's options throws (a `pipeline` getter, say):
+  the read returns the safe empty decision and counts a failed read under `pipeline: 'default'`.
+- New bytes under the same `original.storageRef` and at the same size are not detected as stale:
+  after replacing an original in place, call `invalidate()` for that media.
 
 **Changed behaviour** (`0.3.0-rc.5`, without a host change)
 

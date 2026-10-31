@@ -116,12 +116,15 @@ export class Reader {
     const decision: ReadDecision = { ready, missing: [] };
     // What the read counts. `opts` may be missing (a JS host): the catch below counts it too.
     const read: ReadCounts = { missing: 0, stale: 0 };
+    // The pipeline the catch below counts: read once, inside the guard (a getter may throw).
+    let pipelineLabel = 'default';
 
     try {
       // Inside the guard, so a missing options object also returns the safe empty decision.
       const { media } = opts;
       const ctx = opts.ctx ?? {};
       const pipeline = opts.pipeline ?? 'default';
+      pipelineLabel = pipeline;
       // Inside the never-throw try: a media with no id/_id logs + returns the safe empty decision
       // rather than enqueueing under the literal 'undefined' key.
       const mediaId = requireMediaId(media);
@@ -306,12 +309,7 @@ export class Reader {
         'resize resolve: unexpected internal error — returning the safe empty decision',
         err,
       );
-      this.#countRead(
-        opts?.pipeline ?? 'default',
-        'failed',
-        read,
-        ready.length,
-      );
+      this.#countRead(pipelineLabel, 'failed', read, ready.length);
       const safe: ReadDecision = { ready, missing: [] };
       return { decision: safe, output: undefined };
     }

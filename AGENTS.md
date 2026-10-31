@@ -475,8 +475,10 @@ import { resizeMediaPaths } from '@adaptivestone/framework-module-resize/framewo
 File.find().select(['mediaType', ...resizeMediaPaths]);
 ```
 
-Remove a media's stored previews (e.g. after a pipeline's output changed, or before deleting the
-media). `invalidate` never deletes files and never queues: delete the returned refs yourself:
+Remove a media's stored previews (e.g. after a pipeline's output changed, after replacing an
+original in place, or before deleting the media). New bytes under the same `original.storageRef`
+and at the same size are not detected as stale, so call `invalidate` after such a replacement.
+`invalidate` never deletes files and never queues: delete the returned refs yourself:
 
 ```ts
 const refs = await getResizer().invalidate({ media: fileDoc, pipeline: 'default' }); // omit pipeline: every pipeline
@@ -634,7 +636,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or before `0.3.0-rc.1` is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep preview objects no row references. The wave shares the queue with new uploads' previews: plan worker capacity |
 | one task per read that renders nothing, and the warning "found every requested preview … already fresh" | the API and the worker run different image settings or pipeline versions (deploy them together), or `resolve()` got the media without its stored original (a projection that drops `original.width` / `height`, or a reshaped `storageRef`) — pass `original` as stored |
 | previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: every read after a task ends queues them again, and each replaced preview costs one render, one upload and one orphaned file — deploy every worker at once, or change settings only after the old workers have stopped |
-| the warning "the media store did not record the original's dimensions" | a custom `MediaStore` drops `backfillDims` in `appendPreviews` (also with `previews: []`), so every read of such a media queues a task that downloads the original — make it save the dimensions on the original |
+| the warning "the media store did not record the original's dimensions" | a custom `MediaStore` drops `backfillDims` in `appendPreviews` (also with `previews: []`), so every read of such a media queues a task that downloads the original — make it save the dimensions on the original. The shipped `MongoMediaStore` drops them too when the media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`) without `width` and `height`; its `verify()` warns once about it — spread `resizeMediaSchemaFragment`, or add `width` and `height` as `{ type: Number }` to `original` |
 | `RESIZE_MONGO_LOCK_MODEL_OUTDATED` from `verify()` or at worker start | the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
 | `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
