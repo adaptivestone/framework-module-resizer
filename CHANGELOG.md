@@ -749,15 +749,17 @@ later release that puts the image engine behind a port.
 - **`MongoMediaStore.verify()` also warns once** (it does not throw) when the media schema declares
   `original` strictly (nested paths, or a sub-schema without `strict: false`) without
   `original.width` or `original.height` (Mongoose drops the measured dimensions, or rejects them
-  under `strict: 'throw'`, failing the task), or declares one with another type than Number
-  (stored as that type): every read of such a media queues a task that downloads the original.
-  Spread `resizeMediaSchemaFragment`, or declare both as `{ type: Number }`.
+  under `strict: 'throw'`, failing the task), or, whatever its strict mode, declares one with a
+  type that does not read back as a number (not Number, Int32 or Mixed: stored as that type, or
+  rejected when Mongoose cannot cast it, failing the task): every read of such a media queues a
+  task that downloads the original. Spread `resizeMediaSchemaFragment`, or declare both as
+  `{ type: Number }`.
 - **A render copies what it reads, keeping the types.** The storage driver gets its own copy of
   the original's locator: plain objects and arrays copied (own keys stay own keys, `__proto__`
   too), a `Buffer` still a `Buffer`, a `Date` a `Date`, and class instances (a bson `ObjectId`,
   say) and functions the same values as before. A Mongoose sub-document locator is copied from its
-  `toObject()` form, with each Buffer path (a bson `Binary` there) a `Buffer` again; schema getters
-  are not applied. The image settings are copied the same way, also when the config inherits them
+  `toObject()` form, with each Buffer path (a generic bson `Binary` there, subtype 0) a `Buffer`
+  again, while a `UUID` path stays a `UUID`; schema getters are not applied. The image settings are copied the same way, also when the config inherits them
   (`Object.create(defaults)`); other config keys, and a function kept beside a setting, are read
   as the config holds them, so a config with such keys still renders.
 - **`ResizeLogger.debug` accepts any value**, as before it was declared; `LogMetrics` writes its

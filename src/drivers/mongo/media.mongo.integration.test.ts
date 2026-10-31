@@ -1067,6 +1067,101 @@ describe('MongoMediaStore.verify(): a strict original without width and height',
     }).verify();
     assert.deepEqual(mixed.warnings, []);
   });
+
+  test('under strict: false a declared dimension is still type-checked; only a missing one is not', () => {
+    for (const [name, model] of [
+      [
+        'LooseStringWidthMedia',
+        modelWithOptions(
+          'LooseStringWidthMedia',
+          { ...noDims, width: String, height: Number },
+          { strict: false },
+        ),
+      ],
+      [
+        'LooseStringWidthSubMedia',
+        modelWithOriginal(
+          'LooseStringWidthSubMedia',
+          new mongoose.Schema(
+            { ...noDims, width: String, height: Number },
+            { strict: false },
+          ),
+        ),
+      ],
+    ] as const) {
+      const { warnings, logger } = recording();
+      new MongoMediaStore({ model, logger }).verify();
+      assert.equal(warnings.length, 1, name);
+      const text = String(warnings[0][0]);
+      assert.match(text, /original\.width as String/, name);
+      assert.doesNotMatch(text, /height/, name);
+      assert.doesNotMatch(text, /field/, name);
+    }
+
+    const loose = recording();
+    new MongoMediaStore({
+      model: modelWithOptions('LooseNoHeightMedia', noDims, { strict: false }),
+      logger: loose.logger,
+    }).verify();
+    assert.deepEqual(loose.warnings, []);
+  });
+
+  test('a dimension Mongoose cannot cast to its type: the warning names the rejection, and the backfill really rejects', async () => {
+    const model = modelWithOriginal('BooleanWidthMedia', {
+      ...noDims,
+      width: Boolean,
+      height: Number,
+    });
+    const { warnings, logger } = recording();
+    const store = new MongoMediaStore({ model, logger });
+    store.verify();
+    assert.equal(warnings.length, 1);
+    const text = String(warnings[0][0]);
+    assert.match(text, /original\.width as Boolean/);
+    assert.match(text, /rejects the update/);
+    assert.match(text, /fails and is retried/);
+    assert.match(text, /width: \{ type: Number \}/);
+
+    const doc = await model.create({
+      original: { storageRef: { path: 'o.png' }, format: 'png' },
+      previews: [],
+    });
+    await assert.rejects(
+      store.appendPreviews(String(doc._id), [], { width: 64, height: 32 }),
+      { name: 'CastError' },
+    );
+  });
+
+  test('Int32 dimensions read back as numbers and do not warn; Double and Decimal128 read back as bson objects and warn', () => {
+    const int32 = recording();
+    new MongoMediaStore({
+      model: modelWithOriginal('Int32DimsMedia', {
+        ...noDims,
+        width: mongoose.Schema.Types.Int32,
+        height: { type: mongoose.Schema.Types.Int32 },
+      }),
+      logger: int32.logger,
+    }).verify();
+    assert.deepEqual(int32.warnings, []);
+
+    for (const type of ['Double', 'Decimal128'] as const) {
+      const { warnings, logger } = recording();
+      new MongoMediaStore({
+        model: modelWithOriginal(`${type}DimsMedia`, {
+          ...noDims,
+          width: mongoose.Schema.Types[type],
+          height: Number,
+        }),
+        logger,
+      }).verify();
+      assert.equal(warnings.length, 1, type);
+      assert.match(
+        String(warnings[0][0]),
+        new RegExp(`original\\.width as ${type}`),
+        type,
+      );
+    }
+  });
 });
 
 describe('MongoMediaStore options', () => {

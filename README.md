@@ -562,8 +562,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     dimensions, and a store that drops them makes every read of such a media queue a task that
     downloads the original (see [Freshness](#freshness)). The shipped `MongoMediaStore` drops them
     when the media schema declares a strict `original` without `width` and `height` (rejects them
-    under `strict: 'throw'`), and stores them with the wrong type when it declares them as another
-    type than Number; its `verify()` warns once about it.
+    under `strict: 'throw'`), and stores them with the wrong type (or rejects them when it cannot
+    cast them) when it declares them as a type that does not read back as a number (not Number,
+    Int32 or Mixed); its `verify()` warns once about it.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -1387,12 +1388,14 @@ the rows fresh. A `MediaStore` must therefore save `backfillDims` in `appendPrev
 downloads the original; the worker then warns once: "resize worker: the media store did not record
 the original's dimensions of media <m> — …". The shipped `MongoMediaStore` drops them too when the
 media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`)
-without `original.width` and `original.height`: Mongoose strips them from the update. Under
-`strict: 'throw'` Mongoose rejects that update instead, so the task fails and is retried without
-storing its previews. Declared with another type than Number (`String`, say), they are stored as
-that type, which the freshness check does not read as dimensions. Its `verify()` warns once about
-such a schema; spread `resizeMediaSchemaFragment`, or declare `width` and `height` as
-`{ type: Number }` in `original`.
+without `original.width` and `original.height`: Mongoose strips them from the update. Declared
+with a type that does not read back as a number (not Number, Int32 or Mixed; `String`, say, also
+under `strict: false`), they are stored as that type, which the freshness check does not read as
+dimensions. Under `strict: 'throw'`, or with a type Mongoose cannot cast them to (`Boolean`,
+`ObjectId`), the symptom differs: the update is rejected, so the task fails with Mongoose's error,
+is retried and is dead-lettered after `maxAttempts`, and no preview is stored. Its `verify()` warns
+once about such a schema, naming the cause; spread `resizeMediaSchemaFragment`, or declare `width`
+and `height` as `{ type: Number }` in `original`.
 
 **`resolve()` must receive `original` as stored**: the same `storageRef` and dimensions. A
 projection that drops `original.width` and `original.height`, or a ref reshaped by a DTO, makes

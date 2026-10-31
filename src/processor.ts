@@ -198,9 +198,10 @@ interface LoadedSource {
  * arrays are copied key by key, a `Buffer` stays a `Buffer` (any other typed array keeps its
  * type) and a `Date` a `Date`; every other value (a class instance such as a bson `ObjectId`, a
  * function) is the same value, as the driver got it before the locator was copied. A Buffer path
- * of a Mongoose sub-document, which `toObject()` turns into a bson `Binary`, becomes a `Buffer` of
- * its bytes again, as the live sub-document gives it; a `Binary` in a plain locator stays as it
- * is. The origin is signed from signedLocator(), never from this copy.
+ * of a Mongoose sub-document, which `toObject()` turns into a generic bson `Binary` (subtype 0),
+ * becomes a `Buffer` of its bytes again, as the live sub-document gives it; a `UUID` (or another
+ * Binary subtype) stays as it is, and so does a `Binary` in a plain locator. The origin is signed
+ * from signedLocator(), never from this copy.
  */
 function copyLocator(ref: StorageRef): StorageRef {
   const fromDocument =
@@ -218,16 +219,23 @@ function copyLocator(ref: StorageRef): StorageRef {
 }
 
 /**
- * The bytes of a bson `Binary` (duck-typed: no bson import) as a new `Buffer`, or undefined when
- * the value is not one or does not expose its bytes as `buffer` (filled up to `position`).
+ * The bytes of a generic bson `Binary` (duck-typed: no bson import) as a new `Buffer`, or
+ * undefined when the value is not one or does not expose its bytes as `buffer` (filled up to
+ * `position`). Only the generic subtypes (`0`, which a Mongoose Buffer path uses by default, and
+ * the old binary `2`) are bytes; a UUID (subtype 3 or 4) or any other subtype stays as it is.
  */
 function binaryBytes(value: object): Buffer | undefined {
-  const { _bsontype, buffer, position } = value as {
+  const { _bsontype, sub_type, buffer, position } = value as {
     _bsontype?: unknown;
+    sub_type?: unknown;
     buffer?: unknown;
     position?: unknown;
   };
-  if (_bsontype !== 'Binary' || !ArrayBuffer.isView(buffer)) {
+  if (
+    _bsontype !== 'Binary' ||
+    (sub_type !== 0 && sub_type !== 2) ||
+    !ArrayBuffer.isView(buffer)
+  ) {
     return undefined;
   }
   const length =
@@ -239,8 +247,8 @@ function binaryBytes(value: object): Buffer | undefined {
 
 /**
  * One value of a locator, copied as copyLocator() describes; `seen` keeps shared and cyclic parts.
- * `fromDocument`: the value comes from a Mongoose `toObject()`, so a bson `Binary` in it was a
- * Buffer path and becomes a `Buffer` again.
+ * `fromDocument`: the value comes from a Mongoose `toObject()`, so a generic bson `Binary` in it
+ * was a Buffer path and becomes a `Buffer` again (binaryBytes()).
  */
 function copyValue(
   value: unknown,

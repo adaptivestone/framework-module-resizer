@@ -1153,6 +1153,50 @@ test('a Mongoose sub-document locator with a Buffer path: the driver gets a Buff
   }
 });
 
+test('a Mongoose sub-document locator with a UUID path: the driver gets the UUID, not a Buffer', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const red = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const { key } = red.storageRef as { key: string };
+  const uuid = new mongoose.mongo.UUID();
+  // A connection that never connects: the document is only hydrated, never saved.
+  const connection = mongoose.createConnection();
+  const Model = connection.model(
+    'LocatorUuidMedia',
+    new mongoose.Schema({
+      original: {
+        storageRef: new mongoose.Schema(
+          { key: String, uuid: mongoose.Schema.Types.UUID },
+          { _id: false },
+        ),
+      },
+    }),
+  );
+  const hydrated = new Model({
+    original: { storageRef: { key, uuid } },
+  }) as unknown as { original: { storageRef: unknown } };
+  const doc: MediaLike = {
+    id: 'm1',
+    original: { ...red, storageRef: hydrated.original.storageRef },
+    previews: [],
+  };
+  w.docs.set('m1', doc);
+  const seen: unknown[] = [];
+  const download = w.storage.download;
+  w.storage.download = async (ref) => {
+    seen.push((ref as { uuid: unknown }).uuid);
+    return download(ref);
+  };
+
+  await r.generate({ media: doc, sizes: cell, formats: ['webp'] });
+  assert.equal(seen.length, 1);
+  assert.equal(Buffer.isBuffer(seen[0]), false);
+  assert.equal(
+    (seen[0] as { toHexString(): string }).toHexString(),
+    uuid.toHexString(),
+  );
+});
+
 test('a bson Binary the host put into a plain locator reaches the driver as it is', async () => {
   const w = world();
   const r = w.resizer(webpConfig(80));
