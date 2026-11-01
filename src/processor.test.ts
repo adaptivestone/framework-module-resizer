@@ -2309,12 +2309,29 @@ describe('processTask — persistence & failure handling', () => {
     const { storage } = makeStorage(redPng);
     let active = 0;
     let maxActive = 0;
+    // The first step waits for a second one to start (2 s at most), instead of holding for 5 ms:
+    // on a loaded machine the second variant's decode could take longer than that, and the two
+    // steps would never overlap.
+    let bothRunning!: () => void;
+    const overlap = new Promise<void>((resolve) => {
+      bothRunning = resolve;
+    });
     const pipeline: Pipeline = {
       variantSteps: [
         async (img) => {
           active += 1;
           maxActive = Math.max(maxActive, active);
-          await new Promise((r) => setTimeout(r, 5));
+          if (active === 2) {
+            bothRunning();
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            overlap,
+            new Promise((r) => {
+              timer = setTimeout(r, 2000);
+            }),
+          ]);
+          clearTimeout(timer);
           active -= 1;
           return img;
         },

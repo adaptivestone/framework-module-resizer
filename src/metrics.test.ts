@@ -534,10 +534,12 @@ test("the window timer is unref'd: a process that counts one event exits at once
   const url = new URL('./metrics.ts', import.meta.url).href;
   const script = `import { LogMetrics } from ${JSON.stringify(url)};
 new LogMetrics({ info() {}, warn() {}, error() {} }).count('resize.read', 1, { outcome: 'ready' });`;
+  // A ref'd timer would hold the process for the 60 s window. Half of that is the limit: a loaded
+  // machine can take more than 5 s to start a Node process.
   const result = spawnSync(
     process.execPath,
     ['--experimental-strip-types', '--input-type=module', '-e', script],
-    { timeout: 5000, encoding: 'utf8' },
+    { timeout: 30_000, encoding: 'utf8' },
   );
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr);
