@@ -378,14 +378,19 @@ const braceGroup = (
 };
 
 // The value of a string name's escapes, as JavaScript reads them: `\'` → `'`, `é` and
-// `\u{e9}` → `é`, `\n` → a line break, and any other escaped character → itself.
+// `\u{e9}` → `é`, `\n` → a line break, and any other escaped character → itself. A `\u{…}` past
+// the last code point (0x10FFFF), which JavaScript refuses, stays as written: no export has that
+// name, so the guard reports it.
 const unescapeName = (raw: string): string =>
   raw.replace(
     /\\(u\{[0-9A-Fa-f]+\}|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|[\s\S])/g,
-    (_, escaped: string) => {
+    (whole: string, escaped: string) => {
       if (escaped.length > 1) {
-        const hex = escaped.replace(/^[ux]\{?|\}$/g, '');
-        return String.fromCodePoint(Number.parseInt(hex, 16));
+        const codePoint = Number.parseInt(
+          escaped.replace(/^[ux]\{?|\}$/g, ''),
+          16,
+        );
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : whole;
       }
       const named: Record<string, string> = {
         n: '\n',

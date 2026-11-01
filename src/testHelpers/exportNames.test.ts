@@ -487,6 +487,9 @@ test('a string import name may hold quotes, commas, braces and escapes', async (
     [`import { 'back\\\\slash' as X } from '${PKG}';`, 'back\\slash'],
     [`import { 'caf\\u00e9' as X } from '${PKG}';`, 'café'],
     [`import { 'caf\\u{e9}' as X } from '${PKG}';`, 'café'],
+    // Past the last code point (0x10FFFF), as JavaScript would refuse it: kept as written, and
+    // reported like any name that is not an export, instead of crashing the scan.
+    [`import { 'bad\\u{110000}' as X } from '${PKG}';`, 'bad\\u{110000}'],
   ]) {
     await assertOneProblem(line, name);
   }
