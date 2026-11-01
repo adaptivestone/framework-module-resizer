@@ -5,7 +5,12 @@
 // logger that throws.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { backoffMs, Consumer, untilDeadline } from './consumer.ts';
+import {
+  backoffMs,
+  Consumer,
+  gateDeadlineIn,
+  untilDeadline,
+} from './consumer.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type {
   ClaimedTask,
@@ -2076,16 +2081,19 @@ describe('a late answer never undoes the end of a task', () => {
     test(`a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store (${clock})`, {
       timeout: 10_000,
     }, async (t) => {
-      let ticking: ReturnType<typeof setInterval> | undefined;
       if (clock !== 'the system clock') {
-        t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
-        ticking = setInterval(() => t.mock.timers.tick(1), 2);
+        // Read from the monotonic clock on every call, so a loaded machine cannot make it fall
+        // further behind: the bound always ends on the wall clock, at twice its length, far from
+        // the one second of lag the monotonic bound allows.
+        const wallStart = Date.now();
+        const monoStart = performance.now();
+        t.mock.method(
+          Date,
+          'now',
+          () => wallStart + Math.floor((performance.now() - monoStart) / 2),
+        );
       }
-      try {
-        await renewalNeverAnswers();
-      } finally {
-        clearInterval(ticking);
-      }
+      await renewalNeverAnswers();
     });
   }
 
@@ -2100,7 +2108,7 @@ describe('a late answer never undoes the end of a task', () => {
     }, async (t) => {
       t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
       const started = performance.now();
-      const { late, cancel } = untilDeadline(Date.now() + 200);
+      const { late, cancel } = untilDeadline(gateDeadlineIn(200));
       if (clock !== 'a frozen wall clock') {
         t.mock.timers.setTime(Date.now() - 60_000);
       }
@@ -2116,6 +2124,51 @@ describe('a late answer never undoes the end of a task', () => {
       assert.ok(waited < 10_000, `waited ${waited} ms`);
     });
   }
+
+  test('the waits of a task end share one bound on the monotonic clock: a wall clock stepped back between them gives the next no new budget', {
+    timeout: 30_000,
+  }, async (t) => {
+    // Every gate call hangs. The wall clock steps back 10 s once the task is completed, between
+    // the wait for the running extend (which used up the bound) and the release.
+    const realNow = Date.now;
+    let stepMs = 0;
+    t.mock.method(Date, 'now', () => realNow() - stepMs);
+    const base = clockLocks();
+    const hang = () => new Promise<boolean>(() => {});
+    const locks: LockStore = { acquire: hang, extend: hang, release: hang };
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const complete = tasks.complete;
+    tasks.complete = async (...args: Parameters<typeof complete>) => {
+      const done = await complete.apply(tasks, args);
+      stepMs = 10_000;
+      return done;
+    };
+    let handled = 0;
+    const events = await runUntil(
+      tasks,
+      async () => {
+        handled = performance.now();
+      },
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    const ended = performance.now() - handled;
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    // One 200 ms bound and at most one second of clock lag for every wait together, with room
+    // for a loaded machine; a release given a new budget would wait out the 10 s step.
+    assert.ok(ended < 5000, `the task end took ${ended} ms`);
+  });
 
   async function renewalNeverAnswers() {
     const base = clockLocks();
