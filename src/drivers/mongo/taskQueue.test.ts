@@ -1362,10 +1362,13 @@ describe('the gate under concurrent reads (MongoDB)', () => {
 
 describe('MongoTaskQueue.claim', () => {
   test('claims the task that became due first; while leased it is due when the lease ends', async () => {
-    // The later-due row is older and goes in first: _id, createdAt and due order disagree.
-    await insert({ availableAt: new Date(Date.now() - 1000) }, new Date(1000));
+    // The later-due row is older and goes in first: _id, createdAt and due order disagree. Both
+    // due times come from one reading of the clock: a stall between the inserts (5 s was seen on
+    // a loaded machine) must not swap them.
+    const now = Date.now();
+    await insert({ availableAt: new Date(now - 1000) }, new Date(1000));
     const first = await insert(
-      { availableAt: new Date(Date.now() - 5000) },
+      { availableAt: new Date(now - 5000) },
       new Date(5000),
     );
     const leased = await tasks.claim('default', 300);
@@ -1387,7 +1390,11 @@ describe('MongoTaskQueue.claim', () => {
   test('a task in backoff is not claimed before its availableAt', async () => {
     await insert({ availableAt: new Date(Date.now() + 60_000) });
     const due = await insert({ availableAt: past() });
-    assert.equal((await tasks.claim('default', 300))?.taskId, String(due._id));
+    // A long lease, so the claimed task is not due again before the second claim.
+    assert.equal(
+      (await tasks.claim('default', 60_000))?.taskId,
+      String(due._id),
+    );
     assert.equal(await tasks.claim('default', 300), null);
   });
 
@@ -1436,9 +1443,10 @@ describe('MongoTaskQueue.claim', () => {
       leaseExpiresAt: new Date(Date.now() + 60_000),
     });
     await M.collection.updateMany({}, { $unset: { availableAt: '' } });
+    // Long leases, so neither claimed task is due again before the last claim.
     const claimed = [
-      (await tasks.claim('default', 300))?.taskId,
-      (await tasks.claim('default', 300))?.taskId,
+      (await tasks.claim('default', 60_000))?.taskId,
+      (await tasks.claim('default', 60_000))?.taskId,
     ];
     assert.deepEqual(
       claimed.sort(),
@@ -1522,8 +1530,10 @@ describe('MongoTaskQueue.claim', () => {
       attempts: 0,
       availableAt: past(),
     });
+    // A long lease: a 300 ms one could end between two claims on a loaded machine, and the task
+    // would be claimed again.
     const claimFor = async (resizers: string[]) =>
-      (await tasks.claim('default', 300, undefined, { resizers }))?.taskId;
+      (await tasks.claim('default', 60_000, undefined, { resizers }))?.taskId;
     assert.equal(await claimFor(['listings']), listings);
     assert.equal(await claimFor(['listings']), undefined);
     assert.deepEqual(
@@ -1641,10 +1651,11 @@ describe('MongoTaskQueue named queues and task events', () => {
       { _id: legacy._id },
       { $unset: { queue: '', resizer: '' } },
     );
-    const fromDefault = await tasks.claim('default', 300);
+    // Long leases: a 300 ms one could end before the last claim on a loaded machine.
+    const fromDefault = await tasks.claim('default', 60_000);
     assert.equal(fromDefault?.taskId, String(legacy._id));
-    assert.equal((await tasks.claim('bulk', 300))?.queue, 'bulk');
-    assert.equal(await tasks.claim('default', 300), null);
+    assert.equal((await tasks.claim('bulk', 60_000))?.queue, 'bulk');
+    assert.equal(await tasks.claim('default', 60_000), null);
   });
 
   test('the default queue claim ignores tasks waiting on bulk', async () => {
@@ -1919,8 +1930,12 @@ describe('MongoTaskQueue.fail and the Consumer retry policy', () => {
     assert.equal(rec.dead.length, 1);
   });
 
-  test('a pending retry cannot be claimed until its backoff elapses', async () => {
+  test('a pending retry cannot be claimed until its backoff elapses', async (t) => {
     await insert();
+    // Date stands still until the test moves it past the backoff: on a loaded machine the calls
+    // before the "not yet" claim could take longer than the 150 ms backoff. (Taken after the
+    // insert, whose schema default reads the real Date.now.)
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     const leased = await tasks.claim('default', 300);
     assert.ok(leased);
     const retryAt = new Date(Date.now() + 150);
@@ -1932,7 +1947,7 @@ describe('MongoTaskQueue.fail and the Consumer retry policy', () => {
     assert.equal(row?.leaseToken, null);
     assert.equal(row?.error, 'boom');
     assert.equal(await tasks.claim('default', 300), null);
-    await waitFor(() => Date.now() > retryAt.getTime());
+    t.mock.timers.tick(151);
     const reclaimed = await tasks.claim('default', 300);
     assert.ok(reclaimed);
     assert.equal(reclaimed.taskId, leased.taskId);
