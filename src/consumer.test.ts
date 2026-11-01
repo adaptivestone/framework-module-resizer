@@ -84,10 +84,10 @@ async function shutDownMidTask(
     },
     logger: silent,
   });
-  const until = Date.now() + 5000;
+  const until = performance.now() + 5000;
   try {
     while (!started) {
-      assert.ok(Date.now() < until, 'the handler never started');
+      assert.ok(performance.now() < until, 'the handler never started');
       await new Promise((r) => setTimeout(r, 2));
     }
   } catch (err) {
@@ -152,12 +152,12 @@ async function runUntil(
     logger: silent,
     ...opts,
   });
-  const until = Date.now() + 5000;
+  const until = performance.now() + 5000;
   try {
     try {
       while (!done()) {
         assert.ok(
-          Date.now() < until,
+          performance.now() < until,
           'the queue loop did not reach the expected state',
         );
         await new Promise((r) => setTimeout(r, 5));
@@ -639,10 +639,10 @@ describe('Consumer', () => {
       },
       logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
     });
-    const until = Date.now() + 5000;
+    const until = performance.now() + 5000;
     try {
       while (tasks.rows[0].status !== 'completed') {
-        assert.ok(Date.now() < until, 'the task was never completed');
+        assert.ok(performance.now() < until, 'the task was never completed');
         await new Promise((r) => setTimeout(r, 5));
       }
     } catch (err) {
@@ -1588,9 +1588,9 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       coordinationOf: () => coordination,
       logger: silent,
     }).run('default', crashed.signal);
-    const until = Date.now() + 5000;
+    const until = performance.now() + 5000;
     while (!firstStarted) {
-      assert.ok(Date.now() < until, 'the first worker never started');
+      assert.ok(performance.now() < until, 'the first worker never started');
       await sleepMs(2);
     }
     const startCalls = calls.length;
@@ -2687,8 +2687,8 @@ describe('Consumer metrics', () => {
       logger: silent,
       metricsOf: () => rec,
     });
-    const until = Date.now() + 5000;
-    while (!started && Date.now() < until) {
+    const until = performance.now() + 5000;
+    while (!started && performance.now() < until) {
       await sleepMs(2);
     }
     stop.abort();
@@ -2741,8 +2741,8 @@ describe('Consumer metrics', () => {
     });
     await sleepMs(60); // several empty polls
     await tasks.add(newTask());
-    const until = Date.now() + 5000;
-    while (tasks.rows[0].status !== 'completed' && Date.now() < until) {
+    const until = performance.now() + 5000;
+    while (tasks.rows[0].status !== 'completed' && performance.now() < until) {
       await sleepMs(2);
     }
     stop.abort();
