@@ -183,7 +183,9 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   // Every extend, with the clock reading when the Consumer called it and the TTL it asked for.
   const extendCalls: { at: number; ttlMs: number }[] = [];
   const locks = {
-    ...base,
+    acquire: base.acquire,
+    release: base.release,
+    entry: base.entry,
     extend: (lockKey: string, owner: string, ttlMs: number) => {
       extendCalls.push({ at: Date.now(), ttlMs });
       return base.extend(lockKey, owner, ttlMs);
