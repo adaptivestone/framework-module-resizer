@@ -55,8 +55,8 @@ the image engine behind a port.
     keeps `queue: 'default'`: the Resizers share that queue, and no new worker is needed. Only a
     queue on a different backend, or one that should get its own timing, needs a name of its own in
     `queues` and `queue: '<that name>'`, and every new name needs a worker that consumes it:
-    `npm run cli ResizeWorker -- --queue=<name>`, or, from `0.3.0-rc.3`, one worker for several
-    names (`--queue=default --queue=<name>`). A `queue` object, in any file, is `RESIZE_CONFIG_REMOVED_KEY`
+    `npm run cli ResizeWorker -- --queue=<name>`, or one worker for several names
+    (`--queue=default --queue=<name>`). A `queue` object, in any file, is `RESIZE_CONFIG_REMOVED_KEY`
     with the new shape in the message, and so is `queues.<name>.queues` (give each SQS queue its own
     entry).
   - `RESIZE_CONFIG_INVALID` also covers a malformed `queues` map or entry (no `driver`, an SQS
@@ -143,9 +143,8 @@ the image engine behind a port.
   and `createdAt` are informational and not checked. The current `resizeMediaSchemaFragment`
   declares all of them; a mixed or plain `previews` array, or rows with `strict: false`, pass.
 - **A call on a queue that its task queue does not serve queues nothing.** That is an unknown
-  queue name, or, from `0.3.0-rc.3`, a queue whose backend's optional SDK is not installed in that
-  process (a queue on another available backend is routed, see Features; in `0.3.0-rc.1` and
-  `0.3.0-rc.2` it was not served). Before any gate lock or `add()`, `prewarm()` reports
+  queue name, or a queue whose backend's optional SDK is not installed in that process (a queue on
+  another available backend is routed, see Features). Before any gate lock or `add()`, `prewarm()` reports
   every variant `unconfirmed` with the issue `RESIZE_QUEUE_NOT_SERVED` (`retryable: false`), and
   `resolve()` logs a warning once per queue name. On SQS this replaces the logged
   `RESIZE_SQS_QUEUE_UNKNOWN` and the issue `RESIZE_ENQUEUE_QUEUE_FAILED` for a queue name without a
@@ -169,8 +168,8 @@ the image engine behind a port.
   restore your customizations; the scaffold never overwrites a file, so re-running `--eject` alone
   changes nothing). The config file is still never diffed. An ejected model without the two times
   keeps working: they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
-- **Old preview rows.** Rows written before `0.3.0-rc.1` have no `origin` or `encodeSig`, so the
-  freshness check (`0.3.0-rc.4`) finds them stale: each is served until its replacement is stored,
+- **Old preview rows.** Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are
+  stale to the freshness check: each is served until its replacement is stored,
   regenerated on its next read, `prewarm()` or `generate()`, and its old file stays in storage, so
   plan the storage cost and the cleanup (see Changed behaviour). Rows without an `identity`
   (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`: the host deletes
@@ -293,7 +292,7 @@ the image engine behind a port.
   `canServeOriginalPublicly` is removed from `ResizeStorage` and both shipped drivers; the module
   never calls `signedUrl`: to give an owner the private original, call
   `storage.signedUrl(original.storageRef, ttlSeconds)` yourself.
-- The module drops the `deepmerge` dependency. From `0.3.0-rc.3` it merges the image settings
+- The module drops the `deepmerge` dependency. It merges the image settings
   over the package defaults itself (see "Partial framework config files" and `createResizer` under
   Features); `storage` and the other sections are read as the files hold them. The config is
   validated when the Resizer first reads it (a plain config object: at construction), or by
@@ -555,8 +554,8 @@ the image engine behind a port.
 - One task queue per backend in a framework app, and each queue name is a lane on it, with its own
   timing. Every `database` entry of `queues` is one backend (the app's `ResizeTask` model), and the
   SQS entries that share `region`, `endpoint`, `deadLetterQueueUrl` and the effective
-  `waitTimeSeconds` (default 10) are one backend: one `SqsTaskQueue` for all their names. From
-  `0.3.0-rc.3` names on different backends route: each call goes to the backend of its queue name,
+  `waitTimeSeconds` (default 10) are one backend: one `SqsTaskQueue` for all their names. Names
+  on different backends route: each call goes to the backend of its queue name,
   so one Resizer may use queues on several backends. The worker runs one loop (Consumer) per
   backend and queue name it consumes, one task at a time, each task processed with its own
   Resizer. `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is
@@ -681,14 +680,14 @@ the image engine behind a port.
 - `verify()` checks the framework `Lock` model only for a Resizer whose own queue is on SQS.
 - A driver name in a config (`storage`, `queues`) is checked against the Resizer's drivers when the
   Resizer first reads that section. An unregistered storage driver in an explicit `config` option
-  still throws at construction, with the text and code of `0.3.0-rc.2`.
+  is the exception: it throws at construction.
 - With `queues` on more than one available backend, every `FrameworkResizer` that takes its task
   queue from the config file has the same router as `tasks`, which can queue to every name. So a
   custom `runWorker({ resizers })` that consumes a queue on SQS (a backend that cannot filter
   claims) must list every such `FrameworkResizer` of the process, whatever its own queue; else it
-  fails with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. `0.3.0-rc.2` accepted, for example,
-  `runWorker({ resizers: [b], queue: 'bulk' })` with `'bulk'` on SQS beside a Resizer `a` on the
-  database queue `'default'`. The framework CLI (`npm run cli ResizeWorker`) serves every Resizer
+  fails with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. For example,
+  `runWorker({ resizers: [b], queue: 'bulk' })` with `'bulk'` on SQS fails beside a Resizer `a`
+  on the database queue `'default'`, since `a` can queue to `'bulk'` too. The framework CLI (`npm run cli ResizeWorker`) serves every Resizer
   and is not affected.
 - `RESIZE_QUEUE_NOT_SERVED` is narrower: an unknown name, or a backend whose SDK is not installed;
   a queue on another available backend now queues.
@@ -699,8 +698,8 @@ the image engine behind a port.
 - A worker no longer checks a served Resizer's own queue unless it consumes it.
 - A worker given `queue: ''` (or a list with a blank entry, or an empty list) fails with
   `RESIZE_QUEUE_INVALID`.
-- With several broken `queues` entries, the first error reported may differ from `0.3.0-rc.2`;
-  a config with one error keeps its text and code.
+- With several broken `queues` entries, the error reported first is not necessarily the first
+  entry's; a config with one error reports that error.
 - `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and `FrameworkS3StorageConfig` are
   deprecated (use `StorageConfig`, `LocalStorageConfig` and `S3StorageConfig`).
 
@@ -708,8 +707,8 @@ the image engine behind a port.
 
 - **Outdated previews regenerate.** A stored preview whose `origin` or `encodeSig` differs from
   what the current settings would record (another original or other stored dimensions, other
-  encode settings, another pipeline `version`), or that has neither (written before
-  `0.3.0-rc.1`), is stale. It is still served, and its replacement is made on its next read,
+  encode settings, another pipeline `version`), or that has neither (written by 0.2.x or
+  earlier), is stale. It is still served, and its replacement is made on its next read,
   `prewarm()` or `generate()` and stored over it in one write. Each replacement costs a render and
   an upload, and the old file is never deleted: plan the storage cost, and clean up from the
   `info` line "resize: replaced <n> outdated preview(s) of media <id>; their files are not
@@ -778,8 +777,8 @@ the image engine behind a port.
   `S3Storage.upload` itself must give every upload a new key, as the `ResizeStorage.upload`
   contract requires (the driver does not check). CDNs and browsers keep these objects up to a
   year, so purge your CDN when you delete one that must disappear sooner (browsers that already
-  have it may keep it until it expires). Objects uploaded before `0.3.0-rc.5` keep the headers they
-  were stored with.
+  have it may keep it until it expires). Objects already in the bucket keep the headers they were
+  stored with.
 
 **Features**
 
@@ -890,8 +889,8 @@ the image engine behind a port.
   settings (for animated formats: `animated`, `limits.animationFrames` and the pixel budget
   `min(limits.sourcePixels, limits.inputPixels)`, which also caps the frames at the larger of
   the source's and the preview's size), the result-dimension cap, the fit box (for fit rows) and the pipeline version), from the worker and
-  from `generate()`; `resizeMediaSchemaFragment` declares them. From `0.3.0-rc.4` the freshness
-  check compares them with the current settings (below).
+  from `generate()`; `resizeMediaSchemaFragment` declares them. The freshness check compares them
+  with the current settings (below).
 - `Pipeline.version` (optional string) is part of every row's `encodeSig`: bump it when a step's
   output changes, and the pipeline's stored previews are regenerated on their next read. It is not
   validated, and `''` signs differently from an absent version.
