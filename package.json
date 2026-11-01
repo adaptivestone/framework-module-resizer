@@ -1,6 +1,6 @@
 {
   "name": "@adaptivestone/framework-module-resize",
-  "version": "0.3.0-rc.5",
+  "version": "0.3.0",
   "description": "Adaptive stone node js framework module: image resize (sharp)",
   "main": "./dist/index.js",
   "type": "module",
@@ -80,13 +80,13 @@
     }
   },
   "devDependencies": {
-    "@adaptivestone/framework": "^5.5.0",
-    "@aws-sdk/client-s3": "^3.1146.0",
-    "@aws-sdk/client-sqs": "^3.1146.0",
-    "@aws-sdk/s3-request-presigner": "^3.1146.0",
+    "@adaptivestone/framework": "^5.6.0",
+    "@aws-sdk/client-s3": "^3.1159.0",
+    "@aws-sdk/client-sqs": "^3.1159.0",
+    "@aws-sdk/s3-request-presigner": "^3.1159.0",
     "@biomejs/biome": "^2.5.2",
     "@types/express": "^5.0.6",
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.6",
     "mongodb-memory-server": "^11.0.0",
     "mongoose": "^9.11.0",
     "typescript": "^7.0.2"

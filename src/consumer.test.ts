@@ -5,7 +5,12 @@
 // logger that throws.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { backoffMs, Consumer } from './consumer.ts';
+import {
+  backoffMs,
+  Consumer,
+  gateDeadlineIn,
+  untilDeadline,
+} from './consumer.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type {
   ClaimedTask,
@@ -79,10 +84,10 @@ async function shutDownMidTask(
     },
     logger: silent,
   });
-  const until = Date.now() + 5000;
+  const until = performance.now() + 5000;
   try {
     while (!started) {
-      assert.ok(Date.now() < until, 'the handler never started');
+      assert.ok(performance.now() < until, 'the handler never started');
       await new Promise((r) => setTimeout(r, 2));
     }
   } catch (err) {
@@ -130,6 +135,13 @@ async function runUntil(
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
+  // Once `done()` holds, the loop starts no other delivery. `done()` is checked every 5 ms, and
+  // under load that check can come after a 200 ms lease has run out: the queue would hand the task
+  // out again, and the test would see a delivery it never asked for.
+  const ownClaim = Object.hasOwn(tasks, 'claim');
+  const claim = tasks.claim;
+  tasks.claim = (async (...args: Parameters<typeof claim>) =>
+    done() ? null : claim.apply(tasks, args)) as typeof claim;
   const loop = consume(tasks, {
     queue: 'default',
     signal: stop.signal,
@@ -140,23 +152,31 @@ async function runUntil(
     logger: silent,
     ...opts,
   });
-  const until = Date.now() + 5000;
+  const until = performance.now() + 5000;
   try {
-    while (!done()) {
-      assert.ok(
-        Date.now() < until,
-        'the queue loop did not reach the expected state',
-      );
-      await new Promise((r) => setTimeout(r, 5));
+    try {
+      while (!done()) {
+        assert.ok(
+          performance.now() < until,
+          'the queue loop did not reach the expected state',
+        );
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } catch (err) {
+      // A failed wait still stops the loop, so the test file can exit; the assertion is the error.
+      stop.abort();
+      await loop.catch(() => {});
+      throw err;
     }
-  } catch (err) {
-    // A failed wait still stops the loop, so the test file can exit; the assertion is the error.
     stop.abort();
-    await loop.catch(() => {});
-    throw err;
+    await loop;
+  } finally {
+    if (ownClaim) {
+      tasks.claim = claim;
+    } else {
+      Reflect.deleteProperty(tasks, 'claim');
+    }
   }
-  stop.abort();
-  await loop;
   return events;
 }
 
@@ -564,9 +584,11 @@ describe('Consumer', () => {
   });
 
   test('an empty claim that already waited (a long poll) is retried at once; a quick one waits idlePollMs', async () => {
-    const idlePollMs = 60;
+    // A sleep after the long poll would be about idlePollMs; the gap allowed is half of it, so a
+    // loaded machine that runs the next claim late (40 ms was seen) does not pass for a sleep.
+    const idlePollMs = 300;
     for (const [claimWaitMs, expectGap] of [
-      [80, 'none'],
+      [320, 'none'],
       [0, 'idle'],
     ] as const) {
       const tasks = new MemoryTaskQueue({
@@ -583,12 +605,12 @@ describe('Consumer', () => {
       await runUntil(
         tasks,
         async () => {},
-        () => starts.length >= 3,
+        () => starts.length >= 2,
       );
       if (expectGap === 'none') {
         const gap = starts[1] - ends[0];
         assert.ok(
-          gap < 30,
+          gap < idlePollMs / 2,
           `a long poll is not followed by a sleep (${gap} ms)`,
         );
       } else {
@@ -617,10 +639,10 @@ describe('Consumer', () => {
       },
       logger: { ...silent, error: (...a: unknown[]) => errors.push(a) },
     });
-    const until = Date.now() + 5000;
+    const until = performance.now() + 5000;
     try {
       while (tasks.rows[0].status !== 'completed') {
-        assert.ok(Date.now() < until, 'the task was never completed');
+        assert.ok(performance.now() < until, 'the task was never completed');
         await new Promise((r) => setTimeout(r, 5));
       }
     } catch (err) {
@@ -984,6 +1006,27 @@ function recordingLocks() {
 
 const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * clockLocks whose clock (`now`) stands still until the first extend, a task's start, and then
+ * runs with Date.now(). The wait for the claim, which under load can outlast the short lock a
+ * test takes for the Dispatcher, does not let that lock lapse before the task starts.
+ */
+function startClockLocks() {
+  let pausedAt: number | undefined = Date.now();
+  let shift = 0;
+  const now = () => pausedAt ?? Date.now() - shift;
+  const locks = clockLocks(now);
+  const extend = locks.extend;
+  locks.extend = (...args) => {
+    if (pausedAt !== undefined) {
+      shift = Date.now() - pausedAt;
+      pausedAt = undefined;
+    }
+    return extend(...args);
+  };
+  return { locks, now };
+}
+
 describe('the gate lock on a task queue without gatesByTask', () => {
   const gateTiming = {
     ...fastTiming,
@@ -1005,10 +1048,10 @@ describe('the gate lock on a task queue without gatesByTask', () => {
   }
 
   test('is extended when the task starts and on every heartbeat, and released on completion', async () => {
-    const locks = clockLocks();
+    const { locks, now: lockNow } = startClockLocks();
     const tasks = await gatedTask(locks);
     const left: number[] = [];
-    const remaining = () => (locks.entry(key)?.expiresAt ?? 0) - Date.now();
+    const remaining = () => (locks.entry(key)?.expiresAt ?? 0) - lockNow();
     const events = await runUntil(
       tasks,
       async () => {
@@ -1455,7 +1498,11 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       assert.ok(held > 60_000 && held <= 60_200, `held for ${held} ms`);
     });
 
-    test('for the cooldown hold after a dead-letter', async () => {
+    // The cooldown holds below are exact: the Consumer takes their end on Date.now() and their TTL
+    // from it a moment later, so Date stands still in them, or a millisecond that passes between
+    // the two reads (more often under load) shortens the TTL by one.
+    test('for the cooldown hold after a dead-letter', async (t) => {
+      t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
       const { clock, locks, tasks } = await lapsed();
       await runUntil(
         tasks,
@@ -1472,7 +1519,8 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       });
     });
 
-    test('for the cooldown of a task past maxAttempts', async () => {
+    test('for the cooldown of a task past maxAttempts', async (t) => {
+      t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
       const { locks, tasks } = await lapsed();
       tasks.rows[0].attempts = gateTiming.maxAttempts; // the next claim is one too many
       let handled = 0;
@@ -1495,7 +1543,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
   test('after a worker crash the redelivery finds its gate still held', async () => {
     // The lease (600 ms) and the gate lock are moved by the same heartbeat tick, every 300 ms.
     const timing = { ...gateTiming, leaseMs: 600 };
-    const base = clockLocks();
+    const { locks: base, now: lockNow } = startClockLocks();
     const calls: { op: string; held: boolean }[] = [];
     const locks: LockStore = {
       acquire: async (lockKey, owner, ttlMs) => {
@@ -1540,9 +1588,9 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       coordinationOf: () => coordination,
       logger: silent,
     }).run('default', crashed.signal);
-    const until = Date.now() + 5000;
+    const until = performance.now() + 5000;
     while (!firstStarted) {
-      assert.ok(Date.now() < until, 'the first worker never started');
+      assert.ok(performance.now() < until, 'the first worker never started');
       await sleepMs(2);
     }
     const startCalls = calls.length;
@@ -1557,7 +1605,7 @@ describe('the gate lock on a task queue without gatesByTask', () => {
         async () => {
           const lock = base.entry(key);
           atRedelivery = {
-            live: (lock?.expiresAt ?? 0) > Date.now(),
+            live: (lock?.expiresAt ?? 0) > lockNow(),
             owner: lock?.owner,
             // Another request trying to queue a task for the media now.
             taken: await base.acquire(key, 'another request', 60_000),
@@ -1737,10 +1785,12 @@ describe('a lock store that never answers', () => {
       ['completed', 'completed'],
     );
     for (const mediaId of ['m1', 'm2']) {
-      // The start extend hangs; the end waits for it one bound at most, then releases.
+      // The start extend hangs; the end waits for it one bound at most, then releases. Checked as
+      // less than two bounds: a loaded machine runs the bound's timer late (480 ms was seen), and
+      // the log check below reads the wait the Consumer applied.
       const waited = completed[mediaId] - handled[mediaId];
       assert.ok(
-        waited <= leaseMs + 150,
+        waited < 2 * leaseMs,
         `${mediaId} completed ${waited} ms after its handler`,
       );
       assert.equal(
@@ -1772,8 +1822,10 @@ describe('a lock store that never answers', () => {
 
   test('the task timeout aborts the handler at once, while a gate call hangs', async () => {
     const { locks } = hangingExtend();
+    // A 1 s bound here, so a timer that a loaded machine runs late (250 ms was seen) does not pass
+    // for a wait on the hanging extend.
     const tasks = new PlainTaskQueue({
-      timing: { ...hangingTiming, taskTimeoutMs: 50 },
+      timing: { ...hangingTiming, leaseMs: 1000, taskTimeoutMs: 50 },
     });
     await tasks.add({ ...newTask(), gateOwner: 'g1' });
     let startedAt = 0;
@@ -1796,10 +1848,10 @@ describe('a lock store that never answers', () => {
         }),
       },
     );
-    // Aborted at the timeout (50 ms), not after the hanging start extend's bound (300 ms).
+    // Aborted at the timeout (50 ms), not after the hanging start extend's bound (1000 ms).
     assert.ok(abortedAt > 0, 'the handler was aborted');
     assert.ok(
-      abortedAt - startedAt < 250,
+      abortedAt - startedAt < 500,
       `aborted ${abortedAt - startedAt} ms after the start`,
     );
     assert.deepEqual(
@@ -1838,9 +1890,10 @@ describe('a lock store that never answers', () => {
     } finally {
       clearTimeout(timer);
     }
+    // One bound, checked as less than two: a loaded machine runs the bound's timer late.
     const tookMs = Date.now() - stoppedAt;
     assert.ok(
-      tookMs <= leaseMs + 150,
+      tookMs < 2 * leaseMs,
       `run() resolved ${tookMs} ms after the abort`,
     );
     assert.deepEqual(tasks.releaseCalls, ['task-1']);
@@ -2017,9 +2070,107 @@ describe('a late answer never undoes the end of a task', () => {
     );
   });
 
-  test('a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store', {
-    timeout: 10_000,
-  }, async () => {
+  // The gate bound is measured on Date.now(), and its waits run on timers, a different clock: a
+  // timer may fire while Date.now() is still short of its end. Under load that left the release
+  // a wait of 1 ms instead of none; a wall clock that runs at half the timers' speed makes it so on
+  // every run.
+  for (const clock of [
+    'the system clock',
+    'a wall clock that lags the timers',
+  ]) {
+    test(`a renewal that never answers uses up the gate bound: it is logged, and the gate calls are not blamed on the lock store (${clock})`, {
+      timeout: 10_000,
+    }, async (t) => {
+      if (clock !== 'the system clock') {
+        // Read from the monotonic clock on every call, so a loaded machine cannot make it fall
+        // further behind: the bound always ends on the wall clock, at twice its length, far from
+        // the one second of lag the monotonic bound allows.
+        const wallStart = Date.now();
+        const monoStart = performance.now();
+        t.mock.method(
+          Date,
+          'now',
+          () => wallStart + Math.floor((performance.now() - monoStart) / 2),
+        );
+      }
+      await renewalNeverAnswers();
+    });
+  }
+
+  // The deadline is on Date.now(), which is not monotonic: a wall clock that stops or steps back
+  // (an NTP correction, a VM resume) while a gate call waits must not stretch the wait by the step.
+  for (const clock of [
+    'a frozen wall clock',
+    'a wall clock stepped back 60 s',
+  ]) {
+    test(`a gate wait ends about its budget after it started, on ${clock}`, {
+      timeout: 15_000,
+    }, async (t) => {
+      t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+      const started = performance.now();
+      const { late, cancel } = untilDeadline(gateDeadlineIn(200));
+      if (clock !== 'a frozen wall clock') {
+        t.mock.timers.setTime(Date.now() - 60_000);
+      }
+      try {
+        await late;
+      } finally {
+        cancel();
+      }
+      const waited = performance.now() - started;
+      // The 200 ms budget plus at most the one second of clock lag a wait allows; the bound is
+      // loose for a loaded machine and still far below the 60 s step.
+      assert.ok(waited >= 190, `waited ${waited} ms`);
+      assert.ok(waited < 10_000, `waited ${waited} ms`);
+    });
+  }
+
+  test('the waits of a task end share one bound on the monotonic clock: a wall clock stepped back between them gives the next no new budget', {
+    timeout: 30_000,
+  }, async (t) => {
+    // Every gate call hangs. The wall clock steps back 10 s once the task is completed, between
+    // the wait for the running extend (which used up the bound) and the release.
+    const realNow = Date.now;
+    let stepMs = 0;
+    t.mock.method(Date, 'now', () => realNow() - stepMs);
+    const base = clockLocks();
+    const hang = () => new Promise<boolean>(() => {});
+    const locks: LockStore = { acquire: hang, extend: hang, release: hang };
+    const tasks = new PlainTaskQueue({ timing: lateTiming });
+    assert.equal(await base.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const complete = tasks.complete;
+    tasks.complete = async (...args: Parameters<typeof complete>) => {
+      const done = await complete.apply(tasks, args);
+      stepMs = 10_000;
+      return done;
+    };
+    let handled = 0;
+    const events = await runUntil(
+      tasks,
+      async () => {
+        handled = performance.now();
+      },
+      () => tasks.rows[0].status === 'completed',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+      },
+    );
+    const ended = performance.now() - handled;
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed'],
+    );
+    // One 200 ms bound and at most one second of clock lag for every wait together, with room
+    // for a loaded machine; a release given a new budget would wait out the 10 s step.
+    assert.ok(ended < 5000, `the task end took ${ended} ms`);
+  });
+
+  async function renewalNeverAnswers() {
     const base = clockLocks();
     let markReleased!: () => void;
     const releaseLanded = new Promise<void>((resolve) => {
@@ -2112,31 +2263,43 @@ describe('a late answer never undoes the end of a task', () => {
     } finally {
       letRelease();
     }
-  });
+  }
 
   test('nothing is made again once a renewal reported the lease lost', async () => {
+    // The order is set by promises, not by sleeps that a loaded machine can run late: the task
+    // ends once the second renewal is sent; that renewal reports the lease lost once the
+    // completion has released the gate; the first heartbeat's extend lands after that report.
+    const milestone = () => {
+      let mark!: () => void;
+      const done = new Promise<void>((resolve) => {
+        mark = resolve;
+      });
+      return { done, mark };
+    };
+    const secondRenewal = milestone();
+    const released = milestone();
+    const lossReported = milestone();
+    const landed = milestone();
     const base = clockLocks();
     let extendCalls = 0;
-    let markLanded!: () => void;
-    const landed = new Promise<void>((resolve) => {
-      markLanded = resolve;
-    });
     let releases = 0;
     const locks: LockStore = {
       acquire: base.acquire,
       extend: async (lockKey, owner, ttlMs) => {
         extendCalls += 1;
         if (extendCalls === 2) {
-          // The first heartbeat's extend lands after the completion's release.
-          await sleepMs(600);
+          // The first heartbeat's extend lands after the completion's release and the loss.
+          await lossReported.done;
+          await sleepMs(10);
           const held = await base.extend(lockKey, owner, ttlMs);
-          markLanded();
+          landed.mark();
           return held;
         }
         return base.extend(lockKey, owner, ttlMs);
       },
       release: async (lockKey, owner) => {
         releases += 1;
+        released.mark();
         return base.release(lockKey, owner);
       },
     };
@@ -2147,16 +2310,18 @@ describe('a late answer never undoes the end of a task', () => {
     let renewCalls = 0;
     tasks.renew = async () => {
       renewCalls += 1;
-      if (renewCalls === 1) {
+      if (renewCalls !== 2) {
         return true;
       }
-      await sleepMs(300);
+      secondRenewal.mark();
+      await released.done;
+      lossReported.mark();
       return false;
     };
     await runUntil(
       tasks,
       async () => {
-        await sleepMs(250);
+        await secondRenewal.done;
       },
       () => tasks.rows[0].status === 'completed',
       {
@@ -2167,7 +2332,7 @@ describe('a late answer never undoes the end of a task', () => {
         }),
       },
     );
-    await landed;
+    await landed.done;
     await sleepMs(50);
     assert.equal(
       releases,
@@ -2522,8 +2687,8 @@ describe('Consumer metrics', () => {
       logger: silent,
       metricsOf: () => rec,
     });
-    const until = Date.now() + 5000;
-    while (!started && Date.now() < until) {
+    const until = performance.now() + 5000;
+    while (!started && performance.now() < until) {
       await sleepMs(2);
     }
     stop.abort();
@@ -2576,8 +2741,8 @@ describe('Consumer metrics', () => {
     });
     await sleepMs(60); // several empty polls
     await tasks.add(newTask());
-    const until = Date.now() + 5000;
-    while (tasks.rows[0].status !== 'completed' && Date.now() < until) {
+    const until = performance.now() + 5000;
+    while (tasks.rows[0].status !== 'completed' && performance.now() < until) {
       await sleepMs(2);
     }
     stop.abort();

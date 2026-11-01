@@ -1,6 +1,6 @@
 # Reference architecture: narrow ports, explicit dependencies, task-row gate
 
-Status: **implemented** in phases S1–S6 for 0.3.0 (branches
+Status: **implemented** in phases S1–S6, shipped in 0.3.0 (branches
 `refactor/s1-ports-and-composition-root`, `refactor/s2-gate-and-coordination`,
 `refactor/s2b-host-shapes`, `refactor/s3-decoder-port`, `refactor/s4-config-factory`,
 `refactor/s5-metrics-freshness` and `refactor/s6-hygiene`); proposed and decided by the owner on

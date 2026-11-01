@@ -137,6 +137,66 @@ const MAX_GATE_WAIT_MS = 30_000;
 // A gate call that has not answered in time.
 const TIMED_OUT = Symbol('timed out');
 
+// How far past its deadline's monotonic twin a gate wait may last: the ~1 ms lag
+// between the timer clock and Date.now() is re-armed away, and a wall clock that stepped back (an
+// NTP correction, a VM resume) costs at most this much more, not the size of the step.
+const MAX_CLOCK_LAG_MS = 1_000;
+
+/**
+ * The end of a wait, taken once and shared by every wait that must end with it: `wall` on
+ * Date.now(), and its twin `mono` on performance.now().
+ */
+export interface GateDeadline {
+  wall: number;
+  mono: number;
+}
+
+/** A GateDeadline `ms` from now. */
+export function gateDeadlineIn(ms: number): GateDeadline {
+  return { wall: Date.now() + ms, mono: performance.now() + ms };
+}
+
+/**
+ * What is left of `deadline` in ms: until Date.now() reaches `wall`, or performance.now() reaches
+ * `mono` plus MAX_CLOCK_LAG_MS, whichever comes first (may be negative).
+ */
+function msLeft(deadline: GateDeadline): number {
+  return Math.min(
+    deadline.wall - Date.now(),
+    deadline.mono + MAX_CLOCK_LAG_MS - performance.now(),
+  );
+}
+
+/**
+ * Resolves with TIMED_OUT once Date.now() has reached `deadline.wall`, or once performance.now()
+ * has reached `deadline.mono` plus MAX_CLOCK_LAG_MS, whichever comes first (after one timer turn
+ * at least, so an answer already there wins); `cancel` stops it. Timers run on another clock than
+ * Date.now(), so a timer may fire a little before Date.now() gets there: it is then armed again
+ * for what is left, and a wait never leaves a sliver of its deadline to the next. A wall clock that
+ * stops or steps back ends the wait by the monotonic twin instead, and since every wait that shares
+ * a deadline shares that twin, a step gives none of them a new budget.
+ * `unref`: the timer does not keep the process alive.
+ */
+export function untilDeadline(
+  deadline: GateDeadline,
+  unref = false,
+): { late: Promise<typeof TIMED_OUT>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<typeof TIMED_OUT>((resolve) => {
+    const arm = () => {
+      timer = setTimeout(
+        () => (msLeft(deadline) <= 0 ? resolve(TIMED_OUT) : arm()),
+        Math.max(1, msLeft(deadline)),
+      );
+      if (unref) {
+        timer.unref?.();
+      }
+    };
+    arm();
+  });
+  return { late, cancel: () => clearTimeout(timer) };
+}
+
 // The gate calls of one task run (see GateLock): once the final gate action has started, the
 // action (`final`) and how to make it again (`again`), for a running call that answers later;
 // `leaseLost` once a renewal reported the lease lost, after which nothing is made again.
@@ -381,7 +441,7 @@ export class Consumer {
     // loop and the shutdown, waits for the queue's renewals and the lock store for at most one gate
     // bound in all. A gate call made after the deadline is still sent, but its answer is not
     // waited for.
-    const gateDeadline = Date.now() + this.#gateWaitMs;
+    const gateDeadline = gateDeadlineIn(this.#gateWaitMs);
     // A renewal still in flight may yet report the lease lost: wait for its answer first, on every
     // queue (a gating one too).
     if (
@@ -506,7 +566,7 @@ export class Consumer {
     error: unknown,
     opts: {
       forceDead?: boolean;
-      gateDeadline?: number;
+      gateDeadline?: GateDeadline;
       run?: GateRun;
       claim: ClaimStart;
     },
@@ -518,7 +578,7 @@ export class Consumer {
       task.attempts >= timing.maxAttempts;
     const message = String(error).slice(0, 1000);
     const gate = this.#gate(task, coordination);
-    const gateDeadline = opts.gateDeadline ?? Date.now() + this.#gateWaitMs;
+    const gateDeadline = opts.gateDeadline ?? gateDeadlineIn(this.#gateWaitMs);
     try {
       if (dead) {
         const cooldownMs =
@@ -589,12 +649,15 @@ export class Consumer {
     task: ClaimedTask,
     gate: GateLock | undefined,
     ttlMs: number,
-    opts: { retake?: () => boolean; deadline?: number } & GateCallOptions = {},
+    opts: {
+      retake?: () => boolean;
+      deadline?: GateDeadline;
+    } & GateCallOptions = {},
   ): Promise<void> {
     if (!gate) {
       return;
     }
-    const deadline = opts.deadline ?? Date.now() + this.#gateWaitMs;
+    const deadline = opts.deadline ?? gateDeadlineIn(this.#gateWaitMs);
     const how = { run: opts.run, detached: opts.detached };
     const held = await this.#gateCall(
       task,
@@ -623,7 +686,7 @@ export class Consumer {
     gate: GateLock | undefined,
     until: number,
     retake: () => boolean,
-    gateDeadline: number,
+    gateDeadline: GateDeadline,
     run: GateRun | undefined,
   ): Promise<void> {
     return this.#finalGate(
@@ -646,13 +709,13 @@ export class Consumer {
    */
   #finalGate(
     run: GateRun | undefined,
-    act: (deadline: number, detached?: boolean) => Promise<void>,
-    deadline: number,
+    act: (deadline: GateDeadline, detached?: boolean) => Promise<void>,
+    deadline: GateDeadline,
   ): Promise<void> {
     const first = act(deadline);
     if (run) {
       run.final = first;
-      run.again = () => act(Date.now() + this.#gateWaitMs, true);
+      run.again = () => act(gateDeadlineIn(this.#gateWaitMs), true);
     }
     return first;
   }
@@ -664,7 +727,7 @@ export class Consumer {
   async #releaseGate(
     task: ClaimedTask,
     gate: GateLock | undefined,
-    deadline: number,
+    deadline: GateDeadline,
     detached?: boolean,
   ): Promise<void> {
     if (!gate) {
@@ -689,7 +752,7 @@ export class Consumer {
     task: ClaimedTask,
     action: 'extending' | 'releasing' | 'taking back',
     call: () => Promise<boolean>,
-    deadline: number,
+    deadline: GateDeadline,
     { run, detached }: GateCallOptions = {},
   ): Promise<boolean | undefined> {
     const { logger } = this.#deps;
@@ -718,14 +781,8 @@ export class Consumer {
     }
     // The wait this call gets: what is left of its deadline (none once a task's end has used up
     // its one gate bound).
-    const waitMs = Math.max(0, deadline - Date.now());
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(() => resolve(TIMED_OUT), waitMs);
-      if (detached) {
-        timer.unref?.();
-      }
-    });
+    const waitMs = Math.max(0, Math.round(msLeft(deadline)));
+    const { late, cancel } = untilDeadline(deadline, detached);
     try {
       const result = await Promise.race([answer, late]);
       if (result === TIMED_OUT) {
@@ -739,7 +796,7 @@ export class Consumer {
       }
       return result;
     } finally {
-      clearTimeout(timer);
+      cancel();
     }
   }
 
@@ -747,18 +804,15 @@ export class Consumer {
    * Wait for `calls` until `deadline` at most; whatever is still pending then goes on alone.
    * Resolves true when they settled in time.
    */
-  async #within(calls: Promise<void>, deadline: number): Promise<boolean> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(
-        () => resolve(TIMED_OUT),
-        Math.max(0, deadline - Date.now()),
-      );
-    });
+  async #within(
+    calls: Promise<void>,
+    deadline: GateDeadline,
+  ): Promise<boolean> {
+    const { late, cancel } = untilDeadline(deadline);
     try {
       return (await Promise.race([calls, late])) !== TIMED_OUT;
     } finally {
-      clearTimeout(timer);
+      cancel();
     }
   }
 
@@ -766,7 +820,7 @@ export class Consumer {
   async #giveBackAtShutdown(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
-    opts: { gateDeadline?: number; run?: GateRun } = {},
+    opts: { gateDeadline?: GateDeadline; run?: GateRun } = {},
   ): Promise<void> {
     await this.#giveBack(
       task,
@@ -788,7 +842,7 @@ export class Consumer {
     coordination: TaskCoordination | undefined,
     reason: string,
     done?: string,
-    opts: { gateDeadline?: number; run?: GateRun } = {},
+    opts: { gateDeadline?: GateDeadline; run?: GateRun } = {},
   ): Promise<void> {
     const { tasks, logger } = this.#deps;
     // The hold comes first, while the task is not back yet. It only extends the lock, never takes
@@ -801,7 +855,7 @@ export class Consumer {
         gate,
         Date.now() + gate.gateTtlMs,
         never,
-        opts.gateDeadline ?? Date.now() + this.#gateWaitMs,
+        opts.gateDeadline ?? gateDeadlineIn(this.#gateWaitMs),
         opts.run,
       );
     }

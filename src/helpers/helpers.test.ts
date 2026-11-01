@@ -58,21 +58,35 @@ describe('sleep', () => {
     assert.ok(Date.now() - start >= 15);
   });
 
+  // The two tests below check order, not the wall clock (a loaded machine stalls for more than
+  // 100 ms): the sleep must settle before a setImmediate callback queued after the abort, which
+  // runs long before its 10 s timer could.
+  const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
   test('resolves immediately when the signal is already aborted', async () => {
     const controller = new AbortController();
     controller.abort();
-    const start = Date.now();
-    await sleep(10_000, controller.signal);
-    assert.ok(Date.now() - start < 100); // did not wait the full 10s
+    let settled = false;
+    const p = sleep(10_000, controller.signal).then(() => {
+      settled = true;
+    });
+    await nextTurn();
+    assert.equal(settled, true, 'did not wait for the 10 s timer');
+    await p;
   });
 
   test('resolves early when aborted mid-sleep', async () => {
     const controller = new AbortController();
-    const start = Date.now();
-    const p = sleep(10_000, controller.signal);
-    setTimeout(() => controller.abort(), 10);
+    let settled = false;
+    const p = sleep(10_000, controller.signal).then(() => {
+      settled = true;
+    });
+    await nextTurn();
+    assert.equal(settled, false, 'still sleeping before the abort');
+    controller.abort();
+    await nextTurn();
+    assert.equal(settled, true, 'woke at the abort, not at the 10 s timer');
     await p;
-    assert.ok(Date.now() - start < 100);
   });
 
   // The wrapper swallows ONLY the AbortError and re-throws anything else. That re-throw path is not

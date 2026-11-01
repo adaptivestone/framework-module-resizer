@@ -43,14 +43,16 @@ Bump with `npm version <patch|minor|major>` (updates `package.json` + creates th
 **Prereleases.** A breaking minor may ship as release candidates first: `X.Y.0-rc.N`, starting
 at `rc.1` (`npm version X.Y.0-rc.1 --no-git-tag-version`, then tag by hand, §4). Each rc is
 published with the npm tag `next` (§3), so `latest` stays on the last stable release until the
-final `X.Y.0`. 0.3.0 ships this way: `0.3.0-rc.1` holds every host-facing shape, `0.3.0-rc.2` the
+final `X.Y.0`. All of a version's rcs stay under its one `# X.Y.0` heading of `CHANGELOG.md`,
+and the final `X.Y.0` is a bump from the last rc with no new heading; at that bump the heading's
+rc note becomes an "Upgrading from a release candidate" note.
+
+0.3.0 shipped this way: `0.3.0-rc.1` held every host-facing shape, `0.3.0-rc.2` the
 `beforeSteps` signature and the decoder port, `0.3.0-rc.3` additions only (`createResizer`, drivers
 by name, routing between backends, a worker queue list, partial config files; no required host
 change), `0.3.0-rc.4` metrics and the freshness check (additions, and outdated previews regenerate
-on read; no required host change), `0.3.0-rc.5` a cache header on S3 public objects (no host
-change), later rcs internal changes only. All of them stay under the one
-`# 0.3.0` heading of `CHANGELOG.md` (its **Prereleases** note says what each rc holds); the
-final `0.3.0` is a bump from the last rc with no new heading.
+on read; no required host change), and `0.3.0-rc.5` a cache header on S3 public objects (no host
+change). The final `0.3.0` followed `0.3.0-rc.5` with no host-facing change.
 
 > **Check `version` first.** Compare `version` with
 > `npm view @adaptivestone/framework-module-resize versions --json` (every version, rcs

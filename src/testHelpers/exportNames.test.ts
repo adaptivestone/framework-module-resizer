@@ -475,10 +475,60 @@ test('a string import name (ES2022) is read and checked', async () => {
   ]);
 });
 
+test('a string import name may hold quotes, commas, braces and escapes', async () => {
+  for (const [line, name] of [
+    [`import { 'a,b' as X } from '${PKG}';`, 'a,b'],
+    [`import { "a}b" as X } from '${PKG}';`, 'a}b'],
+    [`import { "a{b" as X } from '${PKG}';`, 'a{b'],
+    [`import { "it's" as X } from '${PKG}';`, "it's"],
+    [`import { 'say "hi"' as X } from '${PKG}';`, 'say "hi"'],
+    [`import { 'it\\'s' as X } from '${PKG}';`, "it's"],
+    [`import { "a\\"b" as X } from '${PKG}';`, 'a"b'],
+    [`import { 'back\\\\slash' as X } from '${PKG}';`, 'back\\slash'],
+    [`import { 'caf\\u00e9' as X } from '${PKG}';`, 'café'],
+    [`import { 'caf\\u{e9}' as X } from '${PKG}';`, 'café'],
+    // Past the last code point (0x10FFFF), as JavaScript would refuse it: kept as written, and
+    // reported like any name that is not an export, instead of crashing the scan.
+    [`import { 'bad\\u{110000}' as X } from '${PKG}';`, 'bad\\u{110000}'],
+  ]) {
+    await assertOneProblem(line, name);
+  }
+  // The names beside such a string are read as usual.
+  const [imp] = docImports(
+    fenced(`import { 'a,}b' as X, Resizer, type MediaLike } from '${PKG}';`),
+  );
+  assert.deepEqual(imp?.named, [
+    { name: 'a,}b', type: false },
+    { name: 'Resizer', type: false },
+    { name: 'MediaLike', type: true },
+  ]);
+});
+
+test('the word "import" inside a string on a fence line starts no statement', async () => {
+  for (const line of [
+    `const hint = 'import { NotThere } from "${PKG}"';`,
+    `console.log("run: import { NotThere } from '${PKG}/gone.js'");`,
+    `const t = \`import { NotThere } from '${PKG}'\`;`,
+    `const s = 'it\\'s import { NotThere } from "${PKG}"';`,
+  ]) {
+    assert.deepEqual(docImports(fenced(line)), [], line);
+  }
+  // A string with the word, then a real import on the same line and on the next.
+  await assertOneProblem(
+    `const s = 'import'; import { MissingExport } from '${PKG}';`,
+    'MissingExport',
+  );
+  await assertOneProblem(
+    `const s = "import { X } from";\nimport { MissingExport } from '${PKG}';`,
+    'MissingExport',
+  );
+});
+
 // A doc edit must fail the guard, never hang `npm test`, and node:test cannot interrupt a
 // synchronous scan: so the scan runs in a child process with a deadline. Each input is read in
 // well under the budget only when the scan is linear in the fence length.
-// The open braces never close, so that input is checked for its time only.
+// The open braces never close, so that input is checked for its time only, and so are the string
+// names (many items, an escape that never closes its `{`).
 test('the scan is linear on a long statement without a specifier, a comment that never closes, or many open braces', () => {
   const url = new URL('./exportNames.ts', import.meta.url).href;
   const script = `import { docImports } from ${JSON.stringify(url)};
@@ -488,6 +538,10 @@ const inputs = [
   ['unterminated', 'import' + spaces, true],
   ['comments', '/* '.repeat(50000), true],
   ['braces', 'import ' + '{'.repeat(100000) + " from '${PKG}'", false],
+  ['quotes', 'import ' + '\\'"'.repeat(50000), true],
+  ['backslashes', 'import { "' + '\\\\'.repeat(100000), true],
+  ['string names', 'import { ' + '"a,}b" as X, '.repeat(20000) + "} from '${PKG}'", false],
+  ['open escape', 'import { "\\\\u{' + 'f'.repeat(100000) + "\\" as X } from '${PKG}'", false],
 ];
 const slow = [];
 for (const [name, body, none] of inputs) {

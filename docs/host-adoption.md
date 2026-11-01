@@ -33,55 +33,14 @@ survive persistence. Framework `BaseModel` already supplies this default; direct
 Mongoose schemas must set it explicitly. The field fragment alone cannot configure
 the enclosing schema's options.
 
-## Installing the release candidate
-
-0.3.0 ships as release candidates first, published with the npm tag `next`:
+## Installing
 
 ```bash
-npm i @adaptivestone/framework-module-resize@next
+npm i @adaptivestone/framework-module-resize
 ```
 
-`0.3.0-rc.1` holds every host-facing shape of 0.3.0: the config, the option and type names, the
-import paths, the preview fields and `invalidate`. `0.3.0-rc.2` changes the `beforeSteps`
-signature and adds decoders (see [Changed in `0.3.0-rc.2`](#changed-in-030-rc2)).
-
-`0.3.0-rc.3` only adds APIs a host may choose to use: `createResizer` (a Resizer from one config
-object, without the framework), drivers registered by name (the `drivers` option, `fromConfig`),
-`RoutingTaskQueue` and `carrierOf`, a worker that consumes several queues
-(`--queue=default --queue=bulk`), and partial config files (`PartialFrameworkResizeConfig`). It
-requires no host change. Three things a host may notice without changing anything:
-
-- when `queues` spans two available backends (a database entry and an SQS entry whose SDK is
-  installed), `resizer.tasks` is a `RoutingTaskQueue`, not the backend's own task queue (no
-  `release`; an `instanceof MongoTaskQueue` check fails: ask `carrierOf(resizer.tasks, name)`);
-- a call on a queue of another backend now queues there, where `0.3.0-rc.2` reported
-  `RESIZE_QUEUE_NOT_SERVED`;
-- with those two backends, every `FrameworkResizer` that takes its task queue from the config
-  file can queue to every name, so a custom `runWorker({ resizers })` that consumes a queue on SQS
-  must list all of them, whatever their own queue (else `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`;
-  `0.3.0-rc.2` accepted `runWorker({ resizers: [b], queue: 'bulk' })` beside a Resizer `a` on the
-  database queue). `npm run cli ResizeWorker` serves every Resizer and is not affected.
-
-`0.3.0-rc.4` adds metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics` and the `metrics`
-option; by default one summary `info` line per Resizer per minute and one per task outcome) and the
-freshness check. It requires no host change, but one behaviour is visible: outdated previews (made
-from another original, with other image settings or pipeline `version`, or before `0.3.0-rc.1`)
-regenerate on their next read. So:
-
-- plan worker capacity and storage for that wave, which shares the queue with new uploads;
-- clean up the old files, which the module never deletes (from the "resize: replaced …
-  outdated preview(s)" log line, or with a sweep of preview objects no row references);
-- roll out image settings and pipeline versions with every worker at once (or after the old
-  workers have stopped): two worker versions with different settings re-make each other's rows,
-  and each replaced preview costs one render, one upload and one orphaned file;
-- a custom `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`.
-
-`0.3.0-rc.5` removes and renames nothing: it widens two types (the `NoopMetrics` parameters, and
-the timing keys of a custom queue driver's `queues` entry; see Fixes in `CHANGELOG.md`), and every
-public object `S3Storage` uploads (previews and public raster originals, and your own direct
-uploads, which must use new keys) carries `Cache-Control: public, max-age=31536000, immutable`, so
-purge your CDN when you delete one that must disappear sooner (browsers that already have it may
-keep it until it expires). Release candidates after `0.3.0-rc.5` change only internals.
+A host on 0.2.x reads every section below. A host on a 0.3.0 release candidate needs only what
+came after its rc: see [Upgrading from a release candidate](#upgrading-from-a-release-candidate).
 `CHANGELOG.md` (`# 0.3.0`) has the details of everything below.
 
 ## Named queues: from `queue: { … }` to `queues`
@@ -196,8 +155,8 @@ export default {
   (`resize.<NODE_ENV>.ts`), and a `resize.ts` that holds only the process-wide sections (no
   default Resizer, so no `mediaModelName`), write `satisfies Partial<FrameworkResizeConfig>`; an
   override that leaves out nested keys (only `limits.sourcePixels`, say) may write
-  `satisfies PartialFrameworkResizeConfig` instead. From `0.3.0-rc.3` the image settings of every
-  file are merged over the package defaults, so a file may set only the keys it changes. The
+  `satisfies PartialFrameworkResizeConfig` instead. The image settings of every file are merged
+  over the package defaults, so a file may set only the keys it changes. The
   queue entry types are `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (main entry,
   re-exported by `…/framework.js`); `FrameworkQueueConfig`, `FrameworkDatabaseQueueConfig` and
   `FrameworkSqsQueueConfig` are removed.
@@ -247,10 +206,16 @@ export default {
    (`RESIZE_QUEUE_NOT_SERVED`, naming the package). With two backends, `resizer.tasks` is a
    `RoutingTaskQueue`: use `carrierOf(resizer.tasks, name)` instead of an `instanceof` check.
 6. **Old preview rows.**
-   - Rows written before `0.3.0-rc.1` (no `origin` or `encodeSig`) are stale: each is served until
-     its replacement is stored, and regenerated on its next read, `prewarm()` or `generate()`. The
-     old files stay in storage: plan the storage cost and clean them up (see "Freshness" in
-     `README.md`).
+   - Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are stale: each is served
+     until its replacement is stored, and regenerated on its next read, `prewarm()` or
+     `generate()`. The old files stay in storage, since the module never deletes them: plan the
+     storage cost and clean them up (from the "resize: replaced … outdated preview(s)" log line, or
+     with a sweep of preview objects no row references; see "Freshness" in `README.md`).
+   - The same holds after any change of image settings or of a pipeline `version`. That
+     regeneration wave shares the queue with new uploads' previews: plan worker capacity for it.
+   - Roll out image settings and pipeline versions to every worker at once (or after the old
+     workers have stopped): two worker versions with different settings re-make each other's rows,
+     and each replaced preview costs one render, one upload and one orphaned file.
    - Rows without an `identity` are never removed by `invalidate` or `replacePreviews`, and a sweep
      never finds their files; the host deletes those rows and files itself.
 
@@ -325,7 +290,10 @@ export default {
   `removed` being exactly what that write removed. `resizer.verify()` and worker start reject a
   store without it (`RESIZE_MEDIA_REPLACE_MISSING`), and a result other than two arrays is
   `RESIZE_MEDIA_REPLACE_RESULT_INVALID`. See the `MediaStore` contract in `README.md`.
-  `MongoMediaStore` and `FrameworkMediaStore` have it.
+  `MongoMediaStore` and `FrameworkMediaStore` have it. It must also save `backfillDims` in
+  `appendPreviews` whenever it is given, also with `previews: []`: the freshness check needs the
+  original's dimensions, and without them every read of such a media queues a task that downloads
+  the original.
 - To remove a media's stored previews (after a pipeline's output changed, or before deleting the
   media), call `await resizer.invalidate({ media, pipeline? })` and delete the storage refs it
   returns with your own storage client: it removes this Resizer's rows that carry an `identity`
@@ -333,8 +301,8 @@ export default {
   or queues. It takes no gate: a task running for that media can still store rows after it
   returns.
 - Preview rows now record `bytes`, `createdAt`, `origin` and `encodeSig`, and a pipeline may set
-  `version`, which is part of its rows' `encodeSig`. From `0.3.0-rc.4` a row whose signatures no
-  longer match the current settings is regenerated on its next read (statement 6).
+  `version`, which is part of its rows' `encodeSig`. A row whose signatures no longer match the
+  current settings is regenerated on its next read (statement 6).
 - The original is never served. Code that read `isOriginal`, or relied on
   `ctx.isOwner` / `ctx.isAdmin` to get the original from `resolve()`, must change:
   to give an owner the private original, call
@@ -343,7 +311,7 @@ export default {
   size, made by the worker.
 - SVG originals are rendered in a child process, never as markup in a pipeline
   step (`beforeSteps` receive the rendered pixels, see
-  [Changed in `0.3.0-rc.2`](#changed-in-030-rc2)): a host under Node's permission
+  [Pipeline steps and decoders](#pipeline-steps-and-decoders)): a host under Node's permission
   model needs `--allow-child-process`, and a bundle must keep `svgRasterChild.js`
   next to `svgRaster.js` (otherwise `RESIZE_SVG_RENDER_UNAVAILABLE`).
 - Without the framework, call `mongoParts(connection, { mediaModel })` once per process and
@@ -382,8 +350,23 @@ export default {
   remove such rows if that matters.
 - Register every pipeline in `src/resizer.ts`, and deploy the worker before the API
   requests a new or renamed pipeline: an unregistered pipeline is never rendered.
+- Every public object `S3Storage` uploads (previews and public raster originals, and your own
+  direct uploads) carries `Cache-Control: public, max-age=31536000, immutable`. Give your own
+  direct uploads new keys, and purge your CDN when you delete one that must disappear sooner
+  (browsers that already have it may keep it until it expires).
+- Metrics write log lines by default: each Resizer's default sink is a `LogMetrics` on its logger,
+  with one summary `info` line per Resizer per minute and one line per task outcome (a
+  `FrameworkResizer`'s default also writes one `debug` line per metric). Pass
+  `new FrameworkResizer({ metrics: new NoopMetrics() })` to turn them off,
+  `new LogMetrics(logger)` to keep the log lines without the debug ones, or your own
+  `ResizeMetrics` to send them elsewhere (see "Metrics" in `README.md`).
+- With `queues` on more than one available backend (a database entry and an SQS entry whose SDK
+  is installed), every `FrameworkResizer` that takes its task queue from the config file can queue
+  to every name, so a custom `runWorker({ resizers })` that consumes a queue on SQS must list all
+  of them, whatever their own queue (else `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`).
+  `npm run cli ResizeWorker` serves every Resizer and is not affected.
 
-## Changed in `0.3.0-rc.2`
+## Pipeline steps and decoders
 
 - `beforeSteps` receive and return a `Raster`, for every source kind:
   `(raster, { media, source, scale, ctx }) => Raster`. `raster` is the decoded
@@ -410,8 +393,8 @@ export default {
   `metadata()` reports the preview (`format: 'raw'`, no EXIF, ICC profile, density
   or orientation; `hasAlpha` as the sized pixels have it), a step's `resize()`
   resizes the preview, and operations Sharp used to apply before its resize (such
-  as `trim()`) now apply to the preview. Their raster form waits for a later
-  release.
+  as `trim()`) now apply to the preview. A raster form waits for a release that
+  puts the image engine behind a port.
 - With `animated: true`, an animation keeps its frames only for a pipeline with
   neither `beforeSteps` nor `variantSteps`; `beforeSteps` receive its first frame.
 - With `beforeSteps`, a worker holds the decoded source as raw pixels plus a step's
@@ -432,3 +415,52 @@ export default {
   `RESIZE_ORIGINAL_FORMAT_DISABLED`). See "Decoders" in `README.md`.
   `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means that no decoder reads the
   uploaded bytes.
+
+## Upgrading from a release candidate
+
+0.3.0 was published first as release candidates, under the npm tag `next`. A host on one of them
+needs only what came after its rc. 0.3.0 itself changed nothing a host sees after `0.3.0-rc.5`.
+
+`0.3.0-rc.1` held every host-facing shape of 0.3.0: the config, the option and type names, the
+import paths, the preview fields and `invalidate`.
+
+`0.3.0-rc.2` changed the `beforeSteps` signature and added decoders: a host on `0.3.0-rc.1`
+rewrites its `beforeSteps` (see [Pipeline steps and decoders](#pipeline-steps-and-decoders)).
+
+`0.3.0-rc.3` only added APIs a host may choose to use: `createResizer` (a Resizer from one config
+object, without the framework), drivers registered by name (the `drivers` option, `fromConfig`),
+`RoutingTaskQueue` and `carrierOf`, a worker that consumes several queues
+(`--queue=default --queue=bulk`), and partial config files (`PartialFrameworkResizeConfig`). It
+required no host change. Three things a host on `0.3.0-rc.2` may notice without changing anything:
+
+- when `queues` spans two available backends (a database entry and an SQS entry whose SDK is
+  installed), `resizer.tasks` is a `RoutingTaskQueue`, not the backend's own task queue (no
+  `release`; an `instanceof MongoTaskQueue` check fails: ask `carrierOf(resizer.tasks, name)`);
+- a call on a queue of another backend queues there, where `0.3.0-rc.2` reported
+  `RESIZE_QUEUE_NOT_SERVED`;
+- with those two backends, every `FrameworkResizer` that takes its task queue from the config
+  file can queue to every name, so a custom `runWorker({ resizers })` that consumes a queue on SQS
+  must list all of them, whatever their own queue (else `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`;
+  `0.3.0-rc.2` accepted `runWorker({ resizers: [b], queue: 'bulk' })` beside a Resizer `a` on the
+  database queue). `npm run cli ResizeWorker` serves every Resizer and is not affected.
+
+`0.3.0-rc.4` added metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics` and the `metrics`
+option; by default one summary `info` line per Resizer per minute and one per task outcome) and the
+freshness check. It required no host change, but one behaviour is visible: outdated previews (made
+from another original, with other image settings or pipeline `version`, or before `0.3.0-rc.1`)
+regenerate on their next read. So, for a host on an earlier rc:
+
+- plan worker capacity and storage for that wave, which shares the queue with new uploads;
+- clean up the old files, which the module never deletes (from the "resize: replaced …
+  outdated preview(s)" log line, or with a sweep of preview objects no row references);
+- roll out image settings and pipeline versions with every worker at once (or after the old
+  workers have stopped): two worker versions with different settings re-make each other's rows,
+  and each replaced preview costs one render, one upload and one orphaned file;
+- a custom `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`.
+
+`0.3.0-rc.5` removed and renamed nothing: it widened two types (the `NoopMetrics` parameters, and
+the timing keys of a custom queue driver's `queues` entry; see Fixes in `CHANGELOG.md`), and every
+public object `S3Storage` uploads (previews and public raster originals, and your own direct
+uploads, which must use new keys) carries `Cache-Control: public, max-age=31536000, immutable`, so
+purge your CDN when you delete one that must disappear sooner (browsers that already have it may
+keep it until it expires).

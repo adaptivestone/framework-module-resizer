@@ -144,20 +144,30 @@ test('a task in retry backoff blocks new tasks for its media, pipeline and queue
   });
   const stop = new AbortController();
   const failed: number[] = [];
+  let failedAt = 0;
   resizer.hook('onTaskFailed', (task) => {
     failed.push(task.attempts);
+    failedAt = Date.now();
     stop.abort();
   });
   await read();
   assert.equal(tasks.rows.length, 1);
+  const workStarted = Date.now();
   await work(resizer, stop);
   assert.deepEqual(failed, [1], 'the first delivery failed and will retry');
   // The task waits 60 s for its retry and keeps the gate meanwhile.
   await readsAtOnce(read, 10);
   assert.equal(tasks.rows.length, 1);
   assert.equal(tasks.rows[0].status, 'pending');
-  // In a real backoff: the retry is due about 60 s from now, not at once.
-  assert.ok(tasks.rows[0].availableAt - Date.now() > 59_000);
+  // In a real backoff: the retry is due 60 s after the failure, not at once. Bounded by clock
+  // readings taken before the worker started and after the failure, not by a margin a loaded
+  // machine can use up (seconds pass between the failure and these lines there).
+  const { availableAt } = tasks.rows[0];
+  assert.ok(availableAt >= workStarted + 60_000, 'not due before the backoff');
+  assert.ok(
+    availableAt <= failedAt + 60_000,
+    'due one backoff after the failure',
+  );
   assert.equal(tasks.added.length, 11, 'the 10 reads reached the queue');
 });
 
@@ -169,7 +179,31 @@ test('the SQS path holds the gate through the backoff and releases it on complet
       retryBackoffMs: { base: 500, max: 500 },
     },
   });
-  const locks = clockLocks();
+  const base = clockLocks();
+  // Every extend, with the clock reading when the Consumer called it and the TTL it asked for.
+  const extendCalls: { at: number; ttlMs: number }[] = [];
+  const locks = {
+    acquire: base.acquire,
+    release: base.release,
+    entry: base.entry,
+    extend: (lockKey: string, owner: string, ttlMs: number) => {
+      extendCalls.push({ at: Date.now(), ttlMs });
+      return base.extend(lockKey, owner, ttlMs);
+    },
+  };
+  // When the retry was recorded, and how many extends came before: the Consumer reads the clock
+  // for the hold after this, and its next extend is the hold.
+  let failedAt = 0;
+  let holdCall = -1;
+  const fail = tasks.fail;
+  tasks.fail = async (...args: Parameters<typeof fail>) => {
+    const done = await fail.apply(tasks, args);
+    if (!failedAt) {
+      failedAt = Date.now();
+      holdCall = extendCalls.length;
+    }
+    return done;
+  };
   let downloads = 0;
   const { resizer, read } = gated({
     tasks,
@@ -184,11 +218,18 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   });
   const stop = new AbortController();
   // Observers swallow their own errors, so they record what they see, and the test asserts after.
-  const atFailure: { left?: number; rows?: number } = {};
+  const atFailure: {
+    pastRetry?: number;
+    hold?: { at: number; ttlMs: number };
+    retryAt?: number;
+    rows?: number;
+  } = {};
   const atCompletion: { lock?: unknown; rows?: number } = {};
   resizer.hook('onTaskFailed', async () => {
     const lock = locks.entry(key);
-    atFailure.left = lock ? lock.expiresAt - Date.now() : undefined;
+    atFailure.retryAt = tasks.rows[0].availableAt;
+    atFailure.pastRetry = lock ? lock.expiresAt - atFailure.retryAt : undefined;
+    atFailure.hold = extendCalls[holdCall];
     await readsAtOnce(read, 10);
     atFailure.rows = tasks.rows.length;
   });
@@ -201,12 +242,28 @@ test('the SQS path holds the gate through the backoff and releases it on complet
   await read();
   assert.equal(tasks.rows.length, 1);
   await work(resizer, stop);
-  // After the retry was scheduled: held for the 500 ms backoff plus one 400 ms lease, so more
-  // than the 600 ms (a lease and a heartbeat) a running task holds it for.
-  const { left } = atFailure;
+  // After the retry was scheduled: held through the 500 ms backoff and one 400 ms lease after the
+  // retry is due (or after the hold was made, when a loaded machine made it once the retry was
+  // already due), so longer than the 600 ms (a lease and a heartbeat from its start) a running
+  // task holds it for, and far less than a gateTtlMs or cooldown hold. Read against the retry
+  // time in the row, not against the observer's clock, which a loaded machine reaches late.
+  const { pastRetry, hold, retryAt = 0 } = atFailure;
   assert.ok(
-    left !== undefined && left > 600 && left <= 900,
-    `held for ${left} ms`,
+    pastRetry !== undefined && pastRetry >= 400,
+    `held ${pastRetry} ms past the retry time`,
+  );
+  // One lease, exactly: the hold's end is its TTL from a clock reading the Consumer took after the
+  // retry was recorded (failedAt) and before it called extend (hold.at), so the end lies between
+  // those two readings plus the TTL, and must not pass one lease after the later of the retry time
+  // and the call.
+  assert.ok(hold, 'the retry hold extended the gate lock');
+  assert.ok(
+    hold.at + hold.ttlMs >= retryAt + 400,
+    `held until ${hold.at + hold.ttlMs - retryAt} ms or less past the retry time`,
+  );
+  assert.ok(
+    failedAt + hold.ttlMs <= Math.max(hold.at, retryAt) + 400,
+    `held until ${failedAt + hold.ttlMs - Math.max(hold.at, retryAt)} ms or more past the retry time or the call, not one 400 ms lease`,
   );
   assert.equal(atFailure.rows, 1, 'reads during the backoff queue nothing');
   // After the retry completed: released, so a read of a new size queues a second task.

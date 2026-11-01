@@ -2309,12 +2309,41 @@ describe('processTask — persistence & failure handling', () => {
     const { storage } = makeStorage(redPng);
     let active = 0;
     let maxActive = 0;
+    // The first step waits for a second one to start (2 s at most), instead of holding for 5 ms:
+    // on a loaded machine the second variant's decode could take longer than that, and the two
+    // steps would never overlap. Then both keep running until a third starts (which a pool of two
+    // never allows) or 500 ms pass, so a pool that allowed three would show it.
+    let bothRunning!: () => void;
+    const overlap = new Promise<void>((resolve) => {
+      bothRunning = resolve;
+    });
+    let threeRunning!: () => void;
+    const third = new Promise<void>((resolve) => {
+      threeRunning = resolve;
+    });
+    const waitFor = async (event: Promise<void>, ms: number) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        event,
+        new Promise((r) => {
+          timer = setTimeout(r, ms);
+        }),
+      ]);
+      clearTimeout(timer);
+    };
     const pipeline: Pipeline = {
       variantSteps: [
         async (img) => {
           active += 1;
           maxActive = Math.max(maxActive, active);
-          await new Promise((r) => setTimeout(r, 5));
+          if (active === 2) {
+            bothRunning();
+          }
+          if (active === 3) {
+            threeRunning();
+          }
+          await waitFor(overlap, 2000);
+          await waitFor(third, 500);
           active -= 1;
           return img;
         },

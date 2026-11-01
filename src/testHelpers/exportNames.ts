@@ -6,6 +6,10 @@
 // type names have no such check, so the parse has known limits: `export type * from` is read with
 // a single-quoted specifier only, and a starred file is read for its own `export interface|type`
 // declarations only, not for its `export type {…} from` lists or a nested `export type *`.
+// The markdown scan (docImports) runs in time linear in the fence length, and reads strings one
+// line at a time, as JavaScript does outside template literals: a template literal over several
+// lines counts as code after its first line. Comments are stripped before strings are read, so a
+// `//` inside a string (not right after `:`) cuts the rest of its line.
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -221,14 +225,32 @@ const REEXPORT_HEAD = /\s*(?:type(?![\w$])\s*)?[{*]/y;
 const IDENT_CHAR = /[\w$]/;
 const SPACE = /\s/;
 
-// The index of the character that ends the string opened by the quote at `open`: the same quote
-// when the string closes on its line, else the first other quote, line break or the text's end.
+// The index of the character that ends the string opened by the quote at `open`: the next quote
+// of the same kind on its line, else the line break or the text's end. A backslash takes the
+// character after it, so `'it\'s'` is one string, and the other quote is text (`"it's"`).
 const stringEnd = (code: string, open: number): number => {
+  const quote = code[open];
   let end = open + 1;
-  while (end < code.length && !`'"\n`.includes(code[end])) {
-    end += 1;
+  while (end < code.length && code[end] !== quote && code[end] !== '\n') {
+    end += code[end] === '\\' && code[end + 1] !== '\n' ? 2 : 1;
   }
-  return end;
+  return Math.min(end, code.length);
+};
+
+// 1 at every index inside a string ('…', "…" or `…`, ended as stringEnd ends it), in one forward
+// pass. A keyword there is text, not a statement (`'import { X } from "…"'`). Strings end at their
+// line, so an apostrophe in a non-code line hides at most the rest of that line; a template
+// literal is read on its first line only, and its later lines count as code.
+const stringMask = (code: string): Uint8Array => {
+  const mask = new Uint8Array(code.length);
+  for (let at = 0; at < code.length; at += 1) {
+    if (code[at] === "'" || code[at] === '"' || code[at] === '`') {
+      const end = stringEnd(code, at);
+      mask.fill(1, at + 1, end);
+      at = end;
+    }
+  }
+  return mask;
 };
 
 // Every `import … from '…'`, `import '…'` and `export {…}|* … from '…'` in a fence body whose
@@ -239,14 +261,19 @@ const stringEnd = (code: string, open: number): number => {
 // braces opens the specifier, and a clause that then does not end in `from` names no module this
 // way (a dynamic `import(…)`, `import.meta`). Another statement keyword met on the way outside
 // braces starts the statement again there, so a local `export` or an unfinished line never
-// swallows the import after it; inside braces it is a name (`{ import as I }`). What follows the specifier (`with { type: 'json' }`, `;`) is not read. One forward pass:
-// linear in the body's length.
+// swallows the import after it; inside braces it is a name (`{ import as I }`). A keyword inside
+// a string (see stringMask) starts nothing. What follows the specifier (`with { type: 'json' }`,
+// `;`) is not read. One forward pass: linear in the body's length.
 function moduleStatements(
   code: string,
 ): { clause: string | undefined; specifier: string; text: string }[] {
+  const inString = stringMask(code);
   const starts: { index: number; clauseStart: number; isImport: boolean }[] =
     [];
   for (const match of code.matchAll(STATEMENT_KEYWORD)) {
+    if (inString[match.index]) {
+      continue;
+    }
     const clauseStart = match.index + match[1].length;
     REEXPORT_HEAD.lastIndex = clauseStart;
     if (match[1] === 'import' || REEXPORT_HEAD.test(code)) {
@@ -322,6 +349,62 @@ function moduleStatements(
   return statements;
 }
 
+// The items of a clause's first `{…}`, split at the commas outside string names, and the clause
+// without that group; undefined when it has no `{` or the group never closes. One forward pass
+// (a pattern over the braces would retry every `{` of a clause that never closes): a string name
+// is skipped whole (see stringEnd), so a `,`, `{` or `}` in it splits nothing.
+const braceGroup = (
+  clause: string,
+): { items: string[]; rest: string } | undefined => {
+  const open = clause.indexOf('{');
+  if (open < 0) {
+    return undefined;
+  }
+  const items: string[] = [];
+  let itemStart = open + 1;
+  for (let at = open + 1; at < clause.length; at += 1) {
+    const char = clause[at];
+    if (char === "'" || char === '"') {
+      at = stringEnd(clause, at);
+    } else if (char === ',' || char === '}') {
+      items.push(clause.slice(itemStart, at));
+      itemStart = at + 1;
+      if (char === '}') {
+        return { items, rest: clause.slice(0, open) + clause.slice(at + 1) };
+      }
+    }
+  }
+  return undefined;
+};
+
+// The value of a string name's escapes, as JavaScript reads them: `\'` → `'`, `é` and
+// `\u{e9}` → `é`, `\n` → a line break, and any other escaped character → itself. A `\u{…}` past
+// the last code point (0x10FFFF), which JavaScript refuses, stays as written: no export has that
+// name, so the guard reports it.
+const unescapeName = (raw: string): string =>
+  raw.replace(
+    /\\(u\{[0-9A-Fa-f]+\}|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|[\s\S])/g,
+    (whole: string, escaped: string) => {
+      if (escaped.length > 1) {
+        const codePoint = Number.parseInt(
+          escaped.replace(/^[ux]\{?|\}$/g, ''),
+          16,
+        );
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : whole;
+      }
+      const named: Record<string, string> = {
+        n: '\n',
+        r: '\r',
+        t: '\t',
+        b: '\b',
+        f: '\f',
+        v: '\v',
+        '0': '\0',
+      };
+      return named[escaped] ?? escaped;
+    },
+  );
+
 function parseClause(
   clause: string,
 ): Pick<DocImport, 'typeOnly' | 'defaultName' | 'namespace' | 'named'> {
@@ -331,28 +414,29 @@ function parseClause(
     rest = rest.replace(/^type\s+/, '');
   }
   const named: DocImport['named'] = [];
-  // The first `{` and the first `}` after it, found with indexOf: a pattern over the braces would
-  // retry every `{` of a clause that never closes.
-  const open = rest.indexOf('{');
-  const close = open < 0 ? -1 : rest.indexOf('}', open + 1);
-  if (close >= 0) {
-    for (const item of rest.slice(open + 1, close).split(',')) {
+  const group = braceGroup(rest);
+  if (group) {
+    for (const item of group.items) {
       const spec = item.trim();
       if (spec.length === 0) {
         continue;
       }
-      // A name, or a string import name: `"a-b" as x`.
+      // A name, or a string import name with its escapes: `"a-b" as x`, `'it\'s' as x`.
       const m =
-        /^(type\s+)?(?:([A-Za-z_$][\w$]*)|"([^"]*)"|'([^']*)')(?:\s+as\s+[A-Za-z_$][\w$]*)?$/.exec(
+        /^(type\s+)?(?:([A-Za-z_$][\w$]*)|"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')(?:\s+as\s+[A-Za-z_$][\w$]*)?$/.exec(
           spec,
         );
+      const quoted = m?.[3] ?? m?.[4];
       named.push(
         m
-          ? { name: m[2] ?? m[3] ?? m[4], type: !!m[1] }
+          ? {
+              name: quoted === undefined ? m[2] : unescapeName(quoted),
+              type: !!m[1],
+            }
           : { name: spec, type: false },
       );
     }
-    rest = rest.slice(0, open) + rest.slice(close + 1);
+    rest = group.rest;
   }
   const result: ReturnType<typeof parseClause> = { typeOnly, named };
   for (const part of rest.split(',')) {
@@ -372,11 +456,14 @@ function parseClause(
  * single or double quotes; default, named, namespace and side-effect imports and their combinations;
  * `import type` and inline `type` specifiers; `{ default as X }` (named `default`); statements
  * over several lines, with comments, several on one line, or with no space after the keyword
- * (`import{ X }from '…'`), and string import names (`{ "X" as Y }`). Re-exports (`export { X } from '…'`, `export type { X } from '…'`,
- * `export * from '…'`, `export * as ns from '…'`) are read as imports of the same names. Comments
- * are stripped first, so a commented-out import is not read. Imports of other packages, dynamic
- * `import('…')` (its subpath is checked with the other specifiers) and imports outside fences are
- * ignored; an unclosed fence is read too (`fenceProblems` reports it).
+ * (`import{ X }from '…'`), and string import names (`{ "X" as Y }`, holding quotes, `,`, braces
+ * or escapes too: `{ 'it\'s, }' as Y }`). Re-exports (`export { X } from '…'`, `export type { X }
+ * from '…'`, `export * from '…'`, `export * as ns from '…'`) are read as imports of the same names.
+ * Comments are stripped first, so a commented-out import is not read, and the word `import` inside
+ * a string on its line starts nothing (a template literal over several lines is read on its first
+ * line only). Imports of other packages, dynamic `import('…')` (its subpath is checked with the
+ * other specifiers) and imports outside fences are ignored; an unclosed fence is read too
+ * (`fenceProblems` reports it).
  */
 export function docImports(markdown: string): DocImport[] {
   const imports: DocImport[] = [];

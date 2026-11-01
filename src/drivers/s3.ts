@@ -169,8 +169,10 @@ export class S3Storage extends ResizeStorage {
   // Every public object this driver uploads (previews, public raster originals, and a host's
   // own direct uploads) is cacheable for a year and immutable: every key the module writes is
   // new and random, so an object never changes under its URL. A host that calls `upload`
-  // directly must give each object a new key, as the contract says; a host that deletes a
-  // public object purges its CDN, which may keep serving the URL until then.
+  // directly must give each object a new key, as the contract says. A host that deletes a public
+  // object that must disappear sooner purges its CDN, which may keep serving the URL for up to a
+  // year; the purge does not reach copies that browsers already hold, which they may keep until
+  // they expire.
   async upload({
     key,
     body,
