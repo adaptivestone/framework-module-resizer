@@ -5,7 +5,7 @@
 // logger that throws.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { backoffMs, Consumer } from './consumer.ts';
+import { backoffMs, Consumer, untilDeadline } from './consumer.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type {
   ClaimedTask,
@@ -2086,6 +2086,34 @@ describe('a late answer never undoes the end of a task', () => {
       } finally {
         clearInterval(ticking);
       }
+    });
+  }
+
+  // The deadline is on Date.now(), which is not monotonic: a wall clock that stops or steps back
+  // (an NTP correction, a VM resume) while a gate call waits must not stretch the wait by the step.
+  for (const clock of [
+    'a frozen wall clock',
+    'a wall clock stepped back 60 s',
+  ]) {
+    test(`a gate wait ends about its budget after it started, on ${clock}`, {
+      timeout: 15_000,
+    }, async (t) => {
+      t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+      const started = performance.now();
+      const { late, cancel } = untilDeadline(Date.now() + 200);
+      if (clock !== 'a frozen wall clock') {
+        t.mock.timers.setTime(Date.now() - 60_000);
+      }
+      try {
+        await late;
+      } finally {
+        cancel();
+      }
+      const waited = performance.now() - started;
+      // The 200 ms budget plus at most the one second of clock lag a wait allows; the bound is
+      // loose for a loaded machine and still far below the 60 s step.
+      assert.ok(waited >= 190, `waited ${waited} ms`);
+      assert.ok(waited < 10_000, `waited ${waited} ms`);
     });
   }
 

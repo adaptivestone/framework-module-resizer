@@ -137,23 +137,38 @@ const MAX_GATE_WAIT_MS = 30_000;
 // A gate call that has not answered in time.
 const TIMED_OUT = Symbol('timed out');
 
+// How much longer than its budget a gate wait may last on the monotonic clock: the ~1 ms lag
+// between the timer clock and Date.now() is re-armed away, and a wall clock that stepped back (an
+// NTP correction, a VM resume) costs at most this much more, not the size of the step.
+const MAX_CLOCK_LAG_MS = 1_000;
+
 /**
- * Resolves with TIMED_OUT once Date.now() has reached `deadline` (after one timer turn at least,
- * so an answer already there wins); `cancel` stops it. Deadlines are taken on Date.now() and
- * timers run on another clock, so a timer may fire a little before Date.now() gets there: it is
- * then armed again for what is left, and a wait never leaves a sliver of its deadline to the next.
+ * Resolves with TIMED_OUT once Date.now() has reached `deadline`, or once the budget the call
+ * started with (`deadline` minus Date.now() then) plus MAX_CLOCK_LAG_MS has passed on the
+ * monotonic clock, whichever comes first (after one timer turn at least, so an answer already
+ * there wins); `cancel` stops it. Deadlines are taken on Date.now() and timers run on another
+ * clock, so a timer may fire a little before Date.now() gets there: it is then armed again for
+ * what is left, and a wait never leaves a sliver of its deadline to the next. A wall clock that
+ * stops or steps back during the wait ends it by the monotonic bound instead.
  * `unref`: the timer does not keep the process alive.
  */
-function untilDeadline(
+export function untilDeadline(
   deadline: number,
   unref = false,
 ): { late: Promise<typeof TIMED_OUT>; cancel: () => void } {
+  const budget = Math.max(0, deadline - Date.now());
+  const start = performance.now();
+  const monotonicLeft = () =>
+    budget + MAX_CLOCK_LAG_MS - (performance.now() - start);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<typeof TIMED_OUT>((resolve) => {
     const arm = () => {
       timer = setTimeout(
-        () => (Date.now() >= deadline ? resolve(TIMED_OUT) : arm()),
-        Math.max(0, deadline - Date.now()),
+        () =>
+          Date.now() >= deadline || monotonicLeft() <= 0
+            ? resolve(TIMED_OUT)
+            : arm(),
+        Math.max(1, Math.min(deadline - Date.now(), monotonicLeft())),
       );
       if (unref) {
         timer.unref?.();
