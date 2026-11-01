@@ -1346,7 +1346,7 @@ A stale row is served while its replacement is made; the replacement takes its p
   signatures, changing only the larger one changes nothing;
 - a change of the pipeline's `version`;
 - another `original.storageRef`, or other stored dimensions of the original;
-- a row without signatures (written before 0.3.0).
+- a row without signatures (`origin` and `encodeSig`; written by 0.2.x or earlier).
 
 New bytes under the same `original.storageRef` and at the same size are not detected: after
 replacing an original in place, call `invalidate()` for that media.
@@ -1513,10 +1513,10 @@ await ResizeTask.updateOne(
   `limits.animationFrames` and the pixel budget `min(limits.sourcePixels, limits.inputPixels)`,
   which also caps the frames at the larger of the source's and the preview's size), the
   result-dimension cap, the fit box (for fit rows) and the
-  pipeline `version`). The worker and `generate()` record them on every row from 0.3.0 on,
-  and `resizeMediaSchemaFragment` declares them. The read path, `prewarm()`, `generate()` and the
+  pipeline `version`). The worker and `generate()` record them on every row they write, and
+  `resizeMediaSchemaFragment` declares them. The read path, `prewarm()`, `generate()` and the
   worker compare them with what the current settings would record (see [Freshness](#freshness)).
-  Rows written earlier have no `origin` or `encodeSig`, so they are stale: each is served until
+  Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are stale: each is served until
   its replacement is stored, regenerated on its next read, and its old file stays in storage
   (plan the storage cost and the cleanup). Rows without an `identity` (written before 0.3.0) are
   never removed by `invalidate` or `replacePreviews`: delete their files yourself.
