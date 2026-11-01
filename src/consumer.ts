@@ -137,6 +137,33 @@ const MAX_GATE_WAIT_MS = 30_000;
 // A gate call that has not answered in time.
 const TIMED_OUT = Symbol('timed out');
 
+/**
+ * Resolves with TIMED_OUT once Date.now() has reached `deadline` (after one timer turn at least,
+ * so an answer already there wins); `cancel` stops it. Deadlines are taken on Date.now() and
+ * timers run on another clock, so a timer may fire a little before Date.now() gets there: it is
+ * then armed again for what is left, and a wait never leaves a sliver of its deadline to the next.
+ * `unref`: the timer does not keep the process alive.
+ */
+function untilDeadline(
+  deadline: number,
+  unref = false,
+): { late: Promise<typeof TIMED_OUT>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<typeof TIMED_OUT>((resolve) => {
+    const arm = () => {
+      timer = setTimeout(
+        () => (Date.now() >= deadline ? resolve(TIMED_OUT) : arm()),
+        Math.max(0, deadline - Date.now()),
+      );
+      if (unref) {
+        timer.unref?.();
+      }
+    };
+    arm();
+  });
+  return { late, cancel: () => clearTimeout(timer) };
+}
+
 // The gate calls of one task run (see GateLock): once the final gate action has started, the
 // action (`final`) and how to make it again (`again`), for a running call that answers later;
 // `leaseLost` once a renewal reported the lease lost, after which nothing is made again.
@@ -719,13 +746,7 @@ export class Consumer {
     // The wait this call gets: what is left of its deadline (none once a task's end has used up
     // its one gate bound).
     const waitMs = Math.max(0, deadline - Date.now());
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(() => resolve(TIMED_OUT), waitMs);
-      if (detached) {
-        timer.unref?.();
-      }
-    });
+    const { late, cancel } = untilDeadline(deadline, detached);
     try {
       const result = await Promise.race([answer, late]);
       if (result === TIMED_OUT) {
@@ -739,7 +760,7 @@ export class Consumer {
       }
       return result;
     } finally {
-      clearTimeout(timer);
+      cancel();
     }
   }
 
@@ -748,17 +769,11 @@ export class Consumer {
    * Resolves true when they settled in time.
    */
   async #within(calls: Promise<void>, deadline: number): Promise<boolean> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(
-        () => resolve(TIMED_OUT),
-        Math.max(0, deadline - Date.now()),
-      );
-    });
+    const { late, cancel } = untilDeadline(deadline);
     try {
       return (await Promise.race([calls, late])) !== TIMED_OUT;
     } finally {
-      clearTimeout(timer);
+      cancel();
     }
   }
 
