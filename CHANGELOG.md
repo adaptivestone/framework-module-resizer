@@ -1,27 +1,27 @@
 # 0.3.0
 
-**Prereleases.** 0.3.0 ships as release candidates first, published with the npm tag `next`
-(`npm i @adaptivestone/framework-module-resize@next`); `latest` stays on the last stable release.
+**Upgrading from a release candidate.** 0.3.0 was published first as release candidates, under
+the npm tag `next`. A host on 0.2.x reads the sections below; a host on a release candidate needs
+only what came after its rc:
 
-- `0.3.0-rc.1`: the host-facing shapes of this release: the config (`queues`, `queue` as a name,
-  the process-wide `worker` and `coordination`), the option and type names, the import paths, the
-  preview fields and `invalidate`. Integrate against these.
-- `0.3.0-rc.2`: the `beforeSteps` signature (a `Raster` in and a `Raster` out, with the helpers
-  `rasterToSharp` and `sharpToRaster`), decoders (`SourceDecoder` and the `decoders` option) and
-  their error codes (below).
-- `0.3.0-rc.3`: new APIs a host may use, no required host change: `createResizer`, `fromConfig`
-  and drivers by name, routing between backends, `carrierOf`, one worker for several queues,
-  partial config files (see Changed behaviour for what a host may notice).
-- `0.3.0-rc.4`: metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics`, the `metrics` option) and
-  the freshness check, which regenerates outdated previews (see Changed behaviour for the storage
-  cost).
-- `0.3.0-rc.5`: long-lived cache headers on S3 public objects, and hygiene (test types, doc
-  guards); no host change.
-- Later release candidates: internal changes that need no host change.
+- `0.3.0-rc.1` set the host-facing shapes of this release: the config (`queues`, `queue` as a
+  name, the process-wide `worker` and `coordination`), the option and type names, the import
+  paths, the preview fields and `invalidate`.
+- `0.3.0-rc.2` changed the `beforeSteps` signature (a `Raster` in and a `Raster` out, with the
+  helpers `rasterToSharp` and `sharpToRaster`) and added decoders (`SourceDecoder` and the
+  `decoders` option) and their error codes (below).
+- `0.3.0-rc.3` added APIs a host may use, with no required host change: `createResizer`,
+  `fromConfig` and drivers by name, routing between backends, `carrierOf`, one worker for several
+  queues, partial config files (see Changed behaviour for what a host may notice).
+- `0.3.0-rc.4` added metrics (`ResizeMetrics`, `LogMetrics`, `NoopMetrics`, the `metrics` option)
+  and the freshness check, which regenerates outdated previews (see Changed behaviour for the
+  storage cost).
+- `0.3.0-rc.5` added long-lived cache headers on S3 public objects; no host change.
+- 0.3.0 changes nothing a host sees after `0.3.0-rc.5`.
 
-`variantSteps` keep their Sharp instance in `0.3.0-rc.2`, now over each size's pixels (operations
-Sharp used to apply before its resize now apply to the preview). Their raster form waits for a
-later release that puts the image engine behind a port.
+`variantSteps` keep a Sharp instance in 0.3.0, now over each size's pixels (operations Sharp used
+to apply before its resize now apply to the preview); a raster form waits for a release that puts
+the image engine behind a port.
 
 **Breaking changes**
 

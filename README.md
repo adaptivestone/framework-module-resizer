@@ -277,8 +277,8 @@ Resizer of the process that uses that queue: otherwise the worker would claim th
 running them, so it rejects with `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`. With `queues` on more
 than one available backend, every `FrameworkResizer` that takes its task queue from the config file shares
 one router that reaches every name, so a list for a worker that consumes a queue on SQS must name
-all of them, whatever their own queue (`0.3.0-rc.2` did not ask this; `npm run cli ResizeWorker`
-serves every Resizer). For a Resizer it does not
+all of them, whatever their own queue (`npm run cli ResizeWorker` serves every Resizer). For a
+Resizer it does not
 serve it loads only the task queue and, when a consumed backend cannot filter claims, that
 Resizer's backend of the consumed name (built now), and it rejects the same way when either cannot
 be loaded, since it may be a shared one. Resizers built only in other processes cannot be checked:
@@ -998,8 +998,7 @@ and the worker use. They are read only from that file: in another file, or in th
   names the entry. Every entry is validated with the file, on first use. A driver name that the
   Resizer does not have (neither `'database'`, `'sqs'` nor a name in its `drivers`) passes the file
   read and is `RESIZE_CONFIG_INVALID` when the Resizer first reads `queues` (its first use or
-  `verify()`); a disabled worker only logs that it is disabled. With several broken entries, the
-  first error reported may differ from `0.3.0-rc.2`. An entry set to
+  `verify()`); a disabled worker only logs that it is disabled. An entry set to
   `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
   Resizer that still names it gets `RESIZE_CONFIG_QUEUE_UNKNOWN`).
 - `worker`: `{ enabled, sharpConcurrency, sharpCache }` for the `ResizeWorker` command
@@ -1347,7 +1346,7 @@ A stale row is served while its replacement is made; the replacement takes its p
   signatures, changing only the larger one changes nothing;
 - a change of the pipeline's `version`;
 - another `original.storageRef`, or other stored dimensions of the original;
-- a row without signatures (written before `0.3.0-rc.1`).
+- a row without signatures (written before 0.3.0).
 
 New bytes under the same `original.storageRef` and at the same size are not detected: after
 replacing an original in place, call `invalidate()` for that media.
@@ -1514,7 +1513,7 @@ await ResizeTask.updateOne(
   `limits.animationFrames` and the pixel budget `min(limits.sourcePixels, limits.inputPixels)`,
   which also caps the frames at the larger of the source's and the preview's size), the
   result-dimension cap, the fit box (for fit rows) and the
-  pipeline `version`). The worker and `generate()` record them on every row from `0.3.0-rc.1` on,
+  pipeline `version`). The worker and `generate()` record them on every row from 0.3.0 on,
   and `resizeMediaSchemaFragment` declares them. The read path, `prewarm()`, `generate()` and the
   worker compare them with what the current settings would record (see [Freshness](#freshness)).
   Rows written earlier have no `origin` or `encodeSig`, so they are stale: each is served until
