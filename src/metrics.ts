@@ -143,7 +143,13 @@ function taskLine(
   labels: MetricLabels | undefined,
   context: MetricContext | undefined,
 ): string {
-  return `resize: task ${show(context?.taskId)} of media ${show(context?.mediaId)} ${show(labels?.outcome)} in ${Math.round(ms)} ms (Resizer '${show(labels?.resizer)}', queue '${show(labels?.queue)}', pipeline '${show(labels?.pipeline)}', attempt ${show(context?.attempts)}, variants ${show(context?.variants)}${codePart(labels, context)})`;
+  // Only a completed task carries `rendered`; one that rendered all it names keeps the short form.
+  const rendered = context?.rendered;
+  const variants =
+    typeof rendered === 'number' && rendered !== context?.variants
+      ? `${rendered} of ${show(context?.variants)}`
+      : show(context?.variants);
+  return `resize: task ${show(context?.taskId)} of media ${show(context?.mediaId)} ${show(labels?.outcome)} in ${Math.round(ms)} ms (Resizer '${show(labels?.resizer)}', queue '${show(labels?.queue)}', pipeline '${show(labels?.pipeline)}', attempt ${show(context?.attempts)}, variants ${variants}${codePart(labels, context)})`;
 }
 
 function failedVariantLine(
@@ -195,7 +201,7 @@ export class LogMetrics extends ResizeMetrics {
     labels?: MetricLabels,
     context?: MetricContext,
   ): void {
-    this.#debugLine(name, value, labels, context);
+    this.#debugLine(name, String(value), labels, context);
     switch (name) {
       case 'resize.read': {
         const tally = this.#tally(labels);
@@ -221,7 +227,7 @@ export class LogMetrics extends ResizeMetrics {
     labels?: MetricLabels,
     context?: MetricContext,
   ): void {
-    this.#debugLine(name, ms, labels, context);
+    this.#debugLine(name, `${Math.round(ms)} ms`, labels, context);
     switch (name) {
       case 'resize.task':
         this.#write(taskLine(ms, labels, context));
@@ -293,7 +299,7 @@ export class LogMetrics extends ResizeMetrics {
 
   #debugLine(
     name: string,
-    value: number,
+    value: string,
     labels: MetricLabels | undefined,
     context: MetricContext | undefined,
   ): void {

@@ -48,10 +48,28 @@ describe('ResizeWorker CLI contract', () => {
     test(`reads worker settings from src/config/resize.ts (args ${JSON.stringify(args)})`, async () => {
       const asked = installApp();
       const command = new ResizeWorker(undefined, undefined, args);
-      assert.equal(await command.run(), true);
+      // worker.enabled is false in these settings: this process consumes nothing.
+      assert.equal(await command.run(), false);
       assert.deepEqual(asked, ['resize']);
     });
   }
+
+  test('run() resolves false for eager-only wiring', async () => {
+    setAppInstance({
+      getConfig: () => makeResizeConfig({ worker: { enabled: true } }),
+      getModel: () => ({}),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    new FrameworkResizer({
+      storage: {
+        download: async () => Buffer.alloc(0),
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia(),
+    });
+    assert.equal(await new ResizeWorker(undefined, undefined, {}).run(), false);
+  });
 
   test('--queue may be repeated; one --queue passes a single name', {
     timeout: 10_000,

@@ -470,7 +470,9 @@ export class Dispatcher {
    *   never reports): the queue may still have stored the task (a lost response), so the lock is
    *   shortened to one lease of the request's queue, not released, and never kept longer than an
    *   added task's (min(leaseMs, gateTtlMs)). A stored task is claimed and its lock extended within
-   *   that time; otherwise the lock lapses and a later read queues the task.
+   *   that time; otherwise the lock lapses and a later read queues the task, unless the add was
+   *   `unconfirmed` with `retryable: false`: calling again cannot help until someone fixes what
+   *   `causeCode` names.
    * An `in-flight` outcome carries the carrier, which prewarm asks for the active task. Never
    * rejects.
    */

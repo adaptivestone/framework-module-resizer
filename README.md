@@ -292,8 +292,9 @@ renewal that then answers `false` means the lease was lost, so there is no compl
 event, and the task is left to its next delivery. A renewal that does not answer in that time is
 logged, and the task ends without it (its gate calls are then sent without waiting).
 `logger` receives the worker loop's own messages, failed gate lock calls included; a logger that
-throws never stops the loop. Framework hosts run `npm run cli ResizeWorker`, which serves the
-Resizers that `src/resizer.ts` constructs.
+throws never stops the loop. `runWorker` resolves `true` after a run, and `false` when no Resizer has
+a task queue, so the process consumes nothing (an `error` line says so). Framework hosts run
+`npm run cli ResizeWorker`, which serves the Resizers that `src/resizer.ts` constructs.
 
 ## Package exports
 
@@ -733,8 +734,9 @@ reads that section (on first use or in `verify()`; the `storage` of a config obj
 at construction): an unregistered name is `RESIZE_CONFIG_INVALID`
 listing the registered ones (`` `storage` in <config> needs driver 'local', 's3' or 'gcs' ``). A
 framework config file accepts any non-empty driver name when it is read, so a disabled worker
-(`worker.enabled: false`) only logs that it is disabled. A queue build that fails reaches
-`prewarm()` as an issue (see [`prewarm()` issues](#prewarm-issues)): the error's own code when it
+(`worker.enabled: false`) never checks one: it logs a `warn`, and the command resolves `false`, so
+a CLI entry that forwards the result, as the framework docs require, exits 1. A queue build that
+fails reaches `prewarm()` as an issue (see [`prewarm()` issues](#prewarm-issues)): the error's own code when it
 is an issue code, else `RESIZE_ENQUEUE_QUEUE_FAILED` with the error's code in `causeCode`, and
 always the error's own `retryable`.
 
@@ -844,8 +846,8 @@ of its formats (JPEG bytes stored as `png`) is logged too, and rendered as what 
 resize worker: media <id> is stored as 'jpg' but its bytes are 'jpeg' (no decoder lists the stored format); rendering it as 'jpeg'
 ```
 
-(`its decoder refused the bytes` for the second case, `its decoder read another of its formats`
-for the third; when a host decoder lists the stored format,
+(`resize generate:` when `generate()` writes it; `its decoder refused the bytes` for the second
+case, `its decoder read another of its formats` for the third; when a host decoder lists the stored format,
 refuses the bytes and a later decoder reads them as that same format, the warning says
 `… is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder
 read them`). So `original.format` should be the
@@ -1031,8 +1033,9 @@ and the worker use. They are read only from that file: in another file, or in th
   names the entry. Every entry is validated with the file, on first use. A driver name that the
   Resizer does not have (neither `'database'`, `'sqs'` nor a name in its `drivers`) passes the file
   read and is `RESIZE_CONFIG_INVALID` when the Resizer first reads `queues` (its first use or
-  `verify()`); a disabled worker only logs that it is disabled. An entry set to
-  `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
+  `verify()`); a disabled worker never checks it: it logs a `warn`, and the command resolves
+  `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1. An entry
+  set to `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
   Resizer that still names it gets `RESIZE_CONFIG_QUEUE_UNKNOWN`).
 - `worker`: `{ enabled, sharpConcurrency, sharpCache }` for the `ResizeWorker` command
   (`defaultWorkerOptions` from `…/framework.js`: `false`, `1`, `false`). Every key is optional and a
@@ -1189,7 +1192,9 @@ may then be rendered on both; the media store keeps one row per preview identity
   and the owner travels in the task as `gateOwner`. When the queue does not confirm that it stored
   the task (`unconfirmed`, a throw), the task may still be stored, so an ambiguous enqueue keeps the
   gate for one lease (`leaseMs`, at most `gateTtlMs`) instead of releasing it: a stored task is
-  claimed and extended within it, otherwise it lapses and a later read queues the task. The worker extends the lock: to
+  claimed and extended within it, otherwise it lapses and a later read queues the task, unless the
+  add was `unconfirmed` with `retryable: false`: calling again cannot help until someone fixes what
+  `causeCode` names. The worker extends the lock: to
   one lease plus one heartbeat interval (`leaseMs / 2`) when the task starts and on every
   heartbeat, so a redelivery after a worker crash still finds it held; to the retry time plus one
   lease after a failed attempt; to `cooldownMs` after a dead-letter; and to `gateTtlMs` when it
@@ -1254,8 +1259,8 @@ and it catches what they throw or reject.
 `new FrameworkResizer({ metrics })` take the sink; `resizer.metrics` returns it as given. Left out
 (only `undefined` means the default), `new Resizer` and `createResizer` use
 `new LogMetrics(logger)` on the Resizer's logger, and `FrameworkResizer` uses
-`new LogMetrics(logger, { debug: true })` on its `logger` option, else the app logger, so that
-logger decides whether the debug lines are kept. `new NoopMetrics()` turns metrics off. The sink is checked by shape at construction,
+`new LogMetrics(logger)` too, on its `logger` option, else the app logger. `new NoopMetrics()` turns
+metrics off. The sink is checked by shape at construction,
 before the Resizer's name is taken: `metrics: null`, or an object without `count()` and `timing()`
 functions, is `ResizeSetupError` `RESIZE_METRICS_INVALID` (`retryable: false`).
 
@@ -1279,7 +1284,7 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 | `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
 | `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode), `rawFormat` (`format: 'unconfigured'`) |
 | `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
-| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `payloadQueue` (when the task names another queue) |
+| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `rendered` (on `completed`: the variants this delivery stored), `payloadQueue` (when the task names another queue) |
 | `resize.claim` | timing | ms the worker's loop waited for this task | `queue` | `taskId` |
 
 - **`resize.read` outcomes**, in the order a read decides them: `unknown-pipeline` (the pipeline is
@@ -1326,23 +1331,25 @@ that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
 - **Written at once**, one `info` line each, because they are rare and worth reading alone:
 
   ```text
-  resize: task <taskId> of media <mediaId> <completed|failed|dead> in <ms> ms (Resizer '<r>', queue '<q>', pipeline '<p>', attempt <n>, variants <n>[, code <code>])
+  resize: task <taskId> of media <mediaId> <completed|failed|dead> in <ms> ms (Resizer '<r>', queue '<q>', pipeline '<p>', attempt <n>, variants <n>[ of <m>][, code <code>])
   resize: variant <identity> of media <mediaId> failed in <ms> ms (Resizer '<r>', pipeline '<p>', format '<f>'[, code <code>])
   ```
 
-  A missing value prints as `?`; a code reduced to `'other'` prints the raw code.
+  A missing value prints as `?`; a code reduced to `'other'` prints the raw code. `variants 5 of 9`
+  is a completed task that stored 5 of the 9 variants it names; the others were fresh already, or
+  its media is gone.
 - **The window** opens with the first summed event and closes when it is written, after
   `summaryIntervalMs`. Its timer is `unref`ed, so it never keeps a process alive, and no timer runs
   between windows. `flush()` writes the open window now. The worker flushes the sink of every
   Resizer it serves when it stops (once per distinct sink), waiting at most 5 s for each; that wait
-  keeps the process alive until the flush settles or the 5 s end. An API process should call
-  `await resizer.metrics.flush?.()` at shutdown, or the open window's counts are lost.
-- **`debug: true`** also writes every call as one `debug` line, `resize metric <name> <value>
-  <labels JSON> <context JSON>`, when the logger has a `debug` method (`ResizeLogger.debug` is
-  optional). It costs two `JSON.stringify` calls per event. The default sink of a
-  `FrameworkResizer` writes to its `logger` option, else the app logger, which always has `debug`,
-  so it pays that cost even when the app drops debug lines: pass `metrics: new LogMetrics(logger)`
-  to skip it.
+  keeps the process alive until the flush settles or the 5 s end. Framework hosts need no code: the
+  open window is written on the framework's `shutdown` event. Elsewhere, call
+  `await resizer.metrics.flush?.()` in your own SIGTERM handler. A sink with an asynchronous `flush`
+  must keep its own handle open until it finishes, because the event does not wait for it.
+- **`debug: true`** (off by default for every Resizer) also writes every call as one `debug` line,
+  `resize metric <name> <value> <labels JSON> <context JSON>`, when the logger has a `debug` method
+  (`ResizeLogger.debug` is optional). `<value>` is the count, or a rounded `<n> ms`. It costs two
+  `JSON.stringify` calls per event.
 
 **`NoopMetrics`** records nothing.
 
@@ -1460,6 +1467,12 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
 
 ## Operations
 
+- **Starting a worker:** once its checks pass, before it claims anything, the worker logs one `info`
+  line naming what it serves: `resize worker started: queues 'default', 'bulk'; Resizers 'default',
+  'listings'`. A worker that consumes nothing writes no start line. Disabled
+  (`worker.enabled: false`), it logs a `warn`; with no task queue on any Resizer, the `error` line
+  `resize worker: no Resizer has a task queue (eager-only wiring)`. In both cases the command
+  resolves `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1.
 - **Task states (Mongo):** `pending → processing → completed`. A row's `active` is `true` from
   `add()` until the task completes: the row is the gate of its Resizer, media, pipeline and queue (see
   [Coordination](#coordination)). Rows written before the gate have no `active` and never block a
@@ -1608,9 +1621,11 @@ await ResizeTask.updateOne(
   (`maxAttempts` used up), `not retryable` (the error has `retryable: false`) or
   `delivered more often than maxAttempts` (its workers kept crashing mid-task). The code is `none`
   for an error without one. The cause fits one line of at most 1000 characters, with ` | ` for a
-  line break, and the task row holds the same text. The module's line is always one line; the
-  stack of an unexpected error (on a dead line, any error that is not a `ResizeError`) follows it as
-  your logger prints it, so do not treat later lines as the module's own. A worker that no longer
+  line break, and the task row holds the same text. A thrown value cannot break the module's line:
+  its cause and code stay on one line, though on SQS the `mediaId` comes from the message body and
+  prints as sent. The stack of an unexpected error (on a dead line, any error that is not a
+  `ResizeError`) follows the line as your logger prints it, so do not treat later lines as the
+  module's own. A worker that no longer
   holds its task (a lost lease) writes a `warn` and never a dead line.
 - **Damaged originals:** a source the engine refuses is dead-lettered on its first delivery with
   `RESIZE_SOURCE_DAMAGED`. Its pixels are decoded at `limits.failOn`, and that message names the

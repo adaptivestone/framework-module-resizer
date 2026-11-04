@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { afterEach, mock, test } from 'node:test';
+import { EventEmitter } from 'node:events';
+import { afterEach, describe, mock, test } from 'node:test';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import {
   resetAppInstance,
@@ -8,6 +10,7 @@ import {
 } from '@adaptivestone/framework/helpers/appInstance.js';
 import sharp from 'sharp';
 import defaultResizeConfig from '../config/resize.ts';
+import type { ResizeMetrics } from '../contracts/metrics.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { LeasedTask } from '../contracts/taskQueue.ts';
 import { LocalFsStorage } from '../drivers/fs.ts';
@@ -34,6 +37,7 @@ import {
 import { makeResizeConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
 import type { Preview, QueueConfig } from '../types.d.ts';
+import { flushAtShutdown } from './app.ts';
 import { FrameworkLockStore } from './locks.ts';
 import { FrameworkMediaStore } from './media.ts';
 import { FrameworkResizer } from './resizer.ts';
@@ -130,7 +134,7 @@ test('fills config, logger, events and the media store from the app; an eager-on
   assert.deepEqual(emitted, [['resize:afterTaskComplete', done, {}]]);
 });
 
-test('the default metrics of a FrameworkResizer write debug lines through the app logger', () => {
+test('the default sink of a FrameworkResizer writes no debug lines', () => {
   const { logger } = installApp();
   const debug: unknown[] = [];
   logger.debug = (msg: unknown) => {
@@ -139,12 +143,211 @@ test('the default metrics of a FrameworkResizer write debug lines through the ap
   const r = new FrameworkResizer({ storage });
   assert.ok(r.metrics instanceof LogMetrics);
   r.metrics.count('x', 1);
+  assert.deepEqual(debug, []);
+  // Asked for, they go through the app logger.
+  resetResizerForTests();
+  const verbose = new FrameworkResizer({
+    storage,
+    metrics: new LogMetrics(r.logger, { debug: true }),
+  });
+  verbose.metrics.count('x', 1);
   assert.equal(debug.length, 1);
   assert.ok(String(debug[0]).startsWith('resize metric x 1'), String(debug[0]));
   // The host's sink wins.
   resetResizerForTests();
   const sink = new NoopMetrics();
   assert.equal(new FrameworkResizer({ storage, metrics: sink }).metrics, sink);
+});
+
+describe('flushAtShutdown', () => {
+  // An app whose event bus is a real EventEmitter. As in the framework, a listener added first
+  // closes the logger on `shutdown`: a line written after it runs is lost.
+  function installBus() {
+    const events = new EventEmitter();
+    const order: string[] = [];
+    let closed = false;
+    events.on('shutdown', () => {
+      closed = true;
+      order.push('logger closed');
+    });
+    setAppInstance({
+      getConfig: () => makeResizeConfig(),
+      getModel: () => ({ findById: async () => null }),
+      logger: {
+        info(msg: unknown) {
+          if (!closed) {
+            order.push(String(msg));
+          }
+        },
+        warn() {},
+        error() {},
+      },
+      events,
+    } as never);
+    return { events, order };
+  }
+
+  const withSink = (over: Partial<ResizeMetrics> = {}) => ({
+    flushed: 0,
+    count() {},
+    timing() {},
+    flush() {
+      this.flushed += 1;
+    },
+    ...over,
+  });
+
+  test('flushAtShutdown writes the open window on the shutdown event', () => {
+    const { events, order } = installBus();
+    const r = new FrameworkResizer({ storage });
+    flushAtShutdown(r.metrics);
+    r.metrics.count('resize.read', 1, { outcome: 'ready' });
+    events.emit('shutdown');
+    assert.equal(order.length, 2);
+    assert.match(order[0], /over \d+ s: reads 1 \(ready 1\)/);
+    assert.equal(order[1], 'logger closed');
+  });
+
+  test('a second shutdown writes nothing', () => {
+    const { events } = installBus();
+    const sink = withSink();
+    flushAtShutdown(sink);
+    events.emit('shutdown');
+    events.emit('shutdown');
+    assert.equal(sink.flushed, 1);
+  });
+
+  test('a flush that throws or rejects does not escape', async () => {
+    const { events } = installBus();
+    const after = withSink();
+    const unhandled = mock.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      flushAtShutdown(
+        withSink({
+          flush() {
+            throw new Error('flush down');
+          },
+        }),
+      );
+      flushAtShutdown(
+        withSink({
+          flush: async () => Promise.reject(new Error('flush down')),
+        }),
+      );
+      flushAtShutdown(after);
+      assert.doesNotThrow(() => events.emit('shutdown'));
+      await nextTurn();
+      assert.equal(after.flushed, 1);
+      assert.equal(unhandled.mock.callCount(), 0);
+    } finally {
+      process.removeListener('unhandledRejection', unhandled);
+    }
+  });
+
+  test('a bus without prependOnceListener is ignored', () => {
+    installApp();
+    assert.doesNotThrow(() => flushAtShutdown(withSink()));
+  });
+
+  test('a sink shared by two Resizers is flushed once', async () => {
+    const { events } = installBus();
+    const sink = withSink();
+    const a = new FrameworkResizer({ storage, metrics: sink });
+    const b = new FrameworkResizer({ name: 'b', storage, metrics: sink });
+    await a.ready();
+    await b.ready();
+    events.emit('shutdown');
+    assert.equal(sink.flushed, 1);
+  });
+
+  test('twenty sinks add one listener: no MaxListenersExceededWarning', () => {
+    const { events } = installBus();
+    const warnings: Error[] = [];
+    const onWarning = (warning: Error) => warnings.push(warning);
+    process.on('warning', onWarning);
+    const before = events.listenerCount('shutdown');
+    try {
+      const sinks = Array.from({ length: 20 }, () => withSink());
+      for (const sink of sinks) {
+        flushAtShutdown(sink);
+      }
+      assert.equal(events.listenerCount('shutdown'), before + 1);
+      events.emit('shutdown');
+      assert.deepEqual(
+        sinks.map((sink) => sink.flushed),
+        sinks.map(() => 1),
+      );
+      assert.deepEqual(warnings, []);
+    } finally {
+      process.removeListener('warning', onWarning);
+    }
+  });
+
+  test('a sink registered after a shutdown gets a new listener', () => {
+    const { events } = installBus();
+    const first = withSink();
+    flushAtShutdown(first);
+    events.emit('shutdown');
+    const second = withSink();
+    flushAtShutdown(second);
+    events.emit('shutdown');
+    assert.equal(first.flushed, 1);
+    assert.equal(second.flushed, 1);
+  });
+
+  test('a first call with no events on the app still works', async () => {
+    setAppInstance({
+      getConfig: () => makeResizeConfig(),
+      getModel: () => ({ findById: async () => null }),
+      logger: { info() {}, warn() {}, error() {} },
+    } as never);
+    const r = new FrameworkResizer({ storage });
+    const { decision } = await r.resolve({ media: withOriginal(), sizes });
+    assert.ok(decision);
+  });
+
+  test('a first call with no app at all still works', async () => {
+    const r = new FrameworkResizer({
+      storage,
+      media: fakeMedia(),
+      config: makeResizeConfig(),
+      tasks: false,
+      logger: { info() {}, warn() {}, error() {} },
+      events: { emit() {} },
+      metrics: withSink(),
+    });
+    await r.ready();
+    assert.equal(r.tasks, undefined);
+  });
+
+  test('resizer.metrics stays the object the host passed', async () => {
+    installBus();
+    const sink = withSink();
+    const r = new FrameworkResizer({ storage, metrics: sink });
+    await r.ready();
+    assert.equal(r.metrics, sink);
+  });
+
+  test('the first generate() and the first resolve() both register the flush', async () => {
+    for (const call of [
+      (r: FrameworkResizer) => r.generate({ media: withOriginal(), sizes: [] }),
+      (r: FrameworkResizer) => r.resolve({ media: withOriginal(), sizes: [] }),
+    ]) {
+      resetResizerForTests();
+      resetAppInstance();
+      const { events } = installBus();
+      const sink = withSink();
+      const before = events.listenerCount('shutdown');
+      const r = new FrameworkResizer({ storage, metrics: sink });
+      // Nothing is registered until the first call, so importing src/resizer.ts stays free.
+      assert.equal(events.listenerCount('shutdown'), before);
+      await call(r);
+      assert.equal(events.listenerCount('shutdown'), before + 1);
+      events.emit('shutdown');
+      assert.equal(sink.flushed, 1);
+    }
+  });
 });
 
 test('a FrameworkResizer rejects metrics: null as new Resizer does; only undefined means the default', () => {

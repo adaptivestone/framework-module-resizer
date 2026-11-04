@@ -1716,6 +1716,58 @@ describe('decoding the source', () => {
     );
   });
 
+  test('an eager source mismatch warning says resize generate', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(plainJpeg, {
+      logger,
+      original: { format: 'png' },
+    });
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.match(String(logs.warn[0][0]), /^resize generate: media m1 /);
+  });
+
+  test('a queued source mismatch warning still says resize worker', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps } = decodeDeps(plainJpeg, {
+      logger,
+      original: { format: 'png' },
+    });
+    await new Processor(deps).processTask(task({ previews: [variant()] }));
+    assert.match(String(logs.warn[0][0]), /^resize worker: media m1 /);
+  });
+
+  test('an eager variant failure says resize generate', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(redPng, { logger });
+    deps.storage.upload = async () => {
+      throw new Error('upload down');
+    };
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => err instanceof ResizeGenerateError,
+    );
+    assert.match(String(logs.error[0][0]), /^resize generate: variant /);
+  });
+
+  test('a queued variant failure still says resize worker', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps } = decodeDeps(redPng, { logger });
+    deps.storage.upload = async () => {
+      throw new Error('upload down');
+    };
+    await assert.rejects(
+      new Processor(deps).processTask(task({ previews: [variant()] })),
+      { code: 'RESIZE_WORKER_INCOMPLETE' },
+    );
+    assert.match(String(logs.error[0][0]), /^resize worker: variant /);
+  });
+
   test('a host decoder that lists the stored format and refuses: the warning names the decoders, not two equal formats', async () => {
     class RefusingJpeg extends SourceDecoder {
       readonly formats = ['jpeg'];
@@ -1745,8 +1797,79 @@ describe('decoding the source', () => {
     assert.doesNotMatch(message, /but its bytes are/);
     assert.match(
       message,
-      /stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder read them/,
+      /^resize generate: media m1 is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder read them/,
     );
+  });
+});
+
+describe('what processTask resolves', () => {
+  const sizes = ['20x20', '30x30', '40x40'].map((sizeKey) => {
+    const side = Number(sizeKey.split('x')[0]);
+    return variant({ sizeKey, requestedWidth: side, requestedHeight: side });
+  });
+  const stored = (sizeKey: string) =>
+    ({
+      sizeKey,
+      format: 'jpeg',
+      storageRef: { key: sizeKey },
+      contentType: 'image/jpeg',
+    }) as unknown as Preview;
+
+  test('processTask resolves what it rendered', async () => {
+    const deps = processorDeps();
+    const doc = stampFresh(
+      mediaDoc({
+        original: { width: 64, height: 48 },
+        previews: [stored('20x20'), stored('30x30')],
+      }),
+      { config: deps.config },
+    );
+    deps.media = makeMediaStore(doc).mediaStore;
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 1 },
+    );
+  });
+
+  test('a task whose previews are all fresh rendered nothing', async () => {
+    const deps = processorDeps();
+    const doc = stampFresh(
+      mediaDoc({
+        original: { width: 64, height: 48 },
+        previews: sizes.map((size) => stored(size.sizeKey)),
+      }),
+      { config: deps.config },
+    );
+    deps.media = makeMediaStore(doc).mediaStore;
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 0 },
+    );
+  });
+
+  test('a media with no document rendered nothing', async () => {
+    const deps = processorDeps();
+    deps.media = makeMediaStore(null).mediaStore;
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 0 },
+    );
+  });
+
+  test('a media deleted while the task ran counts as nothing rendered', async () => {
+    const deps = processorDeps();
+    let loads = 0;
+    deps.media = fakeMedia({
+      load: async () => {
+        loads += 1;
+        return loads === 1 ? mediaDoc() : null;
+      },
+    });
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 0 },
+    );
+    assert.equal(loads, 2);
   });
 });
 
@@ -4816,7 +4939,7 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.deepEqual(claimedQueues, []);
     assert.ok(
-      logs.info.some((l) =>
+      logs.warn.some((l) =>
         String(l[0]).includes(
           'set worker: { enabled: true } in src/config/resize.ts',
         ),

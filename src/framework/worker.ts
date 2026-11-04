@@ -10,11 +10,12 @@ import { getProcessConfig } from './config.ts';
 
 /**
  * Run the worker for `queue`: one name or a list of them (default 'default'), checked and
- * de-duplicated by runWorker.
+ * de-duplicated by runWorker. Resolves true after a run, and false when this process consumes
+ * nothing, because the worker is disabled or no Resizer has a task queue.
  */
 export async function runResizeWorker(
   opts: { queue?: string | readonly string[] } = {},
-): Promise<void> {
+): Promise<boolean> {
   // Removed with the CLI's --config: a JS caller passing it gets the fix, not a silent default.
   if (Object.hasOwn(opts, 'configName')) {
     throw new ResizeConfigError(
@@ -25,10 +26,10 @@ export async function runResizeWorker(
   const app = getApp();
   const { worker } = getProcessConfig();
   if (worker.enabled === false) {
-    app.logger.info(
-      'resize worker disabled — set worker: { enabled: true } in src/config/resize.ts (or its resize.<NODE_ENV>.ts override) to run it',
+    app.logger.warn(
+      'resize worker disabled — this process consumes no tasks; set worker: { enabled: true } in src/config/resize.ts (or its resize.<NODE_ENV>.ts override) to run it',
     );
-    return;
+    return false;
   }
   // The core worker rejects an empty registry too; this message names the framework fix.
   if (listResizers().length === 0) {
@@ -42,7 +43,7 @@ export async function runResizeWorker(
   process.once('SIGTERM', abort);
   process.once('SIGINT', abort);
   try {
-    await runWorker({
+    return await runWorker({
       ...(opts.queue === undefined ? {} : { queue: opts.queue }),
       signal: controller.signal,
       logger: app.logger,

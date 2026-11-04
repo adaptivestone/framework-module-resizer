@@ -27,6 +27,11 @@
   counts as such a failure, where it was retried. `RESIZE_GENERATE_FAILED` is `false` when every
   variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both
   shipped drivers, where it was the raw driver error.
+- A disabled worker logs `warn`, and the command resolves `false`, so a CLI entry that forwards the
+  result, as the framework docs require, exits 1: a deploy that runs it with the flag off now
+  reports a failure. The eager-only path (`resize worker: no Resizer has a task queue`, still an
+  `error` line) does the same, since that process consumes nothing either. `runWorker` and
+  `runResizeWorker` resolve `true` after a run and `false` in those cases.
 
 **Changed behaviour**
 
@@ -39,6 +44,11 @@
   when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
   indexed query instead of a failed insert; the first add costs about 1 ms more, and the unique
   index still settles races. The gate read and `findActive` read from the primary.
+- `FrameworkResizer`'s default sink writes no debug lines; pass
+  `new LogMetrics(logger, { debug: true })` to keep them. A debug timing is rounded, with a unit.
+  The worker logs one `info` line at start naming its queues and Resizers. Eager failures say
+  `resize generate:`, not `resize worker:`. A completed task says `variants 5 of 9` when it rendered
+  fewer, and `resize.task` gains the context `rendered`.
 
 **Features**
 
@@ -52,6 +62,7 @@
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
 - The dispatcher's once-log sets are capped at 100 keys.
+- A framework host's open metrics window is written on the framework's `shutdown` event.
 
 # 0.3.0
 

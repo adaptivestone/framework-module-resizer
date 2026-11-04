@@ -16,7 +16,7 @@
 //   queue, which keeps the gate in its task rows, and none for an eager-only Resizer;
 // - coordination: `coordination` in src/config/resize.ts, which the core validates;
 // - logger and events: the app's;
-// - metrics: a LogMetrics on that logger, with its debug lines on.
+// - metrics: a LogMetrics on that logger, whose open window is written on the app's `shutdown`.
 // Options win over the config files. Nothing is read from the app until first use, and the AWS
 // drivers (optional peers) are imported only when a queue or storage on them is used.
 import type { DriverRegistry } from '../contracts/drivers.ts';
@@ -43,7 +43,7 @@ import type {
   ResizeEventBus,
   ResizeLogger,
 } from '../types.d.ts';
-import { appEvents, appLogger } from './app.ts';
+import { appEvents, appLogger, flushAtShutdown } from './app.ts';
 import {
   type ConfigSource,
   configFile,
@@ -118,11 +118,11 @@ export class FrameworkResizer<D extends DriverRegistry = {}> extends Resizer {
       ...rest,
       drivers: withFrameworkDatabase(drivers),
       logger: logger ?? appLogger,
-      // The app logger decides whether debug lines are kept, so the default writes them. Only an
-      // option left out takes it: any other value, null included, goes to the core's check.
+      // Only an option left out takes the default: any other value, null included, goes to the
+      // core's check.
       metrics:
         rest.metrics === undefined
-          ? new LogMetrics(logger ?? appLogger, { debug: true })
+          ? new LogMetrics(logger ?? appLogger)
           : rest.metrics,
       events: events ?? appEvents,
       // One queue set per process, built with the app logger, never one Resizer's. It is built
@@ -139,6 +139,14 @@ export class FrameworkResizer<D extends DriverRegistry = {}> extends Resizer {
     checkQueueDrivers(rest.name ?? 'default', queueDrivers);
     super(options);
     sharedValue(QUEUE_DRIVERS_KEY, queueDrivers);
+  }
+
+  protected override onServicesBuilt(): void {
+    try {
+      flushAtShutdown(this.metrics);
+    } catch {
+      // No app yet, or a fake one: nothing to listen on, and a first call must not fail for it.
+    }
   }
 }
 

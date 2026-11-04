@@ -128,7 +128,7 @@ type ConsumeOptions = Parameters<typeof consume>[1];
  */
 async function runUntil(
   tasks: MemoryTaskQueue | PlainTaskQueue,
-  handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>,
+  handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<unknown>,
   done: () => boolean,
   opts: Pick<
     ConsumeOptions,
@@ -2580,6 +2580,71 @@ describe('Consumer metrics', () => {
       variants: 1,
       payloadQueue: 'elsewhere',
     });
+  });
+
+  // The context of the one completed outcome of a handler that resolves `result`.
+  const completedContext = async (result: unknown) => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const rec = recordingMetrics();
+    await runUntil(
+      tasks,
+      async () => result,
+      () => tasks.rows[0].status === 'completed',
+      { metricsOf: () => rec },
+    );
+    const [[, labels, context]] = callsOf(rec, 'resize.task');
+    assert.equal(labels.outcome, 'completed');
+    return context;
+  };
+
+  test('resize.task carries rendered on completed only', async () => {
+    assert.deepEqual(await completedContext({ requested: 1, rendered: 0 }), {
+      taskId: 'task-1',
+      mediaId: 'm1',
+      attempts: 1,
+      variants: 1,
+      rendered: 0,
+    });
+
+    // A failure is not a count of what was rendered, whatever came before it.
+    const tasks = new MemoryTaskQueue({
+      timing: {
+        ...fastTiming,
+        maxAttempts: 2,
+        retryBackoffMs: { base: 1, max: 1 },
+      },
+    });
+    await tasks.add(newTask());
+    const rec = recordingMetrics();
+    await runUntil(
+      tasks,
+      async () => {
+        throw new Error('sharp exploded');
+      },
+      () => tasks.rows[0].status === 'dead',
+      { metricsOf: () => rec },
+    );
+    const outcomes = callsOf(rec, 'resize.task');
+    assert.deepEqual(
+      outcomes.map(([, labels]) => labels.outcome),
+      ['failed', 'dead'],
+    );
+    for (const [, , context] of outcomes) {
+      assert.equal('rendered' in context, false);
+    }
+  });
+
+  test('a handler that resolves nothing carries no rendered', async () => {
+    for (const result of [undefined, null]) {
+      assert.equal('rendered' in (await completedContext(result)), false);
+    }
+  });
+
+  test('a handler that resolves a non-number carries no rendered', async () => {
+    for (const result of [{ rendered: '5' }, { rendered: null }, {}, 5]) {
+      assert.equal('rendered' in (await completedContext(result)), false);
+    }
   });
 
   test('a retried task records failed with the error code, its last attempt records dead', async () => {

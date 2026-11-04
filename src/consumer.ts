@@ -73,9 +73,10 @@ export interface ConsumerDeps {
   // check, so it is never dead-lettered here, and the loop waits idlePollMs before its next claim,
   // so a queue that holds only such tasks is not claimed in a tight loop.
   accepts?: (task: LeasedTask) => boolean;
-  // Runs one task: resolving completes it, rejecting fails it. The signal aborts on a lost lease,
-  // a timeout or the shutdown.
-  handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>;
+  // Runs one task: resolving completes it, rejecting fails it. A numeric `rendered` on the result
+  // goes on the task's completed outcome. The signal aborts on a lost lease, a timeout or the
+  // shutdown.
+  handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<unknown>;
   events?: TaskEventHandler;
   logger: ResizeLogger;
   // Optional: the Resizers this worker serves, passed to every claim, so a queue that filters
@@ -422,6 +423,7 @@ export class Consumer {
     // detached handler that settles after a timeout never becomes an unhandled rejection.
     let handlerError: unknown;
     let ok = false;
+    let rendered: unknown;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<void>((resolve) => {
@@ -433,8 +435,9 @@ export class Consumer {
     try {
       await Promise.race([
         handle(toLeasedTask(task), { signal: taskController.signal }).then(
-          () => {
+          (result) => {
             ok = true;
+            rendered = (result as { rendered?: unknown } | undefined)?.rendered;
           },
           (err) => {
             handlerError = err;
@@ -511,7 +514,7 @@ export class Consumer {
               this.#releaseGate(task, gate, deadline, detached),
             gateDeadline,
           );
-          await this.#report('completed', task, undefined, claim);
+          await this.#report('completed', task, undefined, claim, rendered);
         } else {
           logNeverThrow(
             logger,
@@ -548,12 +551,14 @@ export class Consumer {
    * A task's outcome, once the queue took it: recorded on its Resizer's metrics sink, labelled
    * with the queue this loop consumes and timed from its claim, then sent to the observers. The
    * queue a payload names is the producer's (an SQS body), so a different one is context only.
+   * `rendered` is what the handler resolved on a completed task; only that outcome passes it.
    */
   async #report(
     event: TaskEvent,
     task: ClaimedTask,
     error: unknown,
     claim: ClaimStart,
+    rendered?: unknown,
   ): Promise<void> {
     this.#deps.metricsOf?.(toLeasedTask(task))?.timing(
       'resize.task',
@@ -569,6 +574,7 @@ export class Consumer {
         mediaId: task.mediaId,
         attempts: task.attempts,
         variants: task.previews.length,
+        ...(typeof rendered === 'number' ? { rendered } : {}),
         ...(task.queue === claim.queue ? {} : { payloadQueue: task.queue }),
       },
     );
@@ -628,7 +634,7 @@ export class Consumer {
             logger,
             `resize worker: task ${task.taskId} of media ${task.mediaId} is dead (${attempt}, ${deadReason(error, opts.forceDead)}) — new tasks for its media and pipeline wait ${cooldownMs} ms: ${text}`,
             // A module error's line says it all. The stack of an unexpected error is what an operator
-            // needs: it follows as the logger prints it, and only the line above is one line for sure.
+            // needs: it follows as the logger prints it, and only the line above is the module's.
             isModuleError(error) ? undefined : error,
           );
           await this.#holdUntil(

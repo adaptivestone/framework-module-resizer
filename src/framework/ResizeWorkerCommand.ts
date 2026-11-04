@@ -67,7 +67,7 @@ export default class ResizeWorker {
     // The parser gives a list (`--queue` may be repeated); a caller may still pass one name. One
     // name is passed as itself, as before; runWorker checks the names.
     const names = Array.isArray(queue) && queue.length === 1 ? queue[0] : queue;
-    await runResizeWorker(names === undefined ? {} : { queue: names });
-    return true;
+    // false when this process consumes nothing: a CLI entry that forwards it exits 1.
+    return await runResizeWorker(names === undefined ? {} : { queue: names });
   }
 }

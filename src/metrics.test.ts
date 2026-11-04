@@ -218,7 +218,7 @@ describe('LogMetrics', () => {
       logger.lines.debug.map((line) => line[0]),
       [
         'resize metric resize.read 1 {"outcome":"ready"} {"mediaId":"m1"}',
-        'resize metric resize.unknown 3 {} {}',
+        'resize metric resize.unknown 3 ms {} {}',
       ],
     );
     // A name LogMetrics does not know gets only the debug line: the window holds the read alone.
@@ -249,6 +249,55 @@ describe('LogMetrics', () => {
     assert.doesNotThrow(() =>
       new LogMetrics(throwing, { debug: true }).count('resize.read', 1),
     );
+  });
+
+  test('a timing debug line is rounded', () => {
+    const logger = recordingLogger();
+    const metrics = new LogMetrics(logger, { debug: true });
+    metrics.timing('resize.claim', 22.4, { queue: 'default' }, {});
+    assert.deepEqual(
+      logger.lines.debug.map((line) => line[0]),
+      ['resize metric resize.claim 22 ms {"queue":"default"} {}'],
+    );
+  });
+
+  // One task outcome with the given context, and the line it writes.
+  const taskOutcome = (outcome: string, context: Record<string, number>) => {
+    const logger = recordingLogger();
+    new LogMetrics(logger).timing(
+      'resize.task',
+      10,
+      { resizer: 'default', queue: 'default', pipeline: 'p', outcome },
+      { taskId: 't1', mediaId: 'm1', attempts: 1, ...context },
+    );
+    return String(infoLines(logger)[0]);
+  };
+
+  test('a completed task that rendered fewer says variants 5 of 9', () => {
+    assert.match(
+      taskOutcome('completed', { variants: 9, rendered: 5 }),
+      /completed in \d+ ms \(.*variants 5 of 9\)$/,
+    );
+  });
+
+  test('a completed task that rendered nothing says variants 0 of 9', () => {
+    assert.match(
+      taskOutcome('completed', { variants: 9, rendered: 0 }),
+      /completed in \d+ ms \(.*variants 0 of 9\)$/,
+    );
+  });
+
+  test('a completed task that rendered all says variants 9', () => {
+    assert.match(
+      taskOutcome('completed', { variants: 9, rendered: 9 }),
+      /completed in \d+ ms \(.*variants 9\)$/,
+    );
+  });
+
+  test('failed and dead lines keep variants 9', () => {
+    for (const outcome of ['failed', 'dead']) {
+      assert.match(taskOutcome(outcome, { variants: 9 }), /\(.*variants 9\)$/);
+    }
   });
 
   test('flush() writes the pending summary now and closes the window; with nothing counted it writes nothing', () => {

@@ -2040,6 +2040,89 @@ describe('a worker for several queues', () => {
   });
 });
 
+describe('the start line and what runWorker resolves', () => {
+  const recording = () => {
+    const infos: string[] = [];
+    const errors: string[] = [];
+    return {
+      infos,
+      errors,
+      logger: {
+        info: (line: string) => infos.push(line),
+        warn() {},
+        error: (line: string) => errors.push(line),
+      },
+    };
+  };
+  const stopped = () => AbortSignal.abort();
+
+  test('the worker logs one start line naming its queues and Resizers', async () => {
+    const tasks = new MemoryTaskQueue();
+    queuedResizer('default', tasks);
+    queuedResizer('listings', tasks);
+    const { infos, logger } = recording();
+    await runWorker({
+      queue: ['default', 'bulk'],
+      signal: stopped(),
+      logger,
+    });
+    assert.equal(
+      infos.filter((l) => l.startsWith('resize worker started')).length,
+      1,
+    );
+    assert.ok(
+      infos.includes(
+        "resize worker started: queues 'default', 'bulk'; Resizers 'default', 'listings'",
+      ),
+      infos.join('\n'),
+    );
+    // Before anything is claimed: it comes first, and the stop line last.
+    assert.equal(infos[0].startsWith('resize worker started'), true);
+    assert.equal(infos.at(-1), 'resize worker stopped');
+  });
+
+  test('a worker whose start check fails writes no start line', async () => {
+    const { infos, logger } = recording();
+    queuedResizer('default', new MemoryTaskQueue({ queues: ['default'] }));
+    await assert.rejects(
+      runWorker({ queue: 'nobody', signal: stopped(), logger }),
+      { code: 'RESIZE_QUEUE_NOT_SERVED' },
+    );
+    const started = () =>
+      infos.filter((l) => l.startsWith('resize worker started'));
+    assert.deepEqual(started(), []);
+
+    // The last check of the start, one that passes every earlier one.
+    resetResizerForTests();
+    const tasks = new MemoryTaskQueue();
+    tasks.verify = async () => {
+      throw new ResizeSetupError('test: the queue is not ready', {
+        code: 'RESIZE_MONGO_INDEX_MISSING',
+      });
+    };
+    queuedResizer('default', tasks);
+    await assert.rejects(runWorker({ signal: stopped(), logger }), {
+      code: 'RESIZE_MONGO_INDEX_MISSING',
+    });
+    assert.deepEqual(started(), []);
+  });
+
+  test('runWorker resolves true after a run', async () => {
+    queuedResizer('default', new MemoryTaskQueue());
+    assert.equal(await runWorker({ signal: stopped(), logger: silent }), true);
+  });
+
+  test('an eager-only worker keeps its error line, writes no start line, and resolves false', async () => {
+    queuedResizer('default', undefined);
+    const { infos, errors, logger } = recording();
+    assert.equal(await runWorker({ signal: stopped(), logger }), false);
+    assert.deepEqual(errors, [
+      'resize worker: no Resizer has a task queue (eager-only wiring)',
+    ]);
+    assert.deepEqual(infos, []);
+  });
+});
+
 describe('worker metrics', () => {
   const fast = { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } };
 
@@ -2141,6 +2224,30 @@ describe('worker metrics', () => {
       .filter((line) => line.startsWith('resize: task '))
       .map((line) => /of media m1 (\w+) in \d+ ms/.exec(line)?.[1]);
     assert.deepEqual(outcomes, ['failed', 'dead']);
+  });
+
+  test('a completed task that rendered fewer than it names says so, from the render to the line', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const logger = recordingLogger();
+    // No document: a no-op complete, so nothing of the task's one variant was rendered.
+    const resizer = resizerOn(tasks, {
+      logger,
+      media: fakeMedia({ load: async () => null }),
+    });
+    await addTask(tasks);
+    await workUntil(
+      { logger: silent, resizers: [resizer] },
+      () => tasks.rows[0].status === 'completed',
+    );
+    assert.equal(
+      logger.lines.info.filter((line) =>
+        /^resize: task \S+ of media m1 completed in \d+ ms \(.*variants 0 of 1\)$/.test(
+          line,
+        ),
+      ).length,
+      1,
+      logger.lines.info.join('\n'),
+    );
   });
 
   test('a dead task under NoopMetrics still writes its dead line', async () => {
