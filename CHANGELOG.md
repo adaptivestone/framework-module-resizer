@@ -7,11 +7,11 @@
   `RESIZE_SOURCE_DAMAGED` (`retryable: false`) instead of rendering a garbled preview. Two limits:
   bytes flipped mid-file can still render garbled, and a JPEG missing only its end marker is usually
   refused at every strict level. `limits.failOn: 'none'` restores 0.3.0's rendering; a file whose
-  header cannot be read still fails, now at once. It is not in `encodeSig`, so nothing regenerates;
-  previews already made stay fresh, and the README's `Damaged originals` shows how to find them. A
-  complete config passed to `new Resizer` must now hold `limits.failOn`. Sharp's pixel limit at
-  decode is now `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`), and at upload
-  `RESIZE_ORIGINAL_TOO_MANY_PIXELS`.
+  header cannot be read still fails, usually at once (a file with no usable detail and a cut TIFF
+  are retried). It is not in `encodeSig`, so nothing regenerates; previews already made stay fresh,
+  and the README's `Damaged originals` shows how to find them. A complete config passed to
+  `new Resizer` must now hold `limits.failOn`. Sharp's pixel limit at decode is now
+  `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`), and at upload `RESIZE_ORIGINAL_TOO_MANY_PIXELS`.
 
 **Changed behaviour**
 

@@ -109,7 +109,7 @@ test('inspect reports unreadable markup as RESIZE_SOURCE_DAMAGED and the pixel l
       (err: ResizeError) => {
         assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
         assert.equal(err.retryable, false);
-        assert.match(err.message, /limits\.failOn 'error'/);
+        assert.doesNotMatch(err.message, /failOn/);
         return true;
       },
     );

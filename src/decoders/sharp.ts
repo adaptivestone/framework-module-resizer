@@ -32,8 +32,9 @@ export class SharpDecoder extends SourceDecoder {
 
   async inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
     // Damage and the pixel limit become the module's errors; any other Sharp error (bytes it cannot
-    // read, the timeout) is rethrown as it is. It always runs at Sharp's default level, whatever
-    // limits.failOn says: a header that cannot be read cannot be sized at any level.
+    // read, the timeout) is rethrown as it is. It runs at Sharp's default level, whatever
+    // limits.failOn says, so its error does not name that setting, and a header that level refuses
+    // fails at every limits.failOn, also at 'none'.
     // The first frame only: the input limit applies to one frame, and the header still reports the
     // page count and timing. How many frames are decoded is bounded at render, by the plan.
     let meta: Metadata;
@@ -42,7 +43,7 @@ export class SharpDecoder extends SourceDecoder {
         .timeout({ seconds: limits.processingTimeoutSeconds })
         .metadata();
     } catch (err) {
-      throw sharpDecodeError(err, limits);
+      throw sharpDecodeError(err, { inputPixels: limits.inputPixels });
     }
     const format =
       meta.format === 'heif' && isAvifBuffer(bytes) ? 'avif' : meta.format;

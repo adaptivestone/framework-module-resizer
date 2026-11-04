@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
+import type { SourceInfo } from '../contracts/decoder.ts';
 import { ResizeError } from '../errors.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import type { ResizeFailOn } from '../types.d.ts';
@@ -381,12 +382,27 @@ async function decode(bytes: Buffer, level: ResizeFailOn = 'error') {
 
 for (const format of FORMATS) {
   test(`a cut ${format} is RESIZE_SOURCE_DAMAGED; a Sharp upgrade that changes the message fails here`, async () => {
+    const decoder = new SharpDecoder();
+    const bytes = firstHalf(await sample(format));
+    let source: SourceInfo | undefined;
     await assert.rejects(
-      decode(firstHalf(await sample(format))),
+      (async () => {
+        source = await decoder.inspect(bytes, limits);
+        await decoder.render(
+          bytes,
+          { width: 16, height: 16 },
+          { limits, source, frames: 1 },
+        );
+      })(),
       (err: ResizeError) => {
         assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
         assert.equal(err.retryable, false);
-        assert.match(err.message, /limits\.failOn 'error'/);
+        // Only a render ran at limits.failOn, so only a render's message names it.
+        if (source === undefined) {
+          assert.doesNotMatch(err.message, /failOn/);
+        } else {
+          assert.match(err.message, /limits\.failOn 'error'/);
+        }
         return true;
       },
     );
@@ -450,7 +466,8 @@ test("a file whose header cannot be read fails at every level, also at 'none'", 
     new SharpDecoder().inspect(bytes, { ...limits, failOn: 'none' }),
     (err: ResizeError) => {
       assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED');
-      assert.match(err.message, /limits\.failOn 'none'/);
+      // inspect did not use limits.failOn, so the message does not name it.
+      assert.doesNotMatch(err.message, /failOn/);
       return true;
     },
   );
@@ -527,6 +544,35 @@ test('a baseline JPEG missing only its end marker gets one answer from every str
     assert.equal(answers.size, 1);
     assert.ok((await decode(noEnd, 'none')).data.length > 0);
   }
+});
+
+test('a healthy TIFF whose compression this build does not implement stays an engine failure', async () => {
+  const tiff = Buffer.from(
+    await noisy().tiff({ compression: 'none' }).toBuffer(),
+  );
+  // Sharp writes the byte order this machine uses; tag 259 is Compression, a SHORT held in the entry.
+  const littleEndian = tiff.toString('latin1', 0, 2) === 'II';
+  const u16 = (at: number) =>
+    littleEndian ? tiff.readUInt16LE(at) : tiff.readUInt16BE(at);
+  const ifd = littleEndian ? tiff.readUInt32LE(4) : tiff.readUInt32BE(4);
+  let patched = false;
+  for (let i = 0; i < u16(ifd); i += 1) {
+    const entry = ifd + 2 + i * 12;
+    if (u16(entry) === 259) {
+      if (littleEndian) {
+        tiff.writeUInt16LE(33003, entry + 8);
+      } else {
+        tiff.writeUInt16BE(33003, entry + 8);
+      }
+      patched = true;
+    }
+  }
+  assert.ok(patched, 'tag 259 not found');
+  await assert.rejects(decode(tiff), (err: Error) => {
+    assert.equal(ResizeError.isResizeError(err), false);
+    assert.match(err.message, /not implemented/);
+    return true;
+  });
 });
 
 test('inspect and render report the pixel limit as RESIZE_SOURCE_TOO_LARGE', async () => {

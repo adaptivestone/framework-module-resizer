@@ -285,10 +285,10 @@ export interface InvalidateOpts {
 // module never changes.
 // ---------------------------------------------------------------------------
 
-// Decode/decompression-bomb guards (`ResizeConfig.limits`). Every decoder receives them.
 // How strict decoding is: Sharp's `failOn`, from least to most strict.
 export type ResizeFailOn = 'none' | 'truncated' | 'error' | 'warning';
 
+// Decode/decompression-bomb guards (`ResizeConfig.limits`). Every decoder receives them.
 export interface ResizeLimits {
   inputPixels: number; // default 268402689 — sharp limitInputPixels (decoder bomb guard)
   sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)

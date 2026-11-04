@@ -44,14 +44,15 @@ export class SvgDecoder extends SourceDecoder {
 
   async inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
     // Damage and the pixel limit become the module's errors; any other Sharp error (bytes it cannot
-    // read, the timeout) is rethrown as it is.
+    // read, the timeout) is rethrown as it is. It runs at Sharp's default level, so its error does
+    // not name limits.failOn.
     let meta: Metadata;
     try {
       meta = await sharp(bytes, { limitInputPixels: limits.inputPixels })
         .timeout({ seconds: limits.processingTimeoutSeconds })
         .metadata();
     } catch (err) {
-      throw sharpDecodeError(err, limits);
+      throw sharpDecodeError(err, { inputPixels: limits.inputPixels });
     }
     if (meta.format !== 'svg') {
       throw new ResizeMediaError(
