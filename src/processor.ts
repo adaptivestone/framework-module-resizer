@@ -41,7 +41,7 @@ import {
 import { storedDims } from './freshness.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { logNeverThrow, notRetryable } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import type { HookBus } from './hooks.ts';
 import { previewScope, requireMediaId } from './images.ts';
@@ -588,6 +588,8 @@ interface RenderPendingResult {
   // the identities of the stored previews that replaced them.
   removed: Preview[];
   replaced: Set<string>;
+  // The identities whose failure says no retry can help (`retryable: false`).
+  finalFailures: Set<string>;
   // The size every row was signed with, once the original was measured.
   originDims?: { width: number; height: number };
   // The dimensions the persist recorded on a media that had none stored.
@@ -838,7 +840,7 @@ export class Processor {
     }
     const requested = [...requestedByIdentity.values()];
     this.#warnIfAllFresh(task, media, scope, requested);
-    const { generated, failedCount, originDims, backfilled } =
+    const { generated, failedCount, finalFailures, originDims, backfilled } =
       await this.#renderPending({
         media,
         mediaId: task.mediaId,
@@ -893,6 +895,11 @@ export class Processor {
       const missingIdentities = missing.map((preview) =>
         catalog.identity(scope, preview),
       );
+      // Dead at once only when another delivery could change nothing: a variant missing for any
+      // other reason (a retryable failure, a row the store left out) may still be made.
+      const allFinal = missingIdentities.every((identity) =>
+        finalFailures.has(identity),
+      );
       throw new ResizeGenerateError({
         mediaId: task.mediaId,
         failed: Math.max(failedCount, missing.length),
@@ -900,6 +907,7 @@ export class Processor {
         missing: missingIdentities,
         message: `resize worker: task for media ${task.mediaId} is incomplete; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
         code: 'RESIZE_WORKER_INCOMPLETE',
+        retryable: !allFinal,
       });
     }
   }
@@ -984,11 +992,13 @@ export class Processor {
     let failedCount = 0;
     let removed: Preview[] = [];
     const replaced = new Set<string>();
+    const finalFailures = new Set<string>();
     const nothing = (): RenderPendingResult => ({
       generated,
       failedCount,
       removed,
       replaced,
+      finalFailures,
     });
 
     // Nothing requested (e.g. eager re-run where everything is already fresh) → no download.
@@ -1277,6 +1287,9 @@ export class Processor {
           failure,
         );
         failedCount += 1;
+        if (notRetryable(failure)) {
+          finalFailures.add(plan.identity);
+        }
         recordVariant(
           plan.identity,
           plan.variant.format,
@@ -1394,6 +1407,7 @@ export class Processor {
       failedCount,
       removed,
       replaced,
+      finalFailures,
       originDims: mediaDims,
       ...(backfillDims ? { backfilled: backfillDims } : {}),
     };

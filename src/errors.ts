@@ -4,7 +4,7 @@
 // module rejected this" from "sharp blew up" / "S3 timed out" / "mongo went away". The subclass
 // then answers the only question a catch block actually has — what do I DO about it:
 //   ResizeSetupError    — the wiring is wrong; fix the bootstrap code
-//   ResizeConfigError   — host config is invalid; crash at boot
+//   ResizeConfigError   — host config is invalid; crash at boot, a retry cannot fix it
 //   ResizeMediaError    — this record is unusable; skip it in the request path (the task queue
 //                         still retries it unless it carries `retryable: false`)
 //   ResizeGenerateError — the operation produced nothing
@@ -30,8 +30,10 @@ export interface ResizeErrorOptions {
   code?: string;
   cause?: unknown;
   /**
-   * Default `true` (`false` for `ResizeSecurityError` and `ResizeOriginalError`). `false`: no retry
-   * can help, the task queue dead-letters at once.
+   * Default `true` (`false` for `ResizeSecurityError`, `ResizeOriginalError` and
+   * `ResizeConfigError`). `false`: no later delivery of the same input can succeed, where a later
+   * delivery includes one after a rolling deploy reaches this worker, so the task queue
+   * dead-letters at once. Unclear cases stay `true`: a wrong `false` can strand a media.
    */
   retryable?: boolean;
 }
@@ -75,10 +77,18 @@ export class ResizeSetupError extends ResizeError {
   }
 }
 
-/** Host config is invalid or violates an invariant — crash at boot, do not degrade. */
+/**
+ * Host config is invalid or violates an invariant — crash at boot, do not degrade. Not retryable by
+ * default (`retryable` defaults to `false`): the same config gets the same refusal, and a worker
+ * reports it at start, before it claims a task.
+ */
 export class ResizeConfigError extends ResizeError {
   constructor(message: string, opts?: ResizeErrorOptions) {
-    super(message, { ...opts, code: opts?.code ?? 'RESIZE_CONFIG' });
+    super(message, {
+      ...opts,
+      code: opts?.code ?? 'RESIZE_CONFIG',
+      retryable: opts?.retryable ?? false,
+    });
   }
 }
 
@@ -154,11 +164,16 @@ export class ResizeGenerateError extends ResizeError {
     message?: string;
     code?: string;
     missing?: string[];
+    /** Default `true`: the failed variants may still succeed. */
+    retryable?: boolean;
   }) {
     super(
       opts.message ??
         `resize generate: media ${opts.mediaId} produced 0 previews with ${opts.failed} variant error(s) of ${opts.requested} requested`,
-      { code: opts.code ?? 'RESIZE_GENERATE_FAILED' },
+      {
+        code: opts.code ?? 'RESIZE_GENERATE_FAILED',
+        retryable: opts.retryable ?? true,
+      },
     );
     this.mediaId = opts.mediaId;
     this.failed = opts.failed;

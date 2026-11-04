@@ -402,7 +402,11 @@ describe('MongoTaskQueue setup', () => {
       token: 'token',
       attempts: 1,
     };
-    assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
+    assert.deepEqual(await tasks.add(request()), {
+      status: 'unconfirmed',
+      retryable: false,
+      causeCode: 'RESIZE_MONGO_MODEL_MISSING',
+    });
     assert.equal(await tasks.claim('default', 300), null);
     assert.equal(await tasks.renew(claimed, 300), false);
     assert.equal(await tasks.complete(claimed), false);
@@ -508,9 +512,14 @@ describe('MongoTaskQueue setup', () => {
     const results = await Promise.all(
       Array.from({ length: 20 }, () => tasks.add(request({ mediaId }))),
     );
+    const outdatedResult = {
+      status: 'unconfirmed',
+      retryable: false,
+      causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+    };
     assert.deepEqual(
       results,
-      Array.from({ length: 20 }, () => ({ status: 'unconfirmed' })),
+      Array.from({ length: 20 }, () => outdatedResult),
     );
     assert.equal(await Ejected.countDocuments({}), 0);
     // One line for the model, not one per add.
@@ -524,9 +533,7 @@ describe('MongoTaskQueue setup', () => {
       (error as { code?: unknown }).code,
       'RESIZE_MONGO_MODEL_OUTDATED',
     );
-    assert.deepEqual(await tasks.add(request({ mediaId })), {
-      status: 'unconfirmed',
-    });
+    assert.deepEqual(await tasks.add(request({ mediaId })), outdatedResult);
     assert.equal(errors.length, 1, 'still logged once');
     // Every other method rejects with it.
     const outdated = (error: unknown) =>
@@ -1116,7 +1123,7 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
     assert.equal(await M.countDocuments({ fileId: mediaId }), 2);
   });
 
-  test('a write error other than a duplicate key is logged and unconfirmed; a missing model is unconfirmed', async () => {
+  test('a write error other than a duplicate key is logged and plainly unconfirmed; a missing model says calling again cannot help', async () => {
     const failure = new Error('MongoDB offline');
     const { errors } = configureQueue(() => ({
       create: async () => {
@@ -1128,7 +1135,11 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
     assert.equal(errors[0][1], failure);
     for (const missing of [null, false]) {
       const logged = configureQueue(() => missing);
-      assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
+      assert.deepEqual(await tasks.add(request()), {
+        status: 'unconfirmed',
+        retryable: false,
+        causeCode: 'RESIZE_MONGO_MODEL_MISSING',
+      });
       assert.equal(logged.errors.length, 1);
     }
   });

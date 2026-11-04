@@ -546,6 +546,10 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
   - The ref you return from `upload()` is opaque to the module and comes back unchanged.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
     original's ref, for previews). Never both.
+  - `download()` reports a missing object with a `ResizeStorageError` with the code
+    `RESIZE_STORAGE_NOT_FOUND`, retryable, as both shipped drivers do: each retry costs one 404,
+    and an object can appear later (a row written before its PUT finishes). An S3 role without
+    `s3:ListBucket` gets 403 for a missing key, which stays raw.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
@@ -594,7 +598,10 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     queue cannot say whether the task was stored, e.g. a response lost after the write: the read
     path logs it once until an add is confirmed again, `prewarm()` reports the retryable
     `RESIZE_ENQUEUE_UNCONFIRMED` (see [`prewarm()` issues](#prewarm-issues)); on a gating queue a stored task's row is the gate, and beside a
-    queue without `gatesByTask` the core keeps the gate lock for one lease, at most `gateTtlMs`). A
+    queue without `gatesByTask` the core keeps the gate lock for one lease, at most `gateTtlMs`).
+    `unconfirmed` may also carry `retryable: false` and a string `causeCode`: calling again cannot
+    help until someone fixes what `causeCode` names. `prewarm()` passes both on in its issue, and
+    `MongoTaskQueue` sets them for a missing or outdated `ResizeTask` model. A
     value in
     none of these shapes (a queue written for an older version, e.g. one that resolves a task id)
     is never counted as queued: the Resizer logs it once, and `prewarm()` reports its variants
@@ -1462,18 +1469,26 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   without them keeps working (the times are dropped), but `resize-scaffold --check` reports it.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
-    once when its error has `retryable: false` (`ResizeError.retryable`, default `true`, while
-    `ResizeOriginalError`, which only an upload throws, defaults to `false`): no retry can help.
-    The module sets it on every `ResizeSecurityError` and on seven codes: the media has no original (`RESIZE_NO_ORIGINAL`), no decoder reads the source's bytes
+    once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.
+    The module sets it on every `ResizeSecurityError` and on eleven codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
+    dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
     source has no dimensions or exceeds the
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
-    before storage by `uploadOriginal()`), or an SVG render ran past
-    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`). The worker reads
+    before storage by `uploadOriginal()`), an SVG render ran past
+    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`), an encoder reported SVG output
+    for a preview (`RESIZE_SVG_PUBLIC_PREVIEW`), or the task was delivered more often than
+    `maxAttempts` because its workers kept crashing (`RESIZE_TASK_MAX_ATTEMPTS`). The worker reads
     `retryable` on the error that fails the task, when it is a `ResizeError` — including one from
     a duplicate copy of the package (it checks the `isResizeError` brand, not the class); errors
-    from other libraries are retried, whatever fields they carry. A `ResizeError` from
+    from other libraries are retried, whatever fields they carry. The rule for `false`: no later
+    delivery of the same input can succeed, where a later delivery includes one after a rolling
+    deploy reaches this worker, so `RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay
+    `true`, and so does every unclear case. `ResizeOriginalError` and `ResizeConfigError` default
+    to `false`, like `ResizeSecurityError`, and any other `ResizeError` to `true`;
+    `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false`. A
+    `ResizeError` from
     `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` or
     `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot
     be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
@@ -1483,9 +1498,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     of this process lists its stored format (`RESIZE_DECODER_MISSING` when it fails at `inspect`,
     `RESIZE_SOURCE_DECODE_FAILED` when it fails at render). An
     error inside one variant (`variantSteps`, encoding, `storage.upload`) fails only that
-    variant: it is logged, and the task fails with the retryable
-    `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only, then dead-lettered after
-    `maxAttempts`).
+    variant: it is logged, and the task fails with `RESIZE_WORKER_INCOMPLETE`. It is retryable
+    (retried for the missing variants only, then dead-lettered after `maxAttempts`), unless every
+    missing variant failed with `retryable: false`, when the task is dead-lettered at once.
   - A dead row keeps the gate (`active`) until its `cooldownUntil` (`deadAt` +
     `coordination.cooldownMs`); then the next `add()` takes it over (see
     [Coordination](#coordination)).
@@ -1651,11 +1666,12 @@ const refs = await getResizer().invalidate({ media: file, pipeline: 'photo' }); 
 and `result.issues` says why, each issue with the variants it covers and `retryable`. `false`: the
 module knows that no retry can help until the request, the config or the code changes. `true`: the
 module has not ruled a retry out. The cause may pass by itself, or it is a fault that the queue
-can only report in the logs (an unregistered or outdated `ResizeTask` model, a lock store that
-fails): fix the logged cause before you retry. An issue may also carry `causeCode`, the code of the
-error behind it when that code is not one of the issue codes below: a driver's own code, or
-`RESIZE_PEER_MISSING`, under `RESIZE_ENQUEUE_QUEUE_FAILED`, and `RESIZE_LOCKS_REQUIRED` under
-`RESIZE_ENQUEUE_LOCK_FAILED`. The set of issue codes is closed, so a `switch` over `code` stays
+can only report in the logs (a lock store that fails): fix the logged cause before you retry. An
+issue may also carry `causeCode`, the code of the error behind it when that code is not one of the
+issue codes below: a driver's own code, or `RESIZE_PEER_MISSING`, under
+`RESIZE_ENQUEUE_QUEUE_FAILED`, `RESIZE_LOCKS_REQUIRED` under `RESIZE_ENQUEUE_LOCK_FAILED`, and what
+a queue names (`RESIZE_MONGO_MODEL_MISSING` or `RESIZE_MONGO_MODEL_OUTDATED` from `MongoTaskQueue`)
+under `RESIZE_ENQUEUE_UNCONFIRMED`. The set of issue codes is closed, so a `switch` over `code` stays
 exhaustive.
 
 | `code` | When | `retryable` |
@@ -1670,7 +1686,7 @@ exhaustive.
 | `RESIZE_ENQUEUE_LOCK_CONTENDED` | A task queue without `gatesByTask` (SQS): the gate lock is held (a task queued, running or waiting for a retry, a dead task's cooldown, or the one-lease hold after an add that threw or was not confirmed); SQS cannot say which variants that task holds | `true`: call again after it ends |
 | `RESIZE_ENQUEUE_LOCK_FAILED` | A task queue without `gatesByTask`: acquiring the gate lock threw (logged). Also, with `causeCode: 'RESIZE_LOCKS_REQUIRED'`, a call on a queue whose backend has no gate of its own, on a Resizer with no lock store (a `RoutingTaskQueue`, whose need for locks is per name) | `true`, even when the lock store fails for good: fix the logged cause first; `false` with `causeCode: 'RESIZE_LOCKS_REQUIRED'` |
 | `RESIZE_ENQUEUE_QUEUE_FAILED` | `add()` threw (logged), e.g. an SQS send error; the task may still be stored. Beside a queue without `gatesByTask` the gate lock is then kept for one lease (at most `gateTtlMs`), so a `prewarm()` in that time reports `RESIZE_ENQUEUE_LOCK_CONTENDED` and the read path logs nothing. Also the backend of the call's queue failed to build (a `RoutingTaskQueue` route): the error's code is in `causeCode`, unless that code is itself an issue code, which is then the issue's code | `true`: fix the logged cause first. For a backend that failed to build, the error's own `retryable` (`true` for an error that is not a `ResizeError`) |
-| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue did not confirm the task (on Mongo a database error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`, even for an unregistered or outdated model: fix the logged cause first; `false` for a value in none of the shapes |
+| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue did not confirm the task (on Mongo a database error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged, the model with its code in `causeCode`; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`: fix the logged cause first. `false` when the queue says so, as `MongoTaskQueue` does for an unregistered or outdated model (fix what `causeCode` names), and for a value in none of the shapes |
 | `RESIZE_ENQUEUE_CONFIRM_FAILED` | After an `in-flight` add, `findActive()` threw (logged), so what the active task holds is unknown | `true` |
 | `RESIZE_ENQUEUE_INTERNAL_ERROR` | An unexpected error (e.g. a media without an id, `RESIZE_MEDIA_NO_ID`), a Resizer that could not start (a part that did not load, an invalid config), a task queue that cannot be used (the error `verify()` reports, e.g. `RESIZE_LOCKS_REQUIRED`), or an invalid timing of the call's `queue` (a name used only per call; every variant is `unconfirmed`); the message is the error's | `false` when the error is a `ResizeError` with `retryable: false`, or a `ResizeMediaError`, `ResizeConfigError` or `ResizeSetupError` (or a subclass); otherwise `true` |
 

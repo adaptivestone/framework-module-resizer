@@ -321,7 +321,7 @@ export class Consumer {
           coordination,
           new ResizeError(
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
-            { code: 'RESIZE_TASK_MAX_ATTEMPTS' },
+            { code: 'RESIZE_TASK_MAX_ATTEMPTS', retryable: false },
           ),
           { forceDead: true, claim: { queue, start: claimedAt } },
         );

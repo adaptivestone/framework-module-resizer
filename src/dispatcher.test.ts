@@ -655,6 +655,56 @@ describe('a task queue without gatesByTask', () => {
     );
   });
 
+  test('an unconfirmed add passes its retryable false and causeCode to the prewarm issue', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({
+      status: 'unconfirmed',
+      retryable: false,
+      causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+    });
+    const confirmed = await makeDispatcher({ tasks }).enqueueConfirmed(
+      requestFor([v300]),
+    );
+    assert.deepEqual(confirmed.accepted, []);
+    assert.deepEqual(confirmed.unconfirmed, [v300]);
+    assert.deepEqual(confirmed.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+        causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+        message: 'the task queue did not confirm the task',
+        retryable: false,
+        previews: [v300],
+      },
+    ]);
+  });
+
+  test('a plain unconfirmed add stays retryable, with no causeCode', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'unconfirmed' });
+    const confirmed = await makeDispatcher({ tasks }).enqueueConfirmed(
+      requestFor([v300]),
+    );
+    assert.deepEqual(confirmed.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+        message: 'the task queue did not confirm the task',
+        retryable: true,
+        previews: [v300],
+      },
+    ]);
+  });
+
+  test('a non-string causeCode from a JavaScript queue is dropped', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () =>
+      ({ status: 'unconfirmed', causeCode: 42, retryable: 'no' }) as never;
+    const confirmed = await makeDispatcher({ tasks }).enqueueConfirmed(
+      requestFor([v300]),
+    );
+    assert.equal('causeCode' in confirmed.issues[0], false);
+    assert.equal(confirmed.issues[0].retryable, true);
+  });
+
   test('gate keys cannot collide: each part is URI-encoded', async () => {
     assert.notEqual(
       gateKey('a:x', 'q', 'y', 'default'),

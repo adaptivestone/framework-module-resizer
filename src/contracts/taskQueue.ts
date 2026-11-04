@@ -56,17 +56,18 @@ export interface ClaimedTask extends LeasedTask {
  *   it (prewarm confirms variants through it; an `in-flight` without an id is logged once);
  * - `unconfirmed`: the queue cannot say whether the task was stored (a write error, a response
  *   lost after the write). The core counts nothing as queued: the read path logs it (once, until
- *   an add is confirmed again) and queues nothing more, and prewarm reports the variants with the
- *   retryable RESIZE_ENQUEUE_UNCONFIRMED. On a queue with `gatesByTask` the gate is the queue's
+ *   an add is confirmed again) and queues nothing more, and prewarm reports the variants with
+ *   RESIZE_ENQUEUE_UNCONFIRMED. On a queue with `gatesByTask` the gate is the queue's
  *   own: if the task was stored, its row is the active one and the next `add()` reports it
  *   `in-flight`. Beside a queue without `gatesByTask` the core keeps its gate lock for one lease
  *   (at most gateTtlMs), not released: a stored task is claimed and extends it within that time;
- *   otherwise it lapses and a later read queues the task.
+ *   otherwise it lapses and a later read queues the task. `retryable: false` means calling again
+ *   cannot help until someone fixes what `causeCode` names; prewarm passes both on in its issue.
  */
 export type TaskAddResult =
   | { status: 'added'; taskId: string }
   | { status: 'in-flight'; taskId?: string }
-  | { status: 'unconfirmed' };
+  | { status: 'unconfirmed'; retryable?: false; causeCode?: string };
 
 /** Options for `claim()`. */
 export interface ClaimOptions {

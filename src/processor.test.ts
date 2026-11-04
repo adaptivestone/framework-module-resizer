@@ -43,6 +43,7 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
   ResizeSetupError,
+  ResizeStorageError,
 } from './errors.ts';
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
@@ -1479,22 +1480,23 @@ describe('decoding the source', () => {
     );
   });
 
-  test('an SVG preview output fails its variant with RESIZE_SVG_PUBLIC_PREVIEW naming the media', async () => {
-    // A variantStep whose encoder reports SVG output (Sharp writes none; a custom step could).
-    const svgOutput = {
-      toFormat: () => ({
-        timeout: () => ({
-          toBuffer: async () => ({
-            data: Buffer.from('<svg/>'),
-            info: { format: 'svg', width: 20, height: 20 },
-          }),
+  // A variantStep's result whose encoder reports SVG output (Sharp writes none; a custom step could).
+  const svgOutput = {
+    toFormat: () => ({
+      timeout: () => ({
+        toBuffer: async () => ({
+          data: Buffer.from('<svg/>'),
+          info: { format: 'svg', width: 20, height: 20 },
         }),
       }),
-    };
+    }),
+  } as unknown as Sharp;
+
+  test('an SVG preview output fails its variant with RESIZE_SVG_PUBLIC_PREVIEW naming the media', async () => {
     const { logger, logs } = recordingLogger();
     const { deps, uploads, media } = decodeDeps(redPng, {
       logger,
-      pipeline: { variantSteps: [() => svgOutput as unknown as Sharp] },
+      pipeline: { variantSteps: [() => svgOutput] },
     });
     await assert.rejects(
       new Processor(deps).generate({
@@ -1508,8 +1510,113 @@ describe('decoding the source', () => {
     assert.match(String(message), /variant .* failed for media m1/);
     assert.ok(err instanceof ResizeMediaError);
     assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
+    assert.equal(err.retryable, false);
     assert.equal(err.mediaId, 'm1');
     assert.match(err.message, /\(media m1\)$/);
+  });
+
+  test('a storage upload that returns no locator fails its variant with RESIZE_PREVIEW_STORAGE_REF_INVALID, retryable', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(redPng, { logger });
+    deps.storage.upload = async () => null;
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => err instanceof ResizeGenerateError,
+    );
+    const [message, err] = logs.error[0];
+    assert.match(String(message), /variant .* failed for media m1/);
+    assert.ok(err instanceof ResizeStorageError);
+    assert.equal(err.code, 'RESIZE_PREVIEW_STORAGE_REF_INVALID');
+    assert.equal(err.retryable, true);
+  });
+
+  describe('RESIZE_WORKER_INCOMPLETE and the failures behind it', () => {
+    const bigger = variant({
+      sizeKey: '30x30',
+      requestedWidth: 30,
+      requestedHeight: 30,
+    });
+    const incomplete = async (
+      deps: ProcessorDeps,
+      previews: MissingPreview[],
+    ) => {
+      let thrown: unknown;
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews })),
+        (err: unknown) => {
+          thrown = err;
+          return (
+            err instanceof ResizeGenerateError &&
+            err.code === 'RESIZE_WORKER_INCOMPLETE'
+          );
+        },
+      );
+      return thrown as ResizeGenerateError;
+    };
+
+    test('RESIZE_WORKER_INCOMPLETE is not retryable when every missing variant failed with retryable false', async () => {
+      const { deps } = decodeDeps(redPng, {
+        pipeline: { variantSteps: [() => svgOutput] },
+      });
+      const err = await incomplete(deps, [variant(), bigger]);
+      assert.equal(err.missing.length, 2);
+      assert.equal(err.retryable, false);
+    });
+
+    test('RESIZE_WORKER_INCOMPLETE stays retryable when one missing variant failed with true', async () => {
+      const { deps } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (_img, { variant: v }) => {
+              if (v.sizeKey === '30x30') {
+                throw new Error('a passing failure');
+              }
+              return svgOutput;
+            },
+          ],
+        },
+      });
+      const err = await incomplete(deps, [variant(), bigger]);
+      assert.equal(err.missing.length, 2);
+      assert.equal(err.retryable, true);
+    });
+
+    test('RESIZE_WORKER_INCOMPLETE stays retryable for a missing variant with no recorded failure', async () => {
+      const { deps } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (img, { variant: v }) => (v.sizeKey === '30x30' ? img : svgOutput),
+          ],
+        },
+      });
+      // The store leaves the rendered row out: it is missing, and no failure says why.
+      deps.media = fakeMedia({
+        load: async () => mediaDoc(),
+        appendPreviews: async () => [],
+      });
+      const err = await incomplete(deps, [variant(), bigger]);
+      assert.equal(err.missing.length, 2);
+      assert.equal(err.retryable, true);
+    });
+
+    test('an unconfigured format stays retryable: a rolling deploy can add it', async () => {
+      const { deps } = decodeDeps(redPng);
+      const alone = await incomplete(deps, [variant({ format: 'jpg' })]);
+      assert.equal(alone.retryable, true);
+      // Beside a variant that can never be made, too.
+      const { deps: refusing } = decodeDeps(redPng, {
+        pipeline: { variantSteps: [() => svgOutput] },
+      });
+      const beside = await incomplete(refusing, [
+        variant(),
+        variant({ format: 'jpg' }),
+      ]);
+      assert.equal(beside.missing.length, 2);
+      assert.equal(beside.retryable, true);
+    });
   });
 
   test('JPEG bytes stored as png render as jpeg, with a warning naming both formats', async () => {

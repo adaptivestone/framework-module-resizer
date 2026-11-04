@@ -21,6 +21,11 @@
   `upload: { maxBytes, formats }` or a hand-written `limits`, and `satisfies FrameworkResizeConfig`,
   now fails `tsc`; spreading the defaults' `upload` and `limits` still compiles. At run time such a
   file still works: the module merges it over the defaults.
+- `ResizeConfigError` defaults to `retryable: false`. `RESIZE_TASK_MAX_ATTEMPTS`,
+  `RESIZE_SVG_PUBLIC_PREVIEW`, `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`.
+  `RESIZE_WORKER_INCOMPLETE` is `false` when every missing variant failed with `false`. A missing
+  object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both shipped drivers, where it was the raw
+  driver error.
 
 **Changed behaviour**
 
@@ -33,6 +38,8 @@
 
 - `upload.verify: 'decode'` (default `'none'`) decodes the first frame of a raster original before
   storing it, with `RESIZE_ORIGINAL_DAMAGED` (`false`) and `RESIZE_ORIGINAL_VERIFY_FAILED` (`true`).
+- `unconfirmed` may carry `retryable: false` and `causeCode`; `MongoTaskQueue` sets them for a
+  missing or outdated model, and `prewarm()` passes them on.
 
 **Fixes**
 

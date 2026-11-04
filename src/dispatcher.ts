@@ -410,10 +410,14 @@ export class Dispatcher {
           issues,
         );
       case 'unconfirmed':
-        return none(
-          'RESIZE_ENQUEUE_UNCONFIRMED',
-          'the task queue did not confirm the task',
-        );
+        return failed({
+          code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+          ...(typeof outcome.causeCode === 'string'
+            ? { causeCode: outcome.causeCode }
+            : {}),
+          message: 'the task queue did not confirm the task',
+          retryable: outcome.retryable !== false,
+        });
       case 'add-failed':
         logger.error(
           `resize prewarm: adding the task threw for media ${mediaId}`,

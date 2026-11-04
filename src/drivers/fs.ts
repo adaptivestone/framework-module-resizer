@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { DriverContext } from '../contracts/drivers.ts';
 import { ResizeStorage } from '../contracts/storage.ts';
-import { ResizeSecurityError } from '../errors.ts';
+import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
 import { optionalString, stringValue } from '../helpers/configSection.ts';
 import type { LocalStorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
@@ -139,8 +139,19 @@ export class LocalFsStorage extends ResizeStorage {
     const root =
       parsed.visibility === 'private' ? this.#privateRootDir : this.#rootDir;
     const abs = resolveInsideRoot(root, parsed.path);
-    await assertRealPathInsideRoot(root, abs);
-    return readFile(abs);
+    try {
+      await assertRealPathInsideRoot(root, abs);
+      return await readFile(abs);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new ResizeStorageError(
+          `resize fs: object not found: ${parsed.path}`,
+          { code: 'RESIZE_STORAGE_NOT_FOUND', cause: err },
+        );
+      }
+      throw err;
+    }
   }
 
   async upload({

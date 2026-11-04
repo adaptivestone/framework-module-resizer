@@ -460,6 +460,7 @@ describe('Consumer', () => {
       (events[0].error as { code?: string }).code,
       'RESIZE_TASK_MAX_ATTEMPTS',
     );
+    assert.equal((events[0].error as { retryable?: boolean }).retryable, false);
   });
 
   test('a hung task times out, its signal aborts, and it is retried', async () => {
@@ -485,6 +486,7 @@ describe('Consumer', () => {
       (events[0].error as { code?: string }).code,
       'RESIZE_TASK_TIMEOUT',
     );
+    assert.equal((events[0].error as { retryable?: boolean }).retryable, true);
   });
 
   test('a lost lease aborts the running task', async () => {

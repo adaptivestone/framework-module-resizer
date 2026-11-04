@@ -45,7 +45,7 @@ export function getSizeKey({ width, height, fit }: SizeInput): string {
   }
   throw new ResizeSetupError(
     'getSizeKey: a size needs `fit`, a width, and/or a height',
-    { code: 'RESIZE_SIZE_INVALID' },
+    { code: 'RESIZE_SIZE_INVALID', retryable: false },
   );
 }
 
@@ -164,7 +164,7 @@ export function requireMediaId(media: MediaLike): string {
   if (!id) {
     throw new ResizeMediaError(
       'resize: media has neither `id` nor `_id` — cannot identify the media document',
-      { code: 'RESIZE_MEDIA_NO_ID' },
+      { code: 'RESIZE_MEDIA_NO_ID', retryable: false },
     );
   }
   return id;

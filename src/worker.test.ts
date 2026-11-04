@@ -293,7 +293,7 @@ test('a storage.download security refusal is dead-lettered on its first delivery
   assert.equal(downloads, 1);
 });
 
-test('a variant error with retryable: false fails only its variant; the task fails with the retryable RESIZE_WORKER_INCOMPLETE', async () => {
+test('a variant error with retryable: false fails only its variant, and a task with nothing else missing is dead-lettered at once', async () => {
   const tasks = new MemoryTaskQueue({
     timing: { idlePollMs: 5, retryBackoffMs: { base: 60_000, max: 60_000 } },
   });
@@ -351,18 +351,80 @@ test('a variant error with retryable: false fails only its variant; the task fai
   const events = await firstEvent(tasks);
   assert.deepEqual(
     events.map((e) => e.event),
-    ['failed'],
+    ['deadLettered'],
   );
   assert.ok(events[0].error instanceof ResizeGenerateError);
   assert.equal(events[0].error.code, 'RESIZE_WORKER_INCOMPLETE');
-  assert.equal(events[0].error.retryable, true);
-  assert.equal(tasks.rows[0].status, 'pending');
+  assert.equal(events[0].error.retryable, false);
+  assert.equal(tasks.rows[0].status, 'dead');
   assert.equal(tasks.rows[0].attempts, 1);
   // The other variant is stored.
   assert.deepEqual(
     (stored.get('m1') ?? []).map((preview) => preview.sizeKey),
     ['10x10'],
   );
+});
+
+test('one variant failing with false and one with true stays retried', async () => {
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 60_000, max: 60_000 } },
+  });
+  const media: MediaLike = {
+    id: 'm1',
+    original: { storageRef: { key: 'o' } },
+    previews: [],
+  };
+  new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    storage: {
+      download: async () => png,
+      upload: async () => ({ key: 'k' }),
+      publicUrl: () => '',
+    },
+    media: fakeMedia({ load: async () => media }),
+    locks: memoryLocks(),
+    tasks,
+    pipelines: {
+      default: {
+        variantSteps: [
+          async (_img, { variant }) => {
+            if (variant.sizeKey === '20x20') {
+              throw new ResizeMediaError(
+                'resize: this variant cannot be made',
+                { code: 'TEST_VARIANT_REFUSED', retryable: false },
+              );
+            }
+            throw new Error('a passing failure');
+          },
+        ],
+      },
+    },
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [
+      webp10,
+      {
+        sizeKey: '20x20',
+        format: 'webp',
+        requestedWidth: 20,
+        requestedHeight: 20,
+      },
+    ],
+  });
+  const events = await firstEvent(tasks);
+  assert.deepEqual(
+    events.map((e) => e.event),
+    ['failed'],
+  );
+  assert.ok(events[0].error instanceof ResizeGenerateError);
+  assert.equal(events[0].error.code, 'RESIZE_WORKER_INCOMPLETE');
+  assert.equal(events[0].error.retryable, true);
+  assert.equal(tasks.rows[0].status, 'pending');
 });
 
 // A Resizer named `name` on `tasks`. Its default media store has no docs, so each of its tasks is a

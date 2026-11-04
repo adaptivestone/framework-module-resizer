@@ -212,7 +212,11 @@ export class MongoTaskQueue extends TaskQueue {
     try {
       const model = this.#model();
       if (!model) {
-        return { status: 'unconfirmed' };
+        return {
+          status: 'unconfirmed',
+          retryable: false,
+          causeCode: 'RESIZE_MONGO_MODEL_MISSING',
+        };
       }
       for (let round = 0; round < ADD_ROUNDS; round++) {
         const taskId = await insertActive(model, task);
@@ -252,7 +256,11 @@ export class MongoTaskQueue extends TaskQueue {
             err,
           );
         }
-        return { status: 'unconfirmed' };
+        return {
+          status: 'unconfirmed',
+          retryable: false,
+          causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+        };
       }
       this.#logger.error(
         `resize mongo queue: adding a task failed for media ${task.mediaId}`,

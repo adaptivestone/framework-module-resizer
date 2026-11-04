@@ -232,6 +232,13 @@ const terminalScan = (
     if (flags.length === 0) {
       continue;
     }
+    // An add result, not an error: prewarm reads its `retryable`, the worker never does.
+    if (/status:\s*'unconfirmed'/.test(literal[0])) {
+      for (const flag of flags) {
+        resolved.add(literal.index + flag.index);
+      }
+      continue;
+    }
     // The whole `code:` value, up to the next `,` or the literal's `}`, must be the string literal
     // or the constant's bare name: `UNSUPPORTED + '_NEW'`, a call, a template literal or a
     // property read leaves the flag unread.
@@ -272,13 +279,17 @@ test('the terminal-code scan reads every decoder and driver file, and the consum
 
 test('the README lists exactly the codes a task is dead-lettered with at once', () => {
   const expected = [
+    'RESIZE_MEDIA_NO_ID',
     'RESIZE_NO_ORIGINAL',
+    'RESIZE_SIZE_INVALID',
     'RESIZE_SOURCE_DAMAGED',
     'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
     'RESIZE_SOURCE_METADATA_MISSING',
     'RESIZE_SOURCE_TOO_LARGE',
     'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
+    'RESIZE_SVG_PUBLIC_PREVIEW',
     'RESIZE_SVG_RENDER_TIMEOUT',
+    'RESIZE_TASK_MAX_ATTEMPTS',
   ];
   const files = taskPathFiles();
   assert.ok(files.length >= 25, `only ${files.length} task-path files`);
