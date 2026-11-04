@@ -4,8 +4,9 @@
 
 - A damaged source now fails. `limits.failOn` (new, default `'error'`) replaces the hard-coded
   `failOn: 'none'`. A cut or unreadable original is dead-lettered on its first delivery with
-  `RESIZE_SOURCE_DAMAGED` (`retryable: false`) instead of rendering a garbled preview. Two limits:
-  bytes flipped mid-file can still render garbled, and a JPEG missing only its end marker is usually
+  `RESIZE_SOURCE_DAMAGED` (`retryable: false`) instead of rendering a garbled preview. A cut
+  animated GIF can still render the frames it has, so its preview can be shorter. Two limits: bytes
+  flipped mid-file can still render garbled, and a JPEG missing only its end marker is usually
   refused at every strict level. `limits.failOn: 'none'` restores 0.3.0's rendering; a file whose
   header cannot be read still fails, usually at once (a file with no usable detail and a cut TIFF
   are retried). It is not in `encodeSig`, so nothing regenerates; previews already made stay fresh,

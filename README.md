@@ -1555,40 +1555,47 @@ await ResizeTask.updateOne(
 - **Damaged originals:** a source the engine refuses is dead-lettered on its first delivery with
   `RESIZE_SOURCE_DAMAGED`. Its pixels are decoded at `limits.failOn`, and that message names the
   level; its header is read at Sharp's own default level, whatever `limits.failOn` says. `'error'`
-  refuses a truncation that cuts image data; a cut TIFF is retried, not refused. Two limits: bytes
-  flipped mid-file can still render garbled at every level, and a JPEG missing only its end marker
-  is usually refused at every strict level (the few that pass have all their image data and render
-  the same pixels as the intact file). `'warning'` refuses more, including JPEGs that look identical
-  to the intact file. `'none'` restores 0.3.0's rendering; a file whose header cannot be read still
+  refuses a truncation that cuts image data; a cut TIFF is retried, not refused, and a cut animated
+  GIF can still render the frames it has, so its preview can be shorter. Two limits: bytes flipped
+  mid-file can still render garbled at every level, and a JPEG missing only its end marker is
+  usually refused at every strict level (the few that pass have all their image data and render the
+  same pixels as the intact file). `'warning'` refuses more, including JPEGs that look identical to
+  the intact file. `'none'` restores 0.3.0's rendering; a file whose header cannot be read still
   fails, usually at once. Decoding failures at the same moment in one process can blur which file
-  an engine message belongs to, so a failure with no usable detail is retried.
+  an engine message belongs to, so a failure with no usable detail is retried. They can also,
+  rarely, put a neighbour's damage line on a healthy file this build cannot render (7 of 800 decodes
+  with such files and cut JPEGs failing together); that file is then dead-lettered until the next
+  read after the cooldown.
 
   **Previews made before this version.** A preview made from a damaged original stays fresh:
   upgrading does not regenerate it. To find them, decode each original at the level the worker now
-  uses, with your `limits.inputPixels`. Skip SVG originals, and a record with no `format` that could
-  be one: SVG markup is untrusted, and the module renders it only in a separate process with a time
-  limit.
+  uses, with your `limits.inputPixels`. Skip SVG originals: SVG markup is untrusted, and the module
+  renders it only in a separate process with a time limit. The bytes decide, because a stored
+  `format` can hold a MIME type or a wrong value.
 
   ```ts
   import sharp from 'sharp';
   const { format, storageRef } = media.original;
-  if (format !== undefined && format !== 'svg') {
+  if (format !== 'svg') {
     const bytes = await storage.download(storageRef);
-    await sharp(bytes, { failOn: 'error', limitInputPixels: limits.inputPixels })
-      .resize(16)
-      .raw()
-      .toBuffer(); // rejects: look at this file
+    const input = { limitInputPixels: limits.inputPixels };
+    if ((await sharp(bytes, input).metadata()).format !== 'svg') {
+      await sharp(bytes, { ...input, failOn: 'error' })
+        .resize(16)
+        .raw()
+        .toBuffer(); // rejects: look at this file
+    }
   }
   ```
 
-  A rejection means "look at this file", not proof of damage: a healthy file this build cannot
-  decode rejects too. For each one that is damaged, call `invalidate()` and delete the returned
-  refs. Its next task is dead-lettered with `RESIZE_SOURCE_DAMAGED`, and while reads keep asking,
-  each cooldown costs one download, one decode and one `error` line, so mark that media in your app
-  or replace its original. A second pass at `failOn: 'warning'` also finds some mid-file corruption,
-  but it flags harmless JPEGs too, so look at those by eye. The worker accepts them, so
+  A rejection from either call means "look at this file", not proof of damage: a healthy file this
+  build cannot decode rejects too. For each one that is damaged, call `invalidate()` and delete the
+  returned refs. Its next task is dead-lettered with `RESIZE_SOURCE_DAMAGED`, and while reads keep
+  asking, each cooldown costs one download, one decode and one `error` line, so mark that media in
+  your app or replace its original. A second pass at `failOn: 'warning'` also finds some mid-file
+  corruption, but it flags harmless JPEGs too, so look at those by eye. The worker accepts them, so
   `invalidate()` alone makes the same preview again. Flipped bytes can pass every level: no decode
-  finds them.
+  finds them. A cut animated GIF can pass too, and this recipe reads only its first frame.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the

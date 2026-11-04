@@ -158,10 +158,6 @@ test('sharpDecodeError leaves an empty corrupt-header message the engine failure
   assert.equal(
     engine.message,
     'Input buffer has corrupt header: the engine gave no detail',
-    // A seek line alone, for the same reason: the line after it can be gone. No truncation depends on
-    // it: 14 files, each cut at 201 points and read at four levels, always had a line after it.
-    'source: bad seek to 149238',
-    'Input buffer has corrupt header: source: bad seek to 1024',
   );
   // Any other message keeps its text: only the bare prefix has nothing to say.
   const unknown = new Error('Unknown error');
