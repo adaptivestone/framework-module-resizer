@@ -55,7 +55,7 @@ export interface Original {
   format?: string;
   size?: number;
   contentType?: string;
-  width?: number; // captured at upload; backfilled by the worker if missing
+  width?: number; // captured at upload or adoption; backfilled by the worker if missing
   height?: number;
 }
 
@@ -63,6 +63,12 @@ export interface UploadOriginalOpts {
   body: Buffer | Uint8Array;
   visibility: 'public' | 'private';
   namespace?: string;
+}
+
+export interface AdoptOriginalOpts {
+  // The driver's locator of an object already in storage, built from the host's own records. It is
+  // saved as it is: its JSON form is signed into every preview's origin.
+  storageRef: StorageRef;
 }
 
 // Which Resizer and pipeline rendered a preview. Part of the preview identity, so different

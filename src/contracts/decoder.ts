@@ -30,7 +30,7 @@ export interface DecodeBox {
 
 export interface RenderOptions {
   limits: ResizeLimits;
-  /** Aborts when the task does; a decoder stops when it can. Absent in the upload.verify check. */
+  /** Aborts when the task does; a decoder stops when it can. Absent in the upload and adoption checks. */
   signal?: AbortSignal;
   /** What `inspect` returned for these bytes. */
   source: SourceInfo;
@@ -62,6 +62,14 @@ export interface Raster {
 export abstract class SourceDecoder {
   /** The format ids this decoder reads (`original.format` values), e.g. `['svg']`. */
   abstract readonly formats: readonly string[];
+
+  /**
+   * `true` when a public original of this source kind is safe. Without it, a public upload and the
+   * adoption of a public object are refused with RESIZE_ORIGINAL_PUBLIC_REFUSED. SVG is refused
+   * whatever this says. In TypeScript, set it as a field (`readonly publicOriginals = true`).
+   * `declare`, so a JavaScript subclass's getter is not shadowed by an undefined field.
+   */
+  declare readonly publicOriginals?: boolean;
 
   /**
    * Measure the bytes: format, display size, frames. Read only what that needs; never render.

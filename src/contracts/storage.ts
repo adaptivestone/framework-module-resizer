@@ -9,7 +9,9 @@ export interface StorageUploadArgs {
   contentType: string;
   visibility: 'public' | 'private';
   namespace?: string; // placement hint from uploadOriginal({ namespace })
-  parentRef?: StorageRef; // the original's ref when the worker stores one of its previews
+  // The original's ref when the worker stores one of its previews. An adopted original's ref was
+  // not written by this driver, so a driver must tolerate that.
+  parentRef?: StorageRef;
 }
 
 export interface StorageDownloadOptions {
@@ -24,7 +26,8 @@ export abstract class ResizeStorage {
    * object over `maxBytes` rejects with a ResizeMediaError with the code RESIZE_SOURCE_TOO_LARGE
    * and `retryable: false`, without the key in its message: a key may hold a client's file name,
    * and this line reaches logs. A driver that ignores `maxBytes` still works: the core checks the
-   * length afterwards, but the memory is already spent.
+   * length afterwards, but the memory is already spent. `adoptOriginal` passes refs a host built:
+   * refuse one outside this driver's scope with a ResizeError, which reaches the host unchanged.
    */
   abstract download(
     ref: StorageRef,
@@ -33,13 +36,15 @@ export abstract class ResizeStorage {
 
   /**
    * Upload a new object and return the JSON-compatible locator to persist. It must stay the same on
-   * every load: one that changes per load reads as a replaced original.
+   * every load, for ever: its JSON form is signed into every preview's origin, so one that changes
+   * reads as a replaced original.
    */
   abstract upload(args: StorageUploadArgs): Promise<StorageRef>;
 
   /**
    * Public URL of an object. Pure and synchronous: the read path calls it for stored previews,
-   * so no I/O. It must refuse a ref it would not expose (e.g. a private original).
+   * so no I/O. It must refuse a ref it would not expose (e.g. a private original): `adoptOriginal`
+   * relies on that to tell a public object from a private one.
    */
   abstract publicUrl(ref: StorageRef): string;
 

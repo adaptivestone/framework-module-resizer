@@ -2,10 +2,20 @@
 // shows only here. The recording fakes of s3.test.ts never open a socket.
 import assert from 'node:assert/strict';
 import type { Readable } from 'node:stream';
-import { after, before, test } from 'node:test';
+import { after, afterEach, before, test } from 'node:test';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
+import sharp from 'sharp';
 import { ResizeMediaError, ResizeStorageError } from '../errors.ts';
+import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { type FakeS3, fakeS3 } from '../testHelpers/fakeS3.ts';
+import { fakeMedia, silentLogger } from '../testHelpers/fakes.ts';
+import type { MediaLike } from '../types.d.ts';
+
+const jpeg = await sharp({
+  create: { width: 64, height: 48, channels: 3, background: '#3366cc' },
+})
+  .jpeg()
+  .toBuffer();
 
 let s3: FakeS3;
 
@@ -14,6 +24,8 @@ before(async () => {
 });
 
 after(() => s3.close());
+
+afterEach(resetResizerForTests);
 
 test('download over maxBytes rejects from ContentLength, reads no body and closes the connection', {
   timeout: 10_000,
@@ -83,6 +95,102 @@ test('the fake server stores a PUT, records raw targets and answers a missing ke
       assert.equal(err.code, 'RESIZE_STORAGE_NOT_FOUND');
       return true;
     },
+  );
+});
+
+test('an adopted object with a hostile key renders: previews land on clean keys, and a read serves them', async () => {
+  const key = 'legacy/фото/my cat (1)+%20#?.jpg';
+  s3.objects.set(`priv/${key}`, jpeg);
+  const resizer = new Resizer({
+    storage: s3.storage(),
+    media: fakeMedia(),
+    logger: silentLogger,
+  });
+  const original = await resizer.adoptOriginal({
+    storageRef: { bucket: 'priv', key },
+  });
+  assert.deepEqual(original.storageRef, { bucket: 'priv', key }); // raw, as signed into every origin
+  assert.equal(original.format, 'jpeg');
+  const media: MediaLike = { id: 'm1', original, previews: [] };
+  const sizes = [{ width: 16, height: 16 }];
+  const { created, failed } = await resizer.generate({
+    media,
+    sizes,
+    formats: ['webp'],
+  });
+  assert.equal(failed, 0);
+  assert.match(
+    (created[0].storageRef as { key: string }).key,
+    /^previews\/[0-9a-f]{32}\.webp$/,
+  );
+  const { decision } = await resizer.resolve({
+    media,
+    sizes,
+    formats: ['webp'],
+    enqueueMissing: false,
+  });
+  assert.equal(decision.missing.length, 0);
+  assert.equal((await fetch(decision.ready[0].url)).status, 200);
+});
+
+test('adoption through the real driver: what it refuses reaches the host unchanged, and nothing is sent', async () => {
+  const resizer = new Resizer({
+    storage: s3.storage(),
+    media: fakeMedia(),
+    logger: silentLogger,
+  });
+  const sent = s3.requests.length;
+  for (const key of [
+    'uploads//cat.jpg',
+    'dir/',
+    'a\tb.jpg',
+    '/a.jpg',
+    'a/../b',
+  ]) {
+    await assert.rejects(
+      resizer.adoptOriginal({ storageRef: { bucket: 'priv', key } }),
+      { code: 'RESIZE_STORAGE_KEY_INVALID', retryable: false },
+    );
+  }
+  await assert.rejects(
+    resizer.adoptOriginal({ storageRef: { bucket: 'other', key: 'a.jpg' } }),
+    { code: 'RESIZE_S3_BUCKET_NOT_ALLOWED', retryable: false },
+  );
+  assert.equal(s3.requests.length, sent);
+  await assert.rejects(
+    resizer.adoptOriginal({ storageRef: { bucket: 'priv', key: 'none.jpg' } }),
+    { code: 'RESIZE_STORAGE_NOT_FOUND', retryable: true },
+  );
+});
+
+test('adoption through the real driver: the bucket decides what is public', async () => {
+  const body = Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"/>',
+  );
+  s3.objects.set('priv/a.svg', body);
+  s3.objects.set('pub/a.svg', body);
+  s3.objects.set('pub/a.jpg', jpeg);
+  const resizer = new Resizer({
+    storage: s3.storage(),
+    media: fakeMedia(),
+    logger: silentLogger,
+  });
+  const privateSvg = { bucket: 'priv', key: 'a.svg' };
+  assert.equal(
+    (await resizer.adoptOriginal({ storageRef: privateSvg })).format,
+    'svg',
+  );
+  await assert.rejects(
+    resizer.adoptOriginal({ storageRef: { bucket: 'pub', key: 'a.svg' } }),
+    { code: 'RESIZE_ORIGINAL_SVG_PUBLIC', retryable: false },
+  );
+  assert.equal(
+    (
+      await resizer.adoptOriginal({
+        storageRef: { bucket: 'pub', key: 'a.jpg' },
+      })
+    ).format,
+    'jpeg',
   );
 });
 

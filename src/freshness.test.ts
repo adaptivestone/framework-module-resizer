@@ -64,6 +64,17 @@ test('expectedOrigin signs the original ref with its dimensions', () => {
   assert.equal(expectedOrigin(undefined, { width: 20, height: 10 }), undefined);
 });
 
+test('a ref changed in form only stays fresh; a ref changed in meaning goes stale', () => {
+  const dims = { width: 20, height: 10 };
+  const signed = previewOrigin({ bucket: 'b', key: 'k' }, dims);
+  assert.equal(previewOrigin({ key: 'k', bucket: 'b' }, dims), signed);
+  assert.notEqual(
+    previewOrigin({ bucket: 'b', key: 'k', namespace: 'n' }, dims),
+    signed,
+  );
+  assert.notEqual(previewOrigin({ bucket: 'other', key: 'k' }, dims), signed);
+});
+
 test('isFreshRow', () => {
   const row = (fields: Partial<Preview>): Preview => ({
     storageRef: { key: 'p' },

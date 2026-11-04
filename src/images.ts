@@ -170,6 +170,17 @@ export function requireMediaId(media: MediaLike): string {
   return id;
 }
 
+/**
+ * The one test for "this media is on the module": it holds a storage locator. A hydrated Mongoose
+ * document reads a never-set `original` as an empty object, so `if (doc.original)` is always true
+ * there. A projection without the module's fields reads false too, so load `resizeMediaPaths` first.
+ */
+export function hasOriginal(
+  media: { original?: { storageRef?: unknown } | null } | null | undefined,
+): boolean {
+  return media?.original?.storageRef != null;
+}
+
 /** Scope of rows stored before previews recorded their resizer and pipeline. */
 export const DEFAULT_SCOPE: PreviewScope = Object.freeze({
   resizer: 'default',

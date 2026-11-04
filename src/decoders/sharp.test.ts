@@ -7,8 +7,14 @@ import { ResizeError } from '../errors.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import type { ResizeFailOn } from '../types.d.ts';
 import { SharpDecoder } from './sharp.ts';
+import { SvgDecoder } from './svg.ts';
 
 const limits = makeImageConfig().limits;
+
+test('public originals: the Sharp decoder allows them, and the SVG decoder does not', () => {
+  assert.equal(new SharpDecoder().publicOriginals, true);
+  assert.equal(new SvgDecoder().publicOriginals, undefined);
+});
 
 // 64×48 stored, EXIF orientation 6: displayed 48×64.
 const orientedJpeg = await sharp({

@@ -331,7 +331,7 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 - the errors: `ResizeError`, `ResizeConfigError`, `ResizeSetupError`, `ResizeMediaError`,
   `ResizeNoOriginalError`, `ResizeOriginalError`, `ResizeGenerateError`, `ResizeStorageError`,
   `ResizeSecurityError`, and their options `ResizeErrorOptions`;
-- the helpers: `formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`,
+- the helpers: `formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `hasOriginal`,
   `rasterToSharp`, `sharpToRaster`;
 - the hook and pipeline types: `HookName`, `HookFn`, `HookSignatures`, `HookTaps`, `WaterfallName`,
   `ObserverName`, `Pipeline`, `BeforeStep`, `VariantStep`;
@@ -342,8 +342,9 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
   - the Resizer calls: for `resolve()`, `ResolveOpts`, `SizeInput`, `ReadDecision`, `ReadyEntry`
     and `MissingPreview`; for `prewarm()`, `PrewarmOpts`, `PrewarmResult`, `PrewarmStatus`,
     `EnqueueReceipt` and `EnqueueIssue`; for `generate()`, `GenerateOpts` and `GenerateResult`;
-    for `invalidate()`, `InvalidateOpts`; for `uploadOriginal()`, `UploadOriginalOpts`; and
-    `PictureUrls`, what `formatPictureUrls` makes of a decision;
+    for `invalidate()`, `InvalidateOpts`; for `uploadOriginal()`, `UploadOriginalOpts`; for
+    `adoptOriginal()`, `AdoptOriginalOpts`; and `PictureUrls`, what `formatPictureUrls` makes of a
+    decision;
   - the media and preview shapes: `MediaLike`, `Original`, `OriginalFormat`, `Preview`,
     `PreviewFormat`, `PreviewScope`, `Filters`, `StorageRef`;
   - the config sections: the image settings `ResizeConfig`, `ResizeLimits` and `ResizeFailOn`, and `DeepPartial`
@@ -551,11 +552,16 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `ResizeStorage`: `upload`, `download`, `publicUrl` (pure, no I/O), and optionally
   `signedUrl(ref, ttlSeconds)`. The module never calls `signedUrl`; a host calls it to give an
   owner the private original.
-  - The ref you return from `upload()` is opaque to the module and comes back unchanged, and it must
-    stay the same on every load: a ref that changes per load (a per-access nonce, say) reads as a
-    replaced original.
+  - The ref you return from `upload()` is opaque to the module and comes back unchanged. It is
+    JSON-compatible and byte-stable for ever, because its JSON form is signed into every preview's
+    `origin`: a ref that changes per load (a per-access nonce, say) reads as a replaced original.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
-    original's ref, for previews). Never both.
+    original's ref, for previews). Never both. It must tolerate a `parentRef` it did not write: an
+    adopted object's ref comes from the host.
+  - `download()` must accept every ref the host adopts, and refuse one outside its scope with a
+    `ResizeError`, which `adoptOriginal()` passes through unchanged.
+  - `publicUrl()` must refuse a ref it would not expose, because `adoptOriginal()` relies on that to
+    tell a public object from a private one.
   - `download()` reports a missing object with a `ResizeStorageError` with the code
     `RESIZE_STORAGE_NOT_FOUND`, retryable, as both shipped drivers do: each retry costs one 404,
     and an object can appear later (a row written before its PUT finishes). An S3 role without
@@ -837,8 +843,8 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   limits allow. The core resizes it to each exact size either way, and a raster source smaller
   than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
   its engine can. With `upload.verify: 'decode'` a host's `render` also runs in the API process
-  during `uploadOriginal()`, with no `opts.signal`, so the decoder bounds its own time; a source
-  that reports `vector` is not rendered there. A raster whose `data` length does not match its
+  during `uploadOriginal()`, and it always runs during `adoptOriginal()`, with no `opts.signal`, so
+  the decoder bounds its own time; a source that reports `vector` is not rendered there. A raster whose `data` length does not match its
   `info` is `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
   `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
   (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
@@ -847,6 +853,9 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   as `cause`.
 - Optionally `verify()`: awaited by `resizer.verify()` and at worker start; throw there when the
   decoder cannot work (e.g. a missing engine).
+- `publicOriginals`: optional. Set `true` when public uploads of this source kind are safe. Without
+  it, `uploadOriginal({ visibility: 'public' })` and `adoptOriginal` of a public object throw
+  `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it. SVG is refused whatever the flag says.
 
 **Which decoder reads a source.** At upload the decoders are asked in order, and the first that
 accepts the bytes measures them: its `format` is stored as `original.format` and its
@@ -919,7 +928,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
 | `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
-| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` rejects with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
+| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
@@ -1302,11 +1311,14 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 | `resize.preview.stale` | count | the stale previews one read found | `pipeline` | `mediaId` |
 | `resize.upload` | timing | ms of `uploadOriginal()` | `outcome`: `stored` or `rejected`; `format` (stored); `code` (rejected, for a module error) | — |
 | `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
+| `resize.adopt` | timing | ms of `adoptOriginal()` | `outcome`: `adopted` or `rejected`; `format` (adopted); `code` (rejected, for a module error) | — |
 | `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode), `rawFormat` (`format: 'unconfigured'`) |
 | `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
 | `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `rendered` (on `completed`: the variants this delivery stored), `payloadQueue` (when the task names another queue) |
 | `resize.claim` | timing | ms the worker's loop waited for this task | `queue` | `taskId` |
 
+- **`resize.adopt`** reaches the debug line of `LogMetrics` only, and not its summary: an adoption is
+  a bounded script, not traffic.
 - **`resize.read` outcomes**, in the order a read decides them: `unknown-pipeline` (the pipeline is
   not registered), `ready` (nothing was missing or stale), `suppressed` (nothing was left to queue
   after `beforeEnqueue` and the dropped formats, or the caller passed `enqueueMissing: false`),
@@ -1746,8 +1758,45 @@ const refs = await getResizer().invalidate({ media: file, pipeline: 'photo' }); 
 ```
 
 - **Your app's responsibilities:** deleting media and their storage objects (the refs that
-  `invalidate` returns too), access checks, the response shape, migrating legacy data, and domain
-  image analysis such as face blurring (in pipeline steps).
+  `invalidate` returns too), access checks, the response shape, moving legacy data onto the module
+  (the module's part is [`adoptOriginal()`](#adoptoriginal)), and domain image analysis such as face
+  blurring (in pipeline steps).
+
+### `adoptOriginal()`
+
+`resizer.adoptOriginal({ storageRef })` measures and decodes an object already in storage and
+resolves with the `Original` that `uploadOriginal()` would return for it. It writes nothing and
+queues nothing: save the result as it is, and do not change it later, because a changed ref
+regenerates that media's previews. `hasOriginal(media)` tells whether a media is on the module yet.
+The how-to, with the backfill loop, is in the guide:
+[Adopting on an app with existing media](https://framework.adaptivestone.com/docs/resize#adopting).
+
+It does not apply `upload.maxBytes` or `upload.formats`. It refuses what a worker could never
+render, and a public SVG, so it always decodes the object, on a Sharp thread, in the process that
+calls it. The check decodes the first frame. With `animated: true`, damage in a later frame shows up
+on the worker as a dead task, `RESIZE_SOURCE_DAMAGED`.
+
+| Case | Class | Code | `retryable` |
+|---|---|---|---|
+| No `storageRef` | `ResizeOriginalError` | `RESIZE_ORIGINAL_STORAGE_REF_INVALID` | `false` (at upload, where a driver returned nothing, it is a `ResizeStorageError` and `true`) |
+| A driver's own `ResizeError`: a third bucket, a refused key or ref, a missing object, over the limit | as thrown, the same object | its code, e.g. `RESIZE_S3_BUCKET_NOT_ALLOWED`, `RESIZE_STORAGE_KEY_INVALID`, `RESIZE_STORAGE_NOT_FOUND`, `RESIZE_SOURCE_TOO_LARGE` | its own |
+| Any other driver error | `ResizeStorageError` | `RESIZE_ORIGINAL_DOWNLOAD_FAILED` | `true` |
+| A driver that ignored `maxBytes` | `ResizeMediaError` | `RESIZE_SOURCE_TOO_LARGE` | `false` |
+| Empty object | `ResizeOriginalError` | `RESIZE_ORIGINAL_EMPTY` | `false` |
+| Not an image, unknown format, one frame over the pixel limit | `ResizeOriginalError` | `RESIZE_ORIGINAL_INVALID`, `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`, `RESIZE_ORIGINAL_TOO_MANY_PIXELS` | `false` |
+| An unrecognised engine failure during `inspect` | `ResizeOriginalError` | `RESIZE_ORIGINAL_INSPECT_FAILED` | `true` |
+| Public SVG | `ResizeOriginalError` | `RESIZE_ORIGINAL_SVG_PUBLIC` | `false` |
+| Public, and its decoder has no `publicOriginals: true` | `ResizeOriginalError` | `RESIZE_ORIGINAL_PUBLIC_REFUSED` | `false` |
+| The decode finds damage | `ResizeOriginalError` | `RESIZE_ORIGINAL_DAMAGED` | `false` |
+| The decode fails for another reason | `ResizeOriginalError` | `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` |
+| A host decoder's final refusal (`retryable: false`), at `inspect` or in the decode | `ResizeOriginalError` | its own code | `false` |
+| A decoder's setup or config error | as thrown, the same object | its own code | its own |
+
+**Which keys are refused.** `S3Storage` reads any key except one with a control character, a `.` or
+`..` part, a leading `/` or an empty part: `uploads//cat.jpg`, `dir/` and a name holding a tab are
+`RESIZE_STORAGE_KEY_INVALID` (`retryable: false`). A key that holds a client's file name is fine.
+`LocalFsStorage` paths stay in `[A-Za-z0-9_.-]`, because they are filesystem paths. For such an
+object, copy it to a new key and adopt that.
 
 ### `prewarm()` issues
 

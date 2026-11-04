@@ -445,6 +445,14 @@ const rows: [code: string, retryable: boolean, trigger: () => unknown][] = [
     false,
     () => upload(cutJpeg, { config: { upload: { verify: 'decode' } } }),
   ],
+  [
+    'RESIZE_ORIGINAL_PUBLIC_REFUSED',
+    false,
+    () =>
+      uploader(new DecoderSet([decoder()]), {
+        config: { upload: { formats: ['pdf'] } },
+      }).upload({ body: png, visibility: 'public' }),
+  ],
   // An upload, true: the bytes may be fine.
   ['RESIZE_ORIGINAL_INSPECT_FAILED', true, () => uploadThrough(crashing)],
   [
@@ -466,6 +474,18 @@ const rows: [code: string, retryable: boolean, trigger: () => unknown][] = [
           },
         },
       }),
+  ],
+  [
+    'RESIZE_ORIGINAL_DOWNLOAD_FAILED',
+    true,
+    () =>
+      uploader(createDecoderSet(), {
+        storage: {
+          download: async () => {
+            throw new Error('x');
+          },
+        },
+      }).adopt({ storageRef: { key: 'k' } }),
   ],
   [
     'RESIZE_ORIGINAL_STORAGE_REF_INVALID',

@@ -1,13 +1,16 @@
 // Stores an original as uploaded. The decoders measure it (format, size, frames) to check the
 // upload rules, and with `upload.verify: 'decode'` decode it once; the bytes go to storage unchanged.
-// It needs only the storage, the decoders and the image config; it creates no media, queues no work
-// and logs nothing. Each upload is timed and counted on the metrics sink, stored or rejected.
+// It also measures an object already in storage, and always decodes it once, so a host can put what
+// it holds on the module without uploading it again. It needs only the storage, the decoders and the
+// image config; it creates no media, queues no work and logs nothing. Each upload and each adoption
+// is timed on the metrics sink, whatever its outcome.
 import type { SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { DecoderSet, IdentifiedSource } from './decoderSet.ts';
 import {
   type ResizeError,
+  ResizeMediaError,
   ResizeOriginalError,
   ResizeStorageError,
 } from './errors.ts';
@@ -17,12 +20,16 @@ import { randomHex } from './helpers/random.ts';
 import { engineDetail, isUnsupportedBytes } from './helpers/sharpError.ts';
 import { errorCodeLabel, NoopMetrics } from './metrics.ts';
 import type {
+  AdoptOriginalOpts,
   Original,
   OriginalFormat,
   ResizeConfig,
   StorageRef,
   UploadOriginalOpts,
 } from './types.d.ts';
+
+/** The public method a message speaks for: a host reads which call refused its object. */
+type Verb = 'uploadOriginal' | 'adoptOriginal';
 
 interface IdentifiedOriginal {
   decoder: SourceDecoder;
@@ -34,7 +41,11 @@ interface IdentifiedOriginal {
   height: number;
 }
 
-/** The upload codes of the decoder codes that say what is wrong with the original. */
+/**
+ * The upload codes of the decoder codes that say what is wrong with the original. A storage driver's
+ * RESIZE_SOURCE_TOO_LARGE never reaches this map: it counts bytes, not pixels, and adoption passes
+ * it on as it is.
+ */
 const ORIGINAL_CODES = new Map([
   ['RESIZE_SOURCE_FORMAT_UNSUPPORTED', 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED'],
   ['RESIZE_SOURCE_METADATA_MISSING', 'RESIZE_ORIGINAL_METADATA_MISSING'],
@@ -76,17 +87,17 @@ function damageDetail(err: ResizeError): string {
  * and passes through unchanged; the class is told by the brand and the class names, so an error
  * from a duplicate copy of the package counts too.
  */
-function originalError(cause: unknown): ResizeError {
+function originalError(cause: unknown, verb: Verb): ResizeError {
   if (!isModuleError(cause)) {
     const message = messageText(cause);
     const detail = uploadDetail(message);
     return isUnsupportedBytes(cause)
       ? new ResizeOriginalError(
-          `resize uploadOriginal: bytes are not a supported image: ${detail}`,
+          `resize ${verb}: bytes are not a supported image: ${detail}`,
           { code: 'RESIZE_ORIGINAL_INVALID', cause },
         )
       : new ResizeOriginalError(
-          `resize uploadOriginal: the decoder could not read the image: ${detail}`,
+          `resize ${verb}: the decoder could not read the image: ${detail}`,
           { code: 'RESIZE_ORIGINAL_INSPECT_FAILED', retryable: true, cause },
         );
   }
@@ -98,8 +109,8 @@ function originalError(cause: unknown): ResizeError {
     const xml = detail.match(/XML parse error: (.*)$/);
     return new ResizeOriginalError(
       xml
-        ? `resize uploadOriginal: the SVG could not be parsed: ${xml[1]}`
-        : `resize uploadOriginal: bytes are not a supported image: ${detail}`,
+        ? `resize ${verb}: the SVG could not be parsed: ${xml[1]}`
+        : `resize ${verb}: bytes are not a supported image: ${detail}`,
       { code: 'RESIZE_ORIGINAL_INVALID', cause },
     );
   }
@@ -118,6 +129,7 @@ async function verifyDecodes(
   { decoder, info }: IdentifiedOriginal,
   body: Buffer,
   config: ResizeConfig,
+  verb: Verb,
 ): Promise<void> {
   try {
     await decoder.render(
@@ -132,39 +144,44 @@ async function verifyDecodes(
       }
       if (cause.code === 'RESIZE_SOURCE_DAMAGED') {
         throw new ResizeOriginalError(
-          `resize uploadOriginal: the image is damaged: ${damageDetail(cause)}`,
+          `resize ${verb}: the image is damaged: ${damageDetail(cause)}`,
           { code: 'RESIZE_ORIGINAL_DAMAGED', cause },
         );
       }
       // The decoder's own word that no retry can help (an encrypted PDF) stands, as at `inspect`.
       if (ORIGINAL_CODES.has(cause.code) || notRetryable(cause)) {
-        throw originalError(cause);
+        throw originalError(cause, verb);
       }
     }
     // A timeout, or a file this build cannot decode, gives no verdict on the image.
     throw new ResizeOriginalError(
-      `resize uploadOriginal: the decode check failed: ${uploadDetail(messageText(cause))}`,
+      `resize ${verb}: the decode check failed: ${uploadDetail(messageText(cause))}`,
       { code: 'RESIZE_ORIGINAL_VERIFY_FAILED', retryable: true, cause },
     );
   }
 }
 
+/**
+ * Identify the bytes and hold them to `limits.sourcePixels`. `countFrames: false` means pages count
+ * as 1: a worker checks one frame, and the plan bounds how many it decodes.
+ */
 async function identifyOriginal(
   decoders: DecoderSet,
   body: Buffer,
   config: ResizeConfig,
+  { verb, countFrames }: { verb: Verb; countFrames: boolean },
 ): Promise<IdentifiedOriginal> {
   let identified: IdentifiedSource;
   try {
     identified = await decoders.identify(body, config.limits);
   } catch (cause) {
-    throw originalError(cause);
+    throw originalError(cause, verb);
   }
   const { info } = identified;
-  const pages = info.pages ?? 1;
+  const pages = countFrames ? (info.pages ?? 1) : 1;
   if (info.width * info.height * pages > config.limits.sourcePixels) {
     throw new ResizeOriginalError(
-      `resize uploadOriginal: image ${info.width}x${info.height}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
+      `resize ${verb}: image ${info.width}x${info.height}x${pages}f exceeds limits.sourcePixels (${config.limits.sourcePixels})`,
       { code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS' },
     );
   }
@@ -268,27 +285,21 @@ export class Uploader {
         { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
       );
     }
-    const measured = await identifyOriginal(this.#decoders, body, config);
+    const measured = await identifyOriginal(this.#decoders, body, config, {
+      verb: 'uploadOriginal',
+      countFrames: true,
+    });
     if (!config.upload.formats.includes(measured.format)) {
       throw new ResizeOriginalError(
         `resize uploadOriginal: format ${measured.format} is disabled by upload.formats`,
         { code: 'RESIZE_ORIGINAL_FORMAT_DISABLED' },
       );
     }
-    if (measured.format === 'svg' && opts.visibility === 'public') {
-      throw new ResizeOriginalError(
-        'resize uploadOriginal: SVG originals must be stored privately',
-        { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
-      );
+    if (opts.visibility === 'public') {
+      this.#checkPublic(measured, 'uploadOriginal');
     }
-    // No vector source renders on the request path: inspect has parsed an SVG's XML, and its render
-    // starts a process per upload. A host's vector decoder says so with `vector`.
-    if (
-      config.upload.verify === 'decode' &&
-      measured.format !== 'svg' &&
-      !measured.info.vector
-    ) {
-      await verifyDecodes(measured, body, config);
+    if (config.upload.verify === 'decode') {
+      await this.#decodeCheck(measured, body, 'uploadOriginal');
     }
     const key = `originals/${randomHex()}.${measured.extension}`;
     let ref: StorageRef;
@@ -320,5 +331,152 @@ export class Uploader {
       width: measured.width,
       height: measured.height,
     };
+  }
+
+  /**
+   * Measure and decode an object already in storage, and return the `Original` an upload of it would
+   * return. It stores nothing. The adoption is timed from here to its return or its throw: an
+   * adopted one with its format, a rejected one with its code.
+   */
+  async adopt(opts: AdoptOriginalOpts): Promise<Original> {
+    const started = performance.now();
+    let original: Original & { format: string };
+    try {
+      original = await this.#adopt(opts);
+    } catch (err) {
+      this.#metrics.timing('resize.adopt', performance.now() - started, {
+        outcome: 'rejected',
+        ...errorCodeLabel(err),
+      });
+      throw err;
+    }
+    this.#metrics.timing('resize.adopt', performance.now() - started, {
+      outcome: 'adopted',
+      format: original.format,
+    });
+    return original;
+  }
+
+  /**
+   * The adoption itself, each step before any later cost. `upload.maxBytes` and `upload.formats` are
+   * not applied: they are the policy for what clients send, and this object is already held. What a
+   * worker could never render is refused, which is why the decode always runs.
+   */
+  async #adopt(
+    opts: AdoptOriginalOpts,
+  ): Promise<Original & { format: string; size: number }> {
+    const ref = opts?.storageRef;
+    if (ref === null || ref === undefined) {
+      throw new ResizeOriginalError(
+        'resize adoptOriginal: storageRef is required',
+        { code: 'RESIZE_ORIGINAL_STORAGE_REF_INVALID' },
+      );
+    }
+    const downloaded = await this.#download(ref);
+    const { sourceBytes } = this.#config.limits;
+    // Before asBuffer, which copies a Uint8Array: a file about to be refused costs no second copy.
+    if (downloaded.byteLength > sourceBytes) {
+      throw new ResizeMediaError(
+        `resize adoptOriginal: object is ${downloaded.byteLength} bytes, over limits.sourceBytes (${sourceBytes})`,
+        { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+      );
+    }
+    if (downloaded.byteLength === 0) {
+      throw new ResizeOriginalError('resize adoptOriginal: object is empty', {
+        code: 'RESIZE_ORIGINAL_EMPTY',
+      });
+    }
+    const body = asBuffer(downloaded);
+    const measured = await identifyOriginal(
+      this.#decoders,
+      body,
+      this.#config,
+      { verb: 'adoptOriginal', countFrames: false },
+    );
+    if (this.#isPublic(ref)) {
+      this.#checkPublic(measured, 'adoptOriginal');
+    }
+    await this.#decodeCheck(measured, body, 'adoptOriginal');
+    return {
+      storageRef: ref,
+      format: measured.format,
+      contentType: measured.contentType,
+      size: body.byteLength,
+      width: measured.width,
+      height: measured.height,
+    };
+  }
+
+  /**
+   * The object's bytes, asked for within `limits.sourceBytes`. A driver's own ResizeError says what
+   * is wrong with the ref or the object, so it passes through as the same object. Any other failure,
+   * a driver that resolved with no bytes included, gives no verdict on the object.
+   */
+  async #download(ref: StorageRef): Promise<Buffer | Uint8Array> {
+    try {
+      const bytes = await this.#storage.download(ref, {
+        maxBytes: this.#config.limits.sourceBytes,
+      });
+      if (!(bytes instanceof Uint8Array)) {
+        throw new TypeError('storage.download() resolved with no bytes');
+      }
+      return bytes;
+    } catch (cause) {
+      if (isModuleError(cause)) {
+        throw cause;
+      }
+      throw new ResizeStorageError(
+        'resize adoptOriginal: the object could not be read from storage',
+        { code: 'RESIZE_ORIGINAL_DOWNLOAD_FAILED', cause },
+      );
+    }
+  }
+
+  /** A driver's `publicUrl` must refuse a ref it would not expose, so a URL means public. */
+  #isPublic(ref: StorageRef): boolean {
+    try {
+      this.#storage.publicUrl(ref);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The rule for a public original: never an SVG, and otherwise only what its decoder says is safe,
+   * since a host decoder's source kind may hold anything.
+   */
+  #checkPublic({ decoder, format }: IdentifiedOriginal, verb: Verb): void {
+    if (format === 'svg') {
+      throw new ResizeOriginalError(
+        verb === 'uploadOriginal'
+          ? 'resize uploadOriginal: SVG originals must be stored privately'
+          : 'resize adoptOriginal: this SVG object is public — move it to private storage first; SVG originals stay private',
+        { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
+      );
+    }
+    if (decoder.publicOriginals !== true) {
+      throw new ResizeOriginalError(
+        verb === 'uploadOriginal'
+          ? `resize uploadOriginal: format '${format}' is stored privately unless its decoder sets publicOriginals: true — pass visibility: 'private', or set publicOriginals on the decoder`
+          : `resize adoptOriginal: this '${format}' object is public, and its decoder does not set publicOriginals: true — move it to private storage, or set publicOriginals on the decoder`,
+        { code: 'RESIZE_ORIGINAL_PUBLIC_REFUSED' },
+      );
+    }
+  }
+
+  /**
+   * One decode of the first frame. No vector source renders on the request path: inspect has parsed
+   * an SVG's XML, and its render starts a process per upload. A host's vector decoder says so with
+   * `vector`.
+   */
+  async #decodeCheck(
+    measured: IdentifiedOriginal,
+    body: Buffer,
+    verb: Verb,
+  ): Promise<void> {
+    if (measured.format !== 'svg' && !measured.info.vector) {
+      await verifyDecodes(measured, body, this.#config, verb);
+    }
   }
 }

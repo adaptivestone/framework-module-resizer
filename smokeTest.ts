@@ -42,6 +42,7 @@ const mod = await import(PKG);
 const expected = [
   'formatPictureUrls',
   'getSizeKey',
+  'hasOriginal',
   'isCatalogCovered',
   'parseSizeKey',
   'ResizeError',

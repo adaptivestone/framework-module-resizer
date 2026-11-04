@@ -31,6 +31,22 @@ export const unboundedStorage: ResizeStorage = {
   publicUrl: () => '',
 };
 
+// A decoder's public-originals flag is optional, on a plain object too.
+export const publicDecoder: SourceDecoder = {
+  formats: ['x'],
+  publicOriginals: true,
+  inspect: async () => ({
+    format: 'x',
+    contentType: 'image/x',
+    width: 1,
+    height: 1,
+  }),
+  render: async () => ({
+    data: Buffer.alloc(3),
+    info: { width: 1, height: 1, channels: 3 },
+  }),
+};
+
 export const tasks: TaskQueue = {
   add: async () => ({ status: 'unconfirmed' }),
   claim: async () => null,

@@ -2654,6 +2654,13 @@ describe('resolve — media loaded without the module fields', () => {
     assert.deepEqual(newRow.warns, []);
   });
 
+  test('a sub-field projection that drops the locator warns too', async () => {
+    const { read, warns } = logged();
+    await read(hydrated({ 'original.storageRef': 0 }));
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /without its stored original/);
+  });
+
   test('a fully loaded document never warns', async () => {
     const { read, warns, errors } = logged();
     for (const media of [

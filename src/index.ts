@@ -95,6 +95,7 @@ export type { ResizerConfig } from './factory/types.ts';
 export { formatPictureUrls } from './formatPictureUrls.ts';
 export {
   getSizeKey,
+  hasOriginal,
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';

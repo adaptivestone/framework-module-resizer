@@ -29,6 +29,7 @@ function sharpInputFormats(): string[] {
 
 export class SharpDecoder extends SourceDecoder {
   readonly formats: readonly string[] = Object.freeze(sharpInputFormats());
+  readonly publicOriginals = true;
 
   async inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
     // Damage and the pixel limit become the module's errors; any other Sharp error (bytes it cannot

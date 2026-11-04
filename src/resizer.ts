@@ -36,6 +36,7 @@ import { validateResizeConfig } from './resizeConfig.ts';
 import { carrierOf, isRouter, unavailableReason } from './routing.ts';
 import { timingOf } from './timing.ts';
 import type {
+  AdoptOriginalOpts,
   CoordinationOptions,
   GenerateOpts,
   GenerateResult,
@@ -813,6 +814,16 @@ export class Resizer {
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
   async uploadOriginal(opts: UploadOriginalOpts): Promise<Original> {
     return (await this.#services()).uploader.upload(opts);
+  }
+
+  /**
+   * Measure and decode an object already in storage, and return the `Original` that
+   * `uploadOriginal` would return for it. It stores nothing, writes nothing and queues nothing. Save
+   * the result as it is: its `storageRef` is signed into every preview's origin, so a changed ref
+   * regenerates that media's previews.
+   */
+  async adoptOriginal(opts: AdoptOriginalOpts): Promise<Original> {
+    return (await this.#services()).uploader.adopt(opts);
   }
 }
 

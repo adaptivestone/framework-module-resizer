@@ -24,10 +24,10 @@
   its message says, is the new `RESIZE_ORIGINAL_INSPECT_FAILED` (`true`), where it was
   `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
   now hold `upload.verify`.
-- **`limits.sourceBytes`, default 256 MiB.** A worker, `generate()` and `uploadOriginal()` refuse a
-  larger original with `RESIZE_SOURCE_TOO_LARGE` (`RESIZE_ORIGINAL_TOO_LARGE` at upload), since a
-  ref to a 3 GB file would otherwise kill a worker on every delivery. A host with larger originals
-  raises it; it is not signed, so nothing regenerates. A host that raised `upload.maxBytes` above
+- **`limits.sourceBytes`, default 256 MiB.** A worker, `generate()`, `adoptOriginal()` and
+  `uploadOriginal()` refuse a larger original with `RESIZE_SOURCE_TOO_LARGE`
+  (`RESIZE_ORIGINAL_TOO_LARGE` at upload), since a ref to a 3 GB file would otherwise kill a worker
+  on every delivery. A host with larger originals raises it; it is not signed, so nothing regenerates. A host that raised `upload.maxBytes` above
   256 MiB has such uploads refused after the upgrade, until it raises `limits.sourceBytes` too, and
   `verify()` logs a warning naming both. A complete config passed to `new Resizer({ config })` must
   hold the key.
@@ -57,6 +57,10 @@
   the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so call
   `verify()` at boot.
 
+- **A host decoder's originals are private unless the decoder sets `publicOriginals: true`.** A
+  public upload otherwise throws `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it; a host
+  decoder that takes over a built-in format adds one line.
+
 **Changed behaviour**
 
 - The worker logs task failures itself: `warn` on a retried failure, `error` on a dead-letter, with
@@ -77,9 +81,10 @@
   formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a
   `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error
   out of an entry whose line holds a format sequence such as `%c3` or `%s`.
-- `resolve()` warns once per Resizer when the module's fields were not loaded. After the first added
-  task, `MongoTaskQueue` checks the gate index once per model in the background and logs an `error`
-  when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
+- `resolve()` warns once per Resizer when the module's fields were not loaded, and a sub-field
+  projection that drops `original.storageRef` counts too. After the first added task,
+  `MongoTaskQueue` checks the gate index once per model in the background and logs an `error` when
+  it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
   indexed query instead of a failed insert; the first add costs about 1 ms more, and the unique
   index still settles races. The gate read and `findActive` read from the primary.
 - `FrameworkResizer`'s default sink writes no debug lines; pass
@@ -103,6 +108,10 @@
 - `unconfirmed` may carry `retryable: false` and `causeCode`; `MongoTaskQueue` sets them for a
   missing or outdated model, and `prewarm()` passes them on.
 - `download(ref, { maxBytes })`: an optional argument, which a custom driver may honour.
+- `hasOriginal(media)` and `resizer.adoptOriginal({ storageRef })`: put an object you already hold on
+  the module without re-uploading it. It measures and decodes the object, returns the `Original`
+  that `uploadOriginal` would return for it, and writes nothing. New codes
+  `RESIZE_ORIGINAL_DOWNLOAD_FAILED`, `RESIZE_ORIGINAL_PUBLIC_REFUSED`.
 
 **Fixes**
 

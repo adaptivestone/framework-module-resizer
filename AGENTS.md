@@ -169,7 +169,9 @@ gets the full box its steps were written for. To hand the private original to it
    (the `original.format` ids it reads), `inspect(bytes, limits)` (identify and measure, never
    render; bytes of another format reject with `RESIZE_SOURCE_FORMAT_UNSUPPORTED`),
    `render(bytes, box, opts)` (an upright 8-bit sRGB `Raster`, profile applied, at least `box`
-   where its limits allow) and optional `verify()`; see the README `Decoders` section.
+   where its limits allow), optional `verify()` and optional `publicOriginals` (`true` when public
+   originals of this source kind are safe; without it, a public upload is
+   `RESIZE_ORIGINAL_PUBLIC_REFUSED`); see the README `Decoders` section.
    `MediaStore.appendPreviews` resolves with the previews it stored, and the REQUIRED
    `MediaStore.replacePreviews` swaps rows by identity in one write (see Use); `LockStore` locks
    carry an owner (`release(key, owner)` is a compare-and-delete). The core owns the queue logic
@@ -345,7 +347,7 @@ Store an original (no model creation and no queue work; persist the returned val
 const original = await getResizer().uploadOriginal({
   body: buffer,
   visibility: 'private',
-  // Optional audit grouping: namespace: `users/${user.id}` or `products/${product.id}`,
+  // Optional key prefix: namespace: 'avatars',
 });
 ```
 
@@ -373,9 +375,28 @@ bucket, or for `LocalFsStorage` keep its private root outside the static server'
 Persist `original.storageRef` and `previews[].storageRef` through the host media schema.
 The shipped drivers keep optional grouping metadata in their refs; the worker passes the
 original ref to the driver as `parentRef` when creating public previews. The namespace
-is a placement hint, not authorization. This nested ref shape is a breaking change:
+is a placement hint, not authorization. Previews inherit the namespace, so it appears in their
+public URLs: put nothing in it you would not publish, such as a user id. Set it at upload and keep
+it: it is part of `storageRef`. This nested ref shape is a breaking change:
 update host models, DTOs, custom drivers, and API/worker processes together. No old
 record reader or migration is included.
+
+Put an object you already hold on the module, without uploading it again:
+
+```ts
+import { getResizer, hasOriginal } from '@adaptivestone/framework-module-resize';
+
+if (!hasOriginal(doc)) {
+  doc.original = await getResizer().adoptOriginal({ storageRef });
+  await doc.save();
+}
+```
+
+`hasOriginal(doc)` is the test, never `if (doc.original)`: a hydrated document reads a never-set
+`original` as `{}`. `adoptOriginal` measures an object already in storage and returns the `Original`
+to save. It writes and queues nothing, and it refuses what a worker could never render. Build the
+ref from your own records. Save it once and never change it: a changed ref regenerates that media's
+previews. See the guide: https://framework.adaptivestone.com/docs/resize#adopting
 
 Read path (DTO builders / controllers). `resolve` NEVER throws and never runs sharp — missing
 variants are enqueued and the decision is returned immediately. A stale stored preview (made from
@@ -608,7 +629,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   logged as a warning and the bytes are probed, so the preview still renders: fix the record.
 - Never resize/encode with sharp on the request path. `uploadOriginal()` has two bounded exceptions:
   the decoders' `inspect()`, and, only with `upload.verify: 'decode'`, one decode to a 16 px raster
-  for a raster format, which emits no bytes. It costs about 0.1 s for a 24 MP JPEG and about 1 s for
+  for a raster format, which emits no bytes. `adoptOriginal()` has the same two, and always runs the
+  decode. It costs about 0.1 s for a 24 MP JPEG and about 1 s for
   a 24 MP PNG on a Sharp thread, not on the event loop.
 - The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
   must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`
@@ -672,15 +694,18 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_MONGO_LOCK_MODEL_OUTDATED` from `verify()` or at worker start | the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
 | `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
-| `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (dead-lettered at once), or `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` from `uploadOriginal()` | every decoder refused the bytes: no decoder of this process reads that format — add a decoder for it, or reject the file |
-| `RESIZE_ORIGINAL_INSPECT_FAILED` from `uploadOriginal()` (`retryable: true`) | a decoder failed to read the upload for a reason other than the bytes: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
-| `RESIZE_ORIGINAL_DAMAGED` from `uploadOriginal()` (`retryable: false`) | `upload.verify: 'decode'` decoded the original's first frame at `limits.failOn` and the engine refused it: the file is cut or corrupt, and nothing was stored — ask for the file again. Damage `inspect` finds first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays `RESIZE_ORIGINAL_INVALID`. An animation damaged in a later frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes |
-| `RESIZE_ORIGINAL_VERIFY_FAILED` from `uploadOriginal()` (`retryable: true`) | the `upload.verify: 'decode'` check failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
+| `RESIZE_ORIGINAL_PUBLIC_REFUSED` from `uploadOriginal()` or `adoptOriginal()` (`retryable: false`) | a public original of a host decoder's source kind, whose decoder does not set `publicOriginals: true`: a public upload stores nothing, and an adopted object reads as public when `storage.publicUrl` returns for its ref — pass `visibility: 'private'` or move the object to private storage, or set `publicOriginals` on the decoder (a host decoder that takes over a built-in format needs it too). SVG is `RESIZE_ORIGINAL_SVG_PUBLIC` whatever the flag says |
+| `RESIZE_ORIGINAL_DOWNLOAD_FAILED` from `adoptOriginal()` (`retryable: true`) | the storage driver failed with an error that is not the module's, such as a network error or an S3 403; `cause` says why — retry after fixing it. A driver's own `ResizeError` is not this code: it passes through as the same object |
+| `RESIZE_STORAGE_KEY_INVALID` from `adoptOriginal()` (`retryable: false`) | the driver refuses this key. `S3Storage` reads any key except one with a control character, a `.` or `..` part, a leading `/` or an empty part (`uploads//cat.jpg`, `dir/`, a name holding a tab); `LocalFsStorage` paths stay in `[A-Za-z0-9_.-]` — copy the object to a new key and adopt that |
+| `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (dead-lettered at once), or `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` from `uploadOriginal()` or `adoptOriginal()` | every decoder refused the bytes: no decoder of this process reads that format — add a decoder for it, or reject the file |
+| `RESIZE_ORIGINAL_INSPECT_FAILED` from `uploadOriginal()` or `adoptOriginal()` (`retryable: true`) | a decoder failed to read the upload for a reason other than the bytes: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
+| `RESIZE_ORIGINAL_DAMAGED` from `uploadOriginal()` or `adoptOriginal()` (`retryable: false`) | `upload.verify: 'decode'`, or an adoption, which always runs it, decoded the original's first frame at `limits.failOn` and the engine refused it: the file is cut or corrupt, and nothing was stored — ask for the file again. Damage `inspect` finds first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays `RESIZE_ORIGINAL_INVALID`. An animation damaged in a later frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes |
+| `RESIZE_ORIGINAL_VERIFY_FAILED` from `uploadOriginal()` or `adoptOriginal()` (`retryable: true`) | the `upload.verify: 'decode'` check, or an adoption's, failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
 | worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` (`resize generate:` from `generate()`) | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
 | `RESIZE_STORAGE_NOT_FOUND` on a task or from `generate()` (retried, then dead-lettered) | `storage.download` found no object at the original's `storageRef` — restore the object, or fix or delete the media. It stays retryable because an object can appear later (a row written before its PUT finishes); each retry costs one 404. An S3 role without `s3:ListBucket` gets 403 for a missing key, which stays the raw SDK error |
 | `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: the engine refused its header, or refused its pixels at `limits.failOn` (the worker's dead line then names the level). Dead-lettered on its first delivery, since no retry can help — replace the original (one replaced while the task ran is retried under `RESIZE_WORKER_INCOMPLETE` and renders the new one). Previews made from a damaged original before this version stay fresh: see the README `Damaged originals`. A download whose length differs from `original.size` stays the retryable `RESIZE_SOURCE_DECODE_FAILED`. On a stored format no decoder of this process lists, damage stays retryable too: `RESIZE_DECODER_MISSING` at `inspect`, `RESIZE_SOURCE_DECODE_FAILED` at render |
 | `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source, for a reason other than damage; the error's `cause` says why — retried, then dead-lettered |
-| `RESIZE_SOURCE_TOO_LARGE` naming `limits.sourceBytes`, or `RESIZE_ORIGINAL_TOO_LARGE` naming it from `uploadOriginal()` | the original is larger than `limits.sourceBytes` (default 256 MiB), so a worker refuses to read it into memory: its task is dead-lettered at once, and `generate()` rejects with `RESIZE_SOURCE_TOO_LARGE`. An upload is refused and stores nothing — raise it, or replace the object |
+| `RESIZE_SOURCE_TOO_LARGE` naming `limits.sourceBytes`, or `RESIZE_ORIGINAL_TOO_LARGE` naming it from `uploadOriginal()` | the original is larger than `limits.sourceBytes` (default 256 MiB), so a worker refuses to read it into memory: its task is dead-lettered at once, and `generate()` and `adoptOriginal()` reject with `RESIZE_SOURCE_TOO_LARGE`. An upload is refused and stores nothing — raise it, or replace the object |
 | the warning `resize: upload.maxBytes (…) is above limits.sourceBytes (…)` from `verify()` | the stricter limit wins, since a task could never read a larger stored file, so uploads over `limits.sourceBytes` are refused whatever `upload.maxBytes` says — raise `limits.sourceBytes` to accept them, or lower `upload.maxBytes` |
 | `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
 | `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
