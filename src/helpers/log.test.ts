@@ -2,6 +2,7 @@
 // code: a getter, a `toString` or a Proxy trap can throw, and a message or a code can hold a line
 // break.
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { type TestContext, test } from 'node:test';
 import { ResizeError, ResizeStorageError } from '../errors.ts';
 import type { ResizeLogger } from '../types.d.ts';
@@ -347,6 +348,19 @@ test('a console that cannot write is the end of it: nothing throws', (t) => {
   logNeverThrow({ error: no, warn: no, info: no }, 'm', new Error('x'));
 });
 
+// The redaction file arrived in framework 5.5, and the peer range starts at 5.1. Only a file that is
+// not there skips: `import.meta.resolve` loads nothing and names the file even when it is missing, and
+// a file that is there goes through the real import, where any other break fails the test.
+const skipWithoutRedaction = existsSync(
+  new URL(
+    import.meta.resolve(
+      '@adaptivestone/framework/services/logging/redaction.js',
+    ),
+  ),
+)
+  ? false
+  : "Requires the framework's services/logging/redaction.js, added in 5.5; the peer range starts at 5.1";
+
 /**
  * A real Winston logger as the framework's `#createLogger` builds it: its format at the logger,
  * its default `redact` list, and its console text at the transport, without the colours.
@@ -398,7 +412,9 @@ const withSecrets = () =>
     config: { headers: { Authorization: 'Bearer SECRET-AUTH' } },
   });
 
-test("the framework's Winston format: the secrets are not printed, and a transport gets info.stack", async () => {
+test("the framework's Winston format: the secrets are not printed, and a transport gets info.stack", {
+  skip: skipWithoutRedaction,
+}, async () => {
   const { logger, infos, flushed, printed } = await frameworkWinston();
   const err = withSecrets();
   logNeverThrow(logger, 'resize worker: task t is dead', err);
@@ -414,7 +430,9 @@ test("the framework's Winston format: the secrets are not printed, and a transpo
   assert.doesNotMatch(JSON.stringify(info), /SECRET/);
 });
 
-test('a `%` that reads as no format sequence keeps the error on Winston, and the line as it is', async () => {
+test('a `%` that reads as no format sequence keeps the error on Winston, and the line as it is', {
+  skip: skipWithoutRedaction,
+}, async () => {
   const { logger, infos, flushed } = await frameworkWinston();
   const err = withSecrets();
   const line = 'resize worker: 100% of https://bucket/a%C3%A9.jpg failed';
@@ -427,7 +445,9 @@ test('a `%` that reads as no format sequence keeps the error on Winston, and the
 // A limit the README names, pinned so that it cannot change unnoticed. Winston's own `log()` merges
 // the error into the entry only when the line matches /%[scdjifoO%]/ nowhere. The module does not
 // touch another logger's text, since a Winston logger without `splat` would print `%%`.
-test('a format sequence in the line loses the error on Winston: the line stays literal, with no stack', async () => {
+test('a format sequence in the line loses the error on Winston: the line stays literal, with no stack', {
+  skip: skipWithoutRedaction,
+}, async () => {
   for (const sequence of FORMAT_SEQUENCES) {
     const { logger, infos, flushed, printed } = await frameworkWinston();
     const line = `resize worker: download https://bucket/${sequence} failed`;
