@@ -368,7 +368,7 @@ export interface LocalStorageConfig {
   privateRootDir?: string; // private originals; default rootDir + '-private'
 }
 export interface S3StorageConfig {
-  driver: 's3'; // S3Storage (needs @aws-sdk/client-s3 and @aws-sdk/s3-request-presigner)
+  driver: 's3'; // S3Storage (needs @aws-sdk/client-s3; signedUrl also needs @aws-sdk/s3-request-presigner)
   bucketPublic: string; // previews
   bucketPrivate?: string; // originals; must differ from bucketPublic
   publicBaseUrl?: string; // CDN/base URL
@@ -377,12 +377,6 @@ export interface S3StorageConfig {
   forcePathStyle?: boolean;
 }
 export type StorageConfig = LocalStorageConfig | S3StorageConfig;
-/** @deprecated The same type under its core name: use LocalStorageConfig. */
-export type FrameworkLocalStorageConfig = LocalStorageConfig;
-/** @deprecated The same type under its core name: use S3StorageConfig. */
-export type FrameworkS3StorageConfig = S3StorageConfig;
-/** @deprecated The same type under its core name: use StorageConfig. */
-export type FrameworkStorageConfig = StorageConfig;
 
 // The database a Resizer's media store (and its gate locks and database queue) lives in: the
 // config's `database` section.

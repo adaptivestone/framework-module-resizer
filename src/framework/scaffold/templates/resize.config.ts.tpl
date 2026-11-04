@@ -13,7 +13,7 @@ export default {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File', // TODO(REQUIRED): the host media model, e.g. File or Media
   // Files on the local disk; serve `rootDir` at `publicBaseUrl`. For S3 in production, put in
-  // resize.production.ts (npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner; credentials
+  // resize.production.ts (npm i @aws-sdk/client-s3; credentials
   // come from the AWS SDK's default chain):
   //   storage: { driver: 's3', bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: 'https://…' },
   storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },

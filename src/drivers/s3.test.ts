@@ -8,7 +8,7 @@ import {
 } from '../errors.ts';
 import { asS3Client, silentLogger } from '../testHelpers/fakes.ts';
 import type { S3StorageConfig, StorageRef } from '../types.d.ts';
-import { S3Storage } from './s3.ts';
+import { S3Storage, type S3StorageOptions } from './s3.ts';
 
 function fakeClient() {
   const sent: Array<{
@@ -490,6 +490,27 @@ describe('S3Storage', () => {
     );
   });
 
+  test('the removed publicUrl option throws at construction, because a host would otherwise fall through to bucket URLs', () => {
+    const opts = {
+      bucketPublic: 'pub',
+      publicUrl: 'https://cdn.example.com',
+    } as unknown as S3StorageOptions;
+    assert.throws(
+      () => new S3Storage(opts),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeConfigError);
+        assert.equal(err.code, 'RESIZE_CONFIG_REMOVED_KEY');
+        assert.match(err.message, /publicBaseUrl/);
+        return true;
+      },
+    );
+    // Nothing is lost when it is unset, for example from an empty environment lookup.
+    new S3Storage({
+      bucketPublic: 'pub',
+      publicUrl: undefined,
+    } as unknown as S3StorageOptions);
+  });
+
   test('signed URL uses the exact persisted private bucket and expiry', async () => {
     const client = new S3Client({
       region: 'us-east-1',
@@ -623,6 +644,25 @@ describe('S3Storage.fromConfig', () => {
         ctx,
       ).publicUrl(ref),
       'https://s3.eu-west-1.amazonaws.com/pub/previews/a.jpg',
+    );
+  });
+
+  test('storage.publicUrl in a config section is refused the same way', () => {
+    assert.throws(
+      () =>
+        S3Storage.fromConfig(
+          {
+            driver: 's3',
+            bucketPublic: 'pub',
+            publicUrl: 'https://cdn',
+          } as unknown as S3StorageConfig,
+          ctx,
+        ),
+      {
+        code: 'RESIZE_CONFIG_REMOVED_KEY',
+        message:
+          /`storage\.publicUrl` in src\/config\/resize\.production\.ts is no longer supported — use `storage\.publicBaseUrl`/,
+      },
     );
   });
 

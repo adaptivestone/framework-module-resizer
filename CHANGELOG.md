@@ -49,6 +49,11 @@
   reports a failure. The eager-only path (`resize worker: no Resizer has a task queue`, still an
   `error` line) does the same, since that process consumes nothing either. `runWorker` and
   `runResizeWorker` resolve `true` after a run and `false` in those cases.
+- **Removed, as promised:** the types `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
+  `FrameworkS3StorageConfig` (use `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`), and the
+  `S3Storage` option `publicUrl` (use `publicBaseUrl`). The option now throws
+  `RESIZE_CONFIG_REMOVED_KEY` at construction, in a config section too, because a JavaScript host
+  would otherwise fall through silently to bucket URLs.
 
 **Changed behaviour**
 
@@ -83,6 +88,8 @@
 - The S3 driver reads any key except control characters, `.` or `..` parts, a leading `/` or an
   empty part. `publicUrl` encodes each part of such a key; the URL of a key the module wrote does
   not change. Keys the module writes, `namespace` and the local driver stay strict.
+- The S3 driver loads `@aws-sdk/s3-request-presigner` only inside `signedUrl`. `verify()` no longer
+  asks for it; a missing one is `RESIZE_PEER_MISSING` at that call.
 
 **Features**
 

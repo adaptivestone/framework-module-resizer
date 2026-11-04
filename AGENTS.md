@@ -50,19 +50,21 @@ stored previews only. For a pipeline without `variantSteps`, a raster original n
 requested `WxH` box gets a preview at its own size (no upscaling, no cropping, metadata removed;
 only the `limits.resultDimension` cap can scale it down); a pipeline with `variantSteps` always
 gets the full box its steps were written for. To hand the private original to its owner, call
-`storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it.
+`storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it, and on
+`S3Storage` only that call needs `@aws-sdk/s3-request-presigner`.
 
 ## Integrate (in order)
 
 1. Install. Every peer is OPTIONAL: a framework app already has `@adaptivestone/framework` and
    `mongoose`; the AWS SDKs are needed only for the drivers that use them. A missing one fails at
    your own import line when you import a driver subpath, or, for a driver selected in the config
-   file, at first use or `verify()` with `RESIZE_PEER_MISSING` (naming the packages and the file):
+   file, at first use or `verify()` with `RESIZE_PEER_MISSING` (naming the packages and the file);
+   a missing presigner fails only `signedUrl()`, with the same code:
 
    ```bash
    npm i @adaptivestone/framework-module-resize
    # SQS task queue only: npm i @aws-sdk/client-sqs   (>= 3.572)
-   # S3 storage only:     npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner   (>= 3.572)
+   # S3 storage only:     npm i @aws-sdk/client-s3   (>= 3.572; add @aws-sdk/s3-request-presigner only if you call signedUrl)
    ```
 
 2. Scaffold the integration files (never overwrites existing files; `--force` to regenerate):
@@ -687,10 +689,10 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | a variant stays missing for ~10 min after its task was dead-lettered | `coordination.cooldownMs` (default 600000): the dead task holds the gate of its media, pipeline and queue until the cooldown ends, so reads queue nothing and `prewarm()` reports `RESIZE_TASK_IN_FLIGHT` (SQS: `RESIZE_ENQUEUE_LOCK_CONTENDED`) — fix the cause in the logs first |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoMediaStore()` / `new MongoLockStore()` / `new MongoTaskQueue()` needs exactly one of `model` or `getModel` — or use `mongoParts(connection, { mediaModel })` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
-| `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key or an old shape is still in a config file (`resize.ts`, another Resizer's file, or an environment override) — move it to the path named in the message. Among them: a `queue: { … }` object (define the queue in `queues` of `src/config/resize.ts` and set `queue` to its name), `queues.<name>.queues` (give each SQS queue its own entry), and the worker's `--config` flag or `runResizeWorker({ configName })` (removed: the worker reads `worker` and `queues` from `src/config/resize.ts`) |
+| `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key or an old shape is still in a config file (`resize.ts`, another Resizer's file, or an environment override) — move it to the path named in the message. Among them: a `queue: { … }` object (define the queue in `queues` of `src/config/resize.ts` and set `queue` to its name), `queues.<name>.queues` (give each SQS queue its own entry), `storage.publicUrl` and the `S3Storage` option `publicUrl` (use `publicBaseUrl`), and the worker's `--config` flag or `runResizeWorker({ configName })` (removed: the worker reads `worker` and `queues` from `src/config/resize.ts`) |
 | `formats [...] have no encode.formats entry` (`RESIZE_CONFIG_FORMATS_INVALID` in the config), `RESIZE_FORMAT_NOT_CONFIGURED` | add `encode.formats.<id>` (`{}` for Sharp defaults), or request only configured ids; use `'jpeg'`, not the alias `'jpg'` |
 | `RESIZE_PIPELINE_UNKNOWN` | the pipeline is not registered in that process — register it in `src/resizer.ts`; deploy the worker before the API requests a new or renamed pipeline |
-| `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config (a config file, or the config passed to `createResizer()`) | optional peer not installed — install the packages named, see step 1. A queue whose backend lacks its SDK beside another available backend is only not served in that process (`RESIZE_QUEUE_NOT_SERVED`, naming the package); `verify()` rejects with `RESIZE_PEER_MISSING` only when it is the Resizer's own queue |
+| `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config (a config file, or the config passed to `createResizer()`) or from `signedUrl()` | optional peer not installed — install the packages named, see step 1. A queue whose backend lacks its SDK beside another available backend is only not served in that process (`RESIZE_QUEUE_NOT_SERVED`, naming the package); `verify()` rejects with `RESIZE_PEER_MISSING` only when it is the Resizer's own queue |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx resize-scaffold` |
 | `Resizer '…' is not served by this worker` in worker logs, or `RESIZE_NO_RESIZER` on a task | a task queue that cannot filter claims (SQS) handed the worker a task of a Resizer it does not serve: that Resizer was not constructed in the worker process before the worker started (or not passed in `runWorker({ resizers })`). Its tasks are given back to the queue for a worker that serves it (SQS still counts each receive, so a task bounced between workers that serve different Resizers can use up its `maxAttempts` and be dead-lettered by the worker that serves it: give each set of Resizers a worker serves its own SQS queue URL), or, when the queue cannot give tasks back, fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) — construct every Resizer in `src/resizer.ts`, which both the API and the worker load. On the database queue, which filters claims, such tasks wait for a worker that serves their Resizer, and every claim on that queue reads past them (the claim index does not hold the Resizer): give a Resizer that has no worker its own queue (a log saying the queue "handed its task out although it filters claims" is a broken custom queue) |

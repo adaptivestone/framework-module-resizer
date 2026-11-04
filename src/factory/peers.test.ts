@@ -91,13 +91,72 @@ test('s3 storage without @aws-sdk/client-s3: first use and verify() reject with 
     assert.equal(error.code, 'RESIZE_PEER_MISSING');
     assert.ok(error.message.includes(`'s3' driver selected in ${WHERE}`));
     assert.ok(error.message.includes('@aws-sdk/client-s3'));
-    assert.ok(error.message.includes('@aws-sdk/s3-request-presigner'));
+    assert.ok(!error.message.includes('@aws-sdk/s3-request-presigner'));
   }
   assert.deepEqual(seen.decision, { ready: [], missing: [] });
   // Only the package that cannot be found is reported missing, not every peer of the driver.
   assert.deepEqual(seen.missing, ['@aws-sdk/client-s3']);
   // The probe needs no driver module.
   assert.deepEqual(seen.driverFiles, []);
+});
+
+test('s3 storage without @aws-sdk/s3-request-presigner: verify() passes, signedUrl() rejects with RESIZE_PEER_MISSING, and the ref is checked first', async () => {
+  const seen = await inChild(
+    '@aws-sdk/s3-request-presigner',
+    `
+      const { S3Storage } = await import(${href('../drivers/s3.ts')});
+      const { S3Client } = await import('@aws-sdk/client-s3');
+      const resizer = createResizer(
+        { storage: { driver: 's3', bucketPublic: 'cdn', region: 'us-east-1' } },
+        { media: fakes.fakeMedia(), logger: silent },
+      );
+      const storage = new S3Storage({
+        bucketPublic: 'cdn',
+        bucketPrivate: 'priv',
+        client: new S3Client({ region: 'us-east-1', credentials: { accessKeyId: 'x', secretAccessKey: 'y' } }),
+      });
+      console.log(JSON.stringify({
+        verify: await errorOf(resizer.verify()),
+        signed: await errorOf(storage.signedUrl({ bucket: 'priv', key: 'a.jpg' }, 60)),
+        refused: await errorOf(storage.signedUrl({ bucket: 'other', key: 'a.jpg' }, 60)),
+      }));
+    `,
+  );
+  assert.equal(seen.verify, null);
+  const signed = seen.signed as { code: string; message: string };
+  assert.equal(signed.code, 'RESIZE_PEER_MISSING');
+  assert.match(
+    signed.message,
+    /signedUrl\(\) needs the optional peer `@aws-sdk\/s3-request-presigner`/,
+  );
+  assert.equal(
+    (seen.refused as { code: string }).code,
+    'RESIZE_S3_BUCKET_NOT_ALLOWED',
+  );
+});
+
+test('a package missing deeper in the presigner tree stays the raw error, since installing the presigner would not fix it', async () => {
+  const seen = await inChild(
+    undefined,
+    `
+      const { S3Storage } = await import(${href('../drivers/s3.ts')});
+      registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (specifier === '@aws-sdk/s3-request-presigner') {
+            throw Object.assign(new Error("Cannot find package '@smithy/deep' imported from the presigner"), { code: 'ERR_MODULE_NOT_FOUND' });
+          }
+          return nextResolve(specifier, context);
+        },
+      });
+      const storage = new S3Storage({ bucketPublic: 'cdn', bucketPrivate: 'priv' });
+      console.log(JSON.stringify({
+        signed: await errorOf(storage.signedUrl({ bucket: 'priv', key: 'a.jpg' }, 60)),
+      }));
+    `,
+  );
+  const signed = seen.signed as { code: string; message: string };
+  assert.equal(signed.code, 'ERR_MODULE_NOT_FOUND');
+  assert.match(signed.message, /@smithy\/deep/);
 });
 
 test('an sqs own queue without @aws-sdk/client-sqs: RESIZE_PEER_MISSING naming queues.<name>', async () => {

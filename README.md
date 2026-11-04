@@ -36,13 +36,15 @@ part that uses it:
 |---|---|
 | `…/framework.js` (framework apps) | `@adaptivestone/framework` ≥ 5.1 and `mongoose` 9 (already in a framework app) |
 | `…/drivers/mongo.js` | `mongoose` 9 |
-| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` `@aws-sdk/s3-request-presigner` ≥ 3.572 |
+| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` ≥ 3.572; add `@aws-sdk/s3-request-presigner` only if you call `signedUrl` |
 | SQS: a `queues` entry with `driver: 'sqs'`, or `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` ≥ 3.572 |
 
 A missing optional peer fails at your own import line when you import a driver subpath. A driver
 chosen in the config fails when the Resizer first loads it (the first call, or `verify()`) with
-`ResizeSetupError` `RESIZE_PEER_MISSING`, which names the packages and the config file. A queue
-whose SDK is missing beside queues on another backend is only not served in that process (see
+`ResizeSetupError` `RESIZE_PEER_MISSING`, which names the packages and the config file. The
+presigner is loaded only by `signedUrl`, so a missing one rejects that call with
+`RESIZE_PEER_MISSING` and stops nothing else. A queue whose SDK is missing beside queues on another
+backend is only not served in that process (see
 **Backends** under [Config reference](#config-reference)). An older
 SQS client does not return receive counts, so failing tasks would never be dead-lettered;
 `SqsTaskQueue` warns if that happens.
@@ -306,7 +308,7 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 | `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) and its options type `S3StorageOptions` |
 | `…/drivers/mongo.js` | `mongoParts` (and its types `MongoParts`, `MongoPartsOptions`), `MongoDatabase` (the `'mongo'` database driver), `MongoMediaStore` (and `MongoMediaModel`, `MongoMediaStoreOptions`, `MongoMediaUpdateOptions`), `MongoLockStore` (and `MongoLockModel`, `MongoLockStoreOptions`), `MongoTaskQueue` (and `MongoTaskQueueOptions`), `createResizeModels` (and `CreateResizeModelsOptions`), the schemas `resizeTaskFields`, `resizeTaskIndexes`, `resizeLockFields`, `resizeLockIndexes` and `resizeSchemaOptions`, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
 | `…/drivers/sqs.js` | `SqsTaskQueue` (the `'sqs'` queue driver) and its options type `SqsTaskQueueOptions` |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig` (and their deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`), `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported) |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`, `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported) |
 | `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim, and its document type `TResizeTask` |
 | `…/package.json` | The package manifest (a JSON module, default export only; import it `with { type: 'json' }`), for tools that read the installed version |
 
@@ -353,9 +355,7 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
   - the queue entries and timing: `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`,
     `QueueTimingOptions`;
   - the logger, the event bus and a part built on first use: `ResizeLogger`, `ResizeEventBus`,
-    `LazyPart`;
-  - the deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
-    `FrameworkS3StorageConfig`, each the same type under its core name.
+    `LazyPart`.
 
 `FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every
 config type; `…/framework.js` re-exports only the config types its row names.
@@ -431,7 +431,7 @@ write your own files under `rootDir`, give each a new name.
 |---|---|---|
 | `bucketPublic` | required | Previews |
 | `bucketPrivate` | for private uploads | Originals; must differ from `bucketPublic` |
-| `publicBaseUrl` | optional | CDN/base URL (`publicUrl` is a deprecated alias) |
+| `publicBaseUrl` | optional | CDN/base URL |
 | `client` | optional | An existing `S3Client`; otherwise one is built from `region` / `endpoint` / `forcePathStyle` |
 
 The ref is `{ bucket, key, namespace? }`. Every read accepts only the two configured buckets, so a
@@ -1182,7 +1182,8 @@ framework hosts define queues in `queues` and keep `worker` in `src/config/resiz
 object in a framework config file (define the queue in `queues` of `src/config/resize.ts` and set
 `queue` to its name); `queues.<name>.queues` (give each SQS queue its own entry); `lockTtlMs` in a
 task queue's `timing` or a `queues` entry (use [coordination](#coordination): `failed` →
-`cooldownMs`, `dispatch` → `gateTtlMs`, drop `worker`); and the worker's `--config` flag and
+`cooldownMs`, `dispatch` → `gateTtlMs`, drop `worker`); `storage.publicUrl` and the `S3Storage`
+option `publicUrl` (use `publicBaseUrl`); and the worker's `--config` flag and
 `runResizeWorker({ configName })` (the worker reads `worker` and `queues` from
 `src/config/resize.ts`).
 

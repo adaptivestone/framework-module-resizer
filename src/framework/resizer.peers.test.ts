@@ -64,7 +64,7 @@ async function failedDriverImport(
 for (const [driver, peers, selectedIn] of [
   [
     's3',
-    ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'],
+    ['@aws-sdk/client-s3'],
     /in src\/config\/resizeListings\.ts \(or its resizeListings\.<NODE_ENV>\.ts override\)/,
   ],
   [
@@ -106,3 +106,10 @@ for (const [driver, peers, selectedIn] of [
     }
   });
 }
+
+test('s3: a missing presigner does not stop the driver from loading', async () => {
+  assert.deepEqual(
+    await failedDriverImport('s3', '@aws-sdk/s3-request-presigner'),
+    { resolved: true },
+  );
+});
