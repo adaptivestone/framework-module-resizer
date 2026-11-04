@@ -31,6 +31,7 @@ import { gateKey } from './lockKeys.ts';
 import { consume } from './testHelpers/consume.ts';
 import {
   clockLocks,
+  firstLine,
   MemoryTaskQueue,
   PlainTaskQueue,
   ReleasingTaskQueue,
@@ -1238,9 +1239,10 @@ describe('the gate lock on a task queue without gatesByTask', () => {
       ['completed'],
     );
     assert.ok(errors.length > 0, 'the failures are logged');
-    for (const [message, err] of errors) {
-      assert.match(String(message), /gate/);
-      assert.match(String(err), /lock store down/);
+    for (const args of errors) {
+      assert.equal(args.length, 1);
+      assert.match(firstLine(args[0]), /gate/);
+      assert.match(String(args[0]), /\nError: lock store down\n/);
     }
   });
 
@@ -2980,7 +2982,7 @@ describe('what the worker logs', () => {
     assert.match(without.warns[0], /, code none\)/);
   });
 
-  test('a ResizeError line has no second argument; any other error on a dead line passes the error; a retried line never does', async () => {
+  test('a ResizeError line is the line alone; any other error on a dead line is followed by its stack; a retried line never is', async () => {
     const resizeDead = lineLogger();
     await failOnce(
       new ResizeError('boom', { retryable: false }),
@@ -2988,28 +2990,34 @@ describe('what the worker logs', () => {
       resizeDead.logger,
     );
     assert.equal(resizeDead.calls.error[0].length, 1);
+    assert.equal(resizeDead.errors[0].includes('\n'), false);
 
     const otherDead = lineLogger();
     const err = new Error('boom');
     await failOnce(err, 1, otherDead.logger);
-    assert.equal(otherDead.calls.error[0].length, 2);
-    assert.equal(otherDead.calls.error[0][1], err);
+    assert.equal(otherDead.calls.error[0].length, 1);
+    assert.ok(otherDead.errors[0].includes(`\n${String(err.stack)}`));
 
     const retried = lineLogger();
     await failOnce(new Error('boom'), 3, retried.logger);
     assert.equal(retried.calls.warn[0].length, 1);
+    assert.equal(retried.warns[0].includes('\n'), false);
   });
 
-  test("a dead line of an unexpected error is one line, and the error follows as the logger's to print", async () => {
-    const { calls, logger } = lineLogger();
+  test("a dead line of an unexpected error is one line, and the error's stack follows it", async () => {
+    const { calls, errors, logger } = lineLogger();
     const err = new Error(
       'X\nresize worker: task forged is dead (attempt 1 of 1)',
     );
     await failOnce(err, 1, logger);
-    assert.equal(calls.error[0].length, 2);
-    const [line, second] = calls.error[0];
-    assert.equal(String(line).includes('\n'), false, String(line));
-    assert.equal(second, err);
+    assert.equal(calls.error[0].length, 1);
+    const [line, ...rest] = errors[0].split('\n');
+    // The look-alike in the message stays inside the module's line, after its ` | `.
+    assert.match(
+      line,
+      /^resize worker: task \S+ of media m1 is dead \(.*: Error: X \| resize worker: task forged is dead \(attempt 1 of 1\)$/,
+    );
+    assert.ok(rest.join('\n').startsWith(String(err.stack)));
   });
 
   test('a multi-line message makes one line', async () => {
@@ -3041,7 +3049,7 @@ describe('what the worker logs', () => {
     const dead = lineLogger();
     const rows = await failOnce(new Error('a\nb'), 1, dead.logger);
     assert.equal(rows.rows[0].error, 'Error: a | b');
-    assert.ok(dead.errors[0].endsWith(`: ${rows.rows[0].error}`));
+    assert.ok(firstLine(dead.errors[0]).endsWith(`: ${rows.rows[0].error}`));
   });
 
   test('a thrown value that cannot be printed still fails the task', async () => {
@@ -3232,10 +3240,11 @@ describe('what the worker logs', () => {
       { logger },
     );
     assert.match(
-      errors[0],
+      firstLine(errors[0]),
       /^resize worker: failing task \S+ failed \(it had failed with: .*boom\)$/,
     );
-    assert.equal(calls.error[0][1], queueDown);
+    assert.equal(calls.error[0].length, 1);
+    assert.ok(errors[0].includes(`\n${String(queueDown.stack)}`));
   });
 
   test('a logger that throws does not stop the loop', async (t) => {
@@ -3327,7 +3336,13 @@ describe('what the worker logs', () => {
           await failThenNext(thrown, maxAttempts, logger);
           const written = [...infos, ...warns, ...errors];
           assert.ok(written.length > 0);
-          for (const line of written) {
+          // The module's own line is whole, and the value cannot add one that reads as the module's.
+          for (const text of written) {
+            assert.match(firstLine(text), /^resize worker/, text);
+            assert.equal(firstLine(text).includes('forged'), false, text);
+          }
+          // Only a dead line carries the value's text, below the line.
+          for (const line of [...infos, ...warns]) {
             assert.equal(line.includes('\n'), false, line);
           }
         }
@@ -3347,8 +3362,8 @@ describe('what the worker logs', () => {
         });
       }
       assert.ok(messages.length > 0);
-      for (const line of messages) {
-        assert.equal(line.includes('\n'), false, line);
+      for (const text of messages) {
+        assert.match(firstLine(text), /^resize worker/, text);
       }
     });
   });
@@ -3415,7 +3430,13 @@ describe('what the worker logs', () => {
       () => tasks.rows[0].status === 'completed',
       { logger },
     );
-    assert.ok(errors.some((e) => e === 'resize worker: lease renewal failed'));
+    assert.ok(
+      errors.some(
+        (e) =>
+          firstLine(e) === 'resize worker: lease renewal failed' &&
+          e.includes('\nError: renew down\n'),
+      ),
+    );
     assert.equal(tasks.rows[0].status, 'completed');
   });
 

@@ -26,7 +26,7 @@ import ResizeTaskModel from '../../framework/ResizeTaskModel.ts';
 import { canonicalizeVariants } from '../../images.ts';
 import { Resizer, resetResizerForTests } from '../../resizer.ts';
 import { consume } from '../../testHelpers/consume.ts';
-import { fakeMedia } from '../../testHelpers/fakes.ts';
+import { fakeMedia, firstLine } from '../../testHelpers/fakes.ts';
 import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
 import { timingOf } from '../../timing.ts';
 import type {
@@ -524,15 +524,12 @@ describe('MongoTaskQueue setup', () => {
     assert.equal(await Ejected.countDocuments({}), 0);
     // One line for the model, not one per add.
     assert.equal(errors.length, 1);
-    const [[message, error]] = errors;
+    const [[text]] = errors;
     assert.match(
-      String(message),
-      /outdated \(logged once\) — every add is unconfirmed until the model is fixed/,
+      firstLine(text),
+      /outdated \(logged once\) — every add is unconfirmed until the model is fixed$/,
     );
-    assert.equal(
-      (error as { code?: unknown }).code,
-      'RESIZE_MONGO_MODEL_OUTDATED',
-    );
+    assert.match(String(text), /code: 'RESIZE_MONGO_MODEL_OUTDATED'/);
     assert.deepEqual(await tasks.add(request({ mediaId })), outdatedResult);
     assert.equal(errors.length, 1, 'still logged once');
     // Every other method rejects with it.
@@ -940,13 +937,10 @@ describe('MongoTaskQueue setup', () => {
       await settled();
       assert.equal(errors.length, 1);
       assert.match(
-        String(errors[0][0]),
+        firstLine(errors[0][0]),
         /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(logged once\)$/,
       );
-      assert.equal(
-        (errors[0][1] as { code?: unknown }).code,
-        'RESIZE_MONGO_INDEX_MISSING',
-      );
+      assert.match(String(errors[0][0]), /code: 'RESIZE_MONGO_INDEX_MISSING'/);
       assert.equal((await tasks.add(request())).status, 'added');
       await settled();
       assert.equal(errors.length, 1, 'logged once');
@@ -984,12 +978,12 @@ describe('MongoTaskQueue setup', () => {
         await settled();
         assert.equal(errors.length, 1, cost);
         assert.ok(
-          String(errors[0][0]).endsWith(
+          firstLine(errors[0][0]).endsWith(
             ` — until it exists, ${cost} (logged once)`,
           ),
           String(errors[0][0]),
         );
-        assert.match(String(errors[0][0]), /is not unique or not partial/);
+        assert.match(firstLine(errors[0][0]), /is not unique or not partial/);
       }
     });
 
@@ -1243,7 +1237,7 @@ describe('MongoTaskQueue setup', () => {
       await waitFor(() => errors.length > 0);
       assert.equal(errors.length, 1);
       assert.match(
-        String(errors[0][0]),
+        firstLine(errors[0][0]),
         /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(logged once\)$/,
       );
       // The check creates nothing, and without the index a later read still finds the active row.
@@ -1277,7 +1271,7 @@ describe('MongoTaskQueue setup', () => {
       await waitFor(() => errors.length > 0);
       assert.equal(errors.length, 1);
       assert.match(
-        String(errors[0][0]),
+        firstLine(errors[0][0]),
         / — until it exists, every add after a completed task is in flight with no id and nothing is queued \(logged once\)$/,
       );
       // What the line says: no duplicate, and after the task completes nothing is stored again.
@@ -1404,9 +1398,9 @@ describe('MongoTaskQueue.add', () => {
         assert.deepEqual(result, { status: 'unconfirmed' });
         assert.equal(await M.countDocuments({}), 0);
         assert.equal(errors.length, 1);
-        const error = errors[0][1];
-        assert.ok(error instanceof mongoose.Error.ValidationError);
-        assert.ok(error.errors[errorPath]);
+        assert.match(firstLine(errors[0][0]), /adding a task failed/);
+        assert.match(String(errors[0][0]), /validation failed/);
+        assert.ok(String(errors[0][0]).includes(errorPath));
       },
     );
   }
@@ -1468,7 +1462,7 @@ describe('MongoTaskQueue.add', () => {
     assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(creates, 0);
     assert.equal(errors.length, 1);
-    assert.equal(errors[0][1], failure);
+    assert.ok(String(errors[0][0]).includes(String(failure.stack)));
   });
 
   test('a read with a task waiting reads once and never calls create', async () => {
@@ -1698,7 +1692,7 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
     }));
     assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(errors.length, 1);
-    assert.equal(errors[0][1], failure);
+    assert.ok(String(errors[0][0]).includes(String(failure.stack)));
     for (const missing of [null, false]) {
       const logged = configureQueue(() => missing);
       assert.deepEqual(await tasks.add(request()), {
@@ -1733,7 +1727,7 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
     assert.equal((await tasks.add(request())).status, 'added');
     assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
     assert.equal(errors.length, 1);
-    assert.equal((errors[0][1] as { code?: unknown }).code, 11000);
+    assert.match(String(errors[0][0]), /code: 11000/);
     assert.equal(await Host.countDocuments({ active: true }), 1);
   });
 
@@ -1765,7 +1759,7 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
       }));
       assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
       assert.equal(errors.length, 1);
-      assert.equal(errors[0][1], failure);
+      assert.ok(String(errors[0][0]).includes(String(failure.stack)));
     }
   });
 });

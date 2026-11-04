@@ -14,7 +14,12 @@ import { resolveQueueEntries } from '../factory/queues.ts';
 import { gateKey } from '../lockKeys.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { consume } from '../testHelpers/consume.ts';
-import { clockLocks, fakeMedia, memoryLocks } from '../testHelpers/fakes.ts';
+import {
+  clockLocks,
+  fakeMedia,
+  firstLine,
+  memoryLocks,
+} from '../testHelpers/fakes.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
 import { timingOf } from '../timing.ts';
 import type {
@@ -879,12 +884,14 @@ describe('Consumer with SqsTaskQueue', () => {
     });
     assert.equal(receiveParams.length, 2);
     assert.deepEqual(
-      errors.map((entry) => entry[1]),
-      [boom1, boom2],
+      errors.map((entry) => entry.length),
+      [1, 1],
     );
+    assert.ok(String(errors[0][0]).includes(String(boom1.stack)));
+    assert.ok(String(errors[1][0]).includes(String(boom2.stack)));
     assert.ok(
       errors.every((entry) =>
-        String(entry[0]).includes('claiming a task failed'),
+        firstLine(entry[0]).includes('claiming a task failed'),
       ),
     );
   });
@@ -971,7 +978,11 @@ describe('Consumer with SqsTaskQueue', () => {
       },
     });
     assert.equal(deletes[0].ReceiptHandle, 'rh-ok');
-    assert.equal(errors[0][0], 'resize worker: completed event handler failed');
+    assert.equal(
+      firstLine(errors[0][0]),
+      'resize worker: completed event handler failed',
+    );
+    assert.match(String(errors[0][0]), /\nError: observer bug\n/);
   });
   test('a throwing failed observer is logged and leaves the message scheduled for redelivery', async () => {
     const { errors, logger } = recordingLogger();
@@ -1001,7 +1012,11 @@ describe('Consumer with SqsTaskQueue', () => {
     assert.equal(handlerCalls, 1);
     assert.equal(deletes.length, 0);
     assert.equal(changeVis.length, 1);
-    assert.equal(errors[0][0], 'resize worker: failed event handler failed');
+    assert.equal(
+      firstLine(errors[0][0]),
+      'resize worker: failed event handler failed',
+    );
+    assert.match(String(errors[0][0]), /\nError: observer bug\n/);
   });
   test('a shutdown mid-task makes the message visible at once, with no event and no delete', async () => {
     const { client, changeVis, deletes, sent } = makeFakeSqsClient({

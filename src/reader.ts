@@ -209,7 +209,8 @@ export class Reader {
               // A ref the driver rejects (e.g. a bucket no longer allowlisted) loses only this
               // cell. A fresh one is neither ready nor missing: the preview is stored, so queueing
               // it again would not help.
-              logger.error(
+              logNeverThrow(
+                logger,
                 `resize resolve: publicUrl failed for stored preview ${identity} of media ${mediaId} — skipping it`,
                 err,
               );
@@ -377,7 +378,8 @@ export class Reader {
       return outcome;
     } catch (err) {
       // enqueueWithOutcome is internally guarded and should never reach here; belt-and-suspenders.
-      logger.error(
+      logNeverThrow(
+        logger,
         'resize resolve: enqueue threw unexpectedly (read continues)',
         err,
       );

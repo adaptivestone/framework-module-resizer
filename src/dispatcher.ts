@@ -304,13 +304,15 @@ export class Dispatcher {
         }
         return failed;
       case 'add-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize enqueue: adding the task threw for media ${mediaId} — a later read queues it`,
           outcome.error,
         );
         return failed;
       case 'gate-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize enqueue: the gate lock of media ${mediaId} could not be acquired — nothing queued`,
           outcome.error,
         );
@@ -418,7 +420,8 @@ export class Dispatcher {
           retryable: outcome.retryable !== false,
         });
       case 'add-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize prewarm: adding the task threw for media ${mediaId}`,
           outcome.error,
         );
@@ -432,7 +435,8 @@ export class Dispatcher {
           "the gate lock of this media, pipeline and queue is held: a task of theirs is queued, running or waiting for a retry, or a dead task's cooldown runs",
         );
       case 'gate-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize prewarm: the gate lock of media ${mediaId} could not be acquired`,
           outcome.error,
         );
@@ -580,7 +584,8 @@ export class Dispatcher {
     }
     if (!this.#warnedInvalidAdd) {
       this.#warnedInvalidAdd = true;
-      this.#deps.logger.error(
+      logNeverThrow(
+        this.#deps.logger,
         `resize enqueue: Resizer '${this.#deps.name}' got an add result that is not a ${TASK_ADD_RESULT} — such a task is never counted as queued (a TaskQueue written for an older version of this module?)`,
         result,
       );
@@ -625,7 +630,8 @@ export class Dispatcher {
           queue,
         });
       } catch (error) {
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize prewarm: active-task confirmation failed for media ${mediaId}`,
           error,
         );

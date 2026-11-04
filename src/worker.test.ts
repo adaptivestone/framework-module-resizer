@@ -34,6 +34,7 @@ import { consume } from './testHelpers/consume.ts';
 import {
   clockLocks,
   fakeMedia,
+  firstLine,
   MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
@@ -1664,10 +1665,10 @@ describe('a worker on a router', () => {
       );
       assert.equal(errors.length, 1);
       assert.match(
-        String(errors[0][0]),
+        firstLine(errors[0][0]),
         /queue 'bulk' of Resizer 'default': its backend could not be built/,
       );
-      assert.equal(errors[0][1], down);
+      assert.ok(String(errors[0][0]).includes(String(down.stack)));
       assert.deepEqual(memory.claims, []);
     }
     // The branded error keeps its own code and retryable.

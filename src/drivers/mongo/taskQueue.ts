@@ -296,7 +296,8 @@ export class MongoTaskQueue extends TaskQueue {
       ) {
         if (!loggedSchemaErrors.has(err)) {
           loggedSchemaErrors.add(err);
-          this.#logger.error(
+          logNeverThrow(
+            this.#logger,
             'resize mongo queue: the ResizeTask model is outdated (logged once) — every add is unconfirmed until the model is fixed',
             err,
           );
@@ -307,7 +308,8 @@ export class MongoTaskQueue extends TaskQueue {
           causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
         };
       }
-      this.#logger.error(
+      logNeverThrow(
+        this.#logger,
         `resize mongo queue: adding a task failed for media ${task.mediaId}`,
         err,
       );

@@ -161,10 +161,12 @@ describe('logNeverThrow', () => {
     logNeverThrow(logger, 'a', err);
     logNeverThrow(logger, 'b', undefined, 'info');
     logNeverThrow(logger, 'c', err, 'warn');
+    // One string each: the line, then the error's stack.
+    const stack = String(err.stack);
     assert.deepEqual(calls, [
-      ['error', 'a', err],
+      ['error', `a\n${stack}`],
       ['info', 'b'],
-      ['warn', 'c', err],
+      ['warn', `c\n${stack}`],
     ]);
   });
 

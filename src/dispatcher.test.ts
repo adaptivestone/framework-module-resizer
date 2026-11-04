@@ -567,10 +567,7 @@ describe('a task queue without gatesByTask', () => {
     assert.equal(errors.length, 1);
     assert.match(String(errors[0][0]), /'bulk'/);
     // Invalid timing is never cached, so each call reads it again and meets a new error.
-    assert.equal(
-      (errors[0][1] as Error).message,
-      confirmed.timingError.message,
-    );
+    assert.ok(String(errors[0][0]).includes(confirmed.timingError.message));
     // Another queue name with invalid timing is logged once too.
     assert.equal(await d.enqueue(requestFor([v300], { queue: 'audit' })), 0);
     assert.equal(await d.enqueue(requestFor([v300], { queue: 'audit' })), 0);
@@ -1231,7 +1228,10 @@ describe('a task queue that routes queue names to backends', () => {
       assert.equal(await d.enqueue(bulk), 0);
       assert.equal(errors.length, 1, String(error));
       assert.match(String(errors[0][0]), /cannot queue to 'bulk'/);
-      assert.equal(errors[0][1], error);
+      assert.ok(
+        String(errors[0][0]).includes(String((error as Error).stack)),
+        String(errors[0][0]),
+      );
       // The other route still queues.
       assert.equal(await d.enqueue(requestFor([v300])), 1);
       assert.equal(memory.added.length, 1);

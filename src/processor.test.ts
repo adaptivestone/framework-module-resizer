@@ -57,6 +57,7 @@ import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
   fakeMedia,
+  firstLine,
   MemoryTaskQueue,
   memoryLocks,
   observedQueue,
@@ -4074,7 +4075,9 @@ describe('persist failure', () => {
       (err: unknown) => err === dbDown,
     );
     assert.equal(uploads.length, 2);
-    const entry = logs.error.find((l) => l[1] === dbDown);
+    const entry = logs.error.find((l) =>
+      String(l[0]).includes(String(dbDown.stack)),
+    );
     assert.ok(entry, 'the persist failure is logged');
     for (const upload of uploads) {
       assert.ok(
@@ -4116,7 +4119,9 @@ describe('persist failure', () => {
         }),
       (err: unknown) => err === dbDown,
     );
-    const entry = logs.error.find((l) => l[1] === dbDown);
+    const entry = logs.error.find((l) =>
+      String(l[0]).includes(String(dbDown.stack)),
+    );
     assert.ok(entry);
     const storedRef = media.previews?.[0]?.storageRef as
       | { key: string }
@@ -4148,7 +4153,9 @@ describe('persist failure', () => {
         }),
       (err: unknown) => err === dbDown,
     );
-    const entry = logs.error.find((l) => l[1] === dbDown);
+    const entry = logs.error.find((l) =>
+      String(l[0]).includes(String(dbDown.stack)),
+    );
     assert.ok(entry);
     for (const upload of uploads) {
       assert.ok(String(entry[0]).includes(upload.key), upload.key);
@@ -5150,7 +5157,9 @@ describe('one worker serves every Resizer', () => {
     assert.equal(attempts, 2);
     assert.equal(sibling.rows[0].status, 'completed');
     assert.ok(
-      logs.error.some((args) => String(args[1]).includes('queue unreachable')),
+      logs.error.some((args) =>
+        String(args[0]).includes('Error: queue unreachable'),
+      ),
     );
   });
 
@@ -6446,10 +6455,10 @@ describe('regenerating stale previews', () => {
     assert.equal(media.original?.width, undefined);
     assert.equal(logs.warn.length, 1);
     assert.equal(
-      logs.warn[0][0],
+      firstLine(logs.warn[0][0]),
       "resize: generate() recorded the original's dimensions of media m1 in the media store but could not set them on the caller's media.original, so a same-request resolve() finds its previews stale",
     );
-    assert.ok(logs.warn[0][1] instanceof TypeError);
+    assert.match(String(logs.warn[0][0]), /\nTypeError: /);
   });
 
   test('a replace that fails after the append stored rows records those as stored and the rest as failed', async () => {

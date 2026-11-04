@@ -634,7 +634,7 @@ export class Consumer {
             logger,
             `resize worker: task ${task.taskId} of media ${task.mediaId} is dead (${attempt}, ${deadReason(error, opts.forceDead)}) — new tasks for its media and pipeline wait ${cooldownMs} ms: ${text}`,
             // A module error's line says it all. The stack of an unexpected error is what an operator
-            // needs: it follows as the logger prints it, and only the line above is the module's.
+            // needs: it follows on the lines below, and only the first line is the module's.
             isModuleError(error) ? undefined : error,
           );
           await this.#holdUntil(
