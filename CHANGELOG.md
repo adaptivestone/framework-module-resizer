@@ -108,7 +108,8 @@
 
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
-- The dispatcher's once-log sets are capped at 100 keys.
+- The dispatcher's once-log sets are capped at 100 keys, and every once-log stores at most 1000
+  characters of a key.
 - A framework host's open metrics window is written on the framework's `shutdown` event, which
   `startServer()` and its CLI emit. A script on `new Server()` and `init()`, a `FrameworkResizer`
   with every part in code first used before the `Server` exists, and a CLI command with an

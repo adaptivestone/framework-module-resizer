@@ -10,7 +10,12 @@ import { ResizeConfigError } from '../errors.ts';
 import type { SqsQueueConfig } from '../types.d.ts';
 import { runBounded } from './concurrency.ts';
 import { isPositiveFinite } from './guards.ts';
-import { firstTime, logNeverThrow, ONCE_LOG_KEYS } from './log.ts';
+import {
+  firstTime,
+  logNeverThrow,
+  ONCE_LOG_KEY_LENGTH,
+  ONCE_LOG_KEYS,
+} from './log.ts';
 import { sqsBackendKey, validateSqsEntries } from './queueSections.ts';
 import { randomHex } from './random.ts';
 import { sleep } from './sleep.ts';
@@ -198,6 +203,16 @@ describe('firstTime', () => {
     assert.equal(firstTime(seen, 'one too many'), false);
     assert.equal(seen.size, ONCE_LOG_KEYS);
     assert.equal(firstTime(seen, 'a'), false);
+  });
+
+  test('a long key is stored cut, and keys that differ only past the cut count as one', () => {
+    const seen = new Set<string>();
+    const long = 'x'.repeat(ONCE_LOG_KEY_LENGTH);
+    assert.equal(firstTime(seen, `${long}a`), true);
+    assert.deepEqual([...seen], [long]);
+    assert.equal(firstTime(seen, `${long}b`), false);
+    assert.equal(firstTime(seen, long), false);
+    assert.equal(seen.size, 1);
   });
 });
 
