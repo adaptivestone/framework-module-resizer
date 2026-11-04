@@ -141,6 +141,18 @@ test("inspect rethrows Sharp's own error for bytes Sharp cannot read", async () 
   );
 });
 
+test('a file holding only PNG magic bytes stays an engine failure: an empty message is no evidence of damage', async () => {
+  const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  await assert.rejects(
+    new SharpDecoder().inspect(magic, limits),
+    (err: Error) => {
+      assert.equal(ResizeError.isResizeError(err), false);
+      assert.match(err.message, /the engine gave no detail/);
+      return true;
+    },
+  );
+});
+
 test('inspect applies limits.inputPixels', async () => {
   await assert.rejects(
     new SharpDecoder().inspect(orientedJpeg, { ...limits, inputPixels: 100 }),

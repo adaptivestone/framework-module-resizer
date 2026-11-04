@@ -2,11 +2,9 @@
 // changes a message makes src/decoders/sharp.test.ts fail, and until then costs five attempts
 // instead of one. Never add `unsupported image format` to the damage list: on a worker it means a
 // format this process has no decoder for, and a rolling deploy must not dead-letter good media.
-// libvips keeps one error buffer per process: of two decodes that fail at once, one can read the
-// other's message, or none (`Unknown error`, or the corrupt-header prefix alone). The worker decodes
-// one source per consume loop, so this takes several queues in one process, or concurrent
-// generate() calls. A misread costs one retry, or a dead task that the next read after its cooldown
-// queues again.
+// libvips keeps one error buffer per process, so of two decodes that fail at once one can find it
+// emptied by the other. The corrupt-header prefix with nothing after it is therefore no evidence of
+// damage: it stays retryable, and a file holding only PNG magic bytes takes the normal retries.
 import { ResizeError, ResizeMediaError } from '../errors.ts';
 import type { ResizeLimits } from '../types.d.ts';
 
@@ -33,9 +31,6 @@ export function engineDetail(message: string): string {
 /** True when the engine says the bytes are broken, not that it cannot do the work. */
 export function isEngineDamage(message: string): boolean {
   const detail = engineDetail(message);
-  if (detail === '') {
-    return message.startsWith(CORRUPT_HEADER);
-  }
   if (NOT_DAMAGE.test(detail)) {
     return false;
   }
@@ -59,7 +54,8 @@ export function sharpDecodeError(
   if (!(err instanceof Error) || ResizeError.isResizeError(err)) {
     return err;
   }
-  if (engineDetail(err.message).includes('exceeds pixel limit')) {
+  const detail = engineDetail(err.message);
+  if (detail.includes('exceeds pixel limit')) {
     return new ResizeMediaError(
       `resize: the source exceeds the pixel limit limits.inputPixels (${limits.inputPixels})`,
       { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false, cause: err },
@@ -67,9 +63,13 @@ export function sharpDecodeError(
   }
   if (isEngineDamage(err.message)) {
     return new ResizeMediaError(
-      `resize: the source is damaged (limits.failOn '${limits.failOn}'): ${engineDetail(err.message) || 'the engine gave no detail'}`,
+      `resize: the source is damaged (limits.failOn '${limits.failOn}'): ${detail}`,
       { code: 'RESIZE_SOURCE_DAMAGED', retryable: false, cause: err },
     );
+  }
+  if (detail === '' && err.message.startsWith(CORRUPT_HEADER)) {
+    // Sharp made this error for this one failure, so the text can change here.
+    err.message = `${CORRUPT_HEADER} the engine gave no detail`;
   }
   return err;
 }

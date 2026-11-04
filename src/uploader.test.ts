@@ -678,6 +678,25 @@ describe('uploadOriginal — private SVG source', () => {
     assert.equal(uploads.length, 0);
   });
 
+  test('an upload the engine fails with no detail keeps RESIZE_ORIGINAL_INVALID', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new FrameworkResizer({ storage });
+    await assert.rejects(
+      r.uploadOriginal({
+        body: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        visibility: 'private',
+      }),
+      (err: ResizeOriginalError) => {
+        assert.ok(err instanceof ResizeOriginalError);
+        assert.equal(err.code, 'RESIZE_ORIGINAL_INVALID');
+        assert.match((err.cause as Error).message, /the engine gave no detail/);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test("Sharp's pixel limit at upload is RESIZE_ORIGINAL_TOO_MANY_PIXELS", async () => {
     installApp({ limits: { inputPixels: 100 } });
     const { storage, uploads } = recordingStorage();

@@ -774,6 +774,28 @@ describe('decoding the source', () => {
       });
     }
 
+    test('an engine failure with no detail stays retryable: it is no evidence of damage', async () => {
+      const magic = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const { deps, uploads } = decodeDeps(magic, {
+        original: { format: 'png', size: magic.length },
+      });
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews: [variant()] })),
+        (err: ResizeMediaError) => {
+          assert.ok(err instanceof ResizeMediaError);
+          assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED', err.message);
+          assert.equal(err.retryable, true);
+          assert.equal(err.mediaId, 'm1');
+          assert.match(err.message, /the engine gave no detail/);
+          assert.ok(err.cause instanceof Error);
+          return true;
+        },
+      );
+      assert.equal(uploads.length, 0);
+    });
+
     test('a failure at render on a format no decoder lists stays retryable', async () => {
       const { deps, uploads } = decodeDeps(cutJpeg, {
         original: { format: 'pdf' },

@@ -345,6 +345,20 @@ test('damage with no stored format stays RESIZE_SOURCE_DAMAGED', async () => {
   });
 });
 
+test('an engine failure with no detail on a format no decoder lists is RESIZE_DECODER_MISSING', async () => {
+  const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  await assert.rejects(
+    createDecoderSet().identify(magic, limits, 'pdf'),
+    (err: ResizeSetupError) => {
+      assert.ok(err instanceof ResizeSetupError);
+      assert.equal(err.code, 'RESIZE_DECODER_MISSING');
+      assert.equal(err.retryable, true);
+      assert.match(err.message, /the engine gave no detail/);
+      return true;
+    },
+  );
+});
+
 test("verify() runs each decoder's verify(), in order", async () => {
   const order: string[] = [];
   const first = fake(['png'], 'accept');

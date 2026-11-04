@@ -18,7 +18,6 @@ const damaged = [
   'tiff2vips: Using code not yet in table',
   'source: bad seek to 149238',
   'Input buffer has corrupt header: VipsJpeg: premature end of JPEG image',
-  'Input buffer has corrupt header:',
   'Input buffer has corrupt header: webp: unable to parse image',
   'Input buffer has corrupt header: gifload_buffer: Invalid frame data',
   'Input buffer has corrupt header: source: bad seek to 1024',
@@ -34,6 +33,11 @@ const notDamaged = [
   'heif: Unsupported feature: Unsupported codec (4.3000)',
   // A format this process has no decoder for: must stay RESIZE_DECODER_MISSING (A3).
   'Input buffer contains unsupported image format',
+  // The prefix with nothing after it: another decode that failed at the same moment can have
+  // emptied libvips's error buffer, so this says nothing about these bytes.
+  'Input buffer has corrupt header:',
+  'Input buffer has corrupt header: ',
+  'Input buffer has corrupt header: the engine gave no detail',
   // Not about the bytes.
   'timeout: 1% complete\nVipsImage: killed for image "temp-57"',
   'Unknown error',
@@ -85,16 +89,6 @@ test('sharpDecodeError maps damage and the pixel limit, and returns anything els
     damage.message,
     "resize: the source is damaged (limits.failOn 'error'): VipsJpeg: premature end of JPEG image",
   );
-  // Measured with a file that holds only a PNG's magic bytes.
-  assert.equal(
-    (
-      sharpDecodeError(
-        new Error('Input buffer has corrupt header: '),
-        limits,
-      ) as ResizeError
-    ).message,
-    "resize: the source is damaged (limits.failOn 'error'): the engine gave no detail",
-  );
   const limit = new Error('Input image exceeds pixel limit');
   const big = sharpDecodeError(limit, limits) as ResizeError;
   assert.ok(big instanceof ResizeMediaError);
@@ -112,4 +106,18 @@ test('sharpDecodeError maps damage and the pixel limit, and returns anything els
   ]) {
     assert.equal(sharpDecodeError(raw, limits), raw);
   }
+});
+
+test('sharpDecodeError leaves an empty corrupt-header message the engine failure it is, and says so', () => {
+  const limits = { failOn: 'error', inputPixels: 100 } as const;
+  const engine = new Error('Input buffer has corrupt header: ');
+  assert.equal(sharpDecodeError(engine, limits), engine);
+  assert.equal(
+    engine.message,
+    'Input buffer has corrupt header: the engine gave no detail',
+  );
+  // Any other message keeps its text: only the bare prefix has nothing to say.
+  const unknown = new Error('Unknown error');
+  assert.equal(sharpDecodeError(unknown, limits), unknown);
+  assert.equal(unknown.message, 'Unknown error');
 });

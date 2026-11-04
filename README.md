@@ -1558,6 +1558,8 @@ await ResizeTask.updateOne(
   (the few that pass have all their image data and render the same pixels as the intact file).
   `'warning'` refuses more, including JPEGs that look identical to the intact file. `'none'`
   restores 0.3.0's rendering; a file whose header cannot be read still fails, now at once.
+  Decoding failures at the same moment in one process can blur which file an engine message belongs
+  to, so a failure with no usable detail is retried.
 
   **Previews made before this version.** A preview made from a damaged original stays fresh:
   upgrading does not regenerate it. To find them, decode each original at the level the worker now
