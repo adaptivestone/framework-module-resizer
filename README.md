@@ -560,6 +560,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     adopted object's ref comes from the host.
   - `download()` must accept every ref the host adopts, and refuse one outside its scope with a
     `ResizeError`, which `adoptOriginal()` passes through unchanged.
+  - `download()` resolves with a `Buffer` or a `Uint8Array` (an `ArrayBuffer` is read too). Anything
+    else is `ResizeSetupError` `RESIZE_STORAGE_DOWNLOAD_INVALID` from `generate()` and on a task,
+    where it is retried, and `RESIZE_ORIGINAL_DOWNLOAD_FAILED` from `adoptOriginal()`.
   - `publicUrl()` must refuse a ref it would not expose, because `adoptOriginal()` relies on that to
     tell a public object from a private one.
   - `download()` reports a missing object with a `ResizeStorageError` with the code
@@ -844,8 +847,9 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
   its engine can. With `upload.verify: 'decode'` a host's `render` also runs in the API process
   during `uploadOriginal()`, and it always runs during `adoptOriginal()`, with no `opts.signal`, so
-  the decoder bounds its own time; a source that reports `vector` is not rendered there. A raster whose `data` length does not match its
-  `info` is `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
+  the decoder bounds its own time; a source that reports `vector` is not rendered there. A raster
+  whose `data` length does not match its `info` is `RESIZE_DECODER_INVALID`; one with more pixels
+  (width × height × frames) than
   `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
   (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
   `generate()`, as the same object with the media id set on it; one that cannot take it (frozen)
@@ -905,7 +909,9 @@ exceptions say what they are:
 first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays
 `RESIZE_ORIGINAL_INVALID`. The check decodes the first frame only: an animation damaged in a later
 frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can
-pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes.
+pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes. A JPEG
+cut in its last rows can pass too (measured at 1200×900, up to about 1% of its tail), and a larger
+render then dead-letters it.
 
 ## Config reference
 
@@ -920,7 +926,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
-| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, and flipped bytes can pass, since a decode does not always find them. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
+| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
@@ -1764,23 +1770,33 @@ const refs = await getResizer().invalidate({ media: file, pipeline: 'photo' }); 
 
 ### `adoptOriginal()`
 
-`resizer.adoptOriginal({ storageRef })` measures and decodes an object already in storage and
-resolves with the `Original` that `uploadOriginal()` would return for it. It writes nothing and
+`resizer.adoptOriginal({ storageRef, maxBytes? })` measures and decodes an object already in storage
+and resolves with the `Original` that `uploadOriginal()` would return for it. It writes nothing and
 queues nothing: save the result as it is, and do not change it later, because a changed ref
-regenerates that media's previews. `hasOriginal(media)` tells whether a media is on the module yet.
-The how-to, with the backfill loop, is in the guide:
+regenerates that media's previews. The result holds the ref's JSON form, which is what a save stores,
+so a `namespace: undefined` in the ref you pass is not in it. `hasOriginal(media)` tells whether a
+media is on the module yet. The how-to, with the backfill loop, is in the guide:
 [Adopting on an app with existing media](https://framework.adaptivestone.com/docs/resize#adopting).
 
-It does not apply `upload.maxBytes` or `upload.formats`. It refuses what a worker could never
-render, and a public SVG, so it always decodes the object, on a Sharp thread, in the process that
-calls it. The check decodes the first frame. With `animated: true`, damage in a later frame shows up
-on the worker as a dead task, `RESIZE_SOURCE_DAMAGED`.
+`limits.sourceBytes` is its cap, shared with the workers. `upload.maxBytes` and `upload.formats` do
+not apply. Each call holds the object in memory: about one object on local storage, and on S3 about
+2.3 times it with a current AWS SDK and about 3.3 times with SDK 3.572, per concurrent call (measured
+at 250 MiB). So on a request path, where a client chose the file, pass `maxBytes`, or run the adoption
+from a job. It lowers the cap for this call and cannot raise it; over it, the shipped drivers read
+nothing. The download has no timeout of its own, so set one on your storage client: for S3, pass
+`new S3Storage({ …, client })` with `requestHandler: { socketTimeout }`, which ends a body that stalls.
+
+It refuses what a worker could never render, and a public SVG, so it always decodes the object, on a
+Sharp thread, in the process that calls it. The check decodes the first frame. With `animated: true`,
+damage in a later frame shows up on the worker as a dead task, `RESIZE_SOURCE_DAMAGED`.
 
 | Case | Class | Code | `retryable` |
 |---|---|---|---|
-| No `storageRef` | `ResizeOriginalError` | `RESIZE_ORIGINAL_STORAGE_REF_INVALID` | `false` (at upload, where a driver returned nothing, it is a `ResizeStorageError` and `true`) |
+| No `storageRef`, or one JSON cannot represent (circular, a BigInt) | `ResizeOriginalError` | `RESIZE_ORIGINAL_STORAGE_REF_INVALID` | `false` (at upload, where a driver returned nothing, it is a `ResizeStorageError` and `true`) |
+| `maxBytes` is not a positive safe integer | `ResizeSetupError` | `RESIZE_ADOPT_MAX_BYTES_INVALID` | `false` |
+| Over the call's own `maxBytes` | `ResizeOriginalError` | `RESIZE_ORIGINAL_TOO_LARGE` | `false` |
 | A driver's own `ResizeError`: a third bucket, a refused key or ref, a missing object, over the limit | as thrown, the same object | its code, e.g. `RESIZE_S3_BUCKET_NOT_ALLOWED`, `RESIZE_STORAGE_KEY_INVALID`, `RESIZE_STORAGE_NOT_FOUND`, `RESIZE_SOURCE_TOO_LARGE` | its own |
-| Any other driver error | `ResizeStorageError` | `RESIZE_ORIGINAL_DOWNLOAD_FAILED` | `true` |
+| Any other driver error, or a driver that resolved with something other than bytes | `ResizeStorageError` | `RESIZE_ORIGINAL_DOWNLOAD_FAILED` | `true` |
 | A driver that ignored `maxBytes` | `ResizeMediaError` | `RESIZE_SOURCE_TOO_LARGE` | `false` |
 | Empty object | `ResizeOriginalError` | `RESIZE_ORIGINAL_EMPTY` | `false` |
 | Not an image, unknown format, one frame over the pixel limit | `ResizeOriginalError` | `RESIZE_ORIGINAL_INVALID`, `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`, `RESIZE_ORIGINAL_TOO_MANY_PIXELS` | `false` |

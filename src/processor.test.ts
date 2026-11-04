@@ -8,6 +8,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { afterEach, describe, mock, test } from 'node:test';
 import v8 from 'node:v8';
 import vm from 'node:vm';
@@ -82,6 +83,7 @@ import type {
   ResizeLogger,
   SizeInput,
 } from './types.d.ts';
+import { Uploader } from './uploader.ts';
 import { processTask, runWorker } from './worker.ts';
 
 // ---------------------------------------------------------------------------
@@ -744,6 +746,104 @@ describe('decoding the source', () => {
     });
     assert.equal(failed, 0);
     assert.equal(uploads.length, 1);
+  });
+
+  test('an ArrayBuffer from a driver renders', async () => {
+    const { deps, uploads, media } = decodeDeps(redPng);
+    deps.storage.download = async () =>
+      redPng.buffer.slice(
+        redPng.byteOffset,
+        redPng.byteOffset + redPng.byteLength,
+      ) as never;
+    const { failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(uploads.length, 1);
+  });
+
+  test('a driver that resolves with something other than bytes is RESIZE_STORAGE_DOWNLOAD_INVALID, from generate() and on a task', async () => {
+    for (const value of [
+      undefined,
+      null,
+      'text',
+      {},
+      5,
+      Readable.from([redPng]),
+      new DataView(new ArrayBuffer(1)),
+      new Uint16Array(1),
+    ]) {
+      const { deps, media } = decodeDeps(redPng);
+      deps.storage.download = async () => value as never;
+      const named = (err: unknown) => {
+        assert.ok(err instanceof ResizeSetupError);
+        assert.equal(err.code, 'RESIZE_STORAGE_DOWNLOAD_INVALID');
+        assert.equal(err.retryable, true);
+        assert.match(err.message, /storage\.download\(\)/);
+        assert.match(err.message, /m1/);
+        return true;
+      };
+      await assert.rejects(
+        new Processor(deps).generate({
+          media: media(),
+          sizes: [{ width: 10 }],
+        }),
+        named,
+      );
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews: [variant()] })),
+        named,
+      );
+    }
+  });
+
+  test('a worker and an adoption accept exactly the same shapes from a driver', async () => {
+    const outcome = async (value: unknown) => {
+      const { deps, media } = decodeDeps(redPng);
+      deps.storage.download = async () => value as never;
+      const rendered = await new Processor(deps)
+        .generate({ media: media(), sizes: [{ width: 10 }] })
+        .then(
+          () => true,
+          (err: { code?: string }) =>
+            err.code === 'RESIZE_STORAGE_DOWNLOAD_INVALID'
+              ? false
+              : Promise.reject(err),
+        );
+      const adopted = await new Uploader({
+        storage: deps.storage,
+        decoders: createDecoderSet(),
+        config: makeImageConfig(),
+      })
+        .adopt({ storageRef: { key: 'k' } })
+        .then(
+          () => true,
+          (err: { code?: string }) =>
+            err.code === 'RESIZE_ORIGINAL_DOWNLOAD_FAILED'
+              ? false
+              : Promise.reject(err),
+        );
+      return [rendered, adopted];
+    };
+    const arrayBuffer = redPng.buffer.slice(
+      redPng.byteOffset,
+      redPng.byteOffset + redPng.byteLength,
+    );
+    for (const accepted of [redPng, new Uint8Array(redPng), arrayBuffer]) {
+      assert.deepEqual(await outcome(accepted), [true, true]);
+    }
+    for (const refused of [
+      undefined,
+      null,
+      'text',
+      {},
+      5,
+      new DataView(arrayBuffer),
+      new Uint16Array(1),
+    ]) {
+      assert.deepEqual(await outcome(refused), [false, false]);
+    }
   });
 
   test("a driver's refusal names the media, as the core's does", async (t) => {

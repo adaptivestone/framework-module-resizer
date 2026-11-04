@@ -69,6 +69,25 @@ describe('S3Storage', () => {
       }),
     });
 
+  test('download hands over the memory the SDK read, not a copy of it', async () => {
+    const backing = new ArrayBuffer(8);
+    const bytes = new Uint8Array(backing, 2, 4);
+    bytes.set([1, 2, 3, 4]);
+    const storage = new S3Storage({
+      bucketPublic: 'pub',
+      client: asS3Client({
+        send: async () => ({
+          Body: { transformToByteArray: async () => bytes },
+        }),
+      }),
+    });
+    const got = await storage.download({ bucket: 'pub', key: 'k' });
+    assert.ok(Buffer.isBuffer(got));
+    assert.equal(got.buffer, backing, 'the same memory');
+    assert.equal(got.byteOffset, 2);
+    assert.deepEqual([...got], [1, 2, 3, 4]);
+  });
+
   test('S3Storage: NoSuchKey is RESIZE_STORAGE_NOT_FOUND, retryable, with its cause', async () => {
     const thrown = Object.assign(new Error('x'), { name: 'NoSuchKey' });
     await assert.rejects(

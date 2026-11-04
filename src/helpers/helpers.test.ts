@@ -4,10 +4,12 @@
 // SQS queue-entry checks and backend key) directly.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import vm from 'node:vm';
 import { defaultQueueOptions } from '../config/resize.ts';
 import type { QueueEntry, QueueSection } from '../contracts/drivers.ts';
 import { ResizeConfigError } from '../errors.ts';
 import type { SqsQueueConfig } from '../types.d.ts';
+import { asBuffer, isBytes } from './bytes.ts';
 import { runBounded } from './concurrency.ts';
 import { isPositiveFinite } from './guards.ts';
 import {
@@ -19,6 +21,60 @@ import {
 import { sqsBackendKey, validateSqsEntries } from './queueSections.ts';
 import { randomHex } from './random.ts';
 import { sleep } from './sleep.ts';
+
+describe('isBytes and asBuffer', () => {
+  const bytes = [1, 2, 3];
+
+  test('a Buffer stays the same object, and a Uint8Array and an ArrayBuffer become a Buffer of their bytes', () => {
+    const buffer = Buffer.from(bytes);
+    assert.equal(asBuffer(buffer), buffer);
+    for (const value of [
+      buffer,
+      new Uint8Array(bytes),
+      new Uint8Array(bytes).buffer,
+      new SharedArrayBuffer(3),
+    ]) {
+      assert.equal(isBytes(value), true);
+      assert.ok(Buffer.isBuffer(asBuffer(value)));
+      assert.equal(asBuffer(value).byteLength, 3);
+    }
+    assert.deepEqual([...asBuffer(new Uint8Array(bytes).buffer)], bytes);
+  });
+
+  test('bytes from another realm count, as under a test runner that runs a host in a vm context', () => {
+    const foreign: unknown = vm.runInNewContext('new Uint8Array([1, 2, 3])');
+    assert.equal(foreign instanceof Uint8Array, false);
+    assert.equal(isBytes(foreign), true);
+    assert.deepEqual([...asBuffer(foreign as Uint8Array)], bytes);
+  });
+
+  test('a Proxy around a Uint8Array counts, as a worker has always read one', () => {
+    const wrapped = new Proxy(new Uint8Array(bytes), {
+      get(target, key) {
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    assert.equal(isBytes(wrapped), true);
+    assert.deepEqual([...asBuffer(wrapped)], bytes);
+  });
+
+  test('nothing else counts, not even a view of another element size', () => {
+    for (const value of [
+      undefined,
+      null,
+      'text',
+      5,
+      {},
+      [1, 2, 3],
+      new DataView(new ArrayBuffer(1)),
+      new Uint16Array(1),
+      { byteLength: 3 },
+    ]) {
+      assert.equal(isBytes(value), false);
+    }
+  });
+});
 
 describe('isPositiveFinite', () => {
   test('true only for finite numbers > 0', () => {

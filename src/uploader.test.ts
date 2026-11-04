@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  truncate,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
@@ -2014,7 +2021,15 @@ describe('adoptOriginal', () => {
   });
 
   test('a driver that resolves with something other than bytes is RESIZE_ORIGINAL_DOWNLOAD_FAILED too', async () => {
-    for (const value of [undefined, null, 'text', {}]) {
+    for (const value of [
+      undefined,
+      null,
+      'text',
+      {},
+      5,
+      new DataView(new ArrayBuffer(1)),
+      new Uint16Array(1),
+    ]) {
       const { uploader } = adopting({
         storage: { download: async () => value as never },
       });
@@ -2494,5 +2509,353 @@ describe('adoptOriginal', () => {
       return true;
     });
     assert.deepEqual(metrics.calls[0].labels, { outcome: 'rejected' });
+  });
+
+  test('the value holds the ref as JSON: an undefined value drops, and a later change to the given object reaches nothing', async () => {
+    const seen: unknown[] = [];
+    const { uploader } = adopting({
+      storage: {
+        download: async (ref) => {
+          seen.push(['download', ref]);
+          return png;
+        },
+        publicUrl: (ref) => {
+          seen.push(['publicUrl', ref]);
+          throw new Error('this object is private');
+        },
+      },
+    });
+    const given = {
+      key: 'k',
+      namespace: undefined,
+      nested: { gone: undefined, kept: 1 },
+    };
+    const { storageRef } = await uploader.adopt({ storageRef: given });
+    assert.deepStrictEqual(storageRef, { key: 'k', nested: { kept: 1 } });
+    // The driver reads what a worker reads once the value is saved, so it refuses it now if at all.
+    assert.deepStrictEqual(seen, [
+      ['download', storageRef],
+      ['publicUrl', storageRef],
+    ]);
+    given.key = 'other';
+    given.nested.kept = 2;
+    assert.deepStrictEqual(storageRef, { key: 'k', nested: { kept: 1 } });
+  });
+
+  test('a ref JSON cannot represent is RESIZE_ORIGINAL_STORAGE_REF_INVALID, and nothing is read', async () => {
+    let read = 0;
+    const { uploader } = adopting({
+      storage: {
+        download: async () => {
+          read += 1;
+          return png;
+        },
+      },
+    });
+    const circular: Record<string, unknown> = { key: 'k' };
+    circular.self = circular;
+    const refs: Array<[string, unknown]> = [
+      ['circular', circular],
+      ['a BigInt inside', { key: 1n }],
+      ['a BigInt', 1n],
+      ['a function', () => 'k'],
+      ['a symbol', Symbol('k')],
+      ['NaN, whose JSON form is null', Number.NaN],
+      ['a toJSON that resolves to nothing', { toJSON: () => undefined }],
+      [
+        'a toJSON that throws',
+        {
+          toJSON() {
+            throw new Error('no');
+          },
+        },
+      ],
+      [
+        'a getter that throws',
+        {
+          get key() {
+            throw new Error('no');
+          },
+        },
+      ],
+    ];
+    for (const [what, storageRef] of refs) {
+      await assert.rejects(
+        uploader.adopt({ storageRef } as never),
+        (err: ResizeOriginalError) => {
+          assert.ok(err instanceof ResizeOriginalError, what);
+          assert.equal(err.code, 'RESIZE_ORIGINAL_STORAGE_REF_INVALID', what);
+          assert.equal(err.retryable, false, what);
+          assert.match(err.message, /adoptOriginal: storageRef/, what);
+          return true;
+        },
+      );
+    }
+    assert.equal(read, 0);
+    await assert.rejects(
+      uploader.adopt({ storageRef: circular }),
+      (err: ResizeOriginalError) => {
+        assert.ok(err.cause instanceof TypeError, 'the reason stays readable');
+        return true;
+      },
+    );
+  });
+
+  describe('maxBytes', () => {
+    const storageRef = { key: 'k', private: true };
+    const overMaxBytes = (cap: number) => (err: ResizeOriginalError) => {
+      assert.ok(err instanceof ResizeOriginalError);
+      assert.equal(err.code, 'RESIZE_ORIGINAL_TOO_LARGE');
+      assert.equal(err.retryable, false);
+      assert.match(err.message, new RegExp(`maxBytes \\(${cap}\\)`));
+      assert.doesNotMatch(err.message, /limits\.sourceBytes/);
+      return true;
+    };
+    /** A driver that refuses from the object's length, as the shipped ones do, and reads nothing. */
+    const refusing = (length: number, reads: { count: number }) => ({
+      download: async (_ref: unknown, opts?: { maxBytes?: number }) => {
+        if (opts?.maxBytes !== undefined && length > opts.maxBytes) {
+          throw new ResizeMediaError(
+            `resize test: object is ${length} bytes, over the ${opts.maxBytes} byte limit (limits.sourceBytes)`,
+            { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+          );
+        }
+        reads.count += 1;
+        return png;
+      },
+    });
+
+    test('the driver is asked for the smaller of it and limits.sourceBytes, so it cannot raise the limit', async () => {
+      const limit = png.length + 10;
+      const asked: unknown[] = [];
+      const { uploader } = adopting({
+        config: { limits: { sourceBytes: limit } },
+        storage: {
+          download: async (_ref, opts) => {
+            asked.push(opts);
+            return png;
+          },
+        },
+      });
+      for (const maxBytes of [undefined, png.length, limit, 2 ** 40]) {
+        await uploader.adopt({ storageRef, maxBytes });
+      }
+      assert.deepEqual(asked, [
+        { maxBytes: limit },
+        { maxBytes: png.length },
+        { maxBytes: limit },
+        { maxBytes: limit },
+      ]);
+    });
+
+    test("over a call's own cap: a driver's refusal becomes RESIZE_ORIGINAL_TOO_LARGE, and nothing is read past it", async () => {
+      const reads = { count: 0 };
+      const { uploader, metrics } = adopting({
+        config: { limits: { sourceBytes: 1000 } },
+        storage: refusing(500, reads),
+      });
+      await assert.rejects(
+        uploader.adopt({ storageRef, maxBytes: 100 }),
+        overMaxBytes(100),
+      );
+      assert.equal(reads.count, 0);
+      assert.deepEqual(metrics.calls.at(-1)?.labels, {
+        outcome: 'rejected',
+        code: 'RESIZE_ORIGINAL_TOO_LARGE',
+      });
+    });
+
+    test('an object over both is over the cap that applied: the smaller one', async () => {
+      const { uploader } = adopting({
+        config: { limits: { sourceBytes: 1000 } },
+        storage: refusing(5000, { count: 0 }),
+      });
+      await assert.rejects(
+        uploader.adopt({ storageRef, maxBytes: 100 }),
+        overMaxBytes(100),
+      );
+    });
+
+    test("a driver that ignores it is caught by the core's check, before any decode", async () => {
+      let inspected = 0;
+      const { uploader, files } = adopting({
+        decoders: new DecoderSet([
+          {
+            formats: ['pdf'],
+            inspect: async () => {
+              inspected += 1;
+              return pdfInfo;
+            },
+            render: async () => anyRaster,
+          },
+        ]),
+      });
+      files.set('k', Buffer.alloc(11));
+      await assert.rejects(
+        uploader.adopt({ storageRef, maxBytes: 10 }),
+        overMaxBytes(10),
+      );
+      assert.equal(inspected, 0);
+    });
+
+    test('an object of exactly the cap is adopted', async () => {
+      const { uploader, files } = adopting();
+      files.set('k', png);
+      const original = await uploader.adopt({
+        storageRef,
+        maxBytes: png.length,
+      });
+      assert.equal(original.size, png.length);
+    });
+
+    test('over limits.sourceBytes stays RESIZE_SOURCE_TOO_LARGE, however the call sets maxBytes, on a driver that refuses and on one that ignores it', async () => {
+      const tooLarge = (err: ResizeMediaError) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.match(err.message, /limits\.sourceBytes/);
+        return true;
+      };
+      for (const maxBytes of [undefined, 10, 11]) {
+        const honest = adopting({
+          config: { limits: { sourceBytes: 10 } },
+          storage: refusing(11, { count: 0 }),
+        });
+        const ignoring = adopting({ config: { limits: { sourceBytes: 10 } } });
+        ignoring.files.set('k', Buffer.alloc(11));
+        await assert.rejects(
+          honest.uploader.adopt({ storageRef, maxBytes }),
+          tooLarge,
+        );
+        await assert.rejects(
+          ignoring.uploader.adopt({ storageRef, maxBytes }),
+          tooLarge,
+        );
+      }
+    });
+
+    test('another refusal from the driver passes unchanged under a cap', async () => {
+      const refusal = new ResizeStorageError('gone', {
+        code: 'RESIZE_STORAGE_NOT_FOUND',
+      });
+      const { uploader } = adopting({
+        storage: {
+          download: async () => {
+            throw refusal;
+          },
+        },
+      });
+      await assert.rejects(
+        uploader.adopt({ storageRef, maxBytes: 10 }),
+        (err: unknown) => err === refusal,
+      );
+    });
+
+    test('an invalid value is RESIZE_ADOPT_MAX_BYTES_INVALID, and nothing is read', async () => {
+      let read = 0;
+      const { uploader } = adopting({
+        storage: {
+          download: async () => {
+            read += 1;
+            return png;
+          },
+        },
+      });
+      for (const maxBytes of [
+        0,
+        -1,
+        1.5,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        2 ** 53,
+        '100',
+        null,
+        {},
+      ]) {
+        await assert.rejects(
+          uploader.adopt({ storageRef, maxBytes } as never),
+          (err: ResizeSetupError) => {
+            assert.ok(err instanceof ResizeSetupError, String(maxBytes));
+            assert.equal(err.code, 'RESIZE_ADOPT_MAX_BYTES_INVALID');
+            assert.equal(err.retryable, false);
+            assert.match(err.message, /maxBytes/);
+            return true;
+          },
+        );
+      }
+      assert.equal(read, 0);
+    });
+
+    test('on LocalFsStorage: over it nothing is read, and exactly it is adopted', async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), 'resize-adopt-'));
+      t.after(async () => {
+        await rm(dir, { recursive: true, force: true });
+        await rm(`${dir}-private`, { recursive: true, force: true });
+      });
+      await mkdir(`${dir}-private`, { recursive: true });
+      const uploader = new Uploader({
+        storage: new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' }),
+        decoders: createDecoderSet(),
+        config: makeImageConfig(),
+      });
+      const huge = { path: 'huge.mp4', visibility: 'private' };
+      await writeFile(join(`${dir}-private`, 'huge.mp4'), '');
+      // Sparse and over 2 GiB: readFile would reject with ERR_FS_FILE_TOO_LARGE, so the code proves stat refused it.
+      await truncate(join(`${dir}-private`, 'huge.mp4'), 3 * 1024 ** 3);
+      await assert.rejects(
+        uploader.adopt({ storageRef: huge, maxBytes: 1024 }),
+        overMaxBytes(1024),
+      );
+      const small = { path: 'a.png', visibility: 'private' };
+      await writeFile(join(`${dir}-private`, 'a.png'), png);
+      assert.equal(
+        (await uploader.adopt({ storageRef: small, maxBytes: png.length }))
+          .size,
+        png.length,
+      );
+      await assert.rejects(
+        uploader.adopt({ storageRef: small, maxBytes: png.length - 1 }),
+        overMaxBytes(png.length - 1),
+      );
+    });
+  });
+
+  test('on LocalFsStorage too, the value holds no undefined namespace', async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'resize-adopt-'));
+    t.after(async () => {
+      await rm(dir, { recursive: true, force: true });
+      await rm(`${dir}-private`, { recursive: true, force: true });
+    });
+    await mkdir(`${dir}-private`, { recursive: true });
+    await writeFile(join(`${dir}-private`, 'a.png'), png);
+    const uploader = new Uploader({
+      storage: new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' }),
+      decoders: createDecoderSet(),
+      config: makeImageConfig(),
+    });
+    const { storageRef } = await uploader.adopt({
+      storageRef: {
+        path: 'a.png',
+        visibility: 'private',
+        namespace: undefined,
+      },
+    });
+    assert.deepStrictEqual(storageRef, {
+      path: 'a.png',
+      visibility: 'private',
+    });
+  });
+
+  test('an ArrayBuffer from a driver is adopted, as a worker renders it', async () => {
+    const buffer = png.buffer.slice(
+      png.byteOffset,
+      png.byteOffset + png.byteLength,
+    );
+    const { uploader } = adopting({
+      storage: { download: async () => buffer as never },
+    });
+    const original = await uploader.adopt({ storageRef: { key: 'k' } });
+    assert.equal(original.format, 'png');
+    assert.equal(original.size, png.length);
   });
 });

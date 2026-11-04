@@ -5,7 +5,11 @@ import type { Readable } from 'node:stream';
 import { after, afterEach, before, test } from 'node:test';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
-import { ResizeMediaError, ResizeStorageError } from '../errors.ts';
+import {
+  ResizeMediaError,
+  ResizeOriginalError,
+  ResizeStorageError,
+} from '../errors.ts';
 import { Resizer, resetResizerForTests } from '../resizer.ts';
 import { type FakeS3, fakeS3 } from '../testHelpers/fakeS3.ts';
 import { fakeMedia, silentLogger } from '../testHelpers/fakes.ts';
@@ -131,6 +135,64 @@ test('an adopted object with a hostile key renders: previews land on clean keys,
   });
   assert.equal(decision.missing.length, 0);
   assert.equal((await fetch(decision.ready[0].url)).status, 200);
+});
+
+test("adoptOriginal's maxBytes on S3: over it the object's body is not read and its connection closes", {
+  timeout: 10_000,
+}, async () => {
+  const resizer = new Resizer({
+    storage: s3.storage(),
+    media: fakeMedia(),
+    logger: silentLogger,
+  });
+  // The body never ends: reading it would hang here until the timeout.
+  const closed = s3.hang('priv/video.mp4', 250 * 1024 * 1024);
+  await assert.rejects(
+    resizer.adoptOriginal({
+      storageRef: { bucket: 'priv', key: 'video.mp4' },
+      maxBytes: 25 * 1024 * 1024,
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof ResizeOriginalError);
+      assert.equal(err.code, 'RESIZE_ORIGINAL_TOO_LARGE');
+      assert.equal(err.retryable, false);
+      assert.match(err.message, /maxBytes/);
+      assert.doesNotMatch(err.message, /video\.mp4/);
+      return true;
+    },
+  );
+  await closed; // resolves only when the driver dropped the stream
+
+  s3.objects.set('priv/a.jpg', jpeg);
+  const storageRef = { bucket: 'priv', key: 'a.jpg' };
+  const original = await resizer.adoptOriginal({
+    storageRef,
+    maxBytes: jpeg.length,
+  });
+  assert.equal(original.size, jpeg.length);
+  await assert.rejects(
+    resizer.adoptOriginal({ storageRef, maxBytes: jpeg.length - 1 }),
+    { code: 'RESIZE_ORIGINAL_TOO_LARGE', retryable: false },
+  );
+});
+
+test('adoption through the real driver: the value holds no undefined namespace, and a null one is refused before it is saved', async () => {
+  const resizer = new Resizer({
+    storage: s3.storage(),
+    media: fakeMedia(),
+    logger: silentLogger,
+  });
+  s3.objects.set('priv/a.jpg', jpeg);
+  const { storageRef } = await resizer.adoptOriginal({
+    storageRef: { bucket: 'priv', key: 'a.jpg', namespace: undefined },
+  });
+  assert.deepStrictEqual(storageRef, { bucket: 'priv', key: 'a.jpg' });
+  await assert.rejects(
+    resizer.adoptOriginal({
+      storageRef: { bucket: 'priv', key: 'a.jpg', namespace: null },
+    }),
+    { code: 'RESIZE_STORAGE_NAMESPACE_INVALID', retryable: false },
+  );
 });
 
 test('adoption through the real driver: what it refuses reaches the host unchanged, and nothing is sent', async () => {

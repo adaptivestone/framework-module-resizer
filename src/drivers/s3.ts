@@ -359,7 +359,8 @@ export class S3Storage extends ResizeStorage {
       );
     }
     const bytes = await stream.transformToByteArray();
-    return Buffer.from(bytes);
+    // A view: the SDK's array is this call's alone, and a copy would hold the object once more.
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
 
   // PURE string building — no SDK, no I/O (called on the read path). Three forms:

@@ -20,6 +20,7 @@ import {
   resetResizerForTests,
 } from '../../index.ts';
 import { encodeSignature } from '../../signatures.ts';
+import { fakeS3 } from '../../testHelpers/fakeS3.ts';
 import { memoryStorage } from '../../testHelpers/fakes.ts';
 import type { MediaLike, Preview } from '../../types.d.ts';
 import { runWorker } from '../../worker.ts';
@@ -426,7 +427,7 @@ async function renderQueued(
 }
 
 /** A model with a host's own field beside the module's, and a Resizer on the shipped Mongo drivers. */
-async function adoptingOn(modelName: string) {
+async function adoptingOn(modelName: string, backing?: Resizer['storage']) {
   const File = connection.model(
     modelName,
     new mongoose.Schema(
@@ -449,7 +450,7 @@ async function adoptingOn(modelName: string) {
     name: modelName,
     config: { ...defaultResizeConfig, formats: ['webp'] },
     logger: silent,
-    storage,
+    storage: backing ?? storage,
     ...parts,
   });
   return {
@@ -534,6 +535,43 @@ test('adopt, then save: a queued task renders, and writing the same Original aga
     await connection.models.ResizeTask.countDocuments({ fileId: file._id }),
     1,
     'nothing was queued again',
+  );
+});
+
+test('a ref built with namespace: undefined: the value holds no such key, a real $set stores no null, and the task completes', async (t) => {
+  resetAppInstance();
+  const s3 = await fakeS3();
+  t.after(() => s3.close());
+  s3.objects.set('priv/a.png', png);
+  const { File, resizer, sizes } = await adoptingOn(
+    'UndefinedNamespaceFile',
+    s3.storage(),
+  );
+  const { _id } = (await File.create({ name: 'x' })) as unknown as {
+    _id: unknown;
+  };
+  const original = await resizer.adoptOriginal({
+    storageRef: { bucket: 'priv', key: 'a.png', namespace: undefined },
+  });
+  const storageRef = { bucket: 'priv', key: 'a.png' };
+  assert.deepStrictEqual(original.storageRef, storageRef);
+  await File.updateOne({ _id }, { $set: { original } });
+  const raw = await File.collection.findOne({ _id } as never);
+  assert.deepStrictEqual(raw?.original.storageRef, storageRef);
+
+  const media = (await File.findById(_id)) as unknown as MediaLike;
+  const warm = await resizer.prewarm({ media, sizes });
+  assert.equal(warm.status, 'accepted');
+  const stored = await renderQueued(resizer, File, _id);
+  assert.equal(stored.previews?.length, 1);
+  const { decision } = await resizer.resolve({ media: stored, sizes });
+  assert.equal(decision.ready.length, 1);
+  assert.equal(decision.ready[0].stale, undefined);
+  // The stored row can be adopted again, and that changes nothing.
+  assert.deepStrictEqual(
+    (await resizer.adoptOriginal({ storageRef: raw?.original.storageRef }))
+      .storageRef,
+    storageRef,
   );
 });
 

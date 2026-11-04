@@ -5,6 +5,7 @@
 // literal of a shipped file is here, and every entry is used by a shipped file.
 
 export const RESIZE_ERROR_CODES: ReadonlySet<string> = new Set([
+  'RESIZE_ADOPT_MAX_BYTES_INVALID',
   'RESIZE_APP_NOT_INITIALIZED',
   'RESIZE_CONFIG',
   'RESIZE_CONFIG_COORDINATION_INVALID',
@@ -106,6 +107,7 @@ export const RESIZE_ERROR_CODES: ReadonlySet<string> = new Set([
   'RESIZE_SQS_QUEUE_UNKNOWN',
   'RESIZE_SQS_QUEUE_URL_REQUIRED',
   'RESIZE_STORAGE',
+  'RESIZE_STORAGE_DOWNLOAD_INVALID',
   'RESIZE_STORAGE_KEY_INVALID',
   'RESIZE_STORAGE_NAMESPACE_INVALID',
   'RESIZE_STORAGE_NOT_FOUND',

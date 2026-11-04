@@ -26,8 +26,10 @@ export abstract class ResizeStorage {
    * object over `maxBytes` rejects with a ResizeMediaError with the code RESIZE_SOURCE_TOO_LARGE
    * and `retryable: false`, without the key in its message: a key may hold a client's file name,
    * and this line reaches logs. A driver that ignores `maxBytes` still works: the core checks the
-   * length afterwards, but the memory is already spent. `adoptOriginal` passes refs a host built:
-   * refuse one outside this driver's scope with a ResizeError, which reaches the host unchanged.
+   * length afterwards, but the memory is already spent. Anything other than bytes is
+   * RESIZE_STORAGE_DOWNLOAD_INVALID. `adoptOriginal` passes refs a host built: refuse one outside
+   * this driver's scope with a ResizeError, which reaches the host unchanged. A `maxBytes` here may
+   * be lower than `limits.sourceBytes`: `adoptOriginal` passes a call's own cap.
    */
   abstract download(
     ref: StorageRef,

@@ -819,8 +819,9 @@ export class Resizer {
   /**
    * Measure and decode an object already in storage, and return the `Original` that
    * `uploadOriginal` would return for it. It stores nothing, writes nothing and queues nothing. Save
-   * the result as it is: its `storageRef` is signed into every preview's origin, so a changed ref
-   * regenerates that media's previews.
+   * the result as it is: its `storageRef`, the JSON form of the one given, is signed into every
+   * preview's origin, so a changed ref regenerates that media's previews. On a request path pass
+   * `maxBytes`, which lowers `limits.sourceBytes` for this call.
    */
   async adoptOriginal(opts: AdoptOriginalOpts): Promise<Original> {
     return (await this.#services()).uploader.adopt(opts);

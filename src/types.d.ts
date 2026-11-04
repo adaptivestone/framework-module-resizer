@@ -66,9 +66,13 @@ export interface UploadOriginalOpts {
 }
 
 export interface AdoptOriginalOpts {
-  // The driver's locator of an object already in storage, built from the host's own records. It is
-  // saved as it is: its JSON form is signed into every preview's origin.
+  // The driver's locator of an object already in storage, built from the host's own records. The
+  // result holds its JSON form, which is what gets saved and what every preview's origin signs. A ref
+  // JSON cannot represent is RESIZE_ORIGINAL_STORAGE_REF_INVALID.
   storageRef: StorageRef;
+  // The most this call reads, in bytes: a positive safe integer, for an adoption on a request path.
+  // It lowers limits.sourceBytes for this call and cannot raise it. Over it: RESIZE_ORIGINAL_TOO_LARGE.
+  maxBytes?: number;
 }
 
 // Which Resizer and pipeline rendered a preview. Part of the preview identity, so different

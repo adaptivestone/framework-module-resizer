@@ -12,13 +12,16 @@ import {
   type ResizeError,
   ResizeMediaError,
   ResizeOriginalError,
+  ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
+import { asBuffer, isBytes } from './helpers/bytes.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { isModuleError, messageText, notRetryable } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { engineDetail, isUnsupportedBytes } from './helpers/sharpError.ts';
 import { errorCodeLabel, NoopMetrics } from './metrics.ts';
+import { locatorJson } from './signatures.ts';
 import type {
   AdoptOriginalOpts,
   Original,
@@ -44,7 +47,7 @@ interface IdentifiedOriginal {
 /**
  * The upload codes of the decoder codes that say what is wrong with the original. A storage driver's
  * RESIZE_SOURCE_TOO_LARGE never reaches this map: it counts bytes, not pixels, and adoption passes
- * it on as it is.
+ * it on, or names the call's own `maxBytes`.
  */
 const ORIGINAL_CODES = new Map([
   ['RESIZE_SOURCE_FORMAT_UNSUPPORTED', 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED'],
@@ -54,9 +57,30 @@ const ORIGINAL_CODES = new Map([
   ['RESIZE_SOURCE_TOO_LARGE', 'RESIZE_ORIGINAL_TOO_MANY_PIXELS'],
 ]);
 
-function asBuffer(body: Buffer | Uint8Array): Buffer {
-  return Buffer.isBuffer(body) ? body : Buffer.from(body);
+/** The form a ref is saved in, or the refusal of one that has none: it could not be saved or read back. */
+function savedForm(given: StorageRef): StorageRef {
+  let json: StorageRef | undefined;
+  let cause: unknown;
+  try {
+    json = locatorJson(given);
+  } catch (err) {
+    cause = err;
+  }
+  if (json === null || json === undefined) {
+    throw new ResizeOriginalError(
+      'resize adoptOriginal: storageRef cannot be saved, because JSON cannot represent it',
+      { code: 'RESIZE_ORIGINAL_STORAGE_REF_INVALID', cause },
+    );
+  }
+  return json;
 }
+
+/** Over the cap a call set itself: that call's rule on what it accepts, as at upload. */
+const overMaxBytes = (cap: number): ResizeOriginalError =>
+  new ResizeOriginalError(
+    `resize adoptOriginal: object is over maxBytes (${cap})`,
+    { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
+  );
 
 /** The classes of a wiring bug, not an invalid original (a host's subclass of one counts too). */
 const WIRING_ERRORS: ReadonlySet<string> = new Set([
@@ -360,22 +384,40 @@ export class Uploader {
   /**
    * The adoption itself, each step before any later cost. `upload.maxBytes` and `upload.formats` are
    * not applied: they are the policy for what clients send, and this object is already held. What a
-   * worker could never render is refused, which is why the decode always runs.
+   * worker could never render is refused, which is why the decode always runs. Everything from here
+   * on uses the ref's JSON form, which is what a save stores: an `undefined` value in the given ref
+   * would otherwise be stored as null by a bare `$set`, which the shipped drivers refuse for good,
+   * and the driver now refuses what it would refuse on every delivery.
    */
   async #adopt(
     opts: AdoptOriginalOpts,
   ): Promise<Original & { format: string; size: number }> {
-    const ref = opts?.storageRef;
-    if (ref === null || ref === undefined) {
+    const given = opts?.storageRef;
+    if (given === null || given === undefined) {
       throw new ResizeOriginalError(
         'resize adoptOriginal: storageRef is required',
         { code: 'RESIZE_ORIGINAL_STORAGE_REF_INVALID' },
       );
     }
-    const downloaded = await this.#download(ref);
+    const { maxBytes } = opts;
+    if (
+      maxBytes !== undefined &&
+      !(Number.isSafeInteger(maxBytes) && maxBytes > 0)
+    ) {
+      throw new ResizeSetupError(
+        'resize adoptOriginal: maxBytes must be a positive safe integer',
+        { code: 'RESIZE_ADOPT_MAX_BYTES_INVALID', retryable: false },
+      );
+    }
+    const ref = savedForm(given);
     const { sourceBytes } = this.#config.limits;
+    const cap = Math.min(maxBytes ?? sourceBytes, sourceBytes);
+    const downloaded = await this.#download(ref, cap);
     // Before asBuffer, which copies a Uint8Array: a file about to be refused costs no second copy.
-    if (downloaded.byteLength > sourceBytes) {
+    if (downloaded.byteLength > cap) {
+      if (cap < sourceBytes) {
+        throw overMaxBytes(cap);
+      }
       throw new ResizeMediaError(
         `resize adoptOriginal: object is ${downloaded.byteLength} bytes, over limits.sourceBytes (${sourceBytes})`,
         { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
@@ -408,21 +450,32 @@ export class Uploader {
   }
 
   /**
-   * The object's bytes, asked for within `limits.sourceBytes`. A driver's own ResizeError says what
-   * is wrong with the ref or the object, so it passes through as the same object. Any other failure,
-   * a driver that resolved with no bytes included, gives no verdict on the object.
+   * The object's bytes, asked for within `cap`. A driver's own ResizeError says what is wrong with
+   * the ref or the object, so it passes through as the same object, except a refusal of a cap this
+   * call set: the driver cannot know that, and its line names limits.sourceBytes, so it is not kept
+   * as the cause either. Any other failure, a driver that resolved with no bytes included, gives no
+   * verdict on the object.
    */
-  async #download(ref: StorageRef): Promise<Buffer | Uint8Array> {
+  async #download(
+    ref: StorageRef,
+    cap: number,
+  ): Promise<Uint8Array | ArrayBufferLike> {
     try {
-      const bytes = await this.#storage.download(ref, {
-        maxBytes: this.#config.limits.sourceBytes,
+      const bytes: unknown = await this.#storage.download(ref, {
+        maxBytes: cap,
       });
-      if (!(bytes instanceof Uint8Array)) {
+      if (!isBytes(bytes)) {
         throw new TypeError('storage.download() resolved with no bytes');
       }
       return bytes;
     } catch (cause) {
       if (isModuleError(cause)) {
+        if (
+          cause.code === 'RESIZE_SOURCE_TOO_LARGE' &&
+          cap < this.#config.limits.sourceBytes
+        ) {
+          throw overMaxBytes(cap);
+        }
         throw cause;
       }
       throw new ResizeStorageError(
