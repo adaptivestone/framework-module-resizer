@@ -6,7 +6,8 @@
 // the atomic TaskQueue operations. The host logger is called only through logNeverThrow, so a
 // logger that throws never stops the loop. A task's failure is logged here, whatever the metrics
 // sink is. A thrown value may be host code, so it is read only through the guarded helpers of
-// helpers/log.ts, and it can neither stop the loop nor forge a log line.
+// helpers/log.ts: it cannot stop the loop, and the module's own line is always one line. The stack
+// of an unexpected error follows that line as the logger prints it, so later lines are not ours.
 import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
@@ -589,7 +590,7 @@ export class Consumer {
    * for the cooldown: the task's final gate action (see #finalGate), whose call waits until
    * `opts.gateDeadline` at most (default: one gate bound). `opts.claim` labels and times its
    * outcome (see #report). Once the queue took the failure it is logged, before the gate hold, so
-   * a lock store that stalls cannot hold the line back.
+   * the final gate hold cannot hold the line back.
    */
   async #finish(
     task: ClaimedTask,
@@ -626,7 +627,8 @@ export class Consumer {
           logNeverThrow(
             logger,
             `resize worker: task ${task.taskId} of media ${task.mediaId} is dead (${attempt}, ${deadReason(error, opts.forceDead)}) — new tasks for its media and pipeline wait ${cooldownMs} ms: ${text}`,
-            // A module error's line says it all; another library's may carry more.
+            // A module error's line says it all. The stack of an unexpected error is what an operator
+            // needs: it follows as the logger prints it, and only the line above is one line for sure.
             isModuleError(error) ? undefined : error,
           );
           await this.#holdUntil(
@@ -873,7 +875,8 @@ export class Consumer {
   }
 
   // The worker's shutdown stopped the task before or while it ran. `opts.handlerError`: what its
-  // handler rejected with, for the log line; the task is given back all the same.
+  // handler rejected with, for the log line. It is usually the shutdown itself (the remaining
+  // variants were skipped), not a failure, and the task is given back all the same.
   async #giveBackAtShutdown(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
@@ -886,7 +889,7 @@ export class Consumer {
     const failure =
       opts.handlerError === undefined
         ? ''
-        : ` (it had failed: ${causeText(opts.handlerError)})`;
+        : ` (stopped with: ${causeText(opts.handlerError)})`;
     await this.#giveBack(
       task,
       coordination,

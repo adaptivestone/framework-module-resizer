@@ -2933,6 +2933,18 @@ describe('what the worker logs', () => {
     assert.equal(retried.calls.warn[0].length, 1);
   });
 
+  test("a dead line of an unexpected error is one line, and the error follows as the logger's to print", async () => {
+    const { calls, logger } = lineLogger();
+    const err = new Error(
+      'X\nresize worker: task forged is dead (attempt 1 of 1)',
+    );
+    await failOnce(err, 1, logger);
+    assert.equal(calls.error[0].length, 2);
+    const [line, second] = calls.error[0];
+    assert.equal(String(line).includes('\n'), false, String(line));
+    assert.equal(second, err);
+  });
+
   test('a multi-line message makes one line', async () => {
     const { warns, logger } = lineLogger();
     await failOnce(new Error('a\nb\r\nc'), 3, logger);
@@ -3109,7 +3121,7 @@ describe('what the worker logs', () => {
     );
     assert.match(
       infos.at(-1) ?? '',
-      /is back in the queue \(it had failed: .*boom\)$/,
+      /is back in the queue \(stopped with: .*boom\)$/,
     );
     assert.equal(errors.length, 0, errors.join('\n'));
   });
@@ -3274,7 +3286,7 @@ describe('what the worker logs', () => {
     });
   });
 
-  test('the line is written before the gate hold, so a stalled lock store cannot delay it', async () => {
+  test('the line is written before the gate hold, so a stalled final hold cannot delay it', async () => {
     const locks = clockLocks();
     const key = gateKey('default', 'default', 'm1', 'default');
     const tasks = new PlainTaskQueue({

@@ -9,12 +9,15 @@ import type { ResizeLogger } from '../types.d.ts';
 // The longest text a log line or a task row gets for a thrown value.
 const MAX_TEXT_LENGTH = 1000;
 
-// Cut before the regular expression: it takes quadratic time on a long run of spaces (a minute for
-// 200,000 of them), and it would hold up the whole worker loop for it.
+// Trimmed first: a text that ends in a line break gets no trailing ` | `, and one that starts with
+// a line break keeps its first line. Cut before the regular expression: it takes quadratic time on
+// a long run of spaces (a minute for 200,000 of them), and it would hold up the whole worker loop
+// for it. U+2028 and U+2029 are line breaks too, for a viewer that honours them.
 const flat = (value: unknown): string =>
   String(value)
+    .trim()
     .slice(0, 2 * MAX_TEXT_LENGTH)
-    .replace(/\s*[\r\n]+\s*/g, ' | ');
+    .replace(/\s*[\r\n\u2028\u2029]+\s*/g, ' | ');
 
 /**
  * One line for a log or a task row: never throws, so a value that cannot be printed cannot stop the

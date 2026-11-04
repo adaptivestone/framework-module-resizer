@@ -31,6 +31,24 @@ test('causeText puts a multi-line error on one line', () => {
   assert.equal(causeText(new Error('a\nb\r\nc')), 'Error: a | b | c');
 });
 
+test('causeText treats U+2028 and U+2029 as line breaks', () => {
+  assert.equal(causeText(new Error('a\u2028b\u2029c')), 'Error: a | b | c');
+  assert.equal(causeText(new Error('a \u2028\n b')), 'Error: a | b');
+});
+
+test('causeText leaves no trailing separator after a message that ends in a line break', () => {
+  assert.equal(causeText(new Error('a\n')), 'Error: a');
+  assert.equal(causeText(new Error('a\r\n  ')), 'Error: a');
+  assert.equal(causeText('a\u2029'), 'a');
+});
+
+test('causeText keeps a cause that starts with a line break', () => {
+  assert.equal(
+    causeText(new Error('a', { cause: '\nwhy\nmore' })),
+    'Error: a (cause: why)',
+  );
+});
+
 test('causeText adds the first line of a cause the message does not already hold', () => {
   assert.equal(
     causeText(new Error('a', { cause: new Error('why\nmore') })),
@@ -49,10 +67,11 @@ test('causeText cuts at 1000 characters', () => {
 test('causeText stays quick on a long run of spaces', () => {
   // Without the cut before its regular expression this took about a minute (quadratic time),
   // with the event loop blocked for all of it.
+  // The run is inside the text, so trimming does not remove it.
+  const spaces = `a${' '.repeat(200_000)}b`;
   const started = performance.now();
-  assert.ok(causeText(new Error(' '.repeat(200_000))).length <= 1000);
-  const cause = new Error('a', { cause: new Error(' '.repeat(200_000)) });
-  assert.ok(causeText(cause).length <= 1000);
+  assert.ok(causeText(new Error(spaces)).length <= 1000);
+  assert.ok(causeText(new Error('c', { cause: spaces })).length <= 1000);
   const tookMs = performance.now() - started;
   assert.ok(tookMs < 5000, `took ${tookMs} ms`);
 });

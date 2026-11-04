@@ -1543,8 +1543,10 @@ await ResizeTask.updateOne(
   (`maxAttempts` used up), `not retryable` (the error has `retryable: false`) or
   `delivered more often than maxAttempts` (its workers kept crashing mid-task). The code is `none`
   for an error without one. The cause fits one line of at most 1000 characters, with ` | ` for a
-  line break, and the task row holds the same text. A worker that no longer holds its task (a lost
-  lease) writes a `warn` and never a dead line.
+  line break, and the task row holds the same text. The module's line is always one line; the
+  stack of an unexpected error (on a dead line, any error that is not a `ResizeError`) follows it as
+  your logger prints it, so do not treat later lines as the module's own. A worker that no longer
+  holds its task (a lost lease) writes a `warn` and never a dead line.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the
