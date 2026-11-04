@@ -131,10 +131,13 @@ export class DecoderSet {
       );
     } catch (err) {
       // A worker without the decoder this record needs: a deploy with it can run the task. A
-      // ResizeError other than "every decoder refused" means a decoder recognised its format.
+      // ResizeError other than "every decoder refused" means a decoder recognised its format, except
+      // damage: a decoder that half-reads a container it does not own has not recognised it.
       if (
         reason === 'unlisted' &&
-        (isRefusal(err) || !ResizeError.isResizeError(err))
+        (isRefusal(err) ||
+          !ResizeError.isResizeError(err) ||
+          err.code === 'RESIZE_SOURCE_DAMAGED')
       ) {
         const message = err instanceof Error ? err.message : String(err);
         // The task row keeps only String(error), so the probe's message is part of this one.

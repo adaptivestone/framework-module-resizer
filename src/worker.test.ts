@@ -2101,6 +2101,44 @@ describe('worker metrics', () => {
     );
   });
 
+  test('a damaged source is dead-lettered on its first delivery, and the line names limits.failOn', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const logger = recordingLogger();
+    const whole = await sharp({
+      create: {
+        width: 400,
+        height: 300,
+        channels: 3,
+        background: '#808080',
+        noise: { type: 'gaussian', mean: 128, sigma: 60 },
+      },
+    })
+      .jpeg()
+      .toBuffer();
+    const cut = whole.subarray(0, Math.floor(whole.length / 2));
+    let downloads = 0;
+    const resizer = resizerOn(tasks, {
+      storage: {
+        download: async () => {
+          downloads += 1;
+          return cut;
+        },
+        upload: async () => ({ key: 'k' }),
+        publicUrl: () => '',
+      },
+    });
+    await addTask(tasks);
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(downloads, 1);
+    assert.match(
+      logger.lines.error.join('\n'),
+      /is dead \(attempt 1 of \d+, code RESIZE_SOURCE_DAMAGED, not retryable\).*limits\.failOn 'error'/,
+    );
+  });
+
   test('a task of an unregistered pipeline is labelled unregistered', async () => {
     const tasks = new MemoryTaskQueue({ timing: { ...fast, maxAttempts: 1 } });
     const rec = recordingMetrics();

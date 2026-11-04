@@ -33,8 +33,10 @@ interface IdentifiedOriginal {
 const ORIGINAL_CODES = new Map([
   ['RESIZE_SOURCE_FORMAT_UNSUPPORTED', 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED'],
   ['RESIZE_SOURCE_METADATA_MISSING', 'RESIZE_ORIGINAL_METADATA_MISSING'],
-  // The SVG decoder checks limits.sourcePixels itself, before its density probe.
+  // Sharp's pixel limit, and the SVG decoder's own check of limits.sourcePixels, before its density
+  // probe.
   ['RESIZE_SOURCE_TOO_LARGE', 'RESIZE_ORIGINAL_TOO_MANY_PIXELS'],
+  ['RESIZE_SOURCE_DAMAGED', 'RESIZE_ORIGINAL_INVALID'],
 ]);
 
 function asBuffer(body: Buffer | Uint8Array): Buffer {

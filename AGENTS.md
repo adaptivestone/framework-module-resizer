@@ -450,9 +450,10 @@ can help). The worker reads `retryable` on the error that fails the task, when i
 are retried. It dead-letters the task at once when it is `false`; an error inside one variant
 (`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with the
 retryable `RESIZE_WORKER_INCOMPLETE`. A source that cannot be decoded is a `ResizeError`
-(usually a `ResizeMediaError`: `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the engine's error
-as `cause`, or the decoder's own code; a missing or broken decoder is a `ResizeSetupError`), so
-the catch below still routes it to `badRequest`. Use `ResizeError.isResizeError(err)` rather than
+(usually a `ResizeMediaError`: `RESIZE_SOURCE_DAMAGED`, `retryable: false`, when the engine refuses
+a cut or unreadable source at `limits.failOn`; `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the
+engine's error as `cause`, for any other reason; or the decoder's own code; a missing or broken
+decoder is a `ResizeSetupError`), so the catch below still routes it to `badRequest`. Use `ResizeError.isResizeError(err)` rather than
 `instanceof` when the error may cross a package boundary — duplicate copies of the package break
 `instanceof` but not the symbol brand.
 
@@ -642,7 +643,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
 | `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (dead-lettered at once), or `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` from `uploadOriginal()` | every decoder refused the bytes: no decoder of this process reads that format — add a decoder for it, or reject the file |
 | worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
-| `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source; the error's `cause` says why — retried, then dead-lettered |
+| `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: the engine refused it at `limits.failOn`, and the worker's dead line names the level. Dead-lettered on its first delivery, since no retry can help — replace the original. Previews made from a damaged original before this version stay fresh: see the README `Damaged originals`. A download whose length differs from `original.size`, or a stored format no decoder of this process lists, stays the retryable `RESIZE_SOURCE_DECODE_FAILED` |
+| `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source, for a reason other than damage; the error's `cause` says why — retried, then dead-lettered |
 | `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
 | `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
 | Sharp's `Input file is missing` from a `beforeStep` | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import sharp from 'sharp';
 import { ResizeError } from '../errors.ts';
 import { makeImageConfig } from '../testHelpers/resizeConfig.ts';
+import type { ResizeFailOn } from '../types.d.ts';
 import { SharpDecoder } from './sharp.ts';
 
 const limits = makeImageConfig().limits;
@@ -318,4 +319,221 @@ test('inspect checks one frame of an animation against limits.inputPixels, not t
   assert.deepEqual(raster.info.delay, [100, 200]);
   assert.equal(raster.info.loop, 3);
   assert.equal(raster.data.length, 20 * 20 * raster.info.channels * 2);
+});
+
+// Noise, so a cut falls inside image data instead of in a flat run the codec compressed away.
+const noisy = () =>
+  sharp({
+    create: {
+      width: 400,
+      height: 300,
+      channels: 3,
+      background: '#808080',
+      noise: { type: 'gaussian', mean: 128, sigma: 60 },
+    },
+  });
+
+type Format = 'jpeg' | 'png' | 'webp' | 'gif' | 'avif';
+const FORMATS: readonly Format[] = ['jpeg', 'png', 'webp', 'gif', 'avif'];
+const LEVELS: readonly ResizeFailOn[] = [
+  'none',
+  'truncated',
+  'error',
+  'warning',
+];
+
+const samples = new Map<Format, Buffer>();
+async function sample(format: Format): Promise<Buffer> {
+  let bytes = samples.get(format);
+  if (bytes === undefined) {
+    bytes = await noisy().toFormat(format).toBuffer();
+    samples.set(format, bytes);
+  }
+  return bytes;
+}
+
+const firstHalf = (bytes: Buffer): Buffer =>
+  bytes.subarray(0, Math.floor(bytes.length / 2));
+
+/** `inspect`, then `render` at 16 px: every place a decoder reads the bytes. */
+async function decode(bytes: Buffer, level: ResizeFailOn = 'error') {
+  const decoder = new SharpDecoder();
+  const at = { ...limits, failOn: level };
+  const source = await decoder.inspect(bytes, at);
+  return decoder.render(
+    bytes,
+    { width: 16, height: 16 },
+    { limits: at, source, frames: 1 },
+  );
+}
+
+for (const format of FORMATS) {
+  test(`a cut ${format} is RESIZE_SOURCE_DAMAGED; a Sharp upgrade that changes the message fails here`, async () => {
+    await assert.rejects(
+      decode(firstHalf(await sample(format))),
+      (err: ResizeError) => {
+        assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
+        assert.equal(err.retryable, false);
+        assert.match(err.message, /limits\.failOn 'error'/);
+        return true;
+      },
+    );
+  });
+}
+
+test('a TIFF with flipped bytes is damaged; a cut one is unreadable bytes, not damage', async () => {
+  const tiff = await noisy().tiff({ compression: 'lzw' }).toBuffer();
+  const flipped = Buffer.from(tiff);
+  const middle = Math.floor(flipped.length / 2);
+  for (let i = middle; i < middle + 256; i += 1) {
+    flipped[i] ^= 0xff;
+  }
+  await assert.rejects(decode(flipped), (err: ResizeError) => {
+    assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
+    assert.equal(err.retryable, false);
+    return true;
+  });
+  // A3: on a worker this message means a format with no decoder, so it is never read as damage.
+  await assert.rejects(
+    new SharpDecoder().inspect(firstHalf(tiff), limits),
+    (err: Error) => {
+      assert.equal(ResizeError.isResizeError(err), false);
+      assert.match(err.message, /unsupported image format/);
+      return true;
+    },
+  );
+});
+
+test('a clean image decodes to the same pixels at every failOn level', async () => {
+  for (const format of FORMATS) {
+    const bytes = await sample(format);
+    const baseline = await decode(bytes, 'none');
+    for (const level of LEVELS) {
+      const raster = await decode(bytes, level);
+      assert.deepEqual(raster.info, baseline.info, `${format} at ${level}`);
+      assert.ok(raster.data.equals(baseline.data), `${format} at ${level}`);
+    }
+  }
+});
+
+test("failOn 'none' restores 0.3.0's rendering: a cut JPEG renders", async () => {
+  const cut = firstHalf(await sample('jpeg'));
+  const raster = await decode(cut, 'none');
+  assert.equal(raster.info.channels, 3);
+  // The chain 0.3.0 ran, with its hard-coded level.
+  const reference = await sharp(cut, { failOn: 'none', sequentialRead: true })
+    .rotate()
+    .resize(16, 16, { fit: 'outside', withoutEnlargement: true })
+    .toColorspace('srgb')
+    .raw({ depth: 'uchar' })
+    .toBuffer();
+  assert.ok(raster.data.equals(reference));
+});
+
+test("a file whose header cannot be read fails at every level, also at 'none'", async () => {
+  // inspect runs metadata() at Sharp's default level, whatever limits.failOn says. On 0.3.0 this
+  // was five retries and a dead-letter; now it is dead at once.
+  const bytes = firstHalf(await sample('gif'));
+  await assert.rejects(
+    new SharpDecoder().inspect(bytes, { ...limits, failOn: 'none' }),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED');
+      assert.match(err.message, /limits\.failOn 'none'/);
+      return true;
+    },
+  );
+});
+
+/** A JPEG's first marker of `kind` (0xdb DQT, 0xda SOS), as an index in its bytes. */
+function markerAt(jpeg: Buffer, kind: number): number {
+  const at = jpeg.indexOf(Buffer.from([0xff, kind]));
+  assert.ok(at > 0, `marker 0xff${kind.toString(16)} not found`);
+  return at;
+}
+
+const inserted = (bytes: Buffer, at: number, extra: Buffer): Buffer =>
+  Buffer.concat([bytes.subarray(0, at), extra, bytes.subarray(at)]);
+
+test('harmless JPEG defects render at the default', async () => {
+  const jpeg = await sample('jpeg');
+  const junk = Buffer.alloc(16, 0x41);
+  const intact = await decode(jpeg);
+  const defects = {
+    'trailing garbage after EOI': Buffer.concat([jpeg, junk]),
+    '16 junk bytes before SOS': inserted(jpeg, markerAt(jpeg, 0xda), junk),
+    '16 junk bytes before DQT': inserted(jpeg, markerAt(jpeg, 0xdb), junk),
+  };
+  for (const [name, bytes] of Object.entries(defects)) {
+    const raster = await decode(bytes);
+    assert.ok(raster.data.equals(intact.data), name);
+  }
+});
+
+const STRICT_LEVELS: readonly ResizeFailOn[] = [
+  'truncated',
+  'error',
+  'warning',
+];
+const withoutEndMarker = (jpeg: Buffer): Buffer =>
+  jpeg.subarray(0, jpeg.length - 2);
+
+test('a progressive JPEG missing only its end marker is refused at every strict level, and renders at none', async () => {
+  // The decoder reads on to the next scan's marker, so it always meets the end of the data.
+  const noEnd = withoutEndMarker(
+    await noisy().jpeg({ progressive: true }).toBuffer(),
+  );
+  for (const level of STRICT_LEVELS) {
+    await assert.rejects(decode(noEnd, level), (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
+      assert.match(err.message, new RegExp(`limits\\.failOn '${level}'`));
+      return true;
+    });
+  }
+  assert.ok((await decode(noEnd, 'none')).data.length > 0);
+});
+
+test('a baseline JPEG missing only its end marker gets one answer from every strict level; one that renders has the intact pixels', async () => {
+  // Most are refused. A few are not, by their last bytes: measured on 0.35.5, 2 to 13% of random
+  // files, because the decoder took the last image data without reading past it.
+  for (let i = 0; i < 8; i += 1) {
+    const jpeg = await noisy().jpeg().toBuffer();
+    const noEnd = withoutEndMarker(jpeg);
+    const intact = await decode(jpeg);
+    const answers = new Set<boolean>();
+    // One at a time: libvips keeps one error buffer per process, so of two failures at once one can
+    // get the other's message, or none.
+    for (const level of STRICT_LEVELS) {
+      try {
+        const raster = await decode(noEnd, level);
+        assert.ok(raster.data.equals(intact.data), level);
+        answers.add(true);
+      } catch (err) {
+        assert.equal((err as ResizeError).code, 'RESIZE_SOURCE_DAMAGED');
+        answers.add(false);
+      }
+    }
+    assert.equal(answers.size, 1);
+    assert.ok((await decode(noEnd, 'none')).data.length > 0);
+  }
+});
+
+test('inspect and render report the pixel limit as RESIZE_SOURCE_TOO_LARGE', async () => {
+  const decoder = new SharpDecoder();
+  const small = { ...limits, inputPixels: 100 };
+  const isTooLarge = (err: ResizeError) => {
+    assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE', err.message);
+    assert.equal(err.retryable, false);
+    assert.match(err.message, /pixel limit limits\.inputPixels \(100\)/);
+    return true;
+  };
+  await assert.rejects(decoder.inspect(wideJpeg, small), isTooLarge);
+  const source = await decoder.inspect(wideJpeg, limits);
+  await assert.rejects(
+    decoder.render(
+      wideJpeg,
+      { width: 16, height: 16 },
+      { limits: small, source, frames: 1 },
+    ),
+    isTooLarge,
+  );
 });

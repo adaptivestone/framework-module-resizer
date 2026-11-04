@@ -266,6 +266,39 @@ describe('config split: core validation vs framework loading', () => {
     assert.doesNotThrow(() => validateResizeConfig(makeImageConfig()));
   });
 
+  test('limits.failOn defaults to error and rejects anything else', () => {
+    assert.equal(defaultResizeConfig.limits.failOn, 'error');
+    assert.equal(makeResizeConfig().limits.failOn, 'error');
+    const config = makeImageConfig();
+    for (const failOn of ['none', 'truncated', 'error', 'warning']) {
+      assert.doesNotThrow(() =>
+        validateResizeConfig({
+          ...config,
+          limits: { ...config.limits, failOn },
+        }),
+      );
+    }
+    // `undefined` would silently be Sharp's own default, 'warning': a complete config names it.
+    for (const failOn of ['x', undefined, 1]) {
+      assert.throws(
+        () =>
+          validateResizeConfig({
+            ...config,
+            limits: { ...config.limits, failOn },
+          }),
+        (err: ResizeConfigError) => {
+          assert.ok(err instanceof ResizeConfigError);
+          assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+          assert.equal(
+            err.message,
+            "resize config: `limits.failOn` must be 'none', 'truncated', 'error' or 'warning'",
+          );
+          return true;
+        },
+      );
+    }
+  });
+
   test("the core config's removed queue and worker keys point framework hosts at src/config/resize.ts", () => {
     for (const [key, hint] of [
       [

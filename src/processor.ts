@@ -184,11 +184,43 @@ function sourceError(err: unknown, mediaId: string): unknown {
   );
 }
 
+/**
+ * "Damaged" holds only when the bytes are the object's and a decoder owns the format. A short
+ * download looks like a cut file, and a decoder half-reading a container of a format no decoder of
+ * this process lists proves nothing: a rolling deploy must not dead-letter good media.
+ */
+function decodeFailure(
+  err: unknown,
+  mediaId: string,
+  bytes: Buffer,
+  { size, unlistedFormat }: { size?: unknown; unlistedFormat?: string },
+): unknown {
+  if (ResizeError.isResizeError(err) && err.code === 'RESIZE_SOURCE_DAMAGED') {
+    const why =
+      typeof size === 'number' && size !== bytes.length
+        ? `downloaded ${bytes.length} bytes, the upload stored ${size}`
+        : unlistedFormat === undefined
+          ? undefined
+          : `no decoder in this process lists its stored format '${unlistedFormat}'`;
+    if (why !== undefined) {
+      return new ResizeMediaError(
+        `resize: decoding the source failed for media ${mediaId}: ${why}: ${err.message}`,
+        { mediaId, code: 'RESIZE_SOURCE_DECODE_FAILED', cause: err },
+      );
+    }
+  }
+  return sourceError(err, mediaId);
+}
+
 /** The original's bytes, the decoder that reads them, and what it measured. */
 interface LoadedSource {
   bytes: Buffer;
   decoder: SourceDecoder;
   info: SourceInfo;
+  // The stored length of the upload, to tell a short download from a cut file at render.
+  size?: number;
+  // The stored format no decoder of this process lists, when one was stored.
+  unlistedFormat?: string;
 }
 
 /**
@@ -379,14 +411,19 @@ function snapshotOriginal(original: Original): {
   original: Original;
   signed: Original;
 } {
-  const { format, width, height } = original;
+  const { format, width, height, size } = original;
   const rest = {
     ...(format === undefined ? {} : { format }),
     ...(width === undefined ? {} : { width }),
     ...(height === undefined ? {} : { height }),
   };
   return {
-    original: { storageRef: copyLocator(original.storageRef), ...rest },
+    original: {
+      storageRef: copyLocator(original.storageRef),
+      ...rest,
+      ...(size === undefined ? {} : { size }),
+    },
+    // No `size`: the origin signature must not change on upgrade.
     signed: { storageRef: signedLocator(original.storageRef), ...rest },
   };
 }
@@ -412,7 +449,8 @@ async function loadSource(
   try {
     identified = await decoders.identify(bytes, limits, original.format);
   } catch (err) {
-    throw sourceError(err, mediaId);
+    // No unlisted format here: `identify` already reports damage on one as a missing decoder.
+    throw decodeFailure(err, mediaId, bytes, { size: original.size });
   }
   const { decoder, info, mismatch } = identified;
   if (mismatch !== undefined) {
@@ -439,7 +477,15 @@ async function loadSource(
       { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
     );
   }
-  return { bytes, decoder, info };
+  return {
+    bytes,
+    decoder,
+    info,
+    size: original.size,
+    ...(mismatch?.reason === 'unlisted'
+      ? { unlistedFormat: mismatch.stored }
+      : {}),
+  };
 }
 
 /** The decoder's raster at `box`, checked (shape and pixel budget), in straight alpha. */
@@ -451,7 +497,7 @@ async function decodeSource(
 ): Promise<Raster> {
   try {
     const raster = await source.decoder.render(source.bytes, box, opts);
-    // A broken raster is the decoder's contract error: sourceError passes it on unchanged.
+    // A broken raster is the decoder's contract error: decodeFailure passes it on unchanged.
     checkRaster(raster);
     // A decoder that ignores its box or decodes more frames than asked must not hand the core more
     // pixels than the budget the plan was made for.
@@ -465,7 +511,7 @@ async function decodeSource(
     }
     return await straightAlpha(raster, opts.limits);
   } catch (err) {
-    throw sourceError(err, mediaId);
+    throw decodeFailure(err, mediaId, source.bytes, source);
   }
 }
 

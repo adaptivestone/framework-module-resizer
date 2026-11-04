@@ -342,7 +342,7 @@ Resizers that `src/resizer.ts` constructs.
     `PictureUrls`, what `formatPictureUrls` makes of a decision;
   - the media and preview shapes: `MediaLike`, `Original`, `OriginalFormat`, `Preview`,
     `PreviewFormat`, `PreviewScope`, `Filters`, `StorageRef`;
-  - the config sections: the image settings `ResizeConfig` and `ResizeLimits`, and `DeepPartial`
+  - the config sections: the image settings `ResizeConfig`, `ResizeLimits` and `ResizeFailOn`, and `DeepPartial`
     for overrides; storage `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`; database
     `MongoDatabaseConfig`; coordination `CoordinationOptions`; worker `FrameworkWorkerConfig`; the
     framework config `FrameworkResizeConfig` and `PartialFrameworkResizeConfig`; the Resizer's
@@ -870,6 +870,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
+| `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
 **Pipelines** (`pipelines` of `new Resizer` or `new FrameworkResizer`, fixed at construction) are
@@ -1437,9 +1438,10 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`, default `true`): no
-    retry can help. The module sets it on every `ResizeSecurityError` and on six codes: the
+    retry can help. The module sets it on every `ResizeSecurityError` and on seven codes: the
     media has no original (`RESIZE_NO_ORIGINAL`), no decoder reads the source's bytes
-    (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source has no dimensions or exceeds the
+    (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
+    source has no dimensions or exceeds the
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), or an SVG render ran past
@@ -1451,7 +1453,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot
     be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
     `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED` when that error is not a `ResizeError`
-    (Sharp's own, for example; it is the `cause`). An
+    (Sharp's own, for example; it is the `cause`). A damaged source stays the retryable
+    `RESIZE_SOURCE_DECODE_FAILED` when its download length differs from `original.size`, or when
+    no decoder of this process lists its stored format. An
     error inside one variant (`variantSteps`, encoding, `storage.upload`) fails only that
     variant: it is logged, and the task fails with the retryable
     `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only, then dead-lettered after
@@ -1547,6 +1551,30 @@ await ResizeTask.updateOne(
   stack of an unexpected error (on a dead line, any error that is not a `ResizeError`) follows it as
   your logger prints it, so do not treat later lines as the module's own. A worker that no longer
   holds its task (a lost lease) writes a `warn` and never a dead line.
+- **Damaged originals:** a source the engine refuses at `limits.failOn` is dead-lettered on its
+  first delivery with `RESIZE_SOURCE_DAMAGED`. `'error'` refuses a truncation that cuts image data;
+  a cut TIFF is retried, not refused. Two limits: bytes flipped mid-file can still render garbled
+  at every level, and a JPEG missing only its end marker is usually refused at every strict level
+  (the few that pass have all their image data and render the same pixels as the intact file).
+  `'warning'` refuses more, including JPEGs that look identical to the intact file. `'none'`
+  restores 0.3.0's rendering; a file whose header cannot be read still fails, now at once.
+
+  **Previews made before this version.** A preview made from a damaged original stays fresh:
+  upgrading does not regenerate it. To find them, decode each original at the level the worker now
+  uses:
+
+  ```ts
+  import sharp from 'sharp';
+  const bytes = await storage.download(media.original.storageRef);
+  await sharp(bytes, { failOn: 'error' }).resize(16).raw().toBuffer(); // rejects: the worker would refuse this original
+  ```
+
+  For each one that rejects, call `invalidate()` and delete the returned refs. Its next task is
+  dead-lettered with `RESIZE_SOURCE_DAMAGED`, and while reads keep asking, each cooldown costs one
+  download, one decode and one `error` line, so mark that media in your app or replace its
+  original. A second pass at `failOn: 'warning'` also finds some mid-file corruption, but it flags
+  harmless JPEGs too, so look at those by eye. The worker accepts them, so `invalidate()` alone
+  makes the same preview again. Flipped bytes can pass every level: no decode finds them.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the

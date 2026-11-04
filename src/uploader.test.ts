@@ -645,6 +645,53 @@ describe('uploadOriginal — private SVG source', () => {
     assert.equal(uploads.length, 0);
   });
 
+  test('a damaged upload keeps RESIZE_ORIGINAL_INVALID, with the damage as its cause', async () => {
+    installApp();
+    const { storage, uploads } = recordingStorage();
+    const r = new FrameworkResizer({ storage });
+    const gif = await sharp({
+      create: {
+        width: 400,
+        height: 300,
+        channels: 3,
+        background: '#808080',
+        noise: { type: 'gaussian', mean: 128, sigma: 60 },
+      },
+    })
+      .gif()
+      .toBuffer();
+    await assert.rejects(
+      r.uploadOriginal({
+        body: gif.subarray(0, Math.floor(gif.length / 2)),
+        visibility: 'private',
+      }),
+      (err: ResizeOriginalError) => {
+        assert.ok(err instanceof ResizeOriginalError);
+        assert.equal(err.code, 'RESIZE_ORIGINAL_INVALID');
+        assert.equal(
+          (err.cause as { code?: string }).code,
+          'RESIZE_SOURCE_DAMAGED',
+        );
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test("Sharp's pixel limit at upload is RESIZE_ORIGINAL_TOO_MANY_PIXELS", async () => {
+    installApp({ limits: { inputPixels: 100 } });
+    const { storage, uploads } = recordingStorage();
+    const r = new FrameworkResizer({ storage });
+    await assert.rejects(
+      r.uploadOriginal({ body: orientedJpeg, visibility: 'private' }),
+      {
+        code: 'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
+        message: /pixel limit limits\.inputPixels \(100\)/,
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('applies the source pixel limit to SVG metadata before storage', async () => {
     installApp({ limits: { sourcePixels: 99 } });
     const { storage, uploads } = recordingStorage();

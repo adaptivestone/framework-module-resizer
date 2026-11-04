@@ -165,6 +165,7 @@ test('every package specifier and …/x.js path README and AGENTS.md name is a k
 const TASK_PATH = [
   'errors.ts',
   'decoderSet.ts',
+  'helpers/sharpError.ts',
   'helpers/svgRaster.ts',
   'processor.ts',
   'render.ts',
@@ -272,6 +273,7 @@ test('the terminal-code scan reads every decoder and driver file, and the consum
 test('the README lists exactly the codes a task is dead-lettered with at once', () => {
   const expected = [
     'RESIZE_NO_ORIGINAL',
+    'RESIZE_SOURCE_DAMAGED',
     'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
     'RESIZE_SOURCE_METADATA_MISSING',
     'RESIZE_SOURCE_TOO_LARGE',

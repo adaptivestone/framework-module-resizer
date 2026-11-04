@@ -611,6 +611,25 @@ const timedGif = await sharp(solidFrames(RGB, 20, 20), {
   .gif({ delay: [100, 200, 300], loop: 3 })
   .toBuffer();
 
+// Noise, so a cut falls inside image data. A cut JPEG passes inspect and fails at render; a cut GIF
+// fails at inspect.
+const noise = () =>
+  sharp({
+    create: {
+      width: 400,
+      height: 300,
+      channels: 3,
+      background: '#808080',
+      noise: { type: 'gaussian', mean: 128, sigma: 60 },
+    },
+  });
+const fullJpeg = await noise().jpeg().toBuffer();
+const fullGif = await noise().gif().toBuffer();
+const firstHalf = (bytes: Buffer) =>
+  bytes.subarray(0, Math.floor(bytes.length / 2));
+const cutJpeg = firstHalf(fullJpeg);
+const cutGif = firstHalf(fullGif);
+
 describe('decoding the source', () => {
   /** Deps whose storage serves `fixture` and records uploads, and whose media store records appends. */
   function decodeDeps(
@@ -687,6 +706,118 @@ describe('decoding the source', () => {
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
+  });
+
+  describe('a damaged source', () => {
+    test('a damaged source fails with RESIZE_SOURCE_DAMAGED, not retryable, naming the media', async () => {
+      const { deps, uploads, media } = decodeDeps(cutJpeg, {
+        original: { format: 'jpeg', size: cutJpeg.length },
+      });
+      const isDamaged = (err: ResizeMediaError) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        assert.match(err.message, /limits\.failOn 'error'.*\(media m1\)/);
+        return true;
+      };
+      const processor = new Processor(deps);
+      await assert.rejects(
+        processor.processTask(task({ previews: [variant()] })),
+        isDamaged,
+      );
+      await assert.rejects(
+        processor.generate({
+          media: media(),
+          sizes: [{ width: 20, height: 20 }],
+        }),
+        isDamaged,
+      );
+      assert.equal(uploads.length, 0);
+    });
+
+    for (const [site, bytes, format, whole] of [
+      ['render', cutJpeg, 'jpeg', fullJpeg],
+      ['inspect', cutGif, 'gif', fullGif],
+    ] as const) {
+      test(`a short download stays retryable (it fails at ${site})`, async () => {
+        const { deps, uploads } = decodeDeps(bytes, {
+          original: { format, size: whole.length },
+        });
+        await assert.rejects(
+          new Processor(deps).processTask(task({ previews: [variant()] })),
+          (err: ResizeMediaError) => {
+            assert.ok(err instanceof ResizeMediaError);
+            assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED', err.message);
+            assert.equal(err.retryable, true);
+            assert.equal(err.mediaId, 'm1');
+            assert.match(
+              err.message,
+              /downloaded \d+ bytes, the upload stored \d+/,
+            );
+            assert.equal(
+              (err.cause as ResizeError).code,
+              'RESIZE_SOURCE_DAMAGED',
+            );
+            return true;
+          },
+        );
+        assert.equal(uploads.length, 0);
+      });
+
+      test(`without a size, a damaged source is still damaged (it fails at ${site})`, async () => {
+        const { deps } = decodeDeps(bytes, { original: { format } });
+        await assert.rejects(
+          new Processor(deps).processTask(task({ previews: [variant()] })),
+          { code: 'RESIZE_SOURCE_DAMAGED', retryable: false },
+        );
+      });
+    }
+
+    test('a failure at render on a format no decoder lists stays retryable', async () => {
+      const { deps, uploads } = decodeDeps(cutJpeg, {
+        original: { format: 'pdf' },
+      });
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews: [variant()] })),
+        (err: ResizeMediaError) => {
+          assert.ok(err instanceof ResizeMediaError);
+          assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED', err.message);
+          assert.equal(err.retryable, true);
+          assert.equal(err.mediaId, 'm1');
+          assert.match(
+            err.message,
+            /no decoder in this process lists its stored format 'pdf'/,
+          );
+          assert.equal(
+            (err.cause as ResizeError).code,
+            'RESIZE_SOURCE_DAMAGED',
+          );
+          return true;
+        },
+      );
+      assert.equal(uploads.length, 0);
+    });
+
+    test('original.size never reaches the signature', async () => {
+      const originOf = async (original: Partial<Original>) => {
+        const { deps } = decodeDeps(redPng, { original });
+        const { created } = await new Processor(deps).generate({
+          media: mediaDoc({ original }),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['webp'],
+          persist: false,
+        });
+        assert.equal(created.length, 1);
+        return created[0].origin;
+      };
+      const without = await originOf({ format: 'png' });
+      assert.equal(typeof without, 'string');
+      assert.equal(
+        await originOf({ format: 'png', size: redPng.length }),
+        without,
+      );
+    });
   });
 
   test('a source Sharp cannot decode fails with RESIZE_SOURCE_DECODE_FAILED, retryable, with the media id and the cause', async () => {

@@ -31,6 +31,7 @@ const defaultResizeConfig: ResizeConfig = {
     resultDimension: 5000,
     animationFrames: 64,
     processingTimeoutSeconds: 30,
+    failOn: 'error',
   },
   concurrency: 4,
 };

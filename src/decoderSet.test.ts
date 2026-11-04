@@ -2,6 +2,7 @@
 // of a decoder, and the built-in decoders for createDecoderSet's order.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import sharp from 'sharp';
 import type { Raster, SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import { createDecoderSet, DecoderSet } from './decoderSet.ts';
 import { ResizeError, ResizeMediaError, ResizeSetupError } from './errors.ts';
@@ -300,6 +301,48 @@ test('createDecoderSet refuses entries that are not decoders with RESIZE_DECODER
       },
     );
   }
+});
+
+// Noise, so the cut falls inside image data: Sharp cannot read this GIF's header.
+const wholeGif = await sharp({
+  create: {
+    width: 400,
+    height: 300,
+    channels: 3,
+    background: '#808080',
+    noise: { type: 'gaussian', mean: 128, sigma: 60 },
+  },
+})
+  .gif()
+  .toBuffer();
+const cutGif = wholeGif.subarray(0, Math.floor(wholeGif.length / 2));
+
+test('damage on a format no decoder lists is RESIZE_DECODER_MISSING: a deploy with the decoder can run it', async () => {
+  await assert.rejects(
+    createDecoderSet().identify(cutGif, limits, 'pdf'),
+    (err: ResizeSetupError) => {
+      assert.ok(err instanceof ResizeSetupError);
+      assert.equal(err.code, 'RESIZE_DECODER_MISSING');
+      assert.equal(err.retryable, true);
+      assert.equal((err.cause as ResizeError).code, 'RESIZE_SOURCE_DAMAGED');
+      return true;
+    },
+  );
+});
+
+test('damage on a listed format stays RESIZE_SOURCE_DAMAGED', async () => {
+  await assert.rejects(createDecoderSet().identify(cutGif, limits, 'gif'), {
+    code: 'RESIZE_SOURCE_DAMAGED',
+    retryable: false,
+  });
+});
+
+test('damage with no stored format stays RESIZE_SOURCE_DAMAGED', async () => {
+  // A bare ref, or an upload.
+  await assert.rejects(createDecoderSet().identify(cutGif, limits), {
+    code: 'RESIZE_SOURCE_DAMAGED',
+    retryable: false,
+  });
 });
 
 test("verify() runs each decoder's verify(), in order", async () => {

@@ -1,0 +1,75 @@
+// Reads the engine's error text, the only place it says what went wrong. A Sharp upgrade that
+// changes a message makes src/decoders/sharp.test.ts fail, and until then costs five attempts
+// instead of one. Never add `unsupported image format` to the damage list: on a worker it means a
+// format this process has no decoder for, and a rolling deploy must not dead-letter good media.
+// libvips keeps one error buffer per process: of two decodes that fail at once, one can read the
+// other's message, or none (`Unknown error`, or the corrupt-header prefix alone). The worker decodes
+// one source per consume loop, so this takes several queues in one process, or concurrent
+// generate() calls. A misread costs one retry, or a dead task that the next read after its cooldown
+// queues again.
+import { ResizeError, ResizeMediaError } from '../errors.ts';
+import type { ResizeLimits } from '../types.d.ts';
+
+const CORRUPT_HEADER = 'Input buffer has corrupt header:';
+const SEEK_NOISE = /^source: bad seek to \d+$/;
+const DAMAGE =
+  /^(VipsJpeg:|vipspng:|webp2vips:|webp:|gifload_buffer:|svgload_buffer:|tiff2vips:|heif: Invalid input|glib: XML parse error)|Warning treated as error/;
+// A healthy file this build cannot decode, or a failure that is not about the bytes.
+const NOT_DAMAGE =
+  /unsupported|not supported|not configured|not been built in|insufficient memory|out of memory|out of order read/i;
+
+/** The line that says what went wrong: the first that is not seek noise, without the prefix. */
+export function engineDetail(message: string): string {
+  const body = message.startsWith(CORRUPT_HEADER)
+    ? message.slice(CORRUPT_HEADER.length)
+    : message;
+  const lines = body
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.find((line) => !SEEK_NOISE.test(line)) ?? lines[0] ?? '';
+}
+
+/** True when the engine says the bytes are broken, not that it cannot do the work. */
+export function isEngineDamage(message: string): boolean {
+  const detail = engineDetail(message);
+  if (detail === '') {
+    return message.startsWith(CORRUPT_HEADER);
+  }
+  if (NOT_DAMAGE.test(detail)) {
+    return false;
+  }
+  return SEEK_NOISE.test(detail) || DAMAGE.test(detail);
+}
+
+/** Bytes no loader of this build recognises. Never used on a worker: see the note above. */
+export function isUnsupportedBytes(message: string): boolean {
+  return message.includes('unsupported image format');
+}
+
+/**
+ * The error to throw for what Sharp rejected with: a ResizeMediaError for damage or the pixel
+ * limit, else `err` itself, which the caller reports as a retryable failure. A decoder does not
+ * know its media: the caller adds the id.
+ */
+export function sharpDecodeError(
+  err: unknown,
+  limits: Pick<ResizeLimits, 'failOn' | 'inputPixels'>,
+): unknown {
+  if (!(err instanceof Error) || ResizeError.isResizeError(err)) {
+    return err;
+  }
+  if (engineDetail(err.message).includes('exceeds pixel limit')) {
+    return new ResizeMediaError(
+      `resize: the source exceeds the pixel limit limits.inputPixels (${limits.inputPixels})`,
+      { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false, cause: err },
+    );
+  }
+  if (isEngineDamage(err.message)) {
+    return new ResizeMediaError(
+      `resize: the source is damaged (limits.failOn '${limits.failOn}'): ${engineDetail(err.message) || 'the engine gave no detail'}`,
+      { code: 'RESIZE_SOURCE_DAMAGED', retryable: false, cause: err },
+    );
+  }
+  return err;
+}
