@@ -434,8 +434,12 @@ const { created, failed } = await getResizer().generate({
 ```
 
 No original throws `ResizeNoOriginalError`; every requested variant failing throws
-`ResizeGenerateError` (`retryable: false` when every one failed with `retryable: false`). `created`
-is only this call; `failed > 0` means a partial success.
+`ResizeGenerateError` (`retryable: false` when every one failed with `retryable: false`). A source
+the engine refuses rejects before any variant runs: on a cut JPEG, which 0.3.0 rendered, it is
+`ResizeMediaError` `RESIZE_SOURCE_DAMAGED`, not `ResizeGenerateError`, so a handler catching only
+`ResizeGenerateError` returns 500 on a user's upload (catch `ResizeError`, or refuse the file at
+upload with `upload.verify: 'decode'`). `created` is only this call; `failed > 0` means a partial
+success.
 `generate` also appends `created` onto `media.previews` (when persist is on) so a same-request
 `resolve({ media })` sees them. Reload the media before saving it after `generate()` or
 `invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is
@@ -454,8 +458,9 @@ later delivery of the same input can succeed, a delivery after a rolling deploy 
 on the error that fails the task, when it is a `ResizeError` — including one from a duplicate copy
 of the package; errors from other libraries are retried. It dead-letters the task at once when it is `false`; an error inside one variant
 (`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with
-`RESIZE_WORKER_INCOMPLETE`: retryable, unless every missing variant failed with `retryable: false`,
-when the task is dead-lettered at once. A source that cannot be decoded is a `ResizeError`
+`RESIZE_WORKER_INCOMPLETE`, whose `cause` is the first failure: retryable, unless every missing
+variant failed with `retryable: false` and the media still holds the original they were rendered
+from, when the task is dead-lettered at once. A source that cannot be decoded is a `ResizeError`
 (usually a `ResizeMediaError`: `RESIZE_SOURCE_DAMAGED`, `retryable: false`, when the engine refuses
 a cut or unreadable source; `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the
 engine's error as `cause`, for any other reason; or the decoder's own code; a missing or broken
@@ -544,8 +549,12 @@ Metrics: the default sink writes log lines. To send them elsewhere, or to turn t
 import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize';
 // new FrameworkResizer({ metrics: new NoopMetrics() })                    // off
 // new FrameworkResizer({ metrics: new LogMetrics(logger, { debug: true }) }) // debug lines too
-// API shutdown: framework hosts need no code, the open summary is written on the `shutdown` event
-// Elsewhere, in your SIGTERM handler: await getResizer().metrics.flush?.()
+// API shutdown: the open summary is written on the framework's `shutdown` event, which
+// startServer() (on SIGTERM or SIGINT) and its CLI (after a command returns) emit: no code of yours.
+// Call `await getResizer().metrics.flush?.()` yourself in a script on `new Server()` + init(), for a
+// FrameworkResizer with every part in code first used before the Server exists, before a CLI command
+// returns when the sink's flush is asynchronous (the listener does not wait, and the CLI entry calls
+// process.exit), and in your SIGTERM handler without the framework.
 ```
 
 ## Rules (violations cause real incidents)
@@ -607,7 +616,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   only removes rows and returns their storage refs.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter,
-  at once when every missing variant failed with `retryable: false`.
+  at once when every missing variant failed with `retryable: false` on an original the media still
+  holds.
 
 ## Troubleshooting
 

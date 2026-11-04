@@ -837,6 +837,8 @@ accepts the bytes measures them: its `format` is stored as `original.format` and
 `contentType` as `original.contentType`. `upload.formats` must list that format
 (`RESIZE_ORIGINAL_FORMAT_DISABLED` otherwise). Bytes that every decoder refuses are
 `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`; bytes Sharp cannot read at all stay `RESIZE_ORIGINAL_INVALID`.
+A host decoder's plain error says nothing about the bytes, whatever its message holds:
+`RESIZE_ORIGINAL_INSPECT_FAILED`.
 In the worker and `generate()`, the stored `original.format` picks the decoder to try first. A
 format that no decoder lists, or one whose decoder refuses the bytes, is logged as a warning, and
 the bytes are probed through the other decoders; a format whose decoder reads the bytes as another
@@ -1342,10 +1344,19 @@ that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
   `summaryIntervalMs`. Its timer is `unref`ed, so it never keeps a process alive, and no timer runs
   between windows. `flush()` writes the open window now. The worker flushes the sink of every
   Resizer it serves when it stops (once per distinct sink), waiting at most 5 s for each; that wait
-  keeps the process alive until the flush settles or the 5 s end. Framework hosts need no code: the
-  open window is written on the framework's `shutdown` event. Elsewhere, call
-  `await resizer.metrics.flush?.()` in your own SIGTERM handler. A sink with an asynchronous `flush`
-  must keep its own handle open until it finishes, because the event does not wait for it.
+  keeps the process alive until the flush settles or the 5 s end. In a framework host the open
+  window is written on the framework's `shutdown` event, with no code of yours, wherever the
+  framework emits it: `startServer()` on SIGTERM or SIGINT, and its CLI after a command returns.
+  Everywhere else, call `await getResizer().metrics.flush?.()` yourself:
+  - a script that uses `new Server()` and `init()`, which never emits the event;
+  - a `FrameworkResizer` with every part passed in code that is first used before the `Server`
+    exists: it never registers for the event;
+  - a CLI command with a sink whose `flush` is asynchronous, before the command returns: the
+    listener does not wait, and the CLI entry calls `process.exit`;
+  - a process without the framework, in your own SIGTERM handler.
+
+  Under `startServer()`, a sink with an asynchronous `flush` must keep its own handle open until it
+  finishes, because the event does not wait for it.
 - **`debug: true`** (off by default for every Resizer) also writes every call as one `debug` line,
   `resize metric <name> <value> <labels JSON> <context JSON>`, when the logger has a `debug` method
   (`ResizeLogger.debug` is optional). `<value>` is the count, or a rounded `<n> ms`. It costs two
@@ -1500,8 +1511,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     deploy reaches this worker, so `RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay
     `true`, and so does every unclear case. `ResizeOriginalError` and `ResizeConfigError` default
     to `false`, like `ResizeSecurityError`, and any other `ResizeError` to `true`;
-    `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false`, and
-    `generate()`'s `RESIZE_GENERATE_FAILED` only when every variant did. A
+    `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false` and
+    the media still holds the original they were rendered from, and `generate()`'s
+    `RESIZE_GENERATE_FAILED` only when every variant did. A
     `ResizeError` from
     `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` or
     `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot
@@ -1512,9 +1524,13 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     of this process lists its stored format (`RESIZE_DECODER_MISSING` when it fails at `inspect`,
     `RESIZE_SOURCE_DECODE_FAILED` when it fails at render). An
     error inside one variant (`variantSteps`, encoding, `storage.upload`) fails only that
-    variant: it is logged, and the task fails with `RESIZE_WORKER_INCOMPLETE`. It is retryable
-    (retried for the missing variants only, then dead-lettered after `maxAttempts`), unless every
-    missing variant failed with `retryable: false`, when the task is dead-lettered at once.
+    variant: it is logged as a `warn`, and the task fails with `RESIZE_WORKER_INCOMPLETE`, whose
+    `cause` is the first failure of a variant still missing, so the task row and the task's log
+    line say why (with several, the text counts them). It is retryable (retried for the missing
+    variants only, then dead-lettered after `maxAttempts`), unless every missing variant failed with
+    `retryable: false` and the original has not changed since, when the task is dead-lettered at
+    once. An original replaced during the render keeps the task retryable: the next delivery renders
+    the new one.
   - A dead row keeps the gate (`active`) until its `cooldownUntil` (`deadAt` +
     `coordination.cooldownMs`); then the next `add()` takes it over (see
     [Coordination](#coordination)).
@@ -1616,26 +1632,36 @@ await ResizeTask.updateOne(
   resize worker: task <taskId> of media <mediaId> is dead (attempt 5 of 5, code RESIZE_SOURCE_DECODE_FAILED, last attempt) — new tasks for its media and pipeline wait 600000 ms: <cause>
   ```
 
-  They are written whatever the metrics sink is, `NoopMetrics` included, so a host that alerts on
-  `error` sees one line per dead task. A dead line gives one of three reasons: `last attempt`
+  They are written whatever the metrics sink is, `NoopMetrics` included. Each variant that fails
+  writes a `warn` of its own, on every attempt, in `generate()` too, whose caller gets the failed
+  count or the throw. So the worker writes one `error` line per dead task, however many variants and
+  attempts it took: alert on `error`, or on `is dead`. On SQS without a `deadLetterQueueUrl`, the
+  queue adds one more as it deletes the task (`resize sqs: task … is dead and no deadLetterQueueUrl
+  is set`). Other failures have `error` lines of their own, such as a media store write that failed,
+  which names the uploads it left unrecorded. A dead line gives one of three reasons: `last attempt`
   (`maxAttempts` used up), `not retryable` (the error has `retryable: false`) or
   `delivered more often than maxAttempts` (its workers kept crashing mid-task). The code is `none`
   for an error without one. The cause fits one line of at most 1000 characters, with ` | ` for a
   line break, and the task row holds the same text. A thrown value cannot break the module's line:
-  its cause and code stay on one line, though on SQS the `mediaId` comes from the message body and
-  prints as sent. The stack of an unexpected error (on a dead line, any error that is not a
-  `ResizeError`) follows the line as your logger prints it, so do not treat later lines as the
-  module's own. A worker that no longer
-  holds its task (a lost lease) writes a `warn` and never a dead line.
+  its cause and code stay on one line, and a line break anywhere in the line, such as in a `mediaId`
+  from an SQS message body, reads ` | `. The stack of an unexpected error (on a dead line, any error
+  that is not a `ResizeError`) and its `cause` chain follow on the lines below, cut at 8,000
+  characters, so do not treat later lines as the module's own. Every line the module logs reaches
+  your logger as one string, never with a second argument, so a `%` in a URL cannot corrupt it and
+  every logger keeps the stack; a logger that read a structured error from a second argument finds
+  it in the message.
+  A worker that no longer holds its task (a lost lease) writes a `warn` and never a dead line.
 - **Damaged originals:** a source the engine refuses is dead-lettered on its first delivery with
   `RESIZE_SOURCE_DAMAGED`. Its pixels are decoded at `limits.failOn`, and that message names the
   level; its header is read at Sharp's own default level, whatever `limits.failOn` says. `'error'`
-  refuses a truncation that cuts image data; a cut TIFF is retried, not refused, and a cut animated
-  GIF can still render the frames it has, so its preview can be shorter. Two limits: bytes flipped
-  mid-file can still render garbled at every level, and a JPEG missing only its end marker is
-  usually refused at every strict level (the few that pass have all their image data and render the
-  same pixels as the intact file). `'warning'` refuses more, including JPEGs that look identical to
-  the intact file. `'none'` restores 0.3.0's rendering; a file whose header cannot be read still
+  refuses a truncation that cuts image data; a cut TIFF is usually retried, not refused, and a cut
+  animated GIF can still render the frames it has, so its preview can be shorter. Three limits:
+  bytes flipped mid-file can still render garbled at every level; a JPEG missing only its end marker
+  is usually refused at every strict level (the few that pass have all their image data and render
+  the same pixels as the intact file); and a PNG with a bad IDAT checksum is refused at `'error'`
+  (`vipspng: libpng read error`), although it renders the same pixels as the intact file at
+  `'none'`. `'warning'` refuses more, including JPEGs that look identical to the intact file.
+  `'none'` restores 0.3.0's rendering; a file whose header cannot be read still
   fails, usually at once. Decoding failures at the same moment in one process can blur which file
   an engine message belongs to, so a failure with no usable detail is retried. They can also,
   rarely, put a neighbour's damage line on a healthy file this build cannot render (7 of 800 decodes

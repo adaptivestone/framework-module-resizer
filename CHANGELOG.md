@@ -5,17 +5,24 @@
 - A damaged source now fails. `limits.failOn` (new, default `'error'`) replaces the hard-coded
   `failOn: 'none'`. A cut or unreadable original is dead-lettered on its first delivery with
   `RESIZE_SOURCE_DAMAGED` (`retryable: false`) instead of rendering a garbled preview. A cut
-  animated GIF can still render the frames it has, so its preview can be shorter. Two limits: bytes
-  flipped mid-file can still render garbled, and a JPEG missing only its end marker is usually
-  refused at every strict level. `limits.failOn: 'none'` restores 0.3.0's rendering; a file whose
-  header cannot be read still fails, usually at once (a file with no usable detail and a cut TIFF
-  are retried). It is not in `encodeSig`, so nothing regenerates; previews already made stay fresh,
+  animated GIF can still render the frames it has, so its preview can be shorter. Three limits:
+  bytes flipped mid-file can still render garbled; a JPEG missing only its end marker is usually
+  refused at every strict level; and a PNG with a bad IDAT checksum is refused at `'error'`
+  (`vipspng: libpng read error`), although it renders the same pixels as the intact file at
+  `'none'`. `limits.failOn: 'none'` restores 0.3.0's rendering; a file whose header cannot be read
+  still fails, usually at once (a file with no usable detail is retried, and so, usually, is a cut
+  TIFF). It is not in `encodeSig`, so nothing regenerates; previews already made stay fresh,
   and the README's `Damaged originals` shows how to find them. A complete config passed to
   `new Resizer` must now hold `limits.failOn`. Sharp's pixel limit at decode is now
   `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`), and at upload `RESIZE_ORIGINAL_TOO_MANY_PIXELS`.
+- On a cut JPEG, which 0.3.0 rendered, `generate()` now rejects with `ResizeMediaError`
+  `RESIZE_SOURCE_DAMAGED`, not `ResizeGenerateError`. A handler that catches only
+  `ResizeGenerateError` returns 500 on a user's upload: catch `ResizeError` too, or refuse the file
+  at upload with `upload.verify: 'decode'`.
 - `ResizeOriginalError` defaults to `retryable: false`. An upload rejection names the engine's line;
-  an unrecognised decoder failure during `inspect` is the new `RESIZE_ORIGINAL_INSPECT_FAILED`
-  (`true`), where it was `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
+  an unrecognised decoder failure during `inspect`, a host decoder's plain error included, whatever
+  its message says, is the new `RESIZE_ORIGINAL_INSPECT_FAILED` (`true`), where it was
+  `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
   now hold `upload.verify`.
 - `upload.verify` and `limits.failOn` are required in the config type. A host file with
   `upload: { maxBytes, formats }` or a hand-written `limits`, and `satisfies FrameworkResizeConfig`,
@@ -23,8 +30,9 @@
   file still works: the module merges it over the defaults.
 - `ResizeConfigError` defaults to `retryable: false`. `RESIZE_TASK_MAX_ATTEMPTS`,
   `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`. `RESIZE_WORKER_INCOMPLETE` is `false`
-  when every missing variant failed with `false`, and a storage refusal from a preview upload now
-  counts as such a failure, where it was retried. `RESIZE_GENERATE_FAILED` is `false` when every
+  when every missing variant failed with `false` and the media still holds the original they were
+  rendered from, and a storage refusal from a preview upload now counts as such a failure, where it
+  was retried. `RESIZE_GENERATE_FAILED` is `false` when every
   variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both
   shipped drivers, where it was the raw driver error.
 - A disabled worker logs `warn`, and the command resolves `false`, so a CLI entry that forwards the
@@ -39,6 +47,17 @@
   the code, attempt and cause on one line. `NoopMetrics` does not silence them, so a host that
   alerts on `error` gets new alerts. The task row holds the same one-line text, so a multi-line
   message now reads ` | ` there.
+- A failed variant's line is a `warn`, where it was an `error`, in the worker and in `generate()`,
+  whose caller gets the failed count or the throw. One dead task now writes one `error` line from
+  the worker, where 4 variants over 3 attempts wrote 13: alert on `error` or on `is dead`, not on the
+  variant lines. SQS without a `deadLetterQueueUrl` adds one more.
+- `RESIZE_WORKER_INCOMPLETE` carries the first failure of a variant still missing as its `cause`, so
+  the task row and the retried and dead lines say why, and how many failed when there are several.
+- The module passes its logger one string, never a second argument: its line, then, when there is an
+  error, a line break and the error's stack and `cause` chain, cut at 8,000 characters. A `%` in a
+  cause no longer corrupts the line and loses the stack (on the console, or a Winston logger without
+  `splat`, or pino). A host logger that read a structured error from the second argument finds it
+  in the message instead.
 - `resolve()` warns once per Resizer when the module's fields were not loaded. After the first added
   task, `MongoTaskQueue` checks the gate index once per model in the background and logs an `error`
   when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
@@ -62,7 +81,10 @@
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
 - The dispatcher's once-log sets are capped at 100 keys.
-- A framework host's open metrics window is written on the framework's `shutdown` event.
+- A framework host's open metrics window is written on the framework's `shutdown` event, which
+  `startServer()` and its CLI emit. A script on `new Server()` and `init()`, a `FrameworkResizer`
+  with every part in code first used before the `Server` exists, and a CLI command with an
+  asynchronous sink call `await getResizer().metrics.flush?.()` themselves.
 
 # 0.3.0
 
