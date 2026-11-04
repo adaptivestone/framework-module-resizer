@@ -43,7 +43,6 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
   ResizeSetupError,
-  ResizeStorageError,
 } from './errors.ts';
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
@@ -1506,14 +1505,14 @@ describe('decoding the source', () => {
       (err: unknown) => err instanceof ResizeGenerateError,
     );
     assert.equal(uploads.length, 0);
-    const [message, err] = logs.error[0];
-    assert.match(String(message), /variant .* failed for media m1/);
-    assert.ok(err instanceof ResizeMediaError);
-    assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
+    assert.deepEqual(logs.error, []);
+    const text = String(logs.warn[0][0]);
+    assert.match(firstLine(text), /variant .* failed for media m1$/);
+    assert.match(text, /\nResizeMediaError: .*\(media m1\)\n/);
+    assert.match(text, /code: 'RESIZE_SVG_PUBLIC_PREVIEW'/);
     // Only a custom step reaches it, and a deploy with a fixed step can succeed.
-    assert.equal(err.retryable, true);
-    assert.equal(err.mediaId, 'm1');
-    assert.match(err.message, /\(media m1\)$/);
+    assert.match(text, /retryable: true/);
+    assert.match(text, /mediaId: 'm1'/);
   });
 
   test('a storage upload that returns no locator fails its variant with RESIZE_PREVIEW_STORAGE_REF_INVALID, retryable', async () => {
@@ -1527,11 +1526,11 @@ describe('decoding the source', () => {
       }),
       (err: unknown) => err instanceof ResizeGenerateError,
     );
-    const [message, err] = logs.error[0];
-    assert.match(String(message), /variant .* failed for media m1/);
-    assert.ok(err instanceof ResizeStorageError);
-    assert.equal(err.code, 'RESIZE_PREVIEW_STORAGE_REF_INVALID');
-    assert.equal(err.retryable, true);
+    const text = String(logs.warn[0][0]);
+    assert.match(firstLine(text), /variant .* failed for media m1$/);
+    assert.match(text, /\nResizeStorageError: /);
+    assert.match(text, /code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID'/);
+    assert.match(text, /retryable: true/);
   });
 
   // A host step that knows its variant can never be made.
@@ -1753,7 +1752,7 @@ describe('decoding the source', () => {
       }),
       (err: unknown) => err instanceof ResizeGenerateError,
     );
-    assert.match(String(logs.error[0][0]), /^resize generate: variant /);
+    assert.match(String(logs.warn[0][0]), /^resize generate: variant /);
   });
 
   test('a queued variant failure still says resize worker', async () => {
@@ -1766,7 +1765,7 @@ describe('decoding the source', () => {
       new Processor(deps).processTask(task({ previews: [variant()] })),
       { code: 'RESIZE_WORKER_INCOMPLETE' },
     );
-    assert.match(String(logs.error[0][0]), /^resize worker: variant /);
+    assert.match(String(logs.warn[0][0]), /^resize worker: variant /);
   });
 
   test('a host decoder that lists the stored format and refuses: the warning names the decoders, not two equal formats', async () => {
@@ -3815,10 +3814,10 @@ describe('unconfigured formats', () => {
       ['jpeg'],
     );
     assert.ok(
-      logs.error.some(
+      logs.warn.some(
         (entry) =>
-          entry[1] instanceof ResizeSetupError &&
-          entry[1].code === 'RESIZE_FORMAT_NOT_CONFIGURED',
+          /\nResizeSetupError: /.test(String(entry[0])) &&
+          /code: 'RESIZE_FORMAT_NOT_CONFIGURED'/.test(String(entry[0])),
       ),
     );
   });
@@ -5973,7 +5972,7 @@ describe('variant metrics', () => {
     );
   });
 
-  test('a failed variant records failed with its code and is still logged at error', async () => {
+  test('a failed variant records failed with its code and is still logged, as a warning', async () => {
     const { deps, metrics } = measuredDeps();
     const { logger, logs } = recordingLogger();
     deps.logger = logger;
@@ -6012,7 +6011,7 @@ describe('variant metrics', () => {
     assert.match(identity, /:10x10:/);
     assert.deepEqual(failedCalls[0].context, { mediaId: 'm1', identity });
     assert.ok(
-      logs.error.some((a) =>
+      logs.warn.some((a) =>
         String(a[0]).includes(`variant ${identity} failed for media m1`),
       ),
     );

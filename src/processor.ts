@@ -38,7 +38,7 @@ import {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
-import { storedDims } from './freshness.ts';
+import { expectedOrigin, storedDims } from './freshness.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow, notRetryable } from './helpers/log.ts';
@@ -589,10 +589,14 @@ interface RenderPendingResult {
   // the identities of the stored previews that replaced them.
   removed: Preview[];
   replaced: Set<string>;
+  // What each failed variant failed with, by identity, in the order they failed.
+  failures: Map<string, unknown>;
   // The identities whose failure says no retry can help (`retryable: false`).
   finalFailures: Set<string>;
-  // The size every row was signed with, once the original was measured.
+  // The size every row was signed with, once the original was measured, and the signature of the
+  // original this call rendered from.
   originDims?: { width: number; height: number };
+  origin?: string;
   // The dimensions the persist recorded on a media that had none stored.
   backfilled?: { width: number; height: number };
 }
@@ -858,18 +862,25 @@ export class Processor {
     }
     const requested = [...requestedByIdentity.values()];
     this.#warnIfAllFresh(task, media, scope, requested);
-    const { generated, failedCount, finalFailures, originDims, backfilled } =
-      await this.#renderPending({
-        media,
-        mediaId: task.mediaId,
-        requested,
-        pipeline: task.pipeline,
-        ctx,
-        persist: true,
-        signal: opts.signal,
-        mode: 'task',
-        taskId: task.taskId,
-      });
+    const {
+      generated,
+      failedCount,
+      failures,
+      finalFailures,
+      originDims,
+      origin,
+      backfilled,
+    } = await this.#renderPending({
+      media,
+      mediaId: task.mediaId,
+      requested,
+      pipeline: task.pipeline,
+      ctx,
+      persist: true,
+      signal: opts.signal,
+      mode: 'task',
+      taskId: task.taskId,
+    });
 
     // A queued task is complete only when every requested identity is now persisted fresh. Re-read
     // once so the rows of a concurrent worker running the same task (after an expired lease) count:
@@ -914,18 +925,35 @@ export class Processor {
         catalog.identity(scope, preview),
       );
       // Dead at once only when another delivery could change nothing: a variant missing for any
-      // other reason (a retryable failure, a row the store left out) may still be made.
-      const allFinal = missingIdentities.every((identity) =>
-        finalFailures.has(identity),
-      );
+      // other reason (a retryable failure, a row the store left out) may still be made, and a
+      // failure says nothing about an original that replaced the one it was rendered from.
+      const sameOriginal =
+        origin !== undefined &&
+        expectedOrigin(
+          refreshed.original,
+          storedDims(refreshed.original) ?? originDims,
+        ) === origin;
+      const allFinal =
+        sameOriginal &&
+        missingIdentities.every((identity) => finalFailures.has(identity));
+      // A task row outlives the logs, so the error says why: the first failure of a variant that is
+      // still missing (a variant another worker stored meanwhile no longer matters).
+      const failed = [...failures]
+        .filter(([identity]) => missingIdentities.includes(identity))
+        .map(([, failure]) => failure);
+      const counted =
+        failed.length > 1
+          ? ` (${failed.length} variants failed, the first is the cause)`
+          : '';
       throw new ResizeGenerateError({
         mediaId: task.mediaId,
         failed: Math.max(failedCount, missing.length),
         requested: requested.length,
         missing: missingIdentities,
-        message: `resize worker: task for media ${task.mediaId} is incomplete; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
+        message: `resize worker: task for media ${task.mediaId} is incomplete${counted}; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
         code: 'RESIZE_WORKER_INCOMPLETE',
         retryable: !allFinal,
+        cause: failed[0],
       });
     }
     return { requested: requested.length, rendered: generated.length };
@@ -1013,12 +1041,14 @@ export class Processor {
     let failedCount = 0;
     let removed: Preview[] = [];
     const replaced = new Set<string>();
+    const failures = new Map<string, unknown>();
     const finalFailures = new Set<string>();
     const nothing = (): RenderPendingResult => ({
       generated,
       failedCount,
       removed,
       replaced,
+      failures,
       finalFailures,
     });
 
@@ -1090,11 +1120,14 @@ export class Processor {
     for (const v of unconfigured) {
       const identity = catalog.identity(scope, v);
       const error = formatNotConfiguredError([v.format]);
-      logger.error(
+      logNeverThrow(
+        logger,
         `${who}: variant ${identity} failed for media ${mediaId}`,
         error,
+        'warn',
       );
       failedCount += 1;
+      failures.set(identity, error);
       recordVariant(identity, 'unconfigured', 0, 'failed', {
         ...errorCodeLabel(error),
         rawFormat: v.format,
@@ -1303,11 +1336,16 @@ export class Processor {
         // One bad variant must not fail the whole task; the caller decides what the failures mean.
         // A media error from the pixel work (an SVG output) does not know its media: add it.
         const failure = lacksMediaId(err) ? withMediaId(err, mediaId) : err;
-        logger.error(
+        // A warning: the task may still succeed, and a task's `error` line is its dead line. An
+        // eager caller gets the failed count or the throw.
+        logNeverThrow(
+          logger,
           `${who}: variant ${plan.identity} failed for media ${mediaId}`,
           failure,
+          'warn',
         );
         failedCount += 1;
+        failures.set(plan.identity, failure);
         if (notRetryable(failure)) {
           finalFailures.add(plan.identity);
         }
@@ -1428,8 +1466,10 @@ export class Processor {
       failedCount,
       removed,
       replaced,
+      failures,
       finalFailures,
       originDims: mediaDims,
+      origin,
       ...(backfillDims ? { backfilled: backfillDims } : {}),
     };
   }

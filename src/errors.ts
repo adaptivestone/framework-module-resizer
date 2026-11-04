@@ -166,6 +166,8 @@ export class ResizeGenerateError extends ResizeError {
     missing?: string[];
     /** Default `true`: the failed variants may still succeed. */
     retryable?: boolean;
+    /** What went wrong: a queued task's first failed variant, for its row and its log lines. */
+    cause?: unknown;
   }) {
     super(
       opts.message ??
@@ -173,6 +175,7 @@ export class ResizeGenerateError extends ResizeError {
       {
         code: opts.code ?? 'RESIZE_GENERATE_FAILED',
         retryable: opts.retryable ?? true,
+        cause: opts.cause,
       },
     );
     this.mediaId = opts.mediaId;

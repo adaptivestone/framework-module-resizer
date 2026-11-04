@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
+import type { ResizeStorage } from './contracts/storage.ts';
 import type {
   ClaimedTask,
   LeasedTask,
@@ -2389,5 +2390,417 @@ describe('worker metrics', () => {
     } finally {
       process.off('unhandledRejection', record);
     }
+  });
+});
+
+describe('what a variant failure leaves behind', () => {
+  const fast = { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } };
+  const logged = () => {
+    const lines = {
+      info: [] as string[],
+      warn: [] as string[],
+      error: [] as string[],
+    };
+    return {
+      lines,
+      logger: {
+        info: (msg: unknown) => void lines.info.push(String(msg)),
+        warn: (msg: unknown) => void lines.warn.push(String(msg)),
+        error: (msg: unknown) => void lines.error.push(String(msg)),
+      },
+    };
+  };
+  const sized = (side: number) => ({
+    sizeKey: `${side}x${side}`,
+    format: 'webp',
+    requestedWidth: side,
+    requestedHeight: side,
+  });
+  /** A Resizer whose media m1 has an original, one variant at a time, each logging to `logger`. */
+  const denying = (
+    tasks: TaskQueue,
+    logger: ResizerOptions['logger'],
+    upload: ResizeStorage['upload'],
+  ) =>
+    new Resizer({
+      config: makeImageConfig({ formats: ['webp'], concurrency: 1 }),
+      logger,
+      storage: { download: async () => png, upload, publicUrl: () => '' },
+      media: fakeMedia({
+        load: async () => ({
+          id: 'm1',
+          original: { storageRef: { key: 'o' } },
+          previews: [],
+        }),
+      }),
+      locks: memoryLocks(),
+      tasks,
+    });
+  const accessDenied = () =>
+    Object.assign(new Error('Access Denied'), { name: 'AccessDenied' });
+
+  test('with preview uploads denied, the row and each line say why', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fast, maxAttempts: 2 },
+    });
+    const { lines, logger } = logged();
+    const resizer = denying(tasks, logger, async () => {
+      throw accessDenied();
+    });
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: [sized(10)],
+    });
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    const reason = '(cause: AccessDenied: Access Denied)';
+    assert.ok(
+      tasks.rows[0].error?.endsWith(reason),
+      String(tasks.rows[0].error),
+    );
+    const retried = lines.warn.find((l) => l.includes('retrying in'));
+    assert.ok(retried?.endsWith(reason), String(retried));
+    const dead = lines.error.find((l) => l.includes(' is dead '));
+    assert.ok(dead?.endsWith(reason), String(dead));
+    // One variant: the text has no count of others.
+    assert.doesNotMatch(String(tasks.rows[0].error), /variants failed/);
+  });
+
+  test('with several variants failing differently, the first failure is the cause and the text counts them', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fast, maxAttempts: 1 },
+    });
+    const { logger } = logged();
+    let uploads = 0;
+    const resizer = denying(tasks, logger, async () => {
+      uploads += 1;
+      throw new Error(`failure ${uploads}`);
+    });
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: [sized(10), sized(20), sized(30)],
+    });
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(uploads, 3);
+    const text = String(tasks.rows[0].error);
+    assert.match(text, /3 variants failed, the first is the cause/);
+    assert.ok(text.endsWith('(cause: Error: failure 1)'), text);
+    assert.doesNotMatch(text, /failure 2|failure 3/);
+  });
+
+  test('a long list of missing variants does not push the reason off the row', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fast, maxAttempts: 1 },
+    });
+    const { logger } = logged();
+    const resizer = denying(tasks, logger, async () => {
+      throw accessDenied();
+    });
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: Array.from({ length: 48 }, (_, i) => sized(i + 1)),
+    });
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    const text = String(tasks.rows[0].error);
+    assert.equal(text.length, 1000);
+    assert.ok(text.endsWith('(cause: AccessDenied: Access Denied)'), text);
+  });
+
+  test('one dead task writes one error line: its variants warn, on every attempt', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fast, maxAttempts: 3 },
+    });
+    const { lines, logger } = logged();
+    const resizer = denying(tasks, logger, async () => {
+      throw accessDenied();
+    });
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: [sized(10), sized(20), sized(30), sized(40)],
+    });
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(lines.error.length, 1, lines.error.join('\n---\n'));
+    assert.match(lines.error[0], / is dead \(attempt 3 of 3, /);
+    const variantLines = lines.warn.filter((l) =>
+      /^resize worker: variant \S+ failed for media m1\n/.test(l),
+    );
+    assert.equal(variantLines.length, 4 * 3);
+    assert.ok(
+      variantLines.every((l) => l.includes('AccessDenied: Access Denied')),
+    );
+  });
+
+  test('a variant of an unconfigured format warns too', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fast, maxAttempts: 2 },
+    });
+    const { lines, logger } = logged();
+    const resizer = denying(tasks, logger, async () => ({ key: 'k' }));
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: [{ ...sized(10), format: 'jpg' }],
+    });
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.equal(lines.error.length, 1, lines.error.join('\n---\n'));
+    assert.match(lines.error[0], / is dead /);
+    assert.equal(
+      lines.warn.filter((l) => /^resize worker: variant \S+ failed/.test(l))
+        .length,
+      2,
+    );
+    // The row says why too: a rolling deploy can add the format, so it was retried.
+    assert.match(String(tasks.rows[0].error), /have no encode\.formats entry/);
+  });
+
+  test('generate() writes no error line: the caller has the failed count or the throw', async () => {
+    const { lines, logger } = logged();
+    const r = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger,
+      storage: {
+        download: async () => png,
+        upload: async () => {
+          throw accessDenied();
+        },
+        publicUrl: () => '',
+      },
+      media: fakeMedia(),
+    });
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: { id: 'm1', original: { storageRef: { key: 'o' } } },
+          sizes: [{ width: 10, height: 10 }],
+        }),
+      { code: 'RESIZE_GENERATE_FAILED' },
+    );
+    assert.deepEqual(lines.error, []);
+    assert.equal(lines.warn.length, 1);
+    assert.match(lines.warn[0], /^resize generate: variant \S+ failed/);
+    assert.match(lines.warn[0], /AccessDenied: Access Denied/);
+  });
+});
+
+describe('a final failure of an original that was replaced meanwhile', () => {
+  const fast = {
+    idlePollMs: 5,
+    retryBackoffMs: { base: 5, max: 5 },
+    maxAttempts: 3,
+  };
+  const sizes = [{ width: 10, height: 10 }];
+  const refused = () =>
+    new ResizeSecurityError('resize: this preview may not be stored', {
+      code: 'TEST_UPLOAD_REFUSED',
+    });
+
+  /**
+   * A live media whose preview upload for original `old` waits for `release()` and then refuses,
+   * while one for any other original is stored; `prewarm()` puts the first task on the queue.
+   */
+  const scene = () => {
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const media: MediaLike = {
+      id: 'm1',
+      original: { storageRef: { key: 'old' }, width: 64, height: 48 },
+      previews: [],
+    };
+    const { promise: started, resolve: start } = Promise.withResolvers<void>();
+    const { promise: released, resolve: release } =
+      Promise.withResolvers<void>();
+    const rows = new Map<string, Preview[]>();
+    const parents: string[] = [];
+    const resizer = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => png,
+        upload: async ({ key, parentRef }) => {
+          const parent = (parentRef as { key: string }).key;
+          parents.push(parent);
+          if (parent === 'old') {
+            start();
+            await released;
+            throw refused();
+          }
+          return { key };
+        },
+        publicUrl: () => '',
+      },
+      media: fakeMedia({
+        previews: rows,
+        // A copy, as a store's load is: the task's snapshot must not see the replacement.
+        load: async () => ({
+          ...media,
+          previews: rows.get('m1') ?? [],
+        }),
+      }),
+      locks: memoryLocks(),
+      tasks,
+    });
+    return { tasks, media, started, release, rows, parents, resizer };
+  };
+
+  test('prewarm stays accepted, the task is retried, and the next delivery renders the new original', async () => {
+    const s = scene();
+    const first = await s.resizer.prewarm({ media: s.media, sizes });
+    assert.equal(first.status, 'accepted');
+    const done = workUntil(
+      { logger: silent, resizers: [s.resizer] },
+      () => s.tasks.rows[0].status !== 'processing' && s.rows.has('m1'),
+    );
+    await s.started;
+    // Replaced while the old preview uploads; the same size is asked for, and held by this task.
+    s.media.original = {
+      storageRef: { key: 'new' },
+      width: 64,
+      height: 48,
+    };
+    const second = await s.resizer.prewarm({ media: s.media, sizes });
+    assert.equal(second.status, 'accepted');
+    assert.equal(s.tasks.rows.length, 1);
+    s.release();
+    await done;
+    assert.equal(s.tasks.rows[0].status, 'completed');
+    assert.equal(s.tasks.rows[0].attempts, 2);
+    assert.deepEqual(s.parents, ['old', 'new']);
+    assert.equal(s.rows.get('m1')?.length, 1);
+    // What is stored is fresh for the new original: nothing more to do.
+    const read = await s.resizer.resolve({
+      media: { ...s.media, previews: s.rows.get('m1') },
+      sizes,
+    });
+    assert.deepEqual(read.decision.missing, []);
+    assert.equal(read.decision.ready.length, 1);
+  });
+
+  test('the original unchanged: the same failure is final, on the first delivery', async () => {
+    const s = scene();
+    assert.equal(
+      (await s.resizer.prewarm({ media: s.media, sizes })).status,
+      'accepted',
+    );
+    s.release();
+    const events: { event: TaskEvent; error?: unknown }[] = [];
+    const stop = new AbortController();
+    await consume(s.tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: (task, opts) => processTask(task, opts),
+      onEvent: (event, _task, error) => {
+        events.push({ event, error });
+        stop.abort();
+      },
+      logger: silent,
+    });
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['deadLettered'],
+    );
+    assert.ok(events[0].error instanceof ResizeGenerateError);
+    assert.equal(events[0].error.code, 'RESIZE_WORKER_INCOMPLETE');
+    assert.equal(events[0].error.retryable, false);
+    assert.equal(s.tasks.rows[0].status, 'dead');
+    assert.equal(s.tasks.rows[0].attempts, 1);
+    assert.match(
+      String(s.tasks.rows[0].error),
+      /\(cause: ResizeSecurityError: resize: this preview may not be stored\)$/,
+    );
+  });
+
+  test('a replacement that only changes the stored size counts too; a backfill of the same size does not', async () => {
+    const refuseEvery = async () => {
+      throw refused();
+    };
+    const run = async (
+      loaded: MediaLike['original'],
+      reloaded: MediaLike['original'],
+    ) => {
+      resetResizerForTests();
+      const tasks = new MemoryTaskQueue({ timing: fast });
+      let loads = 0;
+      new Resizer({
+        config: makeImageConfig({ formats: ['webp'] }),
+        logger: silent,
+        storage: {
+          download: async () => png,
+          upload: refuseEvery,
+          publicUrl: () => '',
+        },
+        media: fakeMedia({
+          load: async () => {
+            loads += 1;
+            return {
+              id: 'm1',
+              original: loads === 1 ? loaded : reloaded,
+              previews: [],
+            };
+          },
+        }),
+        locks: memoryLocks(),
+        tasks,
+      });
+      await tasks.add({
+        resizer: 'default',
+        queue: 'default',
+        mediaId: 'm1',
+        pipeline: 'default',
+        previews: [webp10],
+      });
+      const events = await firstEvent(tasks);
+      return (events[0].error as ResizeGenerateError).retryable;
+    };
+    const ref = { key: 'same' };
+    // The same storage ref with another stored size: new bytes may be behind it.
+    assert.equal(
+      await run(
+        { storageRef: ref, width: 64, height: 48 },
+        { storageRef: ref, width: 128, height: 96 },
+      ),
+      true,
+    );
+    // Dimensions the persist backfilled, the very ones the render measured: the same original.
+    assert.equal(
+      await run(
+        { storageRef: ref },
+        { storageRef: ref, width: 64, height: 48 },
+      ),
+      false,
+    );
+    // A store that drops the backfill: still the same original.
+    assert.equal(await run({ storageRef: ref }, { storageRef: ref }), false);
+    // The original gone from the reloaded media: the next delivery says so.
+    assert.equal(
+      await run({ storageRef: ref, width: 64, height: 48 }, undefined),
+      true,
+    );
   });
 });
