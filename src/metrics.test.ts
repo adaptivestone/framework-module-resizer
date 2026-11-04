@@ -3,8 +3,14 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, mock, test } from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import { ResizeMetrics } from './contracts/metrics.ts';
-import { ResizeSetupError } from './errors.ts';
-import { boundMetrics, isMetrics, LogMetrics, NoopMetrics } from './metrics.ts';
+import { ResizeError, ResizeSetupError } from './errors.ts';
+import {
+  boundMetrics,
+  errorCodeLabel,
+  isMetrics,
+  LogMetrics,
+  NoopMetrics,
+} from './metrics.ts';
 import { metricsOf, Resizer, resetResizerForTests } from './resizer.ts';
 import { fakeMedia, recordingMetrics } from './testHelpers/fakes.ts';
 import type { ResizeLogger } from './types.d.ts';
@@ -543,4 +549,36 @@ new LogMetrics({ info() {}, warn() {}, error() {} }).count('resize.read', 1, { o
   );
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('errorCodeLabel never throws, and a code that is not one token gives no label', () => {
+  const no = () => {
+    throw new Error('no');
+  };
+  assert.deepEqual(
+    errorCodeLabel(new ResizeError('x', { code: 'RESIZE_ERROR_A' })),
+    { code: 'RESIZE_ERROR_A' },
+  );
+  assert.deepEqual(errorCodeLabel(new Error('x')), {});
+  assert.deepEqual(
+    errorCodeLabel(new ResizeError('x', { code: 'A\nresize: task forged' })),
+    {},
+  );
+  assert.deepEqual(
+    errorCodeLabel(
+      Object.defineProperty(new ResizeError('x'), 'code', { get: no }),
+    ),
+    {},
+  );
+  const trapped = new Proxy(
+    {},
+    {
+      get: no,
+      has: no,
+      getPrototypeOf: no,
+      ownKeys: no,
+      getOwnPropertyDescriptor: no,
+    },
+  );
+  assert.deepEqual(errorCodeLabel(trapped), {});
 });

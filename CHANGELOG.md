@@ -1,3 +1,21 @@
+# 0.4.0
+
+**Breaking changes**
+
+**Changed behaviour**
+
+- The worker logs task failures itself: `warn` on a retried failure, `error` on a dead-letter, with
+  the code, attempt and cause on one line. `NoopMetrics` does not silence them, so a host that
+  alerts on `error` gets new alerts. The task row holds the same one-line text, so a multi-line
+  message now reads ` | ` there.
+
+**Features**
+
+**Fixes**
+
+- A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
+  the monotonic clock, so a clock step cannot lengthen it.
+
 # 0.3.0
 
 **Upgrading from a release candidate.** 0.3.0 was published first as release candidates, under

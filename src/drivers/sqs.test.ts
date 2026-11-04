@@ -832,6 +832,7 @@ describe('Consumer with SqsTaskQueue', () => {
     await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
+      logger: recordingLogger().logger,
       handle: async () => {
         throw boom;
       },
@@ -1017,6 +1018,7 @@ describe('Consumer with SqsTaskQueue', () => {
     await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
+      logger: recordingLogger().logger,
       handle: (_task, { signal }) =>
         new Promise<void>((_resolve, reject) => {
           signal.addEventListener(
@@ -1054,6 +1056,7 @@ describe('Consumer with SqsTaskQueue', () => {
     await consume(tasks, {
       signal: ctrl.signal,
       queue: 'default',
+      logger: recordingLogger().logger,
       handle: async () => {
         throw boom;
       },
@@ -1112,6 +1115,7 @@ describe('Consumer with SqsTaskQueue', () => {
       await consume(tasks, {
         signal: ctrl.signal,
         queue: 'default',
+        logger: recordingLogger().logger,
         handle: async () => {
           deliveries += 1;
           if (deliveries === 1) {

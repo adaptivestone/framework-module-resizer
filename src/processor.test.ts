@@ -4906,7 +4906,7 @@ describe('one worker serves every Resizer', () => {
     });
     await addTask(tasks, { resizer: 'listings' });
     await addTask(tasks, { resizer: 'listings', mediaId: 'bad' });
-    await runWorker({ signal: controller.signal });
+    await runWorker({ signal: controller.signal, logger: silent });
     assert.deepEqual(seen, [
       ['listings', 'completed'],
       ['listings', 'failed', boom],

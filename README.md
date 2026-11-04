@@ -1529,6 +1529,22 @@ await ResizeTask.updateOne(
   Every read is counted instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A
   stored preview whose `publicUrl` throws, and an enqueue that throws, are still logged on every
   read. `prewarm()` logs as before.
+- **What a worker logs:** the worker writes each task failure itself, one line on its own logger
+  (`runWorker({ logger })`; the app logger under `npm run cli ResizeWorker`). A failure that will
+  be retried is a `warn`, a dead task an `error`:
+
+  ```text
+  resize worker: task <taskId> of media <mediaId> failed (attempt 1 of 5, code RESIZE_SOURCE_DECODE_FAILED) — retrying in 5000 ms: <cause>
+  resize worker: task <taskId> of media <mediaId> is dead (attempt 5 of 5, code RESIZE_SOURCE_DECODE_FAILED, last attempt) — new tasks for its media and pipeline wait 600000 ms: <cause>
+  ```
+
+  They are written whatever the metrics sink is, `NoopMetrics` included, so a host that alerts on
+  `error` sees one line per dead task. A dead line gives one of three reasons: `last attempt`
+  (`maxAttempts` used up), `not retryable` (the error has `retryable: false`) or
+  `delivered more often than maxAttempts` (its workers kept crashing mid-task). The code is `none`
+  for an error without one. The cause fits one line of at most 1000 characters, with ` | ` for a
+  line break, and the task row holds the same text. A worker that no longer holds its task (a lost
+  lease) writes a `warn` and never a dead line.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the

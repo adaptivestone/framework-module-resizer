@@ -23,6 +23,7 @@ import {
   ResizeStorageError,
 } from './errors.ts';
 import { gateKey } from './lockKeys.ts';
+import { NoopMetrics } from './metrics.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -2078,6 +2079,26 @@ describe('worker metrics', () => {
       .filter((line) => line.startsWith('resize: task '))
       .map((line) => /of media m1 (\w+) in \d+ ms/.exec(line)?.[1]);
     assert.deepEqual(outcomes, ['failed', 'dead']);
+  });
+
+  test('a dead task under NoopMetrics still writes its dead line', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const logger = recordingLogger();
+    const resizer = resizerOn(tasks, {
+      metrics: new NoopMetrics(),
+      // No original: the task fails with retryable: false, so it is dead at once.
+      media: fakeMedia({ load: async () => ({ id: 'm1', previews: [] }) }),
+    });
+    await addTask(tasks);
+    // The line goes to the worker's logger, not to the Resizer's or the sink's.
+    await workUntil(
+      { logger, resizers: [resizer] },
+      () => tasks.rows[0].status === 'dead',
+    );
+    assert.match(
+      logger.lines.error.join('\n'),
+      /is dead \(attempt 1 of \d+, code /,
+    );
   });
 
   test('a task of an unregistered pipeline is labelled unregistered', async () => {

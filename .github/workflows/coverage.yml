@@ -37,6 +37,7 @@ on:
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     # `code-quality: write` is the only elevated permission the upload action needs.
     permissions:

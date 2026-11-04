@@ -1,10 +1,11 @@
 // The worker loop (Consumer) against the in-memory TaskQueue: the same lifecycle every backend
 // gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash loops,
 // timeouts, lost leases, graceful shutdown and resilient claiming — plus the gate lock it holds on
-// a queue without gatesByTask, the dead-letter cooldown it passes to a queue with it, and a host
-// logger that throws.
+// a queue without gatesByTask, the dead-letter cooldown it passes to a queue with it, what it logs
+// when a task fails, and a host logger that throws.
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { describe, type TestContext, test } from 'node:test';
+import { format } from 'node:util';
 import {
   backoffMs,
   Consumer,
@@ -68,6 +69,7 @@ async function shutDownMidTask(
     task: LeasedTask,
     opts: { signal: AbortSignal },
   ) => Promise<void> = stoppedByShutdown,
+  logger: ConsumeOptions['logger'] = silent,
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
   const stop = new AbortController();
@@ -82,7 +84,7 @@ async function shutDownMidTask(
     onEvent: (event, task, error) => {
       events.push({ event, task, error });
     },
-    logger: silent,
+    logger,
   });
   const until = performance.now() + 5000;
   try {
@@ -2750,6 +2752,642 @@ describe('Consumer metrics', () => {
     const [claim] = callsOf(rec, 'resize.claim');
     assert.ok(claim, 'the claim is recorded');
     assert.ok(claim[0] >= 50, `waited ${claim[0]} ms`);
+  });
+});
+
+describe('what the worker logs', () => {
+  /** A logger that keeps each level's lines, and the arguments of each call. */
+  const lineLogger = () => {
+    const infos: string[] = [];
+    const warns: string[] = [];
+    const errors: string[] = [];
+    const calls = {
+      info: [] as unknown[][],
+      warn: [] as unknown[][],
+      error: [] as unknown[][],
+    };
+    return {
+      infos,
+      warns,
+      errors,
+      calls,
+      logger: {
+        info: (...args: unknown[]) => {
+          infos.push(String(args[0]));
+          calls.info.push(args);
+        },
+        warn: (...args: unknown[]) => {
+          warns.push(String(args[0]));
+          calls.warn.push(args);
+        },
+        error: (...args: unknown[]) => {
+          errors.push(String(args[0]));
+          calls.error.push(args);
+        },
+      },
+    };
+  };
+
+  /**
+   * The console a throwing logger falls back to: it formats as the real one does, so what the real
+   * one cannot format throws here too, and it writes nothing. Returns the messages it kept.
+   */
+  const quietConsole = (t: TestContext) => {
+    const messages: string[] = [];
+    for (const level of ['info', 'warn', 'error'] as const) {
+      t.mock.method(console, level, (...args: unknown[]) => {
+        format(...args);
+        messages.push(String(args[0]));
+      });
+    }
+    return messages;
+  };
+
+  /** Run one task whose handler rejects with `thrown`, until it has failed once. */
+  const failOnce = async (
+    thrown: unknown,
+    maxAttempts: number,
+    logger: ConsumeOptions['logger'],
+  ) => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, maxAttempts },
+    });
+    await tasks.add(newTask());
+    await runUntil(
+      tasks,
+      () => Promise.reject(thrown),
+      () => tasks.rows[0].error !== undefined,
+      { logger },
+    );
+    return tasks;
+  };
+
+  test('a retried failure logs one warn line with its code, attempt and cause, and no error line', async () => {
+    const { warns, errors, logger } = lineLogger();
+    await failOnce(
+      new ResizeError('boom', { code: 'RESIZE_SOURCE_DECODE_FAILED' }),
+      3,
+      logger,
+    );
+    assert.equal(warns.length, 1, warns.join('\n'));
+    assert.match(
+      warns[0],
+      /^resize worker: task \S+ of media \S+ failed \(attempt 1 of 3, code RESIZE_SOURCE_DECODE_FAILED\) — retrying in \d+ ms: .*boom$/,
+    );
+    assert.equal(errors.length, 0);
+  });
+
+  test('a dead-letter on the last attempt says so', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const { warns, errors, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      async () => {
+        throw new ResizeError('boom');
+      },
+      () => tasks.rows[0].status === 'dead',
+      { logger },
+    );
+    assert.equal(errors.length, 1, errors.join('\n'));
+    assert.match(
+      errors[0],
+      /^resize worker: task \S+ of media \S+ is dead \(attempt 3 of 3, code \S+, last attempt\) — new tasks for its media and pipeline wait \d+ ms: .*boom$/,
+    );
+    // Only the two attempts before it were retried.
+    assert.equal(warns.length, 2, warns.join('\n'));
+  });
+
+  test('a dead-letter of a non-retryable error says so', async () => {
+    const { warns, errors, logger } = lineLogger();
+    await failOnce(new ResizeError('boom', { retryable: false }), 3, logger);
+    assert.equal(errors.length, 1, errors.join('\n'));
+    assert.match(
+      errors[0],
+      /^resize worker: task \S+ of media \S+ is dead \(attempt 1 of 3, code RESIZE_ERROR, not retryable\) — new tasks for its media and pipeline wait \d+ ms: .*boom$/,
+    );
+    assert.equal(warns.length, 0);
+  });
+
+  test('a dead-letter of a task delivered too often says so', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    // Its workers kept dying: three expired leases already.
+    Object.assign(tasks.rows[0], {
+      status: 'processing',
+      attempts: 3,
+      token: 'old',
+      leaseUntil: Date.now() - 1,
+    });
+    const { warns, errors, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      async () => {},
+      () => tasks.rows[0].status === 'dead',
+      { logger },
+    );
+    assert.equal(errors.length, 1, errors.join('\n'));
+    assert.match(
+      errors[0],
+      /^resize worker: task \S+ of media \S+ is dead \(attempt 4 of 3, code RESIZE_TASK_MAX_ATTEMPTS, delivered more often than maxAttempts\) — new tasks for its media and pipeline wait \d+ ms: .*exceeded maxAttempts/,
+    );
+    assert.equal(warns.length, 0);
+  });
+
+  test('a non-retryable error on the last attempt gives the non-retryable reason', async () => {
+    const { errors, logger } = lineLogger();
+    await failOnce(new ResizeError('boom', { retryable: false }), 1, logger);
+    assert.match(errors[0], /, not retryable\) — /);
+  });
+
+  test('a line holds the code of any error, or none', async () => {
+    const withCode = lineLogger();
+    await failOnce(
+      Object.assign(new Error('x'), { code: 'ENOENT' }),
+      3,
+      withCode.logger,
+    );
+    assert.match(withCode.warns[0], /, code ENOENT\)/);
+    const without = lineLogger();
+    await failOnce(new Error('x'), 3, without.logger);
+    assert.match(without.warns[0], /, code none\)/);
+  });
+
+  test('a ResizeError line has no second argument; any other error on a dead line passes the error; a retried line never does', async () => {
+    const resizeDead = lineLogger();
+    await failOnce(
+      new ResizeError('boom', { retryable: false }),
+      3,
+      resizeDead.logger,
+    );
+    assert.equal(resizeDead.calls.error[0].length, 1);
+
+    const otherDead = lineLogger();
+    const err = new Error('boom');
+    await failOnce(err, 1, otherDead.logger);
+    assert.equal(otherDead.calls.error[0].length, 2);
+    assert.equal(otherDead.calls.error[0][1], err);
+
+    const retried = lineLogger();
+    await failOnce(new Error('boom'), 3, retried.logger);
+    assert.equal(retried.calls.warn[0].length, 1);
+  });
+
+  test('a multi-line message makes one line', async () => {
+    const { warns, logger } = lineLogger();
+    await failOnce(new Error('a\nb\r\nc'), 3, logger);
+    assert.equal(warns[0].includes('\n'), false, warns[0]);
+    assert.match(warns[0], /: Error: a \| b \| c$/);
+  });
+
+  test('a long message is cut at 1000 characters and the ids survive', async () => {
+    const { warns, logger } = lineLogger();
+    const tasks = await failOnce(new Error('x'.repeat(5000)), 3, logger);
+    assert.ok(warns[0].length < 1200, `${warns[0].length} characters`);
+    assert.ok(warns[0].includes(tasks.rows[0].id), warns[0]);
+    assert.ok(warns[0].includes('of media m1'), warns[0]);
+    assert.equal(tasks.rows[0].error?.length, 1000);
+  });
+
+  test('the task row holds the same text as the line', async () => {
+    const retried = lineLogger();
+    const pending = await failOnce(
+      new Error('a\nb', { cause: new Error('why') }),
+      3,
+      retried.logger,
+    );
+    assert.equal(pending.rows[0].error, 'Error: a | b (cause: Error: why)');
+    assert.ok(retried.warns[0].endsWith(`: ${pending.rows[0].error}`));
+
+    const dead = lineLogger();
+    const rows = await failOnce(new Error('a\nb'), 1, dead.logger);
+    assert.equal(rows.rows[0].error, 'Error: a | b');
+    assert.ok(dead.errors[0].endsWith(`: ${rows.rows[0].error}`));
+  });
+
+  test('a thrown value that cannot be printed still fails the task', async () => {
+    const { warns, logger } = lineLogger();
+    const tasks = await failOnce(
+      {
+        toString() {
+          throw new Error('no');
+        },
+      },
+      3,
+      logger,
+    );
+    assert.equal(tasks.rows[0].status, 'pending');
+    assert.equal(tasks.rows[0].error, 'a thrown value that cannot be printed');
+    assert.match(warns[0], /: a thrown value that cannot be printed$/);
+  });
+
+  test('tasks.fail false writes one warn and no dead line', async () => {
+    // maxAttempts 3: the retry's fail; maxAttempts 1: the dead-letter's fail.
+    for (const maxAttempts of [3, 1]) {
+      const tasks = new MemoryTaskQueue({
+        timing: { ...fastTiming, maxAttempts },
+      });
+      await tasks.add(newTask());
+      let failed = false;
+      tasks.fail = async () => {
+        failed = true;
+        return false;
+      };
+      const { warns, errors, logger } = lineLogger();
+      const events = await runUntil(
+        tasks,
+        async () => {
+          throw new Error('boom');
+        },
+        () => failed,
+        { logger },
+      );
+      assert.equal(warns.length, 1, warns.join('\n'));
+      assert.match(
+        warns[0],
+        /^resize worker: task \S+ failed, but this worker no longer holds it — left to its next delivery: .*boom$/,
+      );
+      assert.equal(errors.length, 0, errors.join('\n'));
+      assert.deepEqual(events, []);
+    }
+  });
+
+  test('tasks.complete false writes one warn', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    let completing = false;
+    tasks.complete = async () => {
+      completing = true;
+      return false;
+    };
+    const { warns, errors, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      async () => {},
+      () => completing,
+      { logger },
+    );
+    assert.equal(warns.length, 1, warns.join('\n'));
+    assert.match(
+      warns[0],
+      /^resize worker: task \S+ finished, but this worker no longer holds it — its previews are stored; the next delivery finds them fresh$/,
+    );
+    assert.equal(errors.length, 0);
+  });
+
+  test('a lost lease with a failed handler adds the failure to its warn line and writes no dead line', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, maxAttempts: 1 },
+    });
+    await tasks.add(newTask());
+    tasks.renew = async () => false;
+    let aborted = false;
+    const { warns, errors, logger } = lineLogger();
+    const events = await runUntil(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(new Error('boom'));
+            },
+            { once: true },
+          );
+        }),
+      () => aborted,
+      { logger },
+    );
+    assert.equal(warns.length, 1, warns.join('\n'));
+    assert.match(
+      warns[0],
+      /lost its lease — left to its next delivery: .*boom$/,
+    );
+    assert.equal(errors.length, 0, errors.join('\n'));
+    assert.deepEqual(events, []);
+  });
+
+  test('a lost lease with no handler failure keeps its line', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    tasks.renew = async () => false;
+    let aborted = false;
+    const { warns, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((resolve) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              resolve();
+            },
+            { once: true },
+          );
+        }),
+      () => aborted,
+      { logger },
+    );
+    assert.match(warns[0], /lost its lease — left to its next delivery$/);
+  });
+
+  test('a shutdown adds a handler failure to its info line', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const { infos, errors, logger } = lineLogger();
+    await shutDownMidTask(
+      tasks,
+      (_task, { signal }) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('boom')), {
+            once: true,
+          });
+        }),
+      logger,
+    );
+    assert.match(
+      infos.at(-1) ?? '',
+      /is back in the queue \(it had failed: .*boom\)$/,
+    );
+    assert.equal(errors.length, 0, errors.join('\n'));
+  });
+
+  test('a task stopped by a shutdown before it ran keeps the plain line', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    const stop = new AbortController();
+    const claim = tasks.claim.bind(tasks);
+    tasks.claim = async (...args: Parameters<typeof claim>) => {
+      const task = await claim(...args);
+      stop.abort();
+      return task;
+    };
+    const { infos, logger } = lineLogger();
+    await consume(tasks, {
+      queue: 'default',
+      signal: stop.signal,
+      handle: async () => {},
+      logger,
+    });
+    assert.match(infos.at(-1) ?? '', /is back in the queue$/);
+  });
+
+  test('a queue that rejects fail() logs what the task had failed with', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    let failed = false;
+    const queueDown = new Error('queue down');
+    tasks.fail = async () => {
+      failed = true;
+      throw queueDown;
+    };
+    const { errors, calls, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      async () => {
+        throw new Error('boom');
+      },
+      () => failed,
+      { logger },
+    );
+    assert.match(
+      errors[0],
+      /^resize worker: failing task \S+ failed \(it had failed with: .*boom\)$/,
+    );
+    assert.equal(calls.error[0][1], queueDown);
+  });
+
+  test('a logger that throws does not stop the loop', async (t) => {
+    quietConsole(t);
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    await tasks.add(newTask({ mediaId: 'm2' }));
+    const logSinkDown = () => {
+      throw new Error('log sink down');
+    };
+    const ran: string[] = [];
+    await runUntil(
+      tasks,
+      async (task) => {
+        ran.push(task.mediaId);
+        if (task.mediaId === 'm1') {
+          throw new Error('boom');
+        }
+      },
+      () => tasks.rows[1].status === 'completed',
+      { logger: { info: logSinkDown, warn: logSinkDown, error: logSinkDown } },
+    );
+    assert.ok(ran.includes('m2'));
+    assert.equal(tasks.rows[0].status, 'pending');
+  });
+
+  describe('a hostile thrown value cannot stop the loop or forge a line', () => {
+    // Every trap throws, as in src/helpers/log.test.ts.
+    const no = () => {
+      throw new Error('no');
+    };
+    const trapped = new Proxy(
+      {},
+      {
+        get: no,
+        has: no,
+        getPrototypeOf: no,
+        ownKeys: no,
+        getOwnPropertyDescriptor: no,
+      },
+    );
+    const forged = 'X\nresize worker: task forged is dead';
+
+    /** Fail m1 with `thrown` (retried, or dead on its first attempt), and let m2 run after it. */
+    const failThenNext = async (
+      thrown: unknown,
+      maxAttempts: number,
+      logger: ConsumeOptions['logger'],
+    ) => {
+      const tasks = new MemoryTaskQueue({
+        timing: { ...fastTiming, maxAttempts },
+      });
+      await tasks.add(newTask());
+      await tasks.add(newTask({ mediaId: 'm2' }));
+      await runUntil(
+        tasks,
+        async (task) => {
+          if (task.mediaId === 'm1') {
+            throw thrown;
+          }
+        },
+        () => tasks.rows[1].status === 'completed',
+        { logger },
+      );
+      assert.notEqual(tasks.rows[0].status, 'processing');
+      assert.equal(tasks.rows[1].status, 'completed');
+    };
+
+    const values: [string, unknown][] = [
+      [
+        'a throwing code getter',
+        Object.defineProperty(new Error('x'), 'code', { get: no }),
+      ],
+      [
+        'a throwing message getter',
+        Object.defineProperty(new Error('x'), 'message', { get: no }),
+      ],
+      ['a multi-line code', Object.assign(new Error('x'), { code: forged })],
+      ['a Proxy whose traps all throw', trapped],
+      [
+        'a ResizeError whose retryable getter throws',
+        Object.defineProperty(new ResizeError('x'), 'retryable', { get: no }),
+      ],
+    ];
+    for (const [name, thrown] of values) {
+      test(name, async () => {
+        for (const maxAttempts of [3, 1]) {
+          const { infos, warns, errors, logger } = lineLogger();
+          await failThenNext(thrown, maxAttempts, logger);
+          const written = [...infos, ...warns, ...errors];
+          assert.ok(written.length > 0);
+          for (const line of written) {
+            assert.equal(line.includes('\n'), false, line);
+          }
+        }
+      });
+    }
+
+    test('an error whose cause is such a Proxy, under a logger that throws', async (t) => {
+      const messages = quietConsole(t);
+      const logSinkDown = () => {
+        throw new Error('log sink down');
+      };
+      for (const maxAttempts of [3, 1]) {
+        await failThenNext(new Error('x', { cause: trapped }), maxAttempts, {
+          info: logSinkDown,
+          warn: logSinkDown,
+          error: logSinkDown,
+        });
+      }
+      assert.ok(messages.length > 0);
+      for (const line of messages) {
+        assert.equal(line.includes('\n'), false, line);
+      }
+    });
+  });
+
+  test('the line is written before the gate hold, so a stalled lock store cannot delay it', async () => {
+    const locks = clockLocks();
+    const key = gateKey('default', 'default', 'm1', 'default');
+    const tasks = new PlainTaskQueue({
+      timing: { ...fastTiming, maxAttempts: 1 },
+    });
+    assert.equal(await locks.acquire(key, 'g1', 600_000), true);
+    await tasks.add({ ...newTask(), gateOwner: 'g1' });
+    const { errors, logger } = lineLogger();
+    // The lock store stalls once the task has failed: the task's start is answered, its final hold
+    // never is, and that hold is what the line must not wait for.
+    let stalled = false;
+    let linesAtHold: number | undefined;
+    const extend = locks.extend;
+    locks.extend = (...args) => {
+      if (stalled) {
+        linesAtHold ??= errors.length;
+        return new Promise<boolean>(() => {});
+      }
+      return extend(...args);
+    };
+    await runUntil(
+      tasks,
+      async () => {
+        stalled = true;
+        throw new ResizeError('boom', { retryable: false });
+      },
+      () => tasks.rows[0].status === 'dead',
+      {
+        coordinationOf: () => ({
+          cooldownMs: 30_000,
+          gateTtlMs: 600_000,
+          locks,
+        }),
+        logger,
+      },
+    );
+    assert.equal(linesAtHold, 1, 'the dead line came before the gate hold');
+    assert.match(errors[0], /is dead \(attempt 1 of 1, /);
+  });
+
+  test('a renew that throws synchronously is logged and the task still finishes', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, leaseMs: 40 },
+    });
+    await tasks.add(newTask());
+    let renewals = 0;
+    tasks.renew = () => {
+      renewals += 1;
+      throw new Error('renew down');
+    };
+    const { errors, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      async (_task, { signal }) => {
+        while (renewals === 0 && !signal.aborted) {
+          await sleepMs(2);
+        }
+      },
+      () => tasks.rows[0].status === 'completed',
+      { logger },
+    );
+    assert.ok(errors.some((e) => e === 'resize worker: lease renewal failed'));
+    assert.equal(tasks.rows[0].status, 'completed');
+  });
+
+  test('a renew that returns a plain true keeps the lease', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, leaseMs: 40 },
+    });
+    await tasks.add(newTask());
+    let renewals = 0;
+    tasks.renew = (() => {
+      renewals += 1;
+      return true;
+    }) as unknown as typeof tasks.renew;
+    const { warns, errors, logger } = lineLogger();
+    await runUntil(
+      tasks,
+      async (_task, { signal }) => {
+        while (renewals === 0 && !signal.aborted) {
+          await sleepMs(2);
+        }
+      },
+      () => tasks.rows[0].status === 'completed',
+      { logger },
+    );
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.deepEqual([...warns, ...errors], []);
+  });
+
+  test('a clock stepped back during a claim does not lengthen the idle wait', async (t) => {
+    const idlePollMs = 50;
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, idlePollMs },
+    });
+    const realNow = Date.now;
+    let stepMs = 0;
+    t.mock.method(Date, 'now', () => realNow() - stepMs);
+    const claims: number[] = [];
+    tasks.claim = async () => {
+      claims.push(performance.now());
+      if (claims.length === 1) {
+        stepMs = 2000;
+      }
+      return null;
+    };
+    await runUntil(
+      tasks,
+      async () => {},
+      () => claims.length >= 2,
+    );
+    const gap = claims[1] - claims[0];
+    assert.ok(gap < 500, `the next claim came after ${gap} ms`);
   });
 });
 
