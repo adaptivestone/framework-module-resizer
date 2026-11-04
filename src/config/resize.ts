@@ -13,6 +13,7 @@ const defaultResizeConfig: ResizeConfig = {
   upload: {
     maxBytes: 25 * 1024 * 1024,
     formats: ['jpeg', 'png', 'webp', 'avif', 'gif', 'svg'],
+    verify: 'none',
   },
   maxSize: { width: 2000, height: 1200 },
   animated: false,

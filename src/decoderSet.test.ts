@@ -80,6 +80,38 @@ test('a RESIZE_SOURCE_FORMAT_UNSUPPORTED refusal moves on; any other rejection i
   assert.equal(third.calls, 0);
 });
 
+test('a thrown value whose traps throw is no refusal: identify rejects with that value', async () => {
+  const no = () => {
+    throw new Error('no');
+  };
+  const trapped = new Proxy(
+    {},
+    { get: no, has: no, getPrototypeOf: no, ownKeys: no },
+  );
+  const later = fake(['later'], 'accept');
+  const decoders = new DecoderSet([
+    {
+      formats: ['host'],
+      inspect: async () => {
+        throw trapped;
+      },
+      render: async () => {
+        throw new Error('render is not part of these tests');
+      },
+    },
+    later,
+  ]);
+  // Not assert.rejects: it returns the value from an async function, which reads its `then`.
+  let thrown: unknown;
+  try {
+    await decoders.identify(bytes, limits);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown === trapped, 'identify rejects with that very value');
+  assert.equal(later.calls, 0);
+});
+
 test('when every decoder refuses, identify rejects with RESIZE_SOURCE_FORMAT_UNSUPPORTED naming the formats tried', async () => {
   const first = fake(['png', 'apng'], 'refuse');
   const second = fake(['webp'], 'refuse');

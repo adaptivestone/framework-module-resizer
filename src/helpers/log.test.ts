@@ -9,6 +9,7 @@ import {
   codeText,
   isModuleError,
   logNeverThrow,
+  messageText,
   notRetryable,
 } from './log.ts';
 
@@ -26,6 +27,32 @@ const trapped = new Proxy(
     getOwnPropertyDescriptor: no,
   },
 );
+
+test("messageText is a plain Error's message, without its name", () => {
+  assert.equal(messageText(new Error('the engine line')), 'the engine line');
+  assert.equal(messageText(new TypeError('a\nb')), 'a\nb');
+});
+
+test('messageText reads a value that is not an Error as causeText does', () => {
+  assert.equal(messageText('a string'), 'a string');
+  assert.equal(messageText(undefined), 'undefined');
+  assert.equal(messageText({ toString: () => 'its text' }), 'its text');
+});
+
+test('messageText answers as causeText for a value that cannot be read', () => {
+  const hostile = [
+    { toString: no },
+    Object.defineProperty(new Error('hidden'), 'message', { get: no }),
+    Object.defineProperty(new Error('hidden'), 'message', {
+      value: { toString: no },
+    }),
+    trapped,
+  ];
+  for (const value of hostile) {
+    assert.equal(messageText(value), causeText(value));
+    assert.equal(messageText(value), 'a thrown value that cannot be printed');
+  }
+});
 
 test('causeText puts a multi-line error on one line', () => {
   assert.equal(causeText(new Error('a\nb\r\nc')), 'Error: a | b | c');

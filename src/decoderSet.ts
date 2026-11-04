@@ -6,6 +6,7 @@ import type { SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
 import { SvgDecoder } from './decoders/svg.ts';
 import { ResizeError, ResizeMediaError, ResizeSetupError } from './errors.ts';
+import { isModuleError } from './helpers/log.ts';
 import type { ResizeLimits } from './types.d.ts';
 
 const UNSUPPORTED = 'RESIZE_SOURCE_FORMAT_UNSUPPORTED';
@@ -25,9 +26,12 @@ export interface IdentifiedSource {
   };
 }
 
-/** A decoder saying "these bytes are not my format": the next decoder is asked. */
+/**
+ * A decoder saying "these bytes are not my format": the next decoder is asked. A host decoder's
+ * thrown value can be a Proxy whose traps throw: it is no refusal, and the caller must get it back.
+ */
 function isRefusal(err: unknown): boolean {
-  return ResizeError.isResizeError(err) && err.code === UNSUPPORTED;
+  return isModuleError(err) && err.code === UNSUPPORTED;
 }
 
 function isPositiveFinite(value: unknown): boolean {

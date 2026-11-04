@@ -13,6 +13,10 @@
   and the README's `Damaged originals` shows how to find them. A complete config passed to
   `new Resizer` must now hold `limits.failOn`. Sharp's pixel limit at decode is now
   `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`), and at upload `RESIZE_ORIGINAL_TOO_MANY_PIXELS`.
+- `ResizeOriginalError` defaults to `retryable: false`. An upload rejection names the engine's line;
+  an unrecognised decoder failure during `inspect` is the new `RESIZE_ORIGINAL_INSPECT_FAILED`
+  (`true`), where it was `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
+  now hold `upload.verify`.
 
 **Changed behaviour**
 
@@ -22,6 +26,9 @@
   message now reads ` | ` there.
 
 **Features**
+
+- `upload.verify: 'decode'` (default `'none'`) decodes a raster original once before storing it,
+  with `RESIZE_ORIGINAL_DAMAGED` (`false`) and `RESIZE_ORIGINAL_VERIFY_FAILED` (`true`).
 
 **Fixes**
 

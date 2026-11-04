@@ -29,7 +29,10 @@ const RESIZE_ERROR = Symbol.for('@adaptivestone/framework-module-resize.error');
 export interface ResizeErrorOptions {
   code?: string;
   cause?: unknown;
-  /** Default `true`. `false`: no retry can help, the task queue dead-letters at once. */
+  /**
+   * Default `true` (`false` for `ResizeSecurityError` and `ResizeOriginalError`). `false`: no retry
+   * can help, the task queue dead-letters at once.
+   */
   retryable?: boolean;
 }
 
@@ -164,9 +167,17 @@ export class ResizeGenerateError extends ResizeError {
   }
 }
 
-/** Original-upload input is empty, malformed, unsupported, or over a configured limit. */
+/**
+ * Original-upload input is empty, malformed, unsupported, or over a configured limit. Not retryable
+ * by default (`retryable` defaults to `false`): sending the same bytes again gets the same refusal.
+ * The failures that say nothing about the bytes set `retryable: true` themselves.
+ */
 export class ResizeOriginalError extends ResizeMediaError {
   constructor(message: string, opts?: ResizeErrorOptions) {
-    super(message, { ...opts, code: opts?.code ?? 'RESIZE_ORIGINAL_INVALID' });
+    super(message, {
+      ...opts,
+      code: opts?.code ?? 'RESIZE_ORIGINAL_INVALID',
+      retryable: opts?.retryable ?? false,
+    });
   }
 }

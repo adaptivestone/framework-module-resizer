@@ -847,6 +847,23 @@ it in `decoders` in every process). When the stored format's decoder refuses the
 media has no stored format) and every other decoder refuses them too, it fails with
 `ResizeMediaError` `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (`retryable: false`: dead-lettered at once).
 
+**What an upload rejection says.** `uploadOriginal()` throws a `ResizeOriginalError` whose message
+carries the engine's line, for example `resize uploadOriginal: bytes are not a supported image:
+gifload_buffer: Unexpected end of GIF source data`. The code is the stable part: the text may change
+with Sharp, and it may reach end users through `badRequest(err.message)`. A `ResizeOriginalError` is
+not retryable by default, since the same bytes get the same refusal. The exceptions say what they
+are:
+
+- `RESIZE_ORIGINAL_INSPECT_FAILED` (`retryable: true`): a decoder failed for a reason other than the
+  bytes, such as a timeout, a host decoder's own failure, a healthy file this build cannot decode or
+  an engine failure with no detail. Retry may help, and `cause` says why.
+- `RESIZE_ORIGINAL_VERIFY_FAILED` (`retryable: true`): the `upload.verify: 'decode'` check failed for
+  a reason other than damage, such as a timeout or a healthy file this build cannot decode. It says
+  nothing about the image, and `cause` says why.
+
+`RESIZE_ORIGINAL_DAMAGED` (`retryable: false`) comes only from that check. Damage `inspect` finds
+first, such as a cut GIF, stays `RESIZE_ORIGINAL_INVALID`.
+
 ## Config reference
 
 The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
@@ -860,6 +877,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
+| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. SVG is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
@@ -1437,9 +1455,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   without them keeps working (the times are dropped), but `resize-scaffold --check` reports it.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
-    once when its error has `retryable: false` (`ResizeError.retryable`, default `true`): no
-    retry can help. The module sets it on every `ResizeSecurityError` and on seven codes: the
-    media has no original (`RESIZE_NO_ORIGINAL`), no decoder reads the source's bytes
+    once when its error has `retryable: false` (`ResizeError.retryable`, default `true`, while
+    `ResizeOriginalError`, which only an upload throws, defaults to `false`): no retry can help.
+    The module sets it on every `ResizeSecurityError` and on seven codes: the media has no original (`RESIZE_NO_ORIGINAL`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
     source has no dimensions or exceeds the
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
@@ -1565,7 +1583,7 @@ await ResizeTask.updateOne(
   an engine message belongs to, so a failure with no usable detail is retried. They can also,
   rarely, put a neighbour's damage line on a healthy file this build cannot render (7 of 800 decodes
   with such files and cut JPEGs failing together); that file is then dead-lettered until the next
-  read after the cooldown.
+  read after the cooldown. To refuse a damaged file at upload instead, set `upload.verify: 'decode'`.
 
   **Previews made before this version.** A preview made from a damaged original stays fresh:
   upgrading does not regenerate it. To find them, decode each original at the level the worker now

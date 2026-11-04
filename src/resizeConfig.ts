@@ -84,6 +84,12 @@ function validateRequiredResizeConfigFields(
       'RESIZE_CONFIG_UPLOAD_FORMATS_INVALID',
     );
   }
+  if (upload.verify !== 'none' && upload.verify !== 'decode') {
+    invalid(
+      "resize config: `upload.verify` must be 'none' or 'decode'",
+      'RESIZE_CONFIG_INVALID',
+    );
+  }
 
   if (
     !Array.isArray(root.formats) ||

@@ -266,6 +266,42 @@ describe('config split: core validation vs framework loading', () => {
     assert.doesNotThrow(() => validateResizeConfig(makeImageConfig()));
   });
 
+  test('upload.verify defaults to none and rejects anything else', () => {
+    assert.equal(defaultResizeConfig.upload.verify, 'none');
+    assert.equal(makeResizeConfig().upload.verify, 'none');
+    assert.equal(
+      makeResizeConfig({ upload: { maxBytes: 8 } }).upload.verify,
+      'none',
+    );
+    const config = makeImageConfig();
+    for (const verify of ['none', 'decode']) {
+      assert.doesNotThrow(() =>
+        validateResizeConfig({
+          ...config,
+          upload: { ...config.upload, verify },
+        }),
+      );
+    }
+    for (const verify of ['x', undefined, true]) {
+      assert.throws(
+        () =>
+          validateResizeConfig({
+            ...config,
+            upload: { ...config.upload, verify },
+          }),
+        (err: ResizeConfigError) => {
+          assert.ok(err instanceof ResizeConfigError);
+          assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+          assert.equal(
+            err.message,
+            "resize config: `upload.verify` must be 'none' or 'decode'",
+          );
+          return true;
+        },
+      );
+    }
+  });
+
   test('limits.failOn defaults to error and rejects anything else', () => {
     assert.equal(defaultResizeConfig.limits.failOn, 'error');
     assert.equal(makeResizeConfig().limits.failOn, 'error');

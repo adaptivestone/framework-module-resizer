@@ -303,6 +303,7 @@ export interface ResizeConfig {
   upload: {
     maxBytes: number;
     formats: OriginalFormat[];
+    verify: 'none' | 'decode'; // default 'none' — 'decode' also decodes a raster original once before storing it
   };
   maxSize: { width: number; height: number }; // default { 2000, 1200 } (the `fit` cap)
   animated: boolean; // default false — true keeps GIF/WebP frames

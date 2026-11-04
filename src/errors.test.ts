@@ -201,6 +201,14 @@ describe('ResizeError.retryable', () => {
     assert.equal(new ResizeNoOriginalError('m1').retryable, false);
   });
 
+  test('ResizeOriginalError defaults to not retryable, and an explicit true is kept', () => {
+    assert.equal(new ResizeOriginalError('m').retryable, false);
+    assert.equal(
+      new ResizeOriginalError('m', { retryable: true }).retryable,
+      true,
+    );
+  });
+
   test('a security refusal is never retryable by default', () => {
     assert.equal(new ResizeSecurityError('m').retryable, false);
     assert.equal(

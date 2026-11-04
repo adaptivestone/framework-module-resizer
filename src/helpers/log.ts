@@ -44,6 +44,15 @@ export function causeText(error: unknown): string {
   return text.slice(0, MAX_TEXT_LENGTH);
 }
 
+/** A thrown value's message; one that cannot be read reads as causeText. */
+export function messageText(error: unknown): string {
+  try {
+    return error instanceof Error ? String(error.message) : causeText(error);
+  } catch {
+    return causeText(error);
+  }
+}
+
 /** The error's code when it is one token, else `none`: a code can hold a line break too. */
 export function codeText(error: unknown): string {
   try {
