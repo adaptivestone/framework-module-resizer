@@ -1588,8 +1588,12 @@ await ResizeTask.updateOne(
   wrote.
 
   On `MongoTaskQueue`, the first added task checks the gate index, once per model. A missing index
-  is one `error`: "… until it exists, every read can add a duplicate active task (logged once)". The
-  check runs in the background, so it never slows the read, and it never creates the index.
+  is one `error`, whose line ends in what that costs. With no index on those keys, or one that is
+  not unique, concurrent adds can each store a duplicate active task. With a unique index that lacks
+  the partial filter, every add after a completed task is in flight with no id and nothing is
+  queued. With a unique index on another filter, one active task per media, pipeline and queue is
+  not guaranteed. The check runs in the background, so it never slows the read, and it never creates
+  the index.
 - **What a worker logs:** the worker writes each task failure itself, one line on its own logger
   (`runWorker({ logger })`; the app logger under `npm run cli ResizeWorker`). A failure that will
   be retried is a `warn`, a dead task an `error`:

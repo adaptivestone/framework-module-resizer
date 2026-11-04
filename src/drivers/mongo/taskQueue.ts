@@ -213,11 +213,7 @@ export class MongoTaskQueue extends TaskQueue {
           isModuleError(err) &&
           codeText(err) === 'RESIZE_MONGO_INDEX_MISSING'
         ) {
-          logNeverThrow(
-            this.#logger,
-            `${messageText(err)} — until it exists, every read can add a duplicate active task (logged once)`,
-            err,
-          );
+          logNeverThrow(this.#logger, messageText(err), err);
           return;
         }
         gateChecked.delete(model); // unknown: the next add asks again
@@ -610,7 +606,7 @@ interface ConnectionLike {
  *
  * With `background` (the check of the first added task), a NamespaceNotFound answer rejects with
  * the raw error: the task was just stored, so the collection exists, and that answer is unknown,
- * not missing.
+ * not missing. The missing-index error then also says what the gap costs, since it is logged.
  *
  * The connection must be open, or opening (the check waits for it); a closed one rejects at once
  * with RESIZE_MONGO_NOT_CONNECTED. The check then waits for the model's own `init()`: with
@@ -628,9 +624,9 @@ async function checkGateIndex(
     return;
   }
   const name = String(collection.collectionName ?? model.modelName ?? '');
-  const missing = (why: string, cause?: unknown) =>
+  const missing = (why: string, cause?: unknown, cost = '') =>
     new ResizeSetupError(
-      `resize: the ResizeTask collection '${name}' ${why}: the gate needs the index ${GATE_INDEX_SPEC} — create it through your migration process; the module never creates indexes`,
+      `resize: the ResizeTask collection '${name}' ${why}: the gate needs the index ${GATE_INDEX_SPEC} — create it through your migration process; the module never creates indexes${cost}`,
       { code: 'RESIZE_MONGO_INDEX_MISSING', cause },
     );
   await waitForConnection(model.db as ConnectionLike | undefined, name);
@@ -678,7 +674,26 @@ async function checkGateIndex(
       ? `has an index on the gate keys ('${onGateKeys[0].name}') that is not unique or not partial on { active: true }`
       : 'has no gate index',
     buildError,
+    opts.background
+      ? ` — until it exists, ${missingGateCost(onGateKeys)} (logged once)`
+      : '',
   );
+}
+
+/**
+ * What the gate costs without its index, given the indexes on its keys. Without a unique one, only
+ * adds that read before each other's insert can duplicate: a later add reads the active row. A
+ * unique one over every row forbids duplicates, but finished rows collide too, so nothing queues
+ * again. On any other filter, that filter decides which rows collide.
+ */
+function missingGateCost(onGateKeys: IndexInfo[]): string {
+  const unique = onGateKeys.filter((index) => index.unique === true);
+  if (unique.length === 0) {
+    return 'concurrent adds can each store a duplicate active task';
+  }
+  return unique.some((index) => index.partialFilterExpression === undefined)
+    ? 'every add after a completed task is in flight with no id and nothing is queued'
+    : 'one active task per media, pipeline and queue is not guaranteed';
 }
 
 /**

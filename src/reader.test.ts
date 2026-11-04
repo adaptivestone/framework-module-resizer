@@ -2660,6 +2660,8 @@ describe('resolve — media loaded without the module fields', () => {
       hydrated({}),
       hydrated({}, { original: originalField, previews: [row] }),
       hydrated({ _id: 1, name: 1, 'original.storageRef': 1, previews: 1 }),
+      hydrated({ name: 0 }),
+      hydrated({ _id: 1, original: 1, previews: 1 }),
       new File({ name: 'new' }) as unknown as MediaLike,
       { id: 'm1', original: originalField, previews: [] },
       // Raw writes make these: a warning here would be a false alarm.

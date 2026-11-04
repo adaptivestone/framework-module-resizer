@@ -941,7 +941,7 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(errors.length, 1);
       assert.match(
         String(errors[0][0]),
-        /has no gate index.* — until it exists, every read can add a duplicate active task \(logged once\)$/,
+        /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(logged once\)$/,
       );
       assert.equal(
         (errors[0][1] as { code?: unknown }).code,
@@ -953,18 +953,59 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(listed.length, 1);
     });
 
-    test('a gate index that is not unique or not partial logs the same line', async () => {
-      const { model } = checkedModel(async () => [
-        { name: 'gate', key: gateKeys, unique: true },
-      ]);
-      const { errors } = configureQueue(() => model);
-      assert.equal((await tasks.add(request())).status, 'added');
-      await settled();
-      assert.equal(errors.length, 1);
-      assert.match(
-        String(errors[0][0]),
-        /is not unique or not partial .* — until it exists, every read can add a duplicate active task \(logged once\)$/,
-      );
+    test('an index on the gate keys of another shape logs what that shape costs', async () => {
+      const concurrent =
+        'concurrent adds can each store a duplicate active task';
+      const noneQueued =
+        'every add after a completed task is in flight with no id and nothing is queued';
+      const notGuaranteed =
+        'one active task per media, pipeline and queue is not guaranteed';
+      const active = { partialFilterExpression: { active: true } };
+      const pending = { partialFilterExpression: { status: 'pending' } };
+      for (const [cost, ...shapes] of [
+        [noneQueued, { unique: true }],
+        // Whatever else sits on those keys, a unique index over every row is what collides.
+        [noneQueued, {}, { unique: true }],
+        [noneQueued, { unique: true, ...pending }, { unique: true }],
+        [concurrent, active],
+        [concurrent, {}],
+        [notGuaranteed, { unique: true, ...pending }],
+        [notGuaranteed, {}, { unique: true, ...pending }],
+      ] as [string, ...object[]][]) {
+        const { model } = checkedModel(async () =>
+          shapes.map((shape, i) => ({
+            name: `gate${i}`,
+            key: gateKeys,
+            ...shape,
+          })),
+        );
+        const { errors } = configureQueue(() => model);
+        assert.equal((await tasks.add(request())).status, 'added');
+        await settled();
+        assert.equal(errors.length, 1, cost);
+        assert.ok(
+          String(errors[0][0]).endsWith(
+            ` — until it exists, ${cost} (logged once)`,
+          ),
+          String(errors[0][0]),
+        );
+        assert.match(String(errors[0][0]), /is not unique or not partial/);
+      }
+    });
+
+    test('verify rejects with the plain message: the cost belongs to the logged line', async () => {
+      for (const indexes of [
+        [],
+        [{ name: 'gate', key: gateKeys, unique: true }],
+      ]) {
+        const { model } = checkedModel(async () => indexes);
+        await assert.rejects(
+          new MongoTaskQueue({ model }).verify(),
+          (error: unknown) =>
+            error instanceof ResizeSetupError &&
+            error.message.endsWith('the module never creates indexes'),
+        );
+      }
     });
 
     test('a collection-missing answer counts as unknown: nothing is logged, and the next add checks again', async () => {
@@ -1188,7 +1229,7 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(fallback.mock.calls.length, 1);
       assert.match(
         String(fallback.mock.calls[0].arguments[0]),
-        /every read can add a duplicate active task/,
+        /concurrent adds can each store a duplicate active task/,
       );
     });
 
@@ -1203,7 +1244,7 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(errors.length, 1);
       assert.match(
         String(errors[0][0]),
-        /has no gate index.* — until it exists, every read can add a duplicate active task \(logged once\)$/,
+        /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(logged once\)$/,
       );
       // The check creates nothing, and without the index a later read still finds the active row.
       assert.deepEqual(await model.collection.indexes(), before);
@@ -1211,8 +1252,42 @@ describe('MongoTaskQueue setup', () => {
         status: 'in-flight',
         taskId: first.status === 'added' ? first.taskId : '',
       });
-      assert.equal((await tasks.add(request())).status, 'added');
+      // What the line says: adds that read before each other's insert each store a task.
+      const concurrentId = fid();
+      await Promise.all(
+        Array.from({ length: 20 }, () =>
+          tasks.add(request({ mediaId: concurrentId })),
+        ),
+      );
+      assert.ok(
+        (await model.countDocuments({ fileId: concurrentId, active: true })) >
+          1,
+      );
       await sleep(30);
+      assert.equal(errors.length, 1, 'logged once');
+    });
+
+    test('a real unique index without the partial filter logs that nothing queues, and nothing does', async () => {
+      const model = await modelWith('ResizeTaskCheckedNoFilter', [
+        [gateKeys, { unique: true }],
+      ]);
+      const { errors } = configureQueue(() => model);
+      const mediaId = fid();
+      assert.equal((await tasks.add(request({ mediaId }))).status, 'added');
+      await waitFor(() => errors.length > 0);
+      assert.equal(errors.length, 1);
+      assert.match(
+        String(errors[0][0]),
+        / — until it exists, every add after a completed task is in flight with no id and nothing is queued \(logged once\)$/,
+      );
+      // What the line says: no duplicate, and after the task completes nothing is stored again.
+      const claimed = await tasks.claim('default', 300);
+      assert.ok(claimed);
+      assert.equal(await tasks.complete(claimed), true);
+      assert.deepEqual(await tasks.add(request({ mediaId })), {
+        status: 'in-flight',
+      });
+      assert.equal(await model.countDocuments({ fileId: mediaId }), 1);
       assert.equal(errors.length, 1, 'logged once');
     });
 
