@@ -2,9 +2,9 @@
 // code: a getter, a `toString` or a Proxy trap can throw, and a message or a code can hold a line
 // break.
 import assert from 'node:assert/strict';
-import { Writable } from 'node:stream';
-import { test } from 'node:test';
+import { type TestContext, test } from 'node:test';
 import { ResizeError, ResizeStorageError } from '../errors.ts';
+import type { ResizeLogger } from '../types.d.ts';
 import {
   causeText,
   codeText,
@@ -215,154 +215,131 @@ const recording = () => {
   };
 };
 
-// The sequences that corrupted a line, or lost its error, when a cause was a second argument.
+// The sequences that corrupt a line, or lose its error, wherever the line is read as a format string.
 const FORMAT_SEQUENCES = ['a%c3%a9.jpg', '%d0', '%s', '%o %O %j %i %f %%'];
 
-test('logNeverThrow passes one string: the line, then the stack and the cause chain', () => {
+test('logNeverThrow passes the line, and the error object itself as the second argument', () => {
   const { calls, logger } = recording();
-  const err = new Error('download failed', { cause: new Error('HTTP 403') });
-  logNeverThrow(logger, 'the line', err, 'warn');
+  const err = new Error('download failed');
+  logNeverThrow(logger, 'resize worker: the download failed', err);
   assert.equal(calls.length, 1);
-  const [level, text, ...rest] = calls[0] as [string, string, ...unknown[]];
-  assert.equal(level, 'warn');
-  assert.deepEqual(rest, []);
-  const [first, ...others] = text.split('\n');
-  assert.equal(first, 'the line');
-  const body = others.join('\n');
-  assert.match(body, /^Error: download failed\n\s+at /);
-  assert.match(body, /\[cause\]: Error: HTTP 403\n\s+at /);
+  assert.equal(calls[0].length, 3);
+  assert.equal(calls[0][1], 'resize worker: the download failed');
+  assert.equal(calls[0][2], err);
 });
 
 test('logNeverThrow without an error passes the line alone', () => {
   const { calls, logger } = recording();
-  logNeverThrow(logger, 'a');
-  logNeverThrow(logger, 'b', undefined, 'info');
-  assert.deepEqual(calls, [
-    ['error', 'a'],
-    ['info', 'b'],
-  ]);
-});
-
-test('logNeverThrow reaches a cause four levels down', () => {
-  const { calls, logger } = recording();
-  let err = new Error('level 0');
-  for (const level of [1, 2, 3, 4]) {
-    err = new Error(`level ${level}`, { cause: err });
-  }
-  logNeverThrow(logger, 'm', err);
-  assert.match(String(calls[0][1]), /\[cause\]: Error: level 0\n/);
+  logNeverThrow(logger, 'resize worker: m', undefined, 'warn');
+  assert.deepEqual(calls, [['warn', 'resize worker: m']]);
 });
 
 test("logNeverThrow keeps the module's own line one line, whatever it holds", () => {
   const { calls, logger } = recording();
-  logNeverThrow(logger, 'a\nb\r\nc d e\ff\vg\u0085h\n');
-  assert.deepEqual(calls, [['error', 'a | b | c | d | e | f | g | h']]);
-});
-
-test('logNeverThrow cuts the appended text at 8000 characters, and says so', () => {
-  const { calls, logger } = recording();
-  logNeverThrow(logger, 'm', new Error('x'.repeat(100_000)));
-  const text = String(calls[0][1]);
-  assert.ok(text.length < 8100, `${text.length}`);
-  assert.ok(text.startsWith('m\nError: xxx'));
-  assert.ok(text.endsWith('… (cut at 8000 characters)'), text.slice(-60));
-  // The line itself is the caller's: the cut is on what follows it.
-  logNeverThrow(logger, 'm'.repeat(9000), new Error('short'));
-  assert.ok(
-    String(calls[1][1]).startsWith(`${'m'.repeat(9000)}\nError: short`),
-  );
+  const err = new Error('x\ny');
+  logNeverThrow(logger, ' a\nb\r\nc d e\ff\vg\u0085h\n', err);
+  assert.equal(calls[0][1], 'a | b | c | d | e | f | g | h');
+  assert.equal(calls[0][2], err);
 });
 
 test('logNeverThrow stays quick on a long run of spaces', () => {
-  const { logger } = recording();
-  const spaces = `a${' '.repeat(200_000)}b`;
+  const { calls, logger } = recording();
   const started = performance.now();
-  logNeverThrow(logger, spaces, new Error(spaces));
-  const tookMs = performance.now() - started;
-  assert.ok(tookMs < 5000, `took ${tookMs} ms`);
+  logNeverThrow(logger, `a${' '.repeat(200_000)}b`, new Error('x'));
+  assert.ok(performance.now() - started < 1000);
+  assert.equal(calls.length, 1);
 });
 
-test('logNeverThrow prints a thrown value that is no error', () => {
-  const { calls, logger } = recording();
-  logNeverThrow(logger, 'm', 'a string');
-  logNeverThrow(logger, 'm', null);
-  logNeverThrow(logger, 'm', { taskId: 'x' });
-  assert.deepEqual(
-    calls.map((call) => call[1]),
-    ['m\na string', 'm\nnull', "m\n{ taskId: 'x' }"],
-  );
+test('a logger that ignores the error never makes the module touch it', () => {
+  const touched: string[] = [];
+  const note = (trap: string) => () => {
+    touched.push(trap);
+    throw new Error(`the ${trap} trap ran`);
+  };
+  const hostile = new Proxy(new Error('x'), {
+    get: note('get'),
+    has: note('has'),
+    getPrototypeOf: note('getPrototypeOf'),
+    ownKeys: note('ownKeys'),
+    getOwnPropertyDescriptor: note('getOwnPropertyDescriptor'),
+  });
+  const inspecting = Object.assign(new Error('y'), {
+    [Symbol.for('nodejs.util.inspect.custom')]: note('inspect'),
+  });
+  Object.defineProperty(inspecting, 'stack', { get: note('stack') });
+  const quiet = { info() {}, warn() {}, error() {} };
+  logNeverThrow(quiet, 'm', hostile);
+  logNeverThrow(quiet, 'n', inspecting, 'warn');
+  assert.deepEqual(touched, []);
 });
 
-test('a hostile value cannot throw out of logNeverThrow, and falls back to causeText', () => {
-  const hostile: [string, unknown, string][] = [
-    ['a Proxy', trapped, 'a thrown value that cannot be printed'],
-    [
-      'a throwing inspector',
-      {
-        [Symbol.for('nodejs.util.inspect.custom')]: no,
-        toString: () => 'its text',
-      },
-      'its text',
-    ],
-    [
-      'a throwing inspector and toString',
-      { [Symbol.for('nodejs.util.inspect.custom')]: no, toString: no },
-      'a thrown value that cannot be printed',
-    ],
-  ];
-  for (const [what, value, text] of hostile) {
+test('a logger that is not the console gets every `%` as it is', () => {
+  for (const sequence of FORMAT_SEQUENCES) {
     const { calls, logger } = recording();
-    logNeverThrow(logger, 'm', value);
-    assert.deepEqual(calls, [['error', `m\n${text}`]], what);
+    const err = new Error('x');
+    logNeverThrow(logger, `line ${sequence}`, err);
+    assert.deepEqual(calls[0], ['error', `line ${sequence}`, err]);
   }
-  // A getter that throws never gets out, whatever this Node's inspect makes of it.
-  for (const key of ['stack', 'message', 'name', 'cause', 'code']) {
-    const { calls, logger } = recording();
-    const value = Object.defineProperty(new Error('hidden'), key, { get: no });
-    logNeverThrow(logger, 'm', value);
-    assert.equal(calls.length, 1, key);
-    assert.match(String(calls[0][1]), /^m\n./, key);
-  }
-  // Nor does a Proxy as the cause.
-  const { calls, logger } = recording();
-  logNeverThrow(logger, 'm', new Error('x', { cause: trapped }));
-  assert.match(String(calls[0][1]), /^m\nError: x/);
 });
+
+/** What the real console writes: its formatter runs, and only its output is held back. */
+const held = (t: TestContext) => {
+  const written: string[] = [];
+  const keep = (chunk: unknown) => {
+    written.push(String(chunk));
+    return true;
+  };
+  t.mock.method(process.stderr, 'write', keep);
+  t.mock.method(process.stdout, 'write', keep);
+  return written;
+};
 
 test('the real console prints every `%` as it is, and the stack (util.format semantics)', (t) => {
-  const written: string[] = [];
-  t.mock.method(process.stderr, 'write', (chunk: unknown) => {
-    written.push(String(chunk));
-    return true;
-  });
-  for (const sequence of FORMAT_SEQUENCES) {
-    written.length = 0;
-    const err = new Error(`download https://bucket/${sequence} failed`);
-    const line = `resize worker: task t is dead: ${causeText(err)}`;
-    logNeverThrow(console, line, err);
-    assert.equal(written.length, 1, sequence);
-    const [first] = written[0].split('\n');
-    assert.equal(first, line, sequence);
-    assert.ok(written[0].includes(String(err.stack)), sequence);
+  for (const level of ['error', 'warn', 'info'] as const) {
+    for (const sequence of FORMAT_SEQUENCES) {
+      const err = new Error('boom');
+      const line = `resize worker: download https://bucket/${sequence} failed`;
+      const written = held(t);
+      logNeverThrow(console, line, err, level);
+      t.mock.restoreAll();
+      assert.equal(written.length, 1, sequence);
+      assert.ok(written[0].startsWith(`${line} `), written[0]);
+      assert.ok(written[0].includes(String(err.stack)), written[0]);
+    }
   }
 });
 
-test('a throwing logger falls back to the real console, with the same one string', (t) => {
-  const written: string[] = [];
-  t.mock.method(process.stderr, 'write', (chunk: unknown) => {
-    written.push(String(chunk));
-    return true;
-  });
-  const logger = { error: no, warn: no, info: no };
-  const err = new Error('%c3%a9');
-  logNeverThrow(logger, 'm %d0', err);
+test('the real console prints a line with no error as it is: one argument formats nothing', (t) => {
+  for (const sequence of FORMAT_SEQUENCES) {
+    const written = held(t);
+    logNeverThrow(console, `line ${sequence}`);
+    t.mock.restoreAll();
+    assert.deepEqual(written, [`line ${sequence}\n`]);
+  }
+});
+
+test('a throwing logger falls back to the real console: the line as it is, and the stack', (t) => {
+  const err = new Error('boom');
+  const written = held(t);
+  logNeverThrow({ error: no, warn: no, info: no }, 'line a%c3%d0%s', err);
+  t.mock.restoreAll();
   assert.equal(written.length, 1);
-  assert.ok(written[0].startsWith(`m %d0\n${String(err.stack)}`), written[0]);
-  // A value the console could not format reaches it as text.
-  logNeverThrow(logger, 'n', {
+  assert.ok(written[0].startsWith('line a%c3%d0%s '), written[0]);
+  assert.ok(written[0].includes(String(err.stack)), written[0]);
+});
+
+test('logNeverThrow survives a throwing logger and a value console cannot format', (t) => {
+  const written = held(t);
+  const logger = { error: no, warn: no, info: no };
+  logNeverThrow(logger, 'm', new Error('x', { cause: trapped }));
+  // Whatever this Node's formatter makes of that value, the message is written.
+  assert.equal(written.length, 1);
+  assert.match(written[0], /^m/);
+  // A custom inspect that throws stops every Node's formatter: the line goes alone, as it is.
+  logNeverThrow(logger, 'n%c3', {
     [Symbol.for('nodejs.util.inspect.custom')]: no,
   });
-  assert.equal(written[1], 'n\n[object Object]\n');
+  assert.equal(written[1], 'n%c3\n');
 });
 
 test('a console that cannot write is the end of it: nothing throws', (t) => {
@@ -370,55 +347,94 @@ test('a console that cannot write is the end of it: nothing throws', (t) => {
   logNeverThrow({ error: no, warn: no, info: no }, 'm', new Error('x'));
 });
 
-test('a Winston logger keeps every `%` and the stack, with and without splat', async (t) => {
-  // From the framework's dependencies: an optional peer, so it may not be there.
-  let winston: typeof import('winston');
-  try {
-    winston = (await import('winston')).default;
-  } catch {
-    t.skip('winston is not installed');
-    return;
-  }
+/**
+ * A real Winston logger as the framework's `#createLogger` builds it: its format at the logger,
+ * its default `redact` list, and its console text at the transport, without the colours.
+ */
+const frameworkWinston = async () => {
+  const winston = (await import('winston')).default;
+  const Transport = (await import('winston-transport')).default;
+  const { createRedactFormat } = await import(
+    '@adaptivestone/framework/services/logging/redaction.js'
+  );
+  const { default: logConfig } = await import(
+    '@adaptivestone/framework/config/log.js'
+  );
   const { format } = winston;
-  const shapes = {
-    simple: format.simple(),
-    splat: format.combine(format.splat(), format.simple()),
-    // The framework's console format, without its colours.
-    framework: format.combine(
-      format.errors({ stack: true }),
-      format.timestamp(),
-      format.printf(
-        (info) =>
-          `${info.timestamp} ${info.level} : ${info.message} ${info.stack ?? ''}`,
-      ),
-    ),
-  };
-  for (const [shape, logFormat] of Object.entries(shapes)) {
-    for (const sequence of FORMAT_SEQUENCES) {
-      const out: string[] = [];
-      const logger = winston.createLogger({
-        format: logFormat,
-        transports: [
-          new winston.transports.Stream({
-            stream: new Writable({
-              write(chunk, _encoding, done) {
-                out.push(String(chunk));
-                done();
-              },
-            }),
-          }),
-        ],
-      });
-      const err = new Error(`download https://bucket/${sequence} failed`);
-      const line = `resize worker: task t is dead: ${causeText(err)}`;
-      logNeverThrow(logger, line, err);
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(out.length, 1, `${shape} ${sequence}`);
-      assert.ok(out[0].includes(line), `${shape} ${sequence}: ${out[0]}`);
-      assert.ok(
-        out[0].includes(String(err.stack)),
-        `${shape} ${sequence}: ${out[0]}`,
-      );
+  const infos: Record<string | symbol, unknown>[] = [];
+  class Capture extends Transport {
+    log(info: Record<string | symbol, unknown>, done: () => void) {
+      infos.push(info);
+      done();
     }
+  }
+  const logger = winston.createLogger({
+    format: format.combine(
+      format.errors({ stack: true }),
+      createRedactFormat(logConfig.redact as string[]),
+    ),
+    level: 'silly',
+    transports: [
+      new Capture({
+        format: format.printf(
+          (info) => `${info.level} : ${info.message} ${info.stack ?? ''}`,
+        ),
+      }),
+    ],
+  });
+  const flushed = () => new Promise((resolve) => setImmediate(resolve));
+  return {
+    logger: logger as unknown as ResizeLogger,
+    infos,
+    flushed,
+    printed: (info: Record<string | symbol, unknown>) =>
+      String(info[Symbol.for('message')]),
+  };
+};
+
+const withSecrets = () =>
+  Object.assign(new Error('boom'), {
+    token: 'SECRET-TOKEN',
+    config: { headers: { Authorization: 'Bearer SECRET-AUTH' } },
+  });
+
+test("the framework's Winston format: the secrets are not printed, and a transport gets info.stack", async () => {
+  const { logger, infos, flushed, printed } = await frameworkWinston();
+  const err = withSecrets();
+  logNeverThrow(logger, 'resize worker: task t is dead', err);
+  await flushed();
+  assert.equal(infos.length, 1);
+  const [info] = infos;
+  assert.equal(info.stack, err.stack);
+  assert.equal(info.message, 'resize worker: task t is dead boom');
+  assert.ok(printed(info).includes(String(err.stack)), printed(info));
+  assert.doesNotMatch(printed(info), /SECRET/);
+  // Its fields reach every transport, Sentry too, through the framework's redaction.
+  assert.equal(info.token, '[REDACTED]');
+  assert.doesNotMatch(JSON.stringify(info), /SECRET/);
+});
+
+test('a `%` that reads as no format sequence keeps the error on Winston, and the line as it is', async () => {
+  const { logger, infos, flushed } = await frameworkWinston();
+  const err = withSecrets();
+  const line = 'resize worker: 100% of https://bucket/a%C3%A9.jpg failed';
+  logNeverThrow(logger, line, err);
+  await flushed();
+  assert.equal(infos[0].message, `${line} boom`);
+  assert.equal(infos[0].stack, err.stack);
+});
+
+// A limit the README names, pinned so that it cannot change unnoticed. Winston's own `log()` merges
+// the error into the entry only when the line matches /%[scdjifoO%]/ nowhere. The module does not
+// touch another logger's text, since a Winston logger without `splat` would print `%%`.
+test('a format sequence in the line loses the error on Winston: the line stays literal, with no stack', async () => {
+  for (const sequence of FORMAT_SEQUENCES) {
+    const { logger, infos, flushed, printed } = await frameworkWinston();
+    const line = `resize worker: download https://bucket/${sequence} failed`;
+    logNeverThrow(logger, line, withSecrets());
+    await flushed();
+    assert.equal(infos[0].message, line);
+    assert.equal(infos[0].stack, undefined);
+    assert.doesNotMatch(printed(infos[0]), /SECRET/);
   }
 });

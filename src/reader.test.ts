@@ -28,7 +28,6 @@ import { Resizer, resetResizerForTests } from './resizer.ts';
 import { RoutingTaskQueue } from './routing.ts';
 import {
   fakeMedia,
-  firstLine,
   MemoryTaskQueue,
   PlainTaskQueue,
   recordingMetrics,
@@ -371,15 +370,12 @@ describe('Reader', () => {
     assert.equal(result.issues[0].code, 'RESIZE_ENQUEUE_INTERNAL_ERROR');
     assert.equal(result.issues[0].retryable, true);
     assert.deepEqual(
-      errors.map((e) => firstLine(e[0])),
+      errors.map((e) => String(e[0])),
       [
         'resize resolve: unexpected internal error — returning the safe empty decision',
         'resize prewarm: unexpected internal error — nothing confirmed',
       ],
     );
-    for (const [text] of errors) {
-      assert.match(String(text), /\nTypeError: /);
-    }
   });
 
   test('prewarmFailure advises against a retry for setup, config and media errors, also from a duplicate package copy', () => {

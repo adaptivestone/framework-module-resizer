@@ -58,11 +58,12 @@
   the task row and the retried and dead lines say why, and how many failed when there are several.
   `RESIZE_GENERATE_FAILED` carries the first failure as its `cause` too; its message leaves it out,
   for a handler that answers with `err.message`.
-- The module passes its logger one string, never a second argument: its line, then, when there is an
-  error, a line break and the error's stack and `cause` chain, cut at 8,000 characters. A `%` in a
-  cause no longer corrupts the line and loses the stack (on the console, or a Winston logger without
-  `splat`, or pino). A host logger that read a structured error from the second argument finds it
-  in the message instead.
+- The module's line is always one line, and the error still goes to your logger as the second
+  argument: what it prints is your logger's. On the global console every `%` in the line is now
+  escaped, so a `%c3` in a cause cannot consume the error or rewrite the line. A logger that formats
+  its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a
+  cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an
+  entry whose line holds a format sequence such as `%c3` or `%s`.
 - `resolve()` warns once per Resizer when the module's fields were not loaded. After the first added
   task, `MongoTaskQueue` checks the gate index once per model in the background and logs an `error`
   when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one

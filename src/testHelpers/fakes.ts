@@ -61,10 +61,6 @@ export function asS3Client(fake: {
   return fake as unknown as S3Client;
 }
 
-/** The module's own line of a logged text: what follows it is an error's text (logNeverThrow). */
-export const firstLine = (logged: unknown): string =>
-  String(logged).split('\n')[0];
-
 /** A logger that drops every message. */
 export const silentLogger: ResizeLogger = {
   info() {},

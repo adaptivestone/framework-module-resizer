@@ -10,11 +10,7 @@ import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
-import {
-  ResizeConfigError,
-  type ResizeError,
-  ResizeSetupError,
-} from './errors.ts';
+import { ResizeConfigError, ResizeSetupError } from './errors.ts';
 import { FrameworkLockStore } from './framework/locks.ts';
 import { FrameworkMediaStore } from './framework/media.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
@@ -34,7 +30,6 @@ import {
 import { markUnavailable, RoutingTaskQueue } from './routing.ts';
 import {
   fakeMedia,
-  firstLine,
   MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
@@ -769,20 +764,11 @@ describe('a task queue the Resizer cannot use', () => {
       ['20x20'],
     );
     assert.deepEqual(tasks.added, []);
-    let refused: ResizeError | undefined;
-    await assert.rejects(
-      () => r.verify(),
-      (e: ResizeError) => {
-        refused = e;
-        return failed(e);
-      },
-    );
+    await assert.rejects(() => r.verify(), failed);
     await assert.rejects(() => r.verify(), failed);
     assert.equal(errors.length, 1, 'logged once');
-    assert.match(firstLine(errors[0][0]), logged);
-    // The same failure verify() reports: its message and code are in the text after the line.
-    assert.ok(String(errors[0][0]).includes(String(refused?.message)));
-    assert.ok(String(errors[0][0]).includes(`code: '${refused?.code}'`));
+    assert.match(String(errors[0][0]), logged);
+    assert.ok(failed(errors[0][1]));
     return result;
   }
 
@@ -857,10 +843,11 @@ describe('a task queue the Resizer cannot use', () => {
     await r.resolve({ media: seeded(), sizes });
     assert.equal(errors.length, 1, 'logged once per queue name');
     assert.match(
-      firstLine(errors[0][0]),
+      String(errors[0][0]),
       /cannot queue to 'default': its timing is invalid/,
     );
-    assert.match(String(errors[0][0]), /\nResizeConfigError: .*maxAttempts/);
+    assert.ok(errors[0][1] instanceof ResizeConfigError);
+    assert.match((errors[0][1] as Error).message, /maxAttempts/);
     assert.deepEqual(tasks.added, []);
     timing = {};
     const { decision } = await r.resolve({ media: seeded(), sizes });
@@ -1077,12 +1064,8 @@ describe('coordination', () => {
     assert.match(result.issues[0].message, /cooldownMs/);
     assert.equal(tasks.added.length, 0);
     assert.equal(errors.length, 1, 'logged once');
-    assert.match(firstLine(errors[0][0]), /cannot use its task queue/);
-    assert.match(String(errors[0][0]), /\nResizeConfigError: .*cooldownMs/);
-    assert.match(
-      String(errors[0][0]),
-      /code: 'RESIZE_CONFIG_COORDINATION_INVALID'/,
-    );
+    assert.match(String(errors[0][0]), /cannot use its task queue/);
+    assert.ok(invalidCooldown(errors[0][1]));
   });
 
   test("a gateTtlMs below the task queue's lease is fine (a database queue with a long lease needs no coordination)", async () => {

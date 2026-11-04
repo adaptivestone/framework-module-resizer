@@ -544,7 +544,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `ResizeStorage`: `upload`, `download`, `publicUrl` (pure, no I/O), and optionally
   `signedUrl(ref, ttlSeconds)`. The module never calls `signedUrl`; a host calls it to give an
   owner the private original.
-  - The ref you return from `upload()` is opaque to the module and comes back unchanged.
+  - The ref you return from `upload()` is opaque to the module and comes back unchanged, and it must
+    stay the same on every load: a ref that changes per load (a per-access nonce, say) reads as a
+    replaced original.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
     original's ref, for previews). Never both.
   - `download()` reports a missing object with a `ResizeStorageError` with the code
@@ -1648,12 +1650,14 @@ await ResizeTask.updateOne(
   for an error without one. The cause fits one line of at most 1000 characters, with ` | ` for a
   line break, and the task row holds the same text. A thrown value cannot break the module's line:
   its cause and code stay on one line, and a line break anywhere in the line, such as in a `mediaId`
-  from an SQS message body, reads ` | `. The stack of an unexpected error (on a dead line, any error
-  that is not a `ResizeError`) and its `cause` chain follow on the lines below, cut at 8,000
-  characters, so do not treat later lines as the module's own. Every line the module logs reaches
-  your logger as one string, never with a second argument, so a `%` in a URL cannot corrupt it and
-  every logger keeps the stack; a logger that read a structured error from a second argument finds
-  it in the message.
+  from an SQS message body, reads ` | `. The error (on a dead line, any error that is not a
+  `ResizeError`) goes to your logger as the second argument, and what it prints is your logger's,
+  so do not treat later lines as the module's own. On the global console every `%` in the line is
+  escaped, so a `%` in a URL cannot consume the error or rewrite the line. A logger that formats its
+  first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause
+  as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry
+  whose line holds a format sequence such as `%c3` or `%s`: the line and its `(cause: …)` stay, the
+  stack does not.
   A worker that no longer holds its task (a lost lease) writes a `warn` and never a dead line.
 - **Damaged originals:** a source the engine refuses is dead-lettered on its first delivery with
   `RESIZE_SOURCE_DAMAGED`, unless the media was given another original while the task ran, when the

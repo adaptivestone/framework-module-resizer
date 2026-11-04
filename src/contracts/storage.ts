@@ -19,7 +19,10 @@ export abstract class ResizeStorage {
    */
   abstract download(ref: StorageRef): Promise<Buffer | Uint8Array>;
 
-  /** Upload a new object and return the JSON-compatible locator to persist. */
+  /**
+   * Upload a new object and return the JSON-compatible locator to persist. It must stay the same on
+   * every load: one that changes per load reads as a replaced original.
+   */
   abstract upload(args: StorageUploadArgs): Promise<StorageRef>;
 
   /**

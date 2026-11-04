@@ -43,6 +43,7 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
   ResizeSetupError,
+  ResizeStorageError,
 } from './errors.ts';
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
@@ -56,7 +57,6 @@ import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
   fakeMedia,
-  firstLine,
   MemoryTaskQueue,
   memoryLocks,
   observedQueue,
@@ -1506,13 +1506,14 @@ describe('decoding the source', () => {
     );
     assert.equal(uploads.length, 0);
     assert.deepEqual(logs.error, []);
-    const text = String(logs.warn[0][0]);
-    assert.match(firstLine(text), /variant .* failed for media m1$/);
-    assert.match(text, /\nResizeMediaError: .*\(media m1\)\n/);
-    assert.match(text, /code: 'RESIZE_SVG_PUBLIC_PREVIEW'/);
+    const [message, err] = logs.warn[0];
+    assert.match(String(message), /variant .* failed for media m1/);
+    assert.ok(err instanceof ResizeMediaError);
+    assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
     // Only a custom step reaches it, and a deploy with a fixed step can succeed.
-    assert.match(text, /retryable: true/);
-    assert.match(text, /mediaId: 'm1'/);
+    assert.equal(err.retryable, true);
+    assert.equal(err.mediaId, 'm1');
+    assert.match(err.message, /\(media m1\)$/);
   });
 
   test('a storage upload that returns no locator fails its variant with RESIZE_PREVIEW_STORAGE_REF_INVALID, retryable', async () => {
@@ -1526,11 +1527,11 @@ describe('decoding the source', () => {
       }),
       (err: unknown) => err instanceof ResizeGenerateError,
     );
-    const text = String(logs.warn[0][0]);
-    assert.match(firstLine(text), /variant .* failed for media m1$/);
-    assert.match(text, /\nResizeStorageError: /);
-    assert.match(text, /code: 'RESIZE_PREVIEW_STORAGE_REF_INVALID'/);
-    assert.match(text, /retryable: true/);
+    const [message, err] = logs.warn[0];
+    assert.match(String(message), /variant .* failed for media m1/);
+    assert.ok(err instanceof ResizeStorageError);
+    assert.equal(err.code, 'RESIZE_PREVIEW_STORAGE_REF_INVALID');
+    assert.equal(err.retryable, true);
   });
 
   // A host step that knows its variant can never be made.
@@ -3816,8 +3817,8 @@ describe('unconfigured formats', () => {
     assert.ok(
       logs.warn.some(
         (entry) =>
-          /\nResizeSetupError: /.test(String(entry[0])) &&
-          /code: 'RESIZE_FORMAT_NOT_CONFIGURED'/.test(String(entry[0])),
+          entry[1] instanceof ResizeSetupError &&
+          entry[1].code === 'RESIZE_FORMAT_NOT_CONFIGURED',
       ),
     );
   });
@@ -4074,9 +4075,7 @@ describe('persist failure', () => {
       (err: unknown) => err === dbDown,
     );
     assert.equal(uploads.length, 2);
-    const entry = logs.error.find((l) =>
-      String(l[0]).includes(String(dbDown.stack)),
-    );
+    const entry = logs.error.find((l) => l[1] === dbDown);
     assert.ok(entry, 'the persist failure is logged');
     for (const upload of uploads) {
       assert.ok(
@@ -4118,9 +4117,7 @@ describe('persist failure', () => {
         }),
       (err: unknown) => err === dbDown,
     );
-    const entry = logs.error.find((l) =>
-      String(l[0]).includes(String(dbDown.stack)),
-    );
+    const entry = logs.error.find((l) => l[1] === dbDown);
     assert.ok(entry);
     const storedRef = media.previews?.[0]?.storageRef as
       | { key: string }
@@ -4152,9 +4149,7 @@ describe('persist failure', () => {
         }),
       (err: unknown) => err === dbDown,
     );
-    const entry = logs.error.find((l) =>
-      String(l[0]).includes(String(dbDown.stack)),
-    );
+    const entry = logs.error.find((l) => l[1] === dbDown);
     assert.ok(entry);
     for (const upload of uploads) {
       assert.ok(String(entry[0]).includes(upload.key), upload.key);
@@ -5156,9 +5151,7 @@ describe('one worker serves every Resizer', () => {
     assert.equal(attempts, 2);
     assert.equal(sibling.rows[0].status, 'completed');
     assert.ok(
-      logs.error.some((args) =>
-        String(args[0]).includes('Error: queue unreachable'),
-      ),
+      logs.error.some((args) => String(args[1]).includes('queue unreachable')),
     );
   });
 
@@ -6454,10 +6447,10 @@ describe('regenerating stale previews', () => {
     assert.equal(media.original?.width, undefined);
     assert.equal(logs.warn.length, 1);
     assert.equal(
-      firstLine(logs.warn[0][0]),
+      logs.warn[0][0],
       "resize: generate() recorded the original's dimensions of media m1 in the media store but could not set them on the caller's media.original, so a same-request resolve() finds its previews stale",
     );
-    assert.match(String(logs.warn[0][0]), /\nTypeError: /);
+    assert.ok(logs.warn[0][1] instanceof TypeError);
   });
 
   test('a replace that fails after the append stored rows records those as stored and the rest as failed', async () => {

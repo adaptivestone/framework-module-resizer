@@ -864,6 +864,9 @@ export class Processor {
     }
     const requested = [...requestedByIdentity.values()];
     this.#warnIfAllFresh(task, media, scope, requested);
+    // The original as the render finds it, taken now: a store's cached document can change under
+    // this task, in place too, and would then look the same as its reload.
+    const { signed: held } = snapshotOriginal(media.original);
     const {
       generated,
       failedCount,
@@ -889,7 +892,7 @@ export class Processor {
       const replaced =
         notRetryable(err) &&
         (await Promise.try(() => mediaStore.loadMedia(task.mediaId))
-          .then((now) => !!now && !sameOriginal(media.original, now.original))
+          .then((now) => !!now && !sameOriginal(held, now.original))
           .catch(() => false));
       if (!replaced) {
         throw err;

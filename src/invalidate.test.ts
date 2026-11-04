@@ -7,7 +7,7 @@ import type { MediaStore } from './contracts/media.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import { ResizeSetupError } from './errors.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
-import { fakeMedia, firstLine } from './testHelpers/fakes.ts';
+import { fakeMedia } from './testHelpers/fakes.ts';
 import type { MediaLike, Preview } from './types.d.ts';
 
 const silent = { info() {}, warn() {}, error() {} };
@@ -266,10 +266,9 @@ describe('invalidate', () => {
     assert.deepEqual(refsOf(stored()), refsOf([d1(), d2(), l1(), x0()]));
     assert.equal(media.previews?.length, 5);
     assert.equal(warnings.length, 1);
-    assert.equal(warnings[0].length, 1);
-    assert.match(firstLine(warnings[0][0]), /\bmedia m1\b/);
-    assert.match(firstLine(warnings[0][0]), /may still serve them$/);
-    assert.match(String(warnings[0][0]), /\nTypeError: /);
+    assert.match(String(warnings[0][0]), /\bmedia m1\b/);
+    assert.doesNotMatch(String(warnings[0][0]), /\n/);
+    assert.ok(warnings[0][1] instanceof TypeError);
   });
 
   test('a logger that throws on that warning still lets invalidate resolve with the refs', async () => {
@@ -296,10 +295,11 @@ describe('invalidate', () => {
     assert.deepEqual(refsOf(stored()), refsOf([d1(), d2(), l1(), x0()]));
     // The warning falls back to the console.
     assert.equal(consoleWarn.mock.callCount(), 1);
-    assert.equal(consoleWarn.mock.calls[0].arguments.length, 1);
-    const printed = String(consoleWarn.mock.calls[0].arguments[0]);
-    assert.match(firstLine(printed), /\bmedia m1\b/);
-    assert.match(printed, /\nTypeError: /);
+    assert.match(
+      String(consoleWarn.mock.calls[0].arguments[0]),
+      /\bmedia m1\b/,
+    );
+    assert.ok(consoleWarn.mock.calls[0].arguments[1] instanceof TypeError);
   });
 
   test('invalidate works on an eager-only Resizer and for an unregistered pipeline', async () => {

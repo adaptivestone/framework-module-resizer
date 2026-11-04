@@ -8,7 +8,7 @@ import { Catalog } from './catalog.ts';
 import type { MediaStore } from './contracts/media.ts';
 import { getPreviewIdentity } from './images.ts';
 import { PreviewRecorder } from './previewRecorder.ts';
-import { fakeMedia, firstLine } from './testHelpers/fakes.ts';
+import { fakeMedia } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
@@ -271,10 +271,10 @@ test('a rejected replace logs the unrecorded refs and returns the error, with wh
   assert.deepEqual(result.stored, [added]);
   assert.equal(logs.error.length, 1);
   assert.equal(
-    firstLine(logs.error[0][0]),
+    logs.error[0][0],
     'resize: replacing previews failed for media m1; 1 of 1 uploaded preview(s) are not recorded: storage refs {"key":"new.jpg"}',
   );
-  assert.ok(String(logs.error[0][0]).includes(String(db.stack)));
+  assert.equal(logs.error[0][1], db);
 });
 
 test('a replace that stores and removes nothing means the media is gone: one warning with the refs', async () => {
@@ -350,8 +350,8 @@ test('a failed append of the dimensions alone is logged as such, and returned', 
   assert.equal(result.failure?.error, db);
   assert.equal(logs.error.length, 1);
   assert.equal(
-    firstLine(logs.error[0][0]),
+    logs.error[0][0],
     "resize: recording the original's dimensions failed for media m1 (64×48); no uploaded preview is affected",
   );
-  assert.ok(String(logs.error[0][0]).includes(String(db.stack)));
+  assert.equal(logs.error[0][1], db);
 });

@@ -3,7 +3,6 @@
 // failure falls back to the console instead of breaking the guarantee. A thrown value may be host
 // code as well: a getter, a `toString` or a Proxy trap can throw, and a message or a code can hold
 // a line break. Also the cap on a line logged once per key, which such a path repeats on every call.
-import { inspect, types } from 'node:util';
 import { ResizeError } from '../errors.ts';
 import type { ResizeLogger } from '../types.d.ts';
 
@@ -11,10 +10,6 @@ import type { ResizeLogger } from '../types.d.ts';
 const MAX_TEXT_LENGTH = 1000;
 // The most of that text a cause may take, so a long cause leaves room for the message.
 const MAX_CAUSE_LENGTH = 500;
-// The longest text a log call appends after its line: a stack and its causes fit well within it.
-const MAX_ERROR_TEXT_LENGTH = 8000;
-// How many levels of an error's fields and causes it shows.
-const ERROR_TEXT_DEPTH = 5;
 
 // Trimmed first: a text that ends in a line break gets no trailing ` | `, and one that starts with
 // a line break keeps its first line. Cut before the regular expression: it takes quadratic time on
@@ -108,32 +103,14 @@ export function notRetryable(error: unknown): boolean {
 }
 
 /**
- * What a log call appends for a thrown value: the console's text for it, so its stack, its `cause`
- * chain and its fields. A value that cannot be printed that way (a getter, a host inspector or a
- * Proxy trap that throws; inspect() would show a Proxy's target, not what it pretends to be) reads
- * as causeText.
- */
-function errorText(error: unknown): string {
-  let text: string;
-  try {
-    text =
-      typeof error === 'object' && error !== null && !types.isProxy(error)
-        ? inspect(error, { depth: ERROR_TEXT_DEPTH })
-        : causeText(error);
-  } catch {
-    text = causeText(error);
-  }
-  return text.length > MAX_ERROR_TEXT_LENGTH
-    ? `${text.slice(0, MAX_ERROR_TEXT_LENGTH)} … (cut at ${MAX_ERROR_TEXT_LENGTH} characters)`
-    : text;
-}
-
-/**
- * Log `message` at `level` (default 'error'), as one line, and after it, when given, `err`'s text
- * on the lines below. The logger gets ONE string, never a second argument: a second argument turns
- * the line into a format string on the console (a `%c3` in a URL eats the error, stack and all),
- * and a Winston logger without `splat` and pino drop it. A throwing logger falls back to the
- * console method of the same level.
+ * Log `message` at `level` (default 'error') as one line, with `err` (when given) as the second
+ * argument. The module never reads `err` for the logger: what it prints is the logger's, so the
+ * logger's redaction holds, and a logger that ignores it costs nothing. The global console reads
+ * its first argument as a format string once a second follows, so there every `%` is escaped: a
+ * `%c3` in a URL cannot consume the error or rewrite the line. No other logger's text is touched,
+ * since a Winston logger without `splat` would print `%%`. A throwing logger falls back to the
+ * console method of the same level. The console formats `err` too, and `util.inspect` throws on
+ * some values, so that fallback is guarded as well.
  */
 export function logNeverThrow(
   logger: ResizeLogger,
@@ -142,14 +119,21 @@ export function logNeverThrow(
   level: 'error' | 'warn' | 'info' = 'error',
 ): void {
   const line = message.trim().replace(/[\r\n\f\v\u0085\u2028\u2029]+/g, ' | ');
-  const text = err === undefined ? line : `${line}\n${errorText(err)}`;
+  const rest = err === undefined ? [] : [err];
+  // With one argument the console formats nothing, and `%%` would print as it is.
+  const forConsole = err === undefined ? line : line.replaceAll('%', '%%');
   try {
-    logger[level](text);
+    const first = logger[level] === console[level] ? forConsole : line;
+    logger[level](first, ...rest);
   } catch {
     try {
-      console[level](text);
+      console[level](forConsole, ...rest);
     } catch {
-      // Nothing left to write to, and this path must not throw.
+      try {
+        console[level](line);
+      } catch {
+        // Nothing left to write to, and this path must not throw.
+      }
     }
   }
 }

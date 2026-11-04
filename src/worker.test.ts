@@ -36,7 +36,6 @@ import { consume } from './testHelpers/consume.ts';
 import {
   clockLocks,
   fakeMedia,
-  firstLine,
   MemoryTaskQueue,
   memoryLocks,
   PlainTaskQueue,
@@ -1667,10 +1666,10 @@ describe('a worker on a router', () => {
       );
       assert.equal(errors.length, 1);
       assert.match(
-        firstLine(errors[0][0]),
+        String(errors[0][0]),
         /queue 'bulk' of Resizer 'default': its backend could not be built/,
       );
-      assert.ok(String(errors[0][0]).includes(String(down.stack)));
+      assert.equal(errors[0][1], down);
       assert.deepEqual(memory.claims, []);
     }
     // The branded error keeps its own code and retryable.
@@ -2402,11 +2401,17 @@ describe('what a variant failure leaves behind', () => {
       warn: [] as string[],
       error: [] as string[],
     };
+    // What each `warn` got as its second argument, in line order.
+    const warned: unknown[] = [];
     return {
       lines,
+      warned,
       logger: {
         info: (msg: unknown) => void lines.info.push(String(msg)),
-        warn: (msg: unknown) => void lines.warn.push(String(msg)),
+        warn: (msg: unknown, err?: unknown) => {
+          lines.warn.push(String(msg));
+          warned.push(err);
+        },
         error: (msg: unknown) => void lines.error.push(String(msg)),
       },
     };
@@ -2528,7 +2533,7 @@ describe('what a variant failure leaves behind', () => {
     const tasks = new MemoryTaskQueue({
       timing: { ...fast, maxAttempts: 3 },
     });
-    const { lines, logger } = logged();
+    const { lines, warned, logger } = logged();
     const resizer = denying(tasks, logger, async () => {
       throw accessDenied();
     });
@@ -2545,12 +2550,14 @@ describe('what a variant failure leaves behind', () => {
     );
     assert.equal(lines.error.length, 1, lines.error.join('\n---\n'));
     assert.match(lines.error[0], / is dead \(attempt 3 of 3, /);
-    const variantLines = lines.warn.filter((l) =>
-      /^resize worker: variant \S+ failed for media m1\n/.test(l),
+    const variantErrors = warned.filter((_, index) =>
+      /^resize worker: variant \S+ failed for media m1$/.test(
+        lines.warn[index],
+      ),
     );
-    assert.equal(variantLines.length, 4 * 3);
+    assert.equal(variantErrors.length, 4 * 3);
     assert.ok(
-      variantLines.every((l) => l.includes('AccessDenied: Access Denied')),
+      variantErrors.every((err) => (err as Error).name === 'AccessDenied'),
     );
   });
 
@@ -2583,7 +2590,7 @@ describe('what a variant failure leaves behind', () => {
   });
 
   test('generate() writes no error line: the caller has the failed count or the throw', async () => {
-    const { lines, logger } = logged();
+    const { lines, warned, logger } = logged();
     const r = new Resizer({
       config: makeImageConfig({ formats: ['webp'] }),
       logger,
@@ -2607,7 +2614,7 @@ describe('what a variant failure leaves behind', () => {
     assert.deepEqual(lines.error, []);
     assert.equal(lines.warn.length, 1);
     assert.match(lines.warn[0], /^resize generate: variant \S+ failed/);
-    assert.match(lines.warn[0], /AccessDenied: Access Denied/);
+    assert.equal((warned[0] as Error).name, 'AccessDenied');
   });
 
   test("generate()'s error names the first failure as its cause, and keeps it out of its message", async () => {
@@ -2690,7 +2697,13 @@ describe('a final failure of an original that was replaced meanwhile', () => {
    * A live media whose preview upload for original `old` waits for `release()` and then refuses,
    * while one for any other original is stored; `prewarm()` puts the first task on the queue.
    */
-  const scene = () => {
+  const scene = (
+    // A copy, as a store's load is: the task's snapshot must not see the replacement.
+    load: (media: MediaLike, previews: Preview[]) => MediaLike = (
+      media,
+      previews,
+    ) => ({ ...media, previews }),
+  ) => {
     const tasks = new MemoryTaskQueue({ timing: fast });
     const media: MediaLike = {
       id: 'm1',
@@ -2721,11 +2734,7 @@ describe('a final failure of an original that was replaced meanwhile', () => {
       },
       media: fakeMedia({
         previews: rows,
-        // A copy, as a store's load is: the task's snapshot must not see the replacement.
-        load: async () => ({
-          ...media,
-          previews: rows.get('m1') ?? [],
-        }),
+        load: async () => load(media, rows.get('m1') ?? []),
       }),
       locks: memoryLocks(),
       tasks,
@@ -2764,6 +2773,53 @@ describe('a final failure of an original that was replaced meanwhile', () => {
     });
     assert.deepEqual(read.decision.missing, []);
     assert.equal(read.decision.ready.length, 1);
+  });
+
+  test('a cached document, and a ref changed in place, read as replaced too', async () => {
+    const sets: [
+      (media: MediaLike, previews: Preview[]) => MediaLike,
+      (media: MediaLike) => void,
+    ][] = [
+      [
+        (media, previews) => {
+          media.previews = previews;
+          return media;
+        },
+        (media) => {
+          media.original = {
+            storageRef: { key: 'new' },
+            width: 64,
+            height: 48,
+          };
+        },
+      ],
+      [
+        (media, previews) => ({ ...media, previews }),
+        (media) => {
+          (media.original as { storageRef: { key: string } }).storageRef.key =
+            'new';
+        },
+      ],
+    ];
+    for (const [load, replace] of sets) {
+      resetResizerForTests();
+      const s = scene(load);
+      assert.equal(
+        (await s.resizer.prewarm({ media: s.media, sizes })).status,
+        'accepted',
+      );
+      const done = workUntil(
+        { logger: silent, resizers: [s.resizer] },
+        () => s.tasks.rows[0].status !== 'processing' && s.rows.has('m1'),
+      );
+      await s.started;
+      replace(s.media);
+      s.release();
+      await done;
+      assert.equal(s.tasks.rows[0].status, 'completed');
+      assert.equal(s.tasks.rows[0].attempts, 2);
+      assert.deepEqual(s.parents, ['old', 'new']);
+    }
   });
 
   test('the original unchanged: the same failure is final, on the first delivery', async () => {
@@ -2889,7 +2945,14 @@ describe('a final failure of the whole task, on an original that was replaced me
       .jpeg()
       .toBuffer();
 
-  test('a damaged original replaced during its task: prewarm stays accepted, and the next delivery renders the new one', async () => {
+  /**
+   * A cut JPEG whose download waits for its replacement, then a second `prewarm()`. `load` is what
+   * the store gives for the media, and `replace` how the host changes it.
+   */
+  const replacedDuringDownload = async (
+    load: (media: MediaLike, previews: Preview[]) => MediaLike,
+    replace: (media: MediaLike) => void,
+  ) => {
     const whole = await wholeJpeg();
     const cut = whole.subarray(0, Math.floor(whole.length / 2));
     const tasks = new MemoryTaskQueue({ timing: fast });
@@ -2902,13 +2965,16 @@ describe('a final failure of the whole task, on an original that was replaced me
     const { promise: released, resolve: release } =
       Promise.withResolvers<void>();
     const rows = new Map<string, Preview[]>();
+    const downloaded: string[] = [];
     const parents: string[] = [];
     const resizer = new Resizer({
       config: makeImageConfig({ formats: ['webp'] }),
       logger: silent,
       storage: {
         download: async (ref) => {
-          if ((ref as { key: string }).key !== 'old') {
+          const { key } = ref as { key: string };
+          downloaded.push(key);
+          if (key !== 'old') {
             return whole;
           }
           start();
@@ -2923,8 +2989,7 @@ describe('a final failure of the whole task, on an original that was replaced me
       },
       media: fakeMedia({
         previews: rows,
-        // A copy, as a store's load is: the task's snapshot must not see the replacement.
-        load: async () => ({ ...media, previews: rows.get('m1') ?? [] }),
+        load: async () => load(media, rows.get('m1') ?? []),
       }),
       locks: memoryLocks(),
       tasks,
@@ -2936,11 +3001,7 @@ describe('a final failure of the whole task, on an original that was replaced me
       () => tasks.rows[0].status !== 'processing' && rows.has('m1'),
     );
     await started;
-    media.original = {
-      storageRef: { key: 'new' },
-      width: 400,
-      height: 300,
-    };
+    replace(media);
     const second = await resizer.prewarm({ media, sizes });
     assert.equal(second.status, 'accepted');
     assert.equal(tasks.rows.length, 1);
@@ -2948,6 +3009,7 @@ describe('a final failure of the whole task, on an original that was replaced me
     await done;
     assert.equal(tasks.rows[0].status, 'completed');
     assert.equal(tasks.rows[0].attempts, 2);
+    assert.deepEqual(downloaded, ['old', 'new']);
     assert.deepEqual(parents, ['new']);
     const read = await resizer.resolve({
       media: { ...media, previews: rows.get('m1') },
@@ -2955,6 +3017,52 @@ describe('a final failure of the whole task, on an original that was replaced me
     });
     assert.deepEqual(read.decision.missing, []);
     assert.equal(read.decision.ready.length, 1);
+  };
+  const toNew = (media: MediaLike) => {
+    media.original = {
+      storageRef: { key: 'new' },
+      width: 400,
+      height: 300,
+    };
+  };
+  const refInPlace = (media: MediaLike) => {
+    (media.original as { storageRef: { key: string } }).storageRef.key = 'new';
+  };
+
+  test('a damaged original replaced during its task: prewarm stays accepted, and the next delivery renders the new one', async () => {
+    // A copy, as most stores' load is: the task's document cannot see the replacement.
+    await replacedDuringDownload(
+      (media, previews) => ({
+        ...media,
+        original: {
+          ...media.original,
+          storageRef: { ...(media.original?.storageRef as object) },
+        } as MediaLike['original'],
+        previews,
+      }),
+      toNew,
+    );
+  });
+
+  test('a cached document whose original is replaced during the task', async () => {
+    await replacedDuringDownload((media, previews) => {
+      media.previews = previews;
+      return media;
+    }, toNew);
+  });
+
+  test('a shallow-copied document whose ref changes in place during the task', async () => {
+    await replacedDuringDownload(
+      (media, previews) => ({ ...media, previews }),
+      refInPlace,
+    );
+  });
+
+  test('a cached document whose ref changes in place during the task', async () => {
+    await replacedDuringDownload((media, previews) => {
+      media.previews = previews;
+      return media;
+    }, refInPlace);
   });
 
   /** The task's first delivery on a cut JPEG: the first load gives `loaded`, each later one `reload()`. */
