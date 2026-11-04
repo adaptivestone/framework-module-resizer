@@ -7,7 +7,7 @@ import {
   ResizeStorageError,
 } from '../errors.ts';
 import { asS3Client, silentLogger } from '../testHelpers/fakes.ts';
-import type { S3StorageConfig } from '../types.d.ts';
+import type { S3StorageConfig, StorageRef } from '../types.d.ts';
 import { S3Storage } from './s3.ts';
 
 function fakeClient() {
@@ -38,6 +38,25 @@ const args = (key: string, visibility: 'public' | 'private') => ({
   body: Buffer.from(key),
   contentType: 'image/jpeg',
 });
+
+const REFUSED_KEYS = [
+  '',
+  '/a.jpg',
+  'a//b.jpg',
+  'a/',
+  '.',
+  '..',
+  'a/../b.jpg',
+  './a.jpg',
+  'a/./b.jpg',
+  'a\u0000b.jpg',
+  'a\nb.jpg',
+  'a\rb.jpg',
+  'a\tb.jpg',
+  'a\u007fb.jpg',
+  'a\u0085b.jpg',
+  'a\uD800b.jpg',
+];
 
 describe('S3Storage', () => {
   const rejectingWith = (thrown: unknown) =>
@@ -367,11 +386,108 @@ describe('S3Storage', () => {
       () => s.upload(args('previews/a?b.jpg', 'public')),
       /invalid logical key/,
     );
-    assert.throws(
-      () => s.publicUrl({ bucket: 'pub', key: 'previews/a#b.jpg' }),
-      /invalid logical key/,
+    assert.ok(
+      s
+        .publicUrl({ bucket: 'pub', key: 'previews/a#b.jpg' })
+        .endsWith('/previews/a%23b.jpg'),
     );
     assert.equal(sent.length, 0);
+  });
+
+  for (const key of REFUSED_KEYS) {
+    test(`refuses the key ${JSON.stringify(key)} on every read, with no S3 call`, async () => {
+      const { client, sent } = fakeClient();
+      const s = new S3Storage({
+        bucketPublic: 'pub',
+        bucketPrivate: 'priv',
+        client,
+      });
+      const ref = { bucket: 'pub', key };
+      const refused = { code: 'RESIZE_STORAGE_KEY_INVALID', retryable: false };
+      await assert.rejects(s.download(ref), refused);
+      await assert.rejects(s.signedUrl(ref, 60), refused);
+      assert.throws(() => s.publicUrl(ref), refused);
+      await assert.rejects(
+        s.upload({ ...args('previews/a.jpg', 'public'), parentRef: ref }),
+        refused,
+      );
+      assert.equal(sent.length, 0);
+    });
+  }
+
+  test('a key in the upload alphabet comes out of publicUrl unchanged in all three URL forms', () => {
+    const key = 'users/u1/previews/ABCXYZabcxyz0189_.-x.webp';
+    const ref = { bucket: 'pub', key };
+    assert.equal(
+      new S3Storage({
+        bucketPublic: 'pub',
+        publicBaseUrl: 'https://cdn.example.com',
+      }).publicUrl(ref),
+      `https://cdn.example.com/${key}`,
+    );
+    assert.equal(
+      new S3Storage({
+        bucketPublic: 'pub',
+        endpoint: 'http://localhost:9000',
+        forcePathStyle: true,
+      }).publicUrl(ref),
+      `http://localhost:9000/pub/${key}`,
+    );
+    assert.equal(
+      new S3Storage({ bucketPublic: 'pub', region: 'eu-west-1' }).publicUrl(
+        ref,
+      ),
+      `https://pub.s3.eu-west-1.amazonaws.com/${key}`,
+    );
+  });
+
+  test('publicUrl encodes each part of any other key, and never its slashes', () => {
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      publicBaseUrl: 'https://cdn.example.com',
+    });
+    const url = (key: string) =>
+      s
+        .publicUrl({ bucket: 'pub', key })
+        .replace('https://cdn.example.com/', '');
+    assert.equal(url('photos/my cat (1).jpg'), 'photos/my%20cat%20%281%29.jpg');
+    assert.equal(url('a+b#c?d%e.jpg'), 'a%2Bb%23c%3Fd%25e.jpg');
+    assert.equal(url("it's!*.jpg"), 'it%27s%21%2A.jpg');
+    assert.equal(url('фото.jpg'), '%D1%84%D0%BE%D1%82%D0%BE.jpg');
+  });
+
+  test('what the driver writes stays strict, and previews take no part of a stored key', async () => {
+    const { client } = fakeClient();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    const preview = (parentRef: StorageRef) =>
+      s.upload({ ...args('previews/x.webp', 'public'), parentRef });
+    assert.deepEqual(
+      await preview({ bucket: 'priv', key: 'photos/my cat.jpg' }),
+      { bucket: 'pub', key: 'previews/x.webp' },
+    );
+    assert.deepEqual(
+      await preview({
+        bucket: 'priv',
+        key: 'users/7/my cat.jpg',
+        namespace: 'users/7',
+      }),
+      { bucket: 'pub', key: 'users/7/previews/x.webp', namespace: 'users/7' },
+    );
+    await assert.rejects(
+      s.download({ bucket: 'priv', key: 'my cat.jpg', namespace: 'users/7' }),
+      { code: 'RESIZE_S3_REF_INVALID' },
+    );
+    await assert.rejects(s.upload(args('previews/a b.jpg', 'public')), {
+      code: 'RESIZE_STORAGE_KEY_INVALID',
+    });
+    await assert.rejects(
+      s.upload({ ...args('a.jpg', 'public'), namespace: 'users 7' }),
+      { code: 'RESIZE_STORAGE_NAMESPACE_INVALID' },
+    );
   });
 
   test('signed URL uses the exact persisted private bucket and expiry', async () => {

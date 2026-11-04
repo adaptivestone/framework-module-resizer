@@ -80,6 +80,9 @@
   The worker logs one `info` line at start naming its queues and Resizers. Eager failures say
   `resize generate:`, not `resize worker:`. A completed task says `variants 5 of 9` when it rendered
   fewer, and `resize.task` gains the context `rendered`.
+- The S3 driver reads any key except control characters, `.` or `..` parts, a leading `/` or an
+  empty part. `publicUrl` encodes each part of such a key; the URL of a key the module wrote does
+  not change. Keys the module writes, `namespace` and the local driver stay strict.
 
 **Features**
 

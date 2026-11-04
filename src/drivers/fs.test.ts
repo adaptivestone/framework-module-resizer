@@ -292,6 +292,16 @@ describe('LocalFsStorage', () => {
     );
   });
 
+  test('the local driver stays strict: a path with a space is refused', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    await assert.rejects(
+      s.download({ path: 'my cat.jpg', visibility: 'private' }),
+      { code: 'RESIZE_STORAGE_KEY_INVALID' },
+    );
+  });
+
   test('rejects malformed refs, including a private ref in publicUrl', async () => {
     const s = new LocalFsStorage({
       rootDir: await fresh(),

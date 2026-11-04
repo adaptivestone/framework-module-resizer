@@ -12,6 +12,11 @@
 // hosts import `@adaptivestone/framework-module-resize/drivers/s3.js` directly, so the optional
 // peers are resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the
 // host's own import line at bootstrap (no dynamic import(), no lazy loaders).
+//
+// TWO KEY RULES: what this driver writes keeps the strict alphabet of `validateLogicalKey` and
+// `validateNamespace`, and a preview never takes a part of a stored key. What it reads may be any
+// key a bucket already holds (`validateStoredKey`), since a real library's keys hold clients' file
+// names. The SDK encodes such a key itself; `publicUrl` builds a string, so it encodes it here.
 import {
   GetObjectCommand,
   type GetObjectCommandOutput,
@@ -31,7 +36,11 @@ import {
 } from '../errors.ts';
 import { optionalString, requiredString } from '../helpers/configSection.ts';
 import type { S3StorageConfig, StorageRef } from '../types.d.ts';
-import { validateLogicalKey, validateNamespace } from './placement.ts';
+import {
+  validateLogicalKey,
+  validateNamespace,
+  validateStoredKey,
+} from './placement.ts';
 
 // The Cache-Control header of every public object (see `upload` for why it is safe).
 const PUBLIC_CACHE_CONTROL = 'public, max-age=31536000, immutable';
@@ -56,6 +65,21 @@ export interface S3StorageOptions {
   // region/endpoint/forcePathStyle. (This option is also the injection point exercised by the
   // tests — the driver ships NO test-only seams.)
   client?: S3Client;
+}
+
+// A key as a URL path: each `/` part as the SDK puts it on the wire. encodeURIComponent leaves
+// `!'()*` alone, and a quote in a URL could break a host's HTML attribute. The alphabet of the keys
+// this driver writes holds nothing to encode, so their URLs stay as they were.
+function encodeKeyForUrl(key: string): string {
+  return key
+    .split('/')
+    .map((part) =>
+      encodeURIComponent(part).replace(
+        /[!'()*]/g,
+        (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+      ),
+    )
+    .join('/');
 }
 
 export class S3Storage extends ResizeStorage {
@@ -162,13 +186,14 @@ export class S3Storage extends ResizeStorage {
       });
     }
     this.#assertAllowedBucket(ref.bucket);
-    validateLogicalKey(ref.key);
+    validateStoredKey(ref.key);
     const namespace = validateNamespace(ref.namespace);
     if (namespace && !ref.key.startsWith(`${namespace}/`)) {
       throw new ResizeSecurityError('resize s3: namespace does not match key', {
         code: 'RESIZE_S3_REF_INVALID',
       });
     }
+    // The raw ref, never a copy with an encoded key: its JSON form is signed into every `origin`.
     return ref as unknown as S3StorageRef;
   }
 
@@ -324,9 +349,10 @@ export class S3Storage extends ResizeStorage {
         { code: 'RESIZE_S3_PRIVATE_ORIGINAL_PUBLIC_URL' },
       );
     }
+    const urlKey = encodeKeyForUrl(key);
     const publicBase = this.#opts.publicBaseUrl ?? this.#opts.publicUrl;
     if (publicBase) {
-      return `${publicBase.replace(/\/+$/, '')}/${key}`;
+      return `${publicBase.replace(/\/+$/, '')}/${urlKey}`;
     }
     // AWS's own host name: the China regions live under amazonaws.com.cn.
     const region = this.#opts.region ?? 'us-east-1';
@@ -336,9 +362,9 @@ export class S3Storage extends ResizeStorage {
         /\/+$/,
         '',
       );
-      return `${base}/${bucket}/${key}`;
+      return `${base}/${bucket}/${urlKey}`;
     }
-    return `https://${bucket}.${awsHost}/${key}`;
+    return `https://${bucket}.${awsHost}/${urlKey}`;
   }
 
   // Time-limited signed URL for owner/admin reads of a private original.

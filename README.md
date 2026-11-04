@@ -418,8 +418,9 @@ and keeps the parts that loaded.
 | `publicBaseUrl` | required | URL prefix, e.g. `/media` |
 | `privateRootDir` | optional | Private originals; default `rootDir` + `-private`, and never inside `rootDir` |
 
-The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Do not put
-symlinks into the public tree. Serve `rootDir` with a long-lived cache too, for example
+The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Its paths stay in
+the strict alphabet, because they are filesystem paths. Do not put symlinks into the public tree.
+Serve `rootDir` with a long-lived cache too, for example
 `express.static(rootDir, { immutable: true, maxAge: '1y' })`: every file name the module writes
 there is new (previews and public raster originals), so a file never changes under its URL; if you
 write your own files under `rootDir`, give each a new name.
@@ -434,8 +435,13 @@ write your own files under `rootDir`, give each a new name.
 | `client` | optional | An existing `S3Client`; otherwise one is built from `region` / `endpoint` / `forcePathStyle` |
 
 The ref is `{ bucket, key, namespace? }`. Every read accepts only the two configured buckets, so a
-tampered `bucket` cannot reach another bucket. `publicUrl()` does no I/O, and public access is a
-bucket policy, not a per-object ACL. Without `publicBaseUrl`, URLs are virtual-hosted
+tampered `bucket` cannot reach another bucket. A read accepts any key except one with a control
+character, a `.` or `..` part, a leading `/` or an empty part, so a key holding a client's file name
+can be adopted; `publicUrl` encodes each part. Keys the module writes, and `namespace`, keep the
+strict alphabet `[A-Za-z0-9_.-]`, and previews never take a part of a stored key. Never build a ref
+from a client's input: within those buckets it would publish previews of someone else's object.
+`publicUrl()` does no I/O, and public access is a bucket policy, not a per-object ACL. Without
+`publicBaseUrl`, URLs are virtual-hosted
 (`https://<bucket>.s3.<region>.amazonaws.com/<key>`), or path-style with `endpoint` or
 `forcePathStyle` (`<endpoint>/<bucket>/<key>`; without an endpoint,
 `https://s3.<region>.amazonaws.com/<bucket>/<key>`). China regions (`cn-…`) use

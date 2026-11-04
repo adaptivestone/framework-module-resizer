@@ -85,3 +85,60 @@ test('the fake server stores a PUT, records raw targets and answers a missing ke
     },
   );
 });
+
+// Keys a real library holds, or that try to break a URL, a path or a signature. Each object has its
+// own bytes, so a URL that is cut, normalized or decoded twice reaches no object or the wrong one.
+const READABLE_KEYS = [
+  'photos/my cat.jpg',
+  'photos/my cat (1).jpg',
+  'a+b.jpg',
+  'a%20b.jpg',
+  '%2e%2e/secret.jpg',
+  '%2E%2E%2Fsecret.jpg',
+  'a#b.jpg',
+  'a?x=1.jpg',
+  "it's.jpg",
+  'фото/кот.jpg',
+  'a&b=c.jpg',
+  'a;b.jpg',
+  'a\\b.jpg',
+  '..\\..\\etc\\passwd',
+  'a~b.jpg',
+  'a@b.jpg',
+  '.hidden.jpg',
+  '..foo.jpg',
+  'foo...jpg',
+  '...',
+  'é.jpg',
+  'a b.jpg',
+  '\u{1F600}.jpg',
+  'a"b<c>.jpg',
+  'a`b.jpg',
+  'a^b|c.jpg',
+  'a{b}[c].jpg',
+  'a:b.jpg',
+  'a,b.jpg',
+  'a$b!c*d.jpg',
+  ' lead.jpg',
+  'trail .jpg',
+  'a/ /b.jpg',
+  'x-amz-foo=1&X-Amz-Signature=bad.jpg',
+];
+
+for (const key of READABLE_KEYS) {
+  test(`reads ${JSON.stringify(key)} through the SDK, the presigner and its public URL`, async () => {
+    const body = Buffer.from(`bytes of ${key}`);
+    s3.objects.set(`priv/${key}`, body);
+    s3.objects.set(`pub/${key}`, body);
+    const storage = s3.storage();
+    assert.deepEqual(await storage.download({ bucket: 'priv', key }), body);
+    const signed = await storage.signedUrl({ bucket: 'priv', key }, 60);
+    assert.match(signed, /X-Amz-Signature=[0-9a-f]{64}/);
+    const viaSigned = await fetch(signed);
+    assert.equal(viaSigned.status, 200);
+    assert.deepEqual(Buffer.from(await viaSigned.arrayBuffer()), body);
+    const viaPublic = await fetch(storage.publicUrl({ bucket: 'pub', key }));
+    assert.equal(viaPublic.status, 200);
+    assert.deepEqual(Buffer.from(await viaPublic.arrayBuffer()), body);
+  });
+}

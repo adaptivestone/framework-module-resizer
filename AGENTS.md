@@ -618,6 +618,10 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   raster preview formats through the normal durable task lifecycle.
 - Deleting storage objects is the HOST's job — the module only appends rows, and `invalidate`
   only removes rows and returns their storage refs.
+- A `storageRef` you write or pass to `adoptOriginal` comes from the host's own records, never from
+  a client's input: within the two configured buckets it would publish previews of someone else's
+  object. S3 reads any key except control characters, `.` or `..` parts, a leading `/` or an empty
+  part; local paths stay strict.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
   then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter,
   at once when every missing variant failed with `retryable: false` on an original the media still
