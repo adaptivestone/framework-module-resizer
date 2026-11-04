@@ -1,7 +1,9 @@
 // S3Storage with a real SDK client against a real HTTP server: what a stream and its connection do
 // shows only here. The recording fakes of s3.test.ts never open a socket.
 import assert from 'node:assert/strict';
+import type { Readable } from 'node:stream';
 import { after, before, test } from 'node:test';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { ResizeMediaError, ResizeStorageError } from '../errors.ts';
 import { type FakeS3, fakeS3 } from '../testHelpers/fakeS3.ts';
 
@@ -31,6 +33,23 @@ test('download over maxBytes rejects from ContentLength, reads no body and close
     },
   );
   await closed; // resolves only when the driver dropped the stream
+});
+
+test('that hanging response reaches the driver as the body real S3 gives, and destroying it closes the connection', {
+  timeout: 10_000,
+}, async () => {
+  const closed = s3.hang('priv/checksum.jpg', 10);
+  const out = await s3.client.send(
+    new GetObjectCommand({ Bucket: 'priv', Key: 'checksum.jpg' }),
+  );
+  // An SDK from before flexible checksums has no such setting and hands over the raw response.
+  const validates = s3.client.config.responseChecksumValidation !== undefined;
+  assert.equal(
+    out.Body?.constructor.name,
+    validates ? 'ChecksumStream' : 'IncomingMessage',
+  );
+  (out.Body as unknown as Readable).destroy();
+  await closed;
 });
 
 test('download at exactly maxBytes, and without maxBytes, returns the bytes', async () => {

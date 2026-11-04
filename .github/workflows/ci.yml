@@ -49,9 +49,10 @@ jobs:
       - run: node --run check
       - run: node --run build
 
-      # `npm test` = `node --experimental-strip-types --test`; append --experimental-test-coverage
-      # (verified locally to work alongside type stripping). `node --run test -- <args>` forwards
-      # the flag onto the repo's own test script, so the strip-types flag stays single-sourced.
+      # `npm test` = `node --experimental-strip-types --import ./src/testHelpers/noAws.ts --test`;
+      # append --experimental-test-coverage (verified locally to work alongside type stripping).
+      # `node --run test -- <args>` forwards the flag onto the repo's own test script, so its flags
+      # stay single-sourced.
       - name: Run tests (with coverage)
         run: node --run test -- --experimental-test-coverage
 

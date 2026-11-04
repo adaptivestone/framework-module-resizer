@@ -36,6 +36,7 @@ import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
 import { SvgDecoder } from './decoders/svg.ts';
+import { LocalFsStorage } from './drivers/fs.ts';
 import {
   ResizeConfigError,
   ResizeError,
@@ -706,6 +707,71 @@ describe('decoding the source', () => {
     assert.equal(failed, 0);
     assert.equal(created.length, 1);
     assert.equal(uploads.length, 1);
+  });
+
+  test('a refused Uint8Array is not copied', async () => {
+    // A Proxy hides a typed array's bytes from native code, so any copy of them (Buffer.from,
+    // new Uint8Array, Buffer.copyBytesFrom) has to come through this trap. A refusal needs only
+    // byteLength; `then` is the promise that delivers the array.
+    const read = new Set<string | symbol>();
+    const body = new Proxy(new Uint8Array(11), {
+      get(target, key) {
+        read.add(key);
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const { deps, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: 10 } },
+    });
+    deps.storage.download = async () => body;
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      { code: 'RESIZE_SOURCE_TOO_LARGE' },
+    );
+    read.delete('then');
+    assert.deepEqual([...read], ['byteLength']);
+  });
+
+  test('a Uint8Array from a driver within the limit renders', async () => {
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: redPng.length } },
+    });
+    deps.storage.download = async () => new Uint8Array(redPng);
+    const { failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(uploads.length, 1);
+  });
+
+  test("a driver's refusal names the media, as the core's does", async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'resize-source-bytes-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await writeFile(join(dir, 'big.jpg'), Buffer.alloc(11));
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: 10 } },
+      original: { storageRef: { path: 'big.jpg', visibility: 'public' } },
+    });
+    deps.storage = new LocalFsStorage({
+      rootDir: dir,
+      publicBaseUrl: '/media',
+    });
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        assert.match(err.message, /limits\.sourceBytes/);
+        assert.match(err.message, /media m1/);
+        assert.doesNotMatch(err.message, /big\.jpg/);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
   });
 
   test('the source is decoded once per task, at the largest box the previews need', async () => {

@@ -556,7 +556,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     `s3:ListBucket` gets 403 for a missing key, which stays raw.
   - `download(ref, opts?)`: when `opts.maxBytes` is given, refuse a larger object before reading
     it, with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`, `retryable: false`. A driver that ignores
-    it still works; the core checks the length afterwards, but the memory is already spent.
+    it still works; the core checks the length afterwards, but the memory is already spent. A
+    response with no length, which `S3Storage` reads, is likewise caught only by that check, after
+    the read.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
@@ -899,7 +901,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | Key | Default | Notes |
 |---|---|---|
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
-| `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
+| `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
 | `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, and flipped bytes can pass, since a decode does not always find them. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
@@ -909,7 +911,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
 | `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
-| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: `RESIZE_SOURCE_TOO_LARGE`, dead-lettered at once. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
+| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` rejects with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |

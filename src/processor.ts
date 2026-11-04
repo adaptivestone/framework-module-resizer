@@ -447,17 +447,23 @@ async function loadSource(
   mediaId: string,
 ): Promise<LoadedSource> {
   const { storage, decoders, limits, logger, who } = parts;
-  const bytes = asBuffer(
-    await storage.download(original.storageRef, {
+  let downloaded: Buffer | Uint8Array;
+  try {
+    downloaded = await storage.download(original.storageRef, {
       maxBytes: limits.sourceBytes,
-    }),
-  );
-  if (bytes.length > limits.sourceBytes) {
+    });
+  } catch (err) {
+    // A driver's refusal cannot name the media; a generate() caller gets it from both refusals.
+    throw lacksMediaId(err) ? withMediaId(err, mediaId) : err;
+  }
+  // Before asBuffer, which copies a Uint8Array: a file about to be refused costs no second copy.
+  if (downloaded.byteLength > limits.sourceBytes) {
     throw new ResizeMediaError(
-      `resize: source is ${bytes.length} bytes, over limits.sourceBytes (${limits.sourceBytes}) for media ${mediaId}`,
+      `resize: source is ${downloaded.byteLength} bytes, over limits.sourceBytes (${limits.sourceBytes}) for media ${mediaId}`,
       { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
     );
   }
+  const bytes = asBuffer(downloaded);
   let identified: IdentifiedSource;
   try {
     identified = await decoders.identify(bytes, limits, original.format);

@@ -10,10 +10,6 @@ import { S3Storage } from '../drivers/s3.ts';
 const NO_SUCH_KEY =
   '<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>';
 
-// Where the SDK looks for the settings a client was not given, instead of ~/.aws: a test depends on
-// neither file there.
-const NO_AWS_FILE = '/nonexistent/aws';
-
 export interface FakeS3 {
   endpoint: string;
   client: S3Client; // a real SDK client: region us-east-1, path style, fixed test credentials
@@ -54,7 +50,12 @@ export async function fakeS3(): Promise<FakeS3> {
     if (hang) {
       hangs.delete(path);
       req.socket.once('close', hang.closed);
-      res.writeHead(200, { 'content-length': hang.contentLength });
+      // Real S3 sends a checksum for an object uploaded with one, as the SDK does by default, so
+      // the driver gets the SDK's ChecksumStream around the response, not the response itself.
+      res.writeHead(200, {
+        'content-length': hang.contentLength,
+        'x-amz-checksum-crc32': 'AAAAAA==',
+      });
       res.write('xx');
       return;
     }
@@ -72,8 +73,6 @@ export async function fakeS3(): Promise<FakeS3> {
   });
   const { port } = server.address() as AddressInfo;
   const endpoint = `http://127.0.0.1:${port}`;
-  process.env.AWS_CONFIG_FILE = NO_AWS_FILE;
-  process.env.AWS_SHARED_CREDENTIALS_FILE = NO_AWS_FILE;
   const client = new S3Client({
     region: 'us-east-1',
     endpoint,

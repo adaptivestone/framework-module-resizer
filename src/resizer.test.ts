@@ -554,6 +554,45 @@ describe('ports', () => {
     );
   });
 
+  test('verify() warns when upload.maxBytes is above limits.sourceBytes, the limit that wins', async () => {
+    const warnings: unknown[] = [];
+    const logger = { ...silent, warn: (line: unknown) => warnings.push(line) };
+    const over = new Resizer({
+      logger,
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig({
+        upload: { maxBytes: 11 },
+        limits: { sourceBytes: 10 },
+      }),
+    });
+    await over.verify();
+    assert.equal(warnings.length, 1);
+    const [line] = warnings;
+    assert.match(String(line), /upload\.maxBytes \(11\)/);
+    assert.match(String(line), /limits\.sourceBytes \(10\)/);
+    assert.match(String(line), /raise limits\.sourceBytes/);
+    resetResizerForTests();
+
+    warnings.length = 0;
+    const equal = new Resizer({
+      logger,
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig({
+        upload: { maxBytes: 10 },
+        limits: { sourceBytes: 10 },
+      }),
+    });
+    await equal.verify();
+    assert.deepEqual(warnings, []);
+    resetResizerForTests();
+
+    const defaults = new Resizer({ logger, storage, media: fakeMedia() });
+    await defaults.verify();
+    assert.deepEqual(warnings, []);
+  });
+
   test('verify() rejects a media store without replacePreviews', async () => {
     let storeVerified = 0;
     // A custom store written before replacePreviews existed.

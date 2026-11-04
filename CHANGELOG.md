@@ -27,8 +27,10 @@
 - **`limits.sourceBytes`, default 256 MiB.** A worker, `generate()` and `uploadOriginal()` refuse a
   larger original with `RESIZE_SOURCE_TOO_LARGE` (`RESIZE_ORIGINAL_TOO_LARGE` at upload), since a
   ref to a 3 GB file would otherwise kill a worker on every delivery. A host with larger originals
-  raises it; it is not signed, so nothing regenerates. A complete config passed to
-  `new Resizer({ config })` must hold the key.
+  raises it; it is not signed, so nothing regenerates. A host that raised `upload.maxBytes` above
+  256 MiB has such uploads refused after the upgrade, until it raises `limits.sourceBytes` too, and
+  `verify()` logs a warning naming both. A complete config passed to `new Resizer({ config })` must
+  hold the key.
 - `upload.verify`, `limits.failOn` and `limits.sourceBytes` are required in the config type. A host
   file with `upload: { maxBytes, formats }` or a hand-written `limits`, and
   `satisfies FrameworkResizeConfig`, now fails `tsc`; spreading the defaults' `upload` and `limits`

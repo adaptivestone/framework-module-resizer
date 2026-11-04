@@ -627,10 +627,18 @@ export class Resizer {
    * carrier of this Resizer's own queue is built and checked. Framework hosts call it after
    * `Server.init()` to fail at boot instead of at the first upload or read; it is the one call
    * that rejects for a task queue that cannot be used (the read path degrades instead). The worker
-   * runs the same checks for the queue names it consumes.
+   * runs the same checks for the queue names it consumes. It also logs a warning when
+   * `upload.maxBytes` is above `limits.sourceBytes`: the stricter limit wins, since a task could
+   * never read a larger stored file, so the host's larger number silently does nothing.
    */
   async verify(): Promise<void> {
     await this.#verifyServices(undefined);
+    const { upload, limits } = this.config;
+    if (upload.maxBytes > limits.sourceBytes) {
+      this.logger.warn(
+        `resize: upload.maxBytes (${upload.maxBytes}) is above limits.sourceBytes (${limits.sourceBytes}), so uploadOriginal() refuses a larger body with RESIZE_ORIGINAL_TOO_LARGE — raise limits.sourceBytes to accept it, or lower upload.maxBytes`,
+      );
+    }
     if (this.tasks) {
       await this.#verifyRoute(this.queueName, undefined);
     }
