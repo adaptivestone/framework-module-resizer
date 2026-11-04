@@ -679,7 +679,7 @@ try {
   const scaffoldDir = join(consumer, 'scaffold-scratch');
   mkdirSync(scaffoldDir);
   console.log('→ Running the resize-scaffold bin');
-  run('npx', ['--no-install', 'resize-scaffold'], scaffoldDir);
+  run('npx', ['--no', '--', 'resize-scaffold'], scaffoldDir);
   const scaffoldFiles = [
     'src/resizer.ts',
     'src/models/ResizeTask.ts',
@@ -712,7 +712,7 @@ try {
     throw new Error('resize-scaffold did not add /var/ to .gitignore');
   }
   console.log('  ok  scaffold added /var/ to .gitignore');
-  run('npx', ['--no-install', 'resize-scaffold', '--check'], scaffoldDir);
+  run('npx', ['--no', '--', 'resize-scaffold', '--check'], scaffoldDir);
   console.log('  ok  resize-scaffold --check exited 0');
 
   // (d2) the emitted files compile against the installed package and peers, as in a framework
@@ -758,7 +758,7 @@ try {
   writeEsmPackage(eagerDir);
   run(
     'npx',
-    ['--no-install', 'resize-scaffold', '--eager', '--agents', 'skip'],
+    ['--no', '--', 'resize-scaffold', '--eager', '--agents', 'skip'],
     eagerDir,
   );
   const eagerSrc = join(eagerDir, 'src');
@@ -773,11 +773,7 @@ try {
       `resize-scaffold --eager emitted ${JSON.stringify(eagerFiles)}, expected ${JSON.stringify(expectedEagerFiles)}`,
     );
   }
-  run(
-    'npx',
-    ['--no-install', 'resize-scaffold', '--check', '--eager'],
-    eagerDir,
-  );
+  run('npx', ['--no', '--', 'resize-scaffold', '--check', '--eager'], eagerDir);
   compileScaffold(eagerDir);
   console.log('  ok  an --eager scaffold passes --check --eager and compiles');
 
@@ -787,7 +783,7 @@ try {
   writeEsmPackage(ejectDir);
   run(
     'npx',
-    ['--no-install', 'resize-scaffold', '--eject', '--agents', 'skip'],
+    ['--no', '--', 'resize-scaffold', '--eject', '--agents', 'skip'],
     ejectDir,
   );
   // The same four files as the default form, with the full model in place of the shim.
@@ -805,7 +801,7 @@ try {
       'resize-scaffold --eject did not emit the full model: src/models/ResizeTask.ts does not contain `extends BaseModel`',
     );
   }
-  run('npx', ['--no-install', 'resize-scaffold', '--check'], ejectDir);
+  run('npx', ['--no', '--', 'resize-scaffold', '--check'], ejectDir);
   compileScaffold(ejectDir);
   console.log('  ok  an --eject scaffold passes --check and compiles');
 

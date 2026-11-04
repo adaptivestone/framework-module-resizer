@@ -52,8 +52,11 @@ SQS client does not return receive counts, so failing tasks would never be dead-
 ## Quick start (framework, eager)
 
 ```bash
-npx resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
+npx --no -- resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
 ```
+
+Run it after the install. `--no` refuses to fetch a package of that name from the registry when
+this one is missing, and `--` hands the options to this command, not to npm.
 
 ```ts
 // src/config/resize.ts
@@ -66,14 +69,15 @@ export default {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
   storage: { driver: 'local', rootDir: './var/media', privateRootDir: './var/media-private',
-    publicBaseUrl: process.env.RESIZE_PUBLIC_BASE_URL || 'http://localhost:3300/media' },
+    publicBaseUrl: process.env['RESIZE_PUBLIC_BASE_URL'] || 'http://localhost:3300/media' },
 } satisfies FrameworkResizeConfig;
 ```
 
 The framework serves no static files: serve exactly `./var/media` at `publicBaseUrl` (guide:
-[Serve local files](https://framework.adaptivestone.com/docs/resize#serve-local-files)). In the run
-that writes this config, the scaffold also appends `/var/` to `.gitignore`, because private
-originals must never reach version control.
+[Serve local files](https://framework.adaptivestone.com/docs/resize#serve-local-files)), and set
+`RESIZE_PUBLIC_BASE_URL` in every deployed environment. In the run that writes this config, the
+scaffold also appends `/var/` to `.gitignore`, because private originals must never reach version
+control.
 
 ```ts
 // src/resizer.ts — behaviour only; the drivers come from the config file
@@ -135,7 +139,7 @@ same-request `resolve()` sees them. Reload the media before saving it after `gen
 `invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is
 marked modified, and saving the stale list would drop rows a worker stored since it was loaded).
 
-**Background generation.** Run `npx resize-scaffold` (without `--eager`) to add the
+**Background generation.** Run `npx --no -- resize-scaffold` (without `--eager`) to add the
 `ResizeTask` model and the `ResizeWorker` command, then:
 
 1. In `src/config/resize.ts`, define the queue and name it: `queues: { default: { driver:
@@ -155,20 +159,21 @@ marked modified, and saving the stale list would drop rows a worker stored since
 
 The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
 worker has the same Resizers as the API. Keep that import, and run
-`npx resize-scaffold --check` in CI to catch drift (`--check --eager` for an eager app). Right
+`npx --no -- resize-scaffold --check` in CI to catch drift (`--check --eager` for an eager app). Right
 after an upgrade it reports drift for every `src/config/resize.ts`, and every `resize.<NODE_ENV>.ts`
 override of it, scaffolded by an earlier version (a top-level `queue: { … }` object, or
 `defaultFrameworkResizeConfig` imported from `…/config/resize.js`; only full-line `//` comments are
 skipped, and a second Resizer's `configName` file is not checked) and for every ejected
 `ResizeTask` model without `startedAt` and `finishedAt`. This is intended: rewrite the config to
-the shape in [Config reference](#config-reference) (or move it aside, re-run `npx resize-scaffold`
-and copy your settings back), and add `startedAt: { type: Date }` and `finishedAt: { type: Date }`
-to an ejected model (or move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx
-resize-scaffold --eject`, then restore your customizations; the scaffold never overwrites a file, so
-re-running `--eject` alone changes nothing). The config file is never diffed. The model shim extends
+the shape in [Config reference](#config-reference) (or move it aside, re-run
+`npx --no -- resize-scaffold` and copy your settings back), and add `startedAt: { type: Date }` and
+`finishedAt: { type: Date }` to an ejected model (or move `src/models/ResizeTask.ts` aside (or
+delete it), re-run `npx --no -- resize-scaffold --eject`, then restore your customizations; the
+scaffold never overwrites a file, so re-running `--eject` alone changes nothing). The config file is
+never diffed. The model shim extends
 the default export of `…/framework/ResizeTaskModel.js`, which lets `npm run gen` type
 `getModel('ResizeTask')`; `--check` reports a shim from an older scaffold (fix: delete
-`src/models/ResizeTask.ts` and re-run `npx resize-scaffold`; `--force` would also overwrite
+`src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold`; `--force` would also overwrite
 `src/resizer.ts` and `src/config/resize.ts`).
 
 ## Without the framework
@@ -425,9 +430,12 @@ and keeps the parts that loaded.
 | `publicBaseUrl` | required | URL prefix, e.g. `/media`; `''` gives root-relative URLs |
 | `privateRootDir` | optional | Private originals; default `rootDir` + `-private`, and never inside `rootDir` |
 
-`rootDir` and `privateRootDir` must be non-empty (`RESIZE_CONFIG_INVALID`): an empty one resolves to
-the working directory. Never serve a parent of `rootDir`, because `privateRootDir` sits beside it by
-default and the module cannot detect that.
+`rootDir` and `privateRootDir` must hold more than whitespace (`RESIZE_CONFIG_INVALID`): an empty one
+resolves to the working directory, and `'.'` says that on purpose. Never serve a parent of `rootDir`,
+because `privateRootDir` sits beside it by default and the module cannot detect that. Its check that
+`privateRootDir` is outside `rootDir` compares paths, so a symlink between the roots, or a
+case-insensitive volume, can defeat it. An override that moves `rootDir` must move an explicit
+`privateRootDir` too: it no longer follows.
 
 The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Its paths stay in
 the strict alphabet, because they are filesystem paths. Do not put symlinks into the public tree.
@@ -1536,7 +1544,8 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   new task. `startedAt` is when the latest delivery started (every claim sets it), and
   `finishedAt` when the task completed or was dead-lettered (a retry leaves both as they are); they
   are for inspection only, and the worker never reads them. An ejected or hand-written model
-  without them keeps working (the times are dropped), but `resize-scaffold --check` reports it.
+  without them keeps working (the times are dropped), but `npx --no -- resize-scaffold --check`
+  reports it.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.

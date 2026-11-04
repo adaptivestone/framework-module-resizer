@@ -411,6 +411,16 @@ describe('LocalFsStorage.fromConfig', () => {
         '`storage.privateRootDir`',
         'a non-empty string',
       ],
+      // In a config, null stays refused, as on 0.3.0; only the constructor takes it as left out.
+      [
+        {
+          rootDir: '/srv/media',
+          publicBaseUrl: '/media',
+          privateRootDir: null,
+        },
+        '`storage.privateRootDir`',
+        'a non-empty string',
+      ],
     ];
     for (const [keys, key, kind] of cases) {
       assert.throws(
@@ -468,6 +478,86 @@ describe('LocalFsStorage.fromConfig', () => {
         }),
       { ...invalid, message: /privateRootDir must be a non-empty string/ },
     );
+  });
+
+  for (const blank of [' ', '\t', ' \n ']) {
+    test(`a whitespace-only root ${JSON.stringify(blank)} is refused as empty, from a config and from the constructor`, () => {
+      const invalid = { code: 'RESIZE_CONFIG_INVALID' };
+      assert.throws(
+        () =>
+          LocalFsStorage.fromConfig(
+            { driver: 'local', rootDir: blank, publicBaseUrl: '/m' },
+            ctx,
+          ),
+        {
+          ...invalid,
+          message: /`storage\.rootDir` in src\/config\/resize\.ts/,
+        },
+      );
+      assert.throws(
+        () =>
+          LocalFsStorage.fromConfig(
+            {
+              driver: 'local',
+              rootDir: 'a',
+              privateRootDir: blank,
+              publicBaseUrl: '/m',
+            },
+            ctx,
+          ),
+        { ...invalid, message: /`storage\.privateRootDir`/ },
+      );
+      assert.throws(
+        () => new LocalFsStorage({ rootDir: blank, publicBaseUrl: '/m' }),
+        { ...invalid, message: /rootDir must be a non-empty string/ },
+      );
+      assert.throws(
+        () =>
+          new LocalFsStorage({
+            rootDir: 'a',
+            privateRootDir: blank,
+            publicBaseUrl: '/m',
+          }),
+        { ...invalid, message: /privateRootDir must be a non-empty string/ },
+      );
+    });
+  }
+
+  test("'.' is the replacement for an empty root: it is the working directory", () => {
+    const fromCwd = LocalFsStorage.fromConfig(
+      { driver: 'local', rootDir: '.', publicBaseUrl: '/m' },
+      ctx,
+    );
+    assert.ok(fromCwd instanceof LocalFsStorage);
+    assert.ok(
+      LocalFsStorage.fromConfig(
+        {
+          driver: 'local',
+          rootDir: './var/media',
+          privateRootDir: '.',
+          publicBaseUrl: '/m',
+        },
+        ctx,
+      ) instanceof LocalFsStorage,
+    );
+  });
+
+  test('privateRootDir: null takes the default in the constructor, as before', async (t) => {
+    const dir = await fresh();
+    t.after(() =>
+      Promise.all([
+        rm(dir, { recursive: true, force: true }),
+        rm(`${join(dir, 'media')}-private`, { recursive: true, force: true }),
+      ]),
+    );
+    const s = new LocalFsStorage({
+      rootDir: join(dir, 'media'),
+      privateRootDir: null as unknown as string,
+      publicBaseUrl: '/m',
+    });
+    const ref = await s.upload(uploadArgs('originals/a.jpg', 'private'));
+    assert.ok(await readFile(join(dir, 'media-private', 'originals/a.jpg')));
+    assert.deepEqual(await s.download(ref), Buffer.from('originals/a.jpg'));
   });
 
   test('an empty publicBaseUrl is accepted as on rc.2 and gives root-relative URLs', async (t) => {

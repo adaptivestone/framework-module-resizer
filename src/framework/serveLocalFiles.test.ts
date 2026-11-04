@@ -1,4 +1,3 @@
-// biome-ignore-all lint/style/useBlockStatements: `bootHttp` below is the guide's text, byte for byte
 // Runs the guide's "Serve local files" recipe on the framework's own server, because the recipe
 // rests on what the framework does around `bootHttp`: it serves no static files, and it mounts its
 // 404 page after the hook. Models are skipped, so no Mongo is needed; the DSN only passes the boot
@@ -12,12 +11,16 @@ import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import Server, { type BootHttpHook } from '@adaptivestone/framework/server.js';
 
+// biome-ignore-start lint/style/useBlockStatements: the guide's text, byte for byte
+// biome-ignore-start lint/complexity/useLiteralKeys: the guide's text, byte for byte
 // biome-ignore format: the guide's text, byte for byte
 const bootHttp: BootHttpHook = async (app) => {
-  if (process.env.NODE_ENV === 'production') return; // a reverse proxy or a CDN serves these files
+  if (process.env['NODE_ENV'] === 'production') return; // a reverse proxy or a CDN serves these files
   const { default: express } = await import('express'); // npm i -D express
   app.httpServer?.express.use('/media', express.static('var/media', { dotfiles: 'ignore', index: false, immutable: true, maxAge: '1y' }));
 };
+// biome-ignore-end lint/complexity/useLiteralKeys: the guide's text, byte for byte
+// biome-ignore-end lint/style/useBlockStatements: the guide's text, byte for byte
 
 const startDir = process.cwd();
 const startEnv = process.env.NODE_ENV;

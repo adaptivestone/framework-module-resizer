@@ -60,14 +60,25 @@
 - **A host decoder's originals are private unless the decoder sets `publicOriginals: true`.** A
   public upload otherwise throws `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it; a host
   decoder that takes over a built-in format adds one line.
-- **`rootDir: ''` and `privateRootDir: ''` are refused** with `RESIZE_CONFIG_INVALID`, because an
-  empty environment variable put private originals in the working directory.
+- **`rootDir: ''` and `privateRootDir: ''` are refused** with `RESIZE_CONFIG_INVALID`, and so is a
+  whitespace-only root. An empty root resolves to the working directory: `rootDir: ''` put previews
+  there and originals in `<cwd>-private`, and `privateRootDir: ''` put private originals there. A
+  whitespace-only root made a folder of that name. From a config the refusal comes at first use or
+  `verify()`, and `resolve()` then logs an `error` and returns an empty decision, so previews stored
+  earlier stop being served until the root is fixed. `new LocalFsStorage()` throws at construction.
+  The replacement for `''` is `'.'`, which is the same folder.
 
 **Changed behaviour**
 
 - The scaffold writes an explicit `privateRootDir` and an absolute `publicBaseUrl` from
   `RESIZE_PUBLIC_BASE_URL`, has new next steps, and appends `/var/` to `.gitignore` in the run that
-  writes the config. Existing configs are not touched.
+  writes the config, before it writes the config. A file it cannot write stops the run with exit 1,
+  naming what failed. A `!` line for `var` beside a host's rule gets a warning. Existing configs are
+  not touched. An override that moves `rootDir` on a scaffolded config must move `privateRootDir`
+  too, since it no longer follows.
+- The documented command is `npx --no -- resize-scaffold`. Without `--no`, a run with the package
+  missing fetches and runs whatever the registry holds under that name. Without the `--`, npm takes
+  the options for itself: npm 12 refuses them, and npm 11 runs the scaffold without them.
 - The worker logs task failures itself: `warn` on a retried failure, `error` on a dead-letter, with
   the code, attempt and cause on one line. `NoopMetrics` does not silence them, so a host that
   alerts on `error` gets new alerts. The task row holds the same one-line text, so a multi-line

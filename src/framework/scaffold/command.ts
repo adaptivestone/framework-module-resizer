@@ -140,7 +140,7 @@ const OLD_OVERRIDE_HINT =
   "uses the old config shape — define the queue in queues of src/config/resize.ts (or in this override), e.g. queues: { default: { driver: 'sqs', queueUrl: '…' } }, set queue to its name, then delete the old queue: { … } object (CHANGELOG 0.3.0); only full-line // comments are skipped";
 
 const OLD_CONFIG_HINT =
-  "uses the old config shape — define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run resize-scaffold and copy your settings back (only full-line // comments are skipped; a configName file of another Resizer is not checked)";
+  "uses the old config shape — define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run npx --no -- resize-scaffold and copy your settings back (only full-line // comments are skipped; a configName file of another Resizer is not checked)";
 
 // --agents pointer: make the shipped AGENTS.md discoverable from the host's own agent file.
 // Append-only + marker-idempotent — the scaffold NEVER rewrites host-authored content.
@@ -218,7 +218,7 @@ async function writeFiles(
   root: string,
   specs: FileSpec[],
   force: boolean,
-): Promise<number> {
+): Promise<void> {
   for (const spec of specs) {
     const dest = join(root, spec.target);
     const already = await fileExists(dest);
@@ -234,7 +234,6 @@ async function writeFiles(
     await writeFile(dest, content);
     console.log(`${pad(already ? 'overwrote' : 'created')}${spec.target}`);
   }
-  return 0;
 }
 
 interface CheckItem {
@@ -261,12 +260,12 @@ async function checkFiles(root: string, eager: boolean): Promise<number> {
           MODEL_MARKERS.every((marker) => c.includes(marker)) ||
           (EJECTED_MODEL_MARKERS.every((marker) => c.includes(marker)) &&
             EJECTED_MODEL_FIELDS.every((field) => field.test(c))),
-        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework/ResizeTaskModel.js (or be an ejected BaseModel with resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields) — delete the file and re-run resize-scaffold for a fresh shim; for an ejected model, port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields (and the gate index), or delete the file and re-run resize-scaffold --eject',
+        hint: 'must extend ResizeTaskModel from @adaptivestone/framework-module-resize/framework/ResizeTaskModel.js (or be an ejected BaseModel with resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields) — delete the file and re-run npx --no -- resize-scaffold for a fresh shim; for an ejected model, port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields (and the gate index), or delete the file and re-run npx --no -- resize-scaffold --eject',
       },
       {
         target: COMMAND,
         validate: (c) => COMMAND_MARKERS.every((marker) => c.includes(marker)),
-        hint: 'must import ../resizer.ts and export the module command — delete it and re-run resize-scaffold',
+        hint: 'must import ../resizer.ts and export the module command — delete it and re-run npx --no -- resize-scaffold',
       },
     );
   }
@@ -345,25 +344,38 @@ async function writeAgentsPointer(
 }
 
 const IGNORE_ENTRY = '/var/';
-// Each line is trimmed first. A negation, a comment or a deeper path such as src/var does not count.
+// Each line is read as git reads it, with only its trailing spaces stripped: a leading space or a
+// tab is part of the pattern. A negation, a comment or a deeper path such as src/var does not count.
 const IGNORES_VAR = /^\/?var(\/(\*\*?)?)?$/;
+const REINCLUDES_VAR = /^!\/?(\*\*\/)?var(\/|$)/;
 
 /**
  * The scaffolded local storage writes under ./var, private originals included, and those must never
  * reach version control, so the run that writes the config also ignores the folder. Append-only,
  * like the agents pointer: a host's lines are never rewritten, and a rule it already has is kept.
+ * The appended rule comes last, so it wins over any `!` line above it; a `!` line beside a host's own
+ * rule stays, because it is the host's choice, and gets a warning.
  */
 async function ignoreLocalStorage(root: string): Promise<void> {
   const dest = join(root, '.gitignore');
   const existing = (await fileExists(dest))
     ? await readFile(dest, 'utf8')
     : null;
-  if (existing?.split(/\r?\n/).some((line) => IGNORES_VAR.test(line.trim()))) {
-    console.log(`${pad('exists (skipped)')}.gitignore`);
+  const lines = (existing ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/ +$/, ''));
+  if (lines.some((line) => IGNORES_VAR.test(line))) {
+    console.log(
+      lines.some((line) => REINCLUDES_VAR.test(line))
+        ? `${pad('warning')}.gitignore — a ! line can bring var/ back into version control, private originals included: check with git check-ignore var/media-private/x`
+        : `${pad('exists (skipped)')}.gitignore`,
+    );
     return;
   }
   const block = `# Local resize storage: private originals and previews\n${IGNORE_ENTRY}\n`;
   const kept = existing?.trimEnd();
+  // This runs first, so a new --out folder does not exist yet.
+  await mkdir(root, { recursive: true });
   await writeFile(dest, kept ? `${kept}\n\n${block}` : block);
   console.log(`${pad(existing === null ? 'created' : 'appended')}.gitignore`);
 }
@@ -371,26 +383,34 @@ async function ignoreLocalStorage(root: string): Promise<void> {
 const NEXT_COMMON = `  1. src/config/resize.ts: set mediaModelName to your media model ('File' is a guess) and check storage.
   2. Spread resizeMediaSchemaFragment into that model.
   3. Local storage: the framework serves no static files, so serve var/media at publicBaseUrl
-     (guide: "Serve local files"). Serve only that folder, never var/ itself.`;
+     (guide: "Serve local files"). Serve only that folder, never var/ itself.
+     Set RESIZE_PUBLIC_BASE_URL in every deployed environment: unset, previews get localhost URLs.`;
 
 const NEXT_EAGER = `
 Done. Next:
 ${NEXT_COMMON}
   4. Import src/resizer.ts where you need the Resizer, and call generate() at upload.`;
 
-const NEXT_QUEUED = `
+const QUEUE_WRITTEN = `\`queues\` in src/config/resize.ts defines the 'default' queue: driver 'database' needs no Lock
+     model; a queue on driver 'sqs' needs the framework's Lock indexes instead.`;
+
+// A config this run kept can be an eager one, which holds no queue.
+const QUEUE_KEPT = `src/config/resize.ts was kept: if it has no \`queues\`, add queues: { default: { driver: 'database' } } and queue: 'default'.
+     Driver 'database' needs no Lock model; a queue on driver 'sqs' needs the framework's Lock indexes instead.`;
+
+const nextQueued = (configWritten: boolean): string => `
 Done. Next:
 ${NEXT_COMMON}
   4. Create the ResizeTask indexes through your migrations; the worker refuses to start without them.
-     \`queues\` in src/config/resize.ts defines the 'default' queue: driver 'database' needs no Lock
-     model; a queue on driver 'sqs' needs the framework's Lock indexes instead.
+     ${configWritten ? QUEUE_WRITTEN : QUEUE_KEPT}
   5. Import src/resizer.ts where you need the Resizer. The ResizeWorker command imports it too.
   6. Set worker.enabled for the worker to run (worker: { enabled: true } in src/config/resize.ts or an environment file),
      then: npm run cli ResizeWorker`;
 
 const USAGE = `resize-scaffold — vendor the resize module's integration files into a host project.
 
-Usage: npx resize-scaffold [options]   (after npm i @adaptivestone/framework-module-resize)
+Usage: npx --no -- resize-scaffold [options]   (after npm i @adaptivestone/framework-module-resize)
+       --no refuses to fetch a package of that name from the registry; -- hands the options to this command
 
 Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — new FrameworkResizer({ pipelines, hooks })
@@ -416,7 +436,8 @@ Options:
 
 /**
  * Programmatic entry (also what the shebang calls). Returns the process exit code:
- * 0 on success/clean-check, 1 on a failed --check or a usage error. Never calls process.exit.
+ * 0 on success/clean-check, 1 on a failed --check, a usage error or a file it could not write.
+ * Never calls process.exit.
  */
 export async function runScaffold(
   argv: string[],
@@ -479,13 +500,26 @@ export async function runScaffold(
   // Asked before writeFiles, which would make the config exist either way.
   const writesConfig =
     Boolean(values.force) || !(await fileExists(join(root, CONFIG)));
-  const code = await writeFiles(root, specs, Boolean(values.force));
-  await writeAgentsPointer(root, agents as AgentsMode);
-  if (writesConfig) {
-    await ignoreLocalStorage(root);
+  // The rule goes first: a config on disk means later runs skip this step, so a failure must leave
+  // no config, and the re-run retries. A raw error may not say what failed: reading a directory
+  // named .gitignore reports only EISDIR.
+  let writing = '.gitignore';
+  try {
+    if (writesConfig) {
+      await ignoreLocalStorage(root);
+    }
+    writing = 'the integration files';
+    await writeFiles(root, specs, Boolean(values.force));
+    writing = 'the agents pointer';
+    await writeAgentsPointer(root, agents as AgentsMode);
+  } catch (err) {
+    console.error(
+      `\nresize-scaffold: could not write ${writing}: ${(err as Error).message}`,
+    );
+    return 1;
   }
-  console.log(values.eager ? NEXT_EAGER : NEXT_QUEUED);
-  return code;
+  console.log(values.eager ? NEXT_EAGER : nextQueued(writesConfig));
+  return 0;
 }
 
 // Auto-run ONLY when executed directly as the bin (realpath-safe), not when imported by tests.

@@ -11,17 +11,21 @@ import {
 
 export default {
   ...defaultFrameworkResizeConfig,
-  // The name of your media model. 'File' is a guess: change it if yours has another name (a wrong
-  // name fails on first use with RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN).
+  // The name of your media model. 'File' is a guess: change it if yours has another name. With a wrong
+  // name, verify() and generate() throw RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN, uploadOriginal() succeeds,
+  // and resolve() returns the variants as missing.
   mediaModelName: 'File',
   // Files on the local disk. The framework serves no static files, so run something that serves
   // exactly `rootDir` at `publicBaseUrl` (guide: "Serve local files"). Never serve a folder above
-  // `rootDir`: `privateRootDir` holds the private originals beside it. Use an absolute URL when the
-  // frontend is on another origin. For S3 in production, put in resize.production.ts (npm i
-  // @aws-sdk/client-s3; credentials come from the AWS SDK's default chain):
+  // `rootDir`: `privateRootDir` holds the private originals beside it. An override that moves
+  // `rootDir` must move `privateRootDir` too: it no longer follows. Use an absolute URL when the
+  // frontend is on another origin, and set RESIZE_PUBLIC_BASE_URL in every deployed environment:
+  // unset, previews get http://localhost:3300/media/… URLs. For S3 in production, put in
+  // resize.production.ts (npm i @aws-sdk/client-s3; credentials come from the AWS SDK's default
+  // chain):
   //   storage: { driver: 's3', bucketPublic: '…', bucketPrivate: '…', publicBaseUrl: 'https://…' },
   storage: { driver: 'local', rootDir: './var/media', privateRootDir: './var/media-private',
-    publicBaseUrl: process.env.RESIZE_PUBLIC_BASE_URL || 'http://localhost:3300/media' },
+    publicBaseUrl: process.env['RESIZE_PUBLIC_BASE_URL'] || 'http://localhost:3300/media' },
   // The queue this Resizer's tasks go to: a name from `queues` below; false = eager only.
   queue: 'default',
 

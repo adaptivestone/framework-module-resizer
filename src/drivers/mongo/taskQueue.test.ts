@@ -442,7 +442,7 @@ describe('MongoTaskQueue setup', () => {
         /no resizer, queue, availableAt, active, cooldownUntil field/.test(
           error.message,
         ) &&
-        /delete src\/models\/ResizeTask\.ts and re-run resize-scaffold/.test(
+        /delete src\/models\/ResizeTask\.ts and re-run npx --no -- resize-scaffold/.test(
           error.message,
         ) &&
         /--eject/.test(error.message) &&
