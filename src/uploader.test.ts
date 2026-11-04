@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1296,12 +1297,12 @@ describe('upload.verify', () => {
   });
 
   test("upload.verify 'decode' never renders an SVG", async () => {
+    // No `vector` flag: the format's name alone skips the render.
     const svgInfo: SourceInfo = {
       format: 'svg',
       contentType: 'image/svg+xml',
       width: 10,
       height: 10,
-      vector: true,
     };
     const { uploader, uploads } = verifying(
       new DecoderSet([
@@ -1315,6 +1316,58 @@ describe('upload.verify', () => {
       visibility: 'private',
     });
     assert.equal(original.format, 'svg');
+    assert.equal(uploads.length, 1);
+  });
+
+  test("upload.verify 'decode' never renders a host decoder's vector source", async () => {
+    let renders = 0;
+    const { uploader, uploads } = verifying(
+      new DecoderSet([
+        renderingDecoder({ ...pdfInfo, vector: true }, async () => {
+          renders += 1;
+          throw new Error('a vector source must not render at upload');
+        }),
+      ]),
+    );
+    const original = await uploader.upload({
+      body: somePdf,
+      visibility: 'private',
+    });
+    assert.equal(original.format, 'pdf');
+    assert.equal(renders, 0);
+    assert.equal(uploads.length, 1);
+  });
+
+  test("upload.verify 'decode' reads the first frame only", async () => {
+    const frames = 6;
+    const side = 60;
+    // Random pixels, so each frame takes about a sixth of the file.
+    const gif = await sharp(randomBytes(side * side * frames * 3), {
+      raw: {
+        width: side,
+        height: side * frames,
+        channels: 3,
+        pageHeight: side,
+      },
+    })
+      .gif({ delay: Array(frames).fill(100) })
+      .toBuffer();
+    const { uploader, uploads } = verifying();
+    await uploader.upload({ body: cut(gif), visibility: 'private' });
+    assert.equal(uploads.length, 1);
+    // A cut inside the first frame, which `inspect` already finds.
+    await assert.rejects(
+      uploader.upload({
+        body: gif.subarray(0, Math.floor(gif.length / 20)),
+        visibility: 'private',
+      }),
+      {
+        code: 'RESIZE_ORIGINAL_INVALID',
+        retryable: false,
+        message:
+          /^resize uploadOriginal: bytes are not a supported image: gifload_buffer:/,
+      },
+    );
     assert.equal(uploads.length, 1);
   });
 
@@ -1357,11 +1410,11 @@ describe('upload.verify', () => {
         'heif: Error while loading plugin: Support for this compression format has not been built in',
       ],
       [
-        new ResizeMediaError('the test decoder gave up', {
+        new ResizeMediaError('the test decoder is busy', {
           code: 'TEST_CODE',
-          retryable: false,
+          retryable: true,
         }),
-        'the test decoder gave up',
+        'the test decoder is busy',
       ],
     ] as const) {
       const { uploader, uploads } = verifying(refusingRender(cause));
@@ -1383,6 +1436,50 @@ describe('upload.verify', () => {
     }
   });
 
+  test("a host decoder's final refusal during the check keeps its code and retryable, as at inspect", async () => {
+    const cause = new ResizeMediaError('the PDF is encrypted', {
+      code: 'TEST_ENCRYPTED',
+      retryable: false,
+    });
+    const { uploader, uploads } = verifying(refusingRender(cause));
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: ResizeOriginalError) => {
+        assert.ok(err instanceof ResizeOriginalError);
+        assert.equal(err.code, 'TEST_ENCRYPTED');
+        assert.equal(err.retryable, false);
+        assert.equal(err.message, 'the PDF is encrypted');
+        assert.equal(err.cause, cause);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
+  test('a module error whose retryable cannot be read stays RESIZE_ORIGINAL_VERIFY_FAILED', async () => {
+    const cause = Object.defineProperty(
+      new ResizeMediaError('the test decoder gave up', { code: 'TEST_CODE' }),
+      'retryable',
+      {
+        get() {
+          throw new Error('no');
+        },
+      },
+    );
+    const { uploader, uploads } = verifying(refusingRender(cause));
+    await assert.rejects(
+      uploader.upload({ body: somePdf, visibility: 'private' }),
+      (err: ResizeOriginalError) => {
+        assert.ok(err instanceof ResizeOriginalError);
+        assert.equal(err.code, 'RESIZE_ORIGINAL_VERIFY_FAILED');
+        assert.equal(err.retryable, true);
+        assert.equal(err.cause, cause);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('a thrown value that cannot be read does not break the verify error', async () => {
     for (const cause of unreadableValues()) {
       const { uploader, uploads } = verifying(refusingRender(cause));
@@ -1391,7 +1488,12 @@ describe('upload.verify', () => {
         (err: ResizeOriginalError) => {
           assert.ok(err instanceof ResizeOriginalError);
           assert.equal(err.code, 'RESIZE_ORIGINAL_VERIFY_FAILED');
+          assert.equal(err.retryable, true);
           assert.ok(err.cause === cause, 'the cause is that very value');
+          assert.equal(
+            err.message,
+            'resize uploadOriginal: the decode check failed: a thrown value that cannot be printed',
+          );
           return true;
         },
       );

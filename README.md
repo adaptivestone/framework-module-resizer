@@ -811,7 +811,9 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   frames (one when the decoder cannot animate), at least `box` on both sides where the decoder's
   limits allow. The core resizes it to each exact size either way, and a raster source smaller
   than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
-  its engine can. A raster whose `data` length does not match its `info` is
+  its engine can. With `upload.verify: 'decode'` a host's `render` also runs in the API process
+  during `uploadOriginal()`, with no `opts.signal`, so the decoder bounds its own time; a source
+  that reports `vector` is not rendered there. A raster whose `data` length does not match its `info` is
   `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
   `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
   (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
@@ -850,19 +852,23 @@ media has no stored format) and every other decoder refuses them too, it fails w
 **What an upload rejection says.** `uploadOriginal()` throws a `ResizeOriginalError` whose message
 carries the engine's line, for example `resize uploadOriginal: bytes are not a supported image:
 gifload_buffer: Unexpected end of GIF source data`. The code is the stable part: the text may change
-with Sharp, and it may reach end users through `badRequest(err.message)`. A `ResizeOriginalError` is
-not retryable by default, since the same bytes get the same refusal. The exceptions say what they
-are:
+with Sharp, and it may reach end users through `badRequest(err.message)`. Check `err.retryable`: when
+it is `true`, the failure is not about the file, so answer with your own text. A
+`ResizeOriginalError` is not retryable by default, since the same bytes get the same refusal. The
+exceptions say what they are:
 
 - `RESIZE_ORIGINAL_INSPECT_FAILED` (`retryable: true`): a decoder failed for a reason other than the
   bytes, such as a timeout, a host decoder's own failure, a healthy file this build cannot decode or
   an engine failure with no detail. Retry may help, and `cause` says why.
 - `RESIZE_ORIGINAL_VERIFY_FAILED` (`retryable: true`): the `upload.verify: 'decode'` check failed for
-  a reason other than damage, such as a timeout or a healthy file this build cannot decode. It says
-  nothing about the image, and `cause` says why.
+  a reason other than damage, such as a timeout or a healthy file this build cannot decode. It gave
+  no verdict on the image, and `cause` says why. A host decoder's own error with `retryable: false`
+  (an encrypted PDF, say) is not this code: it keeps its code and `retryable`, as at `inspect`.
 
 `RESIZE_ORIGINAL_DAMAGED` (`retryable: false`) comes only from that check. Damage `inspect` finds
-first, such as a cut GIF, stays `RESIZE_ORIGINAL_INVALID`.
+first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays
+`RESIZE_ORIGINAL_INVALID`. The check decodes the first frame only: an animation damaged in a later
+frame is stored, and a worker then renders the frames it has or fails the task.
 
 ## Config reference
 
@@ -877,7 +883,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
-| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. SVG is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
+| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame is stored. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |

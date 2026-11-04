@@ -17,6 +17,10 @@
   an unrecognised decoder failure during `inspect` is the new `RESIZE_ORIGINAL_INSPECT_FAILED`
   (`true`), where it was `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
   now hold `upload.verify`.
+- `upload.verify` and `limits.failOn` are required in the config type. A host file with
+  `upload: { maxBytes, formats }` or a hand-written `limits`, and `satisfies FrameworkResizeConfig`,
+  now fails `tsc`; spreading the defaults' `upload` and `limits` still compiles. At run time such a
+  file still works: the module merges it over the defaults.
 
 **Changed behaviour**
 
@@ -27,8 +31,8 @@
 
 **Features**
 
-- `upload.verify: 'decode'` (default `'none'`) decodes a raster original once before storing it,
-  with `RESIZE_ORIGINAL_DAMAGED` (`false`) and `RESIZE_ORIGINAL_VERIFY_FAILED` (`true`).
+- `upload.verify: 'decode'` (default `'none'`) decodes the first frame of a raster original before
+  storing it, with `RESIZE_ORIGINAL_DAMAGED` (`false`) and `RESIZE_ORIGINAL_VERIFY_FAILED` (`true`).
 
 **Fixes**
 

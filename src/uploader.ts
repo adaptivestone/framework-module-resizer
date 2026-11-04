@@ -12,7 +12,7 @@ import {
   ResizeStorageError,
 } from './errors.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
-import { isModuleError, messageText } from './helpers/log.ts';
+import { isModuleError, messageText, notRetryable } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { engineDetail, isUnsupportedBytes } from './helpers/sharpError.ts';
 import { errorCodeLabel, NoopMetrics } from './metrics.ts';
@@ -135,11 +135,12 @@ async function verifyDecodes(
           { code: 'RESIZE_ORIGINAL_DAMAGED', cause },
         );
       }
-      if (ORIGINAL_CODES.has(cause.code)) {
+      // The decoder's own word that no retry can help (an encrypted PDF) stands, as at `inspect`.
+      if (ORIGINAL_CODES.has(cause.code) || notRetryable(cause)) {
         throw originalError(cause);
       }
     }
-    // A timeout, or a file this build cannot decode, says nothing about the image.
+    // A timeout, or a file this build cannot decode, gives no verdict on the image.
     throw new ResizeOriginalError(
       `resize uploadOriginal: the decode check failed: ${uploadDetail(messageText(cause))}`,
       { code: 'RESIZE_ORIGINAL_VERIFY_FAILED', retryable: true, cause },
@@ -272,8 +273,13 @@ export class Uploader {
         { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
       );
     }
-    // SVG is skipped: inspect has parsed its XML, and a render starts a process per upload.
-    if (config.upload.verify === 'decode' && measured.format !== 'svg') {
+    // No vector source renders on the request path: inspect has parsed an SVG's XML, and its render
+    // starts a process per upload. A host's vector decoder says so with `vector`.
+    if (
+      config.upload.verify === 'decode' &&
+      measured.format !== 'svg' &&
+      !measured.info.vector
+    ) {
       await verifyDecodes(measured, body, config);
     }
     const key = `originals/${randomHex()}.${measured.extension}`;

@@ -30,7 +30,7 @@ export interface DecodeBox {
 
 export interface RenderOptions {
   limits: ResizeLimits;
-  /** Aborts when the task does; a decoder stops when it can. */
+  /** Aborts when the task does; a decoder stops when it can. Absent in the upload.verify check. */
   signal?: AbortSignal;
   /** What `inspect` returned for these bytes. */
   source: SourceInfo;
