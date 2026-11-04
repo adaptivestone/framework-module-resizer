@@ -288,6 +288,21 @@ assert.equal(typeof sqs.SqsTaskQueue, 'function', 'SqsTaskQueue should be a clas
 const s3 = await import(PKG + '/drivers/s3.js');
 assert.equal(typeof s3.S3Storage, 'function', 'S3Storage should be a class');
 console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classes');
+
+// This install has no presigner, so the import above shows no static import of it came back, and
+// this is a real module-not-found from Node, not a test hook's copy of its wording.
+assert.throws(
+  () => import.meta.resolve('@aws-sdk/s3-request-presigner'),
+  { code: 'ERR_MODULE_NOT_FOUND' },
+  'this step must run without the presigner',
+);
+const storage = new s3.S3Storage({ bucketPublic: 'cdn', bucketPrivate: 'priv', region: 'us-east-1' });
+await assert.rejects(storage.signedUrl({ bucket: 'priv', key: 'a.jpg' }, 60), (err) => {
+  assert.equal(err.code, 'RESIZE_PEER_MISSING');
+  assert.ok(err.message.includes('@aws-sdk/s3-request-presigner'));
+  return true;
+});
+console.log('  ok  without the presigner the s3 subpath loads, and signedUrl rejects with RESIZE_PEER_MISSING');
 `;
 
 // Compiled inside the throwaway consumer so package resolution and declarations come from the
@@ -785,7 +800,8 @@ try {
   compileScaffold(ejectDir);
   console.log('  ok  an --eject scaffold passes --check and compiles');
 
-  // (e) install the AWS SDKs, then the sqs/s3 subpaths must import and expose their classes.
+  // (e) install the AWS SDKs a host needs, then the sqs/s3 subpaths must import and expose their
+  // classes. The presigner stays out on purpose: only signedUrl may ask for it.
   console.log('→ Installing the AWS SDKs, re-checking the optional subpaths');
   run(
     'npm',
@@ -794,7 +810,6 @@ try {
       '--no-audit',
       '--no-fund',
       '@aws-sdk/client-s3',
-      '@aws-sdk/s3-request-presigner',
       '@aws-sdk/client-sqs',
     ],
     consumer,

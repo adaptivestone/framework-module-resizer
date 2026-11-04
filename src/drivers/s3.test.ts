@@ -522,7 +522,7 @@ describe('S3Storage', () => {
         return true;
       },
     );
-    // Nothing is lost when it is unset, for example from an empty environment lookup.
+    // Nothing is lost when it is undefined, for example from an unset environment variable.
     new S3Storage({
       bucketPublic: 'pub',
       publicUrl: undefined,
@@ -681,6 +681,23 @@ describe('S3Storage.fromConfig', () => {
         message:
           /`storage\.publicUrl` in src\/config\/resize\.production\.ts is no longer supported — use `storage\.publicBaseUrl`/,
       },
+    );
+  });
+
+  test('storage.publicUrl left undefined is not refused, since nothing is lost', () => {
+    // For example from an unset environment variable.
+    const s = S3Storage.fromConfig(
+      {
+        driver: 's3',
+        bucketPublic: 'pub',
+        region: 'eu-west-1',
+        publicUrl: undefined,
+      } as unknown as S3StorageConfig,
+      ctx,
+    );
+    assert.equal(
+      s.publicUrl(ref),
+      'https://pub.s3.eu-west-1.amazonaws.com/previews/a.jpg',
     );
   });
 

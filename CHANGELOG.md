@@ -52,8 +52,10 @@
 - **Removed, as promised:** the types `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
   `FrameworkS3StorageConfig` (use `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`), and the
   `S3Storage` option `publicUrl` (use `publicBaseUrl`). The option now throws
-  `RESIZE_CONFIG_REMOVED_KEY` at construction, in a config section too, because a JavaScript host
-  would otherwise fall through silently to bucket URLs.
+  `RESIZE_CONFIG_REMOVED_KEY` when `S3Storage` is constructed. In a config section the same code
+  comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews used
+  the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so call
+  `verify()` at boot.
 
 **Changed behaviour**
 
@@ -90,6 +92,9 @@
   not change. Keys the module writes, `namespace` and the local driver stay strict.
 - The S3 driver loads `@aws-sdk/s3-request-presigner` only inside `signedUrl`. `verify()` no longer
   asks for it; a missing one is `RESIZE_PEER_MISSING` at that call.
+- `resolve()` on a Resizer that could not start logs its `error` once per Resizer and error, where
+  it logged on every read, so a busy API does not flood its log. `resize.read` with the outcome
+  `failed` still counts every read. `prewarm()` logs as before.
 
 **Features**
 

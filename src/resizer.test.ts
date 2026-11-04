@@ -1737,6 +1737,66 @@ describe('metrics', () => {
     );
   });
 
+  test('a Resizer that cannot start logs one line per error however many reads fail, counts every read, and serves after a later good build', async () => {
+    const errors: unknown[][] = [];
+    const sink = recordingMetrics();
+    let failure: string | undefined = 'storage down';
+    const r = new Resizer({
+      storage: async () => {
+        if (failure) {
+          throw new Error(failure);
+        }
+        return fakeStorage();
+      },
+      media: fakeMedia(),
+      metrics: sink,
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    });
+    const resolve = () =>
+      r.resolve({ media: { id: 'm1' }, sizes: [{ width: 10, height: 10 }] });
+    const read = async () => {
+      const { decision } = await resolve();
+      assert.deepEqual(decision, { ready: [], missing: [] });
+    };
+    const logged = () => errors.map(([, err]) => (err as Error).message);
+
+    await read();
+    await read();
+    await read();
+    assert.deepEqual(logged(), ['storage down']);
+    assert.match(
+      String(errors[0][0]),
+      /the Resizer could not start .* \(logged once per Resizer and error\)$/,
+    );
+
+    // Each read builds again: another failure is news.
+    failure = 'storage still down';
+    await read();
+    await read();
+    assert.deepEqual(logged(), ['storage down', 'storage still down']);
+
+    // One seen before stays quiet.
+    failure = 'storage down';
+    await read();
+    assert.equal(errors.length, 2);
+
+    // The log is quiet, so the metric is what shows the rate.
+    const outcomes = () => sink.calls.map((call) => call.labels?.outcome);
+    assert.deepEqual(outcomes(), Array(6).fill('failed'));
+
+    // A good build ends the path: no line says so, and the next read gets past it.
+    failure = undefined;
+    const { decision } = await resolve();
+    assert.ok(decision.missing.length > 0);
+    assert.equal(errors.length, 2);
+    assert.equal(outcomes().length, 7);
+    assert.notEqual(outcomes().at(-1), 'failed');
+  });
+
   test('resolve() never throws when reading the options throws inside the read', async () => {
     const sink = recordingMetrics();
     const r = new Resizer({

@@ -24,7 +24,7 @@ import {
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { firstTime, logNeverThrow, messageText } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { boundMetrics, isMetrics, LogMetrics } from './metrics.ts';
 import { PipelineRegistry } from './pipelines.ts';
@@ -213,6 +213,9 @@ export class Resizer {
   // flight. A part whose function failed is retried alone; the parts that loaded are kept.
   readonly #loadedParts = new Set<PartName>();
   readonly #loadingParts = new Map<PartName, Promise<void>>();
+  // Why resolve() could not start, each logged once: every read tries again and fails the same way,
+  // and a busy API would flood its log. A good build ends that path, so nothing here is cleared.
+  readonly #loggedStartFailures = new Set<string>();
   readonly #pipelines: PipelineRegistry;
   readonly #hooks: HookBus;
   // The decoders that read originals, built once: the Processor renders every task through them.
@@ -733,11 +736,13 @@ export class Resizer {
       // The Reader guards the rest, but it does not exist until ready() succeeds.
       services = await this.#services();
     } catch (err) {
-      logNeverThrow(
-        this.logger,
-        'resize resolve: the Resizer could not start — returning the safe empty decision',
-        err,
-      );
+      if (firstTime(this.#loggedStartFailures, messageText(err))) {
+        logNeverThrow(
+          this.logger,
+          'resize resolve: the Resizer could not start — returning the safe empty decision (logged once per Resizer and error)',
+          err,
+        );
+      }
       // Counted like a read that failed inside the Reader; `opts` may be missing (a JS host), and
       // reading it may throw (a getter): the label then falls back to 'default'.
       let pipeline = 'default';

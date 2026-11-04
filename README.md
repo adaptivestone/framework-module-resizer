@@ -1620,8 +1620,11 @@ await ResizeTask.updateOne(
 - **What a read logs:** a read writes a log line only for what an operator must fix, and only once
   per Resizer (once more after its task queue is set up again): an unregistered pipeline name
   (`error`, once per name, for at most 100 names), a format list without `encode.formats` entries
-  (`error`, once per list, for at most 100 lists), and, when the caller passed
-  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. Every read is counted
+  (`error`, once per list, for at most 100 lists), a Resizer that could not start (`error`, once per
+  error message, for at most 100 messages), and, when the caller passed `enqueueMissing: true` to a
+  Resizer without a task queue, one `warn`. Each read of a Resizer that could not start builds it
+  again: a build that fails with a new message logs that message, and a good build ends this with no
+  line of its own, so a read then serves as usual. Every read is counted
   instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A stored preview whose
   `publicUrl` throws, and an enqueue that throws, are still logged on every read. `prewarm()` logs
   as before.
