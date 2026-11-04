@@ -43,6 +43,7 @@ import {
   ResizeMediaError,
   ResizeNoOriginalError,
   ResizeSetupError,
+  ResizeStorageError,
 } from './errors.ts';
 import ResizeWorker from './framework/ResizeWorkerCommand.ts';
 import { FrameworkResizer } from './framework/resizer.ts';
@@ -611,6 +612,25 @@ const timedGif = await sharp(solidFrames(RGB, 20, 20), {
   .gif({ delay: [100, 200, 300], loop: 3 })
   .toBuffer();
 
+// Noise, so a cut falls inside image data. A cut JPEG passes inspect and fails at render; a cut GIF
+// fails at inspect.
+const noise = () =>
+  sharp({
+    create: {
+      width: 400,
+      height: 300,
+      channels: 3,
+      background: '#808080',
+      noise: { type: 'gaussian', mean: 128, sigma: 60 },
+    },
+  });
+const fullJpeg = await noise().jpeg().toBuffer();
+const fullGif = await noise().gif().toBuffer();
+const firstHalf = (bytes: Buffer) =>
+  bytes.subarray(0, Math.floor(bytes.length / 2));
+const cutJpeg = firstHalf(fullJpeg);
+const cutGif = firstHalf(fullGif);
+
 describe('decoding the source', () => {
   /** Deps whose storage serves `fixture` and records uploads, and whose media store records appends. */
   function decodeDeps(
@@ -687,6 +707,140 @@ describe('decoding the source', () => {
     );
     assert.equal(uploads.length, 0);
     assert.equal(appendCalls.length, 0);
+  });
+
+  describe('a damaged source', () => {
+    test('a damaged source fails with RESIZE_SOURCE_DAMAGED, not retryable, naming the media', async () => {
+      const { deps, uploads, media } = decodeDeps(cutJpeg, {
+        original: { format: 'jpeg', size: cutJpeg.length },
+      });
+      const isDamaged = (err: ResizeMediaError) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        assert.match(err.message, /limits\.failOn 'error'.*\(media m1\)/);
+        return true;
+      };
+      const processor = new Processor(deps);
+      await assert.rejects(
+        processor.processTask(task({ previews: [variant()] })),
+        isDamaged,
+      );
+      await assert.rejects(
+        processor.generate({
+          media: media(),
+          sizes: [{ width: 20, height: 20 }],
+        }),
+        isDamaged,
+      );
+      assert.equal(uploads.length, 0);
+    });
+
+    for (const [site, bytes, format, whole] of [
+      ['render', cutJpeg, 'jpeg', fullJpeg],
+      ['inspect', cutGif, 'gif', fullGif],
+    ] as const) {
+      test(`a short download stays retryable (it fails at ${site})`, async () => {
+        const { deps, uploads } = decodeDeps(bytes, {
+          original: { format, size: whole.length },
+        });
+        await assert.rejects(
+          new Processor(deps).processTask(task({ previews: [variant()] })),
+          (err: ResizeMediaError) => {
+            assert.ok(err instanceof ResizeMediaError);
+            assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED', err.message);
+            assert.equal(err.retryable, true);
+            assert.equal(err.mediaId, 'm1');
+            assert.match(
+              err.message,
+              /downloaded \d+ bytes, the upload stored \d+/,
+            );
+            assert.equal(
+              (err.cause as ResizeError).code,
+              'RESIZE_SOURCE_DAMAGED',
+            );
+            return true;
+          },
+        );
+        assert.equal(uploads.length, 0);
+      });
+
+      test(`without a size, a damaged source is still damaged (it fails at ${site})`, async () => {
+        const { deps } = decodeDeps(bytes, { original: { format } });
+        await assert.rejects(
+          new Processor(deps).processTask(task({ previews: [variant()] })),
+          { code: 'RESIZE_SOURCE_DAMAGED', retryable: false },
+        );
+      });
+    }
+
+    test('an engine failure with no detail stays retryable: it is no evidence of damage', async () => {
+      const magic = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const { deps, uploads } = decodeDeps(magic, {
+        original: { format: 'png', size: magic.length },
+      });
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews: [variant()] })),
+        (err: ResizeMediaError) => {
+          assert.ok(err instanceof ResizeMediaError);
+          assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED', err.message);
+          assert.equal(err.retryable, true);
+          assert.equal(err.mediaId, 'm1');
+          assert.match(err.message, /the engine gave no detail/);
+          assert.ok(err.cause instanceof Error);
+          return true;
+        },
+      );
+      assert.equal(uploads.length, 0);
+    });
+
+    test('a failure at render on a format no decoder lists stays retryable', async () => {
+      const { deps, uploads } = decodeDeps(cutJpeg, {
+        original: { format: 'pdf' },
+      });
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews: [variant()] })),
+        (err: ResizeMediaError) => {
+          assert.ok(err instanceof ResizeMediaError);
+          assert.equal(err.code, 'RESIZE_SOURCE_DECODE_FAILED', err.message);
+          assert.equal(err.retryable, true);
+          assert.equal(err.mediaId, 'm1');
+          assert.match(
+            err.message,
+            /no decoder in this process lists its stored format 'pdf'/,
+          );
+          assert.equal(
+            (err.cause as ResizeError).code,
+            'RESIZE_SOURCE_DAMAGED',
+          );
+          return true;
+        },
+      );
+      assert.equal(uploads.length, 0);
+    });
+
+    test('original.size never reaches the signature', async () => {
+      const originOf = async (original: Partial<Original>) => {
+        const { deps } = decodeDeps(redPng, { original });
+        const { created } = await new Processor(deps).generate({
+          media: mediaDoc({ original }),
+          sizes: [{ width: 20, height: 20 }],
+          formats: ['webp'],
+          persist: false,
+        });
+        assert.equal(created.length, 1);
+        return created[0].origin;
+      };
+      const without = await originOf({ format: 'png' });
+      assert.equal(typeof without, 'string');
+      assert.equal(
+        await originOf({ format: 'png', size: redPng.length }),
+        without,
+      );
+    });
   });
 
   test('a source Sharp cannot decode fails with RESIZE_SOURCE_DECODE_FAILED, retryable, with the media id and the cause', async () => {
@@ -1351,12 +1505,198 @@ describe('decoding the source', () => {
       (err: unknown) => err instanceof ResizeGenerateError,
     );
     assert.equal(uploads.length, 0);
-    const [message, err] = logs.error[0];
+    assert.deepEqual(logs.error, []);
+    const [message, err] = logs.warn[0];
     assert.match(String(message), /variant .* failed for media m1/);
     assert.ok(err instanceof ResizeMediaError);
     assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
+    // Only a custom step reaches it, and a deploy with a fixed step can succeed.
+    assert.equal(err.retryable, true);
     assert.equal(err.mediaId, 'm1');
     assert.match(err.message, /\(media m1\)$/);
+  });
+
+  test('a storage upload that returns no locator fails its variant with RESIZE_PREVIEW_STORAGE_REF_INVALID, retryable', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(redPng, { logger });
+    deps.storage.upload = async () => null;
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => err instanceof ResizeGenerateError,
+    );
+    const [message, err] = logs.warn[0];
+    assert.match(String(message), /variant .* failed for media m1/);
+    assert.ok(err instanceof ResizeStorageError);
+    assert.equal(err.code, 'RESIZE_PREVIEW_STORAGE_REF_INVALID');
+    assert.equal(err.retryable, true);
+  });
+
+  // A host step that knows its variant can never be made.
+  const refuse = (): never => {
+    throw new ResizeMediaError('resize: this variant cannot be made', {
+      code: 'TEST_VARIANT_REFUSED',
+      retryable: false,
+    });
+  };
+
+  describe('RESIZE_WORKER_INCOMPLETE and the failures behind it', () => {
+    const bigger = variant({
+      sizeKey: '30x30',
+      requestedWidth: 30,
+      requestedHeight: 30,
+    });
+    const incomplete = async (
+      deps: ProcessorDeps,
+      previews: MissingPreview[],
+    ) => {
+      let thrown: unknown;
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews })),
+        (err: unknown) => {
+          thrown = err;
+          return (
+            err instanceof ResizeGenerateError &&
+            err.code === 'RESIZE_WORKER_INCOMPLETE'
+          );
+        },
+      );
+      return thrown as ResizeGenerateError;
+    };
+
+    test('RESIZE_WORKER_INCOMPLETE is not retryable when every missing variant failed with retryable false', async () => {
+      const { deps } = decodeDeps(redPng, {
+        pipeline: { variantSteps: [refuse] },
+      });
+      const err = await incomplete(deps, [variant(), bigger]);
+      assert.equal(err.missing.length, 2);
+      assert.equal(err.retryable, false);
+    });
+
+    test('RESIZE_WORKER_INCOMPLETE stays retryable when one missing variant failed with true', async () => {
+      const { deps } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (_img, { variant: v }) => {
+              if (v.sizeKey === '30x30') {
+                throw new Error('a passing failure');
+              }
+              return refuse();
+            },
+          ],
+        },
+      });
+      const err = await incomplete(deps, [variant(), bigger]);
+      assert.equal(err.missing.length, 2);
+      assert.equal(err.retryable, true);
+    });
+
+    test('RESIZE_WORKER_INCOMPLETE stays retryable for a missing variant with no recorded failure', async () => {
+      const { deps } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (img, { variant: v }) => (v.sizeKey === '30x30' ? img : refuse()),
+          ],
+        },
+      });
+      // The store leaves the rendered row out: it is missing, and no failure says why.
+      deps.media = fakeMedia({
+        load: async () => mediaDoc(),
+        appendPreviews: async () => [],
+      });
+      const err = await incomplete(deps, [variant(), bigger]);
+      assert.equal(err.missing.length, 2);
+      assert.equal(err.retryable, true);
+    });
+
+    test('an unconfigured format stays retryable: a rolling deploy can add it', async () => {
+      const { deps } = decodeDeps(redPng);
+      const alone = await incomplete(deps, [variant({ format: 'jpg' })]);
+      assert.equal(alone.retryable, true);
+      // Beside a variant that can never be made, too.
+      const { deps: refusing } = decodeDeps(redPng, {
+        pipeline: { variantSteps: [refuse] },
+      });
+      const beside = await incomplete(refusing, [
+        variant(),
+        variant({ format: 'jpg' }),
+      ]);
+      assert.equal(beside.missing.length, 2);
+      assert.equal(beside.retryable, true);
+    });
+  });
+
+  describe('RESIZE_GENERATE_FAILED and the failures behind it', () => {
+    const generateFailure = async (
+      deps: ProcessorDeps,
+      media: MediaLike,
+    ): Promise<ResizeGenerateError> => {
+      let thrown: unknown;
+      await assert.rejects(
+        new Processor(deps).generate({
+          media,
+          sizes: [
+            { width: 20, height: 20 },
+            { width: 30, height: 30 },
+          ],
+        }),
+        (err: unknown) => {
+          thrown = err;
+          return (
+            err instanceof ResizeGenerateError &&
+            err.code === 'RESIZE_GENERATE_FAILED'
+          );
+        },
+      );
+      return thrown as ResizeGenerateError;
+    };
+
+    test('RESIZE_GENERATE_FAILED is not retryable when every variant failed with retryable false', async () => {
+      const { deps, media } = decodeDeps(redPng, {
+        pipeline: { variantSteps: [refuse] },
+      });
+      const err = await generateFailure(deps, media());
+      assert.equal(err.failed, 2);
+      assert.equal(err.retryable, false);
+    });
+
+    test('RESIZE_GENERATE_FAILED stays retryable when one variant failed with true', async () => {
+      const { deps, media } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (_img, { variant: v }) => {
+              if (v.sizeKey === '30x30') {
+                throw new Error('a passing failure');
+              }
+              return refuse();
+            },
+          ],
+        },
+      });
+      const err = await generateFailure(deps, media());
+      assert.equal(err.failed, 2);
+      assert.equal(err.retryable, true);
+    });
+
+    test('RESIZE_GENERATE_FAILED stays retryable when the store left a rendered row out', async () => {
+      const { deps, media } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (img, { variant: v }) => (v.sizeKey === '30x30' ? img : refuse()),
+          ],
+        },
+      });
+      // One variant can never be made, and a retry can still store the other.
+      deps.media = fakeMedia({
+        load: async () => mediaDoc(),
+        appendPreviews: async () => [],
+      });
+      const err = await generateFailure(deps, media());
+      assert.equal(err.failed, 1);
+      assert.equal(err.retryable, true);
+    });
   });
 
   test('JPEG bytes stored as png render as jpeg, with a warning naming both formats', async () => {
@@ -1375,6 +1715,58 @@ describe('decoding the source', () => {
       String(logs.warn[0][0]),
       /media m1 is stored as 'png' but its bytes are 'jpeg' \(its decoder read another of its formats\); rendering it as 'jpeg'/,
     );
+  });
+
+  test('an eager source mismatch warning says resize generate', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(plainJpeg, {
+      logger,
+      original: { format: 'png' },
+    });
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 20, height: 20 }],
+    });
+    assert.match(String(logs.warn[0][0]), /^resize generate: media m1 /);
+  });
+
+  test('a queued source mismatch warning still says resize worker', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps } = decodeDeps(plainJpeg, {
+      logger,
+      original: { format: 'png' },
+    });
+    await new Processor(deps).processTask(task({ previews: [variant()] }));
+    assert.match(String(logs.warn[0][0]), /^resize worker: media m1 /);
+  });
+
+  test('an eager variant failure says resize generate', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps, media } = decodeDeps(redPng, { logger });
+    deps.storage.upload = async () => {
+      throw new Error('upload down');
+    };
+    await assert.rejects(
+      new Processor(deps).generate({
+        media: media(),
+        sizes: [{ width: 20, height: 20 }],
+      }),
+      (err: unknown) => err instanceof ResizeGenerateError,
+    );
+    assert.match(String(logs.warn[0][0]), /^resize generate: variant /);
+  });
+
+  test('a queued variant failure still says resize worker', async () => {
+    const { logger, logs } = recordingLogger();
+    const { deps } = decodeDeps(redPng, { logger });
+    deps.storage.upload = async () => {
+      throw new Error('upload down');
+    };
+    await assert.rejects(
+      new Processor(deps).processTask(task({ previews: [variant()] })),
+      { code: 'RESIZE_WORKER_INCOMPLETE' },
+    );
+    assert.match(String(logs.warn[0][0]), /^resize worker: variant /);
   });
 
   test('a host decoder that lists the stored format and refuses: the warning names the decoders, not two equal formats', async () => {
@@ -1406,8 +1798,79 @@ describe('decoding the source', () => {
     assert.doesNotMatch(message, /but its bytes are/);
     assert.match(
       message,
-      /stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder read them/,
+      /^resize generate: media m1 is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder read them/,
     );
+  });
+});
+
+describe('what processTask resolves', () => {
+  const sizes = ['20x20', '30x30', '40x40'].map((sizeKey) => {
+    const side = Number(sizeKey.split('x')[0]);
+    return variant({ sizeKey, requestedWidth: side, requestedHeight: side });
+  });
+  const stored = (sizeKey: string) =>
+    ({
+      sizeKey,
+      format: 'jpeg',
+      storageRef: { key: sizeKey },
+      contentType: 'image/jpeg',
+    }) as unknown as Preview;
+
+  test('processTask resolves what it rendered', async () => {
+    const deps = processorDeps();
+    const doc = stampFresh(
+      mediaDoc({
+        original: { width: 64, height: 48 },
+        previews: [stored('20x20'), stored('30x30')],
+      }),
+      { config: deps.config },
+    );
+    deps.media = makeMediaStore(doc).mediaStore;
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 1 },
+    );
+  });
+
+  test('a task whose previews are all fresh rendered nothing', async () => {
+    const deps = processorDeps();
+    const doc = stampFresh(
+      mediaDoc({
+        original: { width: 64, height: 48 },
+        previews: sizes.map((size) => stored(size.sizeKey)),
+      }),
+      { config: deps.config },
+    );
+    deps.media = makeMediaStore(doc).mediaStore;
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 0 },
+    );
+  });
+
+  test('a media with no document rendered nothing', async () => {
+    const deps = processorDeps();
+    deps.media = makeMediaStore(null).mediaStore;
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 0 },
+    );
+  });
+
+  test('a media deleted while the task ran counts as nothing rendered', async () => {
+    const deps = processorDeps();
+    let loads = 0;
+    deps.media = fakeMedia({
+      load: async () => {
+        loads += 1;
+        return loads === 1 ? mediaDoc() : null;
+      },
+    });
+    assert.deepEqual(
+      await new Processor(deps).processTask(task({ previews: sizes })),
+      { requested: 3, rendered: 0 },
+    );
+    assert.equal(loads, 2);
   });
 });
 
@@ -3352,7 +3815,7 @@ describe('unconfigured formats', () => {
       ['jpeg'],
     );
     assert.ok(
-      logs.error.some(
+      logs.warn.some(
         (entry) =>
           entry[1] instanceof ResizeSetupError &&
           entry[1].code === 'RESIZE_FORMAT_NOT_CONFIGURED',
@@ -4477,7 +4940,7 @@ describe('runResizeWorker', () => {
     await runResizeWorker();
     assert.deepEqual(claimedQueues, []);
     assert.ok(
-      logs.info.some((l) =>
+      logs.warn.some((l) =>
         String(l[0]).includes(
           'set worker: { enabled: true } in src/config/resize.ts',
         ),
@@ -4906,7 +5369,7 @@ describe('one worker serves every Resizer', () => {
     });
     await addTask(tasks, { resizer: 'listings' });
     await addTask(tasks, { resizer: 'listings', mediaId: 'bad' });
-    await runWorker({ signal: controller.signal });
+    await runWorker({ signal: controller.signal, logger: silent });
     assert.deepEqual(seen, [
       ['listings', 'completed'],
       ['listings', 'failed', boom],
@@ -5502,7 +5965,7 @@ describe('variant metrics', () => {
     );
   });
 
-  test('a failed variant records failed with its code and is still logged at error', async () => {
+  test('a failed variant records failed with its code and is still logged, as a warning', async () => {
     const { deps, metrics } = measuredDeps();
     const { logger, logs } = recordingLogger();
     deps.logger = logger;
@@ -5541,7 +6004,7 @@ describe('variant metrics', () => {
     assert.match(identity, /:10x10:/);
     assert.deepEqual(failedCalls[0].context, { mediaId: 'm1', identity });
     assert.ok(
-      logs.error.some((a) =>
+      logs.warn.some((a) =>
         String(a[0]).includes(`variant ${identity} failed for media m1`),
       ),
     );

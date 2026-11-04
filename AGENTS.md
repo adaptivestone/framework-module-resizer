@@ -107,8 +107,8 @@ gets the full box its steps were written for. To hand the private original to it
    `storage: { driver: 'gcs', … }` then `satisfies FrameworkResizeConfig<{ storage: { gcs: typeof
    GcsStorage } }>`; every `FrameworkResizer` of the process must pass the same `drivers.queue`
    map, else `RESIZE_DRIVER_CONFLICT`), `metrics` (a `ResizeMetrics` sink for reads, uploads,
-   variants and task outcomes; default a `LogMetrics` on its `logger` option, else the app logger,
-   with debug lines on: one summary `info` line per window and one per task outcome;
+   variants and task outcomes; default a `LogMetrics` on its `logger` option, else the app logger:
+   one summary `info` line per window and one per task outcome;
    `new NoopMetrics()` turns it off; only `undefined` means the default, `null` is
    `RESIZE_METRICS_INVALID`; see the README `Metrics` section). `resizer.queue` is gone: read `resizer.queueName`.
    `resizer.tasks` may be a `RoutingTaskQueue` (several backends in `queues`): it has no
@@ -297,9 +297,9 @@ gets the full box its steps were written for. To hand the private original to it
    migration, in this order:
    - create the gate index `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` (unique, partial on
      `active: true`) BEFORE the new API and workers start: it keeps one task per media, pipeline
-     and queue. Without it every `add()` stores a task, duplicate active rows build up, and the
-     unique index build then fails with E11000 until those rows are no longer active (completed,
-     or dead and taken over or expired);
+     and queue. Without it concurrent `add()` calls can each store a task, duplicate active rows
+     build up, and the unique index build then fails with E11000 until those rows are no longer
+     active (completed, or dead and taken over or expired);
    - create the claim index `{ queue: 1, status: 1, availableAt: 1 }` before or together with the
      new workers, then drop the old lease index (`{ status: 1, createdAt: 1 }`, or
      `{ queue: 1, status: 1, createdAt: 1 }` from a pre-release build);
@@ -412,13 +412,15 @@ queue) reports with the same canonical payload; conflicting payloads with one pr
 are explicit errors. A requested variant the active task does not cover stays `unconfirmed` with
 the retryable `RESIZE_TASK_IN_FLIGHT` (also while a dead task cools down): call `prewarm()` again
 after that task ends. On a queue without `gatesByTask` (SQS) a held gate lock is the retryable
-`RESIZE_ENQUEUE_LOCK_CONTENDED`. An `unconfirmed` add is the retryable
-`RESIZE_ENQUEUE_UNCONFIRMED`; an add result that is not a `TaskAddResult` (a custom queue written
+`RESIZE_ENQUEUE_LOCK_CONTENDED`. An `unconfirmed` add is `RESIZE_ENQUEUE_UNCONFIRMED`, retryable
+unless the queue says otherwise (`retryable: false` with a `causeCode`, as `MongoTaskQueue` does
+for a missing or outdated model); an add result that is not a `TaskAddResult` (a custom queue written
 for an older version) is never counted as queued and gets the same code, not retryable, logged
 once. An unexpected internal error is `incomplete` with a `RESIZE_ENQUEUE_INTERNAL_ERROR` issue.
 An issue may carry an optional `causeCode`, the code of the error behind it when that code is not
 an issue code (a driver's own code or `RESIZE_PEER_MISSING` under `RESIZE_ENQUEUE_QUEUE_FAILED`,
-`RESIZE_LOCKS_REQUIRED` under `RESIZE_ENQUEUE_LOCK_FAILED`); the set of issue codes is unchanged.
+`RESIZE_LOCKS_REQUIRED` under `RESIZE_ENQUEUE_LOCK_FAILED`, what a queue names under
+`RESIZE_ENQUEUE_UNCONFIRMED`); the set of issue codes is unchanged.
 The [`prewarm()` issues table](./README.md#prewarm-issues) in `README.md` lists every issue code,
 when it happens and its `retryable`. Delivery remains at-least-once, not exactly-once.
 
@@ -432,7 +434,13 @@ const { created, failed } = await getResizer().generate({
 ```
 
 No original throws `ResizeNoOriginalError`; every requested variant failing throws
-`ResizeGenerateError`. `created` is only this call; `failed > 0` means a partial success.
+`ResizeGenerateError` (`retryable: false` when every one failed with `retryable: false`; its `cause`
+is the first failure, and its message leaves that out). A source
+the engine refuses rejects before any variant runs: on a cut JPEG, which 0.3.0 rendered, it is
+`ResizeMediaError` `RESIZE_SOURCE_DAMAGED`, not `ResizeGenerateError`, so a handler catching only
+`ResizeGenerateError` returns 500 on a user's upload (catch `ResizeError`, or refuse the file at
+upload with `upload.verify: 'decode'`). `created` is only this call; `failed > 0` means a partial
+success.
 `generate` also appends `created` onto `media.previews` (when persist is on) so a same-request
 `resolve({ media })` sees them. Reload the media before saving it after `generate()` or
 `invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is
@@ -444,17 +452,26 @@ is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this re
 request path; `ResizeNoOriginalError` and `ResizeOriginalError` extend it), `ResizeGenerateError`
 (eager produced nothing or queued coverage is incomplete),
 `ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
-Every instance carries a stable `err.code` and `err.retryable` (default `true`; `false`: no retry
-can help). The worker reads `retryable` on the error that fails the task, when it is a
-`ResizeError` — including one from a duplicate copy of the package; errors from other libraries
-are retried. It dead-letters the task at once when it is `false`; an error inside one variant
-(`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with the
-retryable `RESIZE_WORKER_INCOMPLETE`. A source that cannot be decoded is a `ResizeError`
-(usually a `ResizeMediaError`: `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the engine's error
-as `cause`, or the decoder's own code; a missing or broken decoder is a `ResizeSetupError`), so
-the catch below still routes it to `badRequest`. Use `ResizeError.isResizeError(err)` rather than
-`instanceof` when the error may cross a package boundary — duplicate copies of the package break
-`instanceof` but not the symbol brand.
+Every instance carries a stable `err.code` and `err.retryable` (default `true`, but
+`ResizeOriginalError`, `ResizeConfigError` and `ResizeSecurityError` default to `false`; `false`: no
+later delivery of the same input can succeed, a delivery after a rolling deploy included, so
+`RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay `true`). The worker reads `retryable`
+on the error that fails the task, when it is a `ResizeError` — including one from a duplicate copy
+of the package; errors from other libraries are retried. It dead-letters the task at once when it is `false`; an error inside one variant
+(`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with
+`RESIZE_WORKER_INCOMPLETE`, whose `cause` is the first failure: retryable, unless every missing
+variant failed with `retryable: false` and the media still holds the original they were rendered
+from, when the task is dead-lettered at once. A final error of the whole task obeys the same rule:
+when a reload finds that the media holds another original, the task fails with the retryable
+`RESIZE_WORKER_INCOMPLETE`, with that error as `cause`, and its next delivery renders the new one. A
+source that cannot be decoded is a `ResizeError`
+(usually a `ResizeMediaError`: `RESIZE_SOURCE_DAMAGED`, `retryable: false`, when the engine refuses
+a cut or unreadable source; `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the
+engine's error as `cause`, for any other reason; or the decoder's own code; a missing or broken
+decoder is a `ResizeSetupError`), so the catch below still handles it: a retryable error gave no
+verdict on the file, and its message can be raw engine text, so it gets your own answer. Use
+`ResizeError.isResizeError(err)` rather than `instanceof` when the error may cross a package
+boundary — duplicate copies of the package break `instanceof` but not the symbol brand.
 
 ```ts
 import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
@@ -463,7 +480,7 @@ try {
   await getResizer().generate({ media: fileDoc, sizes: catalog });
 } catch (err) {
   if (err instanceof ResizeNoOriginalError) return badRequest('upload the image first');
-  if (ResizeError.isResizeError(err)) return badRequest(err.message);
+  if (ResizeError.isResizeError(err)) return err.retryable ? tryAgainLater() : badRequest(err.message);
   throw err; // not ours
 }
 ```
@@ -535,8 +552,13 @@ Metrics: the default sink writes log lines. To send them elsewhere, or to turn t
 ```ts
 import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize';
 // new FrameworkResizer({ metrics: new NoopMetrics() })                    // off
-// new FrameworkResizer({ metrics: new LogMetrics(logger) })               // no debug lines
-// API shutdown: await getResizer().metrics.flush?.()                      // write the open summary
+// new FrameworkResizer({ metrics: new LogMetrics(logger, { debug: true }) }) // debug lines too
+// API shutdown: the open summary is written on the framework's `shutdown` event, which
+// startServer() (on SIGTERM or SIGINT) and its CLI (after a command returns) emit: no code of yours.
+// Call `await getResizer().metrics.flush?.()` yourself in a script on `new Server()` + init(), for a
+// FrameworkResizer with every part in code first used before the Server exists, before a CLI command
+// returns when the sink's flush is asynchronous (the listener does not wait, and the CLI entry calls
+// process.exit), and in your SIGTERM handler without the framework.
 ```
 
 ## Rules (violations cause real incidents)
@@ -582,9 +604,10 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 - `original.format` should be the decoder's id (`jpeg`, `png`, `svg`, …; not `jpg` or a MIME
   type), as `uploadOriginal()` returns it. The worker tries that decoder first; a mismatch is
   logged as a warning and the bytes are probed, so the preview still renders: fix the record.
-- Never resize/encode with sharp on the request path. `uploadOriginal()` has one bounded exception:
-  the decoders' `inspect()` (Sharp's `metadata()` for raster images and SVG); it never emits
-  transformed bytes.
+- Never resize/encode with sharp on the request path. `uploadOriginal()` has two bounded exceptions:
+  the decoders' `inspect()`, and, only with `upload.verify: 'decode'`, one decode to a 16 px raster
+  for a raster format, which emits no bytes. It costs about 0.1 s for a 24 MP JPEG and about 1 s for
+  a 24 MP PNG on a Sharp thread, not on the event loop.
 - The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
   must keep its `import '../resizer.ts'`. Gate drift in CI with `npx resize-scaffold --check`
   (`--check --eager` for an eager host, which has no model or command to check). Right after an
@@ -596,7 +619,9 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 - Deleting storage objects is the HOST's job — the module only appends rows, and `invalidate`
   only removes rows and returns their storage refs.
 - A queued raster task completes only with full identity coverage. Partial successes are persisted,
-  then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter.
+  then retried for the missing identities only; persistent gaps follow normal backoff/dead-letter,
+  at once when every missing variant failed with `retryable: false` on an original the media still
+  holds.
 
 ## Troubleshooting
 
@@ -616,7 +641,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_MEDIA_APPEND_RESULT_INVALID` | a custom `MediaStore.appendPreviews` resolved with something other than an array — resolve with the previews it stored (`[]` when none) |
 | `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`, or a driver passed in `drivers`) to the config named in the message (a config file, or the config passed to `createResizer()`), or pass `storage` to `new FrameworkResizer()` or `createResizer()` |
 | `RESIZE_FS_PRIVATE_ROOT_PUBLIC` (`ResizeSecurityError`) when `LocalFsStorage` is constructed (from a config file: at first use or `verify()`) | `privateRootDir` is `rootDir` itself or inside it, so private originals would be served — put it outside `rootDir` (`storage.privateRootDir` in the config file), or leave it out for `rootDir` + `-private` |
-| `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` section without a driver name, a `storage` or `queues` driver name the Resizer does not have (not `'local'` / `'s3'` or `'database'` / `'sqs'`, nor a name in its `drivers`; checked when the Resizer first reads that section, so for a config file on first use or in `verify()`, and a disabled worker only logs that it is disabled), a `database` section of `createResizer` without driver `'mongo'` (or a registered one), a `'mongo'` `database` section whose `connection` is not a Mongoose connection (`mongoose` itself is refused: pass `mongoose.connection`) or whose `mediaModel` has no `findById` and `findOneAndUpdate` functions, a `'database'` queue in a `createResizer` config without a `database` section, a `queues` map that is not an object of names, a `queues` entry with a blank name or without a `driver`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), an unknown `worker` key (e.g. a misspelled `sharpConcurency`), or image settings of the wrong type (`maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`) — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use), except an unregistered `queues` or `database` driver name in it and what a driver checks in its own section (the `'mongo'` `connection` and `mediaModel`, say), which are reported on first use or `verify()` (an unregistered `storage` driver in it throws at construction) |
+| `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` section without a driver name, a `storage` or `queues` driver name the Resizer does not have (not `'local'` / `'s3'` or `'database'` / `'sqs'`, nor a name in its `drivers`; checked when the Resizer first reads that section, so for a config file on first use or in `verify()`, and a disabled worker never checks it: it logs a `warn`, and the command resolves `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1), a `database` section of `createResizer` without driver `'mongo'` (or a registered one), a `'mongo'` `database` section whose `connection` is not a Mongoose connection (`mongoose` itself is refused: pass `mongoose.connection`) or whose `mediaModel` has no `findById` and `findOneAndUpdate` functions, a `'database'` queue in a `createResizer` config without a `database` section, a `queues` map that is not an object of names, a `queues` entry with a blank name or without a `driver`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), an unknown `worker` key (e.g. a misspelled `sharpConcurency`), or image settings of the wrong type (`upload.verify`, `maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`) — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use), except an unregistered `queues` or `database` driver name in it and what a driver checks in its own section (the `'mongo'` `connection` and `mediaModel`, say), which are reported on first use or `verify()` (an unregistered `storage` driver in it throws at construction) |
 | `RESIZE_CONFIG_UPLOAD_INVALID`, `RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID` or `RESIZE_CONFIG_UPLOAD_FORMATS_INVALID` | `upload` is not an object, `upload.maxBytes` is not a positive safe integer, or `upload.formats` is not a non-empty list of non-empty format ids — fix that key, e.g. spread the defaults' `upload` and change one value |
 | `RESIZE_NOT_READY` | host code read `resizer.storage` / `media` / `locks` / `tasks`, or a `resizer.queueName` that comes from the config file (or from a function), before the Resizer loaded them — `await resizer.ready()` first (the Resizer's methods do this themselves). A string `queueName` option is readable at once. `resizer.queue` is gone: read `resizer.queueName` |
 | `RESIZE_CONFIG_REMOVED_KEY` naming `queue` or `worker` | a core config passed to `new Resizer` holds image settings only — move timing to the task queue's `timing`; framework hosts define queues in `queues` and keep `worker` in `src/config/resize.ts`; `worker.concurrency` (in a framework config file too) moves to the top-level `concurrency` |
@@ -624,8 +649,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_CONFIG_COORDINATION_INVALID` from `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it) | `coordination` is not an object, or a value in it is not a positive safe integer (ms; `0` is rejected too, so the cooldown cannot be turned off) — fix the key the message names, or the whole section when the message shows its value (`coordination` in `src/config/resize.ts`, the only file it is read from since it is process-wide, or the `coordination` option) |
 | `RESIZE_TASK_IN_FLIGHT` in `prewarm()` issues (`retryable: true`) | a task for this media, pipeline and queue is active, or a dead one is cooling down, and it does not cover these variants: one task per media, pipeline and queue runs at a time — call `prewarm()` again after it ends (a read after it ends queues them too) |
 | `RESIZE_ENQUEUE_LOCK_CONTENDED` in `prewarm()` issues (`retryable: true`) | a task queue without `gatesByTask` (SQS): the gate lock of this Resizer, media, pipeline and queue is held — a task of theirs is queued, running or waiting for a retry, a dead one's `coordination.cooldownMs` runs, or an add that threw or was not confirmed keeps the lock for one lease (at most `coordination.gateTtlMs`). SQS cannot report which variants that task holds, so none is accepted — call `prewarm()` again after the task ends (a read after it ends queues them too) |
-| `RESIZE_ENQUEUE_UNCONFIRMED` in `prewarm()` issues | `retryable: true` (even for an unregistered or outdated model): the task queue's `add()` resolved `unconfirmed`, so the queue did not confirm the task — on `MongoTaskQueue` a database error or a duplicate key on another unique index of the host's `ResizeTask` model (each logged), an unregistered `ResizeTask` model (logged), or an outdated one (`RESIZE_MONGO_MODEL_OUTDATED`, logged once; every add stays unconfirmed until it is fixed); on SQS a send that returned no `MessageId`. Fix the logged cause first, then call `prewarm()` again. `retryable: false`: a custom `TaskQueue` resolved a value in none of the `TaskAddResult` shapes (written for an older version, e.g. `{ taskId }`), logged once — resolve `{ status: 'added', taskId }`, `{ status: 'in-flight', taskId? }` or `{ status: 'unconfirmed' }` |
-| `RESIZE_MONGO_INDEX_MISSING` from `verify()` or at worker start, or the warning "reported a task in flight without its id" | the `ResizeTask` collection has no gate index — unique on exactly `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }` (or `{ active: { $eq: true } }`) — or does not exist yet, or an index on those keys lacks `unique` or that partial filter, or Mongoose's own index build (`autoIndex`) failed (the error's `cause`, e.g. duplicate active rows) (without the filter every add after a completed task is in flight with no id and nothing queues). Create it through your migration (e.g. `ResizeTask.createIndexes()` or `syncIndexes()`; drop a wrong index on those keys first); the module never creates indexes, and a worker on the framework CLI (`autoIndex` off) neither builds them nor waits for a build: create them before it starts (step 7) |
+| `RESIZE_ENQUEUE_UNCONFIRMED` in `prewarm()` issues | `retryable: true`: the task queue's `add()` resolved `unconfirmed`, so the queue did not confirm the task — on `MongoTaskQueue` a database error or a duplicate key on another unique index of the host's `ResizeTask` model (each logged); on SQS a send that returned no `MessageId`. Fix the logged cause first, then call `prewarm()` again. `retryable: false` with `causeCode`: an unregistered `ResizeTask` model (`RESIZE_MONGO_MODEL_MISSING`, logged), an outdated one (`RESIZE_MONGO_MODEL_OUTDATED`, logged once; every add stays unconfirmed until it is fixed), or what a custom queue names: calling again cannot help until it is fixed. `retryable: false` without one: a custom `TaskQueue` resolved a value in none of the `TaskAddResult` shapes (written for an older version, e.g. `{ taskId }`), logged once — resolve `{ status: 'added', taskId }`, `{ status: 'in-flight', taskId? }` or `{ status: 'unconfirmed' }` |
+| `RESIZE_MONGO_INDEX_MISSING` from `verify()` or at worker start, logged once as an `error` by the first added task (once per model, in the background: reads never wait for it, and the line ends in what the gap costs: concurrent adds can each store a duplicate active task, or, for a unique index without the filter, nothing queues), or the warning "reported a task in flight without its id" | the `ResizeTask` collection has no gate index — unique on exactly `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }` (or `{ active: { $eq: true } }`) — or does not exist yet, or an index on those keys lacks `unique` or that partial filter, or Mongoose's own index build (`autoIndex`) failed (the error's `cause`, e.g. duplicate active rows) (without the filter every add after a completed task is in flight with no id and nothing queues). Create it through your migration (e.g. `ResizeTask.createIndexes()` or `syncIndexes()`; drop a wrong index on those keys first); the module never creates indexes, and a worker on the framework CLI (`autoIndex` off) neither builds them nor waits for a build: create them before it starts (step 7) |
 | `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), the lock model (the framework's `Lock`, needed only beside a task queue without `gatesByTask`, or the model passed to `MongoLockStore`), or the media model of a plain `MongoMediaStore` (framework hosts get `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` instead) |
 | `RESIZE_MONGO_MODEL_OUTDATED` from `verify()`, at worker start, or logged once by `add()` (every add is then unconfirmed and queues nothing until the model is fixed; claims reject with it), or `resize-scaffold --check` reports drift in `src/models/ResizeTask.ts` | a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `availableAt`, `active` or `cooldownUntil` fields: port them (and the `{ queue, status, availableAt }` index and the gate index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx resize-scaffold --eject`. Right after the upgrade `--check` also reports every ejected model without `startedAt` and `finishedAt` — intended (such a model keeps working; the times are dropped and `RESIZE_MONGO_MODEL_OUTDATED` does not list them): add both as `{ type: Date }`, or move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`, then restore your customizations (re-running `--eject` alone never overwrites the file) |
 | `resize-scaffold --check` reports drift in `src/config/resize.ts` or a `resize.<NODE_ENV>.ts` override ("uses the old config shape") right after the upgrade | intended, for every config scaffolded by an earlier version: a top-level `queue: { … }` object (a `queue` entry inside `queues` is fine), or `defaultFrameworkResizeConfig` imported from `…/config/resize.js` (only full-line `//` comments are skipped) — rewrite it to the new shape (step 5), or move it aside, re-run `npx resize-scaffold` and copy your settings back. The config file is never diffed, and a second Resizer's `configName` file is not checked: review it yourself |
@@ -634,6 +659,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | previews without `origin` / `encodeSig` (written by 0.2.x or earlier), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are stale — served until replaced and regenerated on their next read; their old files stay (clean up from the "replaced … outdated preview(s)" log line, or sweep preview objects no row references). Rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a sweep never finds their files — delete those rows and files yourself |
 | `RESIZE_METRICS_INVALID` at construction | the `metrics` option is not a sink (`null`, or no `count()` and `timing()` functions), or `new LogMetrics(logger, { summaryIntervalMs })` got an interval that is not a positive safe integer — pass `new LogMetrics(logger)`, `new NoopMetrics()` or your own `ResizeMetrics`, or leave `metrics` out for the default |
 | previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or without `origin` and `encodeSig` (written by 0.2.x or earlier) is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep preview objects no row references. The wave shares the queue with new uploads' previews: plan worker capacity |
+| the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews`, so nothing is served or queued, or previews are served as stale, or previews are made again (the line says which) — add `...resizeMediaPaths` to the query. A lean row the module never wrote has neither field: one harmless line |
 | one task per read that renders nothing, and the warning "found every requested preview … already fresh" | the API and the worker run different image settings or pipeline versions (deploy them together), or `resolve()` got the media without its stored original (a projection that drops `original.width` / `height`, or a reshaped `storageRef`) — pass `original` as stored |
 | previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: every read after a task ends queues them again, and each replaced preview costs one render, one upload and one orphaned file — deploy every worker at once, or change settings only after the old workers have stopped |
 | the warning "the media store did not record the original's dimensions", or tasks that fail with a Mongoose `StrictModeError` or `CastError`, are retried and dead-lettered with no previews | a custom `MediaStore` drops `backfillDims` in `appendPreviews` (also with `previews: []`), so every read of such a media queues a task that downloads the original — make it save the dimensions on the original. The shipped `MongoMediaStore` drops them too when the media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`) without `width` and `height`, or stores them with the wrong type when they are declared as a type that does not read back as a number (not Number, Int32 or Mixed). Under `strict: 'throw'`, or with a type Mongoose cannot cast them to (`Boolean`, `ObjectId`), the backfill is rejected instead: the task fails, is retried and is dead-lettered after `maxAttempts`. In each case its `verify()` warns once, naming the cause — spread `resizeMediaSchemaFragment`, or declare `width` and `height` as `{ type: Number }` in `original` |
@@ -641,11 +667,17 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_SVG_RENDER_UNAVAILABLE` | the SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
 | `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
 | `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (dead-lettered at once), or `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` from `uploadOriginal()` | every decoder refused the bytes: no decoder of this process reads that format — add a decoder for it, or reject the file |
-| worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
-| `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source; the error's `cause` says why — retried, then dead-lettered |
+| `RESIZE_ORIGINAL_INSPECT_FAILED` from `uploadOriginal()` (`retryable: true`) | a decoder failed to read the upload for a reason other than the bytes: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
+| `RESIZE_ORIGINAL_DAMAGED` from `uploadOriginal()` (`retryable: false`) | `upload.verify: 'decode'` decoded the original's first frame at `limits.failOn` and the engine refused it: the file is cut or corrupt, and nothing was stored — ask for the file again. Damage `inspect` finds first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays `RESIZE_ORIGINAL_INVALID`. An animation damaged in a later frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes |
+| `RESIZE_ORIGINAL_VERIFY_FAILED` from `uploadOriginal()` (`retryable: true`) | the `upload.verify: 'decode'` check failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
+| worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` (`resize generate:` from `generate()`) | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
+| `RESIZE_STORAGE_NOT_FOUND` on a task or from `generate()` (retried, then dead-lettered) | `storage.download` found no object at the original's `storageRef` — restore the object, or fix or delete the media. It stays retryable because an object can appear later (a row written before its PUT finishes); each retry costs one 404. An S3 role without `s3:ListBucket` gets 403 for a missing key, which stays the raw SDK error |
+| `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: the engine refused its header, or refused its pixels at `limits.failOn` (the worker's dead line then names the level). Dead-lettered on its first delivery, since no retry can help — replace the original (one replaced while the task ran is retried under `RESIZE_WORKER_INCOMPLETE` and renders the new one). Previews made from a damaged original before this version stay fresh: see the README `Damaged originals`. A download whose length differs from `original.size` stays the retryable `RESIZE_SOURCE_DECODE_FAILED`. On a stored format no decoder of this process lists, damage stays retryable too: `RESIZE_DECODER_MISSING` at `inspect`, `RESIZE_SOURCE_DECODE_FAILED` at render |
+| `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source, for a reason other than damage; the error's `cause` says why — retried, then dead-lettered |
 | `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
 | `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
 | Sharp's `Input file is missing` from a `beforeStep` | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
+| `resize worker: task … is dead (…)` at `error` | the task was dead-lettered; the line holds the code, the reason (`last attempt`, `not retryable`, `delivered more often than maxAttempts`) and the cause — fix the cause first, then the next read after `coordination.cooldownMs` queues the media again. The line is one line; the error goes to your logger as the second argument, and what it prints is your logger's. A logger that formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry whose line holds a sequence such as `%c3` or `%s` |
 | a variant stays missing for ~10 min after its task was dead-lettered | `coordination.cooldownMs` (default 600000): the dead task holds the gate of its media, pipeline and queue until the cooldown ends, so reads queue nothing and `prewarm()` reports `RESIZE_TASK_IN_FLIGHT` (SQS: `RESIZE_ENQUEUE_LOCK_CONTENDED`) — fix the cause in the logs first |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoMediaStore()` / `new MongoLockStore()` / `new MongoTaskQueue()` needs exactly one of `model` or `getModel` — or use `mongoParts(connection, { mediaModel })` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
@@ -669,7 +701,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_QUEUE_INVALID` at worker start | `runWorker({ queue })` (or `runResizeWorker`) got an empty list, or a list entry or a single name that is blank or not a string (`queue: ''` is refused too) — pass a queue name or a list of names; `--queue` may be repeated |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>`. The gate is per queue: such a task blocks new tasks for its media and pipeline on that queue only, never reads on another queue |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
-| previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process |
+| previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process (it logs the `warn` `resize worker disabled — this process consumes no tasks; …`, and the command resolves `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1) |
+| `resize worker: no Resizer has a task queue (eager-only wiring)` | this process consumes nothing: the same mistake as a disabled worker, with the same result (an `error` line, and the command resolves `false`) — set `queue` and `queues`, or do not run a worker |
 | a deleted preview is still served by the CDN | every public object `S3Storage` uploads is cached for a year (`immutable`): purge the CDN path (browsers that already have it may keep it until it expires) |
 | first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
 | `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |

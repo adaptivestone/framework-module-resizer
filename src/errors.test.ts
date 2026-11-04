@@ -201,6 +201,35 @@ describe('ResizeError.retryable', () => {
     assert.equal(new ResizeNoOriginalError('m1').retryable, false);
   });
 
+  test('ResizeOriginalError defaults to not retryable, and an explicit true is kept', () => {
+    assert.equal(new ResizeOriginalError('m').retryable, false);
+    assert.equal(
+      new ResizeOriginalError('m', { retryable: true }).retryable,
+      true,
+    );
+  });
+
+  test('ResizeConfigError defaults to not retryable, and an explicit true is kept', () => {
+    assert.equal(new ResizeConfigError('m').retryable, false);
+    assert.equal(
+      new ResizeConfigError('m', { retryable: true }).retryable,
+      true,
+    );
+  });
+
+  test('ResizeGenerateError takes its retryable from the caller', () => {
+    const generateError = (retryable?: boolean) =>
+      new ResizeGenerateError({
+        mediaId: 'm',
+        failed: 1,
+        requested: 1,
+        retryable,
+      });
+    assert.equal(generateError().retryable, true);
+    assert.equal(generateError(true).retryable, true);
+    assert.equal(generateError(false).retryable, false);
+  });
+
   test('a security refusal is never retryable by default', () => {
     assert.equal(new ResizeSecurityError('m').retryable, false);
     assert.equal(

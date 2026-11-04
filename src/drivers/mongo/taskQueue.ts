@@ -1,10 +1,12 @@
 // MongoTaskQueue: the task queue as documents of a ResizeTask model (see createResizeModels).
 //
 // The task row is the gate: at most one row per Resizer, media, pipeline and queue is `active`,
-// and a unique partial index enforces it. So add() is one insert that either stores the task or
-// runs into the active one and reports it in flight. A row stays active from add() until complete(),
-// through its retries and give-backs. A dead row stays active through its cooldown; the next
-// add() then retires it (`active: false`, its error kept for inspection) and inserts a new row.
+// and a unique partial index enforces it. So add() reads the active row first, and reports it in
+// flight: a read that finds variants missing while a task waits is the common call, and one indexed
+// read costs far less than an insert that ends in a duplicate key. With no active row it inserts,
+// and the unique index settles any race. A row stays active from add() until complete(), through
+// its retries and give-backs. A dead row stays active through its cooldown; the next add() then
+// retires it (`active: false`, its error kept for inspection) and inserts a new row.
 //
 // Every other method is one atomic findOneAndUpdate. The lease token fences every write after a
 // claim, so a worker that lost its lease can never complete, fail or release a task another worker
@@ -20,6 +22,12 @@ import {
   TaskQueue,
 } from '../../contracts/taskQueue.ts';
 import { ResizeError, ResizeSetupError } from '../../errors.ts';
+import {
+  codeText,
+  isModuleError,
+  logNeverThrow,
+  messageText,
+} from '../../helpers/log.ts';
 import { randomHex } from '../../helpers/random.ts';
 import type {
   EnqueueReceipt,
@@ -80,6 +88,9 @@ const WRITTEN_PATHS = [
 const schemaErrors = new WeakMap<object, ResizeSetupError | null>();
 // The schema errors add() has logged: one line per model, not one per read.
 const loggedSchemaErrors = new WeakSet<object>();
+// Models whose gate index has been checked, or is being checked. Module-level, like
+// loggedSchemaErrors: two queues on one model check once.
+const gateChecked = new WeakSet<object>();
 
 /** The model's RESIZE_MONGO_MODEL_OUTDATED error, or undefined when its schema is complete. */
 function schemaError(model: TaskModel): ResizeSetupError | undefined {
@@ -108,8 +119,8 @@ function schemaError(model: TaskModel): ResizeSetupError | undefined {
 // Who holds a lease: the host name tells pods apart (every container's main process is pid 1).
 const LEASE_HOLDER = `${hostname().slice(0, 64)}:${process.pid}`;
 
-// add() inserts at most twice. The second insert runs only when the gate opened between the first
-// insert and the read: the active task had just completed, or this call retired a dead one.
+// add() reads and inserts at most twice. The second round runs only when the first insert ran into
+// an active row: another add won the gate between the read and the insert.
 const ADD_ROUNDS = 2;
 
 // The fields of a ResizeTask document this queue reads.
@@ -124,7 +135,7 @@ interface TaskDoc {
   leaseToken: string | null;
 }
 
-// The fields of the active row that add() reads after a duplicate key.
+// The fields of the active row that add() reads before it inserts.
 interface GateDoc {
   _id: { toString(): string };
   status: string;
@@ -180,6 +191,36 @@ export class MongoTaskQueue extends TaskQueue {
       throw outdated;
     }
     await checkGateIndex(model);
+    // A model that exposes no collection was not checked, and the first add skips it too.
+    if (typeof model.collection?.indexes === 'function') {
+      gateChecked.add(model);
+    }
+  }
+
+  /** Never awaited by add(): a read must not wait for this, and it must not fail a read. */
+  #checkGateOnce(model: TaskModel): void {
+    try {
+      if (
+        gateChecked.has(model) ||
+        typeof model.collection?.indexes !== 'function'
+      ) {
+        return;
+      }
+      gateChecked.add(model);
+      // Nothing awaits this promise, so its handler must not throw: the guarded reads of log.ts.
+      void checkGateIndex(model, { background: true }).catch((err: unknown) => {
+        if (
+          isModuleError(err) &&
+          codeText(err) === 'RESIZE_MONGO_INDEX_MISSING'
+        ) {
+          logNeverThrow(this.#logger, messageText(err), err);
+          return;
+        }
+        gateChecked.delete(model); // unknown: the next add asks again
+      });
+    } catch {
+      // A model that cannot say what it exposes. The task is stored, so the add stands.
+    }
   }
 
   // At runtime a missing model is logged, not thrown: reads and prewarm never throw (verify()
@@ -212,30 +253,38 @@ export class MongoTaskQueue extends TaskQueue {
     try {
       const model = this.#model();
       if (!model) {
-        return { status: 'unconfirmed' };
+        return {
+          status: 'unconfirmed',
+          retryable: false,
+          causeCode: 'RESIZE_MONGO_MODEL_MISSING',
+        };
       }
       for (let round = 0; round < ADD_ROUNDS; round++) {
-        const taskId = await insertActive(model, task);
-        if (taskId !== null) {
-          return { status: 'added', taskId };
-        }
+        // The primary: a lagging secondary could report a finished task as in flight, and nothing
+        // would be queued.
         const active = (await model.findOne(
           { ...gate, active: true },
           { _id: 1, status: 1, cooldownUntil: 1 },
+          { readPreference: 'primary' },
         )) as GateDoc | null;
-        if (!active) {
-          continue; // the active task has just completed
+        if (active) {
+          const now = new Date();
+          if (!canTakeOver(active, now)) {
+            return { status: 'in-flight', taskId: String(active._id) };
+          }
+          // `active: true` in the filter lets only one of several adds that read this row retire it;
+          // the unique index still picks one of their inserts.
+          await model.findOneAndUpdate(
+            { _id: active._id, active: true, ...takeOverRule(now) },
+            { $set: { active: false } },
+          );
         }
-        const now = new Date();
-        if (!canTakeOver(active, now)) {
-          return { status: 'in-flight', taskId: String(active._id) };
+        const taskId = await insertActive(model, task);
+        if (taskId !== null) {
+          this.#checkGateOnce(model);
+          return { status: 'added', taskId };
         }
-        // `active: true` in the filter lets only one of several adds that read this row retire it;
-        // the unique index still picks one of their inserts.
-        await model.findOneAndUpdate(
-          { _id: active._id, active: true, ...takeOverRule(now) },
-          { $set: { active: false } },
-        );
+        // Another add won the gate between the read and the insert: the next round reads it.
       }
       // The gate changed hands in both rounds, so other adds are winning it: report in-flight
       // without an id.
@@ -247,14 +296,20 @@ export class MongoTaskQueue extends TaskQueue {
       ) {
         if (!loggedSchemaErrors.has(err)) {
           loggedSchemaErrors.add(err);
-          this.#logger.error(
+          logNeverThrow(
+            this.#logger,
             'resize mongo queue: the ResizeTask model is outdated (logged once) — every add is unconfirmed until the model is fixed',
             err,
           );
         }
-        return { status: 'unconfirmed' };
+        return {
+          status: 'unconfirmed',
+          retryable: false,
+          causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+        };
       }
-      this.#logger.error(
+      logNeverThrow(
+        this.#logger,
         `resize mongo queue: adding a task failed for media ${task.mediaId}`,
         err,
       );
@@ -389,14 +444,18 @@ export class MongoTaskQueue extends TaskQueue {
     if (!model) {
       return [];
     }
-    const doc = (await model.findOne({
-      resizer: query.resizer,
-      fileId: query.mediaId,
-      pipeline: query.pipeline,
-      queue: query.queue,
-      active: true,
-      status: { $in: ['pending', 'processing'] },
-    })) as TaskDoc | null;
+    const doc = (await model.findOne(
+      {
+        resizer: query.resizer,
+        fileId: query.mediaId,
+        pipeline: query.pipeline,
+        queue: query.queue,
+        active: true,
+        status: { $in: ['pending', 'processing'] },
+      },
+      null,
+      { readPreference: 'primary' }, // like the gate read in add()
+    )) as TaskDoc | null;
     return doc
       ? [{ taskId: String(doc._id), previews: doc.previews ?? [] }]
       : [];
@@ -542,9 +601,14 @@ interface ConnectionLike {
 }
 
 /**
- * Reject unless the model's collection has the gate index: without it every add stores a task
- * (no index), or every add after a completed task is in flight with no id (a unique index without
- * the partial filter). A model that exposes no collection is not checked.
+ * Reject unless the model's collection has the gate index: without it concurrent adds can each
+ * store a task (no index), or every add after a completed task is in flight with no id (a unique
+ * index without the partial filter). A model that exposes no collection is not checked. It lists
+ * the indexes on the primary, as the gate read does.
+ *
+ * With `background` (the check of the first added task), a NamespaceNotFound answer rejects with
+ * the raw error: the task was just stored, so the collection exists, and that answer is unknown,
+ * not missing. The missing-index error then also says what the gap costs, since it is logged.
  *
  * The connection must be open, or opening (the check waits for it); a closed one rejects at once
  * with RESIZE_MONGO_NOT_CONNECTED. The check then waits for the model's own `init()`: with
@@ -553,15 +617,18 @@ interface ConnectionLike {
  * fresh database. `init()` runs once per model, so this builds nothing that Mongoose would not
  * build anyway, and with `autoIndex` off it builds nothing at all.
  */
-async function checkGateIndex(model: TaskModel): Promise<void> {
+async function checkGateIndex(
+  model: TaskModel,
+  opts: { background?: boolean } = {},
+): Promise<void> {
   const collection = model.collection;
   if (typeof collection?.indexes !== 'function') {
     return;
   }
   const name = String(collection.collectionName ?? model.modelName ?? '');
-  const missing = (why: string, cause?: unknown) =>
+  const missing = (why: string, cause?: unknown, cost = '') =>
     new ResizeSetupError(
-      `resize: the ResizeTask collection '${name}' ${why}: the gate needs the index ${GATE_INDEX_SPEC} — create it through your migration process; the module never creates indexes`,
+      `resize: the ResizeTask collection '${name}' ${why}: the gate needs the index ${GATE_INDEX_SPEC} — create it through your migration process; the module never creates indexes${cost}`,
       { code: 'RESIZE_MONGO_INDEX_MISSING', cause },
     );
   await waitForConnection(model.db as ConnectionLike | undefined, name);
@@ -577,9 +644,12 @@ async function checkGateIndex(model: TaskModel): Promise<void> {
   }
   let indexes: IndexInfo[];
   try {
-    indexes = await collection.indexes();
+    indexes = await collection.indexes({ readPreference: 'primary' });
   } catch (err) {
-    if ((err as { code?: unknown } | null)?.code === NAMESPACE_NOT_FOUND) {
+    if (
+      !opts.background &&
+      (err as { code?: unknown } | null)?.code === NAMESPACE_NOT_FOUND
+    ) {
       throw missing('does not exist yet, so it has no gate index', buildError);
     }
     throw err;
@@ -606,7 +676,26 @@ async function checkGateIndex(model: TaskModel): Promise<void> {
       ? `has an index on the gate keys ('${onGateKeys[0].name}') that is not unique or not partial on { active: true }`
       : 'has no gate index',
     buildError,
+    opts.background
+      ? ` — until it exists, ${missingGateCost(onGateKeys)} (logged once)`
+      : '',
   );
+}
+
+/**
+ * What the gate costs without its index, given the indexes on its keys. Without a unique one, only
+ * adds that read before each other's insert can duplicate: a later add reads the active row. A
+ * unique one over every row forbids duplicates, but finished rows collide too, so nothing queues
+ * again. On any other filter, that filter decides which rows collide.
+ */
+function missingGateCost(onGateKeys: IndexInfo[]): string {
+  const unique = onGateKeys.filter((index) => index.unique === true);
+  if (unique.length === 0) {
+    return 'concurrent adds can each store a duplicate active task';
+  }
+  return unique.some((index) => index.partialFilterExpression === undefined)
+    ? 'every add after a completed task is in flight with no id and nothing is queued'
+    : 'one active task per media, pipeline and queue is not guaranteed';
 }
 
 /**

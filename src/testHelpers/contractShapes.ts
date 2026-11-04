@@ -26,6 +26,19 @@ export const tasks: TaskQueue = {
   fail: async () => true,
 };
 
+// An unconfirmed add may say that calling again cannot help, and why.
+export const finalUnconfirmedTasks: TaskQueue = {
+  add: async () => ({
+    status: 'unconfirmed',
+    retryable: false,
+    causeCode: 'X',
+  }),
+  claim: async () => null,
+  renew: async () => true,
+  complete: async () => true,
+  fail: async () => true,
+};
+
 // The optional members stay optional on plain objects too.
 export const fullTasks: TaskQueue = {
   add: async () => ({ status: 'added', taskId: 't' }),

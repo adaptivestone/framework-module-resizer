@@ -1,7 +1,11 @@
 // Pure validation of a complete resize config. It reads no framework state; the framework
 // adapter (src/framework/config.ts) loads the config from the app and checks mediaModelName.
 import { ResizeConfigError } from './errors.ts';
-import type { QueueTimingOptions, ResizeConfig } from './types.d.ts';
+import type {
+  QueueTimingOptions,
+  ResizeConfig,
+  ResizeFailOn,
+} from './types.d.ts';
 
 const invalid = (message: string, code: string): never => {
   throw new ResizeConfigError(message, { code });
@@ -12,6 +16,13 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
+const FAIL_ON_LEVELS: ReadonlySet<unknown> = new Set([
+  'none',
+  'truncated',
+  'error',
+  'warning',
+] satisfies ResizeFailOn[]);
 
 // Keys read by 0.2.x and ignored since. Framework merging keeps unknown keys, so an upgraded
 // host would otherwise lose these settings silently (e.g. webpAvifOnly: jpeg output returns).
@@ -71,6 +82,12 @@ function validateRequiredResizeConfigFields(
     invalid(
       'resize config: upload.formats must contain non-empty Sharp format ids',
       'RESIZE_CONFIG_UPLOAD_FORMATS_INVALID',
+    );
+  }
+  if (upload.verify !== 'none' && upload.verify !== 'decode') {
+    invalid(
+      "resize config: `upload.verify` must be 'none' or 'decode'",
+      'RESIZE_CONFIG_INVALID',
     );
   }
 
@@ -158,6 +175,13 @@ function validateRequiredResizeConfigFields(
   ) {
     invalid(
       'resize config: all limits must be positive safe integers',
+      'RESIZE_CONFIG_INVALID',
+    );
+  }
+  // A missing level is refused too: `undefined` would silently be Sharp's own default, 'warning'.
+  if (!FAIL_ON_LEVELS.has((limits as Record<string, unknown>).failOn)) {
+    invalid(
+      "resize config: `limits.failOn` must be 'none', 'truncated', 'error' or 'warning'",
       'RESIZE_CONFIG_INVALID',
     );
   }

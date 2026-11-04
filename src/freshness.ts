@@ -34,6 +34,18 @@ export function expectedOrigin(
   return d === undefined ? undefined : previewOrigin(original.storageRef, d);
 }
 
+/**
+ * Whether two stored originals are the same one, by the signature a row of each would carry. A
+ * stored size only one of them has is a backfill, not a replacement.
+ */
+export function sameOriginal(
+  a: Original | undefined,
+  b: Original | undefined,
+): boolean {
+  const dims = storedDims(a) ?? storedDims(b) ?? { width: 0, height: 0 };
+  return expectedOrigin(a, dims) === expectedOrigin(b, storedDims(b) ?? dims);
+}
+
 /** True when `row` recorded exactly the expected signatures; never without an expected origin. */
 export function isFreshRow(
   row: Preview,

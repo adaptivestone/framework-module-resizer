@@ -1,11 +1,116 @@
-// Logging on a path that must never throw (resolve, prewarm, the worker loop). The host's logger is
-// host code and may throw too, so its failure falls back to the console instead of breaking the
-// guarantee.
+// Logging on a path that must never throw (resolve, prewarm, the worker loop), and the guarded reads
+// of a thrown value such a path needs. The host's logger is host code and may throw too, so its
+// failure falls back to the console instead of breaking the guarantee. A thrown value may be host
+// code as well: a getter, a `toString` or a Proxy trap can throw, and a message or a code can hold
+// a line break. Also the cap on a line logged once per key, which such a path repeats on every call.
+import { ResizeError } from '../errors.ts';
 import type { ResizeLogger } from '../types.d.ts';
 
+// The longest text a log line or a task row gets for a thrown value.
+const MAX_TEXT_LENGTH = 1000;
+// The most of that text a cause may take, so a long cause leaves room for the message.
+const MAX_CAUSE_LENGTH = 500;
+
+// Trimmed first: a text that ends in a line break gets no trailing ` | `, and one that starts with
+// a line break keeps its first line. Cut before the regular expression: it takes quadratic time on
+// a long run of spaces (a minute for 200,000 of them), and it would hold up the whole worker loop
+// for it. U+2028 and U+2029 are line breaks too, for a viewer that honours them, and so are the
+// form feed, the vertical tab and U+0085.
+const flat = (value: unknown): string =>
+  String(value)
+    .trim()
+    .slice(0, 2 * MAX_TEXT_LENGTH)
+    .replace(/\s*[\r\n\f\v\u0085\u2028\u2029]+\s*/g, ' | ');
+
 /**
- * Log `message` and `err` (when given) at `level` (default 'error'); a throwing logger falls back
- * to the console method of the same level.
+ * The first line of a cause that has text. An error whose message starts with a line break prints
+ * as `Name: \nwhy`, which flattens to `Name: | why`: the name alone says nothing.
+ */
+function firstLine(cause: unknown): string {
+  const [head, next] = flat(cause).split(' | ');
+  return head.endsWith(':') && next !== undefined ? `${head} ${next}` : head;
+}
+
+/**
+ * One line for a log or a task row: never throws, so a value that cannot be printed cannot stop the
+ * worker loop, and a message cannot forge a second log line. A cause the message does not already
+ * hold is kept through the cut: it is the reason, and a long message gives way to it.
+ */
+export function causeText(error: unknown): string {
+  let text: string;
+  try {
+    text = flat(error);
+  } catch {
+    return 'a thrown value that cannot be printed';
+  }
+  try {
+    const cause = (error as { cause?: unknown } | null)?.cause;
+    if (cause !== undefined) {
+      const first = firstLine(cause);
+      if (!text.includes(first)) {
+        const why = ` (cause: ${first.slice(0, MAX_CAUSE_LENGTH)})`;
+        return `${text.slice(0, MAX_TEXT_LENGTH - why.length)}${why}`;
+      }
+    }
+  } catch {
+    // A cause that cannot be read or printed: the message alone is what there is.
+  }
+  return text.slice(0, MAX_TEXT_LENGTH);
+}
+
+/** A thrown value's message; one that cannot be read reads as causeText. */
+export function messageText(error: unknown): string {
+  try {
+    return error instanceof Error ? String(error.message) : causeText(error);
+  } catch {
+    return causeText(error);
+  }
+}
+
+/** The error's code when it is one token, else `none`: a code can hold a line break too. */
+export function codeText(error: unknown): string {
+  try {
+    const code = (error as { code?: unknown } | null | undefined)?.code;
+    if (typeof code === 'string' && /^[\w.:-]{1,100}$/.test(code)) {
+      return code;
+    }
+  } catch {
+    // A getter or a Proxy trap that throws: no code to show.
+  }
+  return 'none';
+}
+
+/** `ResizeError.isResizeError` for a value that may be hostile: a trap that throws means no. */
+export function isModuleError(error: unknown): error is ResizeError {
+  try {
+    return ResizeError.isResizeError(error);
+  } catch {
+    return false;
+  }
+}
+
+// A ResizeError says when no retry can help (`retryable: false`), so the task is dead-lettered at
+// once instead of being downloaded and decoded again. The brand, not `instanceof`, identifies one:
+// it also matches an error from a duplicate copy of this package. Errors from other libraries are
+// retried, even with a `retryable` field of their own (an AWS SDK v2 4xx carries one). A value whose
+// brand or `retryable` cannot be read is retried.
+export function notRetryable(error: unknown): boolean {
+  try {
+    return ResizeError.isResizeError(error) && error.retryable === false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Log `message` at `level` (default 'error') as one line, with `err` (when given) as the second
+ * argument. The module never reads `err` for the logger: what it prints is the logger's, so the
+ * logger's redaction holds, and a logger that ignores it costs nothing. The global console reads
+ * its first argument as a format string once a second follows, so there every `%` is escaped: a
+ * `%c3` in a URL cannot consume the error or rewrite the line. No other logger's text is touched,
+ * since a Winston logger without `splat` would print `%%`. A throwing logger falls back to the
+ * console method of the same level. The console formats `err` too, and `util.inspect` throws on
+ * some values, so that fallback is guarded as well.
  */
 export function logNeverThrow(
   logger: ResizeLogger,
@@ -13,10 +118,38 @@ export function logNeverThrow(
   err?: unknown,
   level: 'error' | 'warn' | 'info' = 'error',
 ): void {
+  const line = message.trim().replace(/[\r\n\f\v\u0085\u2028\u2029]+/g, ' | ');
   const rest = err === undefined ? [] : [err];
+  // With one argument the console formats nothing, and `%%` would print as it is.
+  const forConsole = err === undefined ? line : line.replaceAll('%', '%%');
   try {
-    logger[level](message, ...rest);
+    const first = logger[level] === console[level] ? forConsole : line;
+    logger[level](first, ...rest);
   } catch {
-    console[level](message, ...rest);
+    try {
+      console[level](forConsole, ...rest);
+    } catch {
+      try {
+        console[level](line);
+      } catch {
+        // Nothing left to write to, and this path must not throw.
+      }
+    }
   }
+}
+
+// A once-log keeps at most this many keys: host input (pipeline names, format lists, the message of
+// an error) is unbounded.
+export const ONCE_LOG_KEYS = 100;
+
+/**
+ * True the first time `key` is seen, which it then records, while `seen` holds fewer than
+ * ONCE_LOG_KEYS keys: past that, nothing new is logged.
+ */
+export function firstTime(seen: Set<string>, key: string): boolean {
+  if (seen.has(key) || seen.size >= ONCE_LOG_KEYS) {
+    return false;
+  }
+  seen.add(key);
+  return true;
 }

@@ -2,6 +2,7 @@
 // of a decoder, and the built-in decoders for createDecoderSet's order.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import sharp from 'sharp';
 import type { Raster, SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import { createDecoderSet, DecoderSet } from './decoderSet.ts';
 import { ResizeError, ResizeMediaError, ResizeSetupError } from './errors.ts';
@@ -77,6 +78,38 @@ test('a RESIZE_SOURCE_FORMAT_UNSUPPORTED refusal moves on; any other rejection i
     /boom/,
   );
   assert.equal(third.calls, 0);
+});
+
+test('a thrown value whose traps throw is no refusal: identify rejects with that value', async () => {
+  const no = () => {
+    throw new Error('no');
+  };
+  const trapped = new Proxy(
+    {},
+    { get: no, has: no, getPrototypeOf: no, ownKeys: no },
+  );
+  const later = fake(['later'], 'accept');
+  const decoders = new DecoderSet([
+    {
+      formats: ['host'],
+      inspect: async () => {
+        throw trapped;
+      },
+      render: async () => {
+        throw new Error('render is not part of these tests');
+      },
+    },
+    later,
+  ]);
+  // Not assert.rejects: it returns the value from an async function, which reads its `then`.
+  let thrown: unknown;
+  try {
+    await decoders.identify(bytes, limits);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown === trapped, 'identify rejects with that very value');
+  assert.equal(later.calls, 0);
 });
 
 test('when every decoder refuses, identify rejects with RESIZE_SOURCE_FORMAT_UNSUPPORTED naming the formats tried', async () => {
@@ -300,6 +333,62 @@ test('createDecoderSet refuses entries that are not decoders with RESIZE_DECODER
       },
     );
   }
+});
+
+// Noise, so the cut falls inside image data: Sharp cannot read this GIF's header.
+const wholeGif = await sharp({
+  create: {
+    width: 400,
+    height: 300,
+    channels: 3,
+    background: '#808080',
+    noise: { type: 'gaussian', mean: 128, sigma: 60 },
+  },
+})
+  .gif()
+  .toBuffer();
+const cutGif = wholeGif.subarray(0, Math.floor(wholeGif.length / 2));
+
+test('damage on a format no decoder lists is RESIZE_DECODER_MISSING: a deploy with the decoder can run it', async () => {
+  await assert.rejects(
+    createDecoderSet().identify(cutGif, limits, 'pdf'),
+    (err: ResizeSetupError) => {
+      assert.ok(err instanceof ResizeSetupError);
+      assert.equal(err.code, 'RESIZE_DECODER_MISSING');
+      assert.equal(err.retryable, true);
+      assert.equal((err.cause as ResizeError).code, 'RESIZE_SOURCE_DAMAGED');
+      return true;
+    },
+  );
+});
+
+test('damage on a listed format stays RESIZE_SOURCE_DAMAGED', async () => {
+  await assert.rejects(createDecoderSet().identify(cutGif, limits, 'gif'), {
+    code: 'RESIZE_SOURCE_DAMAGED',
+    retryable: false,
+  });
+});
+
+test('damage with no stored format stays RESIZE_SOURCE_DAMAGED', async () => {
+  // A bare ref, or an upload.
+  await assert.rejects(createDecoderSet().identify(cutGif, limits), {
+    code: 'RESIZE_SOURCE_DAMAGED',
+    retryable: false,
+  });
+});
+
+test('an engine failure with no detail on a format no decoder lists is RESIZE_DECODER_MISSING', async () => {
+  const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  await assert.rejects(
+    createDecoderSet().identify(magic, limits, 'pdf'),
+    (err: ResizeSetupError) => {
+      assert.ok(err instanceof ResizeSetupError);
+      assert.equal(err.code, 'RESIZE_DECODER_MISSING');
+      assert.equal(err.retryable, true);
+      assert.match(err.message, /the engine gave no detail/);
+      return true;
+    },
+  );
 });
 
 test("verify() runs each decoder's verify(), in order", async () => {

@@ -13,10 +13,16 @@ export interface StorageUploadArgs {
 }
 
 export abstract class ResizeStorage {
-  /** Download an existing object by its stored locator (the worker reads originals). */
+  /**
+   * Download an existing object by its stored locator (the worker reads originals). A missing
+   * object rejects with a retryable ResizeStorageError with the code RESIZE_STORAGE_NOT_FOUND.
+   */
   abstract download(ref: StorageRef): Promise<Buffer | Uint8Array>;
 
-  /** Upload a new object and return the JSON-compatible locator to persist. */
+  /**
+   * Upload a new object and return the JSON-compatible locator to persist. It must stay the same on
+   * every load: one that changes per load reads as a replaced original.
+   */
   abstract upload(args: StorageUploadArgs): Promise<StorageRef>;
 
   /**

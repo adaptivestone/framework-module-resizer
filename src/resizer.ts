@@ -501,6 +501,7 @@ export class Resizer {
           metrics: this.#boundMetrics,
         }),
       };
+      this.onServicesBuilt();
     } else if (this.#readerStale) {
       this.#builtServices.reader = this.#buildReader(
         this.#builtServices.catalog,
@@ -509,6 +510,9 @@ export class Resizer {
     this.#readerStale = false;
     return this.#builtServices;
   }
+
+  /** Called once, when the services are first built: the first call of this Resizer has come. */
+  protected onServicesBuilt(): void {}
 
   /** The Reader, on the Dispatcher as it is now, or on the reason there is none. */
   #buildReader(catalog: Catalog): Reader {

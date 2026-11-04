@@ -1,9 +1,20 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { describe, test } from 'node:test';
-import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
+import {
+  ResizeConfigError,
+  ResizeSecurityError,
+  ResizeStorageError,
+} from '../errors.ts';
 import { silentLogger } from '../testHelpers/fakes.ts';
 import type { LocalStorageConfig } from '../types.d.ts';
 import { LocalFsStorage } from './fs.ts';
@@ -17,6 +28,59 @@ const uploadArgs = (key: string, visibility: 'public' | 'private') => ({
 });
 
 describe('LocalFsStorage', () => {
+  test('LocalFsStorage: a missing object is RESIZE_STORAGE_NOT_FOUND, retryable, with its cause', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    await writeFile(join(dir, 'file'), 'x');
+    for (const [path, cause] of [
+      ['gone.jpg', 'ENOENT'],
+      ['gone/a.jpg', 'ENOENT'],
+      ['file/a.jpg', 'ENOTDIR'], // a parent that is a file
+    ]) {
+      await assert.rejects(
+        () => s.download({ path, visibility: 'public' }),
+        (err: unknown) => {
+          assert.ok(err instanceof ResizeStorageError, path);
+          assert.equal(err.code, 'RESIZE_STORAGE_NOT_FOUND', path);
+          assert.equal(err.retryable, true, path);
+          assert.equal(
+            err.message,
+            `resize fs: object not found: ${path}`,
+            path,
+          );
+          assert.equal((err.cause as { code?: string }).code, cause, path);
+          return true;
+        },
+      );
+    }
+  });
+
+  test('LocalFsStorage: a traversal stays a refusal, and other read failures stay as they are', async (t) => {
+    const dir = await fresh();
+    const outside = await fresh();
+    t.after(async () => {
+      await rm(dir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    });
+    await writeFile(join(outside, 'file'), 'x');
+    await symlink(join(outside, 'file'), join(dir, 'link'));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    await assert.rejects(
+      () => s.download({ path: 'link', visibility: 'public' }),
+      (err: unknown) =>
+        err instanceof ResizeSecurityError &&
+        err.code === 'RESIZE_FS_PATH_TRAVERSAL' &&
+        err.retryable === false,
+    );
+    // A folder where a file should be: the disk answered, and it is not a missing object.
+    await mkdir(join(dir, 'folder'));
+    await assert.rejects(
+      () => s.download({ path: 'folder', visibility: 'public' }),
+      { code: 'EISDIR' },
+    );
+  });
+
   test('a trailing slash keeps private originals outside the public root', async (t) => {
     const dir = await fresh();
     t.after(() => rm(dir, { recursive: true, force: true }));

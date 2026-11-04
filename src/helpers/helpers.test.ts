@@ -10,7 +10,7 @@ import { ResizeConfigError } from '../errors.ts';
 import type { SqsQueueConfig } from '../types.d.ts';
 import { runBounded } from './concurrency.ts';
 import { isPositiveFinite } from './guards.ts';
-import { logNeverThrow } from './log.ts';
+import { firstTime, logNeverThrow, ONCE_LOG_KEYS } from './log.ts';
 import { sqsBackendKey, validateSqsEntries } from './queueSections.ts';
 import { randomHex } from './random.ts';
 import { sleep } from './sleep.ts';
@@ -183,6 +183,21 @@ describe('logNeverThrow', () => {
       fallback.mock.calls.map((call) => call.arguments),
       [['stopped']],
     );
+  });
+});
+
+describe('firstTime', () => {
+  test('true once per key, and past the cap nothing new is true or kept', () => {
+    const seen = new Set<string>();
+    assert.equal(firstTime(seen, 'a'), true);
+    assert.equal(firstTime(seen, 'a'), false);
+    for (let i = seen.size; i < ONCE_LOG_KEYS; i++) {
+      assert.equal(firstTime(seen, `key ${i}`), true);
+    }
+    assert.equal(seen.size, ONCE_LOG_KEYS);
+    assert.equal(firstTime(seen, 'one too many'), false);
+    assert.equal(seen.size, ONCE_LOG_KEYS);
+    assert.equal(firstTime(seen, 'a'), false);
   });
 });
 
