@@ -23,6 +23,7 @@ import {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
+import { causeText } from './helpers/log.ts';
 import { gateKey } from './lockKeys.ts';
 import { NoopMetrics } from './metrics.ts';
 import {
@@ -2608,6 +2609,69 @@ describe('what a variant failure leaves behind', () => {
     assert.match(lines.warn[0], /^resize generate: variant \S+ failed/);
     assert.match(lines.warn[0], /AccessDenied: Access Denied/);
   });
+
+  test("generate()'s error names the first failure as its cause, and keeps it out of its message", async () => {
+    let uploads = 0;
+    const r = denying(
+      new MemoryTaskQueue({ timing: fast }),
+      logged().logger,
+      async () => {
+        uploads += 1;
+        throw new Error(`failure ${uploads} at https://bucket/secret`);
+      },
+    );
+    const err = await r
+      .generate({
+        media: { id: 'm1', original: { storageRef: { key: 'o' } } },
+        sizes: [
+          { width: 10, height: 10 },
+          { width: 20, height: 20 },
+          { width: 30, height: 30 },
+        ],
+      })
+      .then(
+        () => assert.fail('generate() should reject'),
+        (rejected: ResizeGenerateError) => rejected,
+      );
+    assert.ok(err instanceof ResizeGenerateError);
+    assert.equal(err.code, 'RESIZE_GENERATE_FAILED');
+    assert.equal(err.failed, 3);
+    assert.equal(
+      (err.cause as Error).message,
+      'failure 1 at https://bucket/secret',
+    );
+    assert.match(causeText(err), /\(cause: Error: failure 1 at /);
+    // A handler may answer with `err.message`, so a driver's text does not reach it.
+    assert.doesNotMatch(err.message, /failure 1|bucket/);
+  });
+
+  test("generate()'s final error keeps its final cause", async () => {
+    const refusal = new ResizeSecurityError(
+      'resize: this preview may not be stored',
+      {
+        code: 'TEST_UPLOAD_REFUSED',
+      },
+    );
+    const r = denying(
+      new MemoryTaskQueue({ timing: fast }),
+      logged().logger,
+      async () => {
+        throw refusal;
+      },
+    );
+    await assert.rejects(
+      () =>
+        r.generate({
+          media: { id: 'm1', original: { storageRef: { key: 'o' } } },
+          sizes: [{ width: 10, height: 10 }],
+        }),
+      (err: ResizeGenerateError) => {
+        assert.equal(err.retryable, false);
+        assert.equal(err.cause, refusal);
+        return true;
+      },
+    );
+  });
 });
 
 describe('a final failure of an original that was replaced meanwhile', () => {
@@ -2802,5 +2866,278 @@ describe('a final failure of an original that was replaced meanwhile', () => {
       await run({ storageRef: ref, width: 64, height: 48 }, undefined),
       true,
     );
+  });
+});
+
+describe('a final failure of the whole task, on an original that was replaced meanwhile', () => {
+  const fast = {
+    idlePollMs: 5,
+    retryBackoffMs: { base: 5, max: 5 },
+    maxAttempts: 3,
+  };
+  const sizes = [{ width: 10, height: 10 }];
+  const wholeJpeg = () =>
+    sharp({
+      create: {
+        width: 400,
+        height: 300,
+        channels: 3,
+        background: '#808080',
+        noise: { type: 'gaussian', mean: 128, sigma: 60 },
+      },
+    })
+      .jpeg()
+      .toBuffer();
+
+  test('a damaged original replaced during its task: prewarm stays accepted, and the next delivery renders the new one', async () => {
+    const whole = await wholeJpeg();
+    const cut = whole.subarray(0, Math.floor(whole.length / 2));
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const media: MediaLike = {
+      id: 'm1',
+      original: { storageRef: { key: 'old' }, width: 400, height: 300 },
+      previews: [],
+    };
+    const { promise: started, resolve: start } = Promise.withResolvers<void>();
+    const { promise: released, resolve: release } =
+      Promise.withResolvers<void>();
+    const rows = new Map<string, Preview[]>();
+    const parents: string[] = [];
+    const resizer = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async (ref) => {
+          if ((ref as { key: string }).key !== 'old') {
+            return whole;
+          }
+          start();
+          await released;
+          return cut;
+        },
+        upload: async ({ key, parentRef }) => {
+          parents.push((parentRef as { key: string }).key);
+          return { key };
+        },
+        publicUrl: () => '',
+      },
+      media: fakeMedia({
+        previews: rows,
+        // A copy, as a store's load is: the task's snapshot must not see the replacement.
+        load: async () => ({ ...media, previews: rows.get('m1') ?? [] }),
+      }),
+      locks: memoryLocks(),
+      tasks,
+    });
+    const first = await resizer.prewarm({ media, sizes });
+    assert.equal(first.status, 'accepted');
+    const done = workUntil(
+      { logger: silent, resizers: [resizer] },
+      () => tasks.rows[0].status !== 'processing' && rows.has('m1'),
+    );
+    await started;
+    media.original = {
+      storageRef: { key: 'new' },
+      width: 400,
+      height: 300,
+    };
+    const second = await resizer.prewarm({ media, sizes });
+    assert.equal(second.status, 'accepted');
+    assert.equal(tasks.rows.length, 1);
+    release();
+    await done;
+    assert.equal(tasks.rows[0].status, 'completed');
+    assert.equal(tasks.rows[0].attempts, 2);
+    assert.deepEqual(parents, ['new']);
+    const read = await resizer.resolve({
+      media: { ...media, previews: rows.get('m1') },
+      sizes,
+    });
+    assert.deepEqual(read.decision.missing, []);
+    assert.equal(read.decision.ready.length, 1);
+  });
+
+  /** The task's first delivery on a cut JPEG: the first load gives `loaded`, each later one `reload()`. */
+  const deliver = async (
+    loaded: MediaLike['original'],
+    reload: () => Promise<MediaLike | null>,
+  ) => {
+    resetResizerForTests();
+    const whole = await wholeJpeg();
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    let loads = 0;
+    new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silent,
+      storage: {
+        download: async () => whole.subarray(0, Math.floor(whole.length / 2)),
+        upload: async ({ key }) => ({ key }),
+        publicUrl: () => '',
+      },
+      media: fakeMedia({
+        load: async () => {
+          loads += 1;
+          return loads === 1
+            ? { id: 'm1', original: loaded, previews: [] }
+            : reload();
+        },
+      }),
+      locks: memoryLocks(),
+      tasks,
+    });
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: [webp10],
+    });
+    const [{ event, error }] = await firstEvent(tasks);
+    return { event, error: error as ResizeError, row: tasks.rows[0], loads };
+  };
+  const ref = { key: 'same' };
+  const mediaWith = (original: MediaLike['original']) => async () => ({
+    id: 'm1',
+    original,
+    previews: [],
+  });
+
+  test('the retry keeps the reason on the row, under RESIZE_WORKER_INCOMPLETE', async () => {
+    const { event, error, row } = await deliver(
+      { storageRef: { key: 'old' }, width: 400, height: 300 },
+      mediaWith({ storageRef: { key: 'new' }, width: 400, height: 300 }),
+    );
+    assert.notEqual(event, 'deadLettered');
+    assert.ok(error instanceof ResizeGenerateError);
+    assert.equal(error.code, 'RESIZE_WORKER_INCOMPLETE');
+    assert.equal(error.retryable, true);
+    assert.deepEqual(error.missing, ['default:default:10x10:webp:none']);
+    assert.equal((error.cause as ResizeError).code, 'RESIZE_SOURCE_DAMAGED');
+    assert.equal((error.cause as ResizeError).retryable, false);
+    assert.match(
+      String(row.error),
+      /is incomplete \(its original was replaced while it ran\);.*\(cause: ResizeMediaError: resize: the source is damaged/,
+    );
+  });
+
+  test('the original unchanged: dead on the first delivery, at the cost of one read', async () => {
+    const { event, error, row, loads } = await deliver(
+      { storageRef: ref, width: 400, height: 300 },
+      mediaWith({ storageRef: ref, width: 400, height: 300 }),
+    );
+    assert.equal(event, 'deadLettered');
+    assert.equal(error.code, 'RESIZE_SOURCE_DAMAGED');
+    assert.equal(error.retryable, false);
+    assert.equal(row.status, 'dead');
+    assert.equal(row.attempts, 1);
+    assert.equal(loads, 2);
+  });
+
+  test('what counts as another original', async () => {
+    const stored = { storageRef: ref, width: 400, height: 300 };
+    const bare = { storageRef: ref };
+    const retried = async (
+      loaded: MediaLike['original'],
+      reloaded: MediaLike['original'],
+    ) => (await deliver(loaded, mediaWith(reloaded))).error.retryable;
+    // The same storage ref with another stored size: new bytes may be behind it.
+    assert.equal(
+      await retried(stored, { storageRef: ref, width: 800, height: 600 }),
+      true,
+    );
+    assert.equal(
+      await retried(stored, {
+        storageRef: { key: 'other' },
+        width: 400,
+        height: 300,
+      }),
+      true,
+    );
+    assert.equal(await retried(bare, { storageRef: { key: 'other' } }), true);
+    // The original gone from a live media: the next delivery says so.
+    assert.equal(await retried(stored, undefined), true);
+    // A stored size only one side holds is a backfill, not a replacement.
+    assert.equal(await retried(bare, stored), false);
+    assert.equal(await retried(stored, bare), false);
+    assert.equal(await retried(bare, bare), false);
+  });
+
+  test('a reload that fails, and a media that is gone, keep the final error', async () => {
+    const stored = { storageRef: ref, width: 400, height: 300 };
+    for (const reload of [
+      async () => {
+        throw new Error('database down');
+      },
+      // Not an async function: a store of the same shape may throw before it returns a promise.
+      () => {
+        throw new Error('database down');
+      },
+      async () => null,
+      // A ref that cannot be signed: nothing proves the original changed.
+      async () => ({
+        id: 'm1',
+        original: { storageRef: { key: 1n } },
+        previews: [],
+      }),
+    ]) {
+      const { event, error } = await deliver(stored, reload);
+      assert.equal(event, 'deadLettered');
+      assert.equal(error.code, 'RESIZE_SOURCE_DAMAGED');
+      assert.equal(error.retryable, false);
+    }
+  });
+
+  test('a failure that is not final, and a task that succeeds, cost no read of their own', async () => {
+    const run = async (download: ResizeStorage['download']) => {
+      resetResizerForTests();
+      const tasks = new MemoryTaskQueue({ timing: fast });
+      let loads = 0;
+      new Resizer({
+        config: makeImageConfig({ formats: ['webp'] }),
+        logger: silent,
+        storage: {
+          download,
+          upload: async ({ key }) => ({ key }),
+          publicUrl: () => '',
+        },
+        media: fakeMedia({
+          load: async () => {
+            loads += 1;
+            return {
+              id: 'm1',
+              original: { storageRef: { key: 'old' } },
+              previews: [],
+            };
+          },
+        }),
+        locks: memoryLocks(),
+        tasks,
+      });
+      await tasks.add({
+        resizer: 'default',
+        queue: 'default',
+        mediaId: 'm1',
+        pipeline: 'default',
+        previews: [webp10],
+      });
+      const [{ error }] = await firstEvent(tasks);
+      return { error, loads };
+    };
+    const retryable = new ResizeStorageError('storage down');
+    const plain = new Error('not ours');
+    const first = await run(async () => {
+      throw retryable;
+    });
+    assert.equal(first.error, retryable);
+    assert.equal(first.loads, 1);
+    const second = await run(async () => {
+      throw plain;
+    });
+    assert.equal(second.error, plain);
+    assert.equal(second.loads, 1);
+    const ok = await run(async () => png);
+    assert.equal(ok.error, undefined);
+    // The load, and the coverage re-read every task makes.
+    assert.equal(ok.loads, 2);
   });
 });

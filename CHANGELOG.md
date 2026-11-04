@@ -32,7 +32,10 @@
   `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`. `RESIZE_WORKER_INCOMPLETE` is `false`
   when every missing variant failed with `false` and the media still holds the original they were
   rendered from, and a storage refusal from a preview upload now counts as such a failure, where it
-  was retried. `RESIZE_GENERATE_FAILED` is `false` when every
+  was retried. A final error of a whole task follows the same rule: when a reload finds another
+  original on the media, the task fails with the retryable `RESIZE_WORKER_INCOMPLETE`, with that
+  error as `cause`, and its next delivery renders the new one. `RESIZE_GENERATE_FAILED` is `false`
+  when every
   variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both
   shipped drivers, where it was the raw driver error.
 - A disabled worker logs `warn`, and the command resolves `false`, so a CLI entry that forwards the
@@ -53,6 +56,8 @@
   variant lines. SQS without a `deadLetterQueueUrl` adds one more.
 - `RESIZE_WORKER_INCOMPLETE` carries the first failure of a variant still missing as its `cause`, so
   the task row and the retried and dead lines say why, and how many failed when there are several.
+  `RESIZE_GENERATE_FAILED` carries the first failure as its `cause` too; its message leaves it out,
+  for a handler that answers with `err.message`.
 - The module passes its logger one string, never a second argument: its line, then, when there is an
   error, a line break and the error's stack and `cause` chain, cut at 8,000 characters. A `%` in a
   cause no longer corrupts the line and loses the stack (on the console, or a Winston logger without

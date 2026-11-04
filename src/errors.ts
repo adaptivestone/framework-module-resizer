@@ -166,7 +166,11 @@ export class ResizeGenerateError extends ResizeError {
     missing?: string[];
     /** Default `true`: the failed variants may still succeed. */
     retryable?: boolean;
-    /** What went wrong: a queued task's first failed variant, for its row and its log lines. */
+    /**
+     * What went wrong, usually the first failed variant: a queued task's row and log lines print
+     * it, and `generate()`'s caller can read it. The message stays free of it, for a host that
+     * answers with `err.message`.
+     */
     cause?: unknown;
   }) {
     super(

@@ -1516,8 +1516,12 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     `RESIZE_GENERATE_FAILED` only when every variant did. A
     `ResizeError` from
     `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` or
-    `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot
-    be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
+    `appendPreviews` with `retryable: false` dead-letters the task at once. Once the media has
+    loaded, such a failure counts only for the original it came from: the worker reloads the media
+    once, and if it holds another original (another `storageRef` or stored size), the task fails
+    with the retryable `RESIZE_WORKER_INCOMPLETE`, whose `cause` is that failure, and the next
+    delivery renders the new one. A reload that fails, or a media that is gone, keeps it final. A
+    source that cannot be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
     `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED` when that error is not a `ResizeError`
     (Sharp's own, for example; it is the `cause`). A damaged source stays retryable in two cases:
     its download length differs from `original.size` (`RESIZE_SOURCE_DECODE_FAILED`), or no decoder
@@ -1634,7 +1638,7 @@ await ResizeTask.updateOne(
 
   They are written whatever the metrics sink is, `NoopMetrics` included. Each variant that fails
   writes a `warn` of its own, on every attempt, in `generate()` too, whose caller gets the failed
-  count or the throw. So the worker writes one `error` line per dead task, however many variants and
+  count or the throw, with the first failure as its `cause`. So the worker writes one `error` line per dead task, however many variants and
   attempts it took: alert on `error`, or on `is dead`. On SQS without a `deadLetterQueueUrl`, the
   queue adds one more as it deletes the task (`resize sqs: task … is dead and no deadLetterQueueUrl
   is set`). Other failures have `error` lines of their own, such as a media store write that failed,
@@ -1652,7 +1656,8 @@ await ResizeTask.updateOne(
   it in the message.
   A worker that no longer holds its task (a lost lease) writes a `warn` and never a dead line.
 - **Damaged originals:** a source the engine refuses is dead-lettered on its first delivery with
-  `RESIZE_SOURCE_DAMAGED`. Its pixels are decoded at `limits.failOn`, and that message names the
+  `RESIZE_SOURCE_DAMAGED`, unless the media was given another original while the task ran, when the
+  task is retried and renders that one. Its pixels are decoded at `limits.failOn`, and that message names the
   level; its header is read at Sharp's own default level, whatever `limits.failOn` says. `'error'`
   refuses a truncation that cuts image data; a cut TIFF is usually retried, not refused, and a cut
   animated GIF can still render the frames it has, so its preview can be shorter. Three limits:

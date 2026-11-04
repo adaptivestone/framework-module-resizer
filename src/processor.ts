@@ -38,7 +38,7 @@ import {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
-import { expectedOrigin, storedDims } from './freshness.ts';
+import { expectedOrigin, sameOriginal, storedDims } from './freshness.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow, notRetryable } from './helpers/log.ts';
@@ -688,6 +688,7 @@ export class Processor {
     const {
       generated,
       failedCount,
+      failures,
       finalFailures,
       removed,
       replaced,
@@ -714,6 +715,7 @@ export class Processor {
         failed: failedCount,
         requested: requested.length,
         retryable: !allFinal,
+        cause: [...failures.values()][0],
       });
     }
 
@@ -880,6 +882,28 @@ export class Processor {
       signal: opts.signal,
       mode: 'task',
       taskId: task.taskId,
+    }).catch(async (err: unknown) => {
+      // A final failure says nothing about an original that replaced the one it came from: the next
+      // delivery renders the new one. Only a final failure pays for this read, and a reload that
+      // fails, or a media that is gone, proves no replacement.
+      const replaced =
+        notRetryable(err) &&
+        (await Promise.try(() => mediaStore.loadMedia(task.mediaId))
+          .then((now) => !!now && !sameOriginal(media.original, now.original))
+          .catch(() => false));
+      if (!replaced) {
+        throw err;
+      }
+      const missing = [...requestedByIdentity.keys()];
+      throw new ResizeGenerateError({
+        mediaId: task.mediaId,
+        failed: missing.length,
+        requested: missing.length,
+        missing,
+        message: `resize worker: task for media ${task.mediaId} is incomplete (its original was replaced while it ran); missing ${missing.join(', ')} — failing for retry/dead-letter`,
+        code: 'RESIZE_WORKER_INCOMPLETE',
+        cause: err,
+      });
     });
 
     // A queued task is complete only when every requested identity is now persisted fresh. Re-read

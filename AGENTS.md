@@ -434,7 +434,8 @@ const { created, failed } = await getResizer().generate({
 ```
 
 No original throws `ResizeNoOriginalError`; every requested variant failing throws
-`ResizeGenerateError` (`retryable: false` when every one failed with `retryable: false`). A source
+`ResizeGenerateError` (`retryable: false` when every one failed with `retryable: false`; its `cause`
+is the first failure, and its message leaves that out). A source
 the engine refuses rejects before any variant runs: on a cut JPEG, which 0.3.0 rendered, it is
 `ResizeMediaError` `RESIZE_SOURCE_DAMAGED`, not `ResizeGenerateError`, so a handler catching only
 `ResizeGenerateError` returns 500 on a user's upload (catch `ResizeError`, or refuse the file at
@@ -460,7 +461,10 @@ of the package; errors from other libraries are retried. It dead-letters the tas
 (`variantSteps`, encoding, `storage.upload`) fails only that variant, and the task fails with
 `RESIZE_WORKER_INCOMPLETE`, whose `cause` is the first failure: retryable, unless every missing
 variant failed with `retryable: false` and the media still holds the original they were rendered
-from, when the task is dead-lettered at once. A source that cannot be decoded is a `ResizeError`
+from, when the task is dead-lettered at once. A final error of the whole task obeys the same rule:
+when a reload finds that the media holds another original, the task fails with the retryable
+`RESIZE_WORKER_INCOMPLETE`, with that error as `cause`, and its next delivery renders the new one. A
+source that cannot be decoded is a `ResizeError`
 (usually a `ResizeMediaError`: `RESIZE_SOURCE_DAMAGED`, `retryable: false`, when the engine refuses
 a cut or unreadable source; `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the
 engine's error as `cause`, for any other reason; or the decoder's own code; a missing or broken
@@ -668,7 +672,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_ORIGINAL_VERIFY_FAILED` from `uploadOriginal()` (`retryable: true`) | the `upload.verify: 'decode'` check failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
 | worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` (`resize generate:` from `generate()`) | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
 | `RESIZE_STORAGE_NOT_FOUND` on a task or from `generate()` (retried, then dead-lettered) | `storage.download` found no object at the original's `storageRef` — restore the object, or fix or delete the media. It stays retryable because an object can appear later (a row written before its PUT finishes); each retry costs one 404. An S3 role without `s3:ListBucket` gets 403 for a missing key, which stays the raw SDK error |
-| `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: the engine refused its header, or refused its pixels at `limits.failOn` (the worker's dead line then names the level). Dead-lettered on its first delivery, since no retry can help — replace the original. Previews made from a damaged original before this version stay fresh: see the README `Damaged originals`. A download whose length differs from `original.size` stays the retryable `RESIZE_SOURCE_DECODE_FAILED`. On a stored format no decoder of this process lists, damage stays retryable too: `RESIZE_DECODER_MISSING` at `inspect`, `RESIZE_SOURCE_DECODE_FAILED` at render |
+| `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: the engine refused its header, or refused its pixels at `limits.failOn` (the worker's dead line then names the level). Dead-lettered on its first delivery, since no retry can help — replace the original (one replaced while the task ran is retried under `RESIZE_WORKER_INCOMPLETE` and renders the new one). Previews made from a damaged original before this version stay fresh: see the README `Damaged originals`. A download whose length differs from `original.size` stays the retryable `RESIZE_SOURCE_DECODE_FAILED`. On a stored format no decoder of this process lists, damage stays retryable too: `RESIZE_DECODER_MISSING` at `inspect`, `RESIZE_SOURCE_DECODE_FAILED` at render |
 | `RESIZE_SOURCE_DECODE_FAILED` | Sharp (or a host decoder) could not decode the source, for a reason other than damage; the error's `cause` says why — retried, then dead-lettered |
 | `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
 | `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
