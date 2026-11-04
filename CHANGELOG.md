@@ -24,10 +24,15 @@
   its message says, is the new `RESIZE_ORIGINAL_INSPECT_FAILED` (`true`), where it was
   `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
   now hold `upload.verify`.
-- `upload.verify` and `limits.failOn` are required in the config type. A host file with
-  `upload: { maxBytes, formats }` or a hand-written `limits`, and `satisfies FrameworkResizeConfig`,
-  now fails `tsc`; spreading the defaults' `upload` and `limits` still compiles. At run time such a
-  file still works: the module merges it over the defaults.
+- **`limits.sourceBytes`, default 256 MiB.** A worker, `generate()` and `uploadOriginal()` refuse a
+  larger original with `RESIZE_SOURCE_TOO_LARGE` (`RESIZE_ORIGINAL_TOO_LARGE` at upload), since a
+  ref to a 3 GB file would otherwise kill a worker on every delivery. A host with larger originals
+  raises it; it is not signed, so nothing regenerates. A complete config passed to
+  `new Resizer({ config })` must hold the key.
+- `upload.verify`, `limits.failOn` and `limits.sourceBytes` are required in the config type. A host
+  file with `upload: { maxBytes, formats }` or a hand-written `limits`, and
+  `satisfies FrameworkResizeConfig`, now fails `tsc`; spreading the defaults' `upload` and `limits`
+  still compiles. At run time such a file still works: the module merges it over the defaults.
 - `ResizeConfigError` defaults to `retryable: false`. `RESIZE_TASK_MAX_ATTEMPTS`,
   `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`. `RESIZE_WORKER_INCOMPLETE` is `false`
   when every missing variant failed with `false` and the media still holds the original they were
@@ -35,9 +40,8 @@
   was retried. A final error of a whole task follows the same rule: when a reload finds another
   original on the media, the task fails with the retryable `RESIZE_WORKER_INCOMPLETE`, with that
   error as `cause`, and its next delivery renders the new one. `RESIZE_GENERATE_FAILED` is `false`
-  when every
-  variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both
-  shipped drivers, where it was the raw driver error.
+  when every variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`)
+  from both shipped drivers, where it was the raw driver error.
 - A disabled worker logs `warn`, and the command resolves `false`, so a CLI entry that forwards the
   result, as the framework docs require, exits 1: a deploy that runs it with the flag off now
   reports a failure. The eager-only path (`resize worker: no Resizer has a task queue`, still an
@@ -58,12 +62,12 @@
   the task row and the retried and dead lines say why, and how many failed when there are several.
   `RESIZE_GENERATE_FAILED` carries the first failure as its `cause` too; its message leaves it out,
   for a handler that answers with `err.message`.
-- The module's line is always one line, and the error still goes to your logger as the second
-  argument: what it prints is your logger's. On the global console every `%` in the line is now
-  escaped, so a `%c3` in a cause cannot consume the error or rewrite the line. A logger that formats
-  its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a
-  cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an
-  entry whose line holds a format sequence such as `%c3` or `%s`.
+- A line the module logs with an error is one line, and the error still goes to your logger as the
+  second argument: what it prints is your logger's. On the global console every `%` in the line is
+  now escaped, so a `%c3` in a cause cannot consume the error or rewrite the line. A logger that
+  formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a
+  `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error
+  out of an entry whose line holds a format sequence such as `%c3` or `%s`.
 - `resolve()` warns once per Resizer when the module's fields were not loaded. After the first added
   task, `MongoTaskQueue` checks the gate index once per model in the background and logs an `error`
   when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
@@ -81,6 +85,7 @@
   storing it, with `RESIZE_ORIGINAL_DAMAGED` (`false`) and `RESIZE_ORIGINAL_VERIFY_FAILED` (`true`).
 - `unconfirmed` may carry `retryable: false` and `causeCode`; `MongoTaskQueue` sets them for a
   missing or outdated model, and `prewarm()` passes them on.
+- `download(ref, { maxBytes })`: an optional argument, which a custom driver may honour.
 
 **Fixes**
 

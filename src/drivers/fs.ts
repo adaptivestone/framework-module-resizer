@@ -1,9 +1,16 @@
 // Local filesystem driver. Each persisted ref identifies both a relative path and its root.
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { DriverContext } from '../contracts/drivers.ts';
-import { ResizeStorage } from '../contracts/storage.ts';
-import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
+import {
+  ResizeStorage,
+  type StorageDownloadOptions,
+} from '../contracts/storage.ts';
+import {
+  ResizeMediaError,
+  ResizeSecurityError,
+  ResizeStorageError,
+} from '../errors.ts';
 import { optionalString, stringValue } from '../helpers/configSection.ts';
 import type { LocalStorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
@@ -134,13 +141,25 @@ export class LocalFsStorage extends ResizeStorage {
     return ref as unknown as LocalFsStorageRef;
   }
 
-  async download(ref: StorageRef): Promise<Buffer> {
+  async download(
+    ref: StorageRef,
+    opts?: StorageDownloadOptions,
+  ): Promise<Buffer> {
     const parsed = this.#ref(ref);
     const root =
       parsed.visibility === 'private' ? this.#privateRootDir : this.#rootDir;
     const abs = resolveInsideRoot(root, parsed.path);
     try {
       await assertRealPathInsideRoot(root, abs);
+      if (opts?.maxBytes !== undefined) {
+        const { size } = await stat(abs);
+        if (size > opts.maxBytes) {
+          throw new ResizeMediaError(
+            `resize fs: object is ${size} bytes, over the ${opts.maxBytes} byte limit (limits.sourceBytes)`,
+            { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+          );
+        }
+      }
       return await readFile(abs);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;

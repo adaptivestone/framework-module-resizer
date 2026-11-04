@@ -169,6 +169,7 @@ function validateRequiredResizeConfigFields(
     !isRecord(limits) ||
     !isPositiveSafeInteger(limits.inputPixels) ||
     !isPositiveSafeInteger(limits.sourcePixels) ||
+    !isPositiveSafeInteger(limits.sourceBytes) ||
     !isPositiveSafeInteger(limits.resultDimension) ||
     !isPositiveSafeInteger(limits.animationFrames) ||
     !isPositiveSafeInteger(limits.processingTimeoutSeconds)

@@ -429,9 +429,11 @@ function snapshotOriginal(original: Original): {
 }
 
 /**
- * Download the original once and identify its bytes. The detected format is the truth: a stored
- * format that does not match is logged once and the bytes are rendered as what they are. One frame
- * must fit `limits.sourcePixels`; how many frames are decoded is bounded by the plan.
+ * Download the original once and identify its bytes. The bytes must fit `limits.sourceBytes`: a
+ * driver is asked to refuse a larger object before reading it, and one that cannot is caught here,
+ * after the memory is spent but before any decoder sees them. The detected format is the truth: a
+ * stored format that does not match is logged once and the bytes are rendered as what they are. One
+ * frame must fit `limits.sourcePixels`; how many frames are decoded is bounded by the plan.
  */
 async function loadSource(
   parts: {
@@ -445,7 +447,17 @@ async function loadSource(
   mediaId: string,
 ): Promise<LoadedSource> {
   const { storage, decoders, limits, logger, who } = parts;
-  const bytes = asBuffer(await storage.download(original.storageRef));
+  const bytes = asBuffer(
+    await storage.download(original.storageRef, {
+      maxBytes: limits.sourceBytes,
+    }),
+  );
+  if (bytes.length > limits.sourceBytes) {
+    throw new ResizeMediaError(
+      `resize: source is ${bytes.length} bytes, over limits.sourceBytes (${limits.sourceBytes}) for media ${mediaId}`,
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+    );
+  }
   let identified: IdentifiedSource;
   try {
     identified = await decoders.identify(bytes, limits, original.format);

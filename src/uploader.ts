@@ -261,6 +261,13 @@ export class Uploader {
         { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
       );
     }
+    // A host with a larger upload.maxBytes would otherwise store originals no task can read.
+    if (body.byteLength > config.limits.sourceBytes) {
+      throw new ResizeOriginalError(
+        `resize uploadOriginal: body exceeds limits.sourceBytes (${config.limits.sourceBytes}): a worker could not read it`,
+        { code: 'RESIZE_ORIGINAL_TOO_LARGE' },
+      );
+    }
     const measured = await identifyOriginal(this.#decoders, body, config);
     if (!config.upload.formats.includes(measured.format)) {
       throw new ResizeOriginalError(

@@ -302,6 +302,27 @@ describe('config split: core validation vs framework loading', () => {
     }
   });
 
+  test('rejects an invalid limits.sourceBytes', () => {
+    assert.equal(defaultResizeConfig.limits.sourceBytes, 268435456);
+    const config = makeImageConfig();
+    // `undefined` too: only the merge gives a default, so a complete config names it.
+    for (const sourceBytes of [0, -1, 1.5, '256', null, undefined]) {
+      assert.throws(
+        () =>
+          validateResizeConfig({
+            ...config,
+            limits: { ...config.limits, sourceBytes },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ResizeConfigError);
+          assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+          return true;
+        },
+        String(sourceBytes),
+      );
+    }
+  });
+
   test('limits.failOn defaults to error and rejects anything else', () => {
     assert.equal(defaultResizeConfig.limits.failOn, 'error');
     assert.equal(makeResizeConfig().limits.failOn, 'error');

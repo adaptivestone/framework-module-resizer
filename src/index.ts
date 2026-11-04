@@ -51,7 +51,11 @@ export type {
   Pipeline,
   VariantStep,
 } from './contracts/pipeline.ts';
-export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
+export {
+  ResizeStorage,
+  type StorageDownloadOptions,
+  type StorageUploadArgs,
+} from './contracts/storage.ts';
 export {
   type ClaimedTask,
   type ClaimOptions,

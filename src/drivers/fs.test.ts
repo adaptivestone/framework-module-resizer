@@ -5,6 +5,7 @@ import {
   readFile,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,6 +13,7 @@ import { join, sep } from 'node:path';
 import { describe, test } from 'node:test';
 import {
   ResizeConfigError,
+  ResizeMediaError,
   ResizeSecurityError,
   ResizeStorageError,
 } from '../errors.ts';
@@ -28,6 +30,71 @@ const uploadArgs = (key: string, visibility: 'public' | 'private') => ({
 });
 
 describe('LocalFsStorage', () => {
+  test('download over maxBytes rejects from stat without reading the file', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    const abs = join(dir, 'huge.jpg');
+    await writeFile(abs, '');
+    // Sparse and over 2 GiB: readFile would reject with ERR_FS_FILE_TOO_LARGE, so the code proves stat refused it.
+    await truncate(abs, 3 * 1024 ** 3);
+    await assert.rejects(
+      s.download(
+        { path: 'huge.jpg', visibility: 'public' },
+        { maxBytes: 1024 },
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.match(err.message, /limits\.sourceBytes/);
+        assert.doesNotMatch(err.message, /huge\.jpg/);
+        return true;
+      },
+    );
+  });
+
+  test('download at exactly maxBytes returns the bytes', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    const bytes = Buffer.from('0123456789');
+    await writeFile(join(dir, 'ten.jpg'), bytes);
+    assert.deepEqual(
+      await s.download(
+        { path: 'ten.jpg', visibility: 'public' },
+        { maxBytes: 10 },
+      ),
+      bytes,
+    );
+  });
+
+  test('a missing object with maxBytes is still RESIZE_STORAGE_NOT_FOUND', async (t) => {
+    const dir = await fresh();
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    await assert.rejects(
+      s.download({ path: 'gone.jpg', visibility: 'public' }, { maxBytes: 1 }),
+      { code: 'RESIZE_STORAGE_NOT_FOUND' },
+    );
+  });
+
+  test('a symlink out of the root is refused before its size is read', async (t) => {
+    const dir = await fresh();
+    const outside = await fresh();
+    t.after(async () => {
+      await rm(dir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    });
+    await writeFile(join(outside, 'file'), 'larger than one byte');
+    await symlink(join(outside, 'file'), join(dir, 'link'));
+    const s = new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' });
+    await assert.rejects(
+      s.download({ path: 'link', visibility: 'public' }, { maxBytes: 1 }),
+      { code: 'RESIZE_FS_PATH_TRAVERSAL' },
+    );
+  });
+
   test('LocalFsStorage: a missing object is RESIZE_STORAGE_NOT_FOUND, retryable, with its cause', async (t) => {
     const dir = await fresh();
     t.after(() => rm(dir, { recursive: true, force: true }));

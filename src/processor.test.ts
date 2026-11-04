@@ -473,6 +473,7 @@ function recordingLogger(): {
 class RecordingDecoder extends SourceDecoder {
   readonly formats: readonly string[];
   readonly renders: DecodeBox[] = [];
+  inspects = 0;
   rejectWith: unknown;
   returns: Raster | undefined;
   readonly #inner: SourceDecoder;
@@ -484,6 +485,7 @@ class RecordingDecoder extends SourceDecoder {
   }
 
   inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
+    this.inspects += 1;
     return this.#inner.inspect(bytes, limits);
   }
 
@@ -657,6 +659,54 @@ describe('decoding the source', () => {
       media: () => mediaDoc({ original: opts.original }),
     };
   }
+
+  test('every download asks for limits.sourceBytes', async () => {
+    const seen: unknown[] = [];
+    const { deps, media } = decodeDeps(redPng);
+    deps.storage.download = async (_ref, opts) => {
+      seen.push(opts);
+      return redPng;
+    };
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.deepEqual(seen, [{ maxBytes: 268435456 }]);
+  });
+
+  test('a driver that ignores maxBytes is caught by the core before any decode', async () => {
+    const recording = new RecordingDecoder(new SharpDecoder());
+    const { deps, uploads, media } = decodeDeps(Buffer.alloc(11), {
+      config: { limits: { sourceBytes: 10 } },
+      decoders: createDecoderSet([recording]),
+    });
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        assert.match(err.message, /limits\.sourceBytes \(10\)/);
+        return true;
+      },
+    );
+    assert.equal(recording.inspects, 0);
+    assert.equal(uploads.length, 0);
+  });
+
+  test('a source of exactly limits.sourceBytes renders', async () => {
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: redPng.length } },
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 1);
+    assert.equal(uploads.length, 1);
+  });
 
   test('the source is decoded once per task, at the largest box the previews need', async () => {
     const recording = new RecordingDecoder(new SharpDecoder());

@@ -293,6 +293,7 @@ export type ResizeFailOn = 'none' | 'truncated' | 'error' | 'warning';
 export interface ResizeLimits {
   inputPixels: number; // default 268402689 — sharp limitInputPixels (decoder bomb guard)
   sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)
+  sourceBytes: number; // default 268_435_456 — largest original a worker or adoptOriginal() reads into memory
   resultDimension: number; // default 5000 — clamp on the cover branch
   animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
   processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout

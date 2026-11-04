@@ -20,8 +20,15 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { DriverContext } from '../contracts/drivers.ts';
-import { ResizeStorage } from '../contracts/storage.ts';
-import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
+import {
+  ResizeStorage,
+  type StorageDownloadOptions,
+} from '../contracts/storage.ts';
+import {
+  ResizeMediaError,
+  ResizeSecurityError,
+  ResizeStorageError,
+} from '../errors.ts';
 import { optionalString, requiredString } from '../helpers/configSection.ts';
 import type { S3StorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
@@ -252,7 +259,10 @@ export class S3Storage extends ResizeStorage {
     };
   }
 
-  async download(ref: StorageRef): Promise<Buffer> {
+  async download(
+    ref: StorageRef,
+    opts?: StorageDownloadOptions,
+  ): Promise<Buffer> {
     const { bucket, key } = this.#ref(ref);
     let out: GetObjectCommandOutput;
     try {
@@ -268,6 +278,21 @@ export class S3Storage extends ResizeStorage {
         );
       }
       throw err;
+    }
+    // From the response's own length, so no HeadObject and no new IAM permission. A response
+    // without one is read, and the core checks the bytes.
+    const length = out.ContentLength;
+    if (
+      opts?.maxBytes !== undefined &&
+      length !== undefined &&
+      length > opts.maxBytes
+    ) {
+      // The body is unread and its connection open: dropping it is what stops the transfer.
+      (out.Body as { destroy?: () => void } | undefined)?.destroy?.();
+      throw new ResizeMediaError(
+        `resize s3: object is ${length} bytes, over the ${opts.maxBytes} byte limit (limits.sourceBytes)`,
+        { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+      );
     }
     const stream = out.Body;
     if (!stream) {

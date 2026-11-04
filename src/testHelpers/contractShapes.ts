@@ -18,6 +18,19 @@ export const storage: ResizeStorage = {
   publicUrl: () => '',
 };
 
+// A driver may honour maxBytes; one written before the option, with one parameter, still fits.
+export const boundedStorage: ResizeStorage = {
+  download: async (_ref, opts) =>
+    Buffer.alloc(opts?.maxBytes === undefined ? 0 : 1),
+  upload: async () => ({ key: 'k' }),
+  publicUrl: () => '',
+};
+export const unboundedStorage: ResizeStorage = {
+  download: async (_ref) => Buffer.alloc(0),
+  upload: async () => ({ key: 'k' }),
+  publicUrl: () => '',
+};
+
 export const tasks: TaskQueue = {
   add: async () => ({ status: 'unconfirmed' }),
   claim: async () => null,

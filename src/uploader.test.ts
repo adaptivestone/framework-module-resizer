@@ -1038,6 +1038,29 @@ describe('uploadOriginal — private SVG source', () => {
 });
 
 describe('uploadOriginal — typed failures', () => {
+  test('a body over limits.sourceBytes is refused at upload, naming that limit', async () => {
+    const { storage, uploads } = recordingStorage();
+    const uploader = new Uploader({
+      storage,
+      decoders: createDecoderSet(),
+      config: makeImageConfig({
+        upload: { maxBytes: 1024 * 1024 },
+        limits: { sourceBytes: 10 },
+      }),
+    });
+    await assert.rejects(
+      uploader.upload({ body: png, visibility: 'private' }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeOriginalError);
+        assert.equal(err.code, 'RESIZE_ORIGINAL_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.match(err.message, /limits\.sourceBytes \(10\)/);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('rejects empty, over-limit, and disabled formats before storage', async () => {
     installApp({ upload: { maxBytes: 8, formats: ['jpeg'] } });
     const { storage, uploads } = recordingStorage();

@@ -12,12 +12,24 @@ export interface StorageUploadArgs {
   parentRef?: StorageRef; // the original's ref when the worker stores one of its previews
 }
 
+export interface StorageDownloadOptions {
+  /** The largest object the caller will read. A driver refuses a larger one before reading it, when it can. */
+  maxBytes?: number;
+}
+
 export abstract class ResizeStorage {
   /**
    * Download an existing object by its stored locator (the worker reads originals). A missing
-   * object rejects with a retryable ResizeStorageError with the code RESIZE_STORAGE_NOT_FOUND.
+   * object rejects with a retryable ResizeStorageError with the code RESIZE_STORAGE_NOT_FOUND. An
+   * object over `maxBytes` rejects with a ResizeMediaError with the code RESIZE_SOURCE_TOO_LARGE
+   * and `retryable: false`, without the key in its message: a key may hold a client's file name,
+   * and this line reaches logs. A driver that ignores `maxBytes` still works: the core checks the
+   * length afterwards, but the memory is already spent.
    */
-  abstract download(ref: StorageRef): Promise<Buffer | Uint8Array>;
+  abstract download(
+    ref: StorageRef,
+    opts?: StorageDownloadOptions,
+  ): Promise<Buffer | Uint8Array>;
 
   /**
    * Upload a new object and return the JSON-compatible locator to persist. It must stay the same on

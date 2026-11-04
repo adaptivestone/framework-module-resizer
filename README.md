@@ -318,9 +318,10 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 - `runWorker`, the framework-free worker, and its options `RunWorkerOptions`;
 - routing: `RoutingTaskQueue` (each queue name goes to the backend that carries it), `carrierOf`,
   and the types `Route` and `RoutingTaskQueueOptions`;
-- the contracts a driver extends, with their types: `ResizeStorage` (`StorageUploadArgs`),
-  `MediaStore` (`ReplacedPreviews`), `LockStore`, and `TaskQueue` (`NewTask`, `TaskAddResult`,
-  `ClaimOptions`, `ClaimedTask`, `LeasedTask`, `FailOptions`, `TaskEvent`, `TaskEventHandler`);
+- the contracts a driver extends, with their types: `ResizeStorage` (`StorageUploadArgs`,
+  `StorageDownloadOptions`), `MediaStore` (`ReplacedPreviews`), `LockStore`, and `TaskQueue`
+  (`NewTask`, `TaskAddResult`, `ClaimOptions`, `ClaimedTask`, `LeasedTask`, `FailOptions`,
+  `TaskEvent`, `TaskEventHandler`);
 - the decoder contract `SourceDecoder` and the decoder types `SourceInfo`, `Raster`, `RasterInfo`,
   `DecodeBox`, `RenderOptions`;
 - metrics: the contract `ResizeMetrics`, the sinks `LogMetrics` (its options `LogMetricsOptions`)
@@ -553,6 +554,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     `RESIZE_STORAGE_NOT_FOUND`, retryable, as both shipped drivers do: each retry costs one 404,
     and an object can appear later (a row written before its PUT finishes). An S3 role without
     `s3:ListBucket` gets 403 for a missing key, which stays raw.
+  - `download(ref, opts?)`: when `opts.maxBytes` is given, refuse a larger object before reading
+    it, with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`, `retryable: false`. A driver that ignores
+    it still works; the core checks the length afterwards, but the memory is already spent.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
@@ -905,6 +909,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
 | `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
+| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: `RESIZE_SOURCE_TOO_LARGE`, dead-lettered at once. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
@@ -1499,8 +1504,8 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     The module sets it on every `ResizeSecurityError` and on ten codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
     dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
-    source has no dimensions or exceeds the
-    pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
+    source has no dimensions or exceeds the pixel or byte limits
+    (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), an SVG render ran past
     `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`), or the task was delivered more

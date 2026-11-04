@@ -65,6 +65,15 @@ describe('S3Storage', () => {
     );
   });
 
+  test('a response with no ContentLength is read, for the core to check', async () => {
+    const { client } = fakeClient();
+    const s = new S3Storage({ bucketPublic: 'pub', client });
+    assert.deepEqual(
+      await s.download({ bucket: 'pub', key: 'k' }, { maxBytes: 1 }),
+      Buffer.from([1, 2, 3]),
+    );
+  });
+
   test('S3Storage: other failures stay raw', async () => {
     for (const name of ['NoSuchBucket', 'AccessDenied']) {
       const thrown = Object.assign(new Error('x'), { name });
