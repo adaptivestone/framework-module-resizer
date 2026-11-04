@@ -5,17 +5,23 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 const FLAG = '--import ./src/testHelpers/noAws.ts';
+const STARTS_RUNNER = /\s--test(\s|$)/;
 const WORKFLOWS = new URL('../../.github/workflows/', import.meta.url);
 const packageJson = JSON.parse(
   readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
 );
 
 test('every script that runs tests preloads noAws.ts', () => {
-  assert.ok(packageJson.scripts.test.includes(FLAG), packageJson.scripts.test);
-  assert.ok(
-    packageJson.scripts.smoke.includes(FLAG),
-    packageJson.scripts.smoke,
+  const scripts: Record<string, string> = packageJson.scripts;
+  const runners = Object.entries(scripts).filter(([, command]) =>
+    STARTS_RUNNER.test(command),
   );
+  assert.ok(runners.length > 0, 'no script starts the test runner');
+  for (const [name, command] of runners) {
+    assert.ok(command.includes(FLAG), `${name}: ${command}`);
+  }
+  // The smoke test is no `--test` run, and it builds real SDK clients too.
+  assert.ok(scripts.smoke.includes(FLAG), scripts.smoke);
 });
 
 test('no workflow starts the test runner except through the script', () => {
@@ -23,7 +29,7 @@ test('no workflow starts the test runner except through the script', () => {
   for (const file of readdirSync(WORKFLOWS)) {
     const lines = readFileSync(new URL(file, WORKFLOWS), 'utf8').split('\n');
     for (const line of lines) {
-      if (!line.trim().startsWith('#') && /\s--test(\s|$)/.test(line)) {
+      if (!line.trim().startsWith('#') && STARTS_RUNNER.test(line)) {
         bypasses.push(`${file}: ${line.trim()}`);
       }
     }

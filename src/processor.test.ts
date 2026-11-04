@@ -1567,6 +1567,34 @@ describe('decoding the source', () => {
     );
   });
 
+  test('a driver refusal with no readable message and no room for the id gets a text that blames no decoder', async () => {
+    const refusal = new ResizeMediaError('host: refused', {
+      code: 'HOST_REFUSED',
+      retryable: false,
+    });
+    Object.defineProperty(refusal, 'message', {
+      get: () => {
+        throw new Error('host: the message is private');
+      },
+    });
+    Object.freeze(refusal);
+    const { deps, media } = decodeDeps(redPng);
+    deps.storage.download = async () => {
+      throw refusal;
+    };
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.message, 'resize: the source was refused (media m1)');
+        assert.equal(err.code, 'HOST_REFUSED');
+        assert.equal(err.retryable, false);
+        assert.equal(err.cause, refusal);
+        return true;
+      },
+    );
+  });
+
   test("a host decoder's ResizeMediaError subclass keeps its class and name, and gains the media id", async () => {
     class HostDecodeError extends ResizeMediaError {}
     const recording = new RecordingDecoder(new SharpDecoder());

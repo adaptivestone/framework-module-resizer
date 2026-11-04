@@ -146,7 +146,7 @@ function withMediaId(err: ResizeMediaError, mediaId: string): ResizeMediaError {
   const code = fieldOf(err, 'code');
   const retryable = fieldOf(err, 'retryable');
   return new ResizeMediaError(
-    `${typeof message === 'string' ? message : 'resize: the decoder refused the source'} (media ${mediaId})`,
+    `${typeof message === 'string' ? message : 'resize: the source was refused'} (media ${mediaId})`,
     {
       mediaId,
       ...(typeof code === 'string' ? { code } : {}),

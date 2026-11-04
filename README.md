@@ -558,7 +558,8 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     it, with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`, `retryable: false`. A driver that ignores
     it still works; the core checks the length afterwards, but the memory is already spent. A
     response with no length, which `S3Storage` reads, is likewise caught only by that check, after
-    the read.
+    the read. On `@aws-sdk/client-s3` 3.729 to 3.734, which collect a checksummed body before `send`
+    resolves, `S3Storage`'s bound only applies after the read, and the core's check still refuses.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
