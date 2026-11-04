@@ -92,15 +92,37 @@ test('any line of the message can clear a file, not only the line engineDetail r
   );
 });
 
-test('isUnsupportedBytes names only the message for bytes no loader recognises', () => {
-  assert.equal(
-    isUnsupportedBytes('Input buffer contains unsupported image format'),
-    true,
+test('isUnsupportedBytes is true only for what a built-in decoder passed through sharpDecodeError', () => {
+  const limits = { failOn: 'error', inputPixels: 100 } as const;
+  const words = 'Input buffer contains unsupported image format';
+  const sharps = new Error(words);
+  // The very error comes back, so a worker still retries it as any other plain error.
+  assert.equal(sharpDecodeError(sharps, limits), sharps);
+  assert.equal(isUnsupportedBytes(sharps), true);
+  // The same words from anywhere else are not that verdict.
+  assert.equal(isUnsupportedBytes(new Error(words)), false);
+  assert.equal(isUnsupportedBytes(words), false);
+  // Any other failure of the engine is not one either.
+  const crashed = new Error('the engine crashed');
+  assert.equal(sharpDecodeError(crashed, limits), crashed);
+  assert.equal(isUnsupportedBytes(crashed), false);
+  const damage = sharpDecodeError(
+    new Error('VipsJpeg: premature end of JPEG image'),
+    limits,
   );
+  assert.equal(isUnsupportedBytes(damage), false);
+  // A value that cannot be read gives no verdict, and reading nothing cannot throw.
+  const trap = () => {
+    throw new Error('no');
+  };
   assert.equal(
-    isUnsupportedBytes('VipsJpeg: premature end of JPEG image'),
+    isUnsupportedBytes(
+      new Proxy({}, { get: trap, has: trap, getPrototypeOf: trap }),
+    ),
     false,
   );
+  assert.equal(isUnsupportedBytes(null), false);
+  assert.equal(isUnsupportedBytes(undefined), false);
 });
 
 test('sharpDecodeError maps damage and the pixel limit, and returns anything else unchanged', () => {

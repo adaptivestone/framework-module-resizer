@@ -329,6 +329,67 @@ describe('uploadOriginal — through the decoders', () => {
     }
   });
 
+  test("a host decoder's error that reads like Sharp's is not read as Sharp's verdict on the bytes", async () => {
+    // The words of Sharp's refusal, thrown by a decoder that has nothing to do with Sharp.
+    for (const message of [
+      'Input buffer contains unsupported image format',
+      'pdf: unsupported image format in page 3',
+    ]) {
+      const cause = new Error(message);
+      const { uploader, uploads } = uploaderWith(
+        new DecoderSet([fakeDecoder(['pdf'], { error: cause })]),
+      );
+      await assert.rejects(
+        uploader.upload({ body: somePdf, visibility: 'private' }),
+        (err: ResizeOriginalError) => {
+          assert.equal(err.code, 'RESIZE_ORIGINAL_INSPECT_FAILED');
+          assert.equal(err.retryable, true);
+          assert.equal(err.cause, cause);
+          return true;
+        },
+      );
+      assert.equal(uploads.length, 0);
+    }
+  });
+
+  test('bytes the built-in decoder recognises nothing in stay RESIZE_ORIGINAL_INVALID, behind a host decoder too', async () => {
+    const { uploader, uploads } = uploaderWith(createDecoderSet([]));
+    const refused = (err: ResizeOriginalError) => {
+      assert.equal(err.code, 'RESIZE_ORIGINAL_INVALID');
+      assert.equal(err.retryable, false);
+      assert.equal(
+        err.message,
+        'resize uploadOriginal: bytes are not a supported image: Input buffer contains unsupported image format',
+      );
+      return true;
+    };
+    await assert.rejects(
+      uploader.upload({
+        body: Buffer.from('not an image'),
+        visibility: 'private',
+      }),
+      refused,
+    );
+    const behind = uploaderWith(
+      createDecoderSet([
+        fakeDecoder(['pdf'], {
+          error: new ResizeMediaError('not mine', {
+            code: 'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
+            retryable: false,
+          }),
+        }),
+      ]),
+    );
+    await assert.rejects(
+      behind.uploader.upload({
+        body: Buffer.from('not an image'),
+        visibility: 'private',
+      }),
+      refused,
+    );
+    assert.equal(uploads.length, 0);
+  });
+
   test('the engine line in an upload error is cut at 200 characters', async () => {
     const { uploader } = uploaderWith(
       new DecoderSet([

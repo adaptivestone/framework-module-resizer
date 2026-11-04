@@ -37,9 +37,14 @@ export function isEngineDamage(message: string): boolean {
   return !NOT_DAMAGE.test(message) && DAMAGE.test(engineDetail(message));
 }
 
-/** Bytes no loader of this build recognises. Never used on a worker: see the note above. */
-export function isUnsupportedBytes(message: string): boolean {
-  return message.includes('unsupported image format');
+// The errors of bytes no loader of this build recognises, as a built-in decoder rejected with them.
+// Kept by identity, not read from the message: a host decoder's error may hold the same words and
+// say nothing about the bytes. The error itself stays as it is, so a worker retries it.
+const UNSUPPORTED_BYTES = new WeakSet<object>();
+
+/** A built-in decoder's word that no loader recognises the bytes. Never read on a worker. */
+export function isUnsupportedBytes(err: unknown): boolean {
+  return UNSUPPORTED_BYTES.has(err as object);
 }
 
 /**
@@ -72,6 +77,9 @@ export function sharpDecodeError(
   if (detail === '' && err.message.startsWith(CORRUPT_HEADER)) {
     // Sharp made this error for this one failure, so the text can change here.
     err.message = `${CORRUPT_HEADER} the engine gave no detail`;
+  }
+  if (err.message.includes('unsupported image format')) {
+    UNSUPPORTED_BYTES.add(err);
   }
   return err;
 }

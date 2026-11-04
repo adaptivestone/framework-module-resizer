@@ -80,7 +80,7 @@ function originalError(cause: unknown): ResizeError {
   if (!isModuleError(cause)) {
     const message = messageText(cause);
     const detail = uploadDetail(message);
-    return isUnsupportedBytes(message)
+    return isUnsupportedBytes(cause)
       ? new ResizeOriginalError(
           `resize uploadOriginal: bytes are not a supported image: ${detail}`,
           { code: 'RESIZE_ORIGINAL_INVALID', cause },
