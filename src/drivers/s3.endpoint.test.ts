@@ -141,4 +141,20 @@ for (const key of READABLE_KEYS) {
     assert.equal(viaPublic.status, 200);
     assert.deepEqual(Buffer.from(await viaPublic.arrayBuffer()), body);
   });
+
+  // Compared raw: this server decodes a path before it looks the object up, so the reads above pass
+  // however a character is encoded, while a CDN in front of the bucket can tell the two apart.
+  test(`${JSON.stringify(key)} goes on the wire as its public URL writes it`, async () => {
+    const ref = { bucket: 'pub', key };
+    s3.objects.set(`pub/${key}`, Buffer.from(key));
+    const storage = s3.storage();
+    await storage.download(ref);
+    const wire = s3.requests.at(-1);
+    assert.equal(wire?.method, 'GET');
+    // Everything after the raw `?` is the SDK's own query: a `?` in the key is encoded.
+    assert.equal(
+      `${s3.endpoint}${wire?.url.split('?')[0]}`,
+      storage.publicUrl(ref),
+    );
+  });
 }

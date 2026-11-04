@@ -490,6 +490,24 @@ describe('S3Storage', () => {
     );
   });
 
+  test('a read holds a namespace to the strict alphabet, though its key may hold anything', async () => {
+    const { client, sent } = fakeClient();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    await assert.rejects(
+      s.download({
+        bucket: 'priv',
+        key: 'users 7/a.jpg',
+        namespace: 'users 7',
+      }),
+      { code: 'RESIZE_STORAGE_NAMESPACE_INVALID' },
+    );
+    assert.deepEqual(sent, []);
+  });
+
   test('the removed publicUrl option throws at construction, because a host would otherwise fall through to bucket URLs', () => {
     const opts = {
       bucketPublic: 'pub',
