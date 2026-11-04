@@ -70,10 +70,11 @@ function damageDetail(err: ResizeError): string {
 
 /**
  * What a decoder rejected the original with, as an upload error. Only a failure that names the
- * bytes refuses them for good; any other failure of a decoder says nothing about them, so a retry
- * may help. A setup or config error is a wiring bug, not an invalid original, and passes through
- * unchanged; the class is told by the brand and the class names, so an error from a duplicate copy
- * of the package counts too.
+ * bytes refuses them for good; any other failure of a decoder gives no verdict on them, so a retry
+ * may help. A host decoder's final refusal (`retryable: false`), at `inspect` or in the upload check,
+ * keeps its code and `retryable`. A setup or config error is a wiring bug, not an invalid original,
+ * and passes through unchanged; the class is told by the brand and the class names, so an error
+ * from a duplicate copy of the package counts too.
  */
 function originalError(cause: unknown): ResizeError {
   if (!isModuleError(cause)) {

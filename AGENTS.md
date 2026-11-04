@@ -453,9 +453,10 @@ retryable `RESIZE_WORKER_INCOMPLETE`. A source that cannot be decoded is a `Resi
 (usually a `ResizeMediaError`: `RESIZE_SOURCE_DAMAGED`, `retryable: false`, when the engine refuses
 a cut or unreadable source; `RESIZE_SOURCE_DECODE_FAILED`, retryable, with the
 engine's error as `cause`, for any other reason; or the decoder's own code; a missing or broken
-decoder is a `ResizeSetupError`), so the catch below still routes it to `badRequest`. Use `ResizeError.isResizeError(err)` rather than
-`instanceof` when the error may cross a package boundary — duplicate copies of the package break
-`instanceof` but not the symbol brand.
+decoder is a `ResizeSetupError`), so the catch below still handles it: a retryable error gave no
+verdict on the file, and its message can be raw engine text, so it gets your own answer. Use
+`ResizeError.isResizeError(err)` rather than `instanceof` when the error may cross a package
+boundary — duplicate copies of the package break `instanceof` but not the symbol brand.
 
 ```ts
 import { ResizeError, ResizeNoOriginalError } from '@adaptivestone/framework-module-resize';
@@ -464,8 +465,7 @@ try {
   await getResizer().generate({ media: fileDoc, sizes: catalog });
 } catch (err) {
   if (err instanceof ResizeNoOriginalError) return badRequest('upload the image first');
-  // err.retryable true: the failure is not about the file, so answer with your own text instead.
-  if (ResizeError.isResizeError(err)) return badRequest(err.message);
+  if (ResizeError.isResizeError(err)) return err.retryable ? tryAgainLater() : badRequest(err.message);
   throw err; // not ours
 }
 ```
@@ -645,7 +645,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_DECODER_MISSING` on a task or from `generate()` (retried) | no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
 | `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (dead-lettered at once), or `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` from `uploadOriginal()` | every decoder refused the bytes: no decoder of this process reads that format — add a decoder for it, or reject the file |
 | `RESIZE_ORIGINAL_INSPECT_FAILED` from `uploadOriginal()` (`retryable: true`) | a decoder failed to read the upload for a reason other than the bytes: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
-| `RESIZE_ORIGINAL_DAMAGED` from `uploadOriginal()` (`retryable: false`) | `upload.verify: 'decode'` decoded the original's first frame at `limits.failOn` and the engine refused it: the file is cut or corrupt, and nothing was stored — ask for the file again. Damage `inspect` finds first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays `RESIZE_ORIGINAL_INVALID`. An animation damaged in a later frame is stored, and a worker then renders the frames it has or fails the task |
+| `RESIZE_ORIGINAL_DAMAGED` from `uploadOriginal()` (`retryable: false`) | `upload.verify: 'decode'` decoded the original's first frame at `limits.failOn` and the engine refused it: the file is cut or corrupt, and nothing was stored — ask for the file again. Damage `inspect` finds first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays `RESIZE_ORIGINAL_INVALID`. An animation damaged in a later frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes |
 | `RESIZE_ORIGINAL_VERIFY_FAILED` from `uploadOriginal()` (`retryable: true`) | the `upload.verify: 'decode'` check failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
 | worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
 | `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: the engine refused its header, or refused its pixels at `limits.failOn` (the worker's dead line then names the level). Dead-lettered on its first delivery, since no retry can help — replace the original. Previews made from a damaged original before this version stay fresh: see the README `Damaged originals`. A download whose length differs from `original.size` stays the retryable `RESIZE_SOURCE_DECODE_FAILED`. On a stored format no decoder of this process lists, damage stays retryable too: `RESIZE_DECODER_MISSING` at `inspect`, `RESIZE_SOURCE_DECODE_FAILED` at render |
