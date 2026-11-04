@@ -1782,9 +1782,15 @@ media is on the module yet. The how-to, with the backfill loop, is in the guide:
 not apply. Each call holds the object in memory: about one object on local storage, and on S3 about
 2.3 times it with a current AWS SDK and about 3.3 times with SDK 3.572, per concurrent call (measured
 at 250 MiB). So on a request path, where a client chose the file, pass `maxBytes`, or run the adoption
-from a job. It lowers the cap for this call and cannot raise it; over it, the shipped drivers read
-nothing. The download has no timeout of its own, so set one on your storage client: for S3, pass
-`new S3Storage({ …, client })` with `requestHandler: { socketTimeout }`, which ends a body that stalls.
+from a job. It lowers the cap for this call and cannot raise it. Over it, the shipped drivers read
+nothing, except on an S3 response with no length, where the object is read whole and then refused
+with the same code. Real S3 sends a length. SDK 3.729 to 3.734 also read first, as the `download`
+contract above says.
+
+The download has no timeout of its own, so set one on your storage client: for S3, pass
+`new S3Storage({ …, client })` with `requestHandler: { socketTimeout: 5000 }`. Use a value under
+6000 ms, because on current SDKs a larger one does not end a body that stalls after its headers
+(measured against a local server, not real S3).
 
 It refuses what a worker could never render, and a public SVG, so it always decodes the object, on a
 Sharp thread, in the process that calls it. The check decodes the first frame. With `animated: true`,
@@ -1797,7 +1803,7 @@ damage in a later frame shows up on the worker as a dead task, `RESIZE_SOURCE_DA
 | Over the call's own `maxBytes` | `ResizeOriginalError` | `RESIZE_ORIGINAL_TOO_LARGE` | `false` |
 | A driver's own `ResizeError`: a third bucket, a refused key or ref, a missing object, over the limit | as thrown, the same object | its code, e.g. `RESIZE_S3_BUCKET_NOT_ALLOWED`, `RESIZE_STORAGE_KEY_INVALID`, `RESIZE_STORAGE_NOT_FOUND`, `RESIZE_SOURCE_TOO_LARGE` | its own |
 | Any other driver error, or a driver that resolved with something other than bytes | `ResizeStorageError` | `RESIZE_ORIGINAL_DOWNLOAD_FAILED` | `true` |
-| A driver that ignored `maxBytes` | `ResizeMediaError` | `RESIZE_SOURCE_TOO_LARGE` | `false` |
+| A driver that ignored `maxBytes`, over `limits.sourceBytes` | `ResizeMediaError` | `RESIZE_SOURCE_TOO_LARGE` | `false` |
 | Empty object | `ResizeOriginalError` | `RESIZE_ORIGINAL_EMPTY` | `false` |
 | Not an image, unknown format, one frame over the pixel limit | `ResizeOriginalError` | `RESIZE_ORIGINAL_INVALID`, `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`, `RESIZE_ORIGINAL_TOO_MANY_PIXELS` | `false` |
 | An unrecognised engine failure during `inspect` | `ResizeOriginalError` | `RESIZE_ORIGINAL_INSPECT_FAILED` | `true` |
