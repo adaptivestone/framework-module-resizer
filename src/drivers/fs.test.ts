@@ -398,16 +398,21 @@ describe('LocalFsStorage.fromConfig', () => {
   });
 
   test('rejects a missing rootDir with RESIZE_CONFIG_INVALID naming where', () => {
-    const cases: Array<[Record<string, unknown>, string]> = [
-      [{ publicBaseUrl: '/media' }, '`storage.rootDir`'],
-      [{ rootDir: 7, publicBaseUrl: '/media' }, '`storage.rootDir`'],
-      [{ rootDir: '/srv/media' }, '`storage.publicBaseUrl`'],
+    const cases: Array<[Record<string, unknown>, string, string]> = [
+      [{ publicBaseUrl: '/media' }, '`storage.rootDir`', 'a non-empty string'],
+      [
+        { rootDir: 7, publicBaseUrl: '/media' },
+        '`storage.rootDir`',
+        'a non-empty string',
+      ],
+      [{ rootDir: '/srv/media' }, '`storage.publicBaseUrl`', 'a string'],
       [
         { rootDir: '/srv/media', publicBaseUrl: '/media', privateRootDir: 1 },
         '`storage.privateRootDir`',
+        'a non-empty string',
       ],
     ];
-    for (const [keys, key] of cases) {
+    for (const [keys, key, kind] of cases) {
       assert.throws(
         () =>
           LocalFsStorage.fromConfig(
@@ -418,9 +423,51 @@ describe('LocalFsStorage.fromConfig', () => {
           err instanceof ResizeConfigError &&
           err.code === 'RESIZE_CONFIG_INVALID' &&
           err.message ===
-            `resize config: ${key} in src/config/resize.ts must be a string`,
+            `resize config: ${key} in src/config/resize.ts must be ${kind}`,
       );
     }
+  });
+
+  test('an empty rootDir or privateRootDir is refused, from a config and from the constructor', () => {
+    const invalid = { code: 'RESIZE_CONFIG_INVALID' };
+    assert.throws(
+      () =>
+        LocalFsStorage.fromConfig(
+          { driver: 'local', rootDir: '', publicBaseUrl: '/m' },
+          ctx,
+        ),
+      {
+        ...invalid,
+        message:
+          /`storage\.rootDir` in src\/config\/resize\.ts must be a non-empty string/,
+      },
+    );
+    assert.throws(
+      () =>
+        LocalFsStorage.fromConfig(
+          {
+            driver: 'local',
+            rootDir: 'a',
+            privateRootDir: '',
+            publicBaseUrl: '/m',
+          },
+          ctx,
+        ),
+      { ...invalid, message: /`storage\.privateRootDir`/ },
+    );
+    assert.throws(
+      () => new LocalFsStorage({ rootDir: '', publicBaseUrl: '/m' }),
+      { ...invalid, message: /rootDir must be a non-empty string/ },
+    );
+    assert.throws(
+      () =>
+        new LocalFsStorage({
+          rootDir: 'a',
+          privateRootDir: '',
+          publicBaseUrl: '/m',
+        }),
+      { ...invalid, message: /privateRootDir must be a non-empty string/ },
+    );
   });
 
   test('an empty publicBaseUrl is accepted as on rc.2 and gives root-relative URLs', async (t) => {

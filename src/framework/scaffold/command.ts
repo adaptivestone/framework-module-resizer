@@ -344,9 +344,53 @@ async function writeAgentsPointer(
   console.log(`${pad(existing === null ? 'created' : 'appended')}${target}`);
 }
 
+const IGNORE_ENTRY = '/var/';
+// Each line is trimmed first. A negation, a comment or a deeper path such as src/var does not count.
+const IGNORES_VAR = /^\/?var(\/(\*\*?)?)?$/;
+
+/**
+ * The scaffolded local storage writes under ./var, private originals included, and those must never
+ * reach version control, so the run that writes the config also ignores the folder. Append-only,
+ * like the agents pointer: a host's lines are never rewritten, and a rule it already has is kept.
+ */
+async function ignoreLocalStorage(root: string): Promise<void> {
+  const dest = join(root, '.gitignore');
+  const existing = (await fileExists(dest))
+    ? await readFile(dest, 'utf8')
+    : null;
+  if (existing?.split(/\r?\n/).some((line) => IGNORES_VAR.test(line.trim()))) {
+    console.log(`${pad('exists (skipped)')}.gitignore`);
+    return;
+  }
+  const block = `# Local resize storage: private originals and previews\n${IGNORE_ENTRY}\n`;
+  const kept = existing?.trimEnd();
+  await writeFile(dest, kept ? `${kept}\n\n${block}` : block);
+  console.log(`${pad(existing === null ? 'created' : 'appended')}.gitignore`);
+}
+
+const NEXT_COMMON = `  1. src/config/resize.ts: set mediaModelName to your media model ('File' is a guess) and check storage.
+  2. Spread resizeMediaSchemaFragment into that model.
+  3. Local storage: the framework serves no static files, so serve var/media at publicBaseUrl
+     (guide: "Serve local files"). Serve only that folder, never var/ itself.`;
+
+const NEXT_EAGER = `
+Done. Next:
+${NEXT_COMMON}
+  4. Import src/resizer.ts where you need the Resizer, and call generate() at upload.`;
+
+const NEXT_QUEUED = `
+Done. Next:
+${NEXT_COMMON}
+  4. Create the ResizeTask indexes through your migrations; the worker refuses to start without them.
+     \`queues\` in src/config/resize.ts defines the 'default' queue: driver 'database' needs no Lock
+     model; a queue on driver 'sqs' needs the framework's Lock indexes instead.
+  5. Import src/resizer.ts where you need the Resizer. The ResizeWorker command imports it too.
+  6. Set worker.enabled for the worker to run (worker: { enabled: true } in src/config/resize.ts or an environment file),
+     then: npm run cli ResizeWorker`;
+
 const USAGE = `resize-scaffold — vendor the resize module's integration files into a host project.
 
-Usage: npx @adaptivestone/framework-module-resize resize-scaffold [options]
+Usage: npx resize-scaffold [options]   (after npm i @adaptivestone/framework-module-resize)
 
 Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — new FrameworkResizer({ pipelines, hooks })
@@ -354,6 +398,7 @@ Emits (into process.cwd(), or --out <dir>):
   src/commands/ResizeWorker.ts  imports src/resizer.ts and re-exports the module's worker command
   src/config/resize.ts      media model, storage, the queue name, \`queues\`, \`worker\` (worker.enabled)
                             and overrides (framework merges environment files)
+  .gitignore                adds /var/ in the run that writes the config (append-only)
 
 Options:
   --check      verify the shims exist + reference the module (and the worker command imports
@@ -431,32 +476,15 @@ export async function runScaffold(
     eject: Boolean(values.eject),
     eager: Boolean(values.eager),
   });
+  // Asked before writeFiles, which would make the config exist either way.
+  const writesConfig =
+    Boolean(values.force) || !(await fileExists(join(root, CONFIG)));
   const code = await writeFiles(root, specs, Boolean(values.force));
   await writeAgentsPointer(root, agents as AgentsMode);
-  if (values.eager) {
-    console.log(
-      '\nDone. Next: set `mediaModelName` in src/config/resize.ts, import src/resizer.ts where',
-    );
-    console.log(
-      'you need the Resizer (a static import is fine), then call generate() at upload.',
-    );
-  } else {
-    console.log(
-      '\nDone. Next: set `mediaModelName` (and check `storage`) in src/config/resize.ts, create',
-    );
-    console.log(
-      'the ResizeTask and Lock indexes through your migrations, and import src/resizer.ts where you',
-    );
-    console.log(
-      'need the Resizer (a static import is fine). The ResizeWorker command imports it too.',
-    );
-    console.log(
-      "`queues` in src/config/resize.ts defines the 'default' queue (driver 'database', or 'sqs');",
-    );
-    console.log(
-      'set worker.enabled — worker: { enabled: true } in src/config/resize.ts or an environment file — for the worker to run.',
-    );
+  if (writesConfig) {
+    await ignoreLocalStorage(root);
   }
+  console.log(values.eager ? NEXT_EAGER : NEXT_QUEUED);
   return code;
 }
 

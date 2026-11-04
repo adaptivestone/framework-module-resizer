@@ -704,6 +704,14 @@ try {
     throw new Error('AGENTS.md pointer is missing its idempotency marker');
   }
   console.log('  ok  scaffold wrote the AGENTS.md pointer');
+  const gitignore = join(scaffoldDir, '.gitignore');
+  if (
+    !existsSync(gitignore) ||
+    !readFileSync(gitignore, 'utf8').includes('/var/')
+  ) {
+    throw new Error('resize-scaffold did not add /var/ to .gitignore');
+  }
+  console.log('  ok  scaffold added /var/ to .gitignore');
   run('npx', ['--no-install', 'resize-scaffold', '--check'], scaffoldDir);
   console.log('  ok  resize-scaffold --check exited 0');
 

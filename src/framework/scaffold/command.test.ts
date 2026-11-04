@@ -918,6 +918,158 @@ describe('packaging smoke', () => {
   });
 });
 
+describe('runScaffold — local storage', () => {
+  const IGNORE_BLOCK =
+    '# Local resize storage: private originals and previews\n/var/\n';
+
+  for (const flags of [[], ['--eager']]) {
+    test(`the ${flags[0] ?? 'default'} config writes the private root and an absolute URL from the environment`, async () => {
+      await run(flags);
+      const source = await read(CONFIG);
+      assert.match(source, /privateRootDir: '\.\/var\/media-private'/);
+      assert.match(
+        source,
+        /publicBaseUrl: process\.env\.RESIZE_PUBLIC_BASE_URL \|\| 'http:\/\/localhost:3300\/media'/,
+      );
+      assert.doesNotMatch(source, /publicBaseUrl: '\/media'/);
+      assert.doesNotMatch(source, /TODO\(REQUIRED\)/);
+      assert.match(source, /Never serve a folder above/);
+      assert.doesNotMatch(source, /s3-request-presigner/);
+    });
+  }
+
+  test('the run that writes the config creates .gitignore with /var/', async () => {
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.match(out, /created\s+\.gitignore/);
+  });
+
+  test('an existing .gitignore gets the rule appended after a blank line', async () => {
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), `node_modules\n\n${IGNORE_BLOCK}`);
+    assert.match(out, /appended\s+\.gitignore/);
+  });
+
+  test('an empty .gitignore gets the rule with no blank lines before it', async () => {
+    await writeFile(join(root, '.gitignore'), '');
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.match(out, /appended\s+\.gitignore/);
+  });
+
+  for (const rule of [
+    'var',
+    'var/',
+    '/var',
+    '/var/',
+    'var/*',
+    '/var/**',
+    '  /var/  ',
+  ]) {
+    test(`an existing rule ${JSON.stringify(rule)} is left alone`, async () => {
+      const before = `node_modules\n${rule}\ndist\n`;
+      await writeFile(join(root, '.gitignore'), before);
+      const { out } = await run([]);
+      assert.equal(await read('.gitignore'), before);
+      assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+    });
+  }
+
+  test('a .gitignore with CRLF line endings is read correctly', async () => {
+    const before = 'node_modules\r\n/var/\r\n';
+    await writeFile(join(root, '.gitignore'), before);
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), before);
+    assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+  });
+
+  for (const line of ['src/var', '# /var/', '!/var/']) {
+    test(`${line} in a .gitignore does not count: the rule is still added`, async () => {
+      await writeFile(join(root, '.gitignore'), `${line}\n`);
+      await run([]);
+      assert.equal(await read('.gitignore'), `${line}\n\n${IGNORE_BLOCK}`);
+    });
+  }
+
+  test('a re-run that keeps the config does not touch .gitignore', async () => {
+    await run([]);
+    await rm(join(root, '.gitignore'));
+    const { out } = await run([]);
+    assert.equal(await exists('.gitignore'), false);
+    assert.doesNotMatch(out, /\.gitignore/);
+  });
+
+  test("a run over a host's own config leaves it and .gitignore alone", async () => {
+    const hostConfig = 'export default { mine: true };\n';
+    await mkdir(join(root, 'src/config'), { recursive: true });
+    await writeFile(join(root, CONFIG), hostConfig);
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    await run(['--eager']);
+    assert.equal(await read(CONFIG), hostConfig);
+    assert.equal(await read('.gitignore'), 'node_modules\n');
+  });
+
+  test('--force writes the config, so it adds the rule', async () => {
+    await run([]);
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    const { out } = await run(['--force']);
+    assert.equal(await read('.gitignore'), `node_modules\n\n${IGNORE_BLOCK}`);
+    assert.match(out, /appended\s+\.gitignore/);
+  });
+
+  test('--force keeps a rule that is already there', async () => {
+    await run([]);
+    const { out } = await run(['--force']);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+  });
+
+  test('--check writes no .gitignore', async () => {
+    await run(['--check']);
+    assert.equal(await exists('.gitignore'), false);
+    await run([]);
+    await rm(join(root, '.gitignore'));
+    const { code } = await run(['--check']);
+    assert.equal(code, 0);
+    assert.equal(await exists('.gitignore'), false);
+  });
+
+  test('--eager adds the rule too', async () => {
+    await run(['--eager']);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+  });
+
+  test('--out puts the rule in that project root', async () => {
+    await run(['--out', 'app']);
+    assert.equal(await read('app/.gitignore'), IGNORE_BLOCK);
+    assert.equal(await exists('.gitignore'), false);
+  });
+
+  test('next steps name the local serving rule and the right indexes', async () => {
+    const { out } = await run([]);
+    assert.match(out, /Serve local files/);
+    assert.match(out, /never var\/ itself/);
+    assert.doesNotMatch(out, /ResizeTask and Lock/);
+    assert.match(out, /'File' is a guess/);
+  });
+
+  test('eager next steps end with generate() at upload', async () => {
+    const { out } = await run(['--eager']);
+    assert.match(out, /call generate\(\) at upload/);
+    assert.doesNotMatch(out, /npm run cli ResizeWorker/);
+  });
+
+  test('the usage names one invocation, after the install', async () => {
+    const { out } = await run(['--help']);
+    assert.match(
+      out,
+      /Usage: npx resize-scaffold \[options\] {3}\(after npm i @adaptivestone\/framework-module-resize\)/,
+    );
+    assert.match(out, /\.gitignore/);
+  });
+});
+
 describe('scaffolded ResizeWorker command', () => {
   test('loads src/resizer.ts before the module worker starts', async () => {
     await run([]);

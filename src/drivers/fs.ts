@@ -7,11 +7,12 @@ import {
   type StorageDownloadOptions,
 } from '../contracts/storage.ts';
 import {
+  ResizeConfigError,
   ResizeMediaError,
   ResizeSecurityError,
   ResizeStorageError,
 } from '../errors.ts';
-import { optionalString, stringValue } from '../helpers/configSection.ts';
+import { requiredString, stringValue } from '../helpers/configSection.ts';
 import type { LocalStorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
@@ -54,6 +55,21 @@ async function assertRealPathInsideRoot(
   }
 }
 
+/**
+ * An empty root resolves to the working directory: an empty environment variable would put private
+ * originals there.
+ */
+function assertRootDir(name: string, value: unknown): void {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new ResizeConfigError(
+      `resize fs: ${name} must be a non-empty string`,
+      {
+        code: 'RESIZE_CONFIG_INVALID',
+      },
+    );
+  }
+}
+
 export class LocalFsStorage extends ResizeStorage {
   readonly #rootDir: string;
   readonly #privateRootDir: string;
@@ -61,6 +77,10 @@ export class LocalFsStorage extends ResizeStorage {
 
   constructor(opts: LocalFsStorageOptions) {
     super();
+    assertRootDir('rootDir', opts.rootDir);
+    if (opts.privateRootDir !== undefined) {
+      assertRootDir('privateRootDir', opts.privateRootDir);
+    }
     this.#rootDir = resolve(opts.rootDir);
     this.#privateRootDir = resolve(
       opts.privateRootDir ?? `${this.#rootDir}-private`,
@@ -83,25 +103,28 @@ export class LocalFsStorage extends ResizeStorage {
   /**
    * The storage of a config's `storage` section (driver 'local'). Only this driver's keys are read:
    * an environment file that switched the driver leaves the other driver's keys (e.g. bucketPublic)
-   * in the merged section. A missing key, or a key that is not a string, is RESIZE_CONFIG_INVALID
-   * naming `ctx.where`; '' is accepted as before (`publicBaseUrl: ''` gives root-relative URLs).
+   * in the merged section. A missing key, or a key of the wrong type, is RESIZE_CONFIG_INVALID
+   * naming `ctx.where`. '' is allowed only for `publicBaseUrl`, where it gives root-relative URLs.
    */
   static fromConfig(
     section: LocalStorageConfig,
     ctx: DriverContext,
   ): LocalFsStorage {
     const { where } = ctx;
-    const rootDir = stringValue(section.rootDir, 'storage.rootDir', where);
+    const rootDir = requiredString(section.rootDir, 'storage.rootDir', where);
     const publicBaseUrl = stringValue(
       section.publicBaseUrl,
       'storage.publicBaseUrl',
       where,
     );
-    const privateRootDir = optionalString(
-      section.privateRootDir,
-      'storage.privateRootDir',
-      where,
-    );
+    const privateRootDir =
+      section.privateRootDir === undefined
+        ? undefined
+        : requiredString(
+            section.privateRootDir,
+            'storage.privateRootDir',
+            where,
+          );
     return new LocalFsStorage({
       rootDir,
       publicBaseUrl,

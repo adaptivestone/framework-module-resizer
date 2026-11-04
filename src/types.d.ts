@@ -373,9 +373,9 @@ export interface FrameworkWorkerConfig {
 // default provider chain.
 export interface LocalStorageConfig {
   driver: 'local'; // LocalFsStorage
-  rootDir: string; // public previews; serve only this directory
+  rootDir: string; // public previews; non-empty; serve exactly this directory, never a parent
   publicBaseUrl: string; // URL prefix, e.g. '/media'
-  privateRootDir?: string; // private originals; default rootDir + '-private'
+  privateRootDir?: string; // private originals; non-empty; default rootDir + '-private'
 }
 export interface S3StorageConfig {
   driver: 's3'; // S3Storage (needs @aws-sdk/client-s3; signedUrl also needs @aws-sdk/s3-request-presigner)

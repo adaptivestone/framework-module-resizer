@@ -65,9 +65,15 @@ import {
 export default {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
-  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+  storage: { driver: 'local', rootDir: './var/media', privateRootDir: './var/media-private',
+    publicBaseUrl: process.env.RESIZE_PUBLIC_BASE_URL || 'http://localhost:3300/media' },
 } satisfies FrameworkResizeConfig;
 ```
+
+The framework serves no static files: serve exactly `./var/media` at `publicBaseUrl` (guide:
+[Serve local files](https://framework.adaptivestone.com/docs/resize#serve-local-files)). In the run
+that writes this config, the scaffold also appends `/var/` to `.gitignore`, because private
+originals must never reach version control.
 
 ```ts
 // src/resizer.ts — behaviour only; the drivers come from the config file
@@ -415,9 +421,13 @@ and keeps the parts that loaded.
 
 | Option | | |
 |---|---|---|
-| `rootDir` | required | Public previews go here; serve only this directory |
-| `publicBaseUrl` | required | URL prefix, e.g. `/media` |
+| `rootDir` | required | Public previews go here; serve exactly this directory |
+| `publicBaseUrl` | required | URL prefix, e.g. `/media`; `''` gives root-relative URLs |
 | `privateRootDir` | optional | Private originals; default `rootDir` + `-private`, and never inside `rootDir` |
+
+`rootDir` and `privateRootDir` must be non-empty (`RESIZE_CONFIG_INVALID`): an empty one resolves to
+the working directory. Never serve a parent of `rootDir`, because `privateRootDir` sits beside it by
+default and the module cannot detect that.
 
 The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Its paths stay in
 the strict alphabet, because they are filesystem paths. Do not put symlinks into the public tree.

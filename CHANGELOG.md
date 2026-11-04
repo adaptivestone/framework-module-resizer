@@ -60,9 +60,14 @@
 - **A host decoder's originals are private unless the decoder sets `publicOriginals: true`.** A
   public upload otherwise throws `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it; a host
   decoder that takes over a built-in format adds one line.
+- **`rootDir: ''` and `privateRootDir: ''` are refused** with `RESIZE_CONFIG_INVALID`, because an
+  empty environment variable put private originals in the working directory.
 
 **Changed behaviour**
 
+- The scaffold writes an explicit `privateRootDir` and an absolute `publicBaseUrl` from
+  `RESIZE_PUBLIC_BASE_URL`, has new next steps, and appends `/var/` to `.gitignore` in the run that
+  writes the config. Existing configs are not touched.
 - The worker logs task failures itself: `warn` on a retried failure, `error` on a dead-letter, with
   the code, attempt and cause on one line. `NoopMetrics` does not silence them, so a host that
   alerts on `error` gets new alerts. The task row holds the same one-line text, so a multi-line
