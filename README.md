@@ -1470,24 +1470,25 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.
-    The module sets it on every `ResizeSecurityError` and on eleven codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
+    The module sets it on every `ResizeSecurityError` and on ten codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
     dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
     source has no dimensions or exceeds the
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), an SVG render ran past
-    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`), an encoder reported SVG output
-    for a preview (`RESIZE_SVG_PUBLIC_PREVIEW`), or the task was delivered more often than
-    `maxAttempts` because its workers kept crashing (`RESIZE_TASK_MAX_ATTEMPTS`). The worker reads
-    `retryable` on the error that fails the task, when it is a `ResizeError` — including one from
+    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`), or the task was delivered more
+    often than `maxAttempts` because its workers kept crashing (`RESIZE_TASK_MAX_ATTEMPTS`).
+    The worker reads `retryable` on the error that fails the task, when it is a `ResizeError` —
+    including one from
     a duplicate copy of the package (it checks the `isResizeError` brand, not the class); errors
     from other libraries are retried, whatever fields they carry. The rule for `false`: no later
     delivery of the same input can succeed, where a later delivery includes one after a rolling
     deploy reaches this worker, so `RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay
     `true`, and so does every unclear case. `ResizeOriginalError` and `ResizeConfigError` default
     to `false`, like `ResizeSecurityError`, and any other `ResizeError` to `true`;
-    `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false`. A
+    `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false`, and
+    `generate()`'s `RESIZE_GENERATE_FAILED` only when every variant did. A
     `ResizeError` from
     `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` or
     `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot

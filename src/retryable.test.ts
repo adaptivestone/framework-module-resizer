@@ -210,6 +210,7 @@ const rows: [code: string, retryable: boolean, trigger: () => unknown][] = [
       throw new ResizeSecurityError('m');
     },
   ],
+  // false only when every variant failed with false: processor.test.ts.
   [
     'RESIZE_GENERATE_FAILED',
     true,
@@ -490,12 +491,12 @@ for (const [code, retryable, trigger] of rows) {
 const elsewhere: [code: string, retryable: boolean, file: string][] = [
   ['RESIZE_SOURCE_METADATA_MISSING', false, 'uploader.test.ts'],
   ['RESIZE_SVG_RENDER_TIMEOUT', false, 'helpers/svgRaster.test.ts'],
-  ['RESIZE_SVG_PUBLIC_PREVIEW', false, 'processor.test.ts'],
   ['RESIZE_TASK_MAX_ATTEMPTS', false, 'consumer.test.ts'],
   ['RESIZE_TASK_TIMEOUT', true, 'consumer.test.ts'],
   ['RESIZE_WORKER_INCOMPLETE', true, 'worker.test.ts'], // false only when every missing variant failed with false
   ['RESIZE_SVG_RENDER_UNAVAILABLE', true, 'helpers/svgRaster.test.ts'],
   ['RESIZE_PIPELINE_STEP_INVALID', true, 'processor.test.ts'],
+  ['RESIZE_SVG_PUBLIC_PREVIEW', true, 'processor.test.ts'], // a custom step's output: a deploy can fix it
   ['RESIZE_PREVIEW_STORAGE_REF_INVALID', true, 'processor.test.ts'],
   ['RESIZE_MEDIA_APPEND_RESULT_INVALID', true, 'previewRecorder.test.ts'],
   ['RESIZE_MEDIA_REPLACE_MISSING', true, 'previewRecorder.test.ts'],

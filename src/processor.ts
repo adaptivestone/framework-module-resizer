@@ -670,29 +670,39 @@ export class Processor {
     )) as SizeInput[];
 
     // Expand sizes × formats; skip unbuildable sizes + fresh stored identities (idempotent).
-    const requested = catalog.missing(media, sizes, formats, {
-      resizer: name,
-      pipeline,
-    });
+    const scope: PreviewScope = { resizer: name, pipeline };
+    const requested = catalog.missing(media, sizes, formats, scope);
 
     const persist = opts.persist !== false;
-    const { generated, failedCount, removed, replaced, backfilled } =
-      await this.#renderPending({
-        media,
-        mediaId,
-        requested,
-        pipeline,
-        ctx,
-        persist,
-        mode: 'eager',
-      });
+    const {
+      generated,
+      failedCount,
+      finalFailures,
+      removed,
+      replaced,
+      backfilled,
+    } = await this.#renderPending({
+      media,
+      mediaId,
+      requested,
+      pipeline,
+      ctx,
+      persist,
+      mode: 'eager',
+    });
 
     // When the call throws, the caller's media keeps no dimensions, even if the store recorded them.
     if (requested.length > 0 && generated.length === 0 && failedCount > 0) {
+      // Final only when another call could change nothing: a variant with any other outcome (a
+      // retryable failure, a row the store left out) may still be made.
+      const allFinal = requested.every((preview) =>
+        finalFailures.has(catalog.identity(scope, preview)),
+      );
       throw new ResizeGenerateError({
         mediaId,
         failed: failedCount,
         requested: requested.length,
+        retryable: !allFinal,
       });
     }
 

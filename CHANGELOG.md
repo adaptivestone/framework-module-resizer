@@ -22,10 +22,11 @@
   now fails `tsc`; spreading the defaults' `upload` and `limits` still compiles. At run time such a
   file still works: the module merges it over the defaults.
 - `ResizeConfigError` defaults to `retryable: false`. `RESIZE_TASK_MAX_ATTEMPTS`,
-  `RESIZE_SVG_PUBLIC_PREVIEW`, `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`.
-  `RESIZE_WORKER_INCOMPLETE` is `false` when every missing variant failed with `false`. A missing
-  object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both shipped drivers, where it was the raw
-  driver error.
+  `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`. `RESIZE_WORKER_INCOMPLETE` is `false`
+  when every missing variant failed with `false`, and a storage refusal from a preview upload now
+  counts as such a failure, where it was retried. `RESIZE_GENERATE_FAILED` is `false` when every
+  variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both
+  shipped drivers, where it was the raw driver error.
 
 **Changed behaviour**
 

@@ -429,6 +429,64 @@ describe('a task queue without gatesByTask', () => {
     assert.equal(unconfirmedLines(), 2);
   });
 
+  test('a final unconfirmed add on the read path names its causeCode and promises no later read, logged once', async () => {
+    const tasks = new MemoryTaskQueue();
+    const realAdd = tasks.add.bind(tasks);
+    let confirm = false;
+    tasks.add = async (task) =>
+      confirm
+        ? realAdd(task)
+        : {
+            status: 'unconfirmed',
+            retryable: false,
+            causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+          };
+    const d = makeDispatcher({ tasks });
+    const lines = () =>
+      errors
+        .map(([message]) => String(message))
+        .filter((message) => /did not confirm the task/.test(message));
+    for (let i = 0; i < 5; i++) {
+      assert.equal(await d.enqueue(requestFor([v300])), 0);
+    }
+    assert.equal(lines().length, 1);
+    assert.match(lines()[0], /cause code RESIZE_MONGO_MODEL_OUTDATED/);
+    assert.doesNotMatch(lines()[0], /a later read/);
+    // The same once-only rule: again after an add was confirmed.
+    confirm = true;
+    assert.equal(await d.enqueue(requestFor([v300])), 1);
+    confirm = false;
+    assert.equal(await d.enqueue(requestFor([v300], { mediaId: 'm2' })), 0);
+    assert.equal(lines().length, 2);
+  });
+
+  test('a plain unconfirmed add on the read path still says a later read queues it, with no cause code', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'unconfirmed', causeCode: 'X' });
+    assert.equal(
+      await makeDispatcher({ tasks }).enqueue(requestFor([v300])),
+      0,
+    );
+    assert.match(String(errors[0][0]), /a later read queues it/);
+    assert.doesNotMatch(String(errors[0][0]), /cause code/);
+  });
+
+  test("a final add's cause code that is not one token cannot forge a read path line", async () => {
+    for (const causeCode of ['X\nresize worker: forged', 42, undefined]) {
+      errors = [];
+      const tasks = new PlainTaskQueue();
+      tasks.add = async () =>
+        ({ status: 'unconfirmed', retryable: false, causeCode }) as never;
+      assert.equal(
+        await makeDispatcher({ tasks }).enqueue(requestFor([v300])),
+        0,
+      );
+      const line = String(errors[0][0]);
+      assert.match(line, /cause code none/);
+      assert.doesNotMatch(line, /\n/);
+    }
+  });
+
   test('the one-lease hold never exceeds gateTtlMs (a lease longer than the gate lock)', async () => {
     const now = 5_000;
     const tasks = new PlainTaskQueue();

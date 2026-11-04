@@ -340,7 +340,6 @@ export async function encodeVariant(
   if (outputFormat === 'svg') {
     throw new ResizeMediaError('resize: SVG cannot be published as a preview', {
       code: 'RESIZE_SVG_PUBLIC_PREVIEW',
-      retryable: false,
     });
   }
   return {

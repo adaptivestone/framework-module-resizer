@@ -1480,23 +1480,22 @@ describe('decoding the source', () => {
     );
   });
 
-  // A variantStep's result whose encoder reports SVG output (Sharp writes none; a custom step could).
-  const svgOutput = {
-    toFormat: () => ({
-      timeout: () => ({
-        toBuffer: async () => ({
-          data: Buffer.from('<svg/>'),
-          info: { format: 'svg', width: 20, height: 20 },
+  test('an SVG preview output fails its variant with RESIZE_SVG_PUBLIC_PREVIEW naming the media', async () => {
+    // A variantStep whose encoder reports SVG output (Sharp writes none; a custom step could).
+    const svgOutput = {
+      toFormat: () => ({
+        timeout: () => ({
+          toBuffer: async () => ({
+            data: Buffer.from('<svg/>'),
+            info: { format: 'svg', width: 20, height: 20 },
+          }),
         }),
       }),
-    }),
-  } as unknown as Sharp;
-
-  test('an SVG preview output fails its variant with RESIZE_SVG_PUBLIC_PREVIEW naming the media', async () => {
+    };
     const { logger, logs } = recordingLogger();
     const { deps, uploads, media } = decodeDeps(redPng, {
       logger,
-      pipeline: { variantSteps: [() => svgOutput] },
+      pipeline: { variantSteps: [() => svgOutput as unknown as Sharp] },
     });
     await assert.rejects(
       new Processor(deps).generate({
@@ -1510,7 +1509,8 @@ describe('decoding the source', () => {
     assert.match(String(message), /variant .* failed for media m1/);
     assert.ok(err instanceof ResizeMediaError);
     assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
-    assert.equal(err.retryable, false);
+    // Only a custom step reaches it, and a deploy with a fixed step can succeed.
+    assert.equal(err.retryable, true);
     assert.equal(err.mediaId, 'm1');
     assert.match(err.message, /\(media m1\)$/);
   });
@@ -1532,6 +1532,14 @@ describe('decoding the source', () => {
     assert.equal(err.code, 'RESIZE_PREVIEW_STORAGE_REF_INVALID');
     assert.equal(err.retryable, true);
   });
+
+  // A host step that knows its variant can never be made.
+  const refuse = (): never => {
+    throw new ResizeMediaError('resize: this variant cannot be made', {
+      code: 'TEST_VARIANT_REFUSED',
+      retryable: false,
+    });
+  };
 
   describe('RESIZE_WORKER_INCOMPLETE and the failures behind it', () => {
     const bigger = variant({
@@ -1559,7 +1567,7 @@ describe('decoding the source', () => {
 
     test('RESIZE_WORKER_INCOMPLETE is not retryable when every missing variant failed with retryable false', async () => {
       const { deps } = decodeDeps(redPng, {
-        pipeline: { variantSteps: [() => svgOutput] },
+        pipeline: { variantSteps: [refuse] },
       });
       const err = await incomplete(deps, [variant(), bigger]);
       assert.equal(err.missing.length, 2);
@@ -1574,7 +1582,7 @@ describe('decoding the source', () => {
               if (v.sizeKey === '30x30') {
                 throw new Error('a passing failure');
               }
-              return svgOutput;
+              return refuse();
             },
           ],
         },
@@ -1588,7 +1596,7 @@ describe('decoding the source', () => {
       const { deps } = decodeDeps(redPng, {
         pipeline: {
           variantSteps: [
-            (img, { variant: v }) => (v.sizeKey === '30x30' ? img : svgOutput),
+            (img, { variant: v }) => (v.sizeKey === '30x30' ? img : refuse()),
           ],
         },
       });
@@ -1608,7 +1616,7 @@ describe('decoding the source', () => {
       assert.equal(alone.retryable, true);
       // Beside a variant that can never be made, too.
       const { deps: refusing } = decodeDeps(redPng, {
-        pipeline: { variantSteps: [() => svgOutput] },
+        pipeline: { variantSteps: [refuse] },
       });
       const beside = await incomplete(refusing, [
         variant(),
@@ -1616,6 +1624,77 @@ describe('decoding the source', () => {
       ]);
       assert.equal(beside.missing.length, 2);
       assert.equal(beside.retryable, true);
+    });
+  });
+
+  describe('RESIZE_GENERATE_FAILED and the failures behind it', () => {
+    const generateFailure = async (
+      deps: ProcessorDeps,
+      media: MediaLike,
+    ): Promise<ResizeGenerateError> => {
+      let thrown: unknown;
+      await assert.rejects(
+        new Processor(deps).generate({
+          media,
+          sizes: [
+            { width: 20, height: 20 },
+            { width: 30, height: 30 },
+          ],
+        }),
+        (err: unknown) => {
+          thrown = err;
+          return (
+            err instanceof ResizeGenerateError &&
+            err.code === 'RESIZE_GENERATE_FAILED'
+          );
+        },
+      );
+      return thrown as ResizeGenerateError;
+    };
+
+    test('RESIZE_GENERATE_FAILED is not retryable when every variant failed with retryable false', async () => {
+      const { deps, media } = decodeDeps(redPng, {
+        pipeline: { variantSteps: [refuse] },
+      });
+      const err = await generateFailure(deps, media());
+      assert.equal(err.failed, 2);
+      assert.equal(err.retryable, false);
+    });
+
+    test('RESIZE_GENERATE_FAILED stays retryable when one variant failed with true', async () => {
+      const { deps, media } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (_img, { variant: v }) => {
+              if (v.sizeKey === '30x30') {
+                throw new Error('a passing failure');
+              }
+              return refuse();
+            },
+          ],
+        },
+      });
+      const err = await generateFailure(deps, media());
+      assert.equal(err.failed, 2);
+      assert.equal(err.retryable, true);
+    });
+
+    test('RESIZE_GENERATE_FAILED stays retryable when the store left a rendered row out', async () => {
+      const { deps, media } = decodeDeps(redPng, {
+        pipeline: {
+          variantSteps: [
+            (img, { variant: v }) => (v.sizeKey === '30x30' ? img : refuse()),
+          ],
+        },
+      });
+      // One variant can never be made, and a retry can still store the other.
+      deps.media = fakeMedia({
+        load: async () => mediaDoc(),
+        appendPreviews: async () => [],
+      });
+      const err = await generateFailure(deps, media());
+      assert.equal(err.failed, 1);
+      assert.equal(err.retryable, true);
     });
   });
 

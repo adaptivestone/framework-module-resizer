@@ -434,7 +434,8 @@ const { created, failed } = await getResizer().generate({
 ```
 
 No original throws `ResizeNoOriginalError`; every requested variant failing throws
-`ResizeGenerateError`. `created` is only this call; `failed > 0` means a partial success.
+`ResizeGenerateError` (`retryable: false` when every one failed with `retryable: false`). `created`
+is only this call; `failed > 0` means a partial success.
 `generate` also appends `created` onto `media.previews` (when persist is on) so a same-request
 `resolve({ media })` sees them. Reload the media before saving it after `generate()` or
 `invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is

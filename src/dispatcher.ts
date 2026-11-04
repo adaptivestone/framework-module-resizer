@@ -23,7 +23,7 @@ import type {
 } from './contracts/taskQueue.ts';
 import type { Coordination } from './coordination.ts';
 import { ResizeError } from './errors.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { codeText, logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { gateKey } from './lockKeys.ts';
@@ -299,8 +299,11 @@ export class Dispatcher {
       case 'unconfirmed':
         if (!this.#loggedUnconfirmed) {
           this.#loggedUnconfirmed = true;
+          // A queue's cause code can hold a line break: codeText keeps this one line.
           logger.error(
-            `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it (further unconfirmed adds are not logged until one is confirmed)`,
+            outcome.retryable === false
+              ? `resize enqueue: the task queue did not confirm the task for media ${mediaId} and says no call can queue it until its cause is fixed (cause code ${codeText({ code: outcome.causeCode })}; further unconfirmed adds are not logged until one is confirmed)`
+              : `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it (further unconfirmed adds are not logged until one is confirmed)`,
           );
         }
         return failed;

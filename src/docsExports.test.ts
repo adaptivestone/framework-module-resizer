@@ -287,7 +287,6 @@ test('the README lists exactly the codes a task is dead-lettered with at once', 
     'RESIZE_SOURCE_METADATA_MISSING',
     'RESIZE_SOURCE_TOO_LARGE',
     'RESIZE_SVG_DIMENSIONS_UNSUPPORTED',
-    'RESIZE_SVG_PUBLIC_PREVIEW',
     'RESIZE_SVG_RENDER_TIMEOUT',
     'RESIZE_TASK_MAX_ATTEMPTS',
   ];
