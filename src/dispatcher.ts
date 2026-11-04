@@ -23,7 +23,7 @@ import type {
 } from './contracts/taskQueue.ts';
 import type { Coordination } from './coordination.ts';
 import { ResizeError } from './errors.ts';
-import { codeText, logNeverThrow } from './helpers/log.ts';
+import { codeText, firstTime, logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { gateKey } from './lockKeys.ts';
@@ -204,7 +204,7 @@ export class Dispatcher {
   // The queue names a read found not served, with invalid timing, or on a backend that needs a
   // lock store there is not: each is logged once, since every later read on that name meets the
   // same answer. A backend that failed to build is logged once per name and message, so a
-  // different failure is logged too.
+  // different failure is logged too. A message can differ every time, so firstTime caps each set.
   readonly #loggedNotServed = new Set<string>();
   readonly #loggedTimingInvalid = new Set<string>();
   readonly #loggedLocksMissing = new Set<string>();
@@ -254,8 +254,7 @@ export class Dispatcher {
         // Normal: the active task, or the request that holds the gate lock, covers the media.
         return { added: 0, outcome: 'in-flight' };
       case 'not-served':
-        if (!this.#loggedNotServed.has(req.queue)) {
-          this.#loggedNotServed.add(req.queue);
+        if (firstTime(this.#loggedNotServed, req.queue)) {
           logNeverThrow(
             logger,
             `resize enqueue: Resizer '${name}' ${notServed(req.queue, outcome.reason)} — nothing is queued (logged once per queue name)`,
@@ -267,8 +266,7 @@ export class Dispatcher {
       case 'route-failed': {
         const { message } = routeFailureIssue(outcome.error);
         const key = `${req.queue}\u0000${message}`;
-        if (!this.#loggedRouteFailed.has(key)) {
-          this.#loggedRouteFailed.add(key);
+        if (firstTime(this.#loggedRouteFailed, key)) {
           logNeverThrow(
             logger,
             `resize enqueue: Resizer '${name}' cannot queue to '${req.queue}': its backend could not be built — nothing is queued (logged once per queue name and error)`,
@@ -278,8 +276,7 @@ export class Dispatcher {
         return failed;
       }
       case 'locks-missing':
-        if (!this.#loggedLocksMissing.has(req.queue)) {
-          this.#loggedLocksMissing.add(req.queue);
+        if (firstTime(this.#loggedLocksMissing, req.queue)) {
           logNeverThrow(
             logger,
             `resize enqueue: ${locksMissing(req.queue, name)} — nothing is queued (logged once per queue name)`,
@@ -287,8 +284,7 @@ export class Dispatcher {
         }
         return failed;
       case 'timing-invalid':
-        if (!this.#loggedTimingInvalid.has(req.queue)) {
-          this.#loggedTimingInvalid.add(req.queue);
+        if (firstTime(this.#loggedTimingInvalid, req.queue)) {
           logNeverThrow(
             logger,
             `resize enqueue: Resizer '${this.#deps.name}' cannot queue to '${req.queue}': its timing is invalid — nothing is queued (logged once per queue name)`,

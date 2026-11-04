@@ -2,7 +2,7 @@
 // of a thrown value such a path needs. The host's logger is host code and may throw too, so its
 // failure falls back to the console instead of breaking the guarantee. A thrown value may be host
 // code as well: a getter, a `toString` or a Proxy trap can throw, and a message or a code can hold
-// a line break.
+// a line break. Also the cap on a line logged once per key, which such a path repeats on every call.
 import { ResizeError } from '../errors.ts';
 import type { ResizeLogger } from '../types.d.ts';
 
@@ -113,4 +113,20 @@ export function logNeverThrow(
       }
     }
   }
+}
+
+// A once-log keeps at most this many keys: host input (pipeline names, format lists, the message of
+// an error) is unbounded.
+export const ONCE_LOG_KEYS = 100;
+
+/**
+ * True the first time `key` is seen, which it then records, while `seen` holds fewer than
+ * ONCE_LOG_KEYS keys: past that, nothing new is logged.
+ */
+export function firstTime(seen: Set<string>, key: string): boolean {
+  if (seen.has(key) || seen.size >= ONCE_LOG_KEYS) {
+    return false;
+  }
+  seen.add(key);
+  return true;
 }

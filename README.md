@@ -1570,11 +1570,26 @@ await ResizeTask.updateOne(
   per Resizer (once more after its task queue is set up again): an unregistered pipeline name
   (`error`, once per name, for at most 100 names), a format list without `encode.formats` entries
   (`error`, once per list, for at most 100 lists), and, when the caller passed
-  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. A media without an original
-  logs nothing.
-  Every read is counted instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A
-  stored preview whose `publicUrl` throws, and an enqueue that throws, are still logged on every
-  read. `prewarm()` logs as before.
+  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. Every read is counted
+  instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A stored preview whose
+  `publicUrl` throws, and an enqueue that throws, are still logged on every read. `prewarm()` logs
+  as before.
+
+  A media loaded without the module's fields gets one `warn`, once per Resizer:
+
+  ```text
+  resize resolve: media <id> was loaded without its stored original and previews (a projection that drops resizeMediaPaths, or a row the module never wrote), so nothing is served or queued for it — add ...resizeMediaPaths to the query (logged once per Resizer)
+  ```
+
+  With only `previews` dropped, the line ends in "its previews are not seen and may be made again";
+  with previews and no original, in "its previews are served as stale and no task is queued". A
+  media loaded with an empty `previews` and no original logs nothing: it is a new row. One with
+  neither field gets the warning above, which is one harmless line for a lean row the module never
+  wrote.
+
+  On `MongoTaskQueue`, the first added task checks the gate index, once per model. A missing index
+  is one `error`: "… until it exists, every read can add a duplicate active task (logged once)". The
+  check runs in the background, so it never slows the read, and it never creates the index.
 - **What a worker logs:** the worker writes each task failure itself, one line on its own logger
   (`runWorker({ logger })`; the app logger under `npm run cli ResizeWorker`). A failure that will
   be retried is a `warn`, a dead task an `error`:

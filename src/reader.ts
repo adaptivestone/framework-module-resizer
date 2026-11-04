@@ -10,7 +10,8 @@
 // storage.publicUrl of a stored preview. A Reader takes its parts explicitly and knows no Resizer.
 // Every resolve() counts one `resize.read` with its outcome. A read writes a log line only for what
 // an operator must fix, and only once per Reader: an unregistered pipeline name, a dropped format
-// list, a missing task queue the caller asked to queue to.
+// list, a missing task queue the caller asked to queue to, a media loaded without the module's
+// fields.
 import type { Catalog } from './catalog.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
@@ -21,12 +22,13 @@ import {
 } from './dispatcher.ts';
 import { ResizeError } from './errors.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { firstTime, logNeverThrow } from './helpers/log.ts';
 import type { HookBus } from './hooks.ts';
 import { getSizeKey, requireMediaId, toMissingPreview } from './images.ts';
 import { NoopMetrics } from './metrics.ts';
 import type { PipelineRegistry } from './pipelines.ts';
 import type {
+  MediaLike,
   MissingPreview,
   Preview,
   PreviewScope,
@@ -80,9 +82,6 @@ interface ReadCounts {
   stale: number;
 }
 
-// A once-log keeps at most this many keys: host input (pipeline names, format lists) is unbounded.
-const ONCE_LOG_KEYS = 100;
-
 const noMetrics = new NoopMetrics();
 
 /** Serves the stored previews of one Resizer and requests the missing ones. Never throws. */
@@ -94,6 +93,7 @@ export class Reader {
   readonly #loggedPipelines = new Set<string>();
   readonly #loggedFormats = new Set<string>();
   #loggedEagerOnly = false;
+  #warnedNotLoaded = false;
 
   constructor(deps: ReaderDeps) {
     this.#deps = deps;
@@ -129,6 +129,9 @@ export class Reader {
       // rather than enqueueing under the literal 'undefined' key.
       const mediaId = requireMediaId(media);
       read.mediaId = mediaId;
+      if (!this.#warnedNotLoaded) {
+        this.#warnNotLoaded(media, mediaId);
+      }
       // A pipeline this process does not know (e.g. registered only in another process) has
       // unknown steps: serve what is already stored for it, but no task can be trusted to render it.
       const knownPipeline = pipelines.has(pipeline);
@@ -313,6 +316,24 @@ export class Reader {
       const safe: ReadDecision = { ready, missing: [] };
       return { decision: safe, output: undefined };
     }
+  }
+
+  /**
+   * Say once when this media was loaded without the module's fields: the read looks like a media
+   * with nothing to serve, and only the host's query can change that. Nothing here waits or throws.
+   */
+  #warnNotLoaded(media: MediaLike, mediaId: string): void {
+    const paths = notLoaded(media);
+    if (paths.length === 0) {
+      return;
+    }
+    this.#warnedNotLoaded = true;
+    logNeverThrow(
+      this.#deps.logger,
+      `resize resolve: media ${mediaId} was loaded without its stored ${paths.join(' and ')} (a projection that drops resizeMediaPaths, or a row the module never wrote), so ${notLoadedEffect(media, paths)} — add ...resizeMediaPaths to the query (logged once per Resizer)`,
+      undefined,
+      'warn',
+    );
   }
 
   /**
@@ -598,6 +619,50 @@ export class Reader {
   }
 }
 
+/**
+ * The module's fields this media was loaded without. A hydrated document says so itself: there
+ * `.select('name')` gives a truthy nested `original` with an undefined storageRef. A lean row with
+ * `original` and no `previews` is not listed: raw writes make such rows. A throwing `isSelected`
+ * says nothing.
+ */
+function notLoaded(media: MediaLike): string[] {
+  try {
+    const { isSelected } = media as { isSelected?: (path: string) => boolean };
+    if (typeof isSelected === 'function') {
+      return ['original', 'previews'].filter(
+        (path) => !isSelected.call(media, path),
+      );
+    }
+    if (media.original !== undefined) {
+      return [];
+    }
+    if (media.previews === undefined) {
+      return ['original', 'previews'];
+    }
+    return Array.isArray(media.previews) && media.previews.length > 0
+      ? ['original']
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** What a read does with a media loaded without `paths`, for the warning. */
+function notLoadedEffect(media: MediaLike, paths: string[]): string {
+  if (!paths.includes('original')) {
+    return 'its previews are not seen and may be made again';
+  }
+  let holdsPreviews = false;
+  try {
+    holdsPreviews = Array.isArray(media.previews) && media.previews.length > 0;
+  } catch {
+    // A getter that throws: the warning must not stop the read, and no preview was seen.
+  }
+  return holdsPreviews
+    ? 'its previews are served as stale and no task is queued'
+    : 'nothing is served or queued for it';
+}
+
 // The errors of this package that a prewarm retry cannot fix: an unusable media, or wrong wiring or
 // config. Told by the brand and the class names, so an error from a duplicate copy of the package
 // gets the same advice.
@@ -759,16 +824,4 @@ function splitStale(
     ).push(variant);
   }
   return { stale, missing };
-}
-
-/**
- * True the first time `key` is seen, which it then records, while `seen` holds fewer than
- * ONCE_LOG_KEYS keys: past that, nothing new is logged.
- */
-function firstTime(seen: Set<string>, key: string): boolean {
-  if (seen.has(key) || seen.size >= ONCE_LOG_KEYS) {
-    return false;
-  }
-  seen.add(key);
-  return true;
 }

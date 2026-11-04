@@ -596,6 +596,7 @@ describe('MongoTaskQueue setup', () => {
           return {};
         },
       },
+      findOne: async () => null,
       create: async () => [stored],
     };
     configureQueue(() => model);
@@ -853,6 +854,430 @@ describe('MongoTaskQueue setup', () => {
     // Not after Mongoose's 10 s buffer timeout.
     assert.ok(Date.now() - started < 2000, `${Date.now() - started} ms`);
   });
+
+  describe('the gate index check of the first added task', () => {
+    const goodIndexes = [
+      { name: '_id_', key: { _id: 1 } },
+      {
+        name: 'gate',
+        key: gateKeys,
+        unique: true,
+        partialFilterExpression: { active: true },
+      },
+    ];
+
+    // Lets a check that add() did not wait for run to its end.
+    const settled = async () => {
+      for (let i = 0; i < 5; i++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+
+    /**
+     * A model whose every add stores a task (a new model, so nothing has checked it yet); `indexes`
+     * answers the check, and `listed` records what each call asked.
+     */
+    function checkedModel(
+      indexes: () => Promise<unknown> = async () => goodIndexes,
+      over: Record<string, unknown> = {},
+    ) {
+      const listed: unknown[] = [];
+      const model = {
+        findOne: async () => null,
+        create: async () => [{ _id: new mongoose.Types.ObjectId() }],
+        collection: {
+          collectionName: 'resizetasks',
+          indexes: (options: unknown) => {
+            listed.push(options);
+            return indexes();
+          },
+        },
+        ...over,
+      };
+      return { model, listed };
+    }
+
+    // A short buffer timeout (Mongoose reads it, its types do not list it): a listing that follows
+    // the close is buffered, then rejected, instead of holding the test for 10 s.
+    const closingConnection = (name: string) =>
+      mongoose
+        .createConnection(server.getUri(), {
+          dbName: `resize_check_${name}_${process.pid}`,
+          autoIndex: false,
+          bufferTimeoutMS: 50,
+        } as mongoose.ConnectOptions)
+        .asPromise();
+
+    test('the first add calls the index check without waiting for it', async () => {
+      const { model, listed } = checkedModel(() => new Promise(() => {}));
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.deepEqual(listed, [{ readPreference: 'primary' }]);
+      assert.equal(errors.length, 0);
+    });
+
+    test('the index check runs once per model across many adds', async () => {
+      const { model, listed } = checkedModel();
+      const { errors } = configureQueue(() => model);
+      await Promise.all(Array.from({ length: 20 }, () => tasks.add(request())));
+      await settled();
+      assert.equal((await tasks.add(request())).status, 'added');
+      // Another queue on the same model: the set is module-level, like loggedSchemaErrors.
+      const second = new MongoTaskQueue({ model, logger });
+      assert.equal((await second.add(request())).status, 'added');
+      await settled();
+      assert.equal(listed.length, 1);
+      assert.equal(errors.length, 0);
+    });
+
+    test('a missing gate index logs one error, and the add still succeeds', async () => {
+      const { model, listed } = checkedModel(async () => [
+        { name: '_id_', key: { _id: 1 } },
+      ]);
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(errors.length, 1);
+      assert.match(
+        String(errors[0][0]),
+        /has no gate index.* — until it exists, every read can add a duplicate active task \(logged once\)$/,
+      );
+      assert.equal(
+        (errors[0][1] as { code?: unknown }).code,
+        'RESIZE_MONGO_INDEX_MISSING',
+      );
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(errors.length, 1, 'logged once');
+      assert.equal(listed.length, 1);
+    });
+
+    test('a gate index that is not unique or not partial logs the same line', async () => {
+      const { model } = checkedModel(async () => [
+        { name: 'gate', key: gateKeys, unique: true },
+      ]);
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(errors.length, 1);
+      assert.match(
+        String(errors[0][0]),
+        /is not unique or not partial .* — until it exists, every read can add a duplicate active task \(logged once\)$/,
+      );
+    });
+
+    test('a collection-missing answer counts as unknown: nothing is logged, and the next add checks again', async () => {
+      let asked = 0;
+      const { model, listed } = checkedModel(async () => {
+        asked += 1;
+        if (asked === 1) {
+          throw Object.assign(new Error('ns does not exist'), { code: 26 });
+        }
+        return goodIndexes;
+      });
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(errors.length, 0);
+      assert.equal(listed.length, 2, 'asked again, then settled');
+    });
+
+    test('verify still calls a collection-missing answer missing', async () => {
+      const { model } = checkedModel(async () => {
+        throw Object.assign(new Error('ns does not exist'), { code: 26 });
+      });
+      await assert.rejects(
+        new MongoTaskQueue({ model }).verify(),
+        (error: unknown) =>
+          error instanceof ResizeSetupError &&
+          error.code === 'RESIZE_MONGO_INDEX_MISSING' &&
+          /does not exist yet/.test(error.message),
+      );
+    });
+
+    test('any other failure of the check logs nothing, and the next add checks again', async () => {
+      let asked = 0;
+      const { model, listed } = checkedModel(async () => {
+        asked += 1;
+        if (asked === 1) {
+          throw new Error('not authorized to list indexes');
+        }
+        return goodIndexes;
+      });
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(errors.length, 0);
+      assert.equal(listed.length, 2);
+    });
+
+    test('a closed connection during the check logs nothing and throws nothing', async () => {
+      // Closed before the check lists anything: the check stops at the connection.
+      const closed = checkedModel(async () => goodIndexes, {
+        db: { readyState: 0 },
+      });
+      const { errors } = configureQueue(() => closed.model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.deepEqual(closed.listed, []);
+      // A connection closed under the listing: the next add checks again.
+      const under = checkedModel(async () => {
+        throw Object.assign(new Error('client was closed'), {
+          name: 'MongoNotConnectedError',
+        });
+      });
+      const again = configureQueue(() => under.model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(under.listed.length, 2);
+      assert.deepEqual(errors, []);
+      assert.deepEqual(again.errors, []);
+    });
+
+    test('a real connection that closes while the check lists the indexes', async () => {
+      const closing = await closingConnection('closing');
+      try {
+        const model = closing.model('ResizeTask', declaredSchema(false));
+        await model.init();
+        await model.createCollection();
+        const list = model.collection.indexes.bind(model.collection);
+        let listing: Promise<unknown> | undefined;
+        model.collection.indexes = ((options: never) => {
+          listing = closing.close().then(() => list(options));
+          return listing;
+        }) as typeof model.collection.indexes;
+        const { errors } = configureQueue(() => model);
+        assert.equal((await tasks.add(request())).status, 'added');
+        await waitFor(() => listing !== undefined);
+        await assert.rejects(listing as Promise<unknown>);
+        await settled();
+        assert.equal(errors.length, 0);
+      } finally {
+        await closing.close();
+      }
+    });
+
+    test('a real connection closed right after the add logs nothing', async () => {
+      const closing = await closingConnection('closed');
+      try {
+        const model = closing.model('ResizeTask', declaredSchema(false));
+        await model.init();
+        await model.createCollection();
+        const { errors } = configureQueue(() => model);
+        assert.equal((await tasks.add(request())).status, 'added');
+        await closing.close();
+        await sleep(100);
+        assert.equal(errors.length, 0);
+      } finally {
+        await closing.close();
+      }
+    });
+
+    test('a successful verify() skips the check; a failed one does not', async () => {
+      const { model, listed } = checkedModel();
+      const { errors } = configureQueue(() => model);
+      await tasks.verify();
+      assert.equal(listed.length, 1);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(listed.length, 1);
+      assert.equal(errors.length, 0);
+
+      const missing = checkedModel(async () => []);
+      const logged = configureQueue(() => missing.model);
+      await assert.rejects(tasks.verify());
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(missing.listed.length, 2);
+      assert.equal(logged.errors.length, 1);
+    });
+
+    test('a model without collection.indexes is skipped', async () => {
+      for (const model of [
+        {
+          findOne: async () => null,
+          create: async () => [{ _id: new mongoose.Types.ObjectId() }],
+        },
+        {
+          findOne: async () => null,
+          create: async () => [{ _id: new mongoose.Types.ObjectId() }],
+          collection: {},
+        },
+      ]) {
+        const { errors } = configureQueue(() => model);
+        assert.equal((await tasks.add(request())).status, 'added');
+        await settled();
+        await tasks.verify();
+        assert.equal(errors.length, 0);
+      }
+    });
+
+    test('an in-flight result never starts the check', async () => {
+      const { model, listed } = checkedModel(async () => [], {
+        findOne: async () => ({
+          _id: new mongoose.Types.ObjectId(),
+          status: 'pending',
+        }),
+      });
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'in-flight');
+      await settled();
+      assert.deepEqual(listed, []);
+      assert.equal(errors.length, 0);
+    });
+
+    test('a hostile model cannot change the add result or reject in the background', async () => {
+      const boom = () => {
+        throw new Error('hostile');
+      };
+      const models = [
+        // A getter that throws where add() looks for the check.
+        Object.defineProperty(checkedModel().model, 'collection', {
+          get: boom,
+        }),
+        // An `indexes` that throws instead of rejecting.
+        checkedModel(boom).model,
+        // A rejection that throws on every read of it.
+        checkedModel(
+          () =>
+            Promise.reject(
+              new Proxy(
+                {},
+                {
+                  get: boom,
+                  getPrototypeOf: boom,
+                  has: boom,
+                  getOwnPropertyDescriptor: boom,
+                },
+              ),
+            ) as Promise<unknown>,
+        ).model,
+      ];
+      for (const model of models) {
+        const { errors } = configureQueue(() => model);
+        assert.equal((await tasks.add(request())).status, 'added');
+        await settled();
+        assert.equal(errors.length, 0);
+      }
+    });
+
+    test('a logger that throws at the missing-index line falls back to the console', async (t) => {
+      const fallback = t.mock.method(console, 'error', () => {});
+      const { model } = checkedModel(async () => []);
+      tasks = new MongoTaskQueue({
+        model,
+        logger: {
+          info() {},
+          warn() {},
+          error() {
+            throw new Error('log sink down');
+          },
+        },
+      });
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(fallback.mock.calls.length, 1);
+      assert.match(
+        String(fallback.mock.calls[0].arguments[0]),
+        /every read can add a duplicate active task/,
+      );
+    });
+
+    test('a real collection without the gate index logs one error after the first added task', async () => {
+      const model = await modelWith('ResizeTaskCheckedNoGate', []);
+      const before = await model.collection.indexes();
+      const { errors } = configureQueue(() => model);
+      const mediaId = fid();
+      const first = await tasks.add(request({ mediaId }));
+      assert.equal(first.status, 'added');
+      await waitFor(() => errors.length > 0);
+      assert.equal(errors.length, 1);
+      assert.match(
+        String(errors[0][0]),
+        /has no gate index.* — until it exists, every read can add a duplicate active task \(logged once\)$/,
+      );
+      // The check creates nothing, and without the index a later read still finds the active row.
+      assert.deepEqual(await model.collection.indexes(), before);
+      assert.deepEqual(await tasks.add(request({ mediaId })), {
+        status: 'in-flight',
+        taskId: first.status === 'added' ? first.taskId : '',
+      });
+      assert.equal((await tasks.add(request())).status, 'added');
+      await sleep(30);
+      assert.equal(errors.length, 1, 'logged once');
+    });
+
+    test('a real collection dropped under the check is unknown, and the next add checks again', async () => {
+      const model = await modelWith('ResizeTaskCheckedDropped', []);
+      const list = model.collection.indexes.bind(model.collection);
+      let listing: Promise<unknown> | undefined;
+      model.collection.indexes = ((options: never) => {
+        listing = model.collection.drop().then(() => list(options));
+        return listing;
+      }) as typeof model.collection.indexes;
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await waitFor(() => listing !== undefined);
+      await assert.rejects(listing as Promise<unknown>, { code: 26 });
+      await settled();
+      assert.equal(errors.length, 0);
+      // The next add creates the collection again, with no gate index, and this time that is true.
+      model.collection.indexes = list;
+      assert.equal((await tasks.add(request())).status, 'added');
+      await waitFor(() => errors.length > 0);
+      assert.match(String(errors[0][0]), /has no gate index/);
+    });
+
+    test('a real collection with the gate index logs nothing', async (t) => {
+      const model = await modelWith(
+        'ResizeTaskCheckedWithGate',
+        resizeTaskIndexes.map(([keys, options]) => [
+          keys as Record<string, 1>,
+          options ?? {},
+        ]),
+      );
+      const listing = t.mock.method(model.collection, 'indexes');
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await waitFor(() => listing.mock.calls.length > 0);
+      await listing.mock.calls[0].result;
+      await settled();
+      assert.equal(errors.length, 0);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(listing.mock.calls.length, 1);
+    });
+
+    test("with Mongoose's autoIndex on, the first add on a fresh database raises no false alarm", async () => {
+      for (let i = 0; i < 5; i++) {
+        // The add can land while Mongoose still builds the declared indexes.
+        const fresh = await mongoose
+          .createConnection(server.getUri(), {
+            dbName: `resize_check_autoindex_${process.pid}_${i}`,
+          })
+          .asPromise();
+        try {
+          const model = fresh.model('ResizeTask', declaredSchema(true));
+          const { errors } = configureQueue(() => model);
+          assert.equal((await tasks.add(request())).status, 'added');
+          await model.init();
+          await sleep(30);
+          assert.deepEqual(errors, []);
+        } finally {
+          await fresh.close();
+        }
+      }
+    });
+  });
 });
 
 describe('MongoTaskQueue.add', () => {
@@ -911,12 +1336,13 @@ describe('MongoTaskQueue.add', () => {
     );
   }
 
-  test('a gate that opens between the insert and the read gives the task a second round', async () => {
+  test('a gate that closes between the read and the insert gives the task a second round', async () => {
     const stored = { _id: new mongoose.Types.ObjectId() };
+    const calls: string[] = [];
     let creates = 0;
-    let reads = 0;
     configureQueue(() => ({
       create: async () => {
+        calls.push('create');
         creates += 1;
         if (creates === 1) {
           throw duplicateKey();
@@ -924,7 +1350,7 @@ describe('MongoTaskQueue.add', () => {
         return [stored];
       },
       findOne: async () => {
-        reads += 1;
+        calls.push('read');
         return null;
       },
     }));
@@ -932,40 +1358,104 @@ describe('MongoTaskQueue.add', () => {
       status: 'added',
       taskId: String(stored._id),
     });
-    assert.deepEqual([creates, reads], [2, 1]);
+    assert.deepEqual(calls, ['read', 'create', 'read', 'create']);
   });
 
   test('two rounds at most: a gate that keeps changing hands is reported in-flight', async () => {
-    let creates = 0;
-    let reads = 0;
+    const calls: string[] = [];
     const { errors } = configureQueue(() => ({
       create: async () => {
-        creates += 1;
+        calls.push('create');
         throw duplicateKey();
       },
       findOne: async () => {
-        reads += 1;
+        calls.push('read');
         return null;
       },
     }));
     assert.deepEqual(await tasks.add(request()), { status: 'in-flight' });
-    assert.deepEqual([creates, reads], [2, 2]);
+    assert.deepEqual(calls, ['read', 'create', 'read', 'create']);
     assert.equal(errors.length, 0, 'another add holds the gate: not an error');
   });
 
-  test('a failed read after a duplicate key is logged and unconfirmed', async () => {
+  test('a failed gate read is logged and unconfirmed, and inserts nothing', async () => {
     const failure = new Error('read failed');
+    let creates = 0;
     const { errors } = configureQueue(() => ({
       create: async () => {
-        throw duplicateKey();
+        creates += 1;
+        return [{ _id: new mongoose.Types.ObjectId() }];
       },
       findOne: async () => {
         throw failure;
       },
     }));
     assert.deepEqual(await tasks.add(request()), { status: 'unconfirmed' });
+    assert.equal(creates, 0);
     assert.equal(errors.length, 1);
     assert.equal(errors[0][1], failure);
+  });
+
+  test('a read with a task waiting reads once and never calls create', async () => {
+    const taskId = new mongoose.Types.ObjectId();
+    let reads = 0;
+    let creates = 0;
+    configureQueue(() => ({
+      create: async () => {
+        creates += 1;
+        return [{ _id: new mongoose.Types.ObjectId() }];
+      },
+      findOne: async () => {
+        reads += 1;
+        return { _id: taskId, status: 'pending' };
+      },
+    }));
+    assert.deepEqual(await tasks.add(request()), {
+      status: 'in-flight',
+      taskId: String(taskId),
+    });
+    assert.deepEqual([reads, creates], [1, 0]);
+  });
+
+  test('the gate read and findActive ask the primary', async () => {
+    const findOneCalls: { filter: object; options: unknown }[] = [];
+    configureQueue(() => ({
+      findOne: async (
+        filter: object,
+        _projection: unknown,
+        options: unknown,
+      ) => {
+        findOneCalls.push({ filter, options });
+        return null;
+      },
+      create: async () => [{ _id: new mongoose.Types.ObjectId() }],
+    }));
+    const task = request();
+    await tasks.add(task);
+    await tasks.findActive(task);
+    assert.equal(findOneCalls.length, 2);
+    assert.deepEqual(findOneCalls[0].options, { readPreference: 'primary' });
+    assert.deepEqual(findOneCalls[1].options, { readPreference: 'primary' });
+  });
+
+  test('a row that appears between the read and the insert is reported with its id in round two', async () => {
+    const mediaId = fid();
+    const other = await addedTaskId(request({ mediaId }));
+    let reads = 0;
+    configureQueue(() => ({
+      create: M.create.bind(M),
+      // The first read misses the row another add has just inserted.
+      findOne: (...args: Parameters<typeof M.findOne>) => {
+        reads += 1;
+        return reads === 1 ? Promise.resolve(null) : M.findOne(...args);
+      },
+    }));
+    assert.deepEqual(await tasks.add(request({ mediaId })), {
+      status: 'in-flight',
+      taskId: other,
+    });
+    assert.equal(reads, 2);
+    assert.equal(await M.countDocuments({ fileId: mediaId }), 1);
   });
 });
 
@@ -1126,6 +1616,7 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
   test('a write error other than a duplicate key is logged and plainly unconfirmed; a missing model says calling again cannot help', async () => {
     const failure = new Error('MongoDB offline');
     const { errors } = configureQueue(() => ({
+      findOne: async () => null,
       create: async () => {
         throw failure;
       },
@@ -1192,6 +1683,7 @@ describe('MongoTaskQueue.add: one active task per Resizer, media, pipeline and q
       new Error(message), // only the message says so
     ]) {
       const { errors } = configureQueue(() => ({
+        findOne: async () => null,
         create: async () => {
           throw failure;
         },

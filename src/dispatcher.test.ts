@@ -1238,6 +1238,56 @@ describe('a task queue that routes queue names to backends', () => {
     }
   });
 
+  test('a queue that fails with a new message every time logs at most 100 lines', async () => {
+    let builds = 0;
+    const d = makeDispatcher({
+      tasks: new RoutingTaskQueue({
+        default: new MemoryTaskQueue(),
+        // A failed build is forgotten, so every call builds and fails with its own text.
+        bulk: async () => {
+          builds += 1;
+          throw new Error(`boom ${builds}`);
+        },
+      }),
+    });
+    for (let i = 0; i < 150; i++) {
+      assert.equal(await d.enqueue(requestFor([v300], { queue: 'bulk' })), 0);
+    }
+    assert.equal(builds, 150);
+    assert.equal(errors.length, 100);
+  });
+
+  test('every once-log of the read path is capped at 100 queue names', async () => {
+    const names = Array.from({ length: 150 }, (_, i) => `q${i}`);
+    const drain = async (d: Dispatcher) => {
+      for (const queue of names) {
+        assert.equal(await d.enqueue(requestFor([v300], { queue })), 0);
+        assert.equal(await d.enqueue(requestFor([v300], { queue })), 0);
+      }
+    };
+    // Not served.
+    await drain(
+      makeDispatcher({ tasks: new MemoryTaskQueue({ queues: ['default'] }) }),
+    );
+    assert.equal(warnings.length, 100);
+    // Invalid timing.
+    errors = [];
+    await drain(
+      makeDispatcher({
+        timingOf: () => {
+          throw new ResizeSetupError('bad timing');
+        },
+      }),
+    );
+    assert.equal(errors.length, 100);
+    // A backend that needs a lock store there is not.
+    errors = [];
+    await drain(
+      makeDispatcher({ tasks: new PlainTaskQueue(), locks: undefined }),
+    );
+    assert.equal(errors.length, 100);
+  });
+
   test('a name marked unavailable: prewarm is RESIZE_QUEUE_NOT_SERVED, not retryable, and the message names the package; resolve logs it once', async () => {
     const tasks = new MemoryTaskQueue({ queues: ['default'] });
     markUnavailable(tasks, ['bulk'], {

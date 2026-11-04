@@ -34,6 +34,11 @@
   the code, attempt and cause on one line. `NoopMetrics` does not silence them, so a host that
   alerts on `error` gets new alerts. The task row holds the same one-line text, so a multi-line
   message now reads ` | ` there.
+- `resolve()` warns once per Resizer when the module's fields were not loaded. After the first added
+  task, `MongoTaskQueue` checks the gate index once per model in the background and logs an `error`
+  when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
+  indexed query instead of a failed insert; the first add costs about 1 ms more, and the unique
+  index still settles races. The gate read and `findActive` read from the primary.
 
 **Features**
 
@@ -46,6 +51,7 @@
 
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
+- The dispatcher's once-log sets are capped at 100 keys.
 
 # 0.3.0
 
