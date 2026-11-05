@@ -548,8 +548,9 @@ test('each code asserted elsewhere is in the test file named', () => {
 });
 
 // Every remaining code, written out. None can reach a task or an upload's input: each is thrown at
-// construction, at first use or verify() because the wiring is wrong, or at worker start, or is a
-// prewarm issue code (README table), so nothing reads its retryable on a task. A new code must choose.
+// construction, at first use or verify() because the wiring is wrong, at worker start, or on an
+// invocation whose event is no SQS batch, or is a prewarm issue code (README table), so nothing reads
+// its retryable on a task. A new code must choose.
 const NOT_READ = [
   'RESIZE_APP_NOT_INITIALIZED',
   'RESIZE_CONFIG_COORDINATION_INVALID',
@@ -594,6 +595,7 @@ const NOT_READ = [
   'RESIZE_QUEUE_NOT_SERVED',
   'RESIZE_QUEUE_ROUTES_INVALID',
   'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED',
+  'RESIZE_SQS_EVENT_INVALID',
   'RESIZE_SQS_QUEUE_UNKNOWN',
   'RESIZE_SQS_QUEUE_URL_REQUIRED',
   'RESIZE_STORAGE_REQUIRED',

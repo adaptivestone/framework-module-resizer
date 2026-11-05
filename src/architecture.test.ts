@@ -85,7 +85,7 @@ test('only images.ts decides which stored rows count', () => {
 // through logNeverThrow, which falls back to the console. Optional calls (`logger?.error(`) and
 // references (`logger.error.bind`) count as direct too.
 test('the worker loop logs only through logNeverThrow', () => {
-  const direct = ['consumer.ts', 'worker.ts'].filter((f) =>
+  const direct = ['consumer.ts', 'delivery.ts', 'worker.ts'].filter((f) =>
     /\blogger\??\.(info|warn|error)\b/.test(read(f)),
   );
   assert.deepEqual(direct, []);
