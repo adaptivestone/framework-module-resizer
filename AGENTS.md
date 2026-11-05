@@ -358,8 +358,11 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    The flag permits the command to run; it does not start a worker in the API. The worker consumes
    indexes prepared by the host lifecycle; it does not create them, so start it after they exist
    (step 7).
-   Push delivery (an SQS-triggered Lambda) is not supported in 0.3.0: run the worker as a
-   long-lived process.
+   Push delivery (preview): an SQS-triggered Lambda can run tasks instead of a worker process, with
+   `createSqsHandler()` from `…/lambda.js`. It has not run on real AWS. Standard queues only; do not
+   bundle it. Read the README `Push delivery (preview)` section first: batch size 1, a function
+   timeout well above the task's time, `maxReceiveCount` above `maxAttempts`, the visibility timeout,
+   `ReportBatchItemFailures` (without it failed tasks are lost silently), `deadLetterQueueUrl`.
    Eager mode needs no worker.
 
 ## Use
@@ -847,6 +850,12 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_SQS_QUEUE_UNKNOWN` | a direct `SqsTaskQueue` call (`add`, `claim`) named a queue it has no URL for — add the URL to `queues`. A Resizer never gets it: its call on such a name is `RESIZE_QUEUE_NOT_SERVED` before any gate lock or `add()` (see that row) |
 | `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED` at worker start | `runWorker({ resizers })` does not list a Resizer of the process that uses a task queue the worker consumes and that cannot filter claims, e.g. SQS (the message names the queue and the Resizers; a queue with `claimFilters` may be shared); the worker would claim their tasks without running them — list them too, or give them their own task queue. With `queues` on more than one available backend, every `FrameworkResizer` that takes its task queue from the config file shares one router that reaches every name, so a worker that consumes a queue on SQS must list all of them, whatever their own queue (`npm run cli ResizeWorker` serves every Resizer). When the message says a task queue failed to load, the worker could not compare that unlisted Resizer's task queue (the load error is the cause) — fix that task queue |
 | `RESIZE_DUPLICATE_RESIZER` at worker start, "the `resizers` list names '…' twice" | two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
+| `RESIZE_DELIVERY_UNSUPPORTED` from a Lambda handler | a consumed queue name is not on SQS, or no Resizer has a task queue — only the SQS driver takes pushed messages: consume that name with a worker, or leave it out of `createSqsHandler({ queue })`; when the message names other Resizers on that name that can take them, serve only those, with `createSqsHandler({ resizers })`, and consume the others with a worker |
+| failed tasks disappear on Lambda, with no retries and no dead-letter | the trigger lacks `ReportBatchItemFailures`, so Lambda deletes every message of a normal return — add it to `FunctionResponseTypes` |
+| `resize lambda: … the first record of this invocation, was not started` | the function timeout is too small for the reserve — raise it to what the line names; under 4 s no task starts with the default reserve, and the sixth delivery dead-letters it unrun |
+| `resize lambda: message … was not started` (`warn`), or tasks dead with `RESIZE_TASK_MAX_ATTEMPTS` and no run | a batch does not fit one function timeout: a tail record uses a receive without running, and healthy tasks die unrun — set batch size 1 |
+| `resize lambda: setting the visibility of message … had not answered` | the function has no route to SQS, and no task runs — in a VPC give it a NAT gateway or an SQS endpoint, and a route to S3 |
+| a task in the dead-letter queue with no `is dead` line and no `onTaskDeadLettered` | the redrive's `maxReceiveCount` is too low, so SQS moved the message first, and nothing logs it — set it to `maxAttempts` + 2 |
 | `RESIZE_QUEUE_INVALID` at worker start | `runWorker({ queue })` (or `runResizeWorker`) got an empty list, or a list entry or a single name that is blank or not a string (`queue: ''` is refused too) — pass a queue name or a list of names; `--queue` may be repeated |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>`. The gate is per queue: such a task blocks new tasks for its media and pipeline on that queue only, never reads on another queue |
 | models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |

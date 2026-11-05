@@ -320,3 +320,50 @@ test('the README lists exactly the codes a task is dead-lettered with at once', 
   );
   assert.deepEqual([...inReadme].sort(), expected);
 });
+
+test('the push delivery section leads with the settings a host must get right, in the order that saves tasks', () => {
+  const readme = read('README.md');
+  const from = readme.indexOf('## Push delivery');
+  assert.ok(from >= 0, 'README.md has no "## Push delivery" section');
+  const to = readme.indexOf('\n## ', from + 1);
+  const section = readme.slice(from, to < 0 ? undefined : to);
+  const lead = [
+    'Batch size 1',
+    'function timeout',
+    'maxReceiveCount',
+    'visibility timeout',
+    'ReportBatchItemFailures',
+    'deadLetterQueueUrl',
+  ];
+  let at = -1;
+  for (const setting of lead) {
+    const found = section.indexOf(setting);
+    assert.ok(found > at, `${setting} must come after what leads it`);
+    at = found;
+  }
+  for (const later of [
+    'sqs:ChangeMessageVisibility',
+    'sqs:SendMessage',
+    'MaximumConcurrency',
+    'createSqsHandler(',
+    'Do not bundle',
+  ]) {
+    assert.ok(section.indexOf(later) > at, `${later} must come after the lead`);
+  }
+  assert.ok(
+    section.indexOf('Do not bundle') < section.indexOf('--external:@aws-sdk'),
+    '"Do not bundle" must lead the esbuild table',
+  );
+  assert.ok(
+    section.indexOf('{ concurrency: 1, cache: false }') >= 0,
+    'the handler must lead with its Sharp options',
+  );
+  assert.ok(
+    section.includes('FIFO'),
+    'the section must say FIFO queues are not supported',
+  );
+  assert.ok(
+    /not run on real AWS/.test(section.slice(0, 600)),
+    'the section must open by saying it has not run on real AWS',
+  );
+});

@@ -169,6 +169,55 @@ actual framework host and run it against real infra._
 - [ ] Confirm eager mode (`generate()`, no `queue` or `queues` in the config) on a host scaffolded with
       `--eager`; `npx resize-scaffold --check --eager` passes.
 
+### Push delivery (needs an AWS account)
+
+Nothing in `Push delivery (preview)` has run on real AWS: the handler was measured with stand-ins and
+a model on one machine. Use a throwaway account or prefix, and delete everything afterwards. The
+script below has not been run either, so check its flags as you go. Run C2 and C5 first, since they
+are the two that can change the design. Until C1, C2, C5 and C8 have passed once, the docs keep the
+mark.
+
+To remove the mark, run `grep -rn "Push delivery (preview)" README.md AGENTS.md CHANGELOG.md src/lambda.ts`
+here and the same `grep` on `docs/12-resize.md` in the guide's repository, change each hit and the
+`createSqsHandler` JSDoc, update the README's opening sentence of that section, and fix the guide's
+link to the README's `#push-delivery-preview` anchor, which the new heading changes.
+
+```bash
+# Deployed: a function with the guide's handler, nodejs24.x, arm64, 1769 MB, timeout 120 s, and
+# pipeline steps 'block' (blocks the event loop past the timeout) and 'hang' (awaits past it,
+# ignoring the abort), each on demand.
+aws sqs create-queue --queue-name resize-check-dead
+aws sqs create-queue --queue-name resize-check --attributes '{
+  "VisibilityTimeout":"720",
+  "RedrivePolicy":"{\"deadLetterTargetArn\":\"<DEAD_ARN>\",\"maxReceiveCount\":\"7\"}"}'
+aws lambda create-event-source-mapping --function-name resize-check \
+  --event-source-arn <QUEUE_ARN> --batch-size 1 \
+  --function-response-types ReportBatchItemFailures \
+  --scaling-config MaximumConcurrency=2
+# Feed it with resizer.prewarm(), or send a task's JSON body with `aws sqs send-message`.
+# Read attempts and timing from the "resize: task ..." log lines and the REPORT lines.
+```
+
+| # | Do | Expect | If not |
+|---|---|---|---|
+| C1 | One good task | Previews stored. Message gone, and stays gone after 720 s. No error from Lambda's own delete | Stop deleting in the handler: leave the record out and let Lambda delete it, releasing the gate afterwards |
+| **C2** | A task that fails with a retryable error (a missing storage object) | **Attempts about 5 s, 10 s, 20 s apart, not 720 s** | Safe but slow: document it, and set a shorter visibility or use `DelaySeconds` |
+| C3 | Keep C2 failing. Then set `maxReceiveCount` to 3 and repeat | Dead at attempt 5: in the dead-letter queue with the module's body, `onTaskDeadLettered` fired, cooldown on. At 3: SQS moves it, with no `is dead` line, no hook and no cooldown, as the docs warn | Check `sqs:SendMessage`. Whatever you see, decide here whether the first invocation should check `maxReceiveCount` with one `GetQueueAttributes` call |
+| C4 | Function timeout 30 s, `stopBeforeTimeoutMs: 10000`, a catalog that takes longer than that at this memory | `RESIZE_TASK_TIMEOUT` in the log, no `Status: timeout` in REPORT, some rows stored, retried with backoff, and the retry renders only the rest | Raise the default reserve |
+| **C5** | The `block` step, so REPORT says `Status: timeout` | Redelivered about one lease (60 s) later, not 720 s. Gate still held | Adoption failed: check IAM |
+| C6 | Batch of 3 (mixed), batch size 3 and a 1 s window | Only the failed record comes back | Check `itemIdentifier` |
+| C7 | Remove `ReportBatchItemFailures`, repeat C2 | Message gone after the first failure, confirming the trap in the docs | Update the docs with what you see |
+| C8 | One 12 MP JPEG, one SVG | Both render. Note `Init Duration` and `Max Memory Used` | SVG: capture the error; document rasterising elsewhere, or drop SVG on Lambda |
+| C9 | Reserved concurrency below the burst, 50 messages | Watch whether attempts rise without runs | Raise `maxAttempts`, or document `MaximumConcurrency` only |
+| C10 | Invoke, wait 20 minutes, invoke again | The frozen Mongo connection recovers without a failed task | Tune `maxIdleTimeMS`; document it |
+| C11 | The `hang` step | REPORT ends about 2 s before the timeout with no `Status: timeout`, a `had not settled` line, the record back after its backoff, and no harm when the frozen step resumes | Check that an async handler's return ends the invocation |
+| C12 | Function timeout 3 s, Lambda's default, with the queue's visibility timeout at 18 s for this run | An `error` line naming the first record on each delivery, nothing rendered, deliveries about 18 s apart (a record not started gets no visibility call), then dead with `RESIZE_TASK_MAX_ATTEMPTS` at the sixth delivery | Check the receive count reaches the handler |
+| C13 | A function in a VPC with no NAT and no endpoint | An `error` naming the route to SQS on each delivery, and no task run. Note how long one delivery takes | Set a shorter request timeout on the SDK client, and document it |
+| C14 | In C10's second invocation, watch the first SQS and S3 calls after the thaw | No failed task from a stale socket: the SDK retries | Document it |
+| C15 | In C6, read Lambda's logs and the queue's metrics for the records the function already deleted itself, beside the one it listed | No error from Lambda's own delete of those, and the listed record comes back after the visibility the function set, not 720 s | Stop deleting in the handler, as in C1 |
+| C16 | The `hang` step with a real Sharp chain in flight and an upload after it: let the function return, invoke again within a minute, and once more with `limits.processingTimeoutSeconds` shorter than the gap | Whether a late S3 PUT and a late Mongo write land after the thaw, as a row a read judges as any other. Whether frozen time counts toward Sharp's limit: it did under `SIGSTOP` on one machine, so the chain failed just after the thaw and its retry rendered it | Document what you see in the README's `Stopping in time` |
+| C17 | A package without `@aws-sdk/*`: log `import.meta.resolve('@aws-sdk/client-sqs')` from `/var/task` at init, then deliver one task | Either it resolves to the runtime's copy, and the docs can say a host need not ship the SDK once its version is checked against the peer range, or the task is refused with `RESIZE_PEER_MISSING`, as the docs assume | Document which, and the runtime's SDK version |
+
 ## Notes
 
 - **No publish workflow on purpose.** Both sibling repos release manually; a tagged-release
