@@ -1282,6 +1282,257 @@ describe('SqsTaskQueue options', () => {
   });
 });
 
+describe('delivered messages', () => {
+  const url = 'https://sqs.eu-west-1.amazonaws.com/123456789012/resize';
+  const arn = 'arn:aws:sqs:eu-west-1:123456789012:resize';
+  const fake = makeFakeSqsClient().client;
+
+  test('carriesSource compares the ARN account and name with the last two path parts of the URL', () => {
+    const q = new SqsTaskQueue({
+      queueUrl: url,
+      queues: { local: 'http://localhost:4566/000000000000/bulk' },
+      client: fake,
+    });
+    assert.equal(q.carriesSource('default', arn), true);
+    assert.equal(
+      q.carriesSource('local', 'arn:aws:sqs:us-east-1:000000000000:bulk'),
+      true,
+    );
+    assert.equal(
+      q.carriesSource('default', 'arn:aws:sqs:eu-west-1:999999999999:resize'),
+      false,
+    );
+    assert.equal(
+      q.carriesSource('default', 'arn:aws:sqs:eu-west-1:123456789012:other'),
+      false,
+    );
+    assert.equal(q.carriesSource('default', 'not-an-arn'), false);
+    assert.equal(
+      q.carriesSource('default', 'arn:aws:sns:eu-west-1:123456789012:resize'),
+      false,
+    );
+    assert.equal(q.carriesSource('unknown', arn), false);
+  });
+
+  test('carriesSource takes any partition and ignores a trailing slash on the URL', () => {
+    const q = new SqsTaskQueue({ queueUrl: `${url}/`, client: fake });
+    assert.equal(q.carriesSource('default', arn), true);
+    assert.equal(
+      q.carriesSource(
+        'default',
+        'arn:aws-us-gov:sqs:us-gov-west-1:123456789012:resize',
+      ),
+      true,
+    );
+  });
+
+  test('carriesSource refuses an ARN with a missing or an extra part', () => {
+    const q = new SqsTaskQueue({ queueUrl: url, client: fake });
+    for (const source of [
+      '',
+      'arn:aws:sqs:eu-west-1:123456789012',
+      'arn:aws:sqs::123456789012:resize',
+      'arn:aws:sqs:eu-west-1:123456789012:resize:extra',
+      'xarn:aws:sqs:eu-west-1:123456789012:resize',
+    ]) {
+      assert.equal(q.carriesSource('default', source), false, source);
+    }
+  });
+
+  test('carriesSource answers false for a configured URL it cannot read, and reads no host as a path part', () => {
+    const q = new SqsTaskQueue({
+      queueUrl: url,
+      queues: {
+        relative: 'not a url',
+        empty: '',
+        hostOnly: 'https://123456789012/resize',
+      },
+      client: fake,
+    });
+    assert.equal(q.carriesSource('relative', arn), false);
+    assert.equal(q.carriesSource('empty', arn), false);
+    assert.equal(q.carriesSource('hostOnly', arn), false);
+  });
+
+  test('taskOfDelivery reads a message as claim reads a received one', async () => {
+    const q = new SqsTaskQueue({ queueUrl: url, client: fake });
+    const body = JSON.stringify({
+      resizer: 'listings',
+      mediaId: 'm',
+      pipeline: 'p',
+      previews: [],
+      gateOwner: 'g',
+    });
+    const task = await q.taskOfDelivery(
+      { id: 'm-1', receipt: 'rh-1', receiveCount: '3', body },
+      'default',
+    );
+    assert.deepEqual(task, {
+      taskId: 'm-1',
+      resizer: 'listings',
+      queue: 'default',
+      mediaId: 'm',
+      pipeline: 'p',
+      previews: [],
+      token: JSON.stringify([url, 'rh-1']),
+      attempts: 3,
+      gateOwner: 'g',
+    });
+    const { client } = makeFakeSqsClient({
+      message: {
+        MessageId: 'm-1',
+        ReceiptHandle: 'rh-1',
+        Attributes: { ApproximateReceiveCount: '3' },
+        Body: body,
+      },
+    });
+    const claimed = await new SqsTaskQueue({ queueUrl: url, client }).claim(
+      'default',
+      60_000,
+    );
+    assert.deepEqual(task, claimed);
+  });
+
+  test('reading a task sends nothing: the message is already held', async () => {
+    const { client, commands } = makeFakeSqsClient();
+    const q = new SqsTaskQueue({ queueUrl: url, client });
+    await q.taskOfDelivery(
+      {
+        id: 'm',
+        receipt: 'r',
+        body: JSON.stringify({ mediaId: 'm', pipeline: 'p' }),
+      },
+      'default',
+    );
+    assert.deepEqual(commands, []);
+  });
+
+  test('the token holds the URL of the consumed queue, not of the queue the body names', async () => {
+    const q = new SqsTaskQueue({
+      queues: { default: url, bulk: `${url}-bulk` },
+      client: fake,
+    });
+    const task = await q.taskOfDelivery(
+      {
+        id: 'm',
+        receipt: 'r',
+        body: JSON.stringify({ queue: 'bulk', mediaId: 'm', pipeline: 'p' }),
+      },
+      'default',
+    );
+    assert.ok(task !== 'left' && task !== 'discarded');
+    assert.equal(task.queue, 'bulk');
+    assert.deepEqual(JSON.parse(task.token), [url, 'r']);
+  });
+
+  test('a body without resizer, queue or previews reads with the defaults of the consumed queue', async () => {
+    const q = new SqsTaskQueue({
+      queues: { bulk: `${url}-bulk` },
+      client: fake,
+    });
+    const task = await q.taskOfDelivery(
+      {
+        id: 'm',
+        receipt: 'r',
+        body: JSON.stringify({ mediaId: 'm', pipeline: 'p' }),
+      },
+      'bulk',
+    );
+    assert.ok(task !== 'left' && task !== 'discarded');
+    assert.equal(task.resizer, 'default');
+    assert.equal(task.queue, 'bulk');
+    assert.deepEqual(task.previews, []);
+    assert.equal('gateOwner' in task, false);
+  });
+
+  test('a message without a receive count reads as attempt 1 and warns once', async () => {
+    const warnings: unknown[][] = [];
+    const q = new SqsTaskQueue({
+      queueUrl: url,
+      client: fake,
+      logger: {
+        info() {},
+        warn: (...args: unknown[]) => warnings.push(args),
+        error() {},
+      },
+    });
+    const delivered = {
+      id: 'm',
+      receipt: 'r',
+      body: JSON.stringify({ mediaId: 'm', pipeline: 'p' }),
+    };
+    for (let i = 0; i < 2; i += 1) {
+      const task = await q.taskOfDelivery(delivered, 'default');
+      assert.ok(task !== 'left' && task !== 'discarded');
+      assert.equal(task.attempts, 1);
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(String(warnings[0][0]), /ApproximateReceiveCount/);
+  });
+
+  test('an unknown queue rejects with RESIZE_SQS_QUEUE_UNKNOWN', async () => {
+    const q = new SqsTaskQueue({ queueUrl: url, client: fake });
+    await assert.rejects(
+      q.taskOfDelivery({ id: 'm', receipt: 'r', body: '{}' }, 'unknown'),
+      { code: 'RESIZE_SQS_QUEUE_UNKNOWN' },
+    );
+  });
+
+  test('a malformed body with a dead-letter queue is moved and reported discarded', async () => {
+    const { client, sent, deletes } = makeFakeSqsClient();
+    const { logger } = recordingLogger();
+    const q = new SqsTaskQueue({
+      queueUrl: url,
+      deadLetterQueueUrl: `${url}-dead`,
+      client,
+      logger,
+    });
+    assert.equal(
+      await q.taskOfDelivery(
+        { id: 'm', receipt: 'r', body: '{not json' },
+        'default',
+      ),
+      'discarded',
+    );
+    assert.equal(sent[0].input.MessageBody, '{not json');
+    assert.equal(sent[0].input.QueueUrl, `${url}-dead`);
+    assert.deepEqual(deletes[0], { QueueUrl: url, ReceiptHandle: 'r' });
+  });
+
+  test('a malformed body without a dead-letter queue is logged and left', async () => {
+    const { client, commands } = makeFakeSqsClient();
+    const { errors, logger } = recordingLogger();
+    const q = new SqsTaskQueue({ queueUrl: url, client, logger });
+    for (const body of ['{not json', JSON.stringify({ mediaId: 'm' })]) {
+      assert.equal(
+        await q.taskOfDelivery({ id: 'm', receipt: 'r', body }, 'default'),
+        'left',
+      );
+    }
+    assert.deepEqual(commands, []);
+    assert.equal(errors.length, 2);
+    assert.match(String(errors[0][0]), /malformed task body in message m/);
+  });
+
+  test('a dead-letter send that fails rejects, so the message stays', async () => {
+    const { client, deletes } = makeFakeSqsClient({
+      outputs: { SendMessageCommand: [new Error('down')] },
+    });
+    const { logger } = recordingLogger();
+    const q = new SqsTaskQueue({
+      queueUrl: url,
+      deadLetterQueueUrl: `${url}-dead`,
+      client,
+      logger,
+    });
+    await assert.rejects(
+      q.taskOfDelivery({ id: 'm', receipt: 'r', body: '{not json' }, 'default'),
+      /down/,
+    );
+    assert.deepEqual(deletes, []);
+  });
+});
+
 describe('SqsTaskQueue.fromConfig', () => {
   test("one queue for one backend's entries, each name with its URL and timing", async (t) => {
     const { errors, logger } = recordingLogger();

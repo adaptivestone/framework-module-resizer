@@ -62,6 +62,8 @@ const DRIVER_NAMES = [
   'ResizeWorker',
   'runResizeWorker',
   'FrameworkResizer',
+  // Push delivery lives at …/lambda.js.
+  'createSqsHandler',
 ];
 
 const asRecord = api as unknown as Record<string, unknown>;

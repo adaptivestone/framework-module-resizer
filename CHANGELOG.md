@@ -272,6 +272,14 @@
   Sharp stays a dependency. The engine is not part of `encodeSig`: switching does not regenerate
   stored previews; bump each pipeline's `version` to do that. An `engine` key in a config is
   `RESIZE_CONFIG_INVALID`. New codes: `RESIZE_ENGINE_INVALID`, `RESIZE_ENGINE_FORMAT_UNSUPPORTED`.
+- **Push delivery (preview).** `createSqsHandler()` from the new `…/lambda.js` entry runs queued
+  tasks in an SQS-triggered Lambda, with the same lease, retries, dead-letters and gate as a
+  worker, on either host shape, with no new peer. Standard queues only: FIFO queues are not
+  supported. The trigger must set `ReportBatchItemFailures`, or retries are lost silently, and a
+  batch that does not fit one function timeout can kill healthy tasks unrun: see the README section,
+  which leads with the settings to get right. It has not run on real AWS yet, so it stays a preview until the check
+  list in `RELEASE.md` passes. Workers are unchanged: `src/consumer.ts` did not change for this.
+  New codes: `RESIZE_DELIVERY_UNSUPPORTED`, `RESIZE_SQS_EVENT_INVALID`.
 
 **Fixes**
 
@@ -299,6 +307,10 @@
   `startServer()` and its CLI emit. A script on `new Server()` and `init()`, a `FrameworkResizer`
   with every part in code first used before the `Server` exists, and a CLI command with an
   asynchronous sink call `await getResizer().metrics.flush?.()` themselves.
+
+**Internal**
+
+- `runWorker`'s wiring moved into `prepareServing`, which push delivery shares.
 
 # 0.3.0
 

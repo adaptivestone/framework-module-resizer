@@ -320,3 +320,67 @@ test('the README lists exactly the codes a task is dead-lettered with at once', 
   );
   assert.deepEqual([...inReadme].sort(), expected);
 });
+
+// The eight lines both pages lead with, word for word: the guide's section repeats them, so a host
+// who reads only one page still does not lose tasks. Change one here, in the README and in the guide.
+const PUSH_LEAD = [
+  "1. **`ReportBatchItemFailures` in the trigger's `FunctionResponseTypes`.** Without it Lambda deletes every message of a normal return, so a failing task is gone after its first failure, with no copy, while its line says `retrying in 5000 ms`. The handler cannot detect this.",
+  '2. **Batch size 1, with no batch window.** Records of a batch run one after another. One that does not fit in the time left is not started, yet its delivery counts as an attempt, so healthy tasks die unrun.',
+  "3. **A function timeout well above your slowest task.** Start at 300 s. Lambda's default 3 s runs no task at all.",
+  '4. **Redrive `maxReceiveCount` = `maxAttempts` + 2** (7 for the default 5). Too low, and SQS moves the message itself, with no module line, hook or cooldown.',
+  "5. **A visibility timeout at least 6 × the function timeout**, which is AWS's rule. Set `coordination.gateTtlMs` at or above it.",
+  "6. **A `deadLetterQueueUrl` in the queue's entry.** Without one a dead task is deleted at its last delivery.",
+  '7. **The IAM permissions `AWSLambdaSQSQueueExecutionRole` lacks:** `sqs:ChangeMessageVisibility` on the queue, `sqs:SendMessage` on the dead-letter queue, and S3 get and put.',
+  '8. **`MaximumConcurrency` on the trigger, rather than low reserved concurrency.** Reserved concurrency throttles, and a throttled receive may count as an attempt.',
+];
+
+test('the push delivery section leads with the settings a host must get right, in the order that saves tasks', () => {
+  const readme = read('README.md');
+  const from = readme.indexOf('## Push delivery');
+  assert.ok(from >= 0, 'README.md has no "## Push delivery" section');
+  const to = readme.indexOf('\n## ', from + 1);
+  const section = readme.slice(from, to < 0 ? undefined : to);
+  // First mentions, so the section's opening cannot name one of them ahead of the list.
+  const lead = [
+    'ReportBatchItemFailures',
+    'Batch size 1',
+    'function timeout',
+    'maxReceiveCount',
+    'visibility timeout',
+    'deadLetterQueueUrl',
+    'sqs:ChangeMessageVisibility',
+    'sqs:SendMessage',
+    'MaximumConcurrency',
+  ];
+  let at = -1;
+  for (const setting of lead) {
+    const found = section.indexOf(setting);
+    assert.ok(found > at, `${setting} must come after what leads it`);
+    at = found;
+  }
+  for (const later of ['createSqsHandler(', 'Do not bundle']) {
+    assert.ok(section.indexOf(later) > at, `${later} must come after the lead`);
+  }
+  let line = -1;
+  for (const text of PUSH_LEAD) {
+    const found = section.indexOf(`\n${text}\n`);
+    assert.ok(found > line, `the lead must hold, in this order: ${text}`);
+    line = found;
+  }
+  assert.ok(
+    section.indexOf('Do not bundle') < section.indexOf('--external:@aws-sdk'),
+    '"Do not bundle" must lead the esbuild table',
+  );
+  assert.ok(
+    section.indexOf('{ concurrency: 1, cache: false }') >= 0,
+    'the handler must lead with its Sharp options',
+  );
+  assert.ok(
+    section.includes('FIFO'),
+    'the section must say FIFO queues are not supported',
+  );
+  assert.ok(
+    /not run on real AWS/.test(section.slice(0, 600)),
+    'the section must open by saying it has not run on real AWS',
+  );
+});
