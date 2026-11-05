@@ -404,16 +404,21 @@ function signedLocator(ref: StorageRef): StorageRef {
 
 /**
  * A written row as the store check will compare it, with its nested ref and filters copied too:
- * the taps get the row itself, and may change it.
+ * the taps get the row itself, and may change it. A row that cannot be copied stays as it is: the
+ * write is done, so this must not fail the call, and the check skips what it cannot read.
  */
 function writtenRow(row: Preview): Preview {
-  return {
-    ...row,
-    storageRef: copyLocator(row.storageRef),
-    ...(row.filters
-      ? { filters: copyLocator(row.filters) as Preview['filters'] }
-      : {}),
-  };
+  try {
+    return {
+      ...row,
+      storageRef: copyLocator(row.storageRef),
+      ...(row.filters
+        ? { filters: copyLocator(row.filters) as Preview['filters'] }
+        : {}),
+    };
+  } catch {
+    return row;
+  }
 }
 
 /**

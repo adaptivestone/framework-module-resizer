@@ -2982,3 +2982,114 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
     assert.equal(calls, 1);
   });
 }
+
+// A row the store check cannot copy before the taps: its ref and filters are host data, and by then
+// the write is done.
+const refusesToObject = () => {
+  throw new Error('this cannot be read');
+};
+const uncopyable: Record<
+  string,
+  {
+    ref?: (ref: Record<string, unknown>) => Preview['storageRef'];
+    filters?: () => Record<string, unknown>;
+  }
+> = {
+  'a ref whose toObject method throws': {
+    ref: (ref) => ({ ...ref, toObject: refusesToObject }),
+  },
+  'a ref whose toObject getter throws': {
+    ref: (ref) =>
+      Object.defineProperty({ ...ref }, 'toObject', { get: refusesToObject }),
+  },
+  'filters whose toObject method throws': {
+    filters: () => ({ blur: 2, toObject: refusesToObject }),
+  },
+  'filters whose toObject getter throws': {
+    filters: () =>
+      Object.defineProperty({ blur: 2 }, 'toObject', { get: refusesToObject }),
+  },
+  'filters as a strict Proxy': {
+    filters: () =>
+      new Proxy(
+        { blur: 2 },
+        {
+          get: (target, key, receiver) =>
+            key === 'toObject'
+              ? refusesToObject()
+              : Reflect.get(target, key, receiver),
+        },
+      ),
+  },
+};
+
+/** A world and a Resizer for one case of `uncopyable`, its original stored; `fired` holds the taps. */
+async function uncopyableWorld(
+  { ref }: (typeof uncopyable)[string],
+  timing?: Partial<QueueTimingOptions>,
+) {
+  const w = world({ timing });
+  if (ref) {
+    const upload = w.storage.upload.bind(w.storage);
+    // Previews only: the original's ref is read before anything is written.
+    w.storage.upload = async (args) => {
+      const stored = await upload(args);
+      return args.visibility === 'public'
+        ? ref(stored as Record<string, unknown>)
+        : stored;
+    };
+  }
+  const r = w.resizer(webpConfig(80));
+  const fired: Preview[] = [];
+  r.hook('onPreviewGenerated', (row) => {
+    fired.push(row);
+  });
+  const original = await r.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+  return { w, r, doc, fired };
+}
+
+for (const [what, parts] of Object.entries(uncopyable)) {
+  const sizes = (): SizeInput[] => [
+    {
+      width: 20,
+      height: 20,
+      ...(parts.filters
+        ? { filters: parts.filters() as SizeInput['filters'] }
+        : {}),
+    },
+  ];
+
+  test(`generate() over ${what}: it resolves, with the row stored and its report delivered`, async () => {
+    const { r, doc, fired } = await uncopyableWorld(parts);
+
+    const { created, failed } = await r.generate({
+      media: structuredClone(doc),
+      sizes: sizes(),
+      formats: ['webp'],
+    });
+
+    assert.equal(created.length, 1);
+    assert.equal(failed, 0);
+    assert.equal(doc.previews?.length, 1);
+    assert.equal(fired.length, 1);
+  });
+
+  test(`a worker over ${what}, at maxAttempts 1: the task completes, with the row stored and its report delivered`, async () => {
+    const { w, r, doc, fired } = await uncopyableWorld(parts, {
+      maxAttempts: 1,
+    });
+
+    await w.read(r, doc, sizes());
+    await w.work(r);
+
+    assert.equal(w.tasks.rows[0].error, undefined);
+    assert.equal(w.tasks.rows[0].status, 'completed');
+    assert.equal(doc.previews?.length, 1);
+    assert.equal(fired.length, 1);
+  });
+}

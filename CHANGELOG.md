@@ -71,6 +71,17 @@
   `verify()`, and `resolve()` then logs an `error` and returns an empty decision, so previews stored
   earlier stop being served until the root is fixed. `new LocalFsStorage()` throws at construction.
   The replacement for `''` is `'.'`, which is the same folder.
+- **Timing a timer cannot wait for is refused.** `leaseMs`, `idlePollMs` and `taskTimeoutMs` above
+  `2147483647`, the longest a Node timer takes, are `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
+  `RESIZE_CONFIG_QUEUE_INVALID`. At `taskTimeoutMs: 3000000000` every task timed out after about 1
+  ms and was dead-lettered, but a `leaseMs` of 24.8 to 49.7 days ran on 0.3.0, and it is refused
+  too. From a config file the refusal comes at first use or `verify()`. On a framework host with no
+  boot `verify()`, the first `resolve()` logs one `error` and returns an empty decision, and so does
+  every later read, so previews stored earlier stop being served until the value is fixed. A task
+  queue passed in code keeps serving them and queues nothing, and `resolve()` logs the refusal once
+  per queue name. `LogMetrics` refuses such a `summaryIntervalMs` at construction
+  (`RESIZE_METRICS_INVALID`). `limits.processingTimeoutSeconds` above 3600, where every Sharp call
+  threw, is `RESIZE_CONFIG_INVALID`, with the same first-use refusal from a config file.
 - **A media store must keep what the worker writes.** After its writes the worker reloads the media
   and compares the rows under each `storageRef` it wrote (refs compare with sorted keys, and log
   lines print them that way, so a store that reorders a ref's keys holds the same ref), as written
@@ -186,12 +197,6 @@
   now awaits it up to `taskTimeoutMs` and, once it is stopping, up to 5 s after the later of the
   stop and the task's end, logs one `warn`, and goes on while the tap keeps running beside the next
   task.
-- A timing value a timer cannot wait for is refused. `leaseMs`, `idlePollMs` and `taskTimeoutMs`
-  above `2147483647`, the longest a Node timer takes, are `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
-  `RESIZE_CONFIG_QUEUE_INVALID`: at `taskTimeoutMs: 3000000000` every task timed out after about 1
-  ms and was dead-lettered. `LogMetrics` refuses such a `summaryIntervalMs`
-  (`RESIZE_METRICS_INVALID`), and `limits.processingTimeoutSeconds` above 3600, where every Sharp
-  call threw, is `RESIZE_CONFIG_INVALID`.
 - A row `MongoMediaStore.replacePreviews` writes stores an `_id` exactly when an appended row would,
   unless working it out fails, so it reads the same id on every load. A row replaced under 0.3.0 has
   none stored and reads a new random one on each load until it is next replaced: nothing migrates it,
