@@ -16,7 +16,8 @@
 // the return and thaws at the next invocation, so a variant in flight can still store its row then.
 // Its media writes are not fenced, as with a pull worker's timed-out delivery, and the next read
 // judges that row as any other: a row from an older original is stale and is queued again. A record
-// with too little time is not started, and is not adopted either.
+// with too little time is not started and gets no visibility call, so it comes back only after the
+// queue's visibility timeout: the queue can drain first, and an alarm has time to fire.
 //
 // Internal, and it may change in any release, apart from the event and handler types that
 // src/lambda.ts re-exports: `createSqsHandler()` there is the public way in.
@@ -176,7 +177,7 @@ function flawOf(record: SqsRecordLike): string | undefined {
  * throws leaves it, and a falsy answer means the lease was lost. It forwards no optional flags, as
  * a DeliveryQueue has no `gatesByTask`. A task that must not `start` is handed out with the run
  * already stopped, so the Consumer dead-letters it past maxAttempts or else gives it back, with its
- * gate held, and never runs it.
+ * gate held, and never runs it. That give-back makes no queue call: see `release`.
  */
 class OneShotQueue extends TaskQueue {
   end: DeliveryEnd = 'left';
@@ -243,6 +244,12 @@ class OneShotQueue extends TaskQueue {
   }
 
   async release(task: ClaimedTask): Promise<boolean> {
+    // A record not started stays as it is: visibility 0 would let a function that is too short use
+    // up a task's receives in seconds, and a tail record take its receives from a queue with work
+    // left. `false`, as nothing was given back, also keeps the Consumer from saying it is back.
+    if (!this.#start) {
+      return false;
+    }
     const held = await this.#carrier.release(task);
     this.end = held ? 'given-back' : 'lease-lost';
     return held;
@@ -295,7 +302,7 @@ interface Invocation {
 
 /**
  * The record gets no task run, so the time it was given goes in a line. `willDie`: it is past
- * maxAttempts, so the Consumer dead-letters it unrun rather than giving it back for a retry.
+ * maxAttempts, so the Consumer dead-letters it unrun rather than leaving it for a retry.
  */
 function logNotStarted(
   { wired: { logger }, left }: Invocation,
@@ -307,16 +314,18 @@ function logNotStarted(
 ): void {
   const time = `${left()} ms left and ${budget} ms of that for the task, at least ${Math.ceil(needed)} ms needed`;
   const dying = 'it is past maxAttempts, so it is dead-lettered unrun';
+  const retry =
+    "after the queue's visibility timeout, and this delivery counts as an attempt";
   if (index === 0) {
     logNeverThrow(
       logger,
-      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small for this reserve; raise it. ${willDie ? `And ${dying}` : 'It is listed for a retry, and this delivery counts as an attempt'}`,
+      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small for this reserve; raise it. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
     );
     return;
   }
   logNeverThrow(
     logger,
-    `resize lambda: message ${id} was not started: ${time} — ${willDie ? dying : 'it is listed for a retry, and this delivery counts as an attempt'}; a batch size of 1 avoids this`,
+    `resize lambda: message ${id} was not started: ${time} — ${willDie ? dying : `it is listed for a retry ${retry}`}; a batch size of 1 avoids this`,
     undefined,
     'warn',
   );
@@ -383,8 +392,8 @@ async function deliver(
     defaultReserveMs(left(), wired.processingSecondsOf(task) ?? 0);
   const needed = Math.max(margin, run.longest);
   const budget = () => left() - reserve;
-  // A record that will not start is not adopted: it goes back at once, and its adoption's time comes
-  // out of the budget, not out of the reserve, as the budget is read again after it.
+  // A record that will not start is not adopted, and an adoption's time comes out of the budget, not
+  // out of the reserve, as the budget is read again after it.
   if (budget() >= needed) {
     const adoption = adopt(lane, task, (err) => run.onAdoptionFailure(id, err));
     if (!(await settledWithin(adoption, left() - margin))) {

@@ -342,7 +342,7 @@ timed(
 );
 
 timed(
-  'a first record with too little time is not started: listed, an error line, the gate held, the message back at once',
+  'a first record with too little time is not started: listed, an error line, the gate held, the visibility left alone',
   async () => {
     const sqs = fakeSqs();
     const { handler, lines, locks } = pushed(sqs, notRun, { margin: MARGIN });
@@ -353,8 +353,14 @@ timed(
       lines.find((l) => l.level === 'error')?.message ?? '',
       /message a, the first record of this invocation, was not started: 580 ms left and 290 ms of that for the task, at least 300 ms needed — the function timeout is too small/,
     );
-    assert.deepEqual(sqs.visibility(), [0], 'not adopted, released');
+    // Not adopted and not given back: the receive costs the queue's whole visibility timeout, which
+    // is a window for an alarm, and the queue can drain before the record comes back.
+    assert.deepEqual(sqs.calls, []);
     assert.ok((locks.entry(GATE_KEY)?.expiresAt ?? 0) - Date.now() > 590_000);
+    assert.ok(
+      !lines.some((l) => /back in the queue/.test(l.message)),
+      'it is not back yet, and nothing shut down',
+    );
   },
 );
 
@@ -373,10 +379,10 @@ timed(
     // The reserve is half the time left, rounded down: 299 of 598 leaves 299, and of 599 leaves 300.
     await handler({ Records: [recordOf('a')] }, contextOf(598));
     assert.deepEqual(started, []);
-    assert.deepEqual(sqs.visibility(), [0], 'not adopted');
+    assert.deepEqual(sqs.visibility(), [], 'not adopted');
     await handler({ Records: [recordOf('a')] }, contextOf(599));
     assert.deepEqual(started, ['ran']);
-    assert.deepEqual(sqs.visibility(), [0, 60], 'adopted');
+    assert.deepEqual(sqs.visibility(), [60], 'adopted');
   },
 );
 
@@ -404,7 +410,11 @@ timed(
     for (const left of [250, MARGIN]) {
       const sqs = fakeSqs();
       const { handler, lines } = pushed(sqs, notRun, { margin: MARGIN });
-      const out = await handler({ Records: [recordOf('a')] }, contextOf(left));
+      // Past maxAttempts, where a millisecond more would dead-letter it.
+      const out = await handler(
+        { Records: [recordOf('a', { n: 6 })] },
+        contextOf(left),
+      );
       assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }]);
       assert.deepEqual(sqs.calls, []);
       assert.ok(
@@ -413,11 +423,35 @@ timed(
         ),
       );
     }
-    // A millisecond more leaves time to give it back.
+    // A millisecond more leaves time for the queue calls of a dead-letter.
     const sqs = fakeSqs();
     const { handler } = pushed(sqs, notRun, { margin: MARGIN });
-    await handler({ Records: [recordOf('a')] }, contextOf(MARGIN + 1));
-    assert.deepEqual(sqs.visibility(), [0]);
+    const out = await handler(
+      { Records: [recordOf('a', { n: 6 })] },
+      contextOf(MARGIN + 1),
+    );
+    assert.deepEqual(out.batchItemFailures, []);
+    assert.equal(sqs.deletes(), 1);
+  },
+);
+
+timed(
+  'a record not started runs on its next delivery, under the gate it kept',
+  async () => {
+    const sqs = fakeSqs();
+    const { handler, locks, events } = pushed(sqs, ok, { margin: MARGIN });
+    await locks.acquire(GATE_KEY, 'g1', 1000);
+    const first = await handler({ Records: [recordOf('a')] }, contextOf(580));
+    assert.deepEqual(first.batchItemFailures, [{ itemIdentifier: 'a' }]);
+    assert.deepEqual(events, [], 'no event: nothing ran');
+    const next = await handler(
+      { Records: [recordOf('a', { n: 2, receipt: 'r2' })] },
+      contextOf(1000),
+    );
+    assert.deepEqual(next.batchItemFailures, []);
+    assert.deepEqual(sqs.visibility(), [60]);
+    assert.equal(sqs.deletes(), 1);
+    assert.equal(locks.entry(GATE_KEY), undefined);
   },
 );
 
@@ -443,7 +477,7 @@ timed(
 );
 
 timed(
-  'at maxAttempts itself a record not started is given back, and only past it dead-lettered: the line says which, on a tail record too',
+  'at maxAttempts itself a record not started is left alone, and only past it dead-lettered: the line says which, on a tail record too',
   async () => {
     const sqs = fakeSqs();
     const { handler, lines } = pushed(sqs, notRun, { margin: MARGIN });
@@ -452,10 +486,10 @@ timed(
       contextOf(580),
     );
     assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }]);
-    assert.deepEqual(sqs.visibility(), [0]);
+    assert.deepEqual(sqs.calls, []);
     assert.match(
       lines.find((l) => /was not started/.test(l.message))?.message ?? '',
-      /It is listed for a retry/,
+      /It is listed for a retry after the queue's visibility timeout/,
     );
 
     const tail = pushed(fakeSqs(), () => sleep(400), {
@@ -528,7 +562,7 @@ timed(
 );
 
 timed(
-  'a tail record shorter on time than the longest delivery so far is given back with a warning, not an error',
+  'a tail record shorter on time than the longest delivery so far is left alone with a warning, not an error',
   async () => {
     const sqs = fakeSqs();
     const ran: string[] = [];
@@ -566,12 +600,15 @@ timed(
       lines.some(
         (l) =>
           l.level === 'warn' &&
-          /message tail was not started: 600 ms left and 300 ms of that for the task, at least 400 ms needed — it is listed for a retry/.test(
+          /message tail was not started: 600 ms left and 300 ms of that for the task, at least 400 ms needed — it is listed for a retry after the queue's visibility timeout/.test(
             l.message,
           ),
       ),
     );
-    assert.deepEqual(sqs.visibility().slice(-1), [0]);
+    assert.ok(
+      sqs.calls.every((call) => call.input.ReceiptHandle !== 'rh-tail'),
+      'no queue call for it, so it comes back after the rest of the queue had its turn',
+    );
   },
 );
 

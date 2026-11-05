@@ -611,7 +611,7 @@ test('through the public entry a 3 s function never starts a task', async () => 
     errors.map(({ message }) => message).join('\n'),
     /the first record of this invocation, was not started/,
   );
-  assert.deepEqual(sqs.visibility(), [0]);
+  assert.deepEqual(sqs.visibility(), []);
   assert.equal(uploads(), 0);
 });
 
@@ -623,7 +623,7 @@ test('an explicit stopBeforeTimeoutMs reaches the delivery: a reserve that leave
     logger: silentLogger,
   })({ Records: [recordOf('a', { body: bodyOf(1) })] }, contextOf(60_000));
   assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }]);
-  assert.deepEqual(sqs.visibility(), [0]);
+  assert.deepEqual(sqs.visibility(), []);
   assert.equal(uploads(), 0);
 });
 
