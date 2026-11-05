@@ -6,6 +6,23 @@ import { ResizeSetupError } from '../errors.ts';
 const isPositiveInteger = (n: unknown): n is number =>
   typeof n === 'number' && Number.isInteger(n) && n > 0;
 
+// The time limit of a raster the core hands to a variantStep. `rasterToSharp` reads it, so a Sharp
+// chain in a step stays under `limits.processingTimeoutSeconds` as it did when the step was one
+// chain with the encode: a stuck chain holds a libuv thread, and other tasks then wait behind it. It
+// lives beside the object, not on it, so the `Raster` shape stays what a host and an engine see: a
+// raster spread into a new object is the host's own, and has no limit.
+const stepTimeouts = new WeakMap<Raster, number>();
+
+/** Marks a raster the core hands to a step: `rasterToSharp` puts this limit on its chain. */
+export function limitStepRaster(raster: Raster, seconds: number): void {
+  stepTimeouts.set(raster, seconds);
+}
+
+/** The limit `limitStepRaster` set on this object, if any. */
+export function stepRasterTimeout(raster: Raster): number | undefined {
+  return stepTimeouts.get(raster);
+}
+
 /** Why `value` is not a Raster, or undefined when it is one. */
 export function rasterProblem(value: unknown): string | undefined {
   if (typeof value !== 'object' || value === null) {

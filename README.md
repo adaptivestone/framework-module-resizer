@@ -1000,7 +1000,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation of the module, at most `3600`, the longest Sharp accepts. It does not bound a pipeline step's own Sharp work: a step sets its own `.timeout()` (see Pipelines) |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain gets it too; other host code in a step does not (see Pipelines) |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1045,7 +1045,8 @@ The raster is the step's own copy, so the step may write to it, and the formats 
 see each other's marks. A `resize()` in a step resizes the preview, and operations Sharp used to
 apply before its resize (such as `trim()`) apply to the preview. The `encode.flatten` decision reads
 the channels of the last step's result, so transparency a step adds is flattened on a flattened
-format.
+format. `media` is the live object, so read it and never write to it: a write reaches the next
+variant and your own document. `MediaLike` has no host fields, so TypeScript needs a cast.
 
 ```ts
 variantSteps: [
@@ -1055,30 +1056,41 @@ variantSteps: [
 
 Scale the overlay by `r.info.width`: Sharp refuses one larger than the preview (`Image to composite
 must have same dimensions or smaller`). `composite` on an opaque preview returns 4 channels with
-alpha 255, which costs AVIF about 10% at 1920 wide: add `.removeAlpha()` when `r.info.channels === 3`.
+alpha 255, which costs an AVIF about 200 bytes per file, which matters only on very flat images: add
+`.removeAlpha()` when `r.info.channels === 3`.
 
-`limits.processingTimeoutSeconds` bounds the module's own Sharp calls, not a step, in either list: a
-step is host code. 0.3.0 killed a slow `variantStep` at the limit, because it was one Sharp chain with
-the encode; now `blur(400)` on 24 MP runs for 447 s. Set a timeout on the step's own chain:
-`async (r) => sharpToRaster(rasterToSharp(r).blur(5).timeout({ seconds: 5 }))`. Sharp then rejects at
-that limit (`blur(400)` with it was killed at 5.4 s) and only that variant fails. Without one, a
-worker's `taskTimeoutMs` still ends the task (`RESIZE_TASK_TIMEOUT`), though Sharp keeps running to
-the end of the step and that delivery can still store the preview, and `generate()` has no such
-bound.
+A `rasterToSharp` chain in a `variantStep` runs under `limits.processingTimeoutSeconds`: past it Sharp
+rejects, and only that variant fails. The limit is per chain, so each step and the encode after it
+get their own. The chain's own `.timeout({ seconds: 60 })` replaces the limit, and
+`.timeout({ seconds: 0 })` turns it off. The limit follows the raster object the module hands to the
+step, so a raster spread into a new object has none.
 
-A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source and
-on every format that keeps alpha; on a flattened format, a transparent source can move by a few
-levels (up to 11 of 255 measured) wherever the preview has partly transparent pixels. Other steps can
-write different files, on new previews only: `encodeSig` does not change, so stored previews stay,
-and `verify()` does not run steps, so look at the logs and the files after the first upload.
+Nothing else in a step is bounded: Sharp work that does not go through `rasterToSharp`, such as
+`sharp(raster.data, { raw: raster.info })`, and any other host code. `beforeSteps` are unbounded too,
+through `rasterToSharp` as well, as in 0.3.0. Such work can starve other tasks and dead-letter healthy
+ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants beside one healthy task, at
+`taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
+where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not the
+step: a timed-out delivery keeps its memory until the step ends, and can still store the preview.
+`generate()` has no such bound.
+
+A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source
+(with `png` added to `encode.flatten.formats`, it writes RGB where 0.3.0 wrote RGBA, with no pixel
+difference) and on every format that keeps alpha. On a flattened format, a transparent source can
+move wherever the preview has partly transparent pixels: at most 2 levels before the JPEG encoder, up
+to 20 of 255 measured in the JPEG. Other steps can write different files, on new previews only:
+`encodeSig` does not change, so stored previews stay, and `verify()` does not run steps, so look at
+the logs and the files after the first upload.
 
 - On a transparent source and a flattened format, the step now runs before the flatten, where Sharp
   ran it after, so most operations change that format's pixels. `negate()` also negates alpha: use
-  `negate({ alpha: false })`. `removeAlpha()` shows the colours under transparent pixels.
+  `negate({ alpha: false })`. `removeAlpha()` shows the colours under transparent pixels, which are
+  black after a resize.
 - Several steps now run in order, each on the last one's result, where 0.3.0 gathered them in one
   Sharp chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order.
 - `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error. `greyscale()` on a
-  transparent source loses alpha: use `modulate({ saturation: 0 })`. `toColourspace('b-w')` stays in
+  transparent source loses alpha, so a JPEG shows the colours under transparent pixels, which are
+  black after a resize: use `modulate({ saturation: 0 })`. `toColourspace('b-w')` stays in
   colour: use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`. Metadata calls in a
   step do nothing: `withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this way
   disappears, and `withIccProfile` also shifts the colours, so leave it out.
@@ -1588,8 +1600,9 @@ references, leaving out every `original.storageRef`: an adopted public original 
 bucket, and no preview row references it. A preview is uploaded before its row is written, so list
 the objects first and read the rows after, and delete only objects older than a day and more than
 twice `taskTimeoutMs`, by S3 `LastModified` or file mtime: a delivery that timed out can still write
-its row later, and `generate()` has no timer. Without that rule a sweep deletes the files of rows
-about to be written. A read then still reports such a row as ready, neither stale nor missing, so
+its row later, and `generate()` has no timer. Such a late write is not fenced, so it can replace a
+newer row, even one from a newer original; the next read finds that row stale and queues it again.
+Without that rule a sweep deletes the files of rows about to be written. A read then still reports such a row as ready, neither stale nor missing, so
 nothing renders it again and its URL fails. `invalidate()` on that media removes its rows, and the
 next read or `prewarm()` queues them again.
 

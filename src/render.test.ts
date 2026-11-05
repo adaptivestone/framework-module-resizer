@@ -329,6 +329,26 @@ test('a variantStep gets its own copy of the pixels, for each format', async () 
   assert.ok(sized.data.equals(before));
 });
 
+test('a variantStep owns its memory on a small preview: no slice of the shared pool', async () => {
+  const neighbour = Buffer.from('neighbour');
+  const seen: { own: number; length: number }[] = [];
+  const through: VariantStep = (raster) => {
+    seen.push({
+      own: raster.data.buffer.byteLength,
+      length: raster.data.length,
+    });
+    new Uint8Array(raster.data.buffer).fill(255);
+    return raster;
+  };
+  await encodeVariant(
+    solid(20, 10, [10, 20, 30]),
+    variantPlan(sizePlan(20, 10), 'webp'),
+    encodeOptions([through]),
+  );
+  assert.deepEqual(seen, [{ own: 600, length: 600 }]);
+  assert.equal(neighbour.toString(), 'neighbour');
+});
+
 test('a variantStep sees the variant, media, source and ctx', async () => {
   let meta: Parameters<VariantStep>[1] | undefined;
   const opts = encodeOptions([
@@ -426,20 +446,38 @@ test('a premultiplied variantStep result reaches the engine as straight alpha', 
   assert.deepEqual(pixelAt(seen[0], 0, 0), [100, 100, 100, 128]);
 });
 
-test('a variantStep that resolves with a Buffer is RESIZE_PIPELINE_STEP_INVALID', async () => {
+test('a step that resolves with a Buffer is told to return its pixels, not an image file', async () => {
   const buffer = (raster: Raster) => raster.data as unknown as Raster;
-  await assert.rejects(
-    encodeVariant(
-      solid(20, 10, [1, 2, 3]),
-      variantPlan(sizePlan(20, 10), 'webp'),
-      encodeOptions([buffer]),
-    ),
-    (err: ResizeError) => {
-      assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
-      assert.match(err.message, /a variantStep resolved with/);
-      return true;
-    },
-  );
+  const encoded = (raster: Raster) =>
+    rasterToSharp(raster).png().toBuffer() as unknown as Raster;
+  const expected = (kind: string) => (err: ResizeError) => {
+    assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
+    assert.match(err.message, new RegExp(`a ${kind} resolved with`));
+    assert.match(
+      err.message,
+      /it is a Buffer, not a Raster: return sharpToRaster\(img\), not img\.toBuffer\(\)/,
+    );
+    assert.doesNotMatch(err.message, /`data` is not a Buffer/);
+    return true;
+  };
+  for (const step of [buffer, encoded]) {
+    await assert.rejects(
+      encodeVariant(
+        solid(20, 10, [1, 2, 3]),
+        variantPlan(sizePlan(20, 10), 'webp'),
+        encodeOptions([step]),
+      ),
+      expected('variantStep'),
+    );
+    await assert.rejects(
+      runBeforeSteps(solid(20, 10, [1, 2, 3]), [step], {
+        media: { id: 'm1' },
+        source: encodeOptions().source,
+        ctx: {},
+      }),
+      expected('beforeStep'),
+    );
+  }
 });
 
 test('encodeVariant reports the encoded size and content type', async () => {

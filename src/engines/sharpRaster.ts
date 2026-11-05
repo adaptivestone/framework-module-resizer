@@ -3,7 +3,7 @@
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
 import type { Raster, RasterInfo } from '../contracts/decoder.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { rasterProblem } from '../helpers/raster.ts';
+import { rasterProblem, stepRasterTimeout } from '../helpers/raster.ts';
 
 /** Sharp's raw input options for the raster's pixels, frames stacked top to bottom. */
 function rawOptions(raster: Raster): NonNullable<SharpOptions['raw']> {
@@ -30,7 +30,9 @@ export function rasterInput(raster: Raster): SharpOptions {
 
 /**
  * Sharp over the raster's pixels, for a Sharp-based step. A value that is not a Raster is
- * refused here, before Sharp reads it as raw bytes of the wrong size.
+ * refused here, before Sharp reads it as raw bytes of the wrong size. On a raster the core handed to
+ * a variantStep the chain starts with `limits.processingTimeoutSeconds`; the chain's own
+ * `.timeout()` replaces it, and `.timeout({ seconds: 0 })` turns it off.
  */
 export function rasterToSharp(raster: Raster): Sharp {
   const problem = rasterProblem(raster);
@@ -40,7 +42,9 @@ export function rasterToSharp(raster: Raster): Sharp {
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
-  return sharp(raster.data, rasterInput(raster));
+  const img = sharp(raster.data, rasterInput(raster));
+  const seconds = stepRasterTimeout(raster);
+  return seconds === undefined ? img : img.timeout({ seconds });
 }
 
 /**

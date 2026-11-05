@@ -122,16 +122,19 @@
   `RESIZE_PIPELINE_STEP_INVALID`. `encodeSig` does not change, so stored previews are not regenerated,
   and a broken step shows up only on new media or new sizes: `verify()` does not run steps, so check
   the logs after the first upload. A single step that only composites an overlay writes the same
-  files as 0.3.0 on an opaque source and on every format that keeps alpha; on a flattened format, a
-  transparent source can move by a few levels (up to 11 of 255 measured) wherever the preview has
-  partly transparent pixels. Other steps can write different files, on new previews only: (a) on a
-  transparent source and a flattened format, the step now runs before the flatten, where Sharp ran it
-  after, so most operations change that format's pixels (`negate()` also negates alpha: use
-  `negate({ alpha: false })`; `removeAlpha()` shows the colours under transparent pixels); (b) several
-  steps now run in order, each on the last one's result, where 0.3.0 gathered them in one Sharp
-  chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order; (c)
+  files as 0.3.0 on an opaque source (with `png` added to `encode.flatten.formats`, it writes RGB
+  where 0.3.0 wrote RGBA, with no pixel difference) and on every format that keeps alpha. On a
+  flattened format, a transparent source can move wherever the preview has partly transparent pixels:
+  at most 2 levels before the JPEG encoder, up to 20 of 255 measured in the JPEG. Other steps can
+  write different files, on new previews only: (a) on a transparent source and a flattened format,
+  the step now runs before the flatten, where Sharp ran it after, so most operations change that
+  format's pixels (`negate()` also negates alpha: use `negate({ alpha: false })`; `removeAlpha()` shows
+  the colours under transparent pixels, which are black after a resize); (b) several steps now run in
+  order, each on the last one's result, where 0.3.0 gathered them in one Sharp chain: a second
+  `composite`, `blur` or `resize` replaced the first, and Sharp chose the order; (c)
   `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error: `greyscale()` on a
-  transparent source loses alpha (use `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in
+  transparent source loses alpha, so a JPEG shows the colours under transparent pixels, which are
+  black after a resize (use `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in
   colour (use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`), and metadata calls
   in a step do nothing (`withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this
   way disappears, and `withIccProfile` also shifts the colours, so leave it out). Bump the pipeline's
@@ -206,14 +209,14 @@
 - A variant step that adds transparency to an opaque preview now gets the `encode.flatten` background
   on a flattened format; in 0.3.0 those areas of a JPEG came out black. A pipeline hit by this bumps
   its `version`.
-- `limits.processingTimeoutSeconds` no longer bounds a variant step's Sharp work. A step is host code,
-  like a `beforeStep`, which the limit never bounded; in 0.3.0 a variant step was one Sharp chain with
-  the encode, so the limit killed a slow one: `blur(400)` on 24 MP at a limit of 5 s was killed at
-  5.4 s, and now runs for 447 s. A step sets its own limit, which `sharpToRaster` honours:
-  `async (r) => sharpToRaster(rasterToSharp(r).blur(5).timeout({ seconds: 5 }))`. `blur(400)` with
-  that timeout is killed at 5.4 s, and only its variant fails. A worker's `taskTimeoutMs` still ends
-  the task (`RESIZE_TASK_TIMEOUT`), though Sharp keeps running to the end of the step and that
-  delivery can still store the preview. `generate()` has no such bound.
+- Sharp work in a `variantStep` that does not go through `rasterToSharp`
+  (`sharp(raster.data, { raw: raster.info })`, or a raster spread into a new object), and any other
+  host code in a step, is unbounded. In 0.3.0 a step's Sharp work was one chain with the encode, under
+  `limits.processingTimeoutSeconds`. A `rasterToSharp` chain stays under the limit, with the encode
+  after it under its own; its own `.timeout({ seconds })` replaces the limit, and
+  `.timeout({ seconds: 0 })` turns it off. Unbounded work can starve other tasks and dead-letter
+  healthy ones, because stuck Sharp calls hold libuv's threads, and a timed-out delivery keeps its
+  memory until the step ends.
 - With `variantSteps`, a worker holds one copy of the size's pixels and the step's result per variant
   in progress, up to `width × height × (channels + 4)` bytes each, up to `concurrency` at once.
   Measured with one `composite` step on a 24 MP JPEG at the default `concurrency` of 4, the process's

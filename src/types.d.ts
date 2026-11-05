@@ -312,7 +312,7 @@ export interface ResizeLimits {
   sourceBytes: number; // default 268_435_456 — largest original a worker or adoptOriginal() reads into memory
   resultDimension: number; // default 5000 — clamp on the cover branch
   animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
-  processingTimeoutSeconds: number; // default 30, at most 3600 — Sharp native processing timeout of the module's own calls; a pipeline step sets its own
+  processingTimeoutSeconds: number; // default 30, at most 3600 — Sharp native processing timeout, also on a variantStep's rasterToSharp chain
   failOn: ResizeFailOn; // default 'error' — a source refused at this level is RESIZE_SOURCE_DAMAGED; not signed
 }
 

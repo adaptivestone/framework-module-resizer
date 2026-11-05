@@ -18,7 +18,7 @@ import type {
 } from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
-import { rasterProblem } from './helpers/raster.ts';
+import { limitStepRaster, rasterProblem } from './helpers/raster.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
 import type { MediaLike, ResizeConfig, ResizeLimits } from './types.d.ts';
 
@@ -139,10 +139,12 @@ function stepResult(
     typeof (value as { toBuffer?: unknown } | null)?.toBuffer === 'function';
   const problem = isSharp
     ? 'it is a Sharp instance, not its pixels: return sharpToRaster(img)'
-    : (rasterProblem(value) ??
-      (frames !== undefined && frames !== 1
-        ? `\`info.frames\` is ${frames}, not 1`
-        : undefined));
+    : Buffer.isBuffer(value)
+      ? 'it is a Buffer, not a Raster: return sharpToRaster(img), not img.toBuffer()'
+      : (rasterProblem(value) ??
+        (frames !== undefined && frames !== 1
+          ? `\`info.frames\` is ${frames}, not 1`
+          : undefined));
   if (problem !== undefined) {
     throw new ResizeSetupError(
       `resize: a ${kind} resolved with something that is not a one-frame Raster: ${problem} — a ${kind} receives and returns a Raster ({ data, info }); rasterToSharp / sharpToRaster wrap a Sharp step`,
@@ -366,17 +368,22 @@ export interface EncodeOptions {
 
 export type EncodedVariant = EncodedImage;
 
-/** The variant's steps in order, from its own copy of the sized pixels: other formats share them. */
+/**
+ * The variant's steps in order, from its own copy of the sized pixels: other formats share them.
+ * The copy gets its own ArrayBuffer: `Buffer.from` would take a small one from Node's shared pool,
+ * where a step writing through `data.buffer` reaches the other formats and unrelated Buffers. Each
+ * raster handed to a step carries the limit, for `rasterToSharp` to read.
+ */
 async function runVariantSteps(
   sized: Raster,
   plan: VariantPlan,
   opts: EncodeOptions,
 ): Promise<Raster> {
-  let raster: Raster = {
-    data: Buffer.from(sized.data),
-    info: { ...sized.info },
-  };
+  const data = Buffer.allocUnsafeSlow(sized.data.length);
+  sized.data.copy(data);
+  let raster: Raster = { data, info: { ...sized.info } };
   for (const step of opts.variantSteps) {
+    limitStepRaster(raster, opts.limits.processingTimeoutSeconds);
     raster = straightAlpha(
       stepResult(
         await step(raster, {
