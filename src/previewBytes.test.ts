@@ -11,7 +11,6 @@ import sharp, {
 } from 'sharp';
 import type { DecodeBox, Raster, RasterInfo } from './contracts/decoder.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
-import { SharpDecoder } from './decoders/sharp.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import { fakeMedia, memoryStorage } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
@@ -152,17 +151,30 @@ async function uploaded(
   );
 }
 
+/**
+ * The decode of 0.3.0. Its `failOn: 'none'` is `limits.failOn` since 0.4.0; every source here is
+ * healthy, so the level changes no byte.
+ */
 async function decoded(
   bytes: Buffer,
   box: DecodeBox,
   frames = 1,
 ): Promise<Raster> {
-  const decoder = new SharpDecoder();
-  return decoder.render(bytes, box, {
-    limits,
-    source: await decoder.inspect(bytes, limits),
-    frames,
+  const img = sharp(bytes, {
+    failOn: 'none',
+    sequentialRead: true,
+    limitInputPixels: limits.inputPixels,
+    pages: frames,
   });
+  const { data, info } = await rawOf(
+    (frames === 1 ? img.rotate() : img)
+      .resize(box.width, box.height, {
+        fit: 'outside',
+        withoutEnlargement: true,
+      })
+      .toColorspace('srgb'),
+  );
+  return { data, info: { ...info, height: info.height / frames } };
 }
 
 async function assertSame(
@@ -246,6 +258,37 @@ test('no steps, one small size: the decoder shrinks to its box', async () => {
   );
 });
 
+test('no steps, a portrait JPEG: cover crops top and bottom, on a box that rounds', async () => {
+  // Box 19×26 on 60×80, a shrink of more than 2: the fit decides 26 over 25, and the JPEG loader
+  // shrinks on load.
+  const bytes = await image(60, 80, 3).jpeg({ quality: 90 }).toBuffer();
+  const files = await uploaded(bytes, [{ width: 19, height: 19 }], STILL);
+  const base = await decoded(bytes, { width: 19, height: 26 });
+  assert.equal(base.info.height, 26);
+  await assertSame(
+    files,
+    '19x19',
+    await resizedAsBefore(base, cover(19, 19)),
+    STILL,
+  );
+});
+
+test('no steps, an EXIF-rotated JPEG comes out upright', async () => {
+  const bytes = await image(80, 60, 3)
+    .withMetadata({ orientation: 6 })
+    .jpeg({ quality: 90 })
+    .toBuffer();
+  const files = await uploaded(bytes, [{ width: 45 }], STILL);
+  const base = await decoded(bytes, { width: 45, height: 60 });
+  assert.equal(base.info.height, 60);
+  await assertSame(
+    files,
+    '45w',
+    await resizedAsBefore(base, fill(45, 60)),
+    STILL,
+  );
+});
+
 test('no steps, a transparent PNG: JPEG is flattened, the others keep alpha', async () => {
   const bytes = await image(640, 480, 4).png().toBuffer();
   const files = await uploaded(
@@ -310,7 +353,7 @@ test('no steps, an animation: WebP and GIF keep the frames, JPEG gets the first'
     .toBuffer();
   const files = await uploaded(bytes, [{ width: 32 }], ['webp', 'gif', 'jpeg']);
   const base = await decoded(bytes, { width: 32, height: 24 }, 3);
-  const { width, height, channels, delay, loop } = base.info;
+  const { width, height, channels } = base.info;
   const frameBytes = width * height * channels;
   const frames: Raster[] = [];
   for (let i = 0; i < 3; i++) {
@@ -324,7 +367,7 @@ test('no steps, an animation: WebP and GIF keep the frames, JPEG gets the first'
   }
   const animated = {
     data: Buffer.concat(frames.map((f) => f.data)),
-    info: { ...frames[0].info, frames: 3, delay, loop },
+    info: { ...frames[0].info, frames: 3, delay: [100, 200, 300], loop: 3 },
   };
   await assertSame(files, '32w', animated, ['webp', 'gif']);
   await assertSame(files, '32w', frames[0], ['jpeg']);
