@@ -11,9 +11,12 @@ export function errorTableRows(readme: string): ErrorTableRow[] {
   if (start < 0) {
     throw new Error('README.md has no "## Error codes" section');
   }
+  // With no `### ` after it, the table runs to the end of the file.
   const end = readme.indexOf('\n### ', start + 1);
   const rows: ErrorTableRow[] = [];
-  for (const line of readme.slice(start, end).split('\n')) {
+  for (const line of readme
+    .slice(start, end < 0 ? undefined : end)
+    .split('\n')) {
     const m =
       /^\| `(RESIZE_[A-Z0-9_]+)` \| (`true`|`false`|—) \| (.*) \|$/.exec(line);
     if (m) {

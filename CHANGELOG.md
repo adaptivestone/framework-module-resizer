@@ -57,10 +57,10 @@ it lists what to change before you run `npm i`.
 - **Removed, as promised:** the types `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
   `FrameworkS3StorageConfig` (use `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`), and the
   `S3Storage` option `publicUrl` (use `publicBaseUrl`). The option now throws
-  `RESIZE_CONFIG_REMOVED_KEY` when `S3Storage` is constructed. In a config section the same code
-  comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews used
-  the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so call
-  `verify()` at boot.
+  `RESIZE_CONFIG_REMOVED_KEY` when `S3Storage` is constructed. In an S3 `storage` section the same
+  code comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews
+  used the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so
+  call `verify()` at boot.
 - **`@aws-sdk/client-s3` 3.729 to 3.734 are out of the peer range,** which is now
   `^3.572.0 <3.729.0 || ^3.735.0`. They collect a body with a full-object checksum inside `send()`,
   so on them the byte limit (`limits.sourceBytes`, `adoptOriginal({ maxBytes })`) runs after the

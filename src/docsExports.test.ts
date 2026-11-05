@@ -552,27 +552,58 @@ test('the adoptOriginal table says what the full table says', () => {
   assert.ok(codes >= 12, `only ${codes} codes read`);
 });
 
+// The `retryable` values a text states, by the `causeCode: '…'` named in the same clause ('' when
+// none is). A clause ends at `. ` or `; `.
+const retryableStated = (
+  text: string,
+  value: RegExp,
+): Map<string, Set<string>> => {
+  const stated = new Map<string, Set<string>>();
+  for (const clause of text.split(/[.;] /)) {
+    const cause = /causeCode: '(RESIZE_[A-Z0-9_]+)'/.exec(clause)?.[1] ?? '';
+    for (const [, said] of clause.matchAll(value)) {
+      stated.set(cause, (stated.get(cause) ?? new Set()).add(said));
+    }
+  }
+  return stated;
+};
+
 test('a code in both the full table and the prewarm() table says the same, or says why not', () => {
   const full = new Map(
     errorTableRows(read('README.md')).map((row) => [row.code, row]),
   );
   const issues = [
     ...readmeSubsection('### `prewarm()` issues').matchAll(
-      /^\| `(RESIZE_[A-Z0-9_]+)` \|.* \| `(true|false)`[^|]*\|$/gm,
+      /^\| `(RESIZE_[A-Z0-9_]+)` \| .* \| (`(?:true|false)`[^|]*) \|$/gm,
     ),
   ];
   assert.ok(issues.length >= 13, `only ${issues.length} issues read`);
-  for (const [, code, value] of issues) {
+  for (const [, code, cell] of issues) {
     const row = full.get(code);
     assert.ok(row, code);
     if (row.retryable === '—') {
+      // The row points at the prewarm() table, and a value it states is one that table states
+      // under the same causeCode.
       assert.match(row.text, /`prewarm\(\)`/, `${code} does not point there`);
-    } else if (row.retryable !== `\`${value}\``) {
-      assert.match(
+      const issue = retryableStated(cell, /`(true|false)`/g);
+      for (const [cause, values] of retryableStated(
         row.text,
-        /As a `prewarm\(\)` issue it is `false`: calling again cannot help/,
-        code,
-      );
+        /`retryable: (true|false)`/g,
+      )) {
+        for (const value of values) {
+          assert.ok(
+            issue.get(cause)?.has(value),
+            `${code}${cause ? ` with ${cause}` : ''} says \`retryable: ${value}\`, which the prewarm() table does not`,
+          );
+        }
+      }
+    } else {
+      // A row with its own value has the issue's, or a sentence that says the issue's.
+      const issue = /^`(true|false)`/.exec(cell)?.[1];
+      const said = /As a `prewarm\(\)` issue it is `(true|false)`/.exec(
+        row.text,
+      )?.[1];
+      assert.equal(said ?? row.retryable.slice(1, -1), issue, code);
     }
   }
 });
@@ -611,7 +642,11 @@ test('the push troubleshooting table names every symptom that left AGENTS.md', (
 test('## Config reference ends inside what npm shows of the README', () => {
   const readme = read('README.md');
   const drivers = readme.indexOf('\n## Drivers\n');
-  assert.ok(readme.indexOf('\n## Config reference\n') < drivers);
+  const config = readme.indexOf('\n## Config reference\n');
+  assert.ok(
+    config >= 0 && config < drivers,
+    `## Config reference at ${config}, ## Drivers at ${drivers}`,
+  );
   assert.ok(drivers < 65536, `## Config reference ends at ${drivers}`);
 });
 

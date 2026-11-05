@@ -149,8 +149,12 @@ What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `
   `publicBaseUrl: '/media'`: re-scaffolding writes the new shape, with an explicit `privateRootDir`, so
   an override that moves `rootDir` must then move it too.
 - **Add `/var/` to `.gitignore`** on a host scaffolded by 0.3.0. With the scaffold's local storage,
-  its private originals sit under `./var/media-private`, and no rule keeps them out of git. The 0.4.0
-  scaffold adds the rule only in the run that writes a config, and `--check` does not report it.
+  its private originals sit under `./var/media-private`, and no rule keeps them out of git. Append
+  it at the end of `.gitignore`: a `/var/` above a `!var/`, `!/var/` or `!**/var` line leaves the
+  originals unignored. `git check-ignore var/media-private/x` prints the path when the rule works.
+  Files already committed stay tracked: if `git ls-files var` lists any, run
+  `git rm -r --cached var` (it keeps them on disk) and commit. The 0.4.0 scaffold adds the rule
+  only in the run that writes a config, and `--check` does not report it.
 - **The scaffold's spelling is `npx --no -- resize-scaffold`.** Without `--no`, a run with the package
   missing fetches whatever the registry holds under that name. Without the `--`, npm takes the options
   for itself.
