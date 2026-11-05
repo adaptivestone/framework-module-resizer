@@ -5,6 +5,7 @@
 //   retry    = ChangeMessageVisibility(delay) dead     = send to deadLetterQueueUrl (if set), delete
 //   release  = ChangeMessageVisibility(0)
 // `gateOwner` is the core's gate-lock token; SQS only carries it.
+// A message pushed to the process (taskOfDelivery) reads as a received one; reading sends nothing.
 // The SQS client is built from region/endpoint on first use unless the host passes `client`;
 // credentials come from the AWS provider chain. Subpath-only entry: the optional AWS SDK peer is
 // resolved only when this file is imported, so a missing SDK fails at the host's import line.
@@ -16,6 +17,11 @@ import {
   SendMessageCommand,
   SQSClient,
 } from '@aws-sdk/client-sqs';
+import type {
+  DeliveredMessage,
+  DeliveredTask,
+  DeliveryQueue,
+} from '../contracts/delivery.ts';
 import type { QueueDriverContext, QueueEntry } from '../contracts/drivers.ts';
 import {
   type ClaimedTask,
@@ -64,6 +70,13 @@ interface TaskBody {
 
 const MAX_VISIBILITY_SECONDS = 43_200; // SQS limit: 12 hours
 
+// arn:<partition>:sqs:<region>:<account>:<name>
+const SQS_ARN = /^arn:[^:]+:sqs:[^:]+:([^:]+):([^:]+)$/;
+// The last two path parts of a queue URL, after its scheme and host. A regular expression and not
+// `new URL`, so a malformed configured URL answers no match instead of throwing.
+const QUEUE_URL_TAIL =
+  /^[a-z][a-z\d+.-]*:\/\/[^/]+\/(?:[^?#]*\/)?([^/?#]+)\/([^/?#]+)\/?$/i;
+
 const seconds = (ms: number): number =>
   Math.min(MAX_VISIBILITY_SECONDS, Math.max(0, Math.ceil(ms / 1000)));
 
@@ -77,7 +90,7 @@ const isLostReceipt = (err: unknown): boolean => {
   );
 };
 
-export class SqsTaskQueue extends TaskQueue {
+export class SqsTaskQueue extends TaskQueue implements DeliveryQueue {
   readonly #opts: SqsTaskQueueOptions;
   #client: SQSClient | undefined;
   #warnedNoReceiveCount = false;
@@ -213,34 +226,37 @@ export class SqsTaskQueue extends TaskQueue {
     if (!message?.ReceiptHandle) {
       return null;
     }
-    const body = parseBody(message);
-    if (!body) {
-      await this.#discard(queueUrl, message, 'malformed task body');
-      return null;
-    }
-    const receiveCount = message.Attributes?.ApproximateReceiveCount;
-    if (receiveCount === undefined && !this.#warnedNoReceiveCount) {
-      // Clients before @aws-sdk/client-sqs 3.572 drop MessageSystemAttributeNames: every delivery
-      // then reads as attempt 1, so a failing task would be retried forever.
-      this.#warnedNoReceiveCount = true;
-      this.#logger.warn(
-        'resize sqs: ReceiveMessage returned no ApproximateReceiveCount — attempts cannot be counted, so failing tasks are never dead-lettered; use @aws-sdk/client-sqs >= 3.572',
-      );
-    }
-    return {
-      taskId: message.MessageId ?? message.ReceiptHandle,
-      resizer: body.resizer ?? 'default',
-      queue: body.queue ?? queue,
-      mediaId: body.mediaId,
-      pipeline: body.pipeline,
-      previews: body.previews ?? [],
-      // The URL travels with the token: complete/fail/renew act on the queue it came from.
-      token: JSON.stringify([queueUrl, message.ReceiptHandle]),
-      attempts: Number(receiveCount ?? 1),
-      ...(typeof body.gateOwner === 'string'
-        ? { gateOwner: body.gateOwner }
-        : {}),
-    };
+    const task = await this.#read(queue, queueUrl, message);
+    return typeof task === 'string' ? null : task;
+  }
+
+  /**
+   * Whether `source`, the ARN a transport names a message's queue by, is `queue`: its account and
+   * name equal the last two path parts of the queue's URL. The region is not compared, since a
+   * local endpoint's URL does not hold it. Internal: it may change in any release.
+   */
+  carriesSource(queue: string, source: string): boolean {
+    const arn = SQS_ARN.exec(source);
+    const url = QUEUE_URL_TAIL.exec(this.#urlOf(queue) ?? '');
+    return Boolean(arn && url && arn[1] === url[1] && arn[2] === url[2]);
+  }
+
+  /**
+   * The task of a message pushed to the process from `queue`, read as `claim` reads a received
+   * one. Internal: it may change in any release.
+   */
+  async taskOfDelivery(
+    message: DeliveredMessage,
+    queue: string,
+  ): Promise<DeliveredTask> {
+    return this.#read(queue, this.#queueUrl(queue), {
+      MessageId: message.id,
+      ReceiptHandle: message.receipt,
+      Body: message.body,
+      ...(message.receiveCount === undefined
+        ? {}
+        : { Attributes: { ApproximateReceiveCount: message.receiveCount } }),
+    });
   }
 
   async renew(task: ClaimedTask, leaseMs: number): Promise<boolean> {
@@ -348,16 +364,59 @@ export class SqsTaskQueue extends TaskQueue {
     }
   }
 
+  // The task of a held message, which has a ReceiptHandle: both callers see to that. `queueUrl` is
+  // the queue it came from.
+  async #read(
+    queue: string,
+    queueUrl: string,
+    message: Message,
+  ): Promise<DeliveredTask> {
+    const body = parseBody(message);
+    if (!body) {
+      const moved = await this.#discard(
+        queueUrl,
+        message,
+        'malformed task body',
+      );
+      return moved ? 'discarded' : 'left';
+    }
+    const receiveCount = message.Attributes?.ApproximateReceiveCount;
+    if (receiveCount === undefined && !this.#warnedNoReceiveCount) {
+      // Clients before @aws-sdk/client-sqs 3.572 drop MessageSystemAttributeNames, and a pushed
+      // event can leave the count out: every delivery then reads as attempt 1, so a failing task
+      // would be retried forever.
+      this.#warnedNoReceiveCount = true;
+      this.#logger.warn(
+        'resize sqs: a message came without ApproximateReceiveCount — attempts cannot be counted, so failing tasks are never dead-lettered; a worker needs @aws-sdk/client-sqs >= 3.572',
+      );
+    }
+    const receipt = message.ReceiptHandle as string;
+    return {
+      taskId: message.MessageId ?? receipt,
+      resizer: body.resizer ?? 'default',
+      queue: body.queue ?? queue,
+      mediaId: body.mediaId,
+      pipeline: body.pipeline,
+      previews: body.previews ?? [],
+      // The URL travels with the token: complete/fail/renew act on the queue it came from.
+      token: JSON.stringify([queueUrl, receipt]),
+      attempts: Number(receiveCount ?? 1),
+      ...(typeof body.gateOwner === 'string'
+        ? { gateOwner: body.gateOwner }
+        : {}),
+    };
+  }
+
   // A message the module can't read never becomes a task: move it to the dead-letter queue when
-  // there is one, otherwise leave it to the queue's own redrive policy.
+  // there is one, otherwise leave it to the queue's own redrive policy. Resolves whether it moved.
   async #discard(
     queueUrl: string,
     message: Message,
     reason: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.#logger.error(`resize sqs: ${reason} in message ${message.MessageId}`);
     if (!this.#opts.deadLetterQueueUrl || !message.ReceiptHandle) {
-      return;
+      return false;
     }
     await this.#sqs().send(
       new SendMessageCommand({
@@ -371,6 +430,7 @@ export class SqsTaskQueue extends TaskQueue {
         ReceiptHandle: message.ReceiptHandle,
       }),
     );
+    return true;
   }
 }
 
