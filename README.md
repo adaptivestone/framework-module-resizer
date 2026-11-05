@@ -303,11 +303,14 @@ construct every Resizer in the worker process too. Each task runs with the Resiz
 that Resizer's [coordination](#coordination), so a dead-letter gets that Resizer's `cooldownMs`.
 The task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
 `onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included). The
-worker awaits them in order, before its next task, up to `taskTimeoutMs`, or up to 5 s from a stop.
-Past that it logs one `warn` and goes on, and a tap still running keeps running beside the next
-task. A preview observer (`onPreviewGenerated`, `onPreviewReplaced`) runs inside its task, so
-`taskTimeoutMs` bounds it, during a stop too. `generate()` sets no bound: a tap that never settles
-means `generate()` never returns.
+worker awaits them in order, before its next task, up to `taskTimeoutMs`. Once it is stopping, it
+waits at most 5 s after the later of the stop and the task's end, so a stop adds at most 5 s per
+consume loop after the running task ends. Past either bound it logs one `warn` and goes on, and a
+tap still running keeps running beside the next task. A preview observer (`onPreviewGenerated`,
+`onPreviewReplaced`) runs inside its task, so it counts against `taskTimeoutMs`, during a stop too:
+one that outlasts it costs the attempt (`RESIZE_TASK_TIMEOUT`), and at `maxAttempts: 1` the task is
+dead, though its rows are stored. `generate()` sets no bound: a tap that never settles means
+`generate()` never returns.
 When a task's handler ends, the worker first waits for a lease renewal still in flight, on every
 task queue (a gating one too), within the same `min(leaseMs, 30000)` ms its gate calls get: a
 renewal that then answers `false` means the lease was lost, so there is no completion, failure or
@@ -997,7 +1000,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation, at most `3600`, the longest Sharp accepts |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1077,6 +1080,10 @@ are `defaultQueueOptions` in `…/config/resize.js`:
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
 | `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. The claim index does not hold the Resizer, so a claim reads past every due task of a Resizer that no worker on the queue serves: give a Resizer that has no worker its own queue. Claim errors back off from it up to 10× |
 | `taskTimeoutMs` | `600000` | A longer task is failed |
+
+`leaseMs`, `idlePollMs` and `taskTimeoutMs` can be at most `2147483647` (about 24.8 days), the
+longest a timer can wait: a larger value is `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
+`RESIZE_CONFIG_QUEUE_INVALID`.
 
 Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
 `concurrency × sharp.concurrency ≈ CPU cores`.
@@ -1414,7 +1421,7 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 
 **`LogMetrics`** (the default) writes metrics as log lines on a logger: `new LogMetrics(logger, {
 summaryIntervalMs?, debug? })` (`LogMetricsOptions`; defaults `60000` and `false`). An interval
-that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
+that is not a positive integer of at most `2147483647` is `RESIZE_METRICS_INVALID`.
 - **Summed** per Resizer, never a line of their own: the reads by outcome, the stale previews
   found, the uploads (stored and rejected, with their bytes), the variants stored, duplicate or
   rendered (with their bytes) and the claims (with their total wait). Once per window, one `info`
@@ -1522,17 +1529,29 @@ Its count and refs are the rows that write removed, so they can include such a c
 
 **The module never deletes old files.** Clean them up in an `onPreviewReplaced` observer, which gets
 each row a write of `generate()` or the worker removed, so it can delete `row.storageRef`; from that
-log line; or with a sweep that deletes objects under the `previews/` prefix (below a ref's
-`namespace`) that no row references. Leave out every `original.storageRef`: an adopted public
-original sits in the same bucket, and no preview row references it. A report is delivered at most
-once: a crash, a tap that outlasts its timeout and a failed delete each lose one, a write that
-commits but whose acknowledgement is lost leaves no `resize: replaced` line either, and that line is
-`info`, so keep the sweep if every file must go. A response or a cached page built before the write
-still names the old URL, so delete after your longest cache time if that matters. The observer does
-not fire for `invalidate()`, which returns its refs, or for `persist: false`. A removed row can be a
-copy another worker stored meanwhile; its file is just as unreferenced. Do deletes in a tap: an
-async listener on the event bus that rejects kills the process, since the module cannot catch it and
-the framework's `app.events` is a plain `EventEmitter`.
+log line; or with a sweep (below). A report is delivered at most once: a crash, a tap that outlasts
+its timeout and a failed delete each lose one, a write that commits but whose acknowledgement is
+lost leaves no `resize: replaced` line either, and that line is `info`, so keep the sweep if every
+file must go. A response or a cached page built before the write still names the old URL, so you may
+want to delete after your longest cache time. Do not wait in the tap for that: it runs inside the
+task, so a wait past `taskTimeoutMs` costs the attempt, and at `maxAttempts: 1` the task of a fresh
+preview is dead. Schedule the delete elsewhere, and return. The observer does not fire for
+`invalidate()`, which returns its refs, or for `persist: false`. A removed row can be a copy another
+worker stored meanwhile; its file is just as unreferenced. A host that adopts a stored preview as an
+original while a replacement runs can be told to delete it, since only the original the render read
+counts as live: check your own records before deleting a ref you may have adopted. Use a tap, not an
+event bus listener: an async listener that rejects kills the process, since the module cannot catch
+it and the framework's `app.events` is a plain `EventEmitter`.
+
+**A sweep** deletes objects under the `previews/` prefix (below a ref's `namespace`) that no row
+references, leaving out every `original.storageRef`: an adopted public original sits in the same
+bucket, and no preview row references it. A preview is uploaded before its row is written, so list
+the objects first and read the rows after, and delete only objects older than a day and more than
+twice `taskTimeoutMs`, by S3 `LastModified` or file mtime: a delivery that timed out can still write
+its row later, and `generate()` has no timer. Without that rule a sweep deletes the files of rows
+about to be written. A read then still reports such a row as ready, neither stale nor missing, so
+nothing renders it again and its URL fails. `invalidate()` on that media removes its rows, and the
+next read or `prewarm()` queues them again.
 
 The shipped drivers give every preview a new key. On a driver that names files by their bytes, a ref
 that a new row of the write or the original holds is not reported. Refs compare as JSON with sorted

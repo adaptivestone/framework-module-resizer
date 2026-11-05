@@ -16,10 +16,11 @@ import {
 import { RESIZE_ERROR_CODES } from './errorCodes.ts';
 import { ResizeSetupError } from './errors.ts';
 import { codeText, isModuleError, logNeverThrow } from './helpers/log.ts';
+import { MAX_TIMER_MS } from './helpers/sleep.ts';
 import type { ResizeLogger } from './types.d.ts';
 
 export interface LogMetricsOptions {
-  summaryIntervalMs?: number; // how long one summary window lasts; default 60000
+  summaryIntervalMs?: number; // how long one summary window lasts; default 60000, at most 2147483647
   debug?: boolean; // also write one debug line per call; default false
 }
 
@@ -184,9 +185,13 @@ export class LogMetrics extends ResizeMetrics {
       opts.summaryIntervalMs === undefined
         ? DEFAULT_SUMMARY_INTERVAL_MS
         : opts.summaryIntervalMs;
-    if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
+    if (
+      !Number.isSafeInteger(intervalMs) ||
+      intervalMs <= 0 ||
+      intervalMs > MAX_TIMER_MS
+    ) {
       throw new ResizeSetupError(
-        'resize: LogMetrics `summaryIntervalMs` must be a positive safe integer (ms)',
+        `resize: LogMetrics \`summaryIntervalMs\` must be a positive integer of at most ${MAX_TIMER_MS} (ms)`,
         { code: 'RESIZE_METRICS_INVALID', retryable: false },
       );
     }

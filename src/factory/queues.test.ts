@@ -173,6 +173,21 @@ describe('resolveQueueEntries', () => {
       configError('RESIZE_CONFIG_QUEUE_INVALID', /queues\.slow/),
     );
   });
+
+  test('an entry whose taskTimeoutMs a timer cannot wait for is refused, naming the entry', () => {
+    assert.throws(
+      () =>
+        resolveQueueEntries(
+          { slow: { driver: 'database', taskTimeoutMs: 3_000_000_000 } },
+          WHERE,
+        ),
+      configError(
+        'RESIZE_CONFIG_QUEUE_INVALID',
+        /queues\.slow/,
+        'taskTimeoutMs must be at most 2147483647',
+      ),
+    );
+  });
 });
 
 describe('validateQueueDrivers', () => {

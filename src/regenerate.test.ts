@@ -2826,3 +2826,159 @@ for (const [name, row] of Object.entries({
     assert.equal('replaced' in result, false);
   });
 }
+
+/** A store that keeps its own copy of every row it is given, as a database does. */
+const copiesRows = (inner: MediaStore): MediaStore =>
+  fakeMedia({
+    load: (id) => inner.loadMedia(id),
+    appendPreviews: (id, rows, dims) =>
+      inner.appendPreviews(id, structuredClone(rows), dims),
+    replacePreviews: (id, identities, rows) =>
+      inner.replacePreviews(id, identities, structuredClone(rows)),
+  });
+
+// What a tap may do to the row it gets: it is host code, and the row is only a report.
+const redactions: Record<string, (row: Preview) => void> = {
+  'nothing, the baseline': () => {},
+  'deletes origin': (row) => {
+    delete row.origin;
+  },
+  'deletes encodeSig': (row) => {
+    delete row.encodeSig;
+  },
+  'deletes sizeKey': (row) => {
+    delete (row as Partial<Preview>).sizeKey;
+  },
+  'changes the ref in place': (row) => {
+    (row.storageRef as { key: string }).key = 'redacted';
+  },
+  'swaps the ref': (row) => {
+    row.storageRef = { key: 'redacted' };
+  },
+  'changes a filter in place': (row) => {
+    (row.filters as { blur: number }).blur = 99;
+  },
+  'deletes the filters': (row) => {
+    delete row.filters;
+  },
+};
+const filtered = (): SizeInput[] => [
+  { width: 20, height: 20, filters: { blur: 2 } },
+];
+
+for (const [what, redact] of Object.entries(redactions)) {
+  test(`a tap of onPreviewGenerated that ${what}, on a store that copies rows: the worker's task completes and the row is fresh`, async () => {
+    const w = world({ wrap: copiesRows });
+    const r = w.resizer(webpConfig(80));
+    r.hook('onPreviewGenerated', redact);
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    const doc: MediaLike = { id: 'm1', original, previews: [] };
+    w.docs.set('m1', doc);
+
+    await w.read(r, doc, filtered());
+    await w.work(r);
+
+    assert.equal(w.tasks.rows[0].status, 'completed');
+    assert.equal(w.tasks.rows[0].attempts, 1);
+    const { decision } = await w.read(r, doc, filtered());
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+    assert.equal(w.tasks.rows.length, 1);
+  });
+
+  test(`a tap of onPreviewGenerated that ${what}, on a store that copies rows: generate() resolves, and what the store holds stays fresh`, async () => {
+    const w = world({ wrap: copiesRows });
+    const r = w.resizer(webpConfig(80));
+    r.hook('onPreviewGenerated', redact);
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    const doc: MediaLike = { id: 'm1', original, previews: [] };
+    w.docs.set('m1', doc);
+
+    const { created, failed } = await r.generate({
+      media: structuredClone(doc),
+      sizes: filtered(),
+      formats: ['webp'],
+    });
+
+    assert.equal(created.length, 1);
+    assert.equal(failed, 0);
+    const { decision } = await w.read(r, doc, filtered());
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+  });
+}
+
+test('a row whose file a sweep deleted: a read still calls it ready, nothing renders it again, and invalidate() repairs it', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const doc = await w.seed(r);
+  const [row] = rowsOf(doc);
+  w.files.delete(keyOf(row));
+
+  const damaged = await w.read(r, doc);
+  assert.equal(damaged.decision.ready.length, 1);
+  assert.equal(damaged.decision.ready[0].stale, undefined);
+  assert.equal(damaged.decision.ready[0].url, `/m/${keyOf(row)}`);
+  assert.equal(damaged.decision.missing.length, 0);
+  assert.equal(w.tasks.rows.length, 0);
+
+  assert.deepEqual(await r.invalidate({ media: doc }), [row.storageRef]);
+  const repairing = await w.read(r, doc);
+  assert.equal(repairing.decision.ready.length, 0);
+  assert.equal(repairing.decision.missing.length, 1);
+  assert.equal(w.tasks.rows.length, 1);
+  await w.work(r);
+
+  const repaired = await w.read(r, doc);
+  assert.equal(repaired.decision.ready.length, 1);
+  assert.equal(repaired.decision.ready[0].stale, undefined);
+  assert.ok(w.files.has(keyOf(rowsOf(doc)[0])));
+});
+
+for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
+  test(`a ${hook} tap that outlasts taskTimeoutMs costs the attempt: at maxAttempts 1 the task is dead, with its rows stored`, async () => {
+    const w = world({ timing: { taskTimeoutMs: 100, maxAttempts: 1 } });
+    const a = w.resizer(webpConfig(80));
+    const doc = await w.seed(a);
+    resetResizerForTests();
+    const r = w.resizer(webpConfig(70));
+    r.hook(hook, () => new Promise((done) => setTimeout(done, 400)));
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    const [row] = w.tasks.rows;
+    assert.equal(row.status, 'dead');
+    assert.match(String(row.error), /exceeded taskTimeoutMs/);
+    const { decision } = await w.read(r, doc);
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+  });
+
+  test(`a ${hook} tap that outlasts taskTimeoutMs costs the attempt: the next delivery finds the rows fresh, and the tap does not run again`, async () => {
+    const w = world({ timing: { taskTimeoutMs: 100, maxAttempts: 2 } });
+    const a = w.resizer(webpConfig(80));
+    const doc = await w.seed(a);
+    resetResizerForTests();
+    const r = w.resizer(webpConfig(70));
+    let calls = 0;
+    r.hook(hook, () => {
+      calls += 1;
+      return new Promise((done) => setTimeout(done, 400));
+    });
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    const [row] = w.tasks.rows;
+    assert.equal(row.status, 'completed');
+    assert.equal(row.attempts, 2);
+    assert.equal(calls, 1);
+  });
+}

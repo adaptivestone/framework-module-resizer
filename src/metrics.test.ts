@@ -338,10 +338,18 @@ describe('LogMetrics', () => {
     ]);
   });
 
-  test('summaryIntervalMs must be a positive safe integer', () => {
+  test('summaryIntervalMs must be a positive integer a timer can wait for', () => {
     const logger = recordingLogger();
     // Only a missing value (undefined) takes the default; null is a value, and invalid.
-    for (const summaryIntervalMs of [0, -1, 1.5, Number.NaN, '60000', null]) {
+    for (const summaryIntervalMs of [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      '60000',
+      null,
+      2_147_483_648,
+    ]) {
       assert.throws(
         () =>
           new LogMetrics(logger, {
@@ -352,10 +360,11 @@ describe('LogMetrics', () => {
           err.code === 'RESIZE_METRICS_INVALID' &&
           err.retryable === false &&
           err.message ===
-            'resize: LogMetrics `summaryIntervalMs` must be a positive safe integer (ms)',
+            'resize: LogMetrics `summaryIntervalMs` must be a positive integer of at most 2147483647 (ms)',
         String(summaryIntervalMs),
       );
     }
+    assert.ok(new LogMetrics(logger, { summaryIntervalMs: 2_147_483_647 }));
     const metrics = new LogMetrics(logger, { summaryIntervalMs: 1000 });
     metrics.count('resize.read', 1, { outcome: 'ready' });
     mock.timers.tick(1000);

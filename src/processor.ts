@@ -403,6 +403,20 @@ function signedLocator(ref: StorageRef): StorageRef {
 }
 
 /**
+ * A written row as the store check will compare it, with its nested ref and filters copied too:
+ * the taps get the row itself, and may change it.
+ */
+function writtenRow(row: Preview): Preview {
+  return {
+    ...row,
+    storageRef: copyLocator(row.storageRef),
+    ...(row.filters
+      ? { filters: copyLocator(row.filters) as Preview['filters'] }
+      : {}),
+  };
+}
+
+/**
  * A removed row's ref as generate() reports it, copied: none when the store's row holds no ref or
  * cannot be read, since the write is done and only that row is affected.
  */
@@ -621,8 +635,9 @@ interface RenderPendingArgs {
 interface RenderPendingResult {
   // Previews this call stored (or, with persist:false, produced).
   generated: Preview[];
-  // The rows of `generated`, and those the store left out although it holds no row of their
-  // identity: its answer can already lack the field it lost.
+  // Copies of the rows of `generated`, and of those the store left out although it holds no row of
+  // their identity (its answer can already lack the field it lost), as they were before any
+  // observer ran. Empty without a persist.
   written: Preview[];
   failedCount: number;
   // The refs of the stored rows the persist replaced (outdated, or a concurrent row of the same
@@ -1170,6 +1185,7 @@ export class Processor {
     let generated: Preview[] = [];
     let failedCount = 0;
     let removedRefs: StorageRef[] = [];
+    let written: Preview[] = [];
     const leftOut: Preview[] = [];
     const replaced = new Set<string>();
     const failures = new Map<string, unknown>();
@@ -1587,8 +1603,10 @@ export class Processor {
       const removed = recorded.removed.filter(
         (row) => !live.has(describeRef(row)),
       );
-      // Read before the taps, which get these rows: a tap cannot change what generate() returns.
+      // Read before the taps, which get these rows: a tap cannot change what generate() returns,
+      // or what the store check compares (a tap that redacts a row is no store that lost a field).
       removedRefs = removed.flatMap(readableRef);
+      written = [...generated, ...leftOut].map(writtenRow);
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
       }
@@ -1611,7 +1629,7 @@ export class Processor {
 
     return {
       generated,
-      written: [...generated, ...leftOut],
+      written,
       failedCount,
       removedRefs,
       replaced,

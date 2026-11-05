@@ -312,7 +312,7 @@ export interface ResizeLimits {
   sourceBytes: number; // default 268_435_456 — largest original a worker or adoptOriginal() reads into memory
   resultDimension: number; // default 5000 — clamp on the cover branch
   animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
-  processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
+  processingTimeoutSeconds: number; // default 30, at most 3600 — Sharp native processing timeout
   failOn: ResizeFailOn; // default 'error' — a source refused at this level is RESIZE_SOURCE_DAMAGED; not signed
 }
 
@@ -346,11 +346,11 @@ export interface ResizeConfig {
 // each entry of `queues` in src/config/resize.ts sets its own queue's). How long locks last is not
 // timing: that is the Resizer's `coordination` (CoordinationOptions).
 export interface QueueTimingOptions {
-  leaseMs: number; // default 60000 — the heartbeat renews at leaseMs / 2
+  leaseMs: number; // default 60000, at most 2147483647 — the heartbeat renews at leaseMs / 2
   retryBackoffMs: { base: number; max: number }; // default { base: 5000, max: 300000 }
   maxAttempts: number; // default 5 — deliveries before dead-letter (every lease counts, incl. reclaims)
-  idlePollMs: number; // default 1000 — sleep after an empty poll
-  taskTimeoutMs: number; // default 600000 — a task running longer is failed
+  idlePollMs: number; // default 1000, at most 2147483647 — sleep after an empty poll
+  taskTimeoutMs: number; // default 600000, at most 2147483647 — a task running longer is failed
 }
 
 // How a Resizer with a task queue coordinates its queued work, in ms

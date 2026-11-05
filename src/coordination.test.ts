@@ -55,3 +55,13 @@ test('gateTtlMs below the lease is fine: a running task is held per lease by the
     cooldownMs: 600_000,
   });
 });
+
+test('gateTtlMs and cooldownMs reach no timer, only dates and the lock store: a longer value stays valid', () => {
+  assert.deepEqual(
+    fillCoordination({
+      gateTtlMs: 3_000_000_000,
+      cooldownMs: 3_000_000_000,
+    }),
+    { gateTtlMs: 3_000_000_000, cooldownMs: 3_000_000_000 },
+  );
+});

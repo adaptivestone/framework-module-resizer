@@ -1,6 +1,7 @@
 // Pure validation of a complete resize config. It reads no framework state; the framework
 // adapter (src/framework/config.ts) loads the config from the app and checks mediaModelName.
 import { ResizeConfigError } from './errors.ts';
+import { MAX_TIMER_MS } from './helpers/sleep.ts';
 import type {
   QueueTimingOptions,
   ResizeConfig,
@@ -16,6 +17,13 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
+const overTimerLimit = (value: unknown): boolean =>
+  typeof value === 'number' && value > MAX_TIMER_MS;
+
+// The longest timeout Sharp accepts: above it every Sharp call throws, so every upload and render
+// fails. It also keeps the timer of an SVG render, this many seconds in ms, within a timer's limit.
+const MAX_PROCESSING_TIMEOUT_SECONDS = 3600;
 
 const FAIL_ON_LEVELS: ReadonlySet<unknown> = new Set([
   'none',
@@ -179,6 +187,15 @@ function validateRequiredResizeConfigFields(
       'RESIZE_CONFIG_INVALID',
     );
   }
+  if (
+    (limits as { processingTimeoutSeconds: number }).processingTimeoutSeconds >
+    MAX_PROCESSING_TIMEOUT_SECONDS
+  ) {
+    invalid(
+      `resize config: \`limits.processingTimeoutSeconds\` must be at most ${MAX_PROCESSING_TIMEOUT_SECONDS}, the longest Sharp accepts`,
+      'RESIZE_CONFIG_INVALID',
+    );
+  }
   // A missing level is refused too: `undefined` would silently be Sharp's own default, 'warning'.
   if (!FAIL_ON_LEVELS.has((limits as Record<string, unknown>).failOn)) {
     invalid(
@@ -213,6 +230,15 @@ export function validateQueueTiming(
       'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
     );
   }
+  // What reaches a timer: the heartbeat runs at leaseMs / 2, and a stricter lease limit than that
+  // costs nobody anything. retryBackoffMs, gateTtlMs and cooldownMs only become dates and lock
+  // expiries, so they have no such limit.
+  if (overTimerLimit(queue.leaseMs)) {
+    invalid(
+      `resize queue options: leaseMs must be at most ${MAX_TIMER_MS}, the longest a timer can wait`,
+      'RESIZE_CONFIG_QUEUE_LEASE_INVALID',
+    );
+  }
   const retryBackoffMs = queue.retryBackoffMs;
   if (
     !isRecord(retryBackoffMs) ||
@@ -226,6 +252,14 @@ export function validateQueueTiming(
       'resize queue options: retryBackoffMs, maxAttempts, idlePollMs and taskTimeoutMs must be positive safe integers',
       'RESIZE_CONFIG_QUEUE_INVALID',
     );
+  }
+  for (const key of ['idlePollMs', 'taskTimeoutMs'] as const) {
+    if (overTimerLimit(queue[key])) {
+      invalid(
+        `resize queue options: ${key} must be at most ${MAX_TIMER_MS}, the longest a timer can wait`,
+        'RESIZE_CONFIG_QUEUE_INVALID',
+      );
+    }
   }
 }
 

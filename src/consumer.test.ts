@@ -10,6 +10,7 @@ import {
   backoffMs,
   Consumer,
   type ConsumerDeps,
+  claimRetryDelayMs,
   gateDeadlineIn,
   OBSERVER_STOP_GRACE_MS,
   untilDeadline,
@@ -3609,9 +3610,38 @@ describe('a task observer that never settles', () => {
     // Far beyond what any test here waits: only the grace can end these waits.
     const longTask = { ...fastTiming, leaseMs: 60_000, taskTimeoutMs: 600_000 };
     const slack = 1500;
+    const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const stopMessage = `the worker is stopping, and waits ${OBSERVER_STOP_GRACE_MS} ms at most`;
+
+    /**
+     * A delivery that ends with `event`, `handlerMs` after its handler stops the loop. A retryable
+     * failure after a stop goes back to the queue with no event, so `failed` takes a task timeout,
+     * which also bounds its observers.
+     */
+    const stoppedBeforeItsEnd = (
+      event: TaskEvent,
+      stop: AbortController,
+      handlerMs: number,
+      taskTimeoutMs = longTask.taskTimeoutMs,
+    ): { tasks: MemoryTaskQueue; handle: ConsumerDeps['handle'] } => ({
+      tasks: new MemoryTaskQueue({
+        timing:
+          event === 'failed'
+            ? { ...longTask, taskTimeoutMs: handlerMs }
+            : { ...longTask, taskTimeoutMs },
+      }),
+      handle: async (task, opts) => {
+        stop.abort();
+        if (event === 'failed') {
+          return never();
+        }
+        await pause(handlerMs);
+        await leadsTo[event](task, opts);
+      },
+    });
 
     for (const event of everyEvent) {
-      test(`${event}: a stop returns within the grace, and the warn line says it was a stop`, async () => {
+      test(`${event}: a stop during the wait returns the grace after the stop, and the warn line says it was a stop`, async () => {
         const tasks = new MemoryTaskQueue({ timing: longTask });
         await tasks.add(newTask());
         const warnings: string[] = [];
@@ -3630,6 +3660,7 @@ describe('a task observer that never settles', () => {
           logger: warnsInto(warnings),
         });
         await reached;
+        await pause(300);
         const stopped = performance.now();
         stop.abort();
         await loop;
@@ -3641,55 +3672,121 @@ describe('a task observer that never settles', () => {
         assert.match(
           lines[0],
           new RegExp(
-            `the ${event} observers of task .+ did not settle within \\d+ ms \\(the worker is stopping, and waits ${OBSERVER_STOP_GRACE_MS} ms at most\\)`,
+            `the ${event} observers of task .+ did not settle within \\d+ ms \\(${stopMessage}\\)`,
           ),
         );
       });
+
+      test(`${event}: a stop before the task ends: a tap that never settles still gets the grace, from the start of the wait`, async () => {
+        const stop = new AbortController();
+        const warnings: string[] = [];
+        let waitStart = 0;
+        // Longer than the grace for a timeout, so the grace is what ends the wait.
+        const handlerMs =
+          event === 'failed' ? OBSERVER_STOP_GRACE_MS + 200 : 300;
+        const { tasks, handle } = stoppedBeforeItsEnd(event, stop, handlerMs);
+        await tasks.add(newTask());
+        await consume(tasks, {
+          queue: 'default',
+          signal: stop.signal,
+          handle,
+          onEvent: (seen) => {
+            if (seen === event) {
+              waitStart = performance.now();
+              return never();
+            }
+          },
+          logger: warnsInto(warnings),
+        });
+        const waited = performance.now() - waitStart;
+        assert.ok(waitStart > 0, 'the tap ran');
+        assert.ok(waited >= OBSERVER_STOP_GRACE_MS - 50, `only ${waited} ms`);
+        assert.ok(waited < OBSERVER_STOP_GRACE_MS + slack, `${waited} ms`);
+        const lines = observerLines(warnings);
+        assert.equal(lines.length, 1);
+        assert.ok(lines[0].includes(stopMessage), lines[0]);
+      });
+
+      test(`${event}: a stop more than the grace before the task ends: a tap with one call and a write is delivered`, async () => {
+        const stop = new AbortController();
+        const warnings: string[] = [];
+        let wrote = false;
+        const { tasks, handle } = stoppedBeforeItsEnd(
+          event,
+          stop,
+          OBSERVER_STOP_GRACE_MS + 100,
+        );
+        await tasks.add(newTask());
+        await consume(tasks, {
+          queue: 'default',
+          signal: stop.signal,
+          handle,
+          onEvent: async (seen) => {
+            if (seen === event) {
+              await pause(50);
+              wrote = true;
+            }
+          },
+          logger: warnsInto(warnings),
+        });
+        assert.equal(wrote, true);
+        assert.deepEqual(observerLines(warnings), []);
+      });
+
+      test(`${event}: a wait that taskTimeoutMs ended after a stop names taskTimeoutMs, not the stop`, async () => {
+        const stop = new AbortController();
+        const warnings: string[] = [];
+        const { tasks, handle } = stoppedBeforeItsEnd(event, stop, 150, 150);
+        await tasks.add(newTask());
+        await consume(tasks, {
+          queue: 'default',
+          signal: stop.signal,
+          handle: event === 'failed' ? handle : leadsAfterAStop(event, stop),
+          onEvent: (seen) => (seen === event ? never() : undefined),
+          logger: warnsInto(warnings),
+        });
+        const lines = observerLines(warnings);
+        assert.equal(lines.length, 1);
+        assert.match(lines[0], /\(taskTimeoutMs is 150 ms\)/);
+        assert.doesNotMatch(lines[0], /stopping/);
+      });
     }
 
-    test('the grace is measured from the stop, not from the tap', async () => {
-      const tasks = new MemoryTaskQueue({ timing: longTask });
-      await tasks.add(newTask());
-      const stop = new AbortController();
-      let stopped = 0;
-      const loop = consume(tasks, {
-        queue: 'default',
-        signal: stop.signal,
-        // The stop lands while the task runs, and the task takes 3 s more to end.
-        handle: async () => {
-          stopped = performance.now();
-          stop.abort();
-          await new Promise((r) => setTimeout(r, 3000));
-        },
-        onEvent: never,
-        logger: silent,
-      });
-      await loop;
-      const waited = performance.now() - stopped;
-      assert.ok(waited >= OBSERVER_STOP_GRACE_MS - 50, `only ${waited} ms`);
-      assert.ok(waited < OBSERVER_STOP_GRACE_MS + slack, `${waited} ms`);
-    });
+    /** A delivery that stops the loop, then ends with `event` at once. */
+    function leadsAfterAStop(
+      event: TaskEvent,
+      stop: AbortController,
+    ): ConsumerDeps['handle'] {
+      return async (task, opts) => {
+        stop.abort();
+        await leadsTo[event](task, opts);
+      };
+    }
 
-    test('with the grace used up, a tap that answers at once still runs and is not blamed', async () => {
-      const tasks = new MemoryTaskQueue({ timing: longTask });
+    test('a stop during a wait that taskTimeoutMs ends first: the line names taskTimeoutMs', async () => {
+      const tasks = new MemoryTaskQueue({
+        timing: { ...longTask, taskTimeoutMs: 200 },
+      });
       await tasks.add(newTask());
       const warnings: string[] = [];
       const stop = new AbortController();
-      let tapped = 0;
-      await consume(tasks, {
+      const { promise: reached, resolve } = Promise.withResolvers<void>();
+      const loop = consume(tasks, {
         queue: 'default',
         signal: stop.signal,
-        handle: async () => {
-          stop.abort();
-          await new Promise((r) => setTimeout(r, OBSERVER_STOP_GRACE_MS + 100));
-        },
-        onEvent: async () => {
-          tapped += 1;
+        handle: async () => {},
+        onEvent: () => {
+          resolve();
+          return never();
         },
         logger: warnsInto(warnings),
       });
-      assert.equal(tapped, 1);
-      assert.deepEqual(observerLines(warnings), []);
+      await reached;
+      stop.abort();
+      await loop;
+      const lines = observerLines(warnings);
+      assert.equal(lines.length, 1);
+      assert.match(lines[0], /\(taskTimeoutMs is 200 ms\)/);
     });
 
     test('a tap that settles within the grace is waited for', async () => {
@@ -3705,7 +3802,7 @@ describe('a task observer that never settles', () => {
         handle: async () => {},
         onEvent: async () => {
           resolve();
-          await new Promise((r) => setTimeout(r, 200));
+          await pause(200);
           tapped = true;
         },
         logger: warnsInto(warnings),
@@ -3716,6 +3813,51 @@ describe('a task observer that never settles', () => {
       assert.equal(tapped, true);
       assert.deepEqual(observerLines(warnings), []);
     });
+  });
+});
+
+describe('timers at their limit', () => {
+  test('leaseMs, idlePollMs and taskTimeoutMs at the limit: a task runs, and no timer overflows', async () => {
+    const overflows: string[] = [];
+    const onWarning = (warning: Error) => {
+      overflows.push(warning.name);
+    };
+    process.on('warning', onWarning);
+    try {
+      const tasks = new MemoryTaskQueue({
+        timing: {
+          leaseMs: 2_147_483_647,
+          idlePollMs: 2_147_483_647,
+          taskTimeoutMs: 2_147_483_647,
+        },
+      });
+      await tasks.add(newTask());
+      const stop = new AbortController();
+      const loop = consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async () => {},
+        onEvent: () => {
+          // The loop's next wait is the idle poll: let it start, then stop it.
+          setTimeout(() => stop.abort(), 20);
+        },
+        logger: silent,
+      });
+      await loop;
+      assert.equal(tasks.rows[0].status, 'completed');
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(overflows, []);
+    } finally {
+      process.off('warning', onWarning);
+    }
+  });
+
+  test('the wait after failed claims never passes the limit of a timer', () => {
+    assert.equal(claimRetryDelayMs(1000, 1), 1000);
+    assert.equal(claimRetryDelayMs(1000, 2), 2000);
+    assert.equal(claimRetryDelayMs(1000, 100), 10_000);
+    assert.equal(claimRetryDelayMs(2_147_483_647, 1), 2_147_483_647);
+    assert.equal(claimRetryDelayMs(300_000_000, 100), 2_147_483_647);
   });
 });
 
