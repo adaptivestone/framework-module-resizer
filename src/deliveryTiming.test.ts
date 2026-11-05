@@ -821,8 +821,10 @@ timed(
         getRemainingTimeInMillis: () =>
           Math.max(clock.getRemainingTimeInMillis(), MARGIN + 1),
       };
+      // A tail no budget would stop: read, it would go to the dead-letter queue with a call of its own.
+      const tail = recordOf('tail', { body: '{not json' });
       const out = await handler(
-        { Records: [recordOf('head', { body }), recordOf('tail')] },
+        { Records: [recordOf('head', { body }), tail] },
         c,
       );
       assert.deepEqual(
