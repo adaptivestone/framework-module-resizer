@@ -12,7 +12,7 @@ import { decodePng } from './fakeEngine.ts';
 export class FakePngDecoder extends SourceDecoder {
   readonly formats = ['png'];
   async inspect(bytes: Buffer): Promise<SourceInfo> {
-    if (bytes.readUInt32BE(0) !== 0x89504e47) {
+    if (bytes.length < 4 || bytes.readUInt32BE(0) !== 0x89504e47) {
       throw new ResizeMediaError('fake: not png', {
         code: 'RESIZE_SOURCE_FORMAT_UNSUPPORTED',
         retryable: false,

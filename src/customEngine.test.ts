@@ -64,7 +64,14 @@ function setup(
 
 const SIZES = [{ width: 32 }, { width: 16, height: 16 }, { fit: true }];
 
-test('a fake engine renders every size eager, and each file is what its row says', async () => {
+/** What SIZES come to on a 64×48 source, by size key: a row can agree with its file and both be wrong. */
+const EXPECTED_SIZE: Record<string, [number, number]> = {
+  '32w': [32, 24],
+  '16x16': [16, 16],
+  fit: [64, 48],
+};
+
+test('a fake engine renders every size eager at the size asked for, and each file is what its row says', async () => {
   const engine = new FakeEngine();
   const { resizer, files, doc } = setup(engine);
   doc.original = await resizer.uploadOriginal({
@@ -85,6 +92,7 @@ test('a fake engine renders every size eager, and each file is what its row says
       [info.width, info.height],
       [row.actualWidth, row.actualHeight],
     );
+    assert.deepEqual([info.width, info.height], EXPECTED_SIZE[row.sizeKey]);
   }
   // { fit: true } on a 64×48 source is its own size with no sharpen: no resize at all.
   assert.equal(engine.calls.filter((c) => c.op === 'resize').length, 2);
@@ -234,33 +242,41 @@ test('animatedFormats decides how many frames the decoder is asked for', async (
 });
 
 // The import is reported on stderr and in the exit code as well as thrown, so a caller that catches
-// the error and falls back still fails the run.
+// the error and falls back still fails the run. The resolved URL is checked too: a path into
+// node_modules names no package.
 const BLOCK_SHARP = `data:text/javascript,${encodeURIComponent(`import { registerHooks } from 'node:module';
+const report = (parentURL) => {
+  const message = 'sharp was imported from ' + parentURL;
+  console.error(message);
+  process.exitCode = 1;
+  throw new Error(message);
+};
 registerHooks({ resolve(specifier, context, next) {
   if (specifier === 'sharp' || specifier.startsWith('sharp/')) {
-    const message = 'sharp was imported from ' + context.parentURL;
-    console.error(message);
-    process.exitCode = 1;
-    throw new Error(message);
+    report(context.parentURL);
   }
-  return next(specifier, context);
+  const resolved = next(specifier, context);
+  if (resolved.url.includes('/node_modules/sharp/') || resolved.url.includes('/node_modules/@img/sharp')) {
+    report(context.parentURL);
+  }
+  return resolved;
 } });`)}`;
+
+/** A child that never exits fails its test here, instead of holding the file until CI's job limit. */
+const runBlocked = (args: string[]) =>
+  run(process.execPath, ['--no-warnings', '--import', BLOCK_SHARP, ...args], {
+    timeout: 60_000,
+  });
 
 test('the hook that blocks Sharp does block it', async () => {
   for (const code of [
     "await import('sharp')",
     "await import('sharp').catch(() => {})",
     "import { createRequire } from 'node:module'; try { createRequire(import.meta.url)('sharp'); } catch {}",
+    `await import(${JSON.stringify(import.meta.resolve('sharp'))}).catch(() => {})`,
   ]) {
     await assert.rejects(
-      run(process.execPath, [
-        '--no-warnings',
-        '--import',
-        BLOCK_SHARP,
-        '--input-type=module',
-        '-e',
-        code,
-      ]),
+      runBlocked(['--input-type=module', '-e', code]),
       (err: Error & { stderr: string }) =>
         /sharp was imported from/.test(err.stderr),
       code,
@@ -272,12 +288,6 @@ test('the Processor renders through a fake engine where importing Sharp throws',
   const file = fileURLToPath(
     new URL('./testHelpers/noSharpRun.ts', import.meta.url),
   );
-  const { stdout } = await run(process.execPath, [
-    '--experimental-strip-types',
-    '--no-warnings',
-    '--import',
-    BLOCK_SHARP,
-    file,
-  ]);
+  const { stdout } = await runBlocked(['--experimental-strip-types', file]);
   assert.match(stdout, /rendered without sharp/);
 });

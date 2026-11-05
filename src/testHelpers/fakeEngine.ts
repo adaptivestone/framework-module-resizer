@@ -20,6 +20,9 @@ function chunk(type: string, body: Buffer): Buffer {
   return Buffer.concat([len, tagged, crc]);
 }
 
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
 const COLOUR_TYPE: Record<number, number> = { 1: 0, 2: 4, 3: 2, 4: 6 };
 
 export function encodePng(r: Raster): Buffer {
@@ -36,33 +39,58 @@ export function encodePng(r: Raster): Buffer {
     r.data.copy(lines, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
   }
   return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    PNG_SIGNATURE,
     chunk('IHDR', ihdr),
     chunk('IDAT', deflateSync(lines, { level: 1 })),
     chunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
-/** Reads back only what encodePng writes. */
+/** Reads back only what encodePng writes, and refuses anything else: a test must not read noise. */
 export function decodePng(png: Buffer): Raster {
+  const refused = new Error('fake: this is not a file encodePng wrote');
+  const tagAt = (at: number) => png.toString('latin1', at, at + 4);
+  if (
+    !png.subarray(0, 8).equals(PNG_SIGNATURE) ||
+    tagAt(12) !== 'IHDR' ||
+    tagAt(37) !== 'IDAT'
+  ) {
+    throw refused;
+  }
   const width = png.readUInt32BE(16);
   const height = png.readUInt32BE(20);
   const channels = (
     { 0: 1, 4: 2, 2: 3, 6: 4 } as Record<number, 1 | 2 | 3 | 4>
   )[png[25]];
   const len = png.readUInt32BE(33);
+  if (png[24] !== 8 || channels === undefined || tagAt(49 + len) !== 'IEND') {
+    throw refused;
+  }
   const lines = inflateSync(png.subarray(41, 41 + len));
   const stride = width * channels;
+  if (lines.length !== (stride + 1) * height) {
+    throw refused;
+  }
   const data = Buffer.alloc(stride * height);
   for (let y = 0; y < height; y++) {
+    // encodePng writes filter 0 on every row: any other row is not raw pixels.
+    if (lines[y * (stride + 1)] !== 0) {
+      throw refused;
+    }
     lines.copy(data, y * stride, y * (stride + 1) + 1, (y + 1) * (stride + 1));
   }
   return { data, info: { width, height, channels } };
 }
 
-/** A background as `#rgb` or `#rrggbb`: the only spelling this engine reads. */
+/**
+ * A background as `#rgb` or `#rrggbb`, the only spelling this engine reads. The contract also allows
+ * a name such as 'white', which this engine refuses, so it never writes a colour nobody asked for.
+ */
 const parseHex = (css: string): [number, number, number] => {
-  const hex = css.replace('#', '');
+  if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(css)) {
+    throw new Error(`fake: this engine reads a hex background, not '${css}'`);
+  }
+  const hex = css.slice(1);
   const full = hex.length === 3 ? [...hex].map((c) => c + c).join('') : hex;
   return [0, 2, 4].map((i) => Number.parseInt(full.slice(i, i + 2), 16)) as [
     number,
