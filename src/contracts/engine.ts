@@ -24,7 +24,7 @@ export interface ResizeRequest {
 export interface EncodeRequest {
   format: string; // a configured id, as the host wrote it
   options: Record<string, unknown>; // encode.formats[format]
-  background?: string; // when set, flatten the raster onto this colour first
+  background?: string; // when set, flatten onto this colour first: encode.flatten.background as written, such as 'white' or '#ffffff'
 }
 
 export interface EncodedImage {
@@ -43,7 +43,7 @@ export interface EncodedImage {
  */
 export abstract class ImageEngine {
   abstract readonly id: string; // names the engine in messages
-  abstract readonly formats: readonly string[]; // what encode writes; verify() checks the config against it
+  abstract readonly formats: readonly string[]; // what encode writes; only verify() compares the config with it
   abstract readonly animatedFormats: readonly string[]; // what encode writes with every frame
   /** One frame in; one frame out at exactly the size asked for (with `coverBox`: within a pixel of it, covering the box), 8-bit sRGB, 3 channels or 4 with alpha. */
   abstract resize(
@@ -51,7 +51,11 @@ export abstract class ImageEngine {
     req: ResizeRequest,
     opts: EngineCallOptions,
   ): Promise<Raster>;
-  /** One frame (1 to 4 channels, straight alpha), or `info.frames` of them for an animated format. */
+  /**
+   * One frame (1 to 4 channels, straight alpha), or `info.frames` of them for an animated format.
+   * Refuses a format it does not write: a render does not compare `formats`, so an engine that writes
+   * another format instead gives a row that says `avif` on a `.png` file.
+   */
   abstract encode(
     raster: Raster,
     req: EncodeRequest,

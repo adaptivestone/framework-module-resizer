@@ -981,17 +981,22 @@ render then dead-letters it.
 ### Engines
 
 An engine does the resize and the encode. The default, `SharpEngine`, writes the same files as
-0.3.0. A host passes its own in code, like `decoders`, in every process that renders:
-`new Resizer({ engine })`, `createResizer(config, { engine })` or `new FrameworkResizer({ engine })`.
-There is no config driver. Decoders stay separate, `Raster` is all the two share, and Sharp stays a
-dependency.
+0.3.0. A host passes its own in code, like `decoders`, in every process that renders or calls
+`verify()`: `new Resizer({ engine })`, `createResizer(config, { engine })` or
+`new FrameworkResizer({ engine })`. An API process that only reads but calls `verify()` without it is
+refused, naming `sharp`, for a format only the worker's engine writes. There is no config driver, and
+an `engine` key in a config is `RESIZE_CONFIG_INVALID`. Decoders stay separate, `Raster` is all the two
+share, and Sharp stays a dependency.
 
 An engine extends `ImageEngine`, or is any object of the same shape (the core never checks
 `instanceof`):
 
 - `id` names the engine in messages.
-- `formats` lists the ids `encode` writes. `verify()` and worker start refuse an entry of `formats`
-  or `encode.formats` it does not list (`RESIZE_ENGINE_FORMAT_UNSUPPORTED`).
+- `formats` lists the ids `encode` writes. `verify()` and worker start refuse an entry of `formats`,
+  and an `encode.formats` entry the host wrote or changed, that it does not list
+  (`RESIZE_ENGINE_FORMAT_UNSUPPORTED`). A package default outside `formats` that the host left alone
+  is not checked: on a build without HEIF, `formats: ['jpeg', 'webp']` passes, and a per-call
+  `formats: ['avif']` then fails at render, as on 0.3.0.
 - `animatedFormats` lists the ids `encode` writes with every frame. Any other format gets the first
   frame. With `[]`, an animated source decodes one frame.
 - `resize(frame, { width, height, mode, sharpen, coverBox }, { limits, signal })` takes one frame and
@@ -1003,14 +1008,21 @@ An engine extends `ImageEngine`, or is any object of the same shape (the core ne
 - `encode(raster, { format, options, background }, { limits, signal })` takes one frame of 1 to 4
   channels with straight alpha, or `info.frames` of them (with `info.delay` and `info.loop`) for a
   format in `animatedFormats`. `options` is `encode.formats[format]`. When `background` is set, flatten
-  onto it first. It resolves with `{ data, format, contentType, width, height }`, the size of one
-  frame. The result's `format` is the preview's file extension, letters and digits only; the row keeps
-  the id the host configured.
+  onto it first: it holds `encode.flatten.background` as written, such as `'white'` or `'#ffffff'`, so
+  an engine parses colour names too, or the host writes hex. It resolves with
+  `{ data, format, contentType, width, height }`, where the size is that of the raster, one frame. The
+  result's `format` is the preview's file extension, letters and digits only; the row keeps the id the
+  host configured. `encode` must refuse a format it does not write: only `verify()` compares
+  `formats`, so a png-only engine asked for avif otherwise writes a row `avif`, `image/png`, `.png`.
 - `verify()` is optional, and runs in `resizer.verify()` and at worker start, after the decoders'.
 
 Two rules the types cannot state. An engine must not write to its inputs, because the formats of one
 size share one raster. It must be re-entrant, because calls run concurrently, up to `concurrency`. A
-result of another size, or one without those fields, is `RESIZE_ENGINE_INVALID`.
+result of another size, one without those fields, one with empty `data` or a `contentType` that is not
+`image/…`, and an animation frame with another channel count are `RESIZE_ENGINE_INVALID`. An encode
+result that says SVG (by `format` or `contentType`), HTML or XML is `RESIZE_SVG_PUBLIC_PREVIEW`, on
+that variant. These guard against a mislabelled file; they are no boundary, since an engine is host
+code.
 
 The core sets no timer on an engine's calls. An engine applies `limits.processingTimeoutSeconds`
 itself, and stops when `signal` aborts, where its library can; `generate()` passes no `signal`. A call
@@ -1032,6 +1044,7 @@ than `gif` or `webp` does not sign `animated` into that format's `encodeSig`, so
 `SharpEngine.formats` lists every id Sharp's `toFormat` accepts that this build can write, aliases
 included. An alias takes nothing from `jpeg`'s settings: `formats: ['jpg']` needs its own
 `encode.formats.jpg`, and `encode.flatten.formats` must name it, or transparent pixels turn black.
+Naming it there changes its signature, so its stored previews regenerate.
 
 ## Config reference
 
@@ -1049,7 +1062,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
-| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to the engine's `encode` (`SharpEngine`: `toFormat(id, options)`); `{}` keeps its defaults. The engine must write each key, also one no call requests |
+| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to the engine's `encode` (`SharpEngine`: `toFormat(id, options)`); `{}` keeps its defaults, except `heif` and `heic`, which Sharp has no default compression for: `heic: {}` passes `verify()`, then every render fails with `Expected one of: av1, hevc for compression`, retried until dead, as on 0.3.0, and `heic: { compression: 'av1' }` writes. The engine must write each key the host wrote or changed, also one no call requests |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |

@@ -18,6 +18,7 @@ import type {
   TaskEvent,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+import { SharpEngine } from './engines/sharp.ts';
 import {
   ResizeError,
   ResizeGenerateError,
@@ -2033,6 +2034,70 @@ describe('a worker for several queues', () => {
       }),
       { code: 'RESIZE_ENGINE_FORMAT_UNSUPPORTED' },
     );
+  });
+
+  test('a worker renders each task through the engine of its own Resizer', async () => {
+    const inner = new SharpEngine();
+    /** A SharpEngine that says who encoded a file, in the file's own bytes. */
+    const stamped = (id: string): ImageEngine => ({
+      id,
+      formats: inner.formats,
+      animatedFormats: inner.animatedFormats,
+      resize: (frame, req, opts) => inner.resize(frame, req, opts),
+      encode: async (raster) => ({
+        data: Buffer.from(id),
+        format: 'webp',
+        contentType: 'image/webp',
+        width: raster.info.width,
+        height: raster.info.height,
+      }),
+    });
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const stores = new Map<string, Map<string, Preview[]>>();
+    const uploaded = new Map<string, string>();
+    const resizerOn = (name: string, engineId: string) => {
+      const previews = new Map<string, Preview[]>();
+      stores.set(name, previews);
+      return queuedResizer(
+        name,
+        tasks,
+        fakeMedia({
+          load: async (id) => ({
+            id,
+            original: { storageRef: { key: id } },
+            previews: [],
+          }),
+          previews,
+        }),
+        {
+          engine: stamped(engineId),
+          storage: {
+            download: async () => png,
+            upload: async ({ key, body }) => {
+              uploaded.set(key, body.toString());
+              return { key };
+            },
+            publicUrl: () => '',
+          },
+        },
+      );
+    };
+    const resizers = [resizerOn('a', 'engine-a'), resizerOn('b', 'engine-b')];
+    for (const name of ['a', 'b']) {
+      await tasks.add(taskOf(name));
+    }
+    await workUntil({ logger: silent, resizers }, () =>
+      tasks.rows.every((row) => row.status === 'completed'),
+    );
+    for (const [name, engineId] of [
+      ['a', 'engine-a'],
+      ['b', 'engine-b'],
+    ]) {
+      const [row] = stores.get(name)?.get('m1') ?? [];
+      const { key } = row.storageRef as { key: string };
+      assert.equal(uploaded.get(key), engineId);
+      assert.equal(row.format, 'webp');
+    }
   });
 
   test('Resizers that share a router or a task queue verify its carrier and their lock store once at worker start', async () => {

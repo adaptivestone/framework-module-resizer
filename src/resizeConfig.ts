@@ -67,6 +67,13 @@ function validateRequiredResizeConfigFields(
       );
     }
   }
+  // Framework merging keeps unknown keys, so an engine here would never run, and nothing would say so.
+  if (root.engine !== undefined) {
+    invalid(
+      'resize config: `engine` is not a config key — pass it in code, as the `engine` option: new Resizer({ engine }), createResizer(config, { engine }) or new FrameworkResizer({ engine })',
+      'RESIZE_CONFIG_INVALID',
+    );
+  }
   const upload = root.upload;
   if (!isRecord(upload)) {
     return invalid(
@@ -147,7 +154,7 @@ function validateRequiredResizeConfigFields(
   );
   if (unconfigured.length > 0) {
     invalid(
-      `resize config: formats [${unconfigured.join(', ')}] have no encode.formats entry — add one ({} keeps the engine's defaults), or use an id it already has, such as 'jpeg'`,
+      `resize config: formats [${unconfigured.join(', ')}] have no encode.formats entry — use an id it already has, such as 'jpeg', or add one ({} keeps the engine's defaults); a 'jpg' entry also needs encode.flatten.formats to name it, or transparent pixels turn black`,
       'RESIZE_CONFIG_FORMATS_INVALID',
     );
   }

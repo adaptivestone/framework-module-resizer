@@ -95,7 +95,7 @@ export interface ResizerOptions {
   queueName?: string | (() => string);
   pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
   decoders?: SourceDecoder[]; // asked before the built-in Sharp and SVG decoders; FrameworkResizer passes it through
-  engine?: ImageEngine; // resizes and encodes; default SharpEngine. Pass it in every process that renders. Not part of encodeSig.
+  engine?: ImageEngine; // resizes and encodes; default SharpEngine. Pass it in every process that renders or calls verify(). Not part of encodeSig.
   // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
   hooks?: HookTaps;
 }

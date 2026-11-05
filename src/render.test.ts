@@ -608,7 +608,7 @@ test('a step that resolves with a Buffer is told to return its pixels, not an im
     assert.match(err.message, new RegExp(`a ${kind} resolved with`));
     assert.match(
       err.message,
-      /it is a Buffer, not a Raster: return the raw pixels \(with Sharp: sharpToRaster\(img\), not img\.toBuffer\(\)\)/,
+      /it is a Buffer, not a Raster: return \{ data, info \} \(with Sharp: sharpToRaster\(img\), not img\.toBuffer\(\)\)/,
     );
     assert.doesNotMatch(err.message, /`data` is not a Buffer/);
     // A host on another engine, with no Sharp of its own, hears the shape first.
@@ -909,6 +909,22 @@ for (const [fields, problem] of [
   ],
   [{ contentType: '' }, 'no `contentType`'],
   [{ width: 0 }, 'the size 0×10'],
+  [{ data: Buffer.alloc(0) }, '`data` is empty'],
+  [{ width: 1, height: 1 }, 'it is 1×1, not 20×10'],
+  [{ width: 20, height: 20 }, 'it is 20×20, not 20×10'],
+  [{ width: 21, height: 10 }, 'it is 21×10, not 20×10'],
+  [
+    { contentType: 'text/html' },
+    "the `contentType` 'text/html' is not an image type",
+  ],
+  [
+    { contentType: 'application/octet-stream' },
+    "the `contentType` 'application/octet-stream' is not an image type",
+  ],
+  [
+    { contentType: ' image/svg+xml' },
+    "the `contentType` ' image/svg+xml' is not an image type",
+  ],
 ] as [Partial<EncodedImage>, string][]) {
   test(`an encode result with ${problem} is RESIZE_ENGINE_INVALID`, async () => {
     await assert.rejects(
@@ -950,10 +966,15 @@ test('a resize result of another size is RESIZE_ENGINE_INVALID', async () => {
   );
 });
 
-test('an engine that reports SVG by format or by contentType is refused', async () => {
+test('an engine that reports SVG, HTML or XML by format, or SVG by contentType, is refused, by name', async () => {
   for (const fields of [
     { format: 'svg' },
     { format: 'SVG' },
+    { format: 'svgz' },
+    { format: 'html' },
+    { format: 'htm' },
+    { format: 'xhtml' },
+    { format: 'XML' },
     { format: 'webp', contentType: 'IMAGE/SVG+XML' },
   ]) {
     await assert.rejects(
@@ -962,9 +983,91 @@ test('an engine that reports SVG by format or by contentType is refused', async 
         variantPlan(sizePlan(20, 10), 'webp'),
         { ...encodeOptions(), engine: encodedAs(fields) },
       ),
-      { code: 'RESIZE_SVG_PUBLIC_PREVIEW', retryable: true },
+      (err: ResizeError) => {
+        assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
+        assert.equal(err.retryable, true);
+        assert.match(err.message, /engine 'liar'/);
+        assert.match(err.message, /cannot be published as a preview/);
+        return true;
+      },
+      JSON.stringify(fields),
     );
   }
+});
+
+test('every id SharpEngine writes passes the checks on its result, at 1 to 4 channels', async () => {
+  // `heif` and `heic` have no default compression, so they need one (see the README).
+  const needs: Record<string, Record<string, unknown>> = {
+    heif: { compression: 'av1' },
+    heic: { compression: 'av1' },
+  };
+  for (const format of engine.formats) {
+    for (const colour of [[9], [9, 128], [9, 8, 7], [9, 8, 7, 128]]) {
+      const out = await encodeVariant(
+        solid(20, 10, colour),
+        variantPlan(sizePlan(20, 10), format),
+        {
+          ...encodeOptions(),
+          encode: {
+            ...config.encode,
+            formats: { [format]: needs[format] ?? {} },
+          },
+        },
+      );
+      assert.deepEqual([out.width, out.height], [20, 10], format);
+    }
+  }
+});
+
+test('`heic: {}` fails at render: Sharp has no default compression for it', async () => {
+  await assert.rejects(
+    encodeVariant(
+      solid(20, 10, [9, 8, 7]),
+      variantPlan(sizePlan(20, 10), 'heic'),
+      {
+        ...encodeOptions(),
+        encode: { ...config.encode, formats: { heic: {} } },
+      },
+    ),
+    /Expected one of: av1, hevc for compression/,
+  );
+});
+
+test('an animated encode reports the size of one frame', async () => {
+  for (const format of engine.animatedFormats) {
+    const out = await encodeVariant(
+      threeFrames(),
+      variantPlan(sizePlan(20, 20, 'fill', true), format),
+      encodeOptions(),
+    );
+    assert.deepEqual([out.width, out.height], [20, 20], format);
+  }
+});
+
+test('a later animation frame with another channel count is RESIZE_ENGINE_INVALID, naming the engine', async () => {
+  let call = 0;
+  const wrong = lying({
+    resize: async (_frame, req) => {
+      const channels = call === 0 ? 3 : 4;
+      call += 1;
+      return {
+        data: Buffer.alloc(req.width * req.height * channels),
+        info: { width: req.width, height: req.height, channels },
+      };
+    },
+  });
+  await assert.rejects(
+    renderSize(threeFrames(), sizePlan(4, 4, 'fill', true), wrong, { limits }),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_ENGINE_INVALID');
+      assert.equal(err.retryable, true);
+      assert.equal(
+        err.message,
+        "resize: engine 'liar' broke its contract: the result of resize(): frame 1 holds 64 bytes, not 48 like the first frame",
+      );
+      return true;
+    },
+  );
 });
 
 test('reduceToBox asks for the size one factor gives, and passes the box', async () => {

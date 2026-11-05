@@ -3,15 +3,21 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import sharp from 'sharp';
 import { Catalog } from './catalog.ts';
-import type { ImageEngine } from './contracts/engine.ts';
+import type { Raster } from './contracts/decoder.ts';
+import type {
+  EncodeRequest,
+  EngineCallOptions,
+  ImageEngine,
+} from './contracts/engine.ts';
 import { createEngine } from './engineCheck.ts';
 import { SharpEngine } from './engines/sharp.ts';
-import type { ResizeError } from './errors.ts';
+import { ResizeConfigError, type ResizeError } from './errors.ts';
 import {
   Resizer,
   type ResizerOptions,
   resetResizerForTests,
 } from './resizer.ts';
+import { encodeSignature } from './signatures.ts';
 import { fakeMedia, memoryStorage } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import type {
@@ -114,21 +120,212 @@ test('verify() refuses a configured format the engine does not write, naming all
       assert.equal(err.retryable, true);
       assert.equal(
         err.message,
-        "resize: Resizer 'default' configures formats [avif] that engine 'test' does not write — it writes [jpeg, webp]",
+        "resize: Resizer 'default' has [avif] in `formats` or `encode.formats`, which engine 'test' does not write — it writes [jpeg, webp]",
       );
       return true;
     },
   );
 });
 
-test('an encode.formats key counts, even when no call requests it', async () => {
-  // The default encode.formats also holds jpeg and avif.
-  await assert.rejects(
-    resizerWith(engineOf({ formats: ['webp'] }), {
-      formats: ['webp'],
-    }).verify(),
-    /configures formats \[jpeg, avif\]/,
+const HEIF_IDS = ['heif', 'heic', 'avif'];
+/** SharpEngine on a build without HEIF: it lists no HEIF id, and Sharp refuses them at render. */
+class NoHeifEngine extends SharpEngine {
+  readonly formats = new SharpEngine().formats.filter(
+    (id) => !HEIF_IDS.includes(id),
   );
+  encode(raster: Raster, req: EncodeRequest, opts: EngineCallOptions) {
+    if (HEIF_IDS.includes(req.format)) {
+      throw new Error(`Unsupported output format ${req.format}`);
+    }
+    return super.encode(raster, req, opts);
+  }
+}
+
+test('a default entry the host left alone and does not generate is not checked', async () => {
+  // A build without HEIF, with the default `encode.formats`: it works on 0.3.0.
+  await resizerWith(new NoHeifEngine(), {
+    formats: ['jpeg', 'webp'],
+  }).verify();
+  resetResizerForTests();
+  // An engine that writes webp alone: the host never wrote jpeg or avif.
+  await resizerWith(engineOf({ formats: ['webp'] }), {
+    formats: ['webp'],
+  }).verify();
+});
+
+test('a default entry in `formats`, or one the host changed, and a host entry it does not use are still checked', async () => {
+  const refused = async (config: DeepPartial<ResizeConfig>, ids: string) => {
+    resetResizerForTests();
+    await assert.rejects(
+      resizerWith(new NoHeifEngine(), config).verify(),
+      (err: ResizeError) => {
+        assert.equal(err.code, 'RESIZE_ENGINE_FORMAT_UNSUPPORTED');
+        assert.match(
+          err.message,
+          new RegExp(`has \\[${ids}\\] in \`formats\` or \`encode\\.formats\``),
+        );
+        return true;
+      },
+      ids,
+    );
+  };
+  // The default config generates avif.
+  await refused({}, 'avif');
+  // The default entry, changed by the host.
+  await refused(
+    {
+      formats: ['jpeg', 'webp'],
+      encode: { formats: { avif: { quality: 1 } } },
+    },
+    'avif',
+  );
+  // A host's entry nothing generates.
+  await refused(
+    { formats: ['jpeg', 'webp'], encode: { formats: { jxl: {} } } },
+    'jxl',
+  );
+});
+
+test('a per-call format with a default entry passes verify() and fails at render, as on 0.3.0', async () => {
+  const { storage } = memoryStorage();
+  const doc: MediaLike = { id: 'm1', previews: [] };
+  const resizer = new Resizer({
+    storage,
+    media: fakeMedia({
+      load: async () => doc,
+      appendPreviews: async (_id: string, rows: Preview[]) => rows,
+    }),
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger: silent,
+    engine: new NoHeifEngine(),
+  });
+  await resizer.verify();
+  const body = await sharp({
+    create: { width: 64, height: 48, channels: 3, background: '#336699' },
+  })
+    .png()
+    .toBuffer();
+  doc.original = await resizer.uploadOriginal({ body, visibility: 'private' });
+  await assert.rejects(
+    resizer.generate({
+      media: doc,
+      sizes: [{ width: 32 }],
+      formats: ['avif'],
+    }),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_GENERATE_FAILED');
+      assert.match(
+        String((err.cause as Error).message),
+        /Unsupported output format avif/,
+      );
+      return true;
+    },
+  );
+});
+
+test('only verify() compares the list: a format the list does not name renders without it', async () => {
+  // `JPG` works through Sharp, which lower-cases it, and verify() refuses it (above).
+  const { storage, files } = memoryStorage();
+  const doc: MediaLike = { id: 'm1', previews: [] };
+  const resizer = new Resizer({
+    storage,
+    media: fakeMedia({
+      load: async () => doc,
+      appendPreviews: async (_id: string, rows: Preview[]) => rows,
+    }),
+    config: makeImageConfig({
+      formats: ['JPG'],
+      encode: { formats: { JPG: {} } },
+    }),
+    logger: silent,
+  });
+  const body = await sharp({
+    create: { width: 64, height: 48, channels: 3, background: '#336699' },
+  })
+    .png()
+    .toBuffer();
+  doc.original = await resizer.uploadOriginal({ body, visibility: 'private' });
+  const {
+    created: [row],
+  } = await resizer.generate({ media: doc, sizes: [{ width: 32 }] });
+  assert.equal(row.format, 'JPG');
+  const { key } = row.storageRef as { key: string };
+  assert.equal((await sharp(files.get(key)).metadata()).format, 'jpeg');
+});
+
+test('a subclass of SharpEngine can name itself', async () => {
+  class TunedSharp extends SharpEngine {
+    readonly id = 'tuned-sharp';
+  }
+  await assert.rejects(
+    resizerWith(new TunedSharp(), {
+      formats: ['jxl'],
+      encode: { formats: { jxl: {} } },
+    }).verify(),
+    /engine 'tuned-sharp' does not write/,
+  );
+});
+
+test('the refusal of a bad engine names `verify` too', () => {
+  assert.throws(
+    () => resizerWith(engineOf({ verify: 'x' as never })),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_ENGINE_INVALID');
+      assert.match(err.message, /`verify`, when given, must be a function/);
+      return true;
+    },
+  );
+});
+
+test('an `engine` key in a config is refused, naming the option', () => {
+  assert.throws(
+    () =>
+      new Resizer({
+        storage: memoryStorage().storage,
+        media: fakeMedia(),
+        config: {
+          ...makeImageConfig(),
+          engine: new SharpEngine(),
+        } as ResizeConfig,
+        logger: silent,
+      }),
+    (err: ResizeError) => {
+      assert.ok(err instanceof ResizeConfigError);
+      assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+      assert.match(err.message, /`engine` is not a config key/);
+      assert.match(err.message, /new Resizer\(\{ engine \}\)/);
+      return true;
+    },
+  );
+});
+
+test('a format with no encode.formats entry points to jpeg first, and to what a jpg entry needs', () => {
+  assert.throws(
+    () => resizerWith(undefined, { formats: ['jpg'] }),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_CONFIG_FORMATS_INVALID');
+      assert.equal(
+        err.message,
+        "resize config: formats [jpg] have no encode.formats entry — use an id it already has, such as 'jpeg', or add one ({} keeps the engine's defaults); a 'jpg' entry also needs encode.flatten.formats to name it, or transparent pixels turn black",
+      );
+      return true;
+    },
+  );
+});
+
+test('naming jpg in the flatten list changes its signature, so its previews regenerate', () => {
+  const signature = (flatten: string[]) =>
+    encodeSignature(
+      makeImageConfig({
+        formats: ['jpg'],
+        encode: {
+          formats: { jpg: {} },
+          flatten: { formats: flatten, background: '#ffffff' },
+        },
+      }),
+      { format: 'jpg', fit: false },
+    );
+  assert.notEqual(signature(['jpeg']), signature(['jpg']));
 });
 
 test('SharpEngine refuses what it cannot write here, and an id in another case', async () => {

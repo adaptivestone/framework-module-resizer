@@ -124,6 +124,32 @@ test('a config object and one call: custom storage and database drivers register
   assert.equal(fake.built.length, 1);
 });
 
+test('an `engine` key in the config is refused, naming the option', () => {
+  assert.throws(
+    () =>
+      createResizer(
+        {
+          formats: ['webp'],
+          engine: {},
+          storage: { driver: 'memory' },
+          database: { driver: 'fake' },
+        } as never,
+        {
+          drivers: {
+            storage: { memory: memoryStorageDriver() },
+            database: { fake: fakeDatabaseDriver() },
+          },
+        },
+      ),
+    (err: ResizeError) => {
+      assert.ok(err instanceof ResizeConfigError);
+      assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+      assert.match(err.message, /`engine` is not a config key/);
+      return true;
+    },
+  );
+});
+
 test('createResizer passes the engine option to the Resizer', () => {
   assert.throws(
     () =>

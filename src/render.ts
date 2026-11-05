@@ -62,20 +62,35 @@ async function resized(
   return out;
 }
 
-/** An encode result a row can record, or an engine contract error. `format` becomes the file extension. */
-function checkEncoded(engine: ImageEngine, out: EncodedImage): void {
+/**
+ * An encode result a row can record, or an engine contract error: hosts read this size through
+ * `formatPictureUrls`, and `format` becomes the file extension. The content type is a guard against
+ * a mislabelled file, not a boundary: an engine is host code.
+ */
+function checkEncoded(
+  engine: ImageEngine,
+  out: EncodedImage,
+  raster: Raster,
+): void {
   const positive = (n: unknown) => Number.isInteger(n) && (n as number) > 0;
+  const { width, height } = raster.info;
   const problem = !Buffer.isBuffer(out?.data)
     ? '`data` is not a Buffer'
-    : typeof out.format !== 'string' || out.format === ''
-      ? 'no `format`'
-      : !/^[a-z0-9]+$/i.test(out.format)
-        ? `the \`format\` '${out.format}' is not a file extension`
-        : typeof out.contentType !== 'string' || out.contentType === ''
-          ? 'no `contentType`'
-          : !positive(out.width) || !positive(out.height)
-            ? `the size ${String(out.width)}×${String(out.height)}`
-            : undefined;
+    : out.data.length === 0
+      ? '`data` is empty'
+      : typeof out.format !== 'string' || out.format === ''
+        ? 'no `format`'
+        : !/^[a-z0-9]+$/i.test(out.format)
+          ? `the \`format\` '${out.format}' is not a file extension`
+          : typeof out.contentType !== 'string' || out.contentType === ''
+            ? 'no `contentType`'
+            : !/^image\/[a-z0-9.+-]+$/i.test(out.contentType)
+              ? `the \`contentType\` '${out.contentType}' is not an image type`
+              : !positive(out.width) || !positive(out.height)
+                ? `the size ${String(out.width)}×${String(out.height)}`
+                : out.width !== width || out.height !== height
+                  ? `it is ${out.width}×${out.height}, not ${width}×${height}`
+                  : undefined;
   if (problem !== undefined) {
     throw new ResizeSetupError(
       `resize: engine '${engine.id}' broke its contract: the result of encode(): ${problem}`,
@@ -141,7 +156,7 @@ function stepResult(
   const problem = isSharp
     ? 'it is a Sharp instance, not its pixels: return sharpToRaster(img)'
     : Buffer.isBuffer(value)
-      ? 'it is a Buffer, not a Raster: return the raw pixels (with Sharp: sharpToRaster(img), not img.toBuffer())'
+      ? 'it is a Buffer, not a Raster: return { data, info } (with Sharp: sharpToRaster(img), not img.toBuffer())'
       : (rasterProblem(value) ??
         (frames !== undefined && frames !== 1
           ? `\`info.frames\` is ${frames}, not 1`
@@ -286,7 +301,8 @@ export async function renderSize(
     const { data } = await resizeFrame(frameAt(i), size, engine, opts);
     if (data.length !== outBytes) {
       throw new ResizeSetupError(
-        `resize: frame ${i} resized to ${data.length} bytes, not ${outBytes} like the first frame`,
+        `resize: engine '${engine.id}' broke its contract: the result of resize(): frame ${i} holds ${data.length} bytes, not ${outBytes} like the first frame`,
+        { code: 'RESIZE_ENGINE_INVALID' },
       );
     }
     data.copy(stack, i * outBytes);
@@ -455,14 +471,15 @@ export async function encodeVariant(
     },
     { limits: opts.limits, signal: opts.signal },
   );
-  checkEncoded(engine, encoded);
+  checkEncoded(engine, encoded, raster);
   if (
-    /^svg$/i.test(encoded.format) ||
+    /^(svgz?|x?html?|xml)$/i.test(encoded.format) ||
     /^image\/svg/i.test(encoded.contentType)
   ) {
-    throw new ResizeMediaError('resize: SVG cannot be published as a preview', {
-      code: 'RESIZE_SVG_PUBLIC_PREVIEW',
-    });
+    throw new ResizeMediaError(
+      `resize: engine '${engine.id}' returned '${encoded.format}' (${encoded.contentType}): SVG, HTML and XML cannot be published as a preview`,
+      { code: 'RESIZE_SVG_PUBLIC_PREVIEW' },
+    );
   }
   return encoded;
 }

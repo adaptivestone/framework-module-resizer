@@ -52,7 +52,8 @@ function delayPerFrame(delay: readonly number[], frames: number): number[] {
 }
 
 export class SharpEngine extends ImageEngine {
-  readonly id = 'sharp';
+  // Typed `string`, so a subclass can name itself.
+  readonly id: string = 'sharp';
   readonly formats: readonly string[] = Object.freeze(writableIds());
   // Measured with Sharp 0.35: webp and gif keep every frame; avif, jpeg and png stack the frames
   // into one tall image, and tiff writes them as pages, which no browser plays.

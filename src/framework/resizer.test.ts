@@ -350,6 +350,18 @@ describe('flushAtShutdown', () => {
   });
 });
 
+test('an `engine` key in a config file is refused on first use and by verify(), naming the option', async () => {
+  installApp({
+    resize: { ...makeResizeConfig({ storage: localStorage }), engine: {} },
+  });
+  const refused = configError(
+    'RESIZE_CONFIG_INVALID',
+    '`engine` is not a config key',
+    'new FrameworkResizer({ engine })',
+  );
+  await assert.rejects(new FrameworkResizer().verify(), refused);
+});
+
 test('FrameworkResizer passes the engine option to the Resizer', () => {
   installApp();
   assert.throws(() => new FrameworkResizer({ storage, engine: {} as never }), {

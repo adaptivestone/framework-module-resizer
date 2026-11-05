@@ -139,13 +139,14 @@
   in a step do nothing (`withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this
   way disappears, and `withIccProfile` also shifts the colours, so leave it out). Bump the pipeline's
   `version` when a step's output changes.
-- `verify()` and worker start now check every entry of `formats` and `encode.formats` against
-  `engine.formats`. `SharpEngine.formats` lists the ids Sharp's `toFormat` accepts, aliases included
-  (`jpg`, `jpe`, `tif`, `heic`, `tile`), so a host with `formats: ['jpg']` keeps working and keeps its
-  previews. A format this Sharp build cannot write (`jxl` on the prebuilt binaries), even an unused
-  `encode.formats` entry, and an id in another case (`JPG`, which Sharp accepted) now fail with
-  `RESIZE_ENGINE_FORMAT_UNSUPPORTED`. Remove the entry, or rename the id, which regenerates its
-  previews.
+- `verify()` and worker start now check every entry of `formats`, and every `encode.formats` entry the
+  host wrote or changed, against `engine.formats`. `SharpEngine.formats` lists the ids Sharp's
+  `toFormat` accepts, aliases included (`jpg`, `jpe`, `tif`, `heic`, `tile`), so a host with
+  `formats: ['jpg']` keeps working and keeps its previews. A format this Sharp build cannot write
+  (`jxl` on the prebuilt binaries), even in an unused entry the host wrote, and an id in another case
+  (`JPG`, which Sharp accepted) now fail with `RESIZE_ENGINE_FORMAT_UNSUPPORTED`. Remove the entry, or
+  rename the id, which regenerates its previews. A package default outside `formats` that the host
+  left alone is not checked, so `formats: ['jpeg', 'webp']` on a build without HEIF keeps working.
 
 **Changed behaviour**
 
@@ -238,9 +239,10 @@
   Measured with one `composite` step on a 24 MP JPEG at the default `concurrency` of 4, the process's
   peak RSS is about 185 MB where 0.3.0 had about 130 MB (sizes up to 1920 wide), and about 975 MB
   where 0.3.0 had about 590 MB (sizes from 5000 down to 2000 wide).
-- Messages about formats say `format id`, not `Sharp format id`, and no longer name `jpg`. A log
-  search on the old words needs updating. A `jpg` id still needs its own `encode.formats.jpg`, and
-  `encode.flatten.formats` must name it, or transparent pixels turn black.
+- Messages about formats say `format id`, not `Sharp format id`, and only the config's refusal names
+  `jpg`: it points to `jpeg` first, and says a `jpg` entry needs `encode.flatten.formats` to name it, or
+  transparent pixels turn black. Naming it there changes its signature, so its previews regenerate. A
+  log search on the old words needs updating.
 
 **Features**
 
@@ -265,8 +267,8 @@
   `createResizer(config, { engine })` and `new FrameworkResizer({ engine })` take one; the default,
   `SharpEngine`, writes the same files as 0.3.0. Decoders are separate, and the built-in ones stay;
   Sharp stays a dependency. The engine is not part of `encodeSig`: switching does not regenerate
-  stored previews; bump each pipeline's `version` to do that. New codes: `RESIZE_ENGINE_INVALID`,
-  `RESIZE_ENGINE_FORMAT_UNSUPPORTED`.
+  stored previews; bump each pipeline's `version` to do that. An `engine` key in a config is
+  `RESIZE_CONFIG_INVALID`. New codes: `RESIZE_ENGINE_INVALID`, `RESIZE_ENGINE_FORMAT_UNSUPPORTED`.
 
 **Fixes**
 
