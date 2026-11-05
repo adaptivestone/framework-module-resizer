@@ -761,3 +761,33 @@ test('the docs say `--no` refuses to install, since npx still looks the name up'
     );
   }
 });
+
+test('RELEASE.md says what gates the 0.4.0 publish, and how to merge and tag it', () => {
+  const text = read('RELEASE.md');
+  const section = (heading: string): string => {
+    const start = text.indexOf(heading);
+    assert.ok(start >= 0, heading);
+    const end = text.indexOf('\n## ', start + heading.length);
+    return text.slice(start, end < 0 ? undefined : end).replace(/\s+/g, ' ');
+  };
+  // Read top to bottom, §3 Publish comes before §6: it must send the owner there first.
+  assert.ok(
+    section('## 3. Publish').includes('](#6-the-owners-checks-for-040)'),
+    '§3 points at §6',
+  );
+  assert.doesNotMatch(
+    section('## 4. Git tag convention'),
+    /pick one convention/,
+  );
+  const checks = section("## 6. The owner's checks");
+  for (const needle of [
+    '**Real S3** and **A count on real originals** pass before `npm publish`',
+    '**The npm page,** after `npm publish`',
+    '`## Config reference`',
+    'not a squash',
+    'git diff feat/0.4-f-docs-release main',
+    'git tag v0.4.0',
+  ]) {
+    assert.ok(checks.includes(needle), needle);
+  }
+});

@@ -86,6 +86,8 @@ what they must change.
 
 ## 3. Publish
 
+**0.4.0:** merge and run the checks that gate the publish first, as [§6](#6-the-owners-checks-for-040) says.
+
 This is a **scoped** package (`@adaptivestone/…`). npm defaults scoped packages to **restricted**
 (private) access, so the **first** publish must opt into public access explicitly. Neither this
 repo nor the sibling repos set `publishConfig.access` in `package.json` — the house convention is
@@ -127,10 +129,9 @@ publish time; `files: ["dist", "AGENTS.md", "UPGRADING.md"]` (plus the auto-incl
 Tag the release commit `vX.Y.Z`, and a release candidate `vX.Y.Z-rc.N` (e.g. `v0.3.0-rc.1`).
 
 > **Note:** the sibling repos tag **without** the `v` prefix (`framework` uses `5.3.1`,
-> `framework-module-email` uses `2.0.0`). This repo's existing tags are mixed: `v0.1.0` has the
-> prefix, `0.2.0` does not, and 0.2.1 has no tag at all (`git tag` lists them). This file keeps
-> the `v` prefix, npm's default; pick one convention before the next release and use it from
-> then on.
+> `framework-module-email` uses `2.0.0`). This repo's older tags are mixed: `v0.1.0` has the
+> prefix, `0.2.0` does not, and 0.2.1 has no tag at all (`git tag` lists them). From `v0.3.0` on
+> it uses the `v` prefix, npm's default.
 
 ```bash
 git tag v0.1.0
@@ -328,6 +329,11 @@ The per-task line reads `resize: task … of media … in … ms (… attempt n,
 
 Nothing below can run in CI or in a build. Each was left out of the build, not skipped silently.
 
+**Real S3** and **A count on real originals** pass before `npm publish`. Real S3 runs code that has
+never touched real S3 (`adoptOriginal`, the key rule), and the `failOn` default cannot change once
+0.4.0 is on `latest` without a breaking 0.5.0. The push delivery list does not gate the publish,
+since the feature ships marked preview.
+
 - [ ] **Real S3:** one adopted object, including a key with a space, through `adoptOriginal` and a
       worker.
 - [ ] **Real SQS:** a queued task through a worker.
@@ -342,6 +348,24 @@ Nothing below can run in CI or in a build. Each was left out of the build, not s
       which never installs or runs it: with this package missing, npx only looks the name up in the
       registry and stops with an error. A host that leaves out `--no` would run whatever is published
       there. Claiming the name is cheap insurance, and only the owner can do it.
+- [ ] **The npm page,** after `npm publish`: npmjs.com shows the README up to 64 KiB. Check that it
+      shows the whole `## Config reference`.
+
+### Merging 0.4.0
+
+0.4.0 is six stacked PRs, #71 (`feat/0.4-a-operate`, into `main`) to #76 (`feat/0.4-f-docs-release`).
+Merge them in order, each with a merge commit, not a squash: a squash makes each next PR replay the
+earlier commits. After each merge the next PR's base must be `main`: GitHub retargets it when you
+delete the merged branch. Then confirm that nothing is left out, and tag that merge commit:
+
+```bash
+git checkout main && git pull
+git diff feat/0.4-f-docs-release main   # prints nothing
+git tag v0.4.0                          # main's head: the merge commit of #76
+git push origin v0.4.0
+```
+
+Then publish the guide (§1), run `npm publish` (§3) and publish the GitHub Release (§4).
 
 ## Notes
 

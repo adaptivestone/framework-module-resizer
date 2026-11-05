@@ -110,7 +110,8 @@ it lists what to change before you run `npm i`.
 - **A custom model-shaped `MongoMediaModel` must accept a new filter.** The write of the original's
   dimensions in `MongoMediaStore` had the filter `{ _id }`. It now adds `$or`, `$not` and `$type`,
   so the write lands only while the original holds no stored pair, and its options add
-  `strictQuery: false` (`MongoMediaUpdateOptions`). A Mongoose model accepts both as it is.
+  `strictQuery: false` (`MongoMediaUpdateOptions`). A Mongoose model accepts both as it is. Why the
+  write is guarded is under **Changed behaviour**.
 
 - **`variantSteps` take and return a `Raster`.** `VariantStep` is now
   `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one): `raster` is that
@@ -223,7 +224,8 @@ it lists what to change before you run `npm i`.
   rolling deploy, whose write has no such condition. Two originals without dimensions swapped during
   one render still get the first one's pair. The update form needs MongoDB 4.2, and the driver in use
   may require more (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
-  `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
+  `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it. What a custom
+  model-shaped `MongoMediaModel` must accept for it is under **Breaking changes**.
 - A raster a host decoder marks `premultiplied` now converts to straight alpha in plain JS. It can
   differ from 0.3.0 by 1 level per channel, and it blocks the event loop (182 ms at 24 MP, 372 ms at
   50 MP, against Sharp's 56 ms and 126 ms off the loop), which matters for eager `generate()` on an API
@@ -267,9 +269,10 @@ it lists what to change before you run `npm i`.
 - `hasOriginal(media)` and `resizer.adoptOriginal({ storageRef, maxBytes? })`: put an object you
   already hold on the module without re-uploading it. It measures and decodes the object, returns
   the `Original` that `uploadOriginal` would return for it, with the ref in its JSON form, and writes
-  nothing. `maxBytes` lowers `limits.sourceBytes` for one call, for an adoption on a request path. New
-  codes `RESIZE_ORIGINAL_DOWNLOAD_FAILED`, `RESIZE_ORIGINAL_PUBLIC_REFUSED`,
-  `RESIZE_ADOPT_MAX_BYTES_INVALID`.
+  nothing. `maxBytes` lowers `limits.sourceBytes` for one call, for an adoption on a request path. Each
+  call is timed as the new metric `resize.adopt` (`outcome` `adopted` or `rejected`), which
+  `LogMetrics` writes on its debug line only. New codes `RESIZE_ORIGINAL_DOWNLOAD_FAILED`,
+  `RESIZE_ORIGINAL_PUBLIC_REFUSED`, `RESIZE_ADOPT_MAX_BYTES_INVALID`.
 - `formatPictureUrls` entries carry `width` and `height` when the row has them, since a size key
   does not promise a size. A host that snapshots its API JSON sees two new fields.
 - `onPreviewReplaced(row, ctx)`: an observer that gets each row a write of `generate()` or the worker
