@@ -9,6 +9,10 @@ driver, and turns the record on your media document into image URLs.
   covers setup, workflows, pipelines, security and troubleshooting.
 - **Coding agents:** read [`AGENTS.md`](./AGENTS.md), the integration guide shipped with this package.
 - **Upgrading:** read [`UPGRADING.md`](./UPGRADING.md), also shipped with this package.
+- **Errors:** every code is in [Error codes](#error-codes), further down this file.
+- **On npmjs.com** this page stops at 64 KiB, so links to later sections do nothing there. Read the
+  [whole file on GitHub](https://github.com/adaptivestone/framework-module-resizer#readme), which shows
+  the default branch; the copy in `node_modules` matches your installed version.
 - This README is the package overview and the reference for drivers, config and operations.
 
 ## Workflows
@@ -379,6 +383,424 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 `FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every
 config type; `…/framework.js` re-exports only the config types its row names.
 
+## Config reference
+
+The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
+`…/config/resize.js`; spread it to change keys (`createResizer` and `FrameworkResizer` merge a
+partial config over the defaults for you). A config object is validated when the Resizer is
+created; a config function (the framework adapter passes one) on first use (`ready()`) or
+`verify()`.
+
+| Key | Default | Notes |
+|---|---|---|
+| `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry, and the engine must write it (see [Engines](#engines)) |
+| `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
+| `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
+| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
+| `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
+| `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
+| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to the engine's `encode` (`SharpEngine`: `toFormat(id, options)`); `{}` keeps its defaults, except `heif` and `heic`, which Sharp has no default compression for: `heic: {}` passes `verify()`, then every render fails with `Expected one of: av1, hevc for compression`, retried until dead, as on 0.3.0, and `heic: { compression: 'av1' }` writes. The engine must write each key the host wrote or changed, also one no call requests |
+| `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
+| `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
+| `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
+| `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
+| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
+| `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
+| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain, from a raster the module handed over or made from one through `sharpToRaster` (a raster read back from a `.clone()` has none), gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
+| `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
+| `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
+
+**Pipelines** (`pipelines` of `new Resizer` or `new FrameworkResizer`, fixed at construction) are
+`{ beforeSteps?, variantSteps?, version? }`. `version` is an optional string that is part of every
+preview row's `encodeSig`: bump it when a step's output changes, and the pipeline's stored
+previews are regenerated on their next read, `prewarm()` or `generate()` (see
+[Freshness](#freshness)). It is not validated, and `''` signs differently from an absent version.
+
+A `beforeStep` is `(raster, { media, source, scale, ctx }) => Raster` (or a promise of one). It
+runs once per task, before any resize, on the decoded first frame as a `Raster` (`{ data, info }`:
+raw 8-bit sRGB pixels, upright, with `info.width`, `info.height` and `info.channels`), and resolves
+with one frame of pixels, which replaces the current raster. Steps see pixels, not a library
+object, because the image engine is replaceable. A Sharp-based step stays one line with the
+helpers from the main entry:
+
+```ts
+import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
+
+const pipelines = {
+  photo: {
+    beforeSteps: [
+      // async (r) => sharpToRaster(rasterToSharp(r).blur(5)), // e.g. blur plates: a Raster in, a Raster out
+    ],
+  },
+};
+```
+
+`source` is the decoder's `SourceInfo` for the original. For a raster source the step sees the
+upright original at its own size; a vector source (SVG) is rendered at least at its natural size
+and can be larger, so multiply coordinates stored in the source's units by `scale` (the width of
+the raster the step receives divided by `source.width`). When a step changes the size, every
+variant is planned from its result. A `beforeStep` or `variantStep` that resolves with anything that
+is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not
+match its `info`) fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does
+`sharpToRaster` given a multi-page image.
+
+A `variantStep` is `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one). It
+runs per variant, after the resize and before the encode, on one frame of that size's pixels, and
+resolves with one frame. Read the preview's size from `raster.info` (`width`, `height`, `channels`).
+The raster is the step's own copy, so the step may write to it, and the formats of one size never
+see each other's marks. A `resize()` in a step resizes the preview, and operations Sharp used to
+apply before its resize (such as `trim()`) apply to the preview. The `encode.flatten` decision reads
+the channels of the last step's result, so transparency a step adds is flattened on a flattened
+format. `media` is the live object, so read it and never write to it: a write reaches the next
+variant and your own document. `MediaLike` has no host fields, so TypeScript needs a cast.
+
+```ts
+variantSteps: [
+  async (r) => {
+    const { width, height } = r.info;
+    const input = await sharp(logo)
+      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside', withoutEnlargement: true })
+      .toBuffer();
+    return sharpToRaster(rasterToSharp(r).composite([{ input, gravity: 'southeast' }]));
+  },
+],
+```
+
+Fit the overlay on both sides, with `.resize(w, h, { fit: 'inside', withoutEnlargement: true })`: Sharp
+refuses one larger than the preview on either side (`Image to composite must have same dimensions or
+smaller`). Scaled by `r.info.width` alone, a 400×400 logo failed on 6 of 9 variants of a 4000×300
+banner. `withoutEnlargement` keeps a smaller logo at its own size: without it, a 64×64 logo came out
+300×300 on a 1600×1200 preview. `composite` on an opaque preview returns 4 channels with
+alpha 255, which costs an AVIF about 200 bytes per file, which matters only on very flat images: add
+`.removeAlpha()` when `r.info.channels === 3`.
+
+A `rasterToSharp` chain in a `variantStep`, from a raster the module handed over or made from one
+through `sharpToRaster` (a raster read back from a `.clone()` has none), runs under
+`limits.processingTimeoutSeconds`: past it Sharp rejects, and only that variant fails. Each chain and the encode have their own limit, so the longest a variant holds a
+thread is (chains + 1) × the limit. The chain's own `.timeout({ seconds: 60 })` replaces the limit on
+that chain, and `.timeout({ seconds: 0 })` turns it off there. The limit follows those raster objects,
+so a raster spread into a new object or built by the step has none, and neither has a fresh `sharp()`.
+It does not cross a duplicate copy of the package: `rasterToSharp` from a second copy reads no limit,
+with no error, so dedupe the package.
+
+Nothing else in a step is bounded: Sharp work that does not go through `rasterToSharp`, such as
+`sharp(raster.data, { raw: raster.info })`, and any other host code. `beforeSteps` are unbounded too,
+through `rasterToSharp` as well, as in 0.3.0. Such work can starve other tasks and dead-letter healthy
+ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants beside one healthy task, at
+`taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
+where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not its
+variants in progress: each keeps its thread and memory until it ends, and can still store its row. So
+a step slower than `taskTimeoutMs` still stores its row, and the next delivery finds it fresh and
+completes, if one is left. With none left, because the step outlasts them (5000 ms at `taskTimeoutMs`
+1000) or `maxAttempts` is 1, the task ends dead with its row stored, as on 0.3.0. Such a late write can
+also replace a newer row, even one from a newer original: the next
+read finds that row stale and queues it again. `generate()` has no such bound.
+
+A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source
+(with `png` added to `encode.flatten.formats`, it writes RGB where 0.3.0 wrote RGBA, with no pixel
+difference) and on every format that keeps alpha. On a flattened format, a transparent source can
+move wherever the preview has partly transparent pixels: at most 2 levels before the JPEG encoder, up
+to 20 of 255 measured in the JPEG. Other steps can write different files, on new previews only:
+`encodeSig` does not change, so stored previews stay, and `verify()` does not run steps, so look at
+the logs and the files after the first upload.
+
+- On a transparent source and a flattened format, the step now runs before the flatten, where Sharp
+  ran it after, so most operations change that format's pixels. `negate()` also negates alpha: use
+  `negate({ alpha: false })`. `removeAlpha()` shows the colours under transparent pixels, which are
+  black after a resize.
+- Several steps now run in order, each on the last one's result, where 0.3.0 gathered them in one
+  Sharp chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order.
+- `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error. `greyscale()` on a
+  transparent source loses alpha, so a JPEG shows the colours under transparent pixels, which are
+  black after a resize: use `modulate({ saturation: 0 })`. `toColourspace('b-w')` stays in
+  colour: use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`. Metadata calls in a
+  step do nothing: `withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this way
+  disappears, and `withIccProfile` also shifts the colours, so leave it out.
+
+**Rounding.** Preview sizes are computed from the source's display dimensions and rounded once
+per side, so a preview side can differ by one pixel from what Sharp derived in earlier releases,
+or from a host's own rounding.
+
+**Queue name.** `queueName` (`new Resizer({ queueName })` or `new FrameworkResizer({ queueName })`,
+default `'default'`; a `FrameworkResizer` without it takes its file's `queue`) names the queue of the
+Resizer's tasks. `resolve()` and `prewarm()` take a per-call `queue`, and a worker consumes one queue
+or several (`runWorker({ queue })` with a name or a list, `npm run cli ResizeWorker -- --queue=<name>`,
+which may be repeated). A string `queueName` is
+readable as `resizer.queueName` at once. A name given as a function, as the framework adapter does
+for a name from the config file, is read on first use: until `await resizer.ready()` or the first
+call, `resizer.queueName` throws `RESIZE_NOT_READY`. A `queueName` that is not a non-empty string,
+and the old `queue` option, are `ResizeSetupError` `RESIZE_QUEUE_INVALID`; `resizer.queue` is gone.
+`verify()` and the worker reject a `queueName` that the Resizer's task queue does not serve
+(`RESIZE_QUEUE_NOT_SERVED`).
+
+Queue timing belongs to the **task queue**: `timing` (every name's) and `getTiming(queue)` (one
+name's; when it gives none, `timing` applies) on `MongoTaskQueue` and `SqsTaskQueue`, and `timing`
+on `mongoParts` (one timing for every name). A framework app sets it per queue, in each `queues`
+entry of `src/config/resize.ts` (below), validated with the file on first use. The core reads a
+name's timing once, on that name's first use, and validates it: in `verify()` for the Resizer's own
+`queueName`, at worker start for each name the worker consumes, and on a call's first use of the
+name, where `prewarm()` reports every variant `unconfirmed` with one non-retryable
+`RESIZE_ENQUEUE_INTERNAL_ERROR` issue carrying the timing error, and `resolve()` logs it once per
+queue name and serves the stored previews (see `ready()` under [Drivers](#drivers)). This holds for
+the Resizer's own queue too: its invalid timing is not logged when the Resizer starts, but on the
+first read of that queue. A builder route of a `RoutingTaskQueue` takes its timing from the
+router's `getTiming` option (the factory fills it from each entry). How long locks last is not timing: it is the Resizer's [coordination](#coordination). The timing defaults
+are `defaultQueueOptions` in `…/config/resize.js`:
+
+| Option | Default | Notes |
+|---|---|---|
+| `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
+| `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
+| `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
+| `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. The claim index does not hold the Resizer, so a claim reads past every due task of a Resizer that no worker on the queue serves: give a Resizer that has no worker its own queue. Claim errors back off from it up to 10× |
+| `taskTimeoutMs` | `600000` | A longer task is failed |
+
+`leaseMs`, `idlePollMs` and `taskTimeoutMs` can be at most `2147483647` (about 24.8 days), the
+longest a timer can wait: a larger value is `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
+`RESIZE_CONFIG_QUEUE_INVALID`.
+
+Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
+`concurrency × sharp.concurrency ≈ CPU cores`.
+
+**Framework config files.** Each `FrameworkResizer` reads its own file (`configName`, default
+`'resize'`: `src/config/resize.ts`). The framework merges `<name>.<NODE_ENV>.ts` over it (objects
+merge field by field, arrays are replaced). The module then merges the image settings of the
+result over the package defaults, the same merge as `createResizer`'s: plain objects key by key at
+any depth, arrays and `encode.formats` replaced as a whole, and a key set to `undefined` taking its
+default. Only the image settings are merged; `storage` and the other sections are read as the files
+hold them. So a file may set only the image keys it changes, and a complete file reaches the
+Resizer with its own objects. Its messages name both files
+(``src/config/<name>.ts (or its <name>.<NODE_ENV>.ts override)``). The scaffolded file spreads
+`defaultFrameworkResizeConfig` from `…/framework.js` (the image settings above) and adds that
+Resizer's own sections, which only `FrameworkResizer` reads:
+- `mediaModelName` (required): the host media model, used by `FrameworkMediaStore`.
+- `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or `{ driver: 's3',
+  bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?, forcePathStyle? }`. Required
+  unless the code passes `storage`. S3 is imported only when selected; credentials come from the
+  AWS SDK's default chain. Switching the driver in an environment file keeps the other keys of
+  the merged section, so set `publicBaseUrl` there too. A custom storage driver passed in
+  `drivers` adds its own section (see [Drivers by name](#drivers-by-name)).
+- `queue`: the name of the queue its tasks go to (a key of `queues`), or `false` for eager only.
+  Missing, it is `'default'` when `queues` has entries, and eager only when there are none. A name
+  that `queues` does not define, the implied `'default'` too, is `ResizeConfigError`
+  `RESIZE_CONFIG_QUEUE_UNKNOWN` (a config error on first use and in `verify()`). Any other value
+  that is neither a name nor `false` is `RESIZE_CONFIG_INVALID`, except a `queue: { … }` object,
+  the old shape, which is `RESIZE_CONFIG_REMOVED_KEY` (below). The `queueName` option wins over it.
+
+`src/config/resize.ts` also holds the **process-wide** sections, which every Resizer of the process
+and the worker use. They are read only from that file: in another file, or in the
+`FrameworkResizer` `config` option, each is `RESIZE_CONFIG_INVALID` naming the key.
+- `queues`: every queue, by name, each defined once (`Record<string, QueueConfig>`). An entry is a
+  driver plus that queue's timing:
+
+  | Key | For | Notes |
+  |---|---|---|
+  | `driver` | both, required | `'database'`: tasks in the app's `ResizeTask` model (`DatabaseQueueConfig`); `'sqs'`: an SQS queue of its own (`SqsQueueConfig`, needs `@aws-sdk/client-sqs`); or the name of a queue driver passed in `drivers` |
+  | `queueUrl` | `sqs`, required | This name's SQS queue; two entries with the same URL are `RESIZE_CONFIG_INVALID` |
+  | `deadLetterQueueUrl` | `sqs`, optional | Dead tasks are sent here with their error, then deleted; without it they are logged and deleted |
+  | `waitTimeSeconds` | `sqs`, `10` | Long poll per claim (0–20) |
+  | `region`, `endpoint` | `sqs`, optional | The SQS client's; credentials come from the AWS SDK's default chain |
+  | `leaseMs`, `retryBackoffMs`, `maxAttempts`, `idlePollMs`, `taskTimeoutMs` | both, optional | This queue's timing (the table above); the rest default |
+
+  A `queues` that is not an object of names, a blank name, an entry without a non-empty `driver`,
+  or an SQS entry without `queueUrl` is `RESIZE_CONFIG_INVALID`; an invalid timing value keeps its
+  own code (`RESIZE_CONFIG_QUEUE_INVALID`, `RESIZE_CONFIG_QUEUE_LEASE_INVALID`) and its message
+  names the entry. Every entry is validated with the file, on first use. A driver name that the
+  Resizer does not have (neither `'database'`, `'sqs'` nor a name in its `drivers`) passes the file
+  read and is `RESIZE_CONFIG_INVALID` when the Resizer first reads `queues` (its first use or
+  `verify()`); a disabled worker never checks it: it logs a `warn`, and the command resolves
+  `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1. An entry
+  set to `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
+  Resizer that still names it gets `RESIZE_CONFIG_QUEUE_UNKNOWN`).
+- `worker`: `{ enabled, sharpConcurrency, sharpCache }` for the `ResizeWorker` command
+  (`defaultWorkerOptions` from `…/framework.js`: `false`, `1`, `false`). Every key is optional and a
+  missing one takes its default, so an environment file may set only `worker: { enabled: true }`; a
+  wrong type, or an unknown key (a misspelled `sharpConcurency`, say), is `RESIZE_CONFIG_INVALID`
+  naming the key. `enabled` allows the command to run.
+- `coordination`: `{ gateTtlMs, cooldownMs }` for every Resizer of the process (missing values take
+  `defaultCoordination`); see [Coordination](#coordination). `new FrameworkResizer({ coordination })`
+  sets one Resizer's instead.
+
+A missing `src/config/resize.ts` means no queues, the default `worker` and the default
+`coordination`. Only `queue: false` in the Resizer's own file (with no `queueName` option),
+`tasks: false` in code, or a task queue and `coordination` both passed in code keep a Resizer from
+reading `src/config/resize.ts`; every other Resizer validates that whole file on first use. A
+malformed `queues` or `worker` section there then fails in one of two ways:
+
+- A Resizer that takes its task queue from the file (its queue name from the file or from the
+  `queueName` option), or whose file sets no `queue` (it reads `queues` to learn whether it is eager
+  only or on `'default'`): its first call and its `verify()` fail. `uploadOriginal()`, `generate()`
+  and `invalidate()` throw the config error (e.g. `RESIZE_CONFIG_INVALID`), and `resolve()` and
+  `prewarm()`, which never throw, return the empty decision and `incomplete`, so even stored
+  previews are not served until the file is fixed.
+- A Resizer with a task queue passed in code (and no `coordination` in code) reads the file only
+  for `coordination`, so a broken file is the degraded mode of an invalid `coordination`: it is
+  logged once, reads serve stored previews and queue nothing, `uploadOriginal()`, `generate()` and
+  `invalidate()` work, and `verify()`, `prewarm()` and worker start report it.
+
+`src/config/resize.ts` needs `mediaModelName` only while the default Resizer reads it as its own
+file.
+
+Every file writes `satisfies FrameworkResizeConfig`: `src/config/resize.ts` and each other
+Resizer's file. Two files write `satisfies Partial<FrameworkResizeConfig>` instead: an environment
+override, and a `resize.ts` that holds only the process-wide sections (no default Resizer, so no
+`mediaModelName`). An override that leaves out nested keys (only `limits.sourcePixels`, say) writes
+`satisfies PartialFrameworkResizeConfig` (from `…/framework.js`), which makes every object optional
+key by key at any depth (arrays and `encode.formats` stay whole); `Partial<FrameworkResizeConfig>`
+stays valid for a file that leaves out only top-level keys. With custom drivers, both types take the
+driver registry: `FrameworkResizeConfig<{ storage: { gcs: typeof GcsStorage } }>`. A full
+`src/config/resize.ts` with three queues, and a second Resizer's file:
+
+```ts
+// src/config/resize.ts
+import {
+  defaultFrameworkResizeConfig,
+  defaultWorkerOptions,
+  type FrameworkResizeConfig,
+} from '@adaptivestone/framework-module-resize/framework.js';
+
+export default {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'File',
+  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+  queue: 'default', // the default Resizer's queue
+
+  // process-wide sections, read only from this file
+  queues: {
+    default: { driver: 'database' },
+    bulk: { driver: 'database', leaseMs: 120_000 }, // the same backend, its own timing
+    audit: { driver: 'sqs', queueUrl: 'https://sqs…/audit' }, // another backend, routed by name
+  },
+  worker: { ...defaultWorkerOptions, enabled: false },
+  // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 },
+} satisfies FrameworkResizeConfig;
+```
+
+```ts
+// src/config/resizeListings.ts — new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })
+import {
+  defaultFrameworkResizeConfig,
+  type FrameworkResizeConfig,
+} from '@adaptivestone/framework-module-resize/framework.js';
+
+export default {
+  ...defaultFrameworkResizeConfig,
+  mediaModelName: 'Listing',
+  storage: { driver: 'local', rootDir: './var/listings', publicBaseUrl: '/listings' },
+  queue: 'bulk', // a name from `queues` in src/config/resize.ts; no queues, worker or coordination here
+} satisfies FrameworkResizeConfig;
+```
+
+**Backends.** The entries on one backend share one task queue, built once per process: every
+`database` entry is one backend (the app's `ResizeTask` model), the SQS entries that share
+`region`, `endpoint`, `deadLetterQueueUrl` and the effective `waitTimeSeconds` (unset counts as 10)
+are one backend, one `SqsTaskQueue` with a name → URL map, and a custom queue driver groups its
+entries with `backendOf`. Each name is a lane on its backend's task queue, with its own timing.
+
+Names on different backends route through a `RoutingTaskQueue` (see [Drivers](#drivers)). When
+`queues` spans more than one available backend, `resizer.tasks` is a `RoutingTaskQueue` over them:
+it has no `release`, its `findActive` asks the backend of the name, and a check such as
+`resizer.tasks instanceof MongoTaskQueue` no longer finds the database queue. Use
+`await carrierOf(resizer.tasks, 'default')` (main entry), which gives the backend of a name on any
+task queue. With one available backend, `resizer.tasks` is that backend's task queue, as before.
+
+- **With several backends, a backend is built when one of its names is first needed:** a call on
+  it, `verify()` for the Resizer's own queue, or a worker that consumes it. A database Resizer
+  beside an SQS entry it never uses never loads the SQS driver. A build that fails is forgotten
+  (the next need builds again) and affects only that backend's names. With a single available
+  backend, it is built when the task queue part loads: on the Resizer's first call of any kind,
+  `ready()` or `verify()`.
+- **Each call is gated by its queue's backend:** on a database queue the task row is the gate; on
+  an SQS queue the gate lock in the Resizer's lock store (see [Coordination](#coordination)).
+  Retries, the dead-letter cooldown and the shutdown give-back use the same backend's gate.
+- **A backend whose SDK is not installed is not served in that process.** A call on one of its
+  names queues nothing (`prewarm()` reports `RESIZE_QUEUE_NOT_SERVED`, its message names the
+  package, and `resolve()` logs it once per queue name), and a worker given one of its names
+  refuses to start with the same code and package. `verify()` rejects with `RESIZE_PEER_MISSING`
+  when it is the Resizer's own queue. When no backend is available at all, the task queue fails
+  with `RESIZE_PEER_MISSING`, as before.
+- **The `Lock` model** of a framework app is checked by `verify()` only when the Resizer's own
+  queue is on a backend without its own gate (SQS), and by the worker only for each such queue it
+  consumes: a worker checks only the queues it consumes, never a served Resizer's own queue
+  otherwise. A database Resizer beside SQS queues needs no `Lock` model.
+
+A call on a name that `queues` does not define queues nothing (`RESIZE_QUEUE_NOT_SERVED`, see
+[`prewarm()` issues](#prewarm-issues); `resolve()` logs it once per queue name). So an environment
+override may move only some queues to another backend (only `queues.default` to SQS, say, while
+`queues.bulk` stays on the database): both names keep working, and one worker consumes both with
+`npm run cli ResizeWorker -- --queue=default --queue=bulk`.
+
+Without the framework, buckets, URLs and queue URLs are driver options. Removed keys fail with
+`RESIZE_CONFIG_REMOVED_KEY`, and the message says where the value goes: see
+[Removed keys](./UPGRADING.md#removed-keys).
+
+### Coordination
+
+A Resizer with a task queue keeps one **gate** per Resizer, media, pipeline and queue: at most
+one of their tasks is active at a time, whether it is queued, running, waiting for a retry, or
+cooling down after a dead-letter. While the gate is held, a read that finds variants missing
+queues nothing, whatever variants the active task covers: a new size for that media waits for the
+active task, and the next read after the task ends queues it. So 1000 concurrent reads of a cold
+media create one task. A request on another queue is a separate task, as before the gate: a
+`prewarm({ queue: 'bulk' })` waiting for a bulk worker never blocks reads on `'default'` (the media
+may then be rendered on both; the media store keeps one row per preview identity).
+
+- On `MongoTaskQueue` (`gatesByTask`) the task row is the gate. Its `active` field is `true` from
+  `add()` until the task completes, through its retries, and a unique index on
+  `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }`
+  lets one row per gate be active (`verify()` rejects with `RESIZE_MONGO_INDEX_MISSING` until it
+  exists). A dead row keeps the gate until its `cooldownUntil` (`deadAt` + `cooldownMs`); the next
+  `add()` after that retires it (`active: false`, its `error` kept) and inserts a new row. No lock
+  is taken.
+- On a task queue without `gatesByTask` (`SqsTaskQueue`, most custom queues) the gate is one lock in
+  the Resizer's `LockStore`, `resize_gate:<resizer>:<queue>:<mediaId>:<pipeline>` (each part
+  URI-encoded). The core takes it for `gateTtlMs` with a fresh random owner when it queues a task,
+  and the owner travels in the task as `gateOwner`. When the queue does not confirm that it stored
+  the task (`unconfirmed`, a throw), the task may still be stored, so an ambiguous enqueue keeps the
+  gate for one lease (`leaseMs`, at most `gateTtlMs`) instead of releasing it: a stored task is
+  claimed and extended within it, otherwise it lapses and a later read queues the task, unless the
+  add was `unconfirmed` with `retryable: false`: calling again cannot help until someone fixes what
+  `causeCode` names. The worker extends the lock: to
+  one lease plus one heartbeat interval (`leaseMs / 2`) when the task starts and on every
+  heartbeat, so a redelivery after a worker crash still finds it held; to the retry time plus one
+  lease after a failed attempt; to `cooldownMs` after a dead-letter; and to `gateTtlMs` when it
+  gives a task back (at shutdown, or a task it does not serve). When an extend finds the lock lapsed
+  while the task runs, or for the retry and cooldown holds, the worker takes it back under the
+  task's owner, unless another request has taken the gate meanwhile. It releases the lock when the
+  task completes. Once a delivery's lease is known to be lost (a renewal still in flight when the
+  task ends is awaited first), the worker makes no call for it at all (no completion, no gate
+  call). Every lock store call waits at most `min(leaseMs, 30000)` ms, and a task's end waits that
+  long at most for its renewals and all its gate calls, so a hanging lock store never holds the
+  worker; a call that does not answer in time is logged as failed, with the wait it was given. The
+  task's final gate action (the release, or the retry, cooldown or give-back hold) comes after the
+  calls made while it ran; one of those that answers after the final action (a slow store) is
+  followed by the final action again, so a late extend cannot cut a cooldown short, nor a late
+  re-take re-create a released lock. This gate is best
+  effort across a lost lease, an ambiguous enqueue (one lease) and a lock store failure: at worst a
+  second task renders the same variants, and the media store keeps one row per preview identity.
+
+There are no per-identity locks. The lease keeps a task with one worker at a time, its token fences
+every write, and `appendPreviews` keeps one row per preview identity when an expired lease lets two
+workers render the same variant.
+
+| Option | Default | Notes |
+|---|---|---|
+| `gateTtlMs` | `600000` | How long the gate lock of a QUEUED task holds its media, pipeline and queue before a worker starts the task (from then on the worker extends it per lease), and how long a task given back holds it again. Raise it when tasks wait longer in the queue. Only a task queue without `gatesByTask` takes the lock; `MongoTaskQueue` ignores the value |
+| `cooldownMs` | `600000` | After a task is dead-lettered, no new task for that media, pipeline and queue is queued for this long. The cooldown is per queue, like the gate: a dead task holds only its own queue's gate, so a poison task gets one `maxAttempts` cycle on each queue it is sent to. On Mongo a dead row is kept ~30 days (its TTL index), so a longer cooldown ends when the row expires |
+
+Pass it as `new Resizer({ coordination: { gateTtlMs, cooldownMs } })` (or a function returning it)
+or `new FrameworkResizer({ coordination })`, or set the process-wide `coordination` section of
+`src/config/resize.ts`. Missing values take `defaultCoordination` from `…/config/resize.js` (the
+types are `CoordinationOptions`); an eager-only Resizer never reads it. Only the core validates
+it, when the Resizer sets up its task queue: a section that is not an object, or a value that is
+not a positive safe integer (ms), is `ResizeConfigError` `RESIZE_CONFIG_COORDINATION_INVALID` (the
+message names the key, or the value when the whole section is wrong); `0` is rejected for both
+values (the minimum is 1 ms), so the cooldown cannot be turned off. It degrades like a task queue
+that cannot be used (see `ready()` under [Drivers](#drivers)), in a config file too, and a section set to
+`null` is invalid, not the defaults. No value depends on the queue's lease. Each dead-letter gets
+the `cooldownMs` of the task's own Resizer.
+
 ## Drivers
 
 A `Resizer` takes four parts:
@@ -550,7 +972,7 @@ the add is `unconfirmed`.
 | `queueUrl` | optional | The `'default'` queue; leave it out when `queues` names `'default'`, or when this queue serves only other names |
 | `queues` | optional | Queue names → URLs: `{ bulk: 'https://sqs…/bulk' }` (`'default'` too, unless `queueUrl`). Without any URL from `queueUrl` or `queues`: `RESIZE_SQS_QUEUE_URL_REQUIRED` |
 | `deadLetterQueueUrl` | optional | Dead tasks are sent here with their error, then deleted; without it they are logged and deleted. One for every name |
-| `timing` | optional | Every name's queue timing (below); the lease is the message visibility timeout |
+| `timing` | optional | Every name's queue timing (see [Config reference](#config-reference)); the lease is the message visibility timeout |
 | `getTiming` | optional | `(queue) => timing`: one name's timing, read on that name's first use; when it gives none, `timing` applies |
 | `waitTimeSeconds` | `10` | Long poll per claim (0–20) |
 | `region`, `endpoint`, `client` | optional | An existing `SQSClient`, or one built on first use |
@@ -1052,424 +1474,6 @@ than `gif` or `webp` does not sign `animated` into that format's `encodeSig`, so
 included. An alias takes nothing from `jpeg`'s settings: `formats: ['jpg']` needs its own
 `encode.formats.jpg`, and `encode.flatten.formats` must name it, or transparent pixels turn black.
 Naming it there changes its signature, so its stored previews regenerate.
-
-## Config reference
-
-The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
-`…/config/resize.js`; spread it to change keys (`createResizer` and `FrameworkResizer` merge a
-partial config over the defaults for you). A config object is validated when the Resizer is
-created; a config function (the framework adapter passes one) on first use (`ready()`) or
-`verify()`.
-
-| Key | Default | Notes |
-|---|---|---|
-| `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry, and the engine must write it (see [Engines](#engines)) |
-| `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
-| `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
-| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
-| `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
-| `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
-| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to the engine's `encode` (`SharpEngine`: `toFormat(id, options)`); `{}` keeps its defaults, except `heif` and `heic`, which Sharp has no default compression for: `heic: {}` passes `verify()`, then every render fails with `Expected one of: av1, hevc for compression`, retried until dead, as on 0.3.0, and `heic: { compression: 'av1' }` writes. The engine must write each key the host wrote or changed, also one no call requests |
-| `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
-| `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
-| `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
-| `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
-| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
-| `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
-| `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain, from a raster the module handed over or made from one through `sharpToRaster` (a raster read back from a `.clone()` has none), gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
-| `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
-| `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
-
-**Pipelines** (`pipelines` of `new Resizer` or `new FrameworkResizer`, fixed at construction) are
-`{ beforeSteps?, variantSteps?, version? }`. `version` is an optional string that is part of every
-preview row's `encodeSig`: bump it when a step's output changes, and the pipeline's stored
-previews are regenerated on their next read, `prewarm()` or `generate()` (see
-[Freshness](#freshness)). It is not validated, and `''` signs differently from an absent version.
-
-A `beforeStep` is `(raster, { media, source, scale, ctx }) => Raster` (or a promise of one). It
-runs once per task, before any resize, on the decoded first frame as a `Raster` (`{ data, info }`:
-raw 8-bit sRGB pixels, upright, with `info.width`, `info.height` and `info.channels`), and resolves
-with one frame of pixels, which replaces the current raster. Steps see pixels, not a library
-object, because the image engine is replaceable. A Sharp-based step stays one line with the
-helpers from the main entry:
-
-```ts
-import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
-
-const pipelines = {
-  photo: {
-    beforeSteps: [
-      // async (r) => sharpToRaster(rasterToSharp(r).blur(5)), // e.g. blur plates: a Raster in, a Raster out
-    ],
-  },
-};
-```
-
-`source` is the decoder's `SourceInfo` for the original. For a raster source the step sees the
-upright original at its own size; a vector source (SVG) is rendered at least at its natural size
-and can be larger, so multiply coordinates stored in the source's units by `scale` (the width of
-the raster the step receives divided by `source.width`). When a step changes the size, every
-variant is planned from its result. A `beforeStep` or `variantStep` that resolves with anything that
-is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not
-match its `info`) fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does
-`sharpToRaster` given a multi-page image.
-
-A `variantStep` is `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one). It
-runs per variant, after the resize and before the encode, on one frame of that size's pixels, and
-resolves with one frame. Read the preview's size from `raster.info` (`width`, `height`, `channels`).
-The raster is the step's own copy, so the step may write to it, and the formats of one size never
-see each other's marks. A `resize()` in a step resizes the preview, and operations Sharp used to
-apply before its resize (such as `trim()`) apply to the preview. The `encode.flatten` decision reads
-the channels of the last step's result, so transparency a step adds is flattened on a flattened
-format. `media` is the live object, so read it and never write to it: a write reaches the next
-variant and your own document. `MediaLike` has no host fields, so TypeScript needs a cast.
-
-```ts
-variantSteps: [
-  async (r) => {
-    const { width, height } = r.info;
-    const input = await sharp(logo)
-      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside', withoutEnlargement: true })
-      .toBuffer();
-    return sharpToRaster(rasterToSharp(r).composite([{ input, gravity: 'southeast' }]));
-  },
-],
-```
-
-Fit the overlay on both sides, with `.resize(w, h, { fit: 'inside', withoutEnlargement: true })`: Sharp
-refuses one larger than the preview on either side (`Image to composite must have same dimensions or
-smaller`). Scaled by `r.info.width` alone, a 400×400 logo failed on 6 of 9 variants of a 4000×300
-banner. `withoutEnlargement` keeps a smaller logo at its own size: without it, a 64×64 logo came out
-300×300 on a 1600×1200 preview. `composite` on an opaque preview returns 4 channels with
-alpha 255, which costs an AVIF about 200 bytes per file, which matters only on very flat images: add
-`.removeAlpha()` when `r.info.channels === 3`.
-
-A `rasterToSharp` chain in a `variantStep`, from a raster the module handed over or made from one
-through `sharpToRaster` (a raster read back from a `.clone()` has none), runs under
-`limits.processingTimeoutSeconds`: past it Sharp rejects, and only that variant fails. Each chain and the encode have their own limit, so the longest a variant holds a
-thread is (chains + 1) × the limit. The chain's own `.timeout({ seconds: 60 })` replaces the limit on
-that chain, and `.timeout({ seconds: 0 })` turns it off there. The limit follows those raster objects,
-so a raster spread into a new object or built by the step has none, and neither has a fresh `sharp()`.
-It does not cross a duplicate copy of the package: `rasterToSharp` from a second copy reads no limit,
-with no error, so dedupe the package.
-
-Nothing else in a step is bounded: Sharp work that does not go through `rasterToSharp`, such as
-`sharp(raster.data, { raw: raster.info })`, and any other host code. `beforeSteps` are unbounded too,
-through `rasterToSharp` as well, as in 0.3.0. Such work can starve other tasks and dead-letter healthy
-ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants beside one healthy task, at
-`taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
-where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not its
-variants in progress: each keeps its thread and memory until it ends, and can still store its row. So
-a step slower than `taskTimeoutMs` still stores its row, and the next delivery finds it fresh and
-completes, if one is left. With none left, because the step outlasts them (5000 ms at `taskTimeoutMs`
-1000) or `maxAttempts` is 1, the task ends dead with its row stored, as on 0.3.0. Such a late write can
-also replace a newer row, even one from a newer original: the next
-read finds that row stale and queues it again. `generate()` has no such bound.
-
-A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source
-(with `png` added to `encode.flatten.formats`, it writes RGB where 0.3.0 wrote RGBA, with no pixel
-difference) and on every format that keeps alpha. On a flattened format, a transparent source can
-move wherever the preview has partly transparent pixels: at most 2 levels before the JPEG encoder, up
-to 20 of 255 measured in the JPEG. Other steps can write different files, on new previews only:
-`encodeSig` does not change, so stored previews stay, and `verify()` does not run steps, so look at
-the logs and the files after the first upload.
-
-- On a transparent source and a flattened format, the step now runs before the flatten, where Sharp
-  ran it after, so most operations change that format's pixels. `negate()` also negates alpha: use
-  `negate({ alpha: false })`. `removeAlpha()` shows the colours under transparent pixels, which are
-  black after a resize.
-- Several steps now run in order, each on the last one's result, where 0.3.0 gathered them in one
-  Sharp chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order.
-- `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error. `greyscale()` on a
-  transparent source loses alpha, so a JPEG shows the colours under transparent pixels, which are
-  black after a resize: use `modulate({ saturation: 0 })`. `toColourspace('b-w')` stays in
-  colour: use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`. Metadata calls in a
-  step do nothing: `withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this way
-  disappears, and `withIccProfile` also shifts the colours, so leave it out.
-
-**Rounding.** Preview sizes are computed from the source's display dimensions and rounded once
-per side, so a preview side can differ by one pixel from what Sharp derived in earlier releases,
-or from a host's own rounding.
-
-**Queue name.** `queueName` (`new Resizer({ queueName })` or `new FrameworkResizer({ queueName })`,
-default `'default'`; a `FrameworkResizer` without it takes its file's `queue`) names the queue of the
-Resizer's tasks. `resolve()` and `prewarm()` take a per-call `queue`, and a worker consumes one queue
-or several (`runWorker({ queue })` with a name or a list, `npm run cli ResizeWorker -- --queue=<name>`,
-which may be repeated). A string `queueName` is
-readable as `resizer.queueName` at once. A name given as a function, as the framework adapter does
-for a name from the config file, is read on first use: until `await resizer.ready()` or the first
-call, `resizer.queueName` throws `RESIZE_NOT_READY`. A `queueName` that is not a non-empty string,
-and the old `queue` option, are `ResizeSetupError` `RESIZE_QUEUE_INVALID`; `resizer.queue` is gone.
-`verify()` and the worker reject a `queueName` that the Resizer's task queue does not serve
-(`RESIZE_QUEUE_NOT_SERVED`).
-
-Queue timing belongs to the **task queue**: `timing` (every name's) and `getTiming(queue)` (one
-name's; when it gives none, `timing` applies) on `MongoTaskQueue` and `SqsTaskQueue`, and `timing`
-on `mongoParts` (one timing for every name). A framework app sets it per queue, in each `queues`
-entry of `src/config/resize.ts` (below), validated with the file on first use. The core reads a
-name's timing once, on that name's first use, and validates it: in `verify()` for the Resizer's own
-`queueName`, at worker start for each name the worker consumes, and on a call's first use of the
-name, where `prewarm()` reports every variant `unconfirmed` with one non-retryable
-`RESIZE_ENQUEUE_INTERNAL_ERROR` issue carrying the timing error, and `resolve()` logs it once per
-queue name and serves the stored previews (see `ready()` under [Drivers](#drivers)). This holds for
-the Resizer's own queue too: its invalid timing is not logged when the Resizer starts, but on the
-first read of that queue. A builder route of a `RoutingTaskQueue` takes its timing from the
-router's `getTiming` option (the factory fills it from each entry). How long locks last is not timing: it is the Resizer's [coordination](#coordination). The timing defaults
-are `defaultQueueOptions` in `…/config/resize.js`:
-
-| Option | Default | Notes |
-|---|---|---|
-| `leaseMs` | `60000` | Set to at least ~2× the slowest encode |
-| `retryBackoffMs` | `{ base: 5000, max: 300000 }` | Retry delay |
-| `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
-| `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. The claim index does not hold the Resizer, so a claim reads past every due task of a Resizer that no worker on the queue serves: give a Resizer that has no worker its own queue. Claim errors back off from it up to 10× |
-| `taskTimeoutMs` | `600000` | A longer task is failed |
-
-`leaseMs`, `idlePollMs` and `taskTimeoutMs` can be at most `2147483647` (about 24.8 days), the
-longest a timer can wait: a larger value is `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
-`RESIZE_CONFIG_QUEUE_INVALID`.
-
-Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
-`concurrency × sharp.concurrency ≈ CPU cores`.
-
-**Framework config files.** Each `FrameworkResizer` reads its own file (`configName`, default
-`'resize'`: `src/config/resize.ts`). The framework merges `<name>.<NODE_ENV>.ts` over it (objects
-merge field by field, arrays are replaced). The module then merges the image settings of the
-result over the package defaults, the same merge as `createResizer`'s: plain objects key by key at
-any depth, arrays and `encode.formats` replaced as a whole, and a key set to `undefined` taking its
-default. Only the image settings are merged; `storage` and the other sections are read as the files
-hold them. So a file may set only the image keys it changes, and a complete file reaches the
-Resizer with its own objects. Its messages name both files
-(``src/config/<name>.ts (or its <name>.<NODE_ENV>.ts override)``). The scaffolded file spreads
-`defaultFrameworkResizeConfig` from `…/framework.js` (the image settings above) and adds that
-Resizer's own sections, which only `FrameworkResizer` reads:
-- `mediaModelName` (required): the host media model, used by `FrameworkMediaStore`.
-- `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or `{ driver: 's3',
-  bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?, forcePathStyle? }`. Required
-  unless the code passes `storage`. S3 is imported only when selected; credentials come from the
-  AWS SDK's default chain. Switching the driver in an environment file keeps the other keys of
-  the merged section, so set `publicBaseUrl` there too. A custom storage driver passed in
-  `drivers` adds its own section (see [Drivers by name](#drivers-by-name)).
-- `queue`: the name of the queue its tasks go to (a key of `queues`), or `false` for eager only.
-  Missing, it is `'default'` when `queues` has entries, and eager only when there are none. A name
-  that `queues` does not define, the implied `'default'` too, is `ResizeConfigError`
-  `RESIZE_CONFIG_QUEUE_UNKNOWN` (a config error on first use and in `verify()`). Any other value
-  that is neither a name nor `false` is `RESIZE_CONFIG_INVALID`, except a `queue: { … }` object,
-  the old shape, which is `RESIZE_CONFIG_REMOVED_KEY` (below). The `queueName` option wins over it.
-
-`src/config/resize.ts` also holds the **process-wide** sections, which every Resizer of the process
-and the worker use. They are read only from that file: in another file, or in the
-`FrameworkResizer` `config` option, each is `RESIZE_CONFIG_INVALID` naming the key.
-- `queues`: every queue, by name, each defined once (`Record<string, QueueConfig>`). An entry is a
-  driver plus that queue's timing:
-
-  | Key | For | Notes |
-  |---|---|---|
-  | `driver` | both, required | `'database'`: tasks in the app's `ResizeTask` model (`DatabaseQueueConfig`); `'sqs'`: an SQS queue of its own (`SqsQueueConfig`, needs `@aws-sdk/client-sqs`); or the name of a queue driver passed in `drivers` |
-  | `queueUrl` | `sqs`, required | This name's SQS queue; two entries with the same URL are `RESIZE_CONFIG_INVALID` |
-  | `deadLetterQueueUrl` | `sqs`, optional | Dead tasks are sent here with their error, then deleted; without it they are logged and deleted |
-  | `waitTimeSeconds` | `sqs`, `10` | Long poll per claim (0–20) |
-  | `region`, `endpoint` | `sqs`, optional | The SQS client's; credentials come from the AWS SDK's default chain |
-  | `leaseMs`, `retryBackoffMs`, `maxAttempts`, `idlePollMs`, `taskTimeoutMs` | both, optional | This queue's timing (the table above); the rest default |
-
-  A `queues` that is not an object of names, a blank name, an entry without a non-empty `driver`,
-  or an SQS entry without `queueUrl` is `RESIZE_CONFIG_INVALID`; an invalid timing value keeps its
-  own code (`RESIZE_CONFIG_QUEUE_INVALID`, `RESIZE_CONFIG_QUEUE_LEASE_INVALID`) and its message
-  names the entry. Every entry is validated with the file, on first use. A driver name that the
-  Resizer does not have (neither `'database'`, `'sqs'` nor a name in its `drivers`) passes the file
-  read and is `RESIZE_CONFIG_INVALID` when the Resizer first reads `queues` (its first use or
-  `verify()`); a disabled worker never checks it: it logs a `warn`, and the command resolves
-  `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1. An entry
-  set to `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
-  Resizer that still names it gets `RESIZE_CONFIG_QUEUE_UNKNOWN`).
-- `worker`: `{ enabled, sharpConcurrency, sharpCache }` for the `ResizeWorker` command
-  (`defaultWorkerOptions` from `…/framework.js`: `false`, `1`, `false`). Every key is optional and a
-  missing one takes its default, so an environment file may set only `worker: { enabled: true }`; a
-  wrong type, or an unknown key (a misspelled `sharpConcurency`, say), is `RESIZE_CONFIG_INVALID`
-  naming the key. `enabled` allows the command to run.
-- `coordination`: `{ gateTtlMs, cooldownMs }` for every Resizer of the process (missing values take
-  `defaultCoordination`); see [Coordination](#coordination). `new FrameworkResizer({ coordination })`
-  sets one Resizer's instead.
-
-A missing `src/config/resize.ts` means no queues, the default `worker` and the default
-`coordination`. Only `queue: false` in the Resizer's own file (with no `queueName` option),
-`tasks: false` in code, or a task queue and `coordination` both passed in code keep a Resizer from
-reading `src/config/resize.ts`; every other Resizer validates that whole file on first use. A
-malformed `queues` or `worker` section there then fails in one of two ways:
-
-- A Resizer that takes its task queue from the file (its queue name from the file or from the
-  `queueName` option), or whose file sets no `queue` (it reads `queues` to learn whether it is eager
-  only or on `'default'`): its first call and its `verify()` fail. `uploadOriginal()`, `generate()`
-  and `invalidate()` throw the config error (e.g. `RESIZE_CONFIG_INVALID`), and `resolve()` and
-  `prewarm()`, which never throw, return the empty decision and `incomplete`, so even stored
-  previews are not served until the file is fixed.
-- A Resizer with a task queue passed in code (and no `coordination` in code) reads the file only
-  for `coordination`, so a broken file is the degraded mode of an invalid `coordination`: it is
-  logged once, reads serve stored previews and queue nothing, `uploadOriginal()`, `generate()` and
-  `invalidate()` work, and `verify()`, `prewarm()` and worker start report it.
-
-`src/config/resize.ts` needs `mediaModelName` only while the default Resizer reads it as its own
-file.
-
-Every file writes `satisfies FrameworkResizeConfig`: `src/config/resize.ts` and each other
-Resizer's file. Two files write `satisfies Partial<FrameworkResizeConfig>` instead: an environment
-override, and a `resize.ts` that holds only the process-wide sections (no default Resizer, so no
-`mediaModelName`). An override that leaves out nested keys (only `limits.sourcePixels`, say) writes
-`satisfies PartialFrameworkResizeConfig` (from `…/framework.js`), which makes every object optional
-key by key at any depth (arrays and `encode.formats` stay whole); `Partial<FrameworkResizeConfig>`
-stays valid for a file that leaves out only top-level keys. With custom drivers, both types take the
-driver registry: `FrameworkResizeConfig<{ storage: { gcs: typeof GcsStorage } }>`. A full
-`src/config/resize.ts` with three queues, and a second Resizer's file:
-
-```ts
-// src/config/resize.ts
-import {
-  defaultFrameworkResizeConfig,
-  defaultWorkerOptions,
-  type FrameworkResizeConfig,
-} from '@adaptivestone/framework-module-resize/framework.js';
-
-export default {
-  ...defaultFrameworkResizeConfig,
-  mediaModelName: 'File',
-  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
-  queue: 'default', // the default Resizer's queue
-
-  // process-wide sections, read only from this file
-  queues: {
-    default: { driver: 'database' },
-    bulk: { driver: 'database', leaseMs: 120_000 }, // the same backend, its own timing
-    audit: { driver: 'sqs', queueUrl: 'https://sqs…/audit' }, // another backend, routed by name
-  },
-  worker: { ...defaultWorkerOptions, enabled: false },
-  // coordination: { gateTtlMs: 600_000, cooldownMs: 600_000 },
-} satisfies FrameworkResizeConfig;
-```
-
-```ts
-// src/config/resizeListings.ts — new FrameworkResizer({ name: 'listings', configName: 'resizeListings' })
-import {
-  defaultFrameworkResizeConfig,
-  type FrameworkResizeConfig,
-} from '@adaptivestone/framework-module-resize/framework.js';
-
-export default {
-  ...defaultFrameworkResizeConfig,
-  mediaModelName: 'Listing',
-  storage: { driver: 'local', rootDir: './var/listings', publicBaseUrl: '/listings' },
-  queue: 'bulk', // a name from `queues` in src/config/resize.ts; no queues, worker or coordination here
-} satisfies FrameworkResizeConfig;
-```
-
-**Backends.** The entries on one backend share one task queue, built once per process: every
-`database` entry is one backend (the app's `ResizeTask` model), the SQS entries that share
-`region`, `endpoint`, `deadLetterQueueUrl` and the effective `waitTimeSeconds` (unset counts as 10)
-are one backend, one `SqsTaskQueue` with a name → URL map, and a custom queue driver groups its
-entries with `backendOf`. Each name is a lane on its backend's task queue, with its own timing.
-
-Names on different backends route through a `RoutingTaskQueue` (see [Drivers](#drivers)). When
-`queues` spans more than one available backend, `resizer.tasks` is a `RoutingTaskQueue` over them:
-it has no `release`, its `findActive` asks the backend of the name, and a check such as
-`resizer.tasks instanceof MongoTaskQueue` no longer finds the database queue. Use
-`await carrierOf(resizer.tasks, 'default')` (main entry), which gives the backend of a name on any
-task queue. With one available backend, `resizer.tasks` is that backend's task queue, as before.
-
-- **With several backends, a backend is built when one of its names is first needed:** a call on
-  it, `verify()` for the Resizer's own queue, or a worker that consumes it. A database Resizer
-  beside an SQS entry it never uses never loads the SQS driver. A build that fails is forgotten
-  (the next need builds again) and affects only that backend's names. With a single available
-  backend, it is built when the task queue part loads: on the Resizer's first call of any kind,
-  `ready()` or `verify()`.
-- **Each call is gated by its queue's backend:** on a database queue the task row is the gate; on
-  an SQS queue the gate lock in the Resizer's lock store (see [Coordination](#coordination)).
-  Retries, the dead-letter cooldown and the shutdown give-back use the same backend's gate.
-- **A backend whose SDK is not installed is not served in that process.** A call on one of its
-  names queues nothing (`prewarm()` reports `RESIZE_QUEUE_NOT_SERVED`, its message names the
-  package, and `resolve()` logs it once per queue name), and a worker given one of its names
-  refuses to start with the same code and package. `verify()` rejects with `RESIZE_PEER_MISSING`
-  when it is the Resizer's own queue. When no backend is available at all, the task queue fails
-  with `RESIZE_PEER_MISSING`, as before.
-- **The `Lock` model** of a framework app is checked by `verify()` only when the Resizer's own
-  queue is on a backend without its own gate (SQS), and by the worker only for each such queue it
-  consumes: a worker checks only the queues it consumes, never a served Resizer's own queue
-  otherwise. A database Resizer beside SQS queues needs no `Lock` model.
-
-A call on a name that `queues` does not define queues nothing (`RESIZE_QUEUE_NOT_SERVED`, see
-[`prewarm()` issues](#prewarm-issues); `resolve()` logs it once per queue name). So an environment
-override may move only some queues to another backend (only `queues.default` to SQS, say, while
-`queues.bulk` stays on the database): both names keep working, and one worker consumes both with
-`npm run cli ResizeWorker -- --queue=default --queue=bulk`.
-
-Without the framework, buckets, URLs and queue URLs are driver options. Removed keys fail with
-`RESIZE_CONFIG_REMOVED_KEY`, and the message says where the value goes: see
-[Removed keys](./UPGRADING.md#removed-keys).
-
-### Coordination
-
-A Resizer with a task queue keeps one **gate** per Resizer, media, pipeline and queue: at most
-one of their tasks is active at a time, whether it is queued, running, waiting for a retry, or
-cooling down after a dead-letter. While the gate is held, a read that finds variants missing
-queues nothing, whatever variants the active task covers: a new size for that media waits for the
-active task, and the next read after the task ends queues it. So 1000 concurrent reads of a cold
-media create one task. A request on another queue is a separate task, as before the gate: a
-`prewarm({ queue: 'bulk' })` waiting for a bulk worker never blocks reads on `'default'` (the media
-may then be rendered on both; the media store keeps one row per preview identity).
-
-- On `MongoTaskQueue` (`gatesByTask`) the task row is the gate. Its `active` field is `true` from
-  `add()` until the task completes, through its retries, and a unique index on
-  `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }`
-  lets one row per gate be active (`verify()` rejects with `RESIZE_MONGO_INDEX_MISSING` until it
-  exists). A dead row keeps the gate until its `cooldownUntil` (`deadAt` + `cooldownMs`); the next
-  `add()` after that retires it (`active: false`, its `error` kept) and inserts a new row. No lock
-  is taken.
-- On a task queue without `gatesByTask` (`SqsTaskQueue`, most custom queues) the gate is one lock in
-  the Resizer's `LockStore`, `resize_gate:<resizer>:<queue>:<mediaId>:<pipeline>` (each part
-  URI-encoded). The core takes it for `gateTtlMs` with a fresh random owner when it queues a task,
-  and the owner travels in the task as `gateOwner`. When the queue does not confirm that it stored
-  the task (`unconfirmed`, a throw), the task may still be stored, so an ambiguous enqueue keeps the
-  gate for one lease (`leaseMs`, at most `gateTtlMs`) instead of releasing it: a stored task is
-  claimed and extended within it, otherwise it lapses and a later read queues the task, unless the
-  add was `unconfirmed` with `retryable: false`: calling again cannot help until someone fixes what
-  `causeCode` names. The worker extends the lock: to
-  one lease plus one heartbeat interval (`leaseMs / 2`) when the task starts and on every
-  heartbeat, so a redelivery after a worker crash still finds it held; to the retry time plus one
-  lease after a failed attempt; to `cooldownMs` after a dead-letter; and to `gateTtlMs` when it
-  gives a task back (at shutdown, or a task it does not serve). When an extend finds the lock lapsed
-  while the task runs, or for the retry and cooldown holds, the worker takes it back under the
-  task's owner, unless another request has taken the gate meanwhile. It releases the lock when the
-  task completes. Once a delivery's lease is known to be lost (a renewal still in flight when the
-  task ends is awaited first), the worker makes no call for it at all (no completion, no gate
-  call). Every lock store call waits at most `min(leaseMs, 30000)` ms, and a task's end waits that
-  long at most for its renewals and all its gate calls, so a hanging lock store never holds the
-  worker; a call that does not answer in time is logged as failed, with the wait it was given. The
-  task's final gate action (the release, or the retry, cooldown or give-back hold) comes after the
-  calls made while it ran; one of those that answers after the final action (a slow store) is
-  followed by the final action again, so a late extend cannot cut a cooldown short, nor a late
-  re-take re-create a released lock. This gate is best
-  effort across a lost lease, an ambiguous enqueue (one lease) and a lock store failure: at worst a
-  second task renders the same variants, and the media store keeps one row per preview identity.
-
-There are no per-identity locks. The lease keeps a task with one worker at a time, its token fences
-every write, and `appendPreviews` keeps one row per preview identity when an expired lease lets two
-workers render the same variant.
-
-| Option | Default | Notes |
-|---|---|---|
-| `gateTtlMs` | `600000` | How long the gate lock of a QUEUED task holds its media, pipeline and queue before a worker starts the task (from then on the worker extends it per lease), and how long a task given back holds it again. Raise it when tasks wait longer in the queue. Only a task queue without `gatesByTask` takes the lock; `MongoTaskQueue` ignores the value |
-| `cooldownMs` | `600000` | After a task is dead-lettered, no new task for that media, pipeline and queue is queued for this long. The cooldown is per queue, like the gate: a dead task holds only its own queue's gate, so a poison task gets one `maxAttempts` cycle on each queue it is sent to. On Mongo a dead row is kept ~30 days (its TTL index), so a longer cooldown ends when the row expires |
-
-Pass it as `new Resizer({ coordination: { gateTtlMs, cooldownMs } })` (or a function returning it)
-or `new FrameworkResizer({ coordination })`, or set the process-wide `coordination` section of
-`src/config/resize.ts`. Missing values take `defaultCoordination` from `…/config/resize.js` (the
-types are `CoordinationOptions`); an eager-only Resizer never reads it. Only the core validates
-it, when the Resizer sets up its task queue: a section that is not an object, or a value that is
-not a positive safe integer (ms), is `ResizeConfigError` `RESIZE_CONFIG_COORDINATION_INVALID` (the
-message names the key, or the value when the whole section is wrong); `0` is rejected for both
-values (the minimum is 1 ms), so the cooldown cannot be turned off. It degrades like a task queue
-that cannot be used (see `ready()` under [Drivers](#drivers)), in a config file too, and a section set to
-`null` is invalid, not the defaults. No value depends on the queue's lease. Each dead-letter gets
-the `cooldownMs` of the task's own Resizer.
 
 ## Metrics
 
@@ -2263,6 +2267,166 @@ exhaustive.
 | `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue did not confirm the task (on Mongo a database error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged, the model with its code in `causeCode`; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`: fix the logged cause first. `false` when the queue says so, as `MongoTaskQueue` does for an unregistered or outdated model (fix what `causeCode` names), and for a value in none of the shapes |
 | `RESIZE_ENQUEUE_CONFIRM_FAILED` | After an `in-flight` add, `findActive()` threw (logged), so what the active task holds is unknown | `true` |
 | `RESIZE_ENQUEUE_INTERNAL_ERROR` | An unexpected error (e.g. a media without an id, `RESIZE_MEDIA_NO_ID`), a Resizer that could not start (a part that did not load, an invalid config), a task queue that cannot be used (the error `verify()` reports, e.g. `RESIZE_LOCKS_REQUIRED`), or an invalid timing of the call's `queue` (a name used only per call; every variant is `unconfirmed`); the message is the error's | `false` when the error is a `ResizeError` with `retryable: false`, or a `ResizeMediaError`, `ResizeConfigError` or `ResizeSetupError` (or a subclass); otherwise `true` |
+
+## Error codes
+
+Every code the module raises, sorted so you can search for it. `retryable` is what the error carries when a task or a caller reads it: `false` means no later delivery of the same input can succeed, and the worker dead-letters the task at once (the rule, and the exceptions a row names, are under [Operations](#operations)). A dash means no worker decision depends on it: the wiring is wrong, so fix that rather than branch on the value, or it is a [`prewarm()` issue](#prewarm-issues), whose table gives its `retryable`. Every error extends `ResizeError`, and `err.name` says which subclass it is. What each subclass asks of a catch block is in the guide's [Errors](https://framework.adaptivestone.com/docs/resize#errors). What an upgrade changed is in [`UPGRADING.md`](./UPGRADING.md).
+
+| Code | `retryable` | When, and what to do |
+|---|---|---|
+| `RESIZE_ADOPT_MAX_BYTES_INVALID` | `false` | From `adoptOriginal()`: `maxBytes` is not a positive safe integer — pass one, or leave it out for `limits.sourceBytes` |
+| `RESIZE_APP_NOT_INITIALIZED` | — | A `FrameworkResizer` (or another part from `…/framework.js`) read the framework app before the `Server` was constructed — construct the Server before the first call (importing `src/resizer.ts` earlier is fine: it reads nothing until first use); in tests, install a fake app with `setAppInstance` from `@adaptivestone/framework/helpers/appInstance.js` |
+| `RESIZE_CONFIG` | `false` | The default code of a `ResizeConfigError` whose throw names none: a host or driver error. Fix the config. |
+| `RESIZE_CONFIG_COORDINATION_INVALID` | — | From `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it): `coordination` is not an object, or a value in it is not a positive safe integer (ms; `0` is rejected too, so the cooldown cannot be turned off) — fix the key the message names, or the whole section when the message shows its value (`coordination` in `src/config/resize.ts`, the only file it is read from since it is process-wide, or the `coordination` option) |
+| `RESIZE_CONFIG_FORMATS_INVALID` | — | `formats` in the config holds an empty id, or an id with no `encode.formats` entry (`formats [...] have no encode.formats entry`): use an id the defaults hold, such as `jpeg`, or add `encode.formats.<id>` (`{}` for the engine's defaults, except `heif` and `heic`: `heic: {}` passes `verify()`, then every render fails, and `heic: { compression: 'av1' }` writes), or request only configured ids; a `jpg` id needs its own `encode.formats.jpg`, and `encode.flatten.formats` must name it or transparent pixels turn black; naming it there changes its signature, so its previews regenerate |
+| `RESIZE_CONFIG_INVALID` | `false` | The config is malformed, and the message names the part: a config (or config file) that is not an object, a `storage` section without a driver name, an empty or whitespace-only `rootDir` or `privateRootDir` of local storage (also from `new LocalFsStorage()`, at construction: `''` would resolve to the working directory, and `'.'` says that on purpose; `publicBaseUrl: ''` stays valid), a `storage` or `queues` driver name the Resizer does not have (not `'local'` / `'s3'` or `'database'` / `'sqs'`, nor a name in its `drivers`; checked when the Resizer first reads that section, so for a config file on first use or in `verify()`, and a disabled worker never checks it: it logs a `warn`, and the command resolves `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1), a `database` section of `createResizer` without driver `'mongo'` (or a registered one), a `'mongo'` `database` section whose `connection` is not a Mongoose connection (`mongoose` itself is refused: pass `mongoose.connection`) or whose `mediaModel` has no `findById` and `findOneAndUpdate` functions, a `'database'` queue in a `createResizer` config without a `database` section, a `queues` map that is not an object of names, a `queues` entry with a blank name or without a `driver`, an SQS entry without `queueUrl`, two SQS entries with the same `queueUrl`, a `queue` that is neither a queue name nor `false`, a process-wide section (`queues`, `worker`, `coordination`) outside `src/config/resize.ts` (in another file, or in the `config` option), a `worker` section that is not an object or whose `enabled` (boolean), `sharpConcurrency` (positive integer) or `sharpCache` (boolean) has the wrong type (each key is optional and defaults), an unknown `worker` key (e.g. a misspelled `sharpConcurency`), an `engine` or `decoders` key in a config (each is an option, in code), or image settings of the wrong type (`upload.verify`, `maxSize`, `animated`, `encode.formats`, `encode.flatten`, `encode.sharpen`, `limits`, `concurrency`; `limits.processingTimeoutSeconds` above 3600 too, the longest Sharp accepts), or a `stopBeforeTimeoutMs` of `createSqsHandler()` below its least — fix what the message names. A config file fails on first use or `verify()`; a config object passed in code, at construction (a config function: at first use), except an unregistered `queues` or `database` driver name in it and what a driver checks in its own section (the `'mongo'` `connection` and `mediaModel`, say), which are reported on first use or `verify()` (an unregistered `storage` driver in it throws at construction) |
+| `RESIZE_CONFIG_MEDIA_MODEL_MISSING` | — | ``resize config: `mediaModelName` is required``: set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
+| `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` | — | At worker start: `mediaModelName` does not match a registered host model — fix the name |
+| `RESIZE_CONFIG_QUEUE_INVALID` | — | The queue timing is invalid (`leaseMs`, `idlePollMs` and `taskTimeoutMs` can be at most 2147483647, the longest a timer can wait) — fix the key the message names (in `queues.<name>` of `src/config/resize.ts` or of a `createResizer` config, or the task queue's `timing` / `getTiming`; for a builder route of a `RoutingTaskQueue`, the router's `getTiming` option). A config file fails on first use with the rest of the file. A task queue's own timing is checked per queue name: `verify()` rejects for the Resizer's own queue, worker start for each queue it consumes, and each call on the name fails it (`prewarm()` reports `RESIZE_ENQUEUE_INTERNAL_ERROR`, not retryable; `resolve()` logs it once per queue name, on the first read of that queue, and serves stored previews). It is no longer logged when the Resizer starts |
+| `RESIZE_CONFIG_QUEUE_LEASE_INVALID` | — | See `RESIZE_CONFIG_QUEUE_INVALID`. |
+| `RESIZE_CONFIG_QUEUE_UNKNOWN` | — | On first use or from `verify()`: the Resizer's queue name (its `queueName` option, or its file's `queue`, or the implied `'default'` when the file sets none) is not an entry of `queues` in `src/config/resize.ts` — add `queues.<name>` (e.g. `queues: { default: { driver: 'database' } }`), set `queue`/`queueName` to a defined name, or `queue: false` (`tasks: false` when the name came from the option) for eager only |
+| `RESIZE_CONFIG_REMOVED_KEY` | — | A removed key or an old shape is still in a config (a config file, an environment override, a config passed to `new Resizer`) or in an option (a task queue's `timing`, the `S3Storage` option `publicUrl`, `runResizeWorker({ configName })`), or the worker got its removed `--config` flag: move it to the path the message names. The list is in [Removed keys](./UPGRADING.md#removed-keys). |
+| `RESIZE_CONFIG_STORAGE_MISSING` | — | Add `storage: { driver: 'local', … }` (or `'s3'`, or a driver passed in `drivers`) to the config named in the message (a config file, or the config passed to `createResizer()`), or pass `storage` to `new FrameworkResizer()` or `createResizer()` |
+| `RESIZE_CONFIG_UPLOAD_FORMATS_INVALID` | — | See `RESIZE_CONFIG_UPLOAD_INVALID`. |
+| `RESIZE_CONFIG_UPLOAD_INVALID` | — | `upload` is not an object, `upload.maxBytes` is not a positive safe integer, or `upload.formats` is not a non-empty list of non-empty format ids — fix that key, e.g. spread the defaults' `upload` and change one value |
+| `RESIZE_CONFIG_UPLOAD_MAX_BYTES_INVALID` | — | See `RESIZE_CONFIG_UPLOAD_INVALID`. |
+| `RESIZE_DECODER_INVALID` | `true` | A `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
+| `RESIZE_DECODER_MISSING` | `true` | On a task or from `generate()` (retried): no decoder in this process lists the stored `original.format` and none reads the bytes — pass the decoder in `decoders` in every process (API and worker), or fix an `original.format` that holds an alias of bytes no decoder reads |
+| `RESIZE_DELIVERY_UNSUPPORTED` | — | See the table in [Push delivery (preview)](#troubleshooting). |
+| `RESIZE_DRIVER_CONFLICT` | — | From `new FrameworkResizer()`: every `FrameworkResizer` of the process shares one task queue set, so each must pass the same `drivers.queue` map (the same names, the same driver objects): this one passes another driver, an extra name, or no map where an earlier one passed one (or the reverse). Eager-only Resizers and Resizers with `tasks` in code are compared too; the Resizer's name stays free — pass every `FrameworkResizer` the same `drivers.queue` (e.g. one shared object). A host that passes no `drivers` anywhere is unaffected, and storage drivers may differ per Resizer |
+| `RESIZE_DRIVER_INVALID` | — | At construction (the Resizer's name stays free): the `drivers` option is not an object, has a kind other than `storage`, `database` or `queue`, or an entry has no `fromConfig` function (a queue driver's `backendOf` and `validate` must be functions when given) — the message names `drivers.<kind>.<name>`. On first use: a driver's `fromConfig` returned something that is not the part (a storage needs `upload`, `download`, `publicUrl`; a media store `loadMedia`, `appendPreviews`, `replacePreviews`; a task queue the five required methods and every name of its entries), or a `RoutingTaskQueue` builder resolved something that is not a task queue — fix the driver |
+| `RESIZE_DUPLICATE_RESIZER` | — | From a constructor, `a Resizer named '…' already exists`: each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)`. At worker start, "the `resizers` list names '…' twice": two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
+| `RESIZE_ENGINE_FORMAT_UNSUPPORTED` | — | From `verify()` or at worker start: a format in `formats`, or an `encode.formats` entry the host wrote or changed, is not in `engine.formats` (a package default outside `formats` that the host left alone is not checked) — remove it, use an id the message lists (ids are matched exactly: `jpg`, not `JPG`), or, for a custom engine, list it in `formats`. An API process that calls `verify()` needs the worker's `engine` too |
+| `RESIZE_ENGINE_INVALID` | `true` | The `engine` option is not an image engine (at construction: it needs `id`, `formats`, `animatedFormats`, `resize` and `encode`), or an engine broke the contract (a resize result of another size, an animation frame with another channel count, an encode result without `data`, `contentType` or a size, with empty `data`, a `contentType` that is not `image/…`, a size other than its raster's, or a `format` that is not a file extension) — fix the engine |
+| `RESIZE_ENQUEUE_CONFIRM_FAILED` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). |
+| `RESIZE_ENQUEUE_INTERNAL_ERROR` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). |
+| `RESIZE_ENQUEUE_LOCK_CONTENDED` | — | In `prewarm()` issues, on a task queue without `gatesByTask` (SQS): the gate lock of this Resizer, media, pipeline and queue is held — a task of theirs is queued, running or waiting for a retry, a dead one's `coordination.cooldownMs` runs, or an add that threw or was not confirmed keeps the lock for one lease (at most `coordination.gateTtlMs`). SQS cannot report which variants that task holds, so none is accepted — call `prewarm()` again after the task ends (a read after it ends queues them too) |
+| `RESIZE_ENQUEUE_LOCK_FAILED` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). With `causeCode: 'RESIZE_LOCKS_REQUIRED'` (`retryable: false`), the call's queue is on a backend without `gatesByTask` (SQS) and the Resizer has no lock store — pass `locks`, or give a `FrameworkResizer` the framework `Lock` model. |
+| `RESIZE_ENQUEUE_NO_ORIGINAL` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). |
+| `RESIZE_ENQUEUE_NO_QUEUE` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). |
+| `RESIZE_ENQUEUE_QUEUE_FAILED` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). With a `causeCode`, the backend of the call's queue failed to build (a queue driver's `fromConfig` threw: the driver's own code, or `RESIZE_PEER_MISSING`), with the error's own `retryable`; `resolve()` logs it once per queue name and message, and the next call builds again — fix what the message names. A built error whose code is already an issue code keeps it as the issue's code. |
+| `RESIZE_ENQUEUE_UNCONFIRMED` | — | In `prewarm()` issues, with `retryable: true`: the task queue's `add()` resolved `unconfirmed`, so the queue did not confirm the task — on `MongoTaskQueue` a database error or a duplicate key on another unique index of the host's `ResizeTask` model (each logged); on SQS a send that returned no `MessageId`. Fix the logged cause first, then call `prewarm()` again. `retryable: false` with `causeCode`: an unregistered `ResizeTask` model (`RESIZE_MONGO_MODEL_MISSING`, logged), an outdated one (`RESIZE_MONGO_MODEL_OUTDATED`, logged once; every add stays unconfirmed until it is fixed), or what a custom queue names: calling again cannot help until it is fixed. `retryable: false` without one: a custom `TaskQueue` resolved a value in none of the `TaskAddResult` shapes (written for an older version, e.g. `{ taskId }`), logged once — resolve `{ status: 'added', taskId }`, `{ status: 'in-flight', taskId? }` or `{ status: 'unconfirmed' }` |
+| `RESIZE_ENQUEUE_VARIANT_CONFLICT` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). |
+| `RESIZE_ERROR` | `true` | The default code of a plain `ResizeError` whose throw names none, such as a custom driver's. It comes from a host's or a custom driver's code: read its message. |
+| `RESIZE_FORMAT_NOT_CONFIGURED` | `true` | A requested format, in the call or from a `beforeEnqueue` tap, has no `encode.formats` entry, so it is never generated: `resolve()` leaves it out of `decision.missing`, and `generate()` throws this code — use an id the defaults hold, such as `jpeg`, add `encode.formats.<id>`, or request only configured ids. As a `prewarm()` issue it is `false`: calling again cannot help until a deploy or a config change does. |
+| `RESIZE_FS_HINT_CONFLICT` | `false` | `LocalFsStorage.upload` got both `namespace` and `parentRef`: pass one. |
+| `RESIZE_FS_PATH_TRAVERSAL` | `false` | See `RESIZE_S3_BUCKET_NOT_ALLOWED`. |
+| `RESIZE_FS_PRIVATE_ROOT_PUBLIC` | — | A `ResizeSecurityError`, when `LocalFsStorage` is constructed (from a config file: at first use or `verify()`): `privateRootDir` is `rootDir` itself or inside it, so private originals would be served — put it outside `rootDir` (`storage.privateRootDir` in the config file), or leave it out for `rootDir` + `-private` |
+| `RESIZE_FS_PRIVATE_URL` | `false` | `publicUrl()` got a ref with `visibility: 'private'`, which has no public URL. Pass a preview's ref. |
+| `RESIZE_FS_REF_INVALID` | `false` | See `RESIZE_S3_BUCKET_NOT_ALLOWED`. |
+| `RESIZE_FS_VISIBILITY_INVALID` | `false` | `LocalFsStorage.upload` got a `visibility` other than `'public'` or `'private'`: pass one of those. |
+| `RESIZE_GENERATE_FAILED` | `true` | `generate()` made no preview, because every requested variant failed. `false` when every variant failed with `false`. Its `cause` is the first failure: fix what it names. |
+| `RESIZE_LOCKS_REQUIRED` | — | From `verify()` or at worker start (reads serve stored previews and queue nothing; `prewarm()` reports it): a Resizer whose task queue has no `gatesByTask` (e.g. `SqsTaskQueue`) has no `locks`, and it takes one gate lock per media, pipeline and queue — spread `mongoParts(connection, { mediaModel })` (its `locks`) or pass a `LockStore`, or drop `tasks` for an eager-only Resizer. `MongoTaskQueue` needs no `locks`; a `FrameworkResizer` builds `FrameworkLockStore` itself beside a task queue without `gatesByTask` (the SQS driver, or a custom queue without the flag). On a `RoutingTaskQueue` the need is per queue name: `verify()` rejects only when the Resizer's own queue is on a backend without `gatesByTask`, the worker only for such a queue it consumes, and a call on such a name queues nothing (the `prewarm()` issue `RESIZE_ENQUEUE_LOCK_FAILED` with `causeCode: 'RESIZE_LOCKS_REQUIRED'`) |
+| `RESIZE_MEDIA` | `true` | The default code of a `ResizeMediaError` whose throw names none. It comes from a host's or a custom driver's code: read its message. |
+| `RESIZE_MEDIA_APPEND_RESULT_INVALID` | `true` | A custom `MediaStore.appendPreviews` resolved with something other than an array — resolve with the previews it stored (`[]` when none) |
+| `RESIZE_MEDIA_NO_ID` | `false` | The media has neither `id` nor `_id`: pass a media with one. A task with it is dead at once. |
+| `RESIZE_MEDIA_REPLACE_MISSING` | `true` | From `verify()`, at worker start, or from `invalidate`, or from `generate()` and the worker when a stale preview is replaced: a custom `MediaStore` has no `replacePreviews(mediaId, identities, rows)`, required since 0.3.0 — implement it (one atomic write per media; resolve `{ stored, removed }`; see the `MediaStore` contract under [Drivers](#drivers)), or extend `MongoMediaStore` |
+| `RESIZE_MEDIA_REPLACE_RESULT_INVALID` | `true` | A custom `MediaStore.replacePreviews` resolved with something other than `{ stored, removed }` (two arrays) — resolve with the rows it stored and removed (`[]` when none), `removed` being exactly what the write removed |
+| `RESIZE_MEDIA_REQUIRED` | — | At construction: `new Resizer()` takes its `media` explicitly — framework hosts use `new FrameworkResizer()` from `…/framework.js`; plain Node: `...mongoParts(connection, { mediaModel })`, or a `database: { driver: 'mongo', connection, mediaModel }` section for `createResizer` (which reports a missing one on first use, naming its config) |
+| `RESIZE_MEDIA_ROW_NOT_KEPT` | `false` | On a dead task: a custom `MediaStore`, a `findOneAndUpdate` middleware on the media model, or a strict row schema without `resizer`, `pipeline` or `filters` (`verify()` does not require those: they have defaults) lost or changed `storageRef`, `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline` or `filters`, or lost `contentType`, of a row the worker wrote; the message names the fields and rows. Without this check each read after a task ends would render those previews again — store those fields as given; a read after `coordination.cooldownMs` queues the task again, and a media only `prewarm()` queues needs `prewarm()` again. On a driver that names files by their bytes, a lagging reload raises it too, when it shows another row under the same ref: an older row after a replacement (naming `encodeSig`) or another size key's row on a first render (naming `sizeKey`). Its rows are stored, and the next read is fresh |
+| `RESIZE_METRICS_INVALID` | — | At construction: the `metrics` option is not a sink (`null`, or no `count()` and `timing()` functions), or `new LogMetrics(logger, { summaryIntervalMs })` got an interval that is not a positive integer of at most 2147483647 — pass `new LogMetrics(logger)`, `new NoopMetrics()` or your own `ResizeMetrics`, or leave `metrics` out for the default |
+| `RESIZE_MONGO_INDEX_MISSING` | — | From `verify()` or at worker start, logged once as an `error` by the first added task (once per model, in the background: reads never wait for it, and the line ends in what the gap costs: concurrent adds can each store a duplicate active task, or, for a unique index without the filter, nothing queues), or the warning "reported a task in flight without its id": the `ResizeTask` collection has no gate index — unique on exactly `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }` (or `{ active: { $eq: true } }`) — or does not exist yet, or an index on those keys lacks `unique` or that partial filter, or Mongoose's own index build (`autoIndex`) failed (the error's `cause`, e.g. duplicate active rows) (without the filter every add after a completed task is in flight with no id and nothing queues). Create it through your migration (e.g. `ResizeTask.createIndexes()` or `syncIndexes()`; drop a wrong index on those keys first); the module never creates indexes, and a worker on the framework CLI (`autoIndex` off) neither builds them nor waits for a build: create them before it starts |
+| `RESIZE_MONGO_LOCK_MODEL_OUTDATED` | — | From `verify()` or at worker start: the lock model's strict schema has no `owner` field, so no lock could be released before it expires (e.g. a `ResizeLock` model registered on the connection before this version, which `createResizeModels` returns as it is) — add `owner: { type: String }` (see `resizeLockFields` in `…/drivers/mongo.js`) |
+| `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` | — | From `verify()` or at worker start: the media schema declares preview rows as strict sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType` or `storageRef` (the message names them; a mixed or plain `previews` array, or rows with `strict: false`, pass) — spread the current `resizeMediaSchemaFragment`, or add each missing field to the row as `{ type: String }` (`storageRef` as `{ type: 'Mixed' }`). A strict row schema without `fit` does not throw: it logs one warning (fit rows then lose their flag and are judged by either signature); add `fit: { type: Boolean }` |
+| `RESIZE_MONGO_MODEL_MISSING` | — | From `verify()` or at worker start: a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), the lock model (the framework's `Lock`, needed only beside a task queue without `gatesByTask`, or the model passed to `MongoLockStore`), or the media model of a plain `MongoMediaStore` (framework hosts get `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` instead) |
+| `RESIZE_MONGO_MODEL_OUTDATED` | — | From `verify()`, at worker start, or logged once by `add()` (every add is then unconfirmed and queues nothing until the model is fixed; claims reject with it), or `npx --no -- resize-scaffold --check` reports drift in `src/models/ResizeTask.ts`: a shim from an older scaffold that imports `…/framework.js`: delete `src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold` (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or hand-written model without the `resizer`, `queue`, `availableAt`, `active` or `cooldownUntil` fields: port them (and the `{ queue, status, availableAt }` index and the gate index) from `resizeTaskFields()` / `resizeTaskIndexes` (`…/drivers/mongo.js`), or delete it and re-run `npx --no -- resize-scaffold --eject`. Right after the upgrade `--check` also reports every ejected model without `startedAt` and `finishedAt` — intended (such a model keeps working; the times are dropped and `RESIZE_MONGO_MODEL_OUTDATED` does not list them): add both as `{ type: Date }`, or move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx --no -- resize-scaffold --eject`, then restore your customizations (re-running `--eject` alone never overwrites the file) |
+| `RESIZE_MONGO_MODEL_REQUIRED` | — | `new MongoMediaStore()` / `new MongoLockStore()` / `new MongoTaskQueue()` needs exactly one of `model` or `getModel` — or use `mongoParts(connection, { mediaModel })` |
+| `RESIZE_MONGO_NOT_CONNECTED` | — | From `verify()` or at worker start: the Mongoose connection of the `ResizeTask` model is closed (never opened, or disconnected: at once), or failed to open (after the driver's `serverSelectionTimeoutMS`, 30 s by default; the message names the driver's error) — call `verify()` after the connection has opened (after `Server.init()` in a framework host); an opening connection is awaited |
+| `RESIZE_NAME_INVALID` | — | At construction: the Resizer's `name` option, or its `queueName` option (`RESIZE_QUEUE_INVALID`), is not a non-empty string — pass one, or leave it out for `'default'`. ``resize: `queue` is now `queueName` `` (`RESIZE_QUEUE_INVALID`): the old `queue` option was renamed — pass `queueName`, and read `resizer.queueName` instead of the removed `resizer.queue` |
+| `RESIZE_NOT_READY` | — | Host code read `resizer.storage` / `media` / `locks` / `tasks`, or a `resizer.queueName` that comes from the config file (or from a function), before the Resizer loaded them — `await resizer.ready()` first (the Resizer's methods do this themselves). A string `queueName` option is readable at once. `resizer.queue` is gone: read `resizer.queueName` |
+| `RESIZE_NO_ORIGINAL` | `false` | `generate()` or a task found no original (`ResizeNoOriginalError`): upload it first. |
+| `RESIZE_NO_RESIZER` | `true` | At worker start: `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx --no -- resize-scaffold`. Without the framework, `runWorker()` found no Resizer, or got an empty `resizers` list: construct the Resizers in the worker process before it starts (for a Lambda handler, see [Push delivery (preview)](#troubleshooting)). From `getResizer(name)`: no Resizer of that name was constructed in this process — construct it in bootstrap code that runs in every process that uses it. On a task, or `Resizer '…' is not served by this worker` in worker logs: a task queue that cannot filter claims (SQS) handed the worker a task of a Resizer it does not serve: that Resizer was not constructed in the worker process before the worker started (or not passed in `runWorker({ resizers })`). Its tasks are given back to the queue for a worker that serves it (SQS still counts each receive, so a task bounced between workers that serve different Resizers can use up its `maxAttempts` and be dead-lettered by the worker that serves it: give each set of Resizers a worker serves its own SQS queue URL), or, when the queue cannot give tasks back, fail with `RESIZE_NO_RESIZER` (retried, then dead-lettered) — construct every Resizer in `src/resizer.ts`, which both the API and the worker load. On the database queue, which filters claims, such tasks wait for a worker that serves their Resizer, and every claim on that queue reads past them (the claim index does not hold the Resizer): give a Resizer that has no worker its own queue (a log saying the queue "handed its task out although it filters claims" is a broken custom queue) |
+| `RESIZE_ORIGINAL_BODY_INVALID` | `false` | `uploadOriginal({ body })` is not a `Buffer` or `Uint8Array`: pass the file's bytes. |
+| `RESIZE_ORIGINAL_DAMAGED` | `false` | From `uploadOriginal()` or `adoptOriginal()`: `upload.verify: 'decode'`, or an adoption, which always runs it, decoded the original's first frame at `limits.failOn` and the engine refused it: the file is cut or corrupt, and nothing was stored — ask for the file again. Damage `inspect` finds first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays `RESIZE_ORIGINAL_INVALID`. An animation damaged in a later frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes. A JPEG cut in its last rows can pass too (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it |
+| `RESIZE_ORIGINAL_DOWNLOAD_FAILED` | `true` | From `adoptOriginal()`: the storage driver failed with an error that is not the module's, such as a network error or an S3 403, or resolved with something other than bytes; `cause` says why — retry after fixing it. A driver's own `ResizeError` is not this code: it passes through as the same object |
+| `RESIZE_ORIGINAL_EMPTY` | `false` | The upload, or the object to adopt, has no bytes: refuse the file. |
+| `RESIZE_ORIGINAL_FORMAT_DISABLED` | `false` | `uploadOriginal()`: the format is not in `upload.formats`. Add it, or refuse the file. |
+| `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` | `false` | See `RESIZE_SOURCE_FORMAT_UNSUPPORTED`. |
+| `RESIZE_ORIGINAL_INSPECT_FAILED` | `true` | From `uploadOriginal()` or `adoptOriginal()`: a decoder failed to read the upload for a reason other than the bytes: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
+| `RESIZE_ORIGINAL_INVALID` | `false` | The bytes are malformed or unknown to the engine, and the message carries its line. Refuse the file. |
+| `RESIZE_ORIGINAL_METADATA_MISSING` | `false` | A decoder found no width or height in the upload or the object to adopt: refuse the file. |
+| `RESIZE_ORIGINAL_PUBLIC_REFUSED` | `false` | From `uploadOriginal()` or `adoptOriginal()`: a public original of a host decoder's source kind, whose decoder does not set `publicOriginals: true`: a public upload stores nothing, and an adopted object reads as public when `storage.publicUrl` returns for its ref — pass `visibility: 'private'` or move the object to private storage, or set `publicOriginals` on the decoder (a host decoder that takes over a built-in format needs it too). SVG is `RESIZE_ORIGINAL_SVG_PUBLIC` whatever the flag says |
+| `RESIZE_ORIGINAL_STORAGE_REF_INVALID` | `true` | At `uploadOriginal()`, the driver returned no ref (`true`, `ResizeStorageError`). At `adoptOriginal()`, there is no `storageRef`, or JSON cannot represent it (`false`). Return the ref from the driver, or pass a plain ref. |
+| `RESIZE_ORIGINAL_SVG_PUBLIC` | `false` | A public SVG upload, or a public SVG object to adopt: pass `visibility: 'private'`, or move the object to private storage. |
+| `RESIZE_ORIGINAL_TOO_LARGE` | `false` | From `uploadOriginal()`: the body is over `upload.maxBytes` or `limits.sourceBytes`, the message says which, and nothing is stored. Refuse the file, or raise the limit; above `limits.sourceBytes` raise both, since a task could not read it. From `adoptOriginal()`: the object is over the call's own `maxBytes`; the shipped drivers read nothing, except on an S3 response with no length, which is read whole first. Over `limits.sourceBytes` it is `RESIZE_SOURCE_TOO_LARGE`. |
+| `RESIZE_ORIGINAL_TOO_MANY_PIXELS` | `false` | The upload, or the object to adopt, is over `limits.sourcePixels` or Sharp's pixel limit: refuse the file, or raise the limit before rollout. |
+| `RESIZE_ORIGINAL_UPLOAD_FAILED` | `true` | `storage.upload` failed for an original, and `cause` says why. Retry after fixing it. |
+| `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` | From `uploadOriginal()` or `adoptOriginal()`: the `upload.verify: 'decode'` check, or an adoption's, failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
+| `RESIZE_ORIGINAL_VISIBILITY_INVALID` | `false` | `uploadOriginal({ visibility })` is not `'public'` or `'private'`: pass one of those. |
+| `RESIZE_PEER_MISSING` | `true` | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or this code for a driver selected in the config (a config file, or the config passed to `createResizer()`) or from `signedUrl()`: an optional peer is not installed — install the packages named, see [Install](#install). A queue whose backend lacks its SDK beside another available backend is only not served in that process (`RESIZE_QUEUE_NOT_SERVED`, naming the package); `verify()` rejects with `RESIZE_PEER_MISSING` only when it is the Resizer's own queue |
+| `RESIZE_PIPELINE_STEP_INVALID` | `true` | A `beforeStep` or `variantStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image, or `rasterToSharp` something that is not a `Raster` — return `{ data, info }`, or `sharpToRaster(…)` from a Sharp chain |
+| `RESIZE_PIPELINE_UNKNOWN` | `true` | The pipeline is not registered in that process — register it in `src/resizer.ts`; deploy the worker before the API requests a new or renamed pipeline. As a `prewarm()` issue it is `false`: calling again cannot help until a deploy or a config change does. |
+| `RESIZE_PREVIEW_STORAGE_REF_INVALID` | `true` | A custom driver's `upload` returned no ref for a preview: return the ref it stored. |
+| `RESIZE_QUEUE_INVALID` | — | At construction, see `RESIZE_NAME_INVALID`. At worker start: `runWorker({ queue })` (or `runResizeWorker`) got an empty list, or a list entry or a single name that is blank or not a string (`queue: ''` is refused too) — pass a queue name or a list of names; `--queue` may be repeated |
+| `RESIZE_QUEUE_NOT_SERVED` | — | At worker start or from `verify()`: no task queue can consume that queue: a `--queue` name (with a repeated `--queue`, the message names the one that is not served) that `queues` does not define, an `SqsTaskQueue` without its URL, or a name whose backend's SDK is not installed in this process (the message names the package); or a Resizer's own `queueName` is not served by the task queue passed to it in code (`verify()` checks the Resizer's own queue; the worker checks only the queues it consumes) — define the queue (add its URL), install the package named, or start the worker for other queues. Nothing is claimed before every listed name is served. A Resizer's own queue whose SDK is missing is `RESIZE_PEER_MISSING` from `verify()`. In `prewarm()` issues (`retryable: false`), or the warning "cannot queue to '…': its task queue does not serve that queue" from `resolve()` (once per queue name): the call's `queue` is unknown to the Resizer's task queue (in a framework host or a `createResizer` config, not an entry of `queues`; for `SqsTaskQueue`, no URL; the message ends "(a queue name it does not route)"), or that queue's backend lacks its optional SDK in this process (the message ends "(its driver 'sqs' needs @aws-sdk/client-sqs, which is not installed)"), so nothing is queued — define the queue, or install the package in that process. A queue on another backend of `queues` is routed and needs no change |
+| `RESIZE_QUEUE_ROUTES_INVALID` | — | From `new RoutingTaskQueue()`: the routes are not a non-empty plain object, an object route lacks one of `add`, `claim`, `renew`, `complete`, `fail` or does not serve its own name, or a route is neither a task queue nor a function (the message names the route) — pass a task queue or an `async () => TaskQueue` builder per name |
+| `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED` | — | At worker start: `runWorker({ resizers })` does not list a Resizer of the process that uses a task queue the worker consumes and that cannot filter claims, e.g. SQS (the message names the queue and the Resizers; a queue with `claimFilters` may be shared); the worker would claim their tasks without running them — list them too, or give them their own task queue. With `queues` on more than one available backend, every `FrameworkResizer` that takes its task queue from the config file shares one router that reaches every name, so a worker that consumes a queue on SQS must list all of them, whatever their own queue (`npm run cli ResizeWorker` serves every Resizer). When the message says a task queue failed to load, the worker could not compare that unlisted Resizer's task queue (the load error is the cause) — fix that task queue |
+| `RESIZE_S3_BUCKET_NOT_ALLOWED` | `false` | From `adoptOriginal()` or on a task: the driver refuses a ref the host built. `RESIZE_S3_BUCKET_NOT_ALLOWED`: the bucket is neither `bucketPublic` nor `bucketPrivate` — copy the object into one. Point `bucketPrivate` at that bucket only when no stored original uses the old private bucket and this bucket is not public: otherwise every row in the old bucket fails with this code, and new private uploads, SVG markup included, land in this one. `RESIZE_S3_REF_INVALID`: not `{ bucket, key }` with strings, or a `namespace` that does not prefix the key — fix the ref, or drop `namespace`. `RESIZE_FS_REF_INVALID`: not `{ path, visibility }` with `visibility` `'public'` or `'private'`, or a `namespace` that does not prefix the path — fix the ref. `RESIZE_FS_PATH_TRAVERSAL`: the path, or a symlink on it, leads out of its root — copy the file inside the root. `RESIZE_STORAGE_NAMESPACE_INVALID`: `namespace` is not `/`-separated parts of letters, digits, `_`, `.` and `-`; `null` counts — leave the key out when there is none, and `$unset` a stored `null`. On S3 a `namespace` must also leave room for a preview's key within S3's 1024-byte limit (a preview adds about 50 bytes to it): too long adopts, then every preview fails with `RESIZE_S3_KEY_TOO_LONG` and the task is dead at once — omit or shorten it |
+| `RESIZE_S3_EMPTY_BODY` | `true` | An S3 response had no body. Retried, then dead-lettered after `maxAttempts`. Check the object and the endpoint. |
+| `RESIZE_S3_HINT_CONFLICT` | `false` | `S3Storage.upload` got both `namespace` and `parentRef`: pass one. |
+| `RESIZE_S3_KEY_TOO_LONG` | `false` | The object's key would be over S3's 1024-byte limit, usually because of a long `namespace`: shorten it. Every preview fails with it, and the task is dead at once. |
+| `RESIZE_S3_PRIVATE_BUCKET_REQUIRED` | `false` | A private upload with no `bucketPrivate`, or with one equal to `bucketPublic`: set a distinct private bucket. |
+| `RESIZE_S3_PRIVATE_ORIGINAL_PUBLIC_URL` | `false` | `publicUrl()` got a ref in the private bucket, which has no public URL. Pass a preview's ref, or hand the original over with `storage.signedUrl()`. |
+| `RESIZE_S3_REF_INVALID` | `false` | See `RESIZE_S3_BUCKET_NOT_ALLOWED`. |
+| `RESIZE_S3_VISIBILITY_INVALID` | `false` | `S3Storage.upload` got a `visibility` other than `'public'` or `'private'`: pass one of those. |
+| `RESIZE_SECURITY` | `false` | The default code of a `ResizeSecurityError` whose throw names none. It comes from a host's or a custom driver's code: read its message. |
+| `RESIZE_SETUP` | `true` | The default code of a `ResizeSetupError` whose throw names none: a host's own, or one of the module's internal checks. Read its message. |
+| `RESIZE_SIZE_INVALID` | `false` | A requested size has none of `fit`, a width or a height. A task with it is dead at once. Fix the size in your catalog. |
+| `RESIZE_SOURCE_DAMAGED` | `false` | The source is cut or unreadable: the engine refused its header, or refused its pixels at `limits.failOn` (the worker's dead line then names the level). Dead-lettered on its first delivery, since no retry can help — replace the original (one replaced while the task ran is retried under `RESIZE_WORKER_INCOMPLETE` and renders the new one). Previews made from a damaged original before this version stay fresh: see **Damaged originals** under [Operations](#operations). A download whose length differs from `original.size` stays the retryable `RESIZE_SOURCE_DECODE_FAILED`. On a stored format no decoder of this process lists, damage stays retryable too: `RESIZE_DECODER_MISSING` at `inspect`, `RESIZE_SOURCE_DECODE_FAILED` at render |
+| `RESIZE_SOURCE_DECODE_FAILED` | `true` | Sharp (or a host decoder) could not decode the source, for a reason other than damage; the error's `cause` says why — retried, then dead-lettered |
+| `RESIZE_SOURCE_FORMAT_UNSUPPORTED` | `false` | Every decoder refused the bytes: no decoder of this process reads that format. On a task it is dead-lettered at once; from `uploadOriginal()` or `adoptOriginal()` it is `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`. Add a decoder for it, or reject the file. A bare ref to a non-image (an mp4, HTML, an empty object) is not this code: its task is `RESIZE_SOURCE_DECODE_FAILED`, retried up to `maxAttempts`, where `adoptOriginal()` refuses it at once |
+| `RESIZE_SOURCE_METADATA_MISSING` | `false` | A decoder found no width or height in the stored source. A task with it is dead at once. Replace the original. |
+| `RESIZE_SOURCE_TOO_LARGE` | `false` | A stored original is over a limit, and the message names it: `limits.sourceBytes` (bytes, default 256 MiB), `limits.sourcePixels` or `limits.inputPixels` (pixels). Its task is dead-lettered at once, and `generate()` rejects with it, as `adoptOriginal()` does over `limits.sourceBytes`. Raise that limit, or replace the object. A `beforeStep` whose result is over `limits.sourcePixels` or `limits.inputPixels` gets it too, with no limit named: make the step's result smaller. At upload the same refusals are `RESIZE_ORIGINAL_TOO_LARGE` and `RESIZE_ORIGINAL_TOO_MANY_PIXELS`. |
+| `RESIZE_SQS_EVENT_INVALID` | — | See [Push delivery (preview)](#troubleshooting). |
+| `RESIZE_SQS_QUEUE_UNKNOWN` | — | A direct `SqsTaskQueue` call (`add`, `claim`) named a queue it has no URL for — add the URL to `queues`. A Resizer never gets it: its call on such a name is `RESIZE_QUEUE_NOT_SERVED` before any gate lock or `add()` (see that row) |
+| `RESIZE_SQS_QUEUE_URL_REQUIRED` | — | At construction: `new SqsTaskQueue()` with neither `queueUrl` nor a `queues` entry — pass the `'default'` queue's URL, or name every queue it serves in `queues` (`queueUrl` is optional beside `queues`; a framework `queues` entry with driver `'sqs'` and no `queueUrl` fails with `RESIZE_CONFIG_INVALID` instead) |
+| `RESIZE_STORAGE` | `true` | The default code of a `ResizeStorageError` whose throw names none. It comes from a host's or a custom driver's code: read its message. |
+| `RESIZE_STORAGE_DOWNLOAD_INVALID` | `true` | On a task or from `generate()` (retried, then dead-lettered): a custom driver's `download()` resolved with something other than bytes — make it resolve with a `Buffer` or a `Uint8Array` |
+| `RESIZE_STORAGE_KEY_INVALID` | `false` | From `adoptOriginal()`, or on a task whose ref holds such a key: the driver refuses this key. `S3Storage` reads any key except one with a control character, a `.` or `..` part, a leading `/` or an empty part (`uploads//cat.jpg`, `dir/`, a name holding a tab); `LocalFsStorage` paths stay in `[A-Za-z0-9_.-]` — copy the object to a new key and adopt that |
+| `RESIZE_STORAGE_NAMESPACE_INVALID` | `false` | See `RESIZE_S3_BUCKET_NOT_ALLOWED`. |
+| `RESIZE_STORAGE_NOT_FOUND` | `true` | On a task or from `generate()` (retried, then dead-lettered): `storage.download` found no object at the original's `storageRef` — restore the object, or fix or delete the media. It stays retryable because an object can appear later (a row written before its PUT finishes); each retry costs one 404. An S3 role without `s3:ListBucket` gets 403 for a missing key, which stays the raw SDK error |
+| `RESIZE_STORAGE_REQUIRED` | — | At construction or first use: `new Resizer()` got no `storage`, or a `storage` function resolved with nothing — pass a `ResizeStorage` driver (e.g. `new LocalFsStorage({ … })` from `…/drivers/fs.js`); framework hosts use `new FrameworkResizer()`, which builds it from the config file's `storage` (`RESIZE_CONFIG_STORAGE_MISSING` when that is missing) |
+| `RESIZE_SVG_DIMENSIONS_UNSUPPORTED` | `false` | An SVG's dimensions cannot keep a pixel on each side within the renderer's side limit (`1×100000`, say): refused before storage by `uploadOriginal()` and `adoptOriginal()`. A stored one is dead on its first delivery. Give the SVG a usable size, or refuse the file. |
+| `RESIZE_SVG_PUBLIC_PREVIEW` | `true` | As the cause of a `variant … failed` warning: an engine's `encode` result says SVG (by `format` or `contentType`), HTML or XML, which is never published as a preview; the message names the engine, and only a custom one reaches it — fix the engine |
+| `RESIZE_SVG_RENDER_FAILED` | `true` | The SVG render process crashed, or its task was aborted (a timeout, a lost lease or a stop), and the message then says the abort signal fired. Retried, then dead-lettered after `maxAttempts`. After a crash, look at the SVG, and at the process's memory. |
+| `RESIZE_SVG_RENDER_TIMEOUT` | `false` | An SVG render ran past `limits.processingTimeoutSeconds`, and was killed. A task with it is dead at once. Raise `limits.processingTimeoutSeconds`, or replace the SVG. |
+| `RESIZE_SVG_RENDER_UNAVAILABLE` | `true` | The SVG render process cannot start — allow child processes (`--allow-child-process` under Node's permission model) and keep `svgRasterChild.js` next to `svgRaster.js` in a bundle |
+| `RESIZE_TASK_IN_FLIGHT` | — | In `prewarm()` issues: a task for this media, pipeline and queue is active, or a dead one is cooling down, and it does not cover these variants: one task per media, pipeline and queue runs at a time — call `prewarm()` again after it ends (a read after it ends queues them too) |
+| `RESIZE_TASK_MAX_ATTEMPTS` | `false` | A task was delivered more often than `maxAttempts` with no outcome: its workers kept crashing, or, on push delivery, a record was not started, or an outage or a bad deploy used up its receives (see [How a record ends](#how-a-record-ends)). Dead at once. Fix that cause. |
+| `RESIZE_TASK_TIMEOUT` | `true` | A task ran past `taskTimeoutMs` (on push delivery, past the time the function had, and the message names that budget): raise it. Healthy tasks fail with this code, or are dead-lettered with no previews, beside a slow step: Sharp work that does not go through `rasterToSharp` (`sharp(raster.data, { raw: raster.info })`, a raster spread into a new object), a chain with `.timeout({ seconds: 0 })`, or a slow `beforeStep` holds libuv's threads, and other tasks' Sharp calls wait behind it. `taskTimeoutMs` ends the task but not its variants in progress: each keeps its thread and memory until it ends, and can still store its row, and such a late write can replace a newer row, which the next read finds stale and queues again — run the work through `rasterToSharp`, or give it its own `.timeout({ seconds })` |
+| `RESIZE_WORKER_INCOMPLETE` | `true` | A task left variants missing. Its previews are saved and it is retried for the missing ones, then dead-lettered after `maxAttempts`, or at once when every missing variant failed with `retryable: false` on an original the media still holds. A final error of the whole task is this code too when a reload finds another original on the media, and its next delivery renders the new one. Its `cause` is the first failure: fix what it names. |
+
+### Symptoms without a code
+
+| Symptom | Cause → fix |
+|---|---|
+| a `findOneAndUpdate` middleware on the media model throws on an array update, or `invalidate` fails on a custom model-shaped `MongoMediaModel` | `replacePreviews` (which `invalidate` uses) sends an update pipeline: `findOneAndUpdate(filter, [ … ], { updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } })`, after casting the rows with the model's optional `castObject` — make the model and its middleware accept an array update |
+| the warning `resize worker: the media store did not keep the identity of …` (once per Resizer) | a custom `MediaStore` holds a row with `identity` absent or in another form. A read does not use it, so the row is served and the task completes, but `invalidate()` finds such rows only by identity, so it leaves them, and a `replacePreviews` that removes by stored identity leaves them too (a store keyed by the identity it computes replaces fine) — store and return `identity` as given |
+| `npx --no -- resize-scaffold --check` reports drift in `src/config/resize.ts` or a `resize.<NODE_ENV>.ts` override ("uses the old config shape") right after the upgrade | intended, for every config scaffolded before 0.3.0: a top-level `queue: { … }` object (a `queue` entry inside `queues` is fine), or `defaultFrameworkResizeConfig` imported from `…/config/resize.js` (only full-line `//` comments are skipped) — rewrite it to the new shape (see [Config reference](#config-reference)), or move it aside, re-run `npx --no -- resize-scaffold` and copy your settings back. The config file is never diffed, and a second Resizer's `configName` file is not checked: review it yourself |
+| previews without `origin` / `encodeSig` (written by 0.2.x or earlier), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are stale — served until replaced and regenerated on their next read; their old files stay (clean up in an `onPreviewReplaced` observer, from the "replaced … outdated preview(s)" log line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row references, leaving out every `original.storageRef` and deleting only objects older than a day and more than twice `taskTimeoutMs`). Rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a sweep never finds their files — delete those rows and files yourself |
+| previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or without `origin` and `encodeSig` (written by 0.2.x or earlier) is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up in an `onPreviewReplaced` observer, from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row references, leaving out every `original.storageRef` and deleting only objects older than a day and more than twice `taskTimeoutMs`. The wave shares the queue with new uploads' previews: plan worker capacity |
+| the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews`, so nothing is served or queued, or previews are served as stale, or previews are made again (the line says which) — add `...resizeMediaPaths` to the query. A lean row the module never wrote has neither field: one harmless line |
+| one task per read that renders nothing, and the warning "found every requested preview … already fresh" | the API and the worker run different image settings or pipeline versions (deploy them together), or `resolve()` got the media without its stored original (a projection that drops `original.width` / `height`, or a reshaped `storageRef`) — pass `original` as stored |
+| previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: every read after a task ends queues them again, and each replaced preview costs one render, one upload and one orphaned file — deploy every worker at once, or change settings only after the old workers have stopped |
+| the warning "the media store did not record the original's dimensions", or tasks that fail with a Mongoose `StrictModeError` or `CastError`, are retried and dead-lettered with no previews | a custom `MediaStore` drops `backfillDims` in `appendPreviews` (also with `previews: []`), so every read of such a media queues a task that downloads the original — make it save the dimensions on the original. The shipped `MongoMediaStore` drops them too when the media schema declares `original` strictly (nested paths, or a sub-schema without `strict: false`) without `width` and `height`, or stores them with the wrong type when they are declared as a type that does not read back as a number (not Number, Int32 or Mixed). Under `strict: 'throw'`, or with a type Mongoose cannot cast them to (`Boolean`, `ObjectId`), the backfill is rejected instead: the task fails, is retried and is dead-lettered after `maxAttempts`. In each case its `verify()` warns once, naming the cause — spread `resizeMediaSchemaFragment`, or declare `width` and `height` as `{ type: Number }` in `original` |
+| worker warning `resize worker: media … is stored as '…' but its bytes are '…' (…); rendering it as '…'` (`resize generate:` from `generate()`) | `original.format` holds an alias (`jpg`), a MIME type (`image/jpeg`) or a wrong format, or its decoder refused the bytes or read them as another of its formats (JPEG bytes stored as `png`); the preview renders — fix the record to the decoder's id (`jpeg`) |
+| the warning `resize: upload.maxBytes (…) is above limits.sourceBytes (…)` from `verify()` | the stricter limit wins, since a task could never read a larger stored file, so uploads over `limits.sourceBytes` are refused whatever `upload.maxBytes` says — raise `limits.sourceBytes` to accept them, or lower `upload.maxBytes` |
+| Sharp's `Input file is missing` from a step | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
+| Sharp's `Input buffer contains unsupported image format` from a step | the step calls `sharp(raster.data)`: those bytes are raw pixels, not an image file — use `rasterToSharp(r)` |
+| `img.composite is not a function` (or any Sharp method) from a `variantStep` | an old step that treats its first argument as a Sharp instance; it is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)`, and read `metadata()` values from `r.info`. An old step with a `typeof img.composite === 'function'` check or a `try { } catch { return img; }` raises no error: it renders silently with no watermark, so search for those too |
+| Sharp's `timeout: …% complete` as the cause of a `variant … failed` warning | a `rasterToSharp` chain in a `variantStep` ran past `limits.processingTimeoutSeconds`, and only that variant failed. A slow resize or encode gets the same text, so the warning does not say which. On a worker the task then retries and, after `maxAttempts`, is dead-lettered into the cooldown (`coordination.cooldownMs`) — for a step: make it cheaper, or give the chain its own `.timeout({ seconds })` (`0` turns it off); for a resize or encode: raise the limit |
+| `resize worker: task … is dead (…)` at `error` | the task was dead-lettered; the line holds the code, the reason (`last attempt`, `not retryable`, `delivered more often than maxAttempts`) and the cause — fix the cause first, then the next read after `coordination.cooldownMs` queues the media again. The line is one line; the error goes to your logger as the second argument, and what it prints is your logger's. A logger that formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry whose line holds a sequence such as `%c3` or `%s` |
+| the warning `resize worker: the … observers of task … did not settle within … ms` | a task observer (`afterTaskComplete`, `onTaskFailed` or `onTaskDeadLettered`) was still running after `taskTimeoutMs`, or, once the worker was stopping, 5 s after the later of the stop and the task's end (the line says which). The task's state stands, the worker goes on, and the tap keeps running beside the next task — fix the tap |
+| a preview URL fails while a read calls that preview ready, neither stale nor missing | its file was deleted, usually by a sweep without the age rule: a read never checks storage, so nothing renders it again — call `invalidate()` on that media, and the next read or `prewarm()` queues its previews again. Then fix the sweep: list objects first, read rows after, and delete only objects older than a day and more than twice `taskTimeoutMs` |
+| a variant stays missing for ~10 min after its task was dead-lettered | `coordination.cooldownMs` (default 600000): the dead task holds the gate of its media, pipeline and queue until the cooldown ends, so reads queue nothing and `prewarm()` reports `RESIZE_TASK_IN_FLIGHT` (SQS: `RESIZE_ENQUEUE_LOCK_CONTENDED`) — fix the cause in the logs first |
+| `TS2305` or `TS2724` on `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` or `FrameworkS3StorageConfig` (TypeScript may suggest `FrameworkWorkerConfig`, which is another type) | these aliases are removed — import `StorageConfig`, `LocalStorageConfig` or `S3StorageConfig`, the same types under their core names, from the same entry |
+| tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>`. The gate is per queue: such a task blocks new tasks for its media and pipeline on that queue only, never reads on another queue |
+| models fail to load (framework ≥5.1 reports a duplicate framework copy explicitly at boot) | two `@adaptivestone/framework` copies resolve (npm link / nested install) — dedupe to exactly one |
+| previews never appear | the worker process isn't running, or `worker.enabled` is `false` in that process (it logs the `warn` `resize worker disabled — this process consumes no tasks; …`, and the command resolves `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1) |
+| `resize worker: no Resizer has a task queue (eager-only wiring)` | this process consumes nothing: the same mistake as a disabled worker, with the same result (an `error` line, and the command resolves `false`) — set `queue` and `queues`, or do not run a worker |
+| a deleted preview is still served by the CDN | every public object `S3Storage` uploads is cached for a year (`immutable`): purge the CDN path (browsers that already have it may keep it until it expires) |
+| first read of a new size is slow to fill | lazy mode working as designed — call `prewarm()` at upload if it matters |
+| `resolve` `output` is `undefined` | no `formatPublicUrls` hook (or it threw) — map `decision` or use `formatPictureUrls` |
 
 ## Development
 

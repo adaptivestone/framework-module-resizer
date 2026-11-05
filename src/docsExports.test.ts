@@ -6,6 +6,8 @@
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { RESIZE_ERROR_CODES } from './errorCodes.ts';
+import { errorTableRows } from './testHelpers/errorTable.ts';
 import {
   docImports,
   docName,
@@ -456,4 +458,138 @@ test('UPGRADING.md names every 0.4.0 trap, and what comes before npm i comes fir
     false,
     'no install in the head',
   );
+});
+
+// The README text from a heading to the next `## ` heading, or, for a subsection, the next heading.
+const readmeSection = (heading: string): string => {
+  const readme = read('README.md');
+  const start = readme.indexOf(`\n${heading}\n`);
+  assert.ok(start >= 0, `README.md has no "${heading}"`);
+  const end = readme.indexOf('\n## ', start + 1);
+  return readme.slice(start, end < 0 ? undefined : end);
+};
+const readmeSubsection = (heading: string): string => {
+  const readme = read('README.md');
+  const start = readme.indexOf(`\n${heading}\n`);
+  assert.ok(start >= 0, `README.md has no "${heading}"`);
+  const end = readme.indexOf('\n##', start + 1);
+  return readme.slice(start, end < 0 ? undefined : end);
+};
+
+test('the README Error codes table has one row per code, in order, and names no other', () => {
+  const rows = errorTableRows(read('README.md'));
+  assert.deepEqual(
+    rows.map((row) => row.code),
+    [...RESIZE_ERROR_CODES].sort(),
+  );
+  for (const row of rows) {
+    assert.ok(row.text.length > 0, `${row.code} has no text`);
+    assert.match(row.text, /^[^a-z]/, `${row.code} opens mid-sentence`);
+  }
+});
+
+test('a row that says See points at a row with its own text', () => {
+  const rows = errorTableRows(read('README.md'));
+  const texts = new Map(rows.map((row) => [row.code, row.text]));
+  for (const row of rows) {
+    const target = /^See `(RESIZE_[A-Z0-9_]+)`\.$/.exec(row.text)?.[1];
+    if (target !== undefined) {
+      assert.ok(texts.has(target), `${row.code} points at ${target}`);
+      assert.match(texts.get(target) ?? '', /^(?!See )/, row.code);
+    }
+  }
+});
+
+test('no row of the table has a cut parenthesis', () => {
+  for (const row of errorTableRows(read('README.md'))) {
+    const prose = row.text.replace(/``.*?``/g, '').replace(/`[^`]*`/g, '');
+    assert.equal(
+      prose.split('(').length,
+      prose.split(')').length,
+      `${row.code}: ${prose.slice(0, 80)}`,
+    );
+  }
+});
+
+test('the adoptOriginal table says what the full table says', () => {
+  const full = new Map(
+    errorTableRows(read('README.md')).map((row) => [row.code, row.retryable]),
+  );
+  let codes = 0;
+  for (const line of readmeSubsection('### `adoptOriginal()`').split('\n')) {
+    const cells = line.split(' | ');
+    const stated = cells.at(-1) ?? '';
+    if (line.startsWith('| ') && /^`(true|false)`/.test(stated)) {
+      for (const [code] of (cells.at(-2) ?? '').matchAll(
+        /RESIZE_[A-Z0-9_]+/g,
+      )) {
+        codes += 1;
+        assert.ok(stated.includes(full.get(code) ?? 'no row'), code);
+      }
+    }
+  }
+  assert.ok(codes >= 12, `only ${codes} codes read`);
+});
+
+test('a code in both the full table and the prewarm() table says the same, or says why not', () => {
+  const full = new Map(
+    errorTableRows(read('README.md')).map((row) => [row.code, row]),
+  );
+  const issues = [
+    ...readmeSubsection('### `prewarm()` issues').matchAll(
+      /^\| `(RESIZE_[A-Z0-9_]+)` \|.* \| `(true|false)`[^|]*\|$/gm,
+    ),
+  ];
+  assert.ok(issues.length >= 13, `only ${issues.length} issues read`);
+  for (const [, code, value] of issues) {
+    const row = full.get(code);
+    assert.ok(row, code);
+    if (row.retryable === '—') {
+      assert.match(row.text, /`prewarm\(\)`/, `${code} does not point there`);
+    } else if (row.retryable !== `\`${value}\``) {
+      assert.match(
+        row.text,
+        /As a `prewarm\(\)` issue it is `false`: calling again cannot help/,
+        code,
+      );
+    }
+  }
+});
+
+test('every symptom that left AGENTS.md has a row in the README', () => {
+  const symptoms = readmeSection('## Error codes');
+  for (const needle of [
+    'previews never appear',
+    'tasks stay `pending` on one queue',
+    'a deleted preview is still served by the CDN',
+    'first read of a new size is slow to fill',
+    'the media store did not keep the identity of',
+    'Input file is missing',
+    'img.composite is not a function',
+    'a preview URL fails while a read calls that preview ready',
+    'did not settle within',
+  ]) {
+    assert.ok(symptoms.includes(needle), needle);
+  }
+});
+
+test('the push troubleshooting table names every symptom that left AGENTS.md', () => {
+  const push = readmeSection('## Push delivery (preview)');
+  for (const needle of [
+    'RESIZE_DELIVERY_UNSUPPORTED',
+    'Failed tasks disappear',
+    'the first record … was not started',
+    'message … was not started',
+    'setting the visibility … had not answered',
+    'A task in the dead-letter queue with no `is dead` line',
+  ]) {
+    assert.ok(push.includes(needle), needle);
+  }
+});
+
+test('## Config reference ends inside what npm shows of the README', () => {
+  const readme = read('README.md');
+  const drivers = readme.indexOf('\n## Drivers\n');
+  assert.ok(readme.indexOf('\n## Config reference\n') < drivers);
+  assert.ok(drivers < 65536, `## Config reference ends at ${drivers}`);
 });

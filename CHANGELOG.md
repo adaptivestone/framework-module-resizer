@@ -315,6 +315,9 @@
   did not ship.
 - The 0.3.0 docs gave a sweep of preview objects with no age rule. It can delete the file of a row about
   to be written, and a read still calls that row ready. `UPGRADING.md` gives the rule and the repair.
+- The README has one full error table, `## Error codes`: every code with its `retryable` and what to do.
+  A test requires every code in it, and holds the values to the audited table.
+- `## Config reference` moved above `## Drivers` in the README, so it ends inside the 64 KiB npm shows.
 
 **Internal**
 
