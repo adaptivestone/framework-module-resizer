@@ -1005,7 +1005,10 @@ An engine extends `ImageEngine`, or is any object of the same shape (the core ne
   the box), 8-bit sRGB, 3 channels or 4 with alpha; a grey frame comes back as colour. `mode: 'fill'`
   puts the whole frame into that size, and `'cover'` scales to cover it and crops from the centre. An
   engine without a sharpener ignores `sharpen`. `coverBox` is set only on the reduction after
-  `beforeSteps`: it is the box `width × height` was computed from, and any engine may ignore it.
+  `beforeSteps`: it is the box `width × height` was computed from, and any engine may ignore it. A
+  result marked `info.premultiplied: true` is converted to straight alpha in plain JS, on the event
+  loop (182 ms at 24 MP), before a step or `encode` sees it, unless its `info.format` is `'raw'`: that
+  is Sharp's own `info`, whose flag is true on straight bytes after a resize, so it reads as straight.
 - `encode(raster, { format, options, background }, { limits, signal })` takes one frame of 1 to 4
   channels with straight alpha, or `info.frames` of them (with `info.delay` and `info.loop`) for a
   format in `animatedFormats`. `options` is `encode.formats[format]`. When `background` is set, flatten

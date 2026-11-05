@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
-import type { Raster, SourceInfo } from './contracts/decoder.ts';
+import type { Raster, RasterInfo, SourceInfo } from './contracts/decoder.ts';
 import type {
   EncodedImage,
   EncodeRequest,
@@ -579,6 +579,107 @@ test("a task's signal does not stop a variant's steps or its encode: only the en
   assert.ok(out.data.length > 0);
   assert.deepEqual(ran, ['first', 'second']);
   assert.deepEqual(signals, [controller.signal]);
+});
+
+/** Marks straight [200, 100, 50, 51] premultiplied, as [40, 20, 10, 51]: `resize` may do that. */
+function premultiplyingEngine(resultInfo: Partial<RasterInfo> = {}) {
+  const encodes: Raster[] = [];
+  const recording = {
+    id: 'premultiplying',
+    formats: engine.formats,
+    animatedFormats: engine.animatedFormats,
+    resize: async (_frame: Raster, req: { width: number; height: number }) => ({
+      ...solid(req.width, req.height, [40, 20, 10, 51]),
+      info: {
+        width: req.width,
+        height: req.height,
+        channels: 4,
+        premultiplied: true,
+        ...resultInfo,
+      },
+    }),
+    encode: (raster: Raster, req: EncodeRequest, opts: EngineCallOptions) => {
+      encodes.push(raster);
+      return engine.encode(raster, req, opts);
+    },
+  } as unknown as ImageEngine;
+  return { recording, encodes };
+}
+
+test("an engine's resize result marked premultiplied reaches the encode and the first step as straight alpha", async () => {
+  for (const withStep of [false, true]) {
+    const { recording, encodes } = premultiplyingEngine();
+    const stepInput: Raster[] = [];
+    const size = sizePlan(8, 8);
+    const sized = await renderSize(
+      solid(16, 16, [9, 9, 9, 9]),
+      size,
+      recording,
+      {
+        limits,
+      },
+    );
+    assert.equal(sized.info.premultiplied, undefined);
+    assert.deepEqual([...sized.data.subarray(0, 4)], [200, 100, 50, 51]);
+    await encodeVariant(sized, variantPlan(size, 'webp'), {
+      ...encodeOptions(
+        withStep
+          ? [
+              (raster) => {
+                stepInput.push(raster);
+                return raster;
+              },
+            ]
+          : [],
+      ),
+      engine: recording,
+    });
+    for (const raster of [...stepInput, ...encodes]) {
+      assert.equal(raster.info.premultiplied, undefined);
+      assert.deepEqual([...raster.data.subarray(0, 4)], [200, 100, 50, 51]);
+    }
+    assert.equal(encodes.length, 1);
+    assert.equal(stepInput.length, withStep ? 1 : 0);
+  }
+});
+
+test("the reduction after beforeSteps converts an engine's premultiplied result too", async () => {
+  const { recording } = premultiplyingEngine();
+  const out = await reduceToBox(
+    solid(40, 40, [9, 9, 9, 9]),
+    { width: 20, height: 20 },
+    recording,
+    { limits },
+  );
+  assert.equal(out.info.premultiplied, undefined);
+  assert.deepEqual([...out.data.subarray(0, 4)], [200, 100, 50, 51]);
+});
+
+test("an engine that hands back Sharp's own info keeps its colours: the flag lies on those straight bytes", async () => {
+  const { recording } = premultiplyingEngine();
+  const sharpResize: ImageEngine = {
+    ...recording,
+    id: 'sharp-wrapper',
+    resize: async (frame, req) => {
+      const { data, info } = await sharp(frame.data, {
+        raw: {
+          width: frame.info.width,
+          height: frame.info.height,
+          channels: frame.info.channels,
+        },
+      })
+        .resize(req.width, req.height, { fit: 'fill' })
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      return { data, info } as Raster;
+    },
+    encode: recording.encode,
+  };
+  const size = sizePlan(10, 10);
+  const source = solid(20, 20, [200, 100, 50, 51]);
+  const sized = await renderSize(source, size, sharpResize, { limits });
+  assert.equal(sized.info.premultiplied, undefined);
+  assert.deepEqual([...sized.data.subarray(0, 4)], [200, 100, 50, 51]);
 });
 
 test('a step that resolves with a Buffer is told to return its pixels, not an image file', async () => {

@@ -7,7 +7,8 @@ import { afterEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import sharp from 'sharp';
-import type { SourceDecoder } from './contracts/decoder.ts';
+import type { Raster, SourceDecoder } from './contracts/decoder.ts';
+import type { EngineCallOptions, ResizeRequest } from './contracts/engine.ts';
 import type { LeasedTask } from './contracts/taskQueue.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
@@ -114,6 +115,44 @@ test('only a format in encode.flatten is asked to flatten', async () => {
 
 // worker.test.ts pins that a worker uses its Resizer's engine, on Sharp's resize. Here both pixel
 // operations are the fake's, so the file is a PNG of the requested size.
+test('a resize result marked premultiplied is stored straight, not darkened', async () => {
+  class Premultiplying extends FakeEngine {
+    override async resize(
+      frame: Raster,
+      req: ResizeRequest,
+      opts: EngineCallOptions,
+    ): Promise<Raster> {
+      const { data, info } = await super.resize(frame, req, opts);
+      const out = Buffer.from(data);
+      for (let i = 0; i < out.length; i += 4) {
+        for (let c = 0; c < 3; c++) {
+          out[i + c] = Math.round((out[i + c] * out[i + 3]) / 255);
+        }
+      }
+      return { data: out, info: { ...info, premultiplied: true } };
+    }
+  }
+  const { resizer, files, doc } = setup(new Premultiplying(), {
+    formats: ['webp'],
+  });
+  const data = Buffer.alloc(64 * 48 * 4);
+  for (let i = 0; i < 64 * 48; i++) {
+    data.set([200, 100, 50, 51], i * 4);
+  }
+  doc.original = await resizer.uploadOriginal({
+    body: encodePng({ data, info: { width: 64, height: 48, channels: 4 } }),
+    visibility: 'private',
+  });
+  const { created } = await resizer.generate({
+    media: doc,
+    sizes: [{ width: 32 }],
+  });
+  const stored = decodePng(
+    files.get((created[0].storageRef as { key: string }).key) as Buffer,
+  );
+  assert.deepEqual([...stored.data.subarray(0, 4)], [200, 100, 50, 51]);
+});
+
 test('a fake engine renders a queued task', async () => {
   const engine = new FakeEngine();
   const { resizer, files, doc } = setup(engine);

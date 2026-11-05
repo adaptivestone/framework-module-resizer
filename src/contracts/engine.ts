@@ -45,7 +45,12 @@ export abstract class ImageEngine {
   abstract readonly id: string; // names the engine in messages
   abstract readonly formats: readonly string[]; // what encode writes; only verify() compares the config with it
   abstract readonly animatedFormats: readonly string[]; // what encode writes with every frame
-  /** One frame in; one frame out at exactly the size asked for (with `coverBox`: within a pixel of it, covering the box), 8-bit sRGB, 3 channels or 4 with alpha. */
+  /**
+   * One frame in; one frame out at exactly the size asked for (with `coverBox`: within a pixel of it,
+   * covering the box), 8-bit sRGB, 3 channels or 4 with alpha. It may mark its bytes
+   * `info.premultiplied`, and the core converts them to straight alpha in plain JS, unless its
+   * `info.format` is `'raw'`: Sharp's own info, whose flag is true on straight bytes after a resize.
+   */
   abstract resize(
     frame: Raster,
     req: ResizeRequest,

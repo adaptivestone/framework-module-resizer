@@ -2,8 +2,8 @@
 // chain, the box reduction after it, one render per exact size, and the encode of each format from
 // it. No image library here: every pixel operation is a call on the engine. What an engine returns
 // is checked here, because the core relies on it. Every function but `straightAlpha` takes a
-// straight-alpha raster: the Processor converts a premultiplied one first, and so do both step
-// chains for a step's result, so nothing here forwards a premultiplied flag.
+// straight-alpha raster: the Processor converts a premultiplied one first, both step chains do for
+// a step's result, and `resized` for an engine's, so nothing here forwards a premultiplied flag.
 import type {
   DecodeBox,
   Raster,
@@ -59,7 +59,8 @@ async function resized(
       { code: 'RESIZE_ENGINE_INVALID' },
     );
   }
-  return out;
+  // `encode` and a step are promised straight alpha, and `resize` may mark its bytes.
+  return straightAlpha(withoutSharpFlag(out));
 }
 
 /**
@@ -125,6 +126,19 @@ export function straightAlpha(raster: Raster): Raster {
   return { data, info };
 }
 
+/**
+ * Host code's raster, with a flag that cannot be believed dropped. Sharp's own `{ data, info }` from
+ * `toBuffer({ resolveWithObject: true })` says premultiplied on straight bytes after a resize (see
+ * readRaster). A raster the host built has no `format`, and its flag is believed.
+ */
+function withoutSharpFlag(raster: Raster): Raster {
+  if ((raster.info as { format?: unknown }).format === 'raw') {
+    const { premultiplied: _dropped, ...info } = raster.info;
+    return { data: raster.data, info };
+  }
+  return raster;
+}
+
 /** The top frame, without timing (the raster itself when it has one frame and no timing). */
 export function firstFrame(raster: Raster): Raster {
   const { width, height, channels, frames = 1, delay, loop } = raster.info;
@@ -167,15 +181,7 @@ function stepResult(
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
-  const raster = value as Raster;
-  // Sharp's own `{ data, info }` from `toBuffer({ resolveWithObject: true })`: after a resize its
-  // flag says premultiplied on straight bytes (see readRaster). A raster a step built has no
-  // `format`, and its flag is believed.
-  if ((raster.info as { format?: unknown }).format === 'raw') {
-    const { premultiplied: _dropped, ...info } = raster.info;
-    return { data: raster.data, info };
-  }
-  return raster;
+  return withoutSharpFlag(value as Raster);
 }
 
 /**

@@ -214,8 +214,9 @@
 - A raster a host decoder marks `premultiplied` now converts to straight alpha in plain JS. It can
   differ from 0.3.0 by 1 level per channel, and it blocks the event loop (182 ms at 24 MP, 372 ms at
   50 MP, against Sharp's 56 ms and 126 ms off the loop), which matters for eager `generate()` on an API
-  route and holds for a `beforeStep` or `variantStep` result marked `premultiplied` too. The built-in
-  decoders never mark one, so their previews do not change, and nothing regenerates.
+  route and holds for a `beforeStep` or `variantStep` result marked `premultiplied` too, and for an
+  engine's `resize` result. The built-in decoders and `SharpEngine` never mark one, so their previews
+  do not change, and nothing regenerates.
 - A variant step that adds transparency to an opaque preview now gets the `encode.flatten` background
   on a flattened format; in 0.3.0 those areas of a JPEG came out black. A pipeline hit by this bumps
   its `version`.
