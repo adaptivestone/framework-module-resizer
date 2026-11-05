@@ -532,13 +532,16 @@ test('a record with no event source runs on the only lane, and is listed when th
     client: sqs.client as unknown as SQSClient,
     logger: silentLogger,
   });
-  const two = batchHandler(async () => ({
-    ...wiring,
-    lanes: [
-      ...wiring.lanes,
-      { ...wiring.lanes[0], queue: 'bulk', carrier: bulk },
-    ],
-  }));
+  const two = batchHandler(
+    async () => ({
+      ...wiring,
+      lanes: [
+        ...wiring.lanes,
+        { ...wiring.lanes[0], queue: 'bulk', carrier: bulk },
+      ],
+    }),
+    { settleMarginMs: 300 },
+  );
   const several = await two({ Records: [bare('b')] }, contextOf(60_000));
   assert.deepEqual(several.batchItemFailures, [{ itemIdentifier: 'b' }]);
   assert.equal(sqs.deletes(), 1, 'it did not run');
@@ -703,10 +706,13 @@ test('an empty batch runs the checks and lists nothing', async () => {
   const sqs = fakeSqs();
   const { wiring, flushes } = pushed(sqs, async () => {});
   let wired = 0;
-  const handler = batchHandler(async () => {
-    wired += 1;
-    return wiring;
-  });
+  const handler = batchHandler(
+    async () => {
+      wired += 1;
+      return wiring;
+    },
+    { settleMarginMs: 300 },
+  );
   const out = await handler({ Records: [] }, contextOf(60_000));
   assert.deepEqual(out, { batchItemFailures: [] });
   assert.equal(wired, 1);
@@ -718,13 +724,16 @@ test('the checks run once, and rejected checks throw, touch no record and run ag
   const sqs = fakeSqs();
   const { wiring } = pushed(sqs, async () => assert.fail('must not run'));
   let runs = 0;
-  const handler = batchHandler(async () => {
-    runs += 1;
-    if (runs === 1) {
-      throw new ResizeSetupError('no'); // its default code is RESIZE_SETUP
-    }
-    return wiring;
-  });
+  const handler = batchHandler(
+    async () => {
+      runs += 1;
+      if (runs === 1) {
+        throw new ResizeSetupError('no'); // its default code is RESIZE_SETUP
+      }
+      return wiring;
+    },
+    { settleMarginMs: 300 },
+  );
   // The event is checked first: one that is no batch runs no check at all.
   await assert.rejects(handler({} as never, contextOf(60_000)), {
     code: 'RESIZE_SQS_EVENT_INVALID',

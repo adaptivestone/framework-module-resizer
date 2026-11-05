@@ -1,7 +1,9 @@
 // Test-only: the harness of push delivery. `fakeSqs` is an SQS client that records every call and
 // can make one fail or wait; `pushed` puts a batchHandler with one lane over a real SqsTaskQueue on
 // that client, so a delivered record runs through the real Consumer and the real queue. The other
-// helpers build what a Lambda invocation receives. Nothing here touches AWS.
+// helpers build what a Lambda invocation receives, and `onVirtualClock` runs a test whose numbers a
+// busy machine must not move. Nothing here touches AWS.
+import type { TestContext } from 'node:test';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import { defaultQueueOptions } from '../config/resize.ts';
 import type { ConsumerDeps } from '../consumer.ts';
@@ -105,6 +107,46 @@ export function deferred(): {
   return Promise.withResolvers<void>();
 }
 
+// The longest a test on the virtual clock may wait for: past it, the test hangs rather than waits.
+const MAX_VIRTUAL_MS = 700_000;
+
+/**
+ * Run `body` on a virtual clock: setTimeout, setInterval, Date.now() and performance.now() all read
+ * it, and it moves 1 ms at a time, only once everything that can run has run. So a timer never fires
+ * late and the time left never slips, however busy the machine is, and a test can state exact
+ * numbers. It runs real promises through the real code: only time is virtual, so what `body` awaits
+ * must not need real I/O, which would never be waited for. A timer still pending when `body` ends
+ * is dropped.
+ */
+export async function onVirtualClock(
+  t: TestContext,
+  body: () => Promise<void>,
+): Promise<void> {
+  t.mock.timers.enable({
+    apis: ['setTimeout', 'setInterval', 'Date'],
+    now: Date.now(),
+  });
+  let now = Math.ceil(performance.now()); // whole, so that a difference of two readings is exact
+  t.mock.method(performance, 'now', () => now);
+  let ended = false;
+  const run = body().finally(() => {
+    ended = true;
+  });
+  run.catch(() => {}); // reported by the `await run` below, after the loop's turn
+  for (let moved = 0; !ended; moved += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    if (ended) {
+      break;
+    }
+    if (moved >= MAX_VIRTUAL_MS) {
+      throw new Error(`the test is still waiting after ${moved} virtual ms`);
+    }
+    now += 1;
+    t.mock.timers.tick(1);
+  }
+  await run;
+}
+
 const errorNamed = (name: string, message: string): Error =>
   Object.assign(new Error(message), { name });
 
@@ -132,6 +174,10 @@ export function pushed(
     timing?: Partial<QueueTimingOptions>;
     locks?: ClockLocks; // default clockLocks()
     observer?: () => Promise<void>; // awaited in the events handler, after the event is recorded
+    stop?: number; // BatchOptions.stopBeforeTimeoutMs
+    margin?: number; // BatchOptions.settleMarginMs, default 300
+    processing?: number; // limits.processingTimeoutSeconds of every task, default 30
+    checks?: () => Promise<void>; // awaited inside the wiring function
   } = {},
 ): {
   handler: SqsHandler;
@@ -189,14 +235,24 @@ export function pushed(
         },
       },
     ],
-    processingSecondsOf: () => 30,
+    processingSecondsOf: () => over.processing ?? 30,
     flush: async (waitMs) => {
       flushes.push(waitMs);
     },
     logger,
   };
   return {
-    handler: batchHandler(async () => wiring),
+    handler: batchHandler(
+      async () => {
+        await over.checks?.();
+        return wiring;
+      },
+      {
+        stopBeforeTimeoutMs: over.stop,
+        settleMarginMs: over.margin ?? 300,
+        logger,
+      },
+    ),
     wiring,
     locks,
     events,
