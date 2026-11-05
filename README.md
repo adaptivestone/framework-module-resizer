@@ -134,6 +134,10 @@ const { decision } = await getResizer().resolve({ media: file, sizes });
 const picture = formatPictureUrls(decision, { id: String(file.id) });
 ```
 
+`formatPictureUrls` maps each size key and format to `{ url, contentType }`. Its entries also carry
+`width` and `height`, the preview's real size, when the row has them: a size key does not promise a
+size, since a preview can be smaller than its box.
+
 `generate()` stores the new rows itself and also appends them to `file.previews`, so a
 same-request `resolve()` sees them. Reload the media before saving it after `generate()` or
 `invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is

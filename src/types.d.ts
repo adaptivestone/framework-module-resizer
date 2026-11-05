@@ -222,7 +222,12 @@ export interface PictureUrls {
   id?: string;
   sizes: {
     [sizeKey: string]: {
-      [format: string]: { url: string; contentType?: string };
+      [format: string]: {
+        url: string;
+        contentType?: string;
+        width?: number; // the preview's real size, when its row records it
+        height?: number;
+      };
     };
   };
 }

@@ -137,6 +137,8 @@
   nothing. `maxBytes` lowers `limits.sourceBytes` for one call, for an adoption on a request path. New
   codes `RESIZE_ORIGINAL_DOWNLOAD_FAILED`, `RESIZE_ORIGINAL_PUBLIC_REFUSED`,
   `RESIZE_ADOPT_MAX_BYTES_INVALID`.
+- `formatPictureUrls` entries carry `width` and `height` when the row has them, since a size key
+  does not promise a size. A host that snapshots its API JSON sees two new fields.
 
 **Fixes**
 

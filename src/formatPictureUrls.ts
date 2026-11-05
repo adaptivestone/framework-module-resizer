@@ -21,9 +21,16 @@ export function formatPictureUrls(
       byFormat = new Map();
       sizes.set(entry.sizeKey, byFormat);
     }
+    // A preview can be smaller than its size key says, so a host reads its real size from here.
+    // `?.`: this function never read the row before, so an entry an untyped host built keeps working.
+    const width = entry.preview?.actualWidth;
+    const height = entry.preview?.actualHeight;
     byFormat.set(entry.format, {
       url: entry.url,
       contentType: entry.contentType,
+      ...(typeof width === 'number' && typeof height === 'number'
+        ? { width, height }
+        : {}),
     });
   }
   const out: PictureUrls = {

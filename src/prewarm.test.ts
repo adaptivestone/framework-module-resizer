@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'node:test';
+import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type {
@@ -12,17 +13,22 @@ import { Resizer, resetResizerForTests } from './resizer.ts';
 import { RoutingTaskQueue } from './routing.ts';
 import {
   clockLocks,
+  docMedia,
   fakeMedia,
   MemoryTaskQueue,
   memoryLocks,
+  memoryStorage,
   PlainTaskQueue,
+  refKey,
 } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
+import { workUntil } from './testHelpers/work.ts';
 import type {
   MediaLike,
   MissingPreview,
   ResizeLogger,
+  SizeInput,
   StorageRef,
 } from './types.d.ts';
 
@@ -1044,5 +1050,113 @@ describe('prewarm — formats from a beforeEnqueue tap', () => {
       result.issues.map((issue) => [issue.code, issue.previews.length]),
       [['RESIZE_FORMAT_NOT_CONFIGURED', 1]],
     );
+  });
+});
+
+describe('prewarm — beside a generate() on the upload route', () => {
+  /** A real PNG as media m1, on real Sharp, with the task queue and a worker that drains it. */
+  async function route() {
+    const png = await sharp({
+      create: {
+        width: 64,
+        height: 64,
+        channels: 3,
+        background: { r: 255, g: 0, b: 0 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const { warn } = installFakeApp();
+    const docs = new Map<string, MediaLike>();
+    const { storage } = memoryStorage();
+    const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
+    const r = new Resizer({
+      storage,
+      media: docMedia(docs),
+      tasks,
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: currentLogger,
+    });
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    docs.set('m1', { id: 'm1', original, previews: [] });
+    // The request's copy, as a host loads it: the store's document stays the stored truth.
+    const stored = () => docs.get('m1') as MediaLike;
+    const media = structuredClone(stored());
+    const work = () =>
+      workUntil({ logger: currentLogger, resizers: [r] }, () =>
+        tasks.rows.every((row) => row.status === 'completed'),
+      );
+    return { r, tasks, stored, media, work, warn };
+  }
+
+  const small: SizeInput = { width: 20, height: 20 };
+  const rest: SizeInput[] = [{ width: 40, height: 40 }, { width: 30 }];
+
+  test('generate() of one size, then prewarm() of the rest, ends with each preview stored once', async () => {
+    const { r, tasks, stored, media, work, warn } = await route();
+    const eager = await r.generate({
+      media,
+      sizes: [small],
+      formats: ['webp'],
+    });
+    assert.deepEqual(
+      eager.created.map((row) => row.sizeKey),
+      ['20x20'],
+    );
+
+    const result = await r.prewarm({
+      media,
+      sizes: [small, ...rest],
+      formats: ['webp'],
+    });
+    assert.equal(result.status, 'accepted');
+    assert.deepEqual(
+      result.ready.map((p) => p.sizeKey),
+      ['20x20'],
+    );
+    // The task holds only the rest: the size this request already made is not rendered twice.
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(tasks.rows[0].task.previews.map((p) => p.sizeKey).sort(), [
+      '30w',
+      '40x40',
+    ]);
+
+    await work();
+
+    const rows = stored().previews ?? [];
+    assert.deepEqual(rows.map((row) => row.sizeKey).sort(), [
+      '20x20',
+      '30w',
+      '40x40',
+    ]);
+    assert.equal(new Set(rows.map((row) => refKey(row.storageRef))).size, 3);
+    const { decision } = await r.resolve({
+      media: structuredClone(stored()),
+      sizes: [small, ...rest],
+      formats: ['webp'],
+    });
+    assert.equal(decision.missing.length, 0);
+    assert.equal(decision.ready.length, 3);
+    assert.equal(tasks.rows.length, 1); // the read queued nothing
+    assert.deepEqual(warn, []);
+  });
+
+  test('a resolve() before generate() queues a task that renders nothing and warns once', async () => {
+    const { r, tasks, stored, media, work, warn } = await route();
+    await r.resolve({ media, sizes: [small], formats: ['webp'] });
+    assert.equal(tasks.rows.length, 1);
+
+    await r.generate({ media, sizes: [small], formats: ['webp'] });
+    const [row] = stored().previews ?? [];
+    assert.ok(row);
+
+    await work();
+
+    assert.deepEqual(stored().previews, [row]);
+    assert.equal(warn.length, 1);
+    assert.match(String(warn[0][0]), /already fresh/);
   });
 });

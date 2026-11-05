@@ -49,8 +49,10 @@ without `resizer`/`pipeline` belong to `default`. Task rows written before the g
 stored previews only. For a pipeline without `variantSteps`, a raster original no larger than a
 requested `WxH` box gets a preview at its own size (no upscaling, no cropping, metadata removed;
 only the `limits.resultDimension` cap can scale it down); a pipeline with `variantSteps` always
-gets the full box its steps were written for. To hand the private original to its owner, call
-`storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it, and on
+gets the full box its steps were written for. A width-only or height-only size larger than the
+source, and a box larger than the source on one side only, do enlarge it, so a size key does not
+promise a size: read `width` and `height` from `formatPictureUrls`. To hand the private original
+to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it, and on
 `S3Storage` only that call needs `@aws-sdk/s3-request-presigner`.
 
 ## Integrate (in order)
@@ -642,7 +644,9 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 - `original.format` should be the decoder's id (`jpeg`, `png`, `svg`, …; not `jpg` or a MIME
   type), as `uploadOriginal()` returns it. The worker tries that decoder first; a mismatch is
   logged as a warning and the bytes are probed, so the preview still renders: fix the record.
-- Never resize/encode with sharp on the request path. `uploadOriginal()` has two bounded exceptions:
+- Never resize/encode with sharp on the request path: a read (`resolve()`, a DTO builder, a list
+  route) never runs it. Eager `generate()` on an upload route is the documented exception: that
+  request waits for Sharp. `uploadOriginal()` has two bounded exceptions:
   the decoders' `inspect()`, and, only with `upload.verify: 'decode'`, one decode to a 16 px raster
   for a raster format, which emits no bytes. `adoptOriginal()` has the same two, and always runs the
   decode. It costs about 0.1 s for a 24 MP JPEG and about 1 s for
