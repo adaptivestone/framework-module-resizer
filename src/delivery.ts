@@ -33,8 +33,14 @@ import {
 } from './contracts/taskQueue.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
+import { carrierOf } from './routing.ts';
 import type { ResizeLogger } from './types.d.ts';
-import { flushMetrics, prepareServing, type ServingOptions } from './worker.ts';
+import {
+  flushMetrics,
+  prepareServing,
+  type ServedLane,
+  type ServingOptions,
+} from './worker.ts';
 
 export interface SqsRecordLike {
   messageId: string;
@@ -494,22 +500,37 @@ export function batchHandler(
 ): SqsHandler {
   const { settleMarginMs: margin, stopBeforeTimeoutMs } = opts;
   let ready: Promise<DeliveryWiring> | undefined;
+  let missed = 0; // the invocations that `ready` did not settle within
   // A role without the permission fails every adoption, and one line says what is wrong.
   let adoptionFailureLogged = false;
   return async (event, context) => {
     checkEvent(event, context);
     const left = () => context.getRemainingTimeInMillis();
     const enteredWithMs = left();
-    ready ??= wiring().catch((err) => {
-      ready = undefined;
-      throw err;
-    });
+    if (!ready) {
+      missed = 0;
+      const built: Promise<DeliveryWiring> = wiring().catch((err) => {
+        // Checks dropped below can reject long after newer ones were built.
+        if (ready === built) {
+          ready = undefined;
+        }
+        throw err;
+      });
+      ready = built;
+    }
     const checks = ready;
     if (!(await settledWithin(checks, left() - margin))) {
+      // The handler returns normally, so Lambda keeps this environment: checks that never settle
+      // would list every record for its whole life, using receives until redrive moves them.
+      missed += 1;
+      const again = missed >= 2;
+      if (again) {
+        ready = undefined;
+      }
       // The wiring's logger does not exist yet.
       logNeverThrow(
         opts.logger ?? console,
-        `resize lambda: the first invocation's checks had not finished ${margin} ms before the function timeout — every record is listed for a retry; check the connection settings (a Mongo serverSelectionTimeoutMS longer than the function timeout, say)`,
+        `resize lambda: the start checks had not finished ${margin} ms before the function timeout — every record is listed for a retry; check the connection settings (a Mongo serverSelectionTimeoutMS longer than the function timeout, say)${again ? '; they start again on the next invocation' : ''}`,
       );
       return {
         batchItemFailures: event.Records.map(({ messageId }) => ({
@@ -572,6 +593,34 @@ function isDeliveryQueue(queue: TaskQueue): queue is TaskQueue & DeliveryQueue {
 }
 
 /**
+ * The refusal of a consumed name that cannot take pushes. When other Resizers on that name can,
+ * leaving the name out would drop them too, so the fix keeps those.
+ */
+async function notPushable(
+  queue: string,
+  routing: ServedLane['routing'],
+): Promise<ResizeSetupError> {
+  const can: string[] = [];
+  const cannot: string[] = [];
+  for (const { name, tasks } of routing) {
+    const carrier = tasks && (await carrierOf(tasks, queue));
+    (carrier && isDeliveryQueue(carrier) ? can : cannot).push(name);
+  }
+  const names = cannot.map((name) => `'${name}'`).join(', ');
+  const who =
+    cannot.length === 1 ? `Resizer ${names} is` : `Resizers ${names} are`;
+  const kept = can.map((name) => `getResizer('${name}')`).join(', ');
+  const fix =
+    can.length > 0
+      ? `serve only the ones that can, with createSqsHandler({ resizers: [${kept}] }), and consume the others with a worker process`
+      : 'consume it with a worker process, or leave it out of createSqsHandler({ queue })';
+  return new ResizeSetupError(
+    `resize lambda: queue '${queue}' of ${who} on a task queue that cannot take pushed messages: only the SQS driver can — ${fix}`,
+    { code: 'RESIZE_DELIVERY_UNSUPPORTED' },
+  );
+}
+
+/**
  * What a batchHandler serves, from the same start checks as a worker: rejects when one of them does,
  * or when a consumed name cannot take pushed messages (on a router, the other names may).
  */
@@ -583,21 +632,19 @@ export async function wiringOf(opts: ServingOptions): Promise<DeliveryWiring> {
       { code: 'RESIZE_DELIVERY_UNSUPPORTED' },
     );
   }
-  const lanes = serving.lanes.flatMap(({ queue, carriers }) =>
-    [...carriers].map(([carrier, timingSource]): DeliveryLane => {
+  const lanes: DeliveryLane[] = [];
+  for (const { queue, carriers, routing } of serving.lanes) {
+    for (const [carrier, timingSource] of carriers) {
       if (!isDeliveryQueue(carrier)) {
-        throw new ResizeSetupError(
-          `resize lambda: queue '${queue}' is on a task queue that cannot take pushed messages: only the SQS driver can — consume it with a worker process, or leave it out of createSqsHandler({ queue })`,
-          { code: 'RESIZE_DELIVERY_UNSUPPORTED' },
-        );
+        throw await notPushable(queue, routing);
       }
-      return {
+      lanes.push({
         queue,
         carrier,
         deps: serving.depsOf(queue, carrier, timingSource),
-      };
-    }),
-  );
+      });
+    }
+  }
   return {
     lanes,
     processingSecondsOf: (task) =>

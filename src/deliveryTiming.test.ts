@@ -949,7 +949,7 @@ timed(
       lines.some(
         (l) =>
           l.level === 'error' &&
-          /the first invocation's checks had not finished/.test(l.message),
+          /the start checks had not finished/.test(l.message),
       ),
     );
     checks.resolve();
@@ -958,6 +958,128 @@ timed(
       contextOf(5000),
     );
     assert.deepEqual(next.batchItemFailures, []);
+  },
+);
+
+/** Checks whose nth build is the nth promise given, and how many builds there were. */
+const buildsOf = (...builds: Promise<void>[]) => {
+  let built = 0;
+  return {
+    checks: () => builds[built++],
+    built: () => built,
+  };
+};
+
+const listed = (out: { batchItemFailures: { itemIdentifier: string }[] }) =>
+  out.batchItemFailures.map((f) => f.itemIdentifier);
+
+timed(
+  'a second miss in a row drops checks that never settle, and the next invocation builds them again',
+  async () => {
+    const sqs = fakeSqs();
+    const { checks, built } = buildsOf(deferred().promise, Promise.resolve());
+    const { handler, lines } = pushed(sqs, ok, { margin: MARGIN, checks });
+    const missed = () =>
+      lines.filter((l) => /start checks had not finished/.test(l.message));
+
+    const first = await handler({ Records: [recordOf('a')] }, contextOf(800));
+    assert.deepEqual(listed(first), ['a']);
+    assert.equal(built(), 1);
+    assert.doesNotMatch(missed()[0].message, /start again/);
+
+    const second = await handler(
+      { Records: [recordOf('a', { n: 2 })] },
+      contextOf(800),
+    );
+    assert.deepEqual(listed(second), ['a']);
+    assert.equal(built(), 1, 'one miss keeps the checks');
+    assert.match(missed()[1].message, /start again on the next invocation/);
+    assert.deepEqual(sqs.calls, []);
+
+    const third = await handler(
+      { Records: [recordOf('a', { n: 3 })] },
+      contextOf(5000),
+    );
+    assert.deepEqual(listed(third), []);
+    assert.equal(built(), 2, 'the second miss drops them');
+    assert.equal(sqs.deletes(), 1);
+
+    await handler({ Records: [recordOf('b', { n: 1 })] }, contextOf(5000));
+    assert.equal(built(), 2, 'checks that passed are kept');
+  },
+);
+
+for (const how of ['resolve', 'reject'] as const) {
+  timed(
+    `dropped checks that ${how} later change nothing: the newer ones stay, and their misses count alone`,
+    async () => {
+      const sqs = fakeSqs();
+      const old = deferred();
+      const { checks, built } = buildsOf(
+        old.promise,
+        deferred().promise,
+        Promise.resolve(),
+      );
+      const { handler } = pushed(sqs, ok, { margin: MARGIN, checks });
+      const miss = async (n: number) =>
+        assert.deepEqual(
+          listed(
+            await handler({ Records: [recordOf('a', { n })] }, contextOf(800)),
+          ),
+          ['a'],
+        );
+
+      await miss(1);
+      await miss(2); // drops the first build
+      assert.equal(built(), 1);
+      await miss(3); // builds the second: its own first miss
+      assert.equal(built(), 2);
+
+      // node:test fails the file on an unhandled rejection.
+      if (how === 'resolve') {
+        old.resolve();
+      } else {
+        old.reject(new Error('late'));
+      }
+      await sleep(30);
+
+      await miss(4); // the second build still, and its second miss drops it
+      assert.equal(built(), 2);
+      assert.deepEqual(sqs.calls, []);
+
+      const out = await handler(
+        { Records: [recordOf('a', { n: 5 })] },
+        contextOf(5000),
+      );
+      assert.deepEqual(listed(out), []);
+      assert.equal(built(), 3);
+    },
+  );
+}
+
+timed(
+  'checks that reject between two misses are built again, and the new ones get two misses of their own',
+  async () => {
+    const sqs = fakeSqs();
+    const rejecting = deferred();
+    const { checks, built } = buildsOf(
+      rejecting.promise,
+      deferred().promise,
+      Promise.resolve(),
+    );
+    const { handler } = pushed(sqs, ok, { margin: MARGIN, checks });
+    const invoke = (n: number, ms = 800) =>
+      handler({ Records: [recordOf('a', { n })] }, contextOf(ms));
+
+    assert.deepEqual(listed(await invoke(1)), ['a']);
+    rejecting.reject(new Error('refused'));
+    await sleep(30);
+    assert.deepEqual(listed(await invoke(2)), ['a']);
+    assert.equal(built(), 2);
+    assert.deepEqual(listed(await invoke(3)), ['a']);
+    assert.equal(built(), 2, 'one miss of the new checks keeps them');
+    assert.deepEqual(listed(await invoke(4, 5000)), []);
+    assert.equal(built(), 3);
   },
 );
 

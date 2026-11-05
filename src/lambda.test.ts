@@ -13,6 +13,7 @@ import { SqsTaskQueue } from './drivers/sqs.ts';
 import { createSqsHandler } from './lambda.ts';
 import { NoopMetrics } from './metrics.ts';
 import {
+  getResizer,
   Resizer,
   type ResizerOptions,
   resetResizerForTests,
@@ -247,7 +248,10 @@ test('a consumed name on a task queue that cannot take pushes is refused, touche
   const handler = createSqsHandler({ logger: silentLogger });
   await assert.rejects(
     handler({ Records: [recordOf('a')] }, contextOf(60_000)),
-    { code: 'RESIZE_DELIVERY_UNSUPPORTED', message: /queue 'default'/ },
+    {
+      code: 'RESIZE_DELIVERY_UNSUPPORTED',
+      message: /queue 'default' of Resizer 'default' is on/,
+    },
   );
   assert.deepEqual(sqs.calls, []);
   await assert.rejects(handler({ Records: [] }, contextOf(60_000)), {
@@ -308,7 +312,96 @@ test('on a router only the consumed names must be able to take pushes', async ()
       { Records: [] },
       contextOf(60_000),
     ),
-    { code: 'RESIZE_DELIVERY_UNSUPPORTED', message: /queue 'bulk'/ },
+    {
+      code: 'RESIZE_DELIVERY_UNSUPPORTED',
+      message: /queue 'bulk' of Resizer 'default' is on/,
+    },
+  );
+});
+
+// A Resizer named `name` that takes pushes when `sqs` is given, and otherwise cannot.
+const namedResizer = (name: string, sqs?: FakeSqs) =>
+  realResizer(sqs ? { name, sqs } : { name, tasks: new PlainTaskQueue() });
+
+for (const order of [
+  ['a', 'b'],
+  ['b', 'a'],
+]) {
+  test(`a Resizer on one name that cannot take pushes is named, and the fix keeps the one that can (${order} built)`, async () => {
+    const sqs = fakeSqs();
+    for (const name of order) {
+      namedResizer(name, name === 'a' ? sqs : undefined);
+    }
+    await assert.rejects(
+      createSqsHandler({ logger: silentLogger })(
+        { Records: [] },
+        contextOf(60_000),
+      ),
+      (err: Error & { code?: string }) => {
+        assert.equal(err.code, 'RESIZE_DELIVERY_UNSUPPORTED');
+        assert.match(err.message, /queue 'default' of Resizer 'b' is on/);
+        assert.match(
+          err.message,
+          /createSqsHandler\(\{ resizers: \[getResizer\('a'\)\] \}\)/,
+        );
+        assert.match(err.message, /a worker process/);
+        assert.doesNotMatch(err.message, /leave it out/);
+        return true;
+      },
+    );
+    // The fix the message gives works, on the same two Resizers.
+    const fixed = createSqsHandler({
+      resizers: [getResizer('a')],
+      logger: silentLogger,
+    });
+    const body = { ...bodyOf(0), resizer: 'a' };
+    assert.deepEqual(
+      await fixed({ Records: [recordOf('m', { body })] }, contextOf(60_000)),
+      { batchItemFailures: [] },
+    );
+    assert.equal(sqs.deletes(), 1);
+  });
+}
+
+test('the fix names every Resizer that can take pushes, and every one that cannot', async () => {
+  const sqs = fakeSqs();
+  namedResizer('a', sqs);
+  namedResizer('b');
+  namedResizer('c', fakeSqs());
+  namedResizer('d');
+  await assert.rejects(
+    createSqsHandler({ logger: silentLogger })(
+      { Records: [] },
+      contextOf(60_000),
+    ),
+    (err: Error) => {
+      assert.match(err.message, /queue 'default' of Resizers 'b', 'd' are on/);
+      assert.match(
+        err.message,
+        /resizers: \[getResizer\('a'\), getResizer\('c'\)\]/,
+      );
+      return true;
+    },
+  );
+});
+
+test('when no Resizer on a name can take pushes, the refusal names them and leaves the name out', async () => {
+  namedResizer('a');
+  namedResizer('b');
+  await assert.rejects(
+    createSqsHandler({ logger: silentLogger })(
+      { Records: [] },
+      contextOf(60_000),
+    ),
+    (err: Error) => {
+      assert.match(err.message, /queue 'default' of Resizers 'a', 'b' are on/);
+      assert.match(
+        err.message,
+        /leave it out of createSqsHandler\(\{ queue \}\)/,
+      );
+      assert.doesNotMatch(err.message, /resizers:/);
+      return true;
+    },
   );
 });
 
@@ -384,9 +477,38 @@ test('checks that do not finish list every record, on the logger the host gave',
     { itemIdentifier: 'b' },
   ]);
   assert.deepEqual(sqs.calls, []);
-  assert.match(lines[0].message, /the first invocation's checks had not/);
+  assert.match(lines[0].message, /the start checks had not/);
   assert.equal(lines[0].level, 'error');
   hung.resolve();
+});
+
+test('a verify that hung once passes on a retry: the third invocation runs its record', async () => {
+  const hung = deferred();
+  let checks = 0;
+  const { sqs } = realResizer({
+    verify: () => {
+      checks += 1;
+      return checks === 1 ? hung.promise : undefined;
+    },
+  });
+  const handler = createSqsHandler({ logger: silentLogger });
+  for (const n of [1, 2]) {
+    assert.deepEqual(
+      await handler({ Records: [recordOf('a', { n })] }, contextOf(2200)),
+      { batchItemFailures: [{ itemIdentifier: 'a' }] },
+    );
+  }
+  assert.equal(checks, 1);
+  assert.deepEqual(sqs.calls, []);
+  assert.deepEqual(
+    await handler({ Records: [recordOf('a', { n: 3 })] }, contextOf(60_000)),
+    { batchItemFailures: [] },
+  );
+  assert.equal(checks, 2);
+  assert.equal(sqs.deletes(), 1);
+  hung.resolve();
+  await handler({ Records: [] }, contextOf(60_000));
+  assert.equal(checks, 2, 'a late settle of the old verify changes nothing');
 });
 
 test('the Sharp tuning is applied once, and left alone when omitted', async (t) => {
