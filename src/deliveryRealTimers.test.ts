@@ -88,7 +88,7 @@ test('a complete that hangs past the settle deadline and then succeeds: it is li
   const out = await handler({ Records: [recordOf('a')] }, c);
   assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }]);
   assert.ok(lines.some((l) => /task a had not settled/.test(l.message)));
-  assert.deepEqual(events, []);
+  assert.equal(events.length, 0);
   answered.resolve();
   await sleep(30);
   assert.deepEqual(
