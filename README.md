@@ -36,7 +36,7 @@ part that uses it:
 |---|---|
 | `…/framework.js` (framework apps) | `@adaptivestone/framework` ≥ 5.1 and `mongoose` 9 (already in a framework app) |
 | `…/drivers/mongo.js` | `mongoose` 9 |
-| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` ≥ 3.572; add `@aws-sdk/s3-request-presigner` only if you call `signedUrl` |
+| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` ≥ 3.572, not 3.729 to 3.734; add `@aws-sdk/s3-request-presigner` only if you call `signedUrl` |
 | SQS: a `queues` entry with `driver: 'sqs'`, or `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` ≥ 3.572 |
 
 A missing optional peer fails at your own import line when you import a driver subpath. A driver
@@ -595,9 +595,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     it, with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`, `retryable: false`. A driver that ignores
     it still works; the core checks the length afterwards, but the memory is already spent. A
     response with no length, which `S3Storage` reads, is likewise caught only by that check, after
-    the read. On `@aws-sdk/client-s3` 3.729 to 3.734, which collect a body with a full-object
-    checksum before `send` resolves, `S3Storage`'s own check refuses only after the read, so the
-    memory is already spent.
+    the read. The peer range excludes `@aws-sdk/client-s3` 3.729 to 3.734: they collect a body with
+    a full-object checksum before `send` resolves, so `S3Storage`'s own check would run after the
+    read.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
@@ -1483,9 +1483,11 @@ swaps the rows in the caller's `media.previews` too. Each replacing write logs o
 concurrent copy too.
 
 **Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
-preview objects no row references. A row without an `identity` (written before 0.3.0) stays beside
-its replacement and keeps its file referenced, so a sweep never finds that file: delete such rows
-(and their files) yourself.
+objects under the `previews/` prefix (below a ref's `namespace`) that no row references. Leave out
+every `original.storageRef`: an adopted public original sits in the same bucket, and no preview row
+references it. A row without an `identity` (written before 0.3.0) stays beside its replacement and
+keeps its file referenced, so a sweep never finds that file: delete such rows (and their files)
+yourself.
 
 **A media without stored dimensions** (`original.width` and `original.height` must both be numbers;
 a stored `null` counts as missing) has no row the read path can prove fresh, since it cannot
@@ -1807,8 +1809,7 @@ not apply. Each call holds the object in memory: about one object on local stora
 at 250 MiB). So on a request path, where a client chose the file, pass `maxBytes`, or run the adoption
 from a job. It lowers the cap for this call and cannot raise it. Over it, the shipped drivers read
 nothing, except on an S3 response with no length, where the object is read whole and then refused
-with the same code. Real S3 sends a length. SDK 3.729 to 3.734 also read first, as the `download`
-contract above says.
+with the same code. Real S3 sends a length.
 
 The download has no timeout of its own, so set one on your storage client: for S3, pass
 `new S3Storage({ …, client })` with `requestHandler: { socketTimeout: 5000 }`. Use a value under
@@ -1841,7 +1842,9 @@ damage in a later frame shows up on the worker as a dead task, `RESIZE_SOURCE_DA
 `..` part, a leading `/` or an empty part: `uploads//cat.jpg`, `dir/` and a name holding a tab are
 `RESIZE_STORAGE_KEY_INVALID` (`retryable: false`). A key that holds a client's file name is fine.
 `LocalFsStorage` paths stay in `[A-Za-z0-9_.-]`, because they are filesystem paths. For such an
-object, copy it to a new key and adopt that.
+object, copy it to a new key and adopt that. On S3 a `namespace` must leave room for a preview's key
+within S3's 1024-byte limit, and a preview adds about 50 bytes to it. Too long adopts, then every
+preview fails with `RESIZE_S3_KEY_TOO_LONG` and the task is dead at once: omit or shorten it.
 
 ### `prewarm()` issues
 

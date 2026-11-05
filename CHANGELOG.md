@@ -57,6 +57,10 @@
   comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews used
   the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so call
   `verify()` at boot.
+- **`@aws-sdk/client-s3` 3.729 to 3.734 are out of the peer range,** which is now
+  `^3.572.0 <3.729.0 || ^3.735.0`. They collect a body with a full-object checksum inside `send()`,
+  so on them the byte limit (`limits.sourceBytes`, `adoptOriginal({ maxBytes })`) runs after the
+  read. A host pinned to one of those versions fails `npm install` until it bumps to 3.735 or later.
 - **A host decoder's originals are private unless the decoder sets `publicOriginals: true`.** A
   public upload otherwise throws `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it; a host
   decoder that takes over a built-in format adds one line.

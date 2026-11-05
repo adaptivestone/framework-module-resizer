@@ -86,10 +86,11 @@ jobs:
       - name: npm clean install
         run: npm ci
 
-      # Read the minimums from package.json, so this job follows the peer ranges.
+      # Read the minimums from package.json, so this job follows the peer ranges. A range's first
+      # version is its lowest, also in one that excludes some, such as `^3.572.0 <3.729.0 || ^3.735.0`.
       - name: Install the minimum peer versions
         run: |
-          npm install --no-save $(node -p "Object.entries(require('./package.json').peerDependencies).map(([name, range]) => name + '@' + range.replace(/^[^0-9]*/, '')).join(' ')")
+          npm install --no-save $(node -p "Object.entries(require('./package.json').peerDependencies).map(([name, range]) => name + '@' + range.match(/\d+\.\d+\.\d+/)[0]).join(' ')")
 
       # Shipped code and the type pins against the minimum peers; tests compile against the dev versions they run with.
       - run: node --run types:check:src
