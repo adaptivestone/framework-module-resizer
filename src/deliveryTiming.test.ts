@@ -612,6 +612,157 @@ timed(
   },
 );
 
+const bodyOfMedia = (mediaId: string) => ({
+  resizer: 'default',
+  queue: 'default',
+  mediaId,
+  pipeline: 'default',
+  previews: [],
+});
+
+// A 900 s function, its task stopped by its own 600 s taskTimeoutMs, 300 s left and a reserve of
+// 35 s, at 1:100. What a stop took says how much time the task was given, not what a task takes, so
+// the record after it runs on its 265 s.
+timed(
+  'a delivery the stop ended does not count as the longest: the record after a hung head still runs',
+  async () => {
+    const sqs = fakeSqs();
+    const ran: string[] = [];
+    const { handler } = pushed(
+      sqs,
+      ({ mediaId }, { signal }) => {
+        ran.push(mediaId);
+        if (mediaId !== 'hung') {
+          return Promise.resolve();
+        }
+        return new Promise<void>((_r, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('stopped')));
+        });
+      },
+      { margin: MARGIN, stop: 350, timing: { taskTimeoutMs: 6000 } },
+    );
+    const out = await handler(
+      {
+        Records: [
+          recordOf('hung', { body: bodyOfMedia('hung') }),
+          recordOf('next', { body: bodyOfMedia('next') }),
+        ],
+      },
+      contextOf(9000),
+    );
+    assert.deepEqual(ran, ['hung', 'next']);
+    assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'hung' }]);
+  },
+);
+
+// It ignored the stop and ended a little later, inside the settle wait: still the stop's doing.
+timed(
+  'a delivery that outlives its stop and then ends does not count as the longest either',
+  async () => {
+    const sqs = fakeSqs();
+    const ran: string[] = [];
+    const { handler } = pushed(
+      sqs,
+      async ({ mediaId }) => {
+        ran.push(mediaId);
+        await sleep(mediaId === 'slow' ? 6100 : 1);
+      },
+      { margin: MARGIN, stop: 350, timing: { taskTimeoutMs: 6000 } },
+    );
+    const out = await handler(
+      {
+        Records: [
+          recordOf('slow', { body: bodyOfMedia('slow') }),
+          recordOf('next', { body: bodyOfMedia('next') }),
+        ],
+      },
+      contextOf(9000),
+    );
+    assert.deepEqual(ran, ['slow', 'next']);
+    assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'slow' }]);
+  },
+);
+
+// A failure of its own is a delivery that ended by itself, so it says what a task can take.
+timed(
+  'a delivery that fails by itself counts as the longest, as one that succeeds does',
+  async () => {
+    const sqs = fakeSqs();
+    const ran: string[] = [];
+    const { handler } = pushed(
+      sqs,
+      async ({ mediaId }) => {
+        ran.push(mediaId);
+        await sleep(400);
+        throw new Error('its own failure');
+      },
+      { margin: MARGIN, stop: 300 },
+    );
+    const out = await handler(
+      {
+        Records: [
+          recordOf('head', { body: bodyOfMedia('head') }),
+          recordOf('tail', { body: bodyOfMedia('tail') }),
+        ],
+      },
+      contextOf(1000),
+    );
+    assert.deepEqual(ran, ['head']);
+    assert.deepEqual(out.batchItemFailures, [
+      { itemIdentifier: 'head' },
+      { itemIdentifier: 'tail' },
+    ]);
+  },
+);
+
+// N from the numbers the line prints: a default reserve takes half of what is left, so the budget
+// reaches the least at twice that; an explicit one takes itself. Time already spent counts too.
+timed(
+  'the not-started error line names the function timeout to raise to',
+  async () => {
+    const rows: {
+      name: string;
+      T: number;
+      stop?: number;
+      checks?: () => Promise<void>;
+      target: string;
+    }[] = [
+      { name: 'the default reserve, at 3 s', T: 3000, target: '4 s' },
+      { name: 'no time for a queue call', T: 2000, target: '4 s' },
+      { name: 'an explicit reserve', T: 6000, stop: 5000, target: '7 s' },
+      {
+        name: 'a reserve over the time',
+        T: 3000,
+        stop: 59_000,
+        target: '61 s',
+      },
+      {
+        name: 'a cold start that spent 1.2 s, rounded up',
+        T: 5000,
+        checks: () => sleep(1200),
+        target: '6 s',
+      },
+    ];
+    for (const { name, T, stop, checks, target } of rows) {
+      const { handler, lines } = pushed(fakeSqs(), notRun, {
+        margin: 2000,
+        stop,
+        checks,
+      });
+      await handler({ Records: [recordOf('a')] }, contextOf(T));
+      const line = lines.find((l) => /was not started/.test(l.message));
+      assert.equal(line?.level, 'error', name);
+      assert.match(
+        line?.message ?? '',
+        new RegExp(
+          `the function timeout is too small for this reserve; raise it to at least ${target}\\.`,
+        ),
+        name,
+      );
+    }
+  },
+);
+
 timed('the longest delivery so far counts, not the last one', async () => {
   const sqs = fakeSqs();
   const ran: string[] = [];

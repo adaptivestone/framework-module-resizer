@@ -10,7 +10,8 @@
 // The time rules. A Lambda function is killed at its timeout, and rows persist once at the end of a
 // task, so a task is stopped while there is time left to store what it finished: its budget is the
 // time left minus a reserve, and it runs under that budget as its taskTimeoutMs. The handler waits
-// for it until the margin before the deadline, then lists it and returns, whatever is still running.
+// for it until the margin before the deadline, then lists it and returns, whatever async work is
+// still running (code that blocks the event loop holds these timers too, and can pass the deadline).
 // The Consumer needs no change for this, since the handler races its run from outside. What runs on
 // past the return goes on detached, and only if the environment is reused: the process freezes at
 // the return and thaws at the next invocation, so a variant in flight can still store its row then.
@@ -105,8 +106,6 @@ type DeliveryEnd =
   | 'lease-lost'
   | 'left'
   | 'discarded';
-
-const noop = () => {};
 
 /**
  * Whether `promise` settled within `ms`, rethrowing its rejection. An answer already there wins, as
@@ -296,7 +295,8 @@ interface Invocation {
   // A settle wait ran out, so a later record of the batch makes no queue call, even when a timer
   // fired a millisecond early and leaves it a little time on paper.
   expired: boolean;
-  longest: number; // the longest delivery so far, in ms
+  longest: number; // the longest delivery so far that ended by itself, in ms
+  enteredWithMs: number; // the time left when the handler was entered
   onAdoptionFailure: (id: string, err: unknown) => void;
 }
 
@@ -305,7 +305,7 @@ interface Invocation {
  * maxAttempts, so the Consumer dead-letters it unrun rather than leaving it for a retry.
  */
 function logNotStarted(
-  { wired: { logger }, left }: Invocation,
+  { wired: { logger }, left, enteredWithMs, stopBeforeTimeoutMs }: Invocation,
   id: string,
   index: number,
   budget: number,
@@ -317,9 +317,16 @@ function logNotStarted(
   const retry =
     "after the queue's visibility timeout, and this delivery counts as an attempt";
   if (index === 0) {
+    // Nothing ran before it, so `needed` is the margin: a default reserve, which is over that and
+    // never above half the time left, then needs twice it left. What is already spent comes on top.
+    const leftToStart =
+      stopBeforeTimeoutMs === undefined
+        ? needed * 2
+        : needed + stopBeforeTimeoutMs;
+    const spent = enteredWithMs - left();
     logNeverThrow(
       logger,
-      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small for this reserve; raise it. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
+      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small for this reserve; raise it to at least ${Math.ceil((spent + leftToStart) / 1000)} s. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
     );
     return;
   }
@@ -431,6 +438,9 @@ async function deliver(
   // What the Consumer's wait for the handler leaves behind (a timeout). The settle wait below covers
   // it, so it has settled before this returns, unless that wait runs out.
   let settled: Promise<unknown> = Promise.resolve();
+  // Only a delivery that ended by itself says what a task takes. One the stop ended says what it was
+  // given, and counting that would let one hung head refuse every record after it.
+  let endedByItself = false;
   const consumer = new Consumer({
     ...lane.deps,
     tasks: once,
@@ -445,7 +455,10 @@ async function deliver(
       : lane.deps.timing,
     handle: (leased, opts) => {
       const running = lane.deps.handle(leased, opts);
-      settled = running.catch(noop);
+      const ended = () => {
+        endedByItself = !opts.signal.aborted;
+      };
+      settled = running.then(ended, ended);
       return running;
     },
   });
@@ -462,7 +475,7 @@ async function deliver(
   if (!(await settledWithin(finished, left() - margin))) {
     settleLate(run, `task ${task.taskId}`);
   }
-  if (start) {
+  if (endedByItself) {
     run.longest = Math.max(run.longest, performance.now() - startedAt);
   }
   // Read after the wait: a `fail` still pending leaves 'left', and a `complete` the queue took stays
@@ -486,6 +499,7 @@ export function batchHandler(
   return async (event, context) => {
     checkEvent(event, context);
     const left = () => context.getRemainingTimeInMillis();
+    const enteredWithMs = left();
     ready ??= wiring().catch((err) => {
       ready = undefined;
       throw err;
@@ -511,6 +525,7 @@ export function batchHandler(
       stopBeforeTimeoutMs,
       expired: false,
       longest: 0,
+      enteredWithMs,
       onAdoptionFailure: (id, err) => {
         if (adoptionFailureLogged) {
           return;
