@@ -1,13 +1,13 @@
 // Named pipeline types: the per-media-type pixel work. Both kinds of step work on raw pixels (a
-// `Raster`), so host code never depends on the image engine.
+// `Raster`), so host code never depends on the image engine: a step may use any library, or none.
 import type { MediaLike, MissingPreview } from '../types.d.ts';
 import type { Raster, SourceInfo } from './decoder.ts';
 
 /**
  * Runs once per task on the decoded first frame (upright, 8-bit sRGB) and resolves with one
  * frame. `scale` is the width of the raster the step receives divided by `source.width`: multiply
- * coordinates stored in the source's units by it. `rasterToSharp` / `sharpToRaster` wrap a Sharp
- * step: `async (r) => sharpToRaster(rasterToSharp(r).blur(5))`.
+ * coordinates stored in the source's units by it. `rasterToSharp` / `sharpToRaster` wrap a step
+ * written with Sharp, whatever the engine: `async (r) => sharpToRaster(rasterToSharp(r).blur(5))`.
  */
 export type BeforeStep = (
   raster: Raster,
@@ -22,10 +22,10 @@ export type BeforeStep = (
 /**
  * Runs once per variant, after the resize and before the encode, on one frame of that size's pixels
  * (upright, 8-bit sRGB), and resolves with one frame. The raster is the step's own copy, so it may
- * write to it. `variant` carries `filters` and `fit`. `rasterToSharp` / `sharpToRaster` wrap a Sharp
- * step: `async (r) => sharpToRaster(rasterToSharp(r).blur(5))`, and `rasterToSharp` puts
- * `limits.processingTimeoutSeconds` on that chain (its own `.timeout()` replaces it). Other host
- * code in a step is unbounded, and can hold up other tasks.
+ * write to it. `variant` carries `filters` and `fit`. `rasterToSharp` / `sharpToRaster` wrap a step
+ * written with Sharp, whatever the engine: `async (r) => sharpToRaster(rasterToSharp(r).blur(5))`,
+ * and `rasterToSharp` puts `limits.processingTimeoutSeconds` on that chain (its own `.timeout()`
+ * replaces it). Other host code in a step is unbounded, and can hold up other tasks.
  */
 export type VariantStep = (
   raster: Raster,

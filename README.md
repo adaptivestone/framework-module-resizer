@@ -209,7 +209,7 @@ store over `mediaModel`, and the lock store and the database queue on the packag
 and `ResizeTask` models, as `mongoParts` builds them), `queue` (the Resizer's queue name: a key of
 `queues`, or `false`), `queues` (each name with its driver and timing) and `coordination`. Options
 win over the config: `opts` takes every `new Resizer` option (`pipelines`, `hooks`, `decoders`,
-`name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager
+`engine`, `name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager
 only), `coordination` and `queueName`, each of which replaces what the config would build, and `drivers`
 (see [Drivers by name](#drivers-by-name)). Only the drivers the config selects are loaded, so the
 AWS SDKs are needed only when a section names S3 or SQS (`RESIZE_PEER_MISSING`, naming the
@@ -281,8 +281,8 @@ its task events are logged and dropped. The worker logs each such Resizer once. 
 counts every receive, so there a task given back often can still use up its `maxAttempts` and be
 dead-lettered by the worker that serves it. Before it claims anything, the worker readies every
 listed Resizer and runs the checks of `verify()`: for each Resizer its parts, config, media store,
-lock store (unless its task queue routes names to several backends) and decoders; then, for each
-queue it consumes, the route of every listed Resizer that uses that name (the backend, built now,
+lock store (unless its task queue routes names to several backends), decoders and engine; then, for
+each queue it consumes, the route of every listed Resizer that uses that name (the backend, built now,
 the name's timing, the backend's own `verify()`, and a lock store beside a backend without
 `gatesByTask`). A Resizer's own `queueName` is checked only when the worker consumes it, and each
 backend and lock store is verified once, however many Resizers share it. So a Resizer that cannot
@@ -349,6 +349,8 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
   `TaskEvent`, `TaskEventHandler`);
 - the decoder contract `SourceDecoder` and the decoder types `SourceInfo`, `Raster`, `RasterInfo`,
   `DecodeBox`, `RenderOptions`;
+- the engine contract `ImageEngine`, the default engine `SharpEngine`, and the engine types
+  `EngineCallOptions`, `ResizeRequest`, `EncodeRequest`, `EncodedImage`;
 - metrics: the contract `ResizeMetrics`, the sinks `LogMetrics` (its options `LogMetricsOptions`)
   and `NoopMetrics`, and the types `MetricLabels` and `MetricContext`;
 - the errors: `ResizeError`, `ResizeConfigError`, `ResizeSetupError`, `ResizeMediaError`,
@@ -976,6 +978,60 @@ pass too, since a decode does not always find them: a still JPEG or lossy WebP u
 cut in its last rows can pass too (measured at 1200×900, up to about 1% of its tail), and a larger
 render then dead-letters it.
 
+### Engines
+
+An engine does the resize and the encode. The default, `SharpEngine`, writes the same files as
+0.3.0. A host passes its own in code, like `decoders`, in every process that renders:
+`new Resizer({ engine })`, `createResizer(config, { engine })` or `new FrameworkResizer({ engine })`.
+There is no config driver. Decoders stay separate, `Raster` is all the two share, and Sharp stays a
+dependency.
+
+An engine extends `ImageEngine`, or is any object of the same shape (the core never checks
+`instanceof`):
+
+- `id` names the engine in messages.
+- `formats` lists the ids `encode` writes. `verify()` and worker start refuse an entry of `formats`
+  or `encode.formats` it does not list (`RESIZE_ENGINE_FORMAT_UNSUPPORTED`).
+- `animatedFormats` lists the ids `encode` writes with every frame. Any other format gets the first
+  frame. With `[]`, an animated source decodes one frame.
+- `resize(frame, { width, height, mode, sharpen, coverBox }, { limits, signal })` takes one frame and
+  resolves with one frame at exactly `width × height` (with `coverBox`: within a pixel of it, covering
+  the box), 8-bit sRGB, 3 channels or 4 with alpha; a grey frame comes back as colour. `mode: 'fill'`
+  puts the whole frame into that size, and `'cover'` scales to cover it and crops from the centre. An
+  engine without a sharpener ignores `sharpen`. `coverBox` is set only on the reduction after
+  `beforeSteps`: it is the box `width × height` was computed from, and any engine may ignore it.
+- `encode(raster, { format, options, background }, { limits, signal })` takes one frame of 1 to 4
+  channels with straight alpha, or `info.frames` of them (with `info.delay` and `info.loop`) for a
+  format in `animatedFormats`. `options` is `encode.formats[format]`. When `background` is set, flatten
+  onto it first. It resolves with `{ data, format, contentType, width, height }`, the size of one
+  frame. The result's `format` is the preview's file extension, letters and digits only; the row keeps
+  the id the host configured.
+- `verify()` is optional, and runs in `resizer.verify()` and at worker start, after the decoders'.
+
+Two rules the types cannot state. An engine must not write to its inputs, because the formats of one
+size share one raster. It must be re-entrant, because calls run concurrently, up to `concurrency`. A
+result of another size, or one without those fields, is `RESIZE_ENGINE_INVALID`.
+
+The core sets no timer on an engine's calls. An engine applies `limits.processingTimeoutSeconds`
+itself, and stops when `signal` aborts, where its library can; `generate()` passes no `signal`. A call
+that never settles holds its task until a worker's `taskTimeoutMs`; `generate()` has no such bound.
+
+Steps do not change with the engine. Both kinds receive and resolve with a `Raster`, so a step needs
+no image library: it reads `raster.info` and `raster.data` (`width × height × channels` bytes, row by
+row, 8-bit sRGB with straight alpha) and resolves with `{ data, info }`. `rasterToSharp` and
+`sharpToRaster` are helpers for a step written with Sharp, and no part of the engine contract: they
+run Sharp, whichever engine the Resizer has. A `rasterToSharp` chain in a `variantStep` keeps its
+limit on any engine. A step on another library has none, so it bounds its own time (see Pipelines).
+
+The engine is not part of `encodeSig` and declares no version. Switching engines does not regenerate
+stored previews; bump each pipeline's `version` to do that. An engine that animates a format other
+than `gif` or `webp` does not sign `animated` into that format's `encodeSig`, so after changing
+`animated`, bump `version` too.
+
+`SharpEngine.formats` lists every id Sharp's `toFormat` accepts that this build can write, aliases
+included. An alias takes nothing from `jpeg`'s settings: `formats: ['jpg']` needs its own
+`encode.formats.jpg`, and `encode.flatten.formats` must name it, or transparent pixels turn black.
+
 ## Config reference
 
 The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
@@ -986,13 +1042,13 @@ created; a config function (the framework adapter passes one) on first use (`rea
 
 | Key | Default | Notes |
 |---|---|---|
-| `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
+| `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry, and the engine must write it (see [Engines](#engines)) |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
 | `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
-| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
+| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to the engine's `encode` (`SharpEngine`: `toFormat(id, options)`); `{}` keeps its defaults. The engine must write each key, also one no call requests |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
@@ -1000,7 +1056,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain gets it too; other host code in a step does not (see Pipelines) |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 

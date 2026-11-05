@@ -4,8 +4,8 @@ import type { ResizeLimits } from '../types.d.ts';
 import type { DecodeBox, Raster } from './decoder.ts';
 
 export interface EngineCallOptions {
-  limits: ResizeLimits;
-  signal?: AbortSignal; // the task's; an engine that cannot cancel ignores it
+  limits: ResizeLimits; // the core sets no timer: the engine applies `processingTimeoutSeconds` itself
+  signal?: AbortSignal; // the task's; absent in generate(); an engine that cannot cancel ignores it
 }
 
 export interface ResizeRequest {

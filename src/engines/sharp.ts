@@ -1,5 +1,6 @@
 // The built-in engine: libvips through Sharp, as render.ts called it in 0.3.0. A Sharp call cannot
-// be cancelled, so the signal is not watched: `limits.processingTimeoutSeconds` bounds every call.
+// be cancelled, so the signal is not watched: `limits.processingTimeoutSeconds` bounds each call,
+// except an AVIF encode, which it does not interrupt (the same on 0.3.0).
 import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
 import type { Raster } from '../contracts/decoder.ts';
 import {

@@ -113,7 +113,7 @@ function requirePipeline(
 /** A per-call argument names an unconfigured format: a wiring error at the call site. */
 function formatNotConfiguredError(formats: string[]): ResizeSetupError {
   return new ResizeSetupError(
-    `resize: formats [${formats.join(', ')}] have no encode.formats entry — request configured Sharp format ids such as 'jpeg', not aliases such as 'jpg'`,
+    `resize: formats [${formats.join(', ')}] have no encode.formats entry — request configured format ids such as 'jpeg'`,
     { code: 'RESIZE_FORMAT_NOT_CONFIGURED' },
   );
 }

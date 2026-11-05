@@ -8,7 +8,9 @@ import sharp, {
   type Sharp,
 } from 'sharp';
 import type { Raster } from './contracts/decoder.ts';
+import type { ImageEngine } from './contracts/engine.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
+import { SharpEngine } from './engines/sharp.ts';
 import { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
 import { ResizeGenerateError } from './errors.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
@@ -39,7 +41,12 @@ async function run(
   {
     sizes = [{ width: 100, height: 50 }],
     limits = {},
-  }: { sizes?: SizeInput[]; limits?: Partial<ResizeLimits> } = {},
+    engine,
+  }: {
+    sizes?: SizeInput[];
+    limits?: Partial<ResizeLimits>;
+    engine?: ImageEngine;
+  } = {},
 ) {
   const { storage, files } = memoryStorage();
   const warns: unknown[][] = [];
@@ -57,6 +64,7 @@ async function run(
       error() {},
     },
     pipelines: { default: pipeline },
+    engine,
   });
   doc.original = await resizer.uploadOriginal({
     body: body ?? (await photo()),
@@ -231,6 +239,74 @@ test("a chained step's input carries the limit too", async () => {
     ['webp'],
     await plain(2000, 1000),
     {
+      sizes: [{ width: 2000, height: 1000 }],
+      limits: { processingTimeoutSeconds: 1 },
+    },
+  );
+  await assert.rejects(result);
+  assert.match(String(warns[0][1]), /timeout/);
+});
+
+/** An engine of the host's: it records what encode() gets, and writes a marker file. */
+function recordingEngine() {
+  const sharpEngine = new SharpEngine();
+  const encoded: Raster[] = [];
+  const engine: ImageEngine = {
+    id: 'recording',
+    formats: ['jpeg', 'webp', 'avif'],
+    animatedFormats: [],
+    resize: (frame, req, opts) => sharpEngine.resize(frame, req, opts),
+    encode: async (raster) => {
+      encoded.push(raster);
+      return {
+        data: Buffer.from('preview'),
+        format: 'webp',
+        contentType: 'image/webp',
+        width: raster.info.width,
+        height: raster.info.height,
+      };
+    },
+  };
+  return { engine, encoded };
+}
+
+test('a step with no image library runs beside a custom engine, and encode gets its result', async () => {
+  const { engine, encoded } = recordingEngine();
+  const { result } = await run(
+    {
+      beforeSteps: [
+        ({ data, info }) => ({ data: Buffer.from(data).fill(9), info }),
+      ],
+      variantSteps: [
+        (raster) => {
+          raster.data.fill(7, 0, raster.info.channels);
+          return raster;
+        },
+      ],
+    },
+    ['webp'],
+    undefined,
+    { engine, sizes: [{ width: 100, height: 50 }] },
+  );
+  const { created, failed } = await result;
+  assert.equal(failed, 0);
+  assert.equal(created.length, 1);
+  const [{ data, info }] = encoded;
+  assert.deepEqual([info.width, info.height], [100, 50]);
+  assert.equal(data[0], 7);
+  // Nothing of the step's time limit shows on the raster an engine or a step sees.
+  assert.deepEqual(Object.keys(encoded[0]).sort(), ['data', 'info']);
+  assert.deepEqual(Object.keys(info).sort(), ['channels', 'height', 'width']);
+});
+
+test('a rasterToSharp chain in a step keeps the limit beside a custom engine', async () => {
+  const { engine } = recordingEngine();
+  const { result, warns } = await run(
+    { variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).blur(400))] },
+    ['webp'],
+    await plain(2000, 1000),
+    {
+      engine,
       sizes: [{ width: 2000, height: 1000 }],
       limits: { processingTimeoutSeconds: 1 },
     },

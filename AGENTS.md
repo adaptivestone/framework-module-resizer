@@ -115,6 +115,8 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    `S3Storage` with the host's own `client`), `media`, `locks`, `tasks` (a `TaskQueue`, or
    `false` = eager only), `coordination`, `logger`, `events`, `config`, `configName`, `queueName`
    (the queue name, a key of `queues`), `name`, `decoders` (extra source kinds, see below),
+   `engine` (an `ImageEngine`; default `SharpEngine`; pass it in every process that renders; not
+   part of `encodeSig`; see the README `Engines` section),
    `drivers` (custom drivers by name, e.g. `{ storage: { gcs: GcsStorage } }`; the file's
    `storage: { driver: 'gcs', … }` then `satisfies FrameworkResizeConfig<{ storage: { gcs: typeof
    GcsStorage } }>`; every `FrameworkResizer` of the process must pass the same `drivers.queue`
@@ -150,8 +152,8 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    });
    ```
 
-   Options win over the config (`createResizer(config, { pipelines, hooks, decoders, storage,
-   media, locks, tasks, coordination, queueName, drivers, … })`); only the drivers a section
+   Options win over the config (`createResizer(config, { pipelines, hooks, decoders, engine,
+   storage, media, locks, tasks, coordination, queueName, drivers, … })`); only the drivers a section
    selects are loaded (the AWS SDKs only for S3 or SQS sections, else `RESIZE_PEER_MISSING`); the
    parts are built on first use; two calls build their own queues, so Resizers that share one task
    queue are wired by hand (below). A custom driver is registered by kind and name
@@ -160,8 +162,8 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    `backendOf(section)` and `validate(entries, { where })`); host names win over built-in ones; a
    `fromConfig` must not wait on the network (checks belong in the part's `verify()`); see the
    README `Drivers by name` section. Or by hand: `new Resizer({ storage, media, locks?, tasks?,
-   coordination?, queueName?, decoders? })` from the main entry (`locks` is required only beside a
-   task queue without `gatesByTask`, such as `SqsTaskQueue`, which takes one gate lock per media,
+   coordination?, queueName?, decoders?, engine? })` from the main entry (`locks` is required only
+   beside a task queue without `gatesByTask`, such as `SqsTaskQueue`, which takes one gate lock per media,
    pipeline and queue: `verify()` rejects without it; `MongoTaskQueue` needs none), with
    `@adaptivestone/framework-module-resize/drivers/mongo.js` → `...mongoParts(connection, {
    mediaModel, timing? })` (`{ media, locks, tasks }`: the host media model, and locks and the task
@@ -614,9 +616,9 @@ pixels, not a library object, so the engine stays replaceable). A variantStep re
 size from `raster.info` (`width`, `height`, `channels`) and owns its copy of the pixels.
 A `rasterToSharp` chain in a variantStep runs under `limits.processingTimeoutSeconds`, and past it
 only that variant fails; the chain's own `.timeout({ seconds })` replaces the limit, and
-`.timeout({ seconds: 0 })` turns it off. Nothing else in a step is bounded: Sharp work that does not
-go through `rasterToSharp` (`sharp(raster.data, { raw: raster.info })`, a raster spread into a new
-object), any other host code, and `beforeSteps`. Such work can starve other tasks and dead-letter
+`.timeout({ seconds: 0 })` turns it off. An AVIF encode is not interrupted by the limit. Nothing else
+in a step is bounded: Sharp work that does not go through `rasterToSharp`
+(`sharp(raster.data, { raw: raster.info })`, a raster spread into a new object), any other host code, and `beforeSteps`. Such work can starve other tasks and dead-letter
 healthy ones, because stuck Sharp calls hold libuv's threads, and a timed-out delivery keeps its
 memory until the step ends. An optional pipeline `version` (string) is part of each preview row's
 `encodeSig`: bump it when a step's output changes, and the pipeline's stored previews are
@@ -677,8 +679,10 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in colour (use `greyscale()` on an
   opaque source, or `modulate({ saturation: 0 })`), and metadata calls in a step do nothing.
 - A `beforeStep` receives and returns a one-frame `Raster`, never a Sharp object or a `Buffer`;
-  wrap Sharp work with `rasterToSharp` / `sharpToRaster`. For a raster source it sees the upright
-  original at its own size; for a vector source (SVG) the pixels can be larger, so multiply
+  wrap Sharp work with `rasterToSharp` / `sharpToRaster`. Steps do not change with the `engine`: a
+  step may read `raster.data` and `raster.info` and return `{ data, info }` with no image library,
+  and those helpers run Sharp whichever engine the Resizer has. For a raster source it sees the
+  upright original at its own size; for a vector source (SVG) the pixels can be larger, so multiply
   coordinates stored in the source's units by `meta.scale`. A pipeline with `beforeSteps` (or
   `variantSteps`) renders the first frame of an animation only; an animated preview keeps the
   frames that fit `min(limits.sourcePixels, limits.inputPixels)` at the larger of the source's
@@ -694,9 +698,10 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   module merges the image settings of the result over the package defaults (arrays and
   `encode.formats` replace); add no merge of your own. Arrays in environment overrides replace.
 - Format ids are open strings. `formats` controls generated outputs, `upload.formats` controls
-  accepted originals, and `encode.formats[id]` is passed to Sharp as that encoder's options. A
-  per-call `formats` entry (or a variant a `beforeEnqueue` tap adds or rewrites) without an
-  `encode.formats` key is never generated: `resolve()` leaves it out of `decision.missing`,
+  accepted originals, and `encode.formats[id]` is passed to the engine as that encoder's options
+  (`SharpEngine`: `toFormat`). `verify()` refuses an id `engine.formats` does not list;
+  `SharpEngine.formats` includes Sharp's aliases, such as `jpg`. A per-call `formats` entry (or a
+  variant a `beforeEnqueue` tap adds or rewrites) without an `encode.formats` key is never generated: `resolve()` leaves it out of `decision.missing`,
   `prewarm()` reports it in `unconfirmed` with the non-retryable issue
   `RESIZE_FORMAT_NOT_CONFIGURED`, and `generate()` throws `ResizeSetupError` with that code.
 - `original.format` should be the decoder's id (`jpeg`, `png`, `svg`, …; not `jpg` or a MIME
@@ -792,7 +797,9 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_SOURCE_TOO_LARGE` naming `limits.sourceBytes`, or `RESIZE_ORIGINAL_TOO_LARGE` naming it from `uploadOriginal()` | the original is larger than `limits.sourceBytes` (default 256 MiB), so a worker refuses to read it into memory: its task is dead-lettered at once, and `generate()` and `adoptOriginal()` reject with `RESIZE_SOURCE_TOO_LARGE`. An upload is refused and stores nothing — raise it, or replace the object |
 | the warning `resize: upload.maxBytes (…) is above limits.sourceBytes (…)` from `verify()` | the stricter limit wins, since a task could never read a larger stored file, so uploads over `limits.sourceBytes` are refused whatever `upload.maxBytes` says — raise `limits.sourceBytes` to accept them, or lower `upload.maxBytes` |
 | `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
-| `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` or `variantStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
+| `RESIZE_ENGINE_INVALID` | the `engine` option is not an image engine (at construction: it needs `id`, `formats`, `animatedFormats`, `resize` and `encode`), or an engine broke the contract (a resize result of another size, an encode result without `data`, `contentType` or a size, or whose `format` is not a file extension) — fix the engine |
+| `RESIZE_ENGINE_FORMAT_UNSUPPORTED` from `verify()` or at worker start | a format in `formats` or `encode.formats` is not in `engine.formats` — remove it, use an id the message lists (ids are matched exactly: `jpg`, not `JPG`), or, for a custom engine, list it in `formats` |
+| `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` or `variantStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `{ data, info }`, or `sharpToRaster(…)` from a Sharp chain |
 | Sharp's `Input file is missing` from a step | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
 | Sharp's `Input buffer contains unsupported image format` from a step | the step calls `sharp(raster.data)`: those bytes are raw pixels, not an image file — use `rasterToSharp(r)` |
 | `img.composite is not a function` (or any Sharp method) from a `variantStep` | an old step that treats its first argument as a Sharp instance; it is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)`, and read `metadata()` values from `r.info`. An old step with a `typeof img.composite === 'function'` check or a `try { } catch { return img; }` raises no error: it renders silently with no watermark, so search for those too |
@@ -806,7 +813,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
 | `TS2305` or `TS2724` on `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` or `FrameworkS3StorageConfig` (TypeScript may suggest `FrameworkWorkerConfig`, which is another type) | these aliases are removed — import `StorageConfig`, `LocalStorageConfig` or `S3StorageConfig`, the same types under their core names, from the same entry |
 | `RESIZE_CONFIG_REMOVED_KEY` | a 0.2.x key or an old shape is still in a config file (`resize.ts`, another Resizer's file, or an environment override) — move it to the path named in the message. Among them: a `queue: { … }` object (define the queue in `queues` of `src/config/resize.ts` and set `queue` to its name), `queues.<name>.queues` (give each SQS queue its own entry), `storage.publicUrl` and the `S3Storage` option `publicUrl` (use `publicBaseUrl`), and the worker's `--config` flag or `runResizeWorker({ configName })` (removed: the worker reads `worker` and `queues` from `src/config/resize.ts`) |
-| `formats [...] have no encode.formats entry` (`RESIZE_CONFIG_FORMATS_INVALID` in the config), `RESIZE_FORMAT_NOT_CONFIGURED` | add `encode.formats.<id>` (`{}` for Sharp defaults), or request only configured ids; use `'jpeg'`, not the alias `'jpg'` |
+| `formats [...] have no encode.formats entry` (`RESIZE_CONFIG_FORMATS_INVALID` in the config), `RESIZE_FORMAT_NOT_CONFIGURED` | add `encode.formats.<id>` (`{}` for the engine's defaults), or request only configured ids; a `jpg` id needs its own `encode.formats.jpg`, and `encode.flatten.formats` must name it or transparent pixels turn black; the defaults hold `jpeg` |
 | `RESIZE_PIPELINE_UNKNOWN` | the pipeline is not registered in that process — register it in `src/resizer.ts`; deploy the worker before the API requests a new or renamed pipeline |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` for a driver selected in the config (a config file, or the config passed to `createResizer()`) or from `signedUrl()` | optional peer not installed — install the packages named, see step 1. A queue whose backend lacks its SDK beside another available backend is only not served in that process (`RESIZE_QUEUE_NOT_SERVED`, naming the package); `verify()` rejects with `RESIZE_PEER_MISSING` only when it is the Resizer's own queue |
 | `a Resizer named '…' already exists` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |

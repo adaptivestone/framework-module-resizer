@@ -31,6 +31,14 @@ export type {
   QueueSection,
   StorageDriver,
 } from './contracts/drivers.ts';
+// The image engine: what resizes and encodes. A host passes its own as `engine`.
+export {
+  type EncodedImage,
+  type EncodeRequest,
+  type EngineCallOptions,
+  ImageEngine,
+  type ResizeRequest,
+} from './contracts/engine.ts';
 export type {
   HookFn,
   HookName,
@@ -67,6 +75,8 @@ export {
   type TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+// The default engine.
+export { SharpEngine } from './engines/sharp.ts';
 // --- the Raster helpers: a Sharp-based step wraps the raster it receives and reads its
 // result back (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))`) ---
 export { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';

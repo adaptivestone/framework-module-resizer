@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { afterEach, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
+import type { ImageEngine } from './contracts/engine.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type {
@@ -2005,6 +2006,33 @@ describe('a worker for several queues', () => {
     assert.equal(mostInFlight, 1);
     stop.abort();
     await working;
+  });
+
+  test('a worker does not start on an engine that cannot write a configured format', async () => {
+    const engine: ImageEngine = {
+      id: 'none',
+      formats: ['png'],
+      animatedFormats: [],
+      resize: async (frame) => frame,
+      encode: async () => {
+        throw new Error('not used');
+      },
+    };
+    const r = queuedResizer(
+      'a',
+      new PlainTaskQueue({ timing: fast }),
+      fakeMedia(),
+      { locks: memoryLocks(), engine },
+    );
+    await assert.rejects(
+      runWorker({
+        queue: ['default'],
+        signal: AbortSignal.abort(),
+        logger: silent,
+        resizers: [r],
+      }),
+      { code: 'RESIZE_ENGINE_FORMAT_UNSUPPORTED' },
+    );
   });
 
   test('Resizers that share a router or a task queue verify its carrier and their lock store once at worker start', async () => {

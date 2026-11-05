@@ -88,7 +88,7 @@ function validateRequiredResizeConfigFields(
     )
   ) {
     invalid(
-      'resize config: upload.formats must contain non-empty Sharp format ids',
+      'resize config: upload.formats must contain non-empty format ids',
       'RESIZE_CONFIG_UPLOAD_FORMATS_INVALID',
     );
   }
@@ -107,7 +107,7 @@ function validateRequiredResizeConfigFields(
     )
   ) {
     invalid(
-      'resize config: formats must contain non-empty Sharp output format ids',
+      'resize config: formats must contain non-empty output format ids',
       'RESIZE_CONFIG_FORMATS_INVALID',
     );
   }
@@ -128,7 +128,7 @@ function validateRequiredResizeConfigFields(
   const encode = root.encode;
   if (!isRecord(encode) || !isRecord(encode.formats)) {
     return invalid(
-      'resize config: encode.formats must be an object keyed by Sharp format id',
+      'resize config: encode.formats must be an object keyed by format id',
       'RESIZE_CONFIG_INVALID',
     );
   }
@@ -138,8 +138,8 @@ function validateRequiredResizeConfigFields(
       'RESIZE_CONFIG_INVALID',
     );
   }
-  // Every generated format needs its own encoder entry ({} keeps Sharp defaults). Sharp accepts
-  // aliases such as 'jpg', which would encode JPEG while skipping the 'jpeg' options and the
+  // Every generated format needs its own encoder entry ({} keeps the engine's defaults). Sharp
+  // accepts aliases such as 'jpg', which would encode JPEG while skipping the 'jpeg' options and the
   // flatten list, so transparent pixels would turn black.
   const encoders = encode.formats;
   const unconfigured = (root.formats as string[]).filter(
@@ -147,7 +147,7 @@ function validateRequiredResizeConfigFields(
   );
   if (unconfigured.length > 0) {
     invalid(
-      `resize config: formats [${unconfigured.join(', ')}] have no encode.formats entry — add one ({} keeps Sharp defaults) and use Sharp format ids such as 'jpeg', not aliases such as 'jpg'`,
+      `resize config: formats [${unconfigured.join(', ')}] have no encode.formats entry — add one ({} keeps the engine's defaults), or use an id it already has, such as 'jpeg'`,
       'RESIZE_CONFIG_FORMATS_INVALID',
     );
   }

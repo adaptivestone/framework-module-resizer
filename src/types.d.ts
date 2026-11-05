@@ -38,8 +38,8 @@ export interface ResizeEventBus {
 // Data shapes
 // ---------------------------------------------------------------------------
 
-// Sharp format ids are deliberately open strings. A host using a custom libvips build can
-// enable additional input/output formats in config without changing this package.
+// Format ids are deliberately open strings. A host using a custom libvips build or its own engine
+// can enable additional input/output formats in config without changing this package.
 export type PreviewFormat = string;
 export type OriginalFormat = string;
 
@@ -312,7 +312,7 @@ export interface ResizeLimits {
   sourceBytes: number; // default 268_435_456 — largest original a worker or adoptOriginal() reads into memory
   resultDimension: number; // default 5000 — clamp on the cover branch
   animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
-  processingTimeoutSeconds: number; // default 30, at most 3600 — Sharp native processing timeout, also on a variantStep's rasterToSharp chain
+  processingTimeoutSeconds: number; // default 30, at most 3600 — timeout per decode, resize and encode operation, also on a variantStep's rasterToSharp chain
   failOn: ResizeFailOn; // default 'error' — a source refused at this level is RESIZE_SOURCE_DAMAGED; not signed
 }
 
@@ -326,8 +326,8 @@ export interface ResizeConfig {
   maxSize: { width: number; height: number }; // default { 2000, 1200 } (the `fit` cap)
   animated: boolean; // default false — true keeps GIF/WebP frames
 
-  // Options are passed to sharp.toFormat(format, options). Keys are format ids, so hosts with
-  // additional libvips codecs can configure them without a module code change.
+  // Options are passed to the engine's encode (SharpEngine: toFormat). Keys are format ids, so hosts
+  // with additional codecs can configure them without a module code change.
   encode: {
     formats: Record<string, Record<string, unknown>>;
     sharpen: { cover: boolean; fit: boolean } | false;

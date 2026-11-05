@@ -455,9 +455,14 @@ test('a step that resolves with a Buffer is told to return its pixels, not an im
     assert.match(err.message, new RegExp(`a ${kind} resolved with`));
     assert.match(
       err.message,
-      /it is a Buffer, not a Raster: return sharpToRaster\(img\), not img\.toBuffer\(\)/,
+      /it is a Buffer, not a Raster: return the raw pixels \(with Sharp: sharpToRaster\(img\), not img\.toBuffer\(\)\)/,
     );
     assert.doesNotMatch(err.message, /`data` is not a Buffer/);
+    // A host on another engine, with no Sharp of its own, hears the shape first.
+    assert.match(
+      err.message,
+      /receives and returns a Raster \(\{ data, info \}\), whatever the engine/,
+    );
     return true;
   };
   for (const step of [buffer, encoded]) {

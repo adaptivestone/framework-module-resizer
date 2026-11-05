@@ -350,6 +350,13 @@ describe('flushAtShutdown', () => {
   });
 });
 
+test('FrameworkResizer passes the engine option to the Resizer', () => {
+  installApp();
+  assert.throws(() => new FrameworkResizer({ storage, engine: {} as never }), {
+    code: 'RESIZE_ENGINE_INVALID',
+  });
+});
+
 test('a FrameworkResizer rejects metrics: null as new Resizer does; only undefined means the default', () => {
   installApp();
   assert.throws(

@@ -124,6 +124,27 @@ test('a config object and one call: custom storage and database drivers register
   assert.equal(fake.built.length, 1);
 });
 
+test('createResizer passes the engine option to the Resizer', () => {
+  assert.throws(
+    () =>
+      createResizer(
+        {
+          formats: ['webp'],
+          storage: { driver: 'memory' },
+          database: { driver: 'fake' },
+        },
+        {
+          drivers: {
+            storage: { memory: memoryStorageDriver() },
+            database: { fake: fakeDatabaseDriver() },
+          },
+          engine: {} as never,
+        },
+      ),
+    { code: 'RESIZE_ENGINE_INVALID' },
+  );
+});
+
 test('a custom queue driver registered by name: queues on two backends route, and the plain backend is built on first need', async () => {
   const fake = fakeDatabaseDriver();
   const plain = fakeQueueDriver();

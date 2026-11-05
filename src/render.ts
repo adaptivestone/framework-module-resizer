@@ -140,14 +140,14 @@ function stepResult(
   const problem = isSharp
     ? 'it is a Sharp instance, not its pixels: return sharpToRaster(img)'
     : Buffer.isBuffer(value)
-      ? 'it is a Buffer, not a Raster: return sharpToRaster(img), not img.toBuffer()'
+      ? 'it is a Buffer, not a Raster: return the raw pixels (with Sharp: sharpToRaster(img), not img.toBuffer())'
       : (rasterProblem(value) ??
         (frames !== undefined && frames !== 1
           ? `\`info.frames\` is ${frames}, not 1`
           : undefined));
   if (problem !== undefined) {
     throw new ResizeSetupError(
-      `resize: a ${kind} resolved with something that is not a one-frame Raster: ${problem} — a ${kind} receives and returns a Raster ({ data, info }); rasterToSharp / sharpToRaster wrap a Sharp step`,
+      `resize: a ${kind} resolved with something that is not a one-frame Raster: ${problem} — a ${kind} receives and returns a Raster ({ data, info }), whatever the engine; rasterToSharp / sharpToRaster wrap a Sharp step`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
