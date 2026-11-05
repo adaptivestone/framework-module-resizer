@@ -737,6 +737,13 @@ timed(
         target: '61 s',
       },
       {
+        // Above Lambda's 900 s, so only lowering the reserve can help.
+        name: 'a reserve no function timeout can hold',
+        T: 3000,
+        stop: 1_000_000,
+        target: '1002 s',
+      },
+      {
         name: 'a cold start that spent 1.2 s, rounded up',
         T: 5000,
         checks: () => sleep(1200),
@@ -752,11 +759,21 @@ timed(
       await handler({ Records: [recordOf('a')] }, contextOf(T));
       const line = lines.find((l) => /was not started/.test(l.message));
       assert.equal(line?.level, 'error', name);
+      // A reserve the host set is the setting to lower, too; the default one is not the host's.
+      const setting =
+        stop === undefined
+          ? `the function timeout is too small: it needs at least ${target}`
+          : `the function timeout is too small for stopBeforeTimeoutMs \\(${stop} ms\\): lower that, or give the function at least ${target}`;
       assert.match(
         line?.message ?? '',
         new RegExp(
-          `the function timeout is too small: it needs at least ${target} to start a task, plus the slowest task's time; the README starts at 300 s\\.`,
+          `— ${setting} to start a task, plus the slowest task's time; the README starts at 300 s\\.`,
         ),
+        name,
+      );
+      assert.equal(
+        /stopBeforeTimeoutMs/.test(line?.message ?? ''),
+        stop !== undefined,
         name,
       );
     }

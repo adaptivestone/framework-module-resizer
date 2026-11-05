@@ -348,9 +348,15 @@ function logNotStarted(
         ? needed * 2
         : needed + stopBeforeTimeoutMs;
     const spent = enteredWithMs - left();
+    const seconds = Math.ceil((spent + leftToStart) / 1000);
+    // A reserve the host set may be what is wrong: at 1000000 ms no function timeout can hold it.
+    const fix =
+      stopBeforeTimeoutMs === undefined
+        ? `the function timeout is too small: it needs at least ${seconds} s`
+        : `the function timeout is too small for stopBeforeTimeoutMs (${stopBeforeTimeoutMs} ms): lower that, or give the function at least ${seconds} s`;
     logNeverThrow(
       logger,
-      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small: it needs at least ${Math.ceil((spent + leftToStart) / 1000)} s to start a task, plus the slowest task's time; the README starts at 300 s. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
+      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — ${fix} to start a task, plus the slowest task's time; the README starts at 300 s. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
     );
     return;
   }
