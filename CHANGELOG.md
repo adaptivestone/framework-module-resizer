@@ -163,6 +163,9 @@
   one render still get the first one's pair. The update form needs MongoDB 4.2, and the driver in use
   may require more (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
   `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
+- A raster a host decoder marks `premultiplied` now converts to straight alpha in plain JS. It can
+  differ from 0.3.0 by 1 level per channel, and it is slower. The built-in decoders never mark one,
+  so their previews do not change, and nothing regenerates.
 
 **Features**
 

@@ -19,6 +19,7 @@ import sharp, {
 } from 'sharp';
 import { Catalog } from '../src/catalog.ts';
 import defaultResizeConfig from '../src/config/resize.ts';
+import { SharpEngine } from '../src/engines/sharp.ts';
 import { runBounded } from '../src/helpers/concurrency.ts';
 import { calculateResizedDimensions, coverDimensions } from '../src/images.ts';
 import { Resizer, type ResizeStorage } from '../src/index.ts';
@@ -180,7 +181,7 @@ async function oldOncePerSize(
   const plans = planVariants(
     info,
     new Catalog({ config }).expand(SIZES, formats, SCOPE),
-    planRules(config, SCOPE, {}),
+    planRules(config, SCOPE, {}, new SharpEngine().animatedFormats),
   );
   const rendered = new Map<
     string,

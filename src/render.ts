@@ -1,47 +1,114 @@
-// The Sharp work on decoded rasters, with no port: straight alpha once on the decoded raster, the
-// beforeSteps chain, the box reduction after it, one render per exact size, and the encode of each
-// format from it. Every function but `straightAlpha` takes a straight-alpha raster: the Processor
-// converts a premultiplied one first, and so does `runBeforeSteps` for a step's result, so nothing
-// here forwards a premultiplied flag.
-import sharp, { type FormatEnum, type OutputOptions } from 'sharp';
+// The pixel work on decoded rasters: straight alpha once on the decoded raster, the beforeSteps
+// chain, the box reduction after it, one render per exact size, and the encode of each format from
+// it. No image library here: every pixel operation is a call on the engine (and, until variantSteps
+// take a Raster, the Sharp helper that runs them). What an engine returns is checked here, because
+// the core relies on it. Every function but `straightAlpha` takes a straight-alpha raster: the
+// Processor converts a premultiplied one first, and so does `runBeforeSteps` for a step's result,
+// so nothing here forwards a premultiplied flag.
 import type {
   DecodeBox,
   Raster,
   RasterInfo,
   SourceInfo,
 } from './contracts/decoder.ts';
+import type {
+  EncodedImage,
+  EngineCallOptions,
+  ImageEngine,
+  ResizeRequest,
+} from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
+import { rasterToSharp, readRaster } from './engines/sharpRaster.ts';
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
-import { isAnimatedFormat, isAvifBuffer } from './helpers/imageFormat.ts';
+import { rasterProblem } from './helpers/raster.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
-import { rasterInput, rasterProblem, readRaster } from './raster.ts';
 import type { MediaLike, ResizeConfig, ResizeLimits } from './types.d.ts';
 
-const timeout = (limits: ResizeLimits) => ({
-  seconds: limits.processingTimeoutSeconds,
-});
+/**
+ * Whether a resize result has the requested size. A `coverBox` request only has to cover its box,
+ * within a pixel of the computed size: Sharp's `fit: 'outside'` rounds exact halves its own way.
+ */
+function sizeFits(info: RasterInfo, req: ResizeRequest): boolean {
+  if (req.coverBox === undefined) {
+    return info.width === req.width && info.height === req.height;
+  }
+  return (
+    Math.abs(info.width - req.width) <= 1 &&
+    Math.abs(info.height - req.height) <= 1 &&
+    info.width >= req.coverBox.width &&
+    info.height >= req.coverBox.height
+  );
+}
 
-/** The raster as straight alpha: itself unless a decoder marked its bytes premultiplied. */
-export async function straightAlpha(
-  raster: Raster,
-  limits: ResizeLimits,
+/** A resize result the plan can rely on, or an engine contract error. */
+async function resized(
+  engine: ImageEngine,
+  frame: Raster,
+  req: ResizeRequest,
+  opts: EngineCallOptions,
 ): Promise<Raster> {
+  const out = await engine.resize(frame, req, opts);
+  const problem =
+    rasterProblem(out) ??
+    (!sizeFits(out.info, req)
+      ? `it is ${out.info.width}×${out.info.height}, not ${req.width}×${req.height}`
+      : (out.info.frames ?? 1) !== 1
+        ? `it has ${out.info.frames} frames`
+        : undefined);
+  if (problem !== undefined) {
+    throw new ResizeSetupError(
+      `resize: engine '${engine.id}' broke its contract: the result of resize(): ${problem}`,
+      { code: 'RESIZE_ENGINE_INVALID' },
+    );
+  }
+  return out;
+}
+
+/** An encode result a row can record, or an engine contract error. `format` becomes the file extension. */
+function checkEncoded(engine: ImageEngine, out: EncodedImage): void {
+  const positive = (n: unknown) => Number.isInteger(n) && (n as number) > 0;
+  const problem = !Buffer.isBuffer(out?.data)
+    ? '`data` is not a Buffer'
+    : typeof out.format !== 'string' || out.format === ''
+      ? 'no `format`'
+      : !/^[a-z0-9]+$/i.test(out.format)
+        ? `the \`format\` '${out.format}' is not a file extension`
+        : typeof out.contentType !== 'string' || out.contentType === ''
+          ? 'no `contentType`'
+          : !positive(out.width) || !positive(out.height)
+            ? `the size ${String(out.width)}×${String(out.height)}`
+            : undefined;
+  if (problem !== undefined) {
+    throw new ResizeSetupError(
+      `resize: engine '${engine.id}' broke its contract: the result of encode(): ${problem}`,
+      { code: 'RESIZE_ENGINE_INVALID' },
+    );
+  }
+}
+
+/** The raster as straight alpha: itself unless its bytes are marked premultiplied. Plain JS (D8). */
+export function straightAlpha(raster: Raster): Raster {
   if (raster.info.premultiplied !== true) {
     return raster;
   }
-  // Sharp unpremultiplies raw input marked premultiplied on output, with no other operation.
-  const { data, info } = await readRaster(
-    sharp(raster.data, rasterInput(raster)).timeout(timeout(limits)),
-  );
-  const { delay, loop } = raster.info;
-  return {
-    data,
-    info: {
-      ...info,
-      ...(delay !== undefined ? { delay } : {}),
-      ...(loop !== undefined ? { loop } : {}),
-    },
-  };
+  const { premultiplied: _dropped, ...info } = raster.info;
+  const { channels } = info;
+  if (channels !== 2 && channels !== 4) {
+    return { data: raster.data, info };
+  }
+  const data = Buffer.allocUnsafe(raster.data.length);
+  const colours = channels - 1;
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = raster.data[i + colours];
+    data[i + colours] = alpha;
+    for (let c = 0; c < colours; c++) {
+      data[i + c] =
+        alpha === 0
+          ? 0
+          : Math.min(255, Math.round((raster.data[i + c] * 255) / alpha));
+    }
+  }
+  return { data, info };
 }
 
 /** The top frame, without timing (the raster itself when it has one frame and no timing). */
@@ -90,9 +157,8 @@ export function runBeforeSteps(
   raster: Raster,
   steps: readonly BeforeStep[],
   meta: BeforeStepMeta,
-  limits: ResizeLimits,
 ): Promise<Raster> {
-  return stepChain(firstFrame(raster), steps, meta, limits);
+  return stepChain(firstFrame(raster), steps, meta);
 }
 
 /**
@@ -103,12 +169,11 @@ async function stepChain(
   raster: Raster,
   steps: readonly BeforeStep[],
   meta: BeforeStepMeta,
-  limits: ResizeLimits,
 ): Promise<Raster> {
   for (const step of steps) {
     const scale = raster.info.width / meta.source.width;
     raster = stepResult(await step(raster, { ...meta, scale }));
-    raster = await straightAlpha(raster, limits);
+    raster = straightAlpha(raster);
   }
   return raster;
 }
@@ -120,17 +185,28 @@ async function stepChain(
 export async function reduceToBox(
   raster: Raster,
   box: DecodeBox,
-  limits: ResizeLimits,
+  engine: ImageEngine,
+  opts: EngineCallOptions,
 ): Promise<Raster> {
   const frame = firstFrame(raster);
-  if (frame.info.width <= box.width || frame.info.height <= box.height) {
+  const { width, height } = frame.info;
+  if (width <= box.width || height <= box.height) {
     return frame;
   }
-  return readRaster(
-    sharp(frame.data, rasterInput(frame))
-      .resize(box.width, box.height, { fit: 'outside' })
-      .toColorspace('srgb')
-      .timeout(timeout(limits)),
+  // One factor, the smaller, then each side rounded: Sharp's `fit: 'outside'` up to exact halves,
+  // which it can round the other way (see sizeFits). The engine's own size is kept.
+  const factor = Math.min(width / box.width, height / box.height);
+  return resized(
+    engine,
+    frame,
+    {
+      width: Math.round(width / factor),
+      height: Math.round(height / factor),
+      mode: 'fill',
+      sharpen: false,
+      coverBox: box,
+    },
+    opts,
   );
 }
 
@@ -138,18 +214,20 @@ export async function reduceToBox(
 function resizeFrame(
   frame: Raster,
   size: SizePlan,
-  limits: ResizeLimits,
+  engine: ImageEngine,
+  opts: EngineCallOptions,
 ): Promise<Raster> {
-  let img = sharp(frame.data, rasterInput(frame))
-    .resize(size.width, size.height, {
-      fit: size.mode === 'cover' ? 'cover' : 'fill',
-      position: 'center',
-    })
-    .toColorspace('srgb');
-  if (size.sharpen) {
-    img = img.sharpen();
-  }
-  return readRaster(img.timeout(timeout(limits)));
+  return resized(
+    engine,
+    frame,
+    {
+      width: size.width,
+      height: size.height,
+      mode: size.mode,
+      sharpen: size.sharpen,
+    },
+    opts,
+  );
 }
 
 /**
@@ -159,7 +237,8 @@ function resizeFrame(
 export async function renderSize(
   raster: Raster,
   size: SizePlan,
-  limits: ResizeLimits,
+  engine: ImageEngine,
+  opts: EngineCallOptions,
 ): Promise<Raster> {
   const source = size.animated ? raster : firstFrame(raster);
   const { width, height, channels, frames = 1, delay, loop } = source.info;
@@ -172,7 +251,7 @@ export async function renderSize(
     return source;
   }
   if (frames === 1) {
-    return resizeFrame(source, size, limits);
+    return resizeFrame(source, size, engine, opts);
   }
   // Sharp does not resize a raw multi-page image per frame (the page height goes stale), so each
   // frame is resized on its own, one at a time, and copied into one stack allocated once: the
@@ -183,12 +262,12 @@ export async function renderSize(
     data: source.data.subarray(i * frameBytes, (i + 1) * frameBytes),
     info: { width, height, channels },
   });
-  const first = await resizeFrame(frameAt(0), size, limits);
+  const first = await resizeFrame(frameAt(0), size, engine, opts);
   const outBytes = first.data.length;
   const stack = Buffer.allocUnsafe(frames * outBytes);
   first.data.copy(stack, 0);
   for (let i = 1; i < frames; i++) {
-    const { data } = await resizeFrame(frameAt(i), size, limits);
+    const { data } = await resizeFrame(frameAt(i), size, engine, opts);
     if (data.length !== outBytes) {
       throw new ResizeSetupError(
         `resize: frame ${i} resized to ${data.length} bytes, not ${outBytes} like the first frame`,
@@ -209,7 +288,8 @@ export async function renderSize(
 /** The sized rasters of one task: one render per size key, dropped after its last variant. */
 export class SizedRasters {
   #raster: Raster | undefined;
-  readonly #limits: ResizeLimits;
+  readonly #engine: ImageEngine;
+  readonly #opts: EngineCallOptions;
   /** Variants not yet released, per size key. */
   readonly #pending = new Map<string, number>();
   readonly #rendered = new Map<string, Promise<Raster>>();
@@ -217,10 +297,12 @@ export class SizedRasters {
   constructor(
     raster: Raster,
     plans: readonly VariantPlan[],
-    limits: ResizeLimits,
+    engine: ImageEngine,
+    opts: EngineCallOptions,
   ) {
     this.#raster = raster;
-    this.#limits = limits;
+    this.#engine = engine;
+    this.#opts = opts;
     for (const plan of plans) {
       const key = plan.size.key;
       this.#pending.set(key, (this.#pending.get(key) ?? 0) + 1);
@@ -238,7 +320,7 @@ export class SizedRasters {
           ),
         );
       }
-      rendered = renderSize(this.#raster, size, this.#limits);
+      rendered = renderSize(this.#raster, size, this.#engine, this.#opts);
       this.#rendered.set(size.key, rendered);
     }
     return rendered;
@@ -271,82 +353,58 @@ export interface EncodeOptions {
   ctx: Record<string, unknown>;
   encode: ResizeConfig['encode'];
   limits: ResizeLimits;
+  engine: ImageEngine;
+  signal?: AbortSignal;
 }
 
-export interface EncodedVariant {
-  data: Buffer;
-  format: string;
-  contentType: string;
-  /** One frame. */
-  width: number;
-  height: number;
+export type EncodedVariant = EncodedImage;
+
+// Until variantSteps take a Raster (the next task): the steps' Sharp chain, read back as pixels.
+async function runVariantSteps(
+  sized: Raster,
+  plan: VariantPlan,
+  opts: EncodeOptions,
+): Promise<Raster> {
+  let img = rasterToSharp(sized);
+  for (const step of opts.variantSteps) {
+    img = await step(img, { variant: plan.variant, ctx: opts.ctx });
+  }
+  return readRaster(img);
 }
 
-/**
- * One delay per frame: a shorter list repeats its last delay (the GIF encoder writes 0 for a frame
- * without one, which plays it as fast as the viewer can), a longer one is cut.
- */
-function delayPerFrame(delay: readonly number[], frames: number): number[] {
-  return Array.from(
-    { length: frames },
-    (_, i) => delay[Math.min(i, delay.length - 1)],
-  );
-}
-
-/** One preview file: variantSteps on the sized pixels, the alpha flatten, then the encoder. */
+/** One preview file: variantSteps on the sized pixels, then the engine's flatten and encoder. */
 export async function encodeVariant(
   sized: Raster,
   plan: VariantPlan,
   opts: EncodeOptions,
 ): Promise<EncodedVariant> {
   const { format } = plan.variant;
-  const source = isAnimatedFormat(format) ? sized : firstFrame(sized);
-  const { channels, frames = 1, delay, loop } = source.info;
-  let img = sharp(source.data, rasterInput(source));
-  for (const step of opts.variantSteps) {
-    img = await step(img, { variant: plan.variant, ctx: opts.ctx });
-  }
-  if (
+  const { engine } = opts;
+  const source = engine.animatedFormats.includes(format)
+    ? sized
+    : firstFrame(sized);
+  const { channels } = source.info;
+  const raster =
+    opts.variantSteps.length > 0
+      ? await runVariantSteps(source, plan, opts)
+      : source;
+  const flatten =
     (channels === 2 || channels === 4) &&
-    opts.encode.flatten.formats.includes(format)
-  ) {
-    img = img.flatten({ background: opts.encode.flatten.background });
-  }
-  // Raw pixels carry no timing: without the source's, an animation plays at the encoder's default
-  // speed and loops once.
-  const timing =
-    frames > 1
-      ? {
-          ...(delay !== undefined && delay.length > 0
-            ? { delay: delayPerFrame(delay, frames) }
-            : {}),
-          ...(loop !== undefined ? { loop } : {}),
-        }
-      : {};
-  const { data, info } = await img
-    .toFormat(
-      format as keyof FormatEnum,
-      {
-        ...timing,
-        ...opts.encode.formats[format],
-      } as OutputOptions,
-    )
-    .timeout(timeout(opts.limits))
-    .toBuffer({ resolveWithObject: true });
-  // Sharp reports AVIF output through its HEIF container id; the brands in the bytes tell them
-  // apart, so a configured `heif: { compression: 'av1' }` gets the AVIF type and extension too.
-  const outputFormat =
-    info.format === 'heif' && isAvifBuffer(data) ? 'avif' : info.format;
-  if (outputFormat === 'svg') {
+    opts.encode.flatten.formats.includes(format);
+  const encoded = await engine.encode(
+    raster,
+    {
+      format,
+      options: opts.encode.formats[format] ?? {},
+      ...(flatten ? { background: opts.encode.flatten.background } : {}),
+    },
+    { limits: opts.limits, signal: opts.signal },
+  );
+  checkEncoded(engine, encoded);
+  if (encoded.format === 'svg' || /^image\/svg/i.test(encoded.contentType)) {
     throw new ResizeMediaError('resize: SVG cannot be published as a preview', {
       code: 'RESIZE_SVG_PUBLIC_PREVIEW',
     });
   }
-  return {
-    data,
-    format: outputFormat,
-    contentType: `image/${outputFormat}`,
-    width: info.width,
-    height: info.pageHeight ?? info.height,
-  };
+  return encoded;
 }

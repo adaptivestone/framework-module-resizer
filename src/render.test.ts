@@ -1,13 +1,20 @@
-// The Sharp steps on raw rasters: straight alpha, the box reduction, one render per size, and the
-// encode of each format from it. Rasters are built here from solid colours.
+// The pixel steps on raw rasters, on the real SharpEngine: straight alpha, the box reduction, one
+// render per size, and the encode of each format from it, with the checks on what an engine returns.
+// Rasters are built here from solid colours.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
 import type { Raster, SourceInfo } from './contracts/decoder.ts';
+import type {
+  EncodedImage,
+  ImageEngine,
+  ResizeRequest,
+} from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
-import { ResizeSetupError } from './errors.ts';
+import { SharpEngine } from './engines/sharp.ts';
+import { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
+import { type ResizeError, ResizeSetupError } from './errors.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
-import { rasterToSharp, sharpToRaster } from './raster.ts';
 import {
   type EncodeOptions,
   encodeVariant,
@@ -21,6 +28,7 @@ import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 
 const config = makeImageConfig();
 const { limits } = config;
+const engine = new SharpEngine();
 
 /** A raster of one solid colour per frame (one value per channel), frames stacked. */
 function solid(width: number, height: number, ...colours: number[][]): Raster {
@@ -105,12 +113,12 @@ function variantPlan(size: SizePlan, format: string): VariantPlan {
 }
 
 function encodeOptions(variantSteps: VariantStep[] = []): EncodeOptions {
-  return { variantSteps, ctx: {}, encode: config.encode, limits };
+  return { variantSteps, ctx: {}, encode: config.encode, limits, engine };
 }
 
 test('renderSize returns the raster itself when nothing changes', async () => {
   const raster = solid(20, 10, [10, 20, 30]);
-  const out = await renderSize(raster, sizePlan(20, 10), limits);
+  const out = await renderSize(raster, sizePlan(20, 10), engine, { limits });
   assert.equal(out, raster);
 });
 
@@ -122,20 +130,24 @@ test('renderSize fills exact sizes and cover-crops the centre', async () => {
       raster.data.set([0, 0, 255], (y * 40 + x) * 3);
     }
   }
-  const cover = await renderSize(raster, sizePlan(20, 20, 'cover'), limits);
+  const cover = await renderSize(raster, sizePlan(20, 20, 'cover'), engine, {
+    limits,
+  });
   assert.equal(cover.info.width, 20);
   assert.equal(cover.info.height, 20);
   assertNear(pixelAt(cover, 2, 10), [255, 0, 0]);
   assertNear(pixelAt(cover, 17, 10), [0, 0, 255]);
 
-  const fill = await renderSize(raster, sizePlan(10, 10), limits);
+  const fill = await renderSize(raster, sizePlan(10, 10), engine, { limits });
   assert.equal(fill.info.width, 10);
   assert.equal(fill.info.height, 10);
   assert.equal(fill.data.length, 10 * 10 * fill.info.channels);
 });
 
 test('renderSize turns a grey raster into sRGB', async () => {
-  const out = await renderSize(solid(10, 10, [128]), sizePlan(10, 10), limits);
+  const out = await renderSize(solid(10, 10, [128]), sizePlan(10, 10), engine, {
+    limits,
+  });
   assert.equal(out.info.channels, 3);
   assert.equal(out.data.length, 10 * 10 * 3);
 });
@@ -144,7 +156,8 @@ test('renderSize resizes every frame of an animation and keeps its timing', asyn
   const out = await renderSize(
     threeFrames(),
     sizePlan(10, 10, 'fill', true),
-    limits,
+    engine,
+    { limits },
   );
   assert.equal(out.info.frames, 3);
   assert.equal(out.info.width, 10);
@@ -159,7 +172,7 @@ test('renderSize resizes every frame of an animation and keeps its timing', asyn
 
 test('encodeVariant writes animated WebP and GIF with the source delays and loop count', async () => {
   const size = sizePlan(10, 10, 'fill', true);
-  const sized = await renderSize(threeFrames(), size, limits);
+  const sized = await renderSize(threeFrames(), size, engine, { limits });
   for (const format of ['webp', 'gif']) {
     const encoded = await encodeVariant(
       sized,
@@ -176,7 +189,7 @@ test('encodeVariant writes animated WebP and GIF with the source delays and loop
 
 test('encodeVariant gives a format that cannot animate the first frame', async () => {
   const size = sizePlan(10, 10, 'fill', true);
-  const sized = await renderSize(threeFrames(), size, limits);
+  const sized = await renderSize(threeFrames(), size, engine, { limits });
   const encoded = await encodeVariant(
     sized,
     variantPlan(size, 'jpeg'),
@@ -194,7 +207,8 @@ test('a semi-transparent raster keeps its colours through renderSize and encode'
   const sized = await renderSize(
     solid(40, 30, [100, 50, 200, 128]),
     size,
-    limits,
+    engine,
+    { limits },
   );
   const encoded = await encodeVariant(
     sized,
@@ -204,10 +218,10 @@ test('a semi-transparent raster keeps its colours through renderSize and encode'
   assertNear(await encodedPixel(encoded.data, 0, 0), [100, 50, 200, 128]);
 });
 
-test('straightAlpha turns a premultiplied raster into straight alpha, and leaves a straight one alone', async () => {
+test('straightAlpha turns a premultiplied raster into straight alpha, and leaves a straight one alone', () => {
   const marked = solid(8, 4, [50, 25, 100, 128]);
   marked.info.premultiplied = true;
-  const straight = await straightAlpha(marked, limits);
+  const straight = straightAlpha(marked);
   assert.equal(straight.info.width, 8);
   assert.equal(straight.info.height, 4);
   assert.equal(straight.info.channels, 4);
@@ -215,18 +229,21 @@ test('straightAlpha turns a premultiplied raster into straight alpha, and leaves
   assert.equal(straight.info.premultiplied, undefined);
 
   const unmarked = solid(8, 4, [50, 25, 100, 128]);
-  assert.equal(await straightAlpha(unmarked, limits), unmarked);
+  assert.equal(straightAlpha(unmarked), unmarked);
 });
 
 test('reduceToBox shrinks a larger raster to cover the box and leaves a smaller one alone', async () => {
   const large = solid(600, 400, [10, 20, 30]);
-  const exact = await reduceToBox(large, { width: 300, height: 200 }, limits);
+  const exact = await reduceToBox(large, { width: 300, height: 200 }, engine, {
+    limits,
+  });
   assert.equal(exact.info.width, 300);
   assert.equal(exact.info.height, 200);
   const covering = await reduceToBox(
     large,
     { width: 300, height: 250 },
-    limits,
+    engine,
+    { limits },
   );
   assert.equal(covering.info.width, 375);
   assert.equal(covering.info.height, 250);
@@ -234,7 +251,7 @@ test('reduceToBox shrinks a larger raster to cover the box and leaves a smaller 
 
   const small = solid(200, 100, [10, 20, 30]);
   assert.equal(
-    await reduceToBox(small, { width: 300, height: 200 }, limits),
+    await reduceToBox(small, { width: 300, height: 200 }, engine, { limits }),
     small,
   );
 });
@@ -289,7 +306,7 @@ test('encodeVariant reports the encoded size and content type', async () => {
 
   const animated = sizePlan(10, 10, 'fill', true);
   const webp = await encodeVariant(
-    await renderSize(threeFrames(), animated, limits),
+    await renderSize(threeFrames(), animated, engine, { limits }),
     variantPlan(animated, 'webp'),
     encodeOptions(),
   );
@@ -302,7 +319,9 @@ test('SizedRasters renders each size once for the variants that share it, and dr
   const size = sizePlan(10, 5);
   const a = variantPlan(size, 'jpeg');
   const b = variantPlan(size, 'webp');
-  const sized = new SizedRasters(solid(20, 10, [10, 20, 30]), [a, b], limits);
+  const sized = new SizedRasters(solid(20, 10, [10, 20, 30]), [a, b], engine, {
+    limits,
+  });
   const first = sized.get(a.size);
   assert.equal(sized.get(b.size), first);
   assert.equal((await first).info.width, 10);
@@ -320,7 +339,8 @@ test('SizedRasters.clear drops the base raster and every sized one, released or 
   const sized = new SizedRasters(
     solid(20, 10, [10, 20, 30]),
     [variantPlan(small, 'jpeg'), variantPlan(large, 'jpeg')],
-    limits,
+    engine,
+    { limits },
   );
   await sized.get(small);
   sized.clear();
@@ -367,7 +387,6 @@ test('runBeforeSteps hands each step the current raster with its scale, and pass
     solid(40, 20, [10, 20, 30]),
     steps,
     stepMeta({ format: 'svg', width: 20, height: 10, vector: true }),
-    limits,
   );
   assert.deepEqual(seen, [
     { width: 40, scale: 2 },
@@ -382,7 +401,6 @@ test('runBeforeSteps keeps semi-transparent colours through the helpers', async 
     solid(40, 30, [100, 50, 200, 128]),
     [async (r) => sharpToRaster(rasterToSharp(r).resize(20, 15))],
     stepMeta(),
-    limits,
   );
   assert.equal(result.info.width, 20);
   assertNear(pixelAt(result, 0, 0), [100, 50, 200, 128]);
@@ -400,7 +418,6 @@ test('a returned raster marked premultiplied is converted to straight alpha', as
       },
     ],
     stepMeta(),
-    limits,
   );
   assert.equal(result.info.width, 8);
   assertNear(pixelAt(result, 0, 0), [100, 50, 200, 128]);
@@ -439,12 +456,7 @@ test('a step result that is not a one-frame Raster is RESIZE_PIPELINE_STEP_INVAL
   ];
   for (const [name, step] of cases) {
     await assert.rejects(
-      runBeforeSteps(
-        input,
-        [step as unknown as BeforeStep],
-        stepMeta(),
-        limits,
-      ),
+      runBeforeSteps(input, [step as unknown as BeforeStep], stepMeta()),
       (err: unknown) => {
         assert.ok(err instanceof ResizeSetupError, name);
         assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID', name);
@@ -459,7 +471,9 @@ test('a step result that is not a one-frame Raster is RESIZE_PIPELINE_STEP_INVAL
 test('renderSize resizes a two-frame raster per frame and reads both frames back', async () => {
   const two = solid(12, 8, [255, 0, 0], [0, 0, 255]);
   two.info.frames = 2;
-  const out = await renderSize(two, sizePlan(6, 4, 'fill', true), limits);
+  const out = await renderSize(two, sizePlan(6, 4, 'fill', true), engine, {
+    limits,
+  });
   assert.deepEqual(out.info, { width: 6, height: 4, channels: 3, frames: 2 });
   assert.equal(out.data.length, 6 * 4 * 3 * 2);
   assertNear(pixelAt(out, 3, 2, 0), [255, 0, 0]);
@@ -474,11 +488,12 @@ test('renderSize sharpens a size marked sharpen', async () => {
       edge.data.set([160, 160, 160], (y * 40 + x) * 3);
     }
   }
-  const plain = await renderSize(edge, sizePlan(20, 20), limits);
+  const plain = await renderSize(edge, sizePlan(20, 20), engine, { limits });
   const sharp20 = await renderSize(
     edge,
     { ...sizePlan(20, 20), key: '20x20:fill:s:', sharpen: true },
-    limits,
+    engine,
+    { limits },
   );
   assert.equal(sharp20.info.width, 20);
   assert.notDeepEqual(sharp20.data, plain.data);
@@ -486,7 +501,7 @@ test('renderSize sharpens a size marked sharpen', async () => {
 
 test('encodeVariant gives every frame a delay when the raster lists fewer delays than frames', async () => {
   const size = sizePlan(10, 10, 'fill', true);
-  const sized = await renderSize(threeFrames(), size, limits);
+  const sized = await renderSize(threeFrames(), size, engine, { limits });
   sized.info.delay = [70];
   for (const format of ['gif', 'webp']) {
     const encoded = await encodeVariant(
@@ -500,7 +515,7 @@ test('encodeVariant gives every frame a delay when the raster lists fewer delays
   }
 });
 
-test('straightAlpha converts a premultiplied animation frame by frame and keeps its timing', async () => {
+test('straightAlpha converts a premultiplied animation frame by frame and keeps its timing', () => {
   const marked = solid(8, 4, [50, 25, 100, 128], [25, 50, 0, 128]);
   marked.info = {
     width: 8,
@@ -511,7 +526,7 @@ test('straightAlpha converts a premultiplied animation frame by frame and keeps 
     loop: 2,
     premultiplied: true,
   };
-  const straight = await straightAlpha(marked, limits);
+  const straight = straightAlpha(marked);
   assert.equal(straight.info.frames, 2);
   assert.equal(straight.info.height, 4);
   assert.deepEqual(straight.info.delay, [40, 80]);
@@ -519,4 +534,194 @@ test('straightAlpha converts a premultiplied animation frame by frame and keeps 
   assert.equal(straight.info.premultiplied, undefined);
   assertNear(pixelAt(straight, 0, 0, 0), [100, 50, 200, 128]);
   assertNear(pixelAt(straight, 0, 0, 1), [50, 100, 0, 128]);
+});
+
+const lying = (over: Partial<ImageEngine>): ImageEngine => ({
+  id: 'liar',
+  formats: ['webp'],
+  animatedFormats: [],
+  resize: (frame, req, o) => engine.resize(frame, req, o),
+  encode: (raster, req, o) => engine.encode(raster, req, o),
+  ...over,
+});
+const encodedAs = (fields: Partial<EncodedImage>): ImageEngine =>
+  lying({
+    encode: async () =>
+      ({
+        data: Buffer.from('x'),
+        format: 'webp',
+        contentType: 'image/webp',
+        width: 20,
+        height: 10,
+        ...fields,
+      }) as EncodedImage,
+  });
+for (const [fields, problem] of [
+  [{ data: 'x' as unknown as Buffer }, '`data` is not a Buffer'],
+  [{ format: '' }, 'no `format`'],
+  [
+    { format: 'image/webp' },
+    "the `format` 'image/webp' is not a file extension",
+  ],
+  [{ contentType: '' }, 'no `contentType`'],
+  [{ width: 0 }, 'the size 0×10'],
+] as [Partial<EncodedImage>, string][]) {
+  test(`an encode result with ${problem} is RESIZE_ENGINE_INVALID`, async () => {
+    await assert.rejects(
+      encodeVariant(
+        solid(20, 10, [1, 2, 3]),
+        variantPlan(sizePlan(20, 10), 'webp'),
+        { ...encodeOptions(), engine: encodedAs(fields) },
+      ),
+      (err: ResizeError) => {
+        assert.equal(err.code, 'RESIZE_ENGINE_INVALID');
+        assert.equal(err.retryable, true);
+        assert.equal(
+          err.message,
+          `resize: engine 'liar' broke its contract: the result of encode(): ${problem}`,
+        );
+        return true;
+      },
+    );
+  });
+}
+
+test('a resize result of another size is RESIZE_ENGINE_INVALID', async () => {
+  const wrong = lying({
+    resize: async () => ({
+      data: Buffer.alloc(3),
+      info: { width: 1, height: 1, channels: 3 },
+    }),
+  });
+  await assert.rejects(
+    renderSize(solid(20, 10, [1, 2, 3]), sizePlan(4, 2), wrong, { limits }),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_ENGINE_INVALID');
+      assert.equal(
+        err.message,
+        "resize: engine 'liar' broke its contract: the result of resize(): it is 1×1, not 4×2",
+      );
+      return true;
+    },
+  );
+});
+
+test('an engine that reports SVG by format or by contentType is refused', async () => {
+  for (const fields of [
+    { format: 'svg' },
+    { format: 'webp', contentType: 'IMAGE/SVG+XML' },
+  ]) {
+    await assert.rejects(
+      encodeVariant(
+        solid(20, 10, [1, 2, 3]),
+        variantPlan(sizePlan(20, 10), 'webp'),
+        { ...encodeOptions(), engine: encodedAs(fields) },
+      ),
+      { code: 'RESIZE_SVG_PUBLIC_PREVIEW', retryable: true },
+    );
+  }
+});
+
+test('reduceToBox asks for the size one factor gives, and passes the box', async () => {
+  for (const [w, h, bw, bh] of [
+    [1024, 683, 621, 414],
+    [6000, 4000, 3, 999],
+    [4000, 6000, 123, 77],
+    [997, 601, 97, 61],
+  ]) {
+    const { info } = await sharp({
+      create: { width: w, height: h, channels: 3, background: '#808080' },
+    })
+      .resize(bw, bh, { fit: 'outside' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const seen: ResizeRequest[] = [];
+    const stub = lying({
+      resize: async (_frame, req) => {
+        seen.push(req);
+        return {
+          data: Buffer.alloc(req.width * req.height * 3),
+          info: { width: req.width, height: req.height, channels: 3 },
+        };
+      },
+    });
+    const box = { width: bw, height: bh };
+    await reduceToBox(
+      { data: Buffer.alloc(0), info: { width: w, height: h, channels: 3 } },
+      box,
+      stub,
+      { limits },
+    );
+    assert.deepEqual(
+      seen,
+      [
+        {
+          width: info.width,
+          height: info.height,
+          mode: 'fill',
+          sharpen: false,
+          coverBox: box,
+        },
+      ],
+      `${w}x${h}`,
+    );
+  }
+});
+
+test('a coverBox result may differ from the computed size by a pixel, as long as it covers the box', async () => {
+  const frame: Raster = {
+    data: Buffer.alloc(60 * 80 * 3),
+    info: { width: 60, height: 80, channels: 3 },
+  };
+  const box = { width: 19, height: 26 };
+  const answering = (width: number, height: number) =>
+    lying({
+      resize: async () => ({
+        data: Buffer.alloc(width * height * 3),
+        info: { width, height, channels: 3 },
+      }),
+    });
+  // The computed size is 20×26; Sharp's own is 19×26.
+  const out = await reduceToBox(frame, box, answering(19, 26), { limits });
+  assert.equal(out.info.width, 19);
+  for (const [width, height] of [
+    [18, 26], // does not cover the box
+    [22, 26], // more than a pixel from the computed size
+  ]) {
+    await assert.rejects(
+      reduceToBox(frame, box, answering(width, height), { limits }),
+      { code: 'RESIZE_ENGINE_INVALID' },
+    );
+  }
+});
+
+test('straightAlpha is within one level of Sharp on every valid pixel', async () => {
+  const pairs: number[] = [];
+  for (let alpha = 0; alpha < 256; alpha++) {
+    for (let colour = 0; colour <= alpha; colour++) {
+      pairs.push(colour, colour, colour, alpha);
+    }
+  }
+  const data = Buffer.from(pairs);
+  const raw = { width: data.length / 4, height: 1, channels: 4 as const };
+  const viaSharp = await sharp(data, { raw: { ...raw, premultiplied: true } })
+    .raw({ depth: 'uchar' })
+    .toBuffer();
+  const ours = straightAlpha({ data, info: { ...raw, premultiplied: true } });
+  assert.equal(ours.info.premultiplied, undefined);
+  for (let i = 0; i < data.length; i++) {
+    assert.ok(Math.abs(ours.data[i] - viaSharp[i]) <= 1, `byte ${i}`);
+  }
+});
+
+test('straightAlpha converts grey with alpha, and clamps a colour above its alpha', () => {
+  const data = Buffer.from([100, 128, 0, 0, 200, 100]);
+  const before = Buffer.from(data);
+  const out = straightAlpha({
+    data,
+    info: { width: 3, height: 1, channels: 2, premultiplied: true },
+  });
+  assert.deepEqual([...out.data], [199, 128, 0, 0, 255, 100]);
+  assert.equal(out.info.channels, 2);
+  assert.ok(data.equals(before));
 });

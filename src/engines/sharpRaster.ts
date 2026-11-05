@@ -1,51 +1,9 @@
-// The boundary between a Raster and Sharp: the shape check for rasters that decoders and steps
-// return, the raw input options, and the read-back of Sharp's raw output. Every conversion between
-// the two lives here, so the engine can later be put behind a port at this one place.
+// The boundary between a Raster and Sharp: the raw input options, and the read-back of Sharp's raw
+// output. Every conversion between the two lives here, for SharpEngine and for a Sharp-based step.
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
-import type { Raster, RasterInfo } from './contracts/decoder.ts';
-import { ResizeSetupError } from './errors.ts';
-
-const isPositiveInteger = (n: unknown): n is number =>
-  typeof n === 'number' && Number.isInteger(n) && n > 0;
-
-/** Why `value` is not a Raster, or undefined when it is one. */
-export function rasterProblem(value: unknown): string | undefined {
-  if (typeof value !== 'object' || value === null) {
-    return 'it is not an object';
-  }
-  const { data, info } = value as { data?: unknown; info?: unknown };
-  if (!Buffer.isBuffer(data)) {
-    return '`data` is not a Buffer';
-  }
-  if (typeof info !== 'object' || info === null) {
-    return '`info` is not an object';
-  }
-  const { width, height, channels, frames = 1 } = info as RasterInfo;
-  for (const [name, n] of Object.entries({ width, height, channels, frames })) {
-    if (!isPositiveInteger(n)) {
-      return `\`info.${name}\` (${String(n)}) is not a positive integer`;
-    }
-  }
-  if (channels > 4) {
-    return `\`info.channels\` (${channels}) is not 1–4`;
-  }
-  const expected = width * height * channels * frames;
-  if (data.length !== expected) {
-    return `\`data\` holds ${data.length} bytes, not width × height × channels × frames (${expected})`;
-  }
-  return undefined;
-}
-
-/** Rejects a decoder's raster that is not a Raster. */
-export function checkRaster(raster: Raster): void {
-  const problem = rasterProblem(raster);
-  if (problem !== undefined) {
-    throw new ResizeSetupError(
-      `resize: a decoder returned an invalid raster: ${problem}`,
-      { code: 'RESIZE_DECODER_INVALID' },
-    );
-  }
-}
+import type { Raster, RasterInfo } from '../contracts/decoder.ts';
+import { ResizeSetupError } from '../errors.ts';
+import { rasterProblem } from '../helpers/raster.ts';
 
 /** Sharp's raw input options for the raster's pixels, frames stacked top to bottom. */
 function rawOptions(raster: Raster): NonNullable<SharpOptions['raw']> {

@@ -67,6 +67,9 @@ export {
   type TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+// --- the Raster helpers: a Sharp-based beforeStep wraps the raster it receives and reads its
+// result back (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))`) ---
+export { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
 // --- error hierarchy: every module throw is a `ResizeError`; the subclass says what to DO ---
 // Hosts catch `ResizeError` to separate "this module rejected it" from a sharp/S3/mongo failure,
 // then branch on the subclass (or the stable `err.code`). `ResizeError.isResizeError(err)` is the
@@ -106,9 +109,6 @@ export {
   type LogMetricsOptions,
   NoopMetrics,
 } from './metrics.ts';
-// --- the Raster helpers: a Sharp-based beforeStep wraps the raster it receives and reads its
-// result back (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))`) ---
-export { rasterToSharp, sharpToRaster } from './raster.ts';
 // --- core: the Resizer + named lookup (constructor-wired; one per name) ---
 // `resetResizerForTests` is a TEST-ONLY escape hatch for host test suites.
 export type { ResizerOptions } from './resizer.ts';

@@ -9,6 +9,7 @@
 import { Catalog } from './catalog.ts';
 import defaultResizeConfig, { defaultCoordination } from './config/resize.ts';
 import type { SourceDecoder } from './contracts/decoder.ts';
+import type { ImageEngine } from './contracts/engine.ts';
 import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
@@ -23,6 +24,7 @@ import {
 } from './coordination.ts';
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { Dispatcher } from './dispatcher.ts';
+import { SharpEngine } from './engines/sharp.ts';
 import { ResizeSetupError } from './errors.ts';
 import { firstTime, logNeverThrow, messageText } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
@@ -221,6 +223,8 @@ export class Resizer {
   readonly #hooks: HookBus;
   // The decoders that read originals, built once: the Processor renders every task through them.
   readonly #decoders: DecoderSet;
+  // The pixel work after the decode: resizing and encoding.
+  readonly #engine: ImageEngine = new SharpEngine();
   #builtServices: Services | undefined;
   // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
   #dispatcher: Dispatcher | undefined;
@@ -497,6 +501,7 @@ export class Resizer {
           media,
           storage,
           decoders: this.#decoders,
+          engine: this.#engine,
           pipelines: this.#pipelines,
           hooks: this.#hooks,
           config,

@@ -124,10 +124,10 @@ export class SharpDecoder extends SourceDecoder {
     }
     const { data, info } = rendered;
     // The frame count comes from the pixels themselves, by the rule of `readRaster` in
-    // src/raster.ts (which decoders do not import): Sharp echoes the requested `pages` in
-    // `info.pages` even when the loader read a single frame, and the page height is a frame height
-    // only when it is below the height and divides it. The Processor checks the bytes against the
-    // result (`checkRaster`, RESIZE_DECODER_INVALID).
+    // src/engines/sharpRaster.ts (which decoders do not import): Sharp echoes the requested `pages`
+    // in `info.pages` even when the loader read a single frame, and the page height is a frame
+    // height only when it is below the height and divides it. The Processor checks the bytes
+    // against the result (`checkRaster`, RESIZE_DECODER_INVALID).
     const { pageHeight } = info;
     const count =
       pageHeight !== undefined &&

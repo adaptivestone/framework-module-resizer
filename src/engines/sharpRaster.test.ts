@@ -3,15 +3,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
-import type { Raster } from './contracts/decoder.ts';
-import { ResizeError } from './errors.ts';
-import {
-  checkRaster,
-  rasterProblem,
-  rasterToSharp,
-  readRaster,
-  sharpToRaster,
-} from './raster.ts';
+import type { Raster } from '../contracts/decoder.ts';
+import { ResizeError } from '../errors.ts';
+import { checkRaster, rasterProblem } from '../helpers/raster.ts';
+import { rasterToSharp, readRaster, sharpToRaster } from './sharpRaster.ts';
 
 /** A raster of one solid colour (one value per channel). */
 function solid(width: number, height: number, colour: number[]): Raster {
