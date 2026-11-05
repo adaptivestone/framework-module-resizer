@@ -2,8 +2,10 @@
 // loop (src/consumer.ts), unchanged. A one-shot task queue over the real one gives a Consumer the
 // delivered task once and then ends its run, so its retries, dead-letters, gate lock, observers and
 // metrics are the worker's own. A record that must stay in the queue is listed in
-// `batchItemFailures`, never thrown: Lambda then retries only those. Only an event that is no SQS
-// batch, and checks that reject, throw. The host logger is called only through logNeverThrow.
+// `batchItemFailures`, never thrown: Lambda then retries only those. A record that cannot be
+// delivered is listed alone, with a line, and its neighbours run. Only an event that is no SQS batch
+// (no Records array, a bad context, a record with no messageId to list it by), and checks that
+// reject, throw. The host logger is called only through logNeverThrow.
 //
 // The time rules. A Lambda function is killed at its timeout, and rows persist once at the end of a
 // task, so a task is stopped while there is time left to store what it finished: its budget is the
@@ -35,8 +37,8 @@ export interface SqsRecordLike {
   messageId: string;
   receiptHandle: string;
   body: string;
-  // Optional in the type so that a hand-built event gets its answer from the event check, which
-  // refuses a record without a count.
+  // Optional in the type so that a hand-built event gets its answer from the handler, which lists a
+  // record without a count and names it.
   attributes?: { ApproximateReceiveCount?: string };
   eventSourceARN?: string;
 }
@@ -132,32 +134,39 @@ const RECEIVE_COUNT = /^[1-9]\d*$/;
 const filled = (value: unknown): boolean =>
   typeof value === 'string' && value !== '';
 
-const isRecord = (record: SqsRecordLike): boolean =>
-  filled(record?.messageId) &&
-  filled(record.receiptHandle) &&
-  typeof record.body === 'string';
-
-/** Throw unless this is an SQS batch whose records can all be counted and answered. */
+/**
+ * Throw unless every record can be answered: the response names a record by its messageId, and
+ * Lambda reads an empty one as a failure of the whole batch.
+ */
 function checkEvent(event: SqsEventLike, context: LambdaContextLike): void {
   if (
     !Array.isArray(event?.Records) ||
-    !event.Records.every(isRecord) ||
+    !event.Records.every((record) => filled(record?.messageId)) ||
     typeof context?.getRemainingTimeInMillis !== 'function'
   ) {
     throw new ResizeSetupError(
-      "resize lambda: the event is not an SQS batch: it needs a Records array whose records have a messageId, a receiptHandle and a string body, and a context with getRemainingTimeInMillis() — check the function's trigger",
+      "resize lambda: the event is not an SQS batch: it needs a Records array whose records each have a messageId, and a context with getRemainingTimeInMillis() — check the function's trigger",
       { code: 'RESIZE_SQS_EVENT_INVALID', retryable: false },
     );
   }
-  for (const { messageId, attributes } of event.Records) {
-    const count = attributes?.ApproximateReceiveCount;
-    if (typeof count !== 'string' || !RECEIVE_COUNT.test(count)) {
-      throw new ResizeSetupError(
-        `resize lambda: message ${messageId} has no attributes.ApproximateReceiveCount that holds a whole number from 1, as SQS reports it: its deliveries could not be counted, so a failing task would never be dead-lettered — check the function's trigger`,
-        { code: 'RESIZE_SQS_EVENT_INVALID', retryable: false },
-      );
-    }
+}
+
+/**
+ * What keeps a record from being delivered, for its line. Such a record is listed alone: a throw
+ * would cost its neighbours a receive each time, and past maxAttempts they would die unrun.
+ */
+function flawOf(record: SqsRecordLike): string | undefined {
+  if (!filled(record.receiptHandle)) {
+    return 'no usable receiptHandle';
   }
+  if (typeof record.body !== 'string') {
+    return 'no string body';
+  }
+  const count = record.attributes?.ApproximateReceiveCount;
+  if (typeof count !== 'string' || !RECEIVE_COUNT.test(count)) {
+    return 'no attributes.ApproximateReceiveCount that holds a whole number from 1, as SQS reports it: its deliveries could not be counted, so a failing task would never be dead-lettered';
+  }
+  return undefined;
 }
 
 /**
@@ -333,6 +342,14 @@ async function deliver(
   const { messageId: id, receiptHandle: receipt, body } = record;
   const { wired, left, margin } = run;
   const { logger } = wired;
+  const flaw = flawOf(record);
+  if (flaw) {
+    logNeverThrow(
+      logger,
+      `resize lambda: message ${id} has ${flaw} — it stays in the queue, and the records beside it run; check the function's trigger`,
+    );
+    return 'left';
+  }
   const source = record.eventSourceARN;
   const lane = laneOf(wired.lanes, source);
   if (!lane) {

@@ -291,9 +291,17 @@ test('the heartbeat renews during the run and stops at the end', async () => {
   const timers = () =>
     process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
   const before = timers();
-  const { handler } = pushed(sqs, () => sleep(2300), {
-    timing: { leaseMs: 1000 },
-  });
+  // It waits for the adoption and four heartbeats, not for a time, so a busy runner cannot fail it.
+  // Without a heartbeat the budget ends the wait after 30 s, and the count below fails.
+  const { handler } = pushed(
+    sqs,
+    async (_task, { signal }) => {
+      while (sqs.visibility().length < 5 && !signal.aborted) {
+        await sleep(20);
+      }
+    },
+    { timing: { leaseMs: 1000 } },
+  );
   const out = await handler({ Records: [recordOf('a')] }, context());
   assert.deepEqual(out.batchItemFailures, []);
   const renewals = sqs.visibility().length;
@@ -612,11 +620,11 @@ test('an event that is not an SQS batch throws RESIZE_SQS_EVENT_INVALID and runs
     { Records: 'x' },
     { Records: [{}] },
     { Records: [null] },
-    { Records: [{ messageId: 'a', receiptHandle: 'r' }] },
     { Records: [{ messageId: '', receiptHandle: 'r', body: '' }] },
-    { Records: [{ messageId: 'a', receiptHandle: '', body: '' }] },
+    { Records: [{ messageId: 1, receiptHandle: 'r', body: '' }] },
     { Records: [{ receiptHandle: 'r', body: '' }] },
-    { Records: [{ messageId: 'a', receiptHandle: 'r', body: 1 }] },
+    // It cannot be listed by itself, so the record beside it does not run either.
+    { Records: [recordOf('b'), {}] },
   ];
   for (const event of bad) {
     await assert.rejects(handler(event as never, contextOf(60_000)), {
@@ -634,11 +642,11 @@ test('an event that is not an SQS batch throws RESIZE_SQS_EVENT_INVALID and runs
 });
 
 // A count that is not one SQS would report reads as NaN, 0, or the same 1 on every delivery, so the
-// task would never be dead-lettered: `maxAttempts` compares against it (src/consumer.ts). It comes
-// through an event, so it is refused with the event.
-test('a record whose receive count cannot be counted throws RESIZE_SQS_EVENT_INVALID and runs nothing', async () => {
+// task would never be dead-lettered: `maxAttempts` compares against it (src/consumer.ts). Such a
+// message is not run. It stays in the queue, for the queue's own redrive to end.
+test('a record whose receive count cannot be counted is listed alone, with one error line, and makes no queue call', async () => {
   const sqs = fakeSqs();
-  const { handler, flushes } = pushed(sqs, async () =>
+  const { handler, lines } = pushed(sqs, async () =>
     assert.fail('must not run'),
   );
   const { attributes: _, ...noAttributes } = recordOf('a');
@@ -670,23 +678,123 @@ test('a record whose receive count cannot be counted throws RESIZE_SQS_EVENT_INV
     })),
   ];
   for (const record of records) {
-    await assert.rejects(
-      handler({ Records: [record] } as never, contextOf(60_000)),
-      {
-        code: 'RESIZE_SQS_EVENT_INVALID',
-        retryable: false,
-        message: /message a .*ApproximateReceiveCount/,
-      },
-      JSON.stringify(record),
+    const before = lines.length;
+    const out = await handler(
+      { Records: [record] } as never,
+      contextOf(60_000),
     );
+    const what = JSON.stringify(record);
+    assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }], what);
+    const logged = lines.slice(before);
+    assert.deepEqual(
+      logged.map((l) => l.level),
+      ['error'],
+      what,
+    );
+    assert.match(logged[0].message, /message a .*ApproximateReceiveCount/);
   }
-  // One such record refuses the batch, as a bad body does: the record beside it stays untouched.
-  await assert.rejects(
-    handler({ Records: [recordOf('b'), noAttributes] }, contextOf(60_000)),
-    { code: 'RESIZE_SQS_EVENT_INVALID' },
-  );
   assert.deepEqual(sqs.calls, []);
-  assert.deepEqual(flushes, []);
+});
+
+test('a record with a messageId but a bad receipt or body is listed alone, with one error line, and makes no queue call', async () => {
+  const sqs = fakeSqs();
+  const { handler, lines } = pushed(sqs, async () =>
+    assert.fail('must not run'),
+  );
+  const { receiptHandle: _r, body: _b, ...neither } = recordOf('a');
+  const rows: [unknown, RegExp][] = [
+    [neither, /message a has no usable receiptHandle/],
+    [{ ...recordOf('a'), receiptHandle: '' }, /no usable receiptHandle/],
+    [{ ...recordOf('a'), receiptHandle: 1 }, /no usable receiptHandle/],
+    [{ ...neither, receiptHandle: 'r' }, /message a has no string body/],
+    [{ ...recordOf('a'), body: 1 }, /no string body/],
+    [{ ...recordOf('a'), body: null }, /no string body/],
+  ];
+  for (const [record, line] of rows) {
+    const before = lines.length;
+    const out = await handler(
+      { Records: [record] } as never,
+      contextOf(60_000),
+    );
+    const what = JSON.stringify(record);
+    assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }], what);
+    const logged = lines.slice(before);
+    assert.deepEqual(
+      logged.map((l) => l.level),
+      ['error'],
+      what,
+    );
+    assert.match(logged[0].message, line);
+    assert.match(logged[0].message, /it stays in the queue/);
+  }
+  assert.deepEqual(sqs.calls, []);
+});
+
+// A throw would fail the batch, so every neighbour would lose a receive, and with the record still
+// in the queue they would be dead-lettered unrun past maxAttempts.
+test('one bad record leaves the records beside it to run: they complete and only it is listed', async () => {
+  const { attributes: _, ...noCount } = recordOf('bad', { receipt: 'rh-bad' });
+  for (const bad of [
+    { ...recordOf('bad'), receiptHandle: '' },
+    { ...recordOf('bad', { receipt: 'rh-bad' }), body: 1 },
+    noCount,
+  ]) {
+    const sqs = fakeSqs();
+    let ran = 0;
+    const { handler, events, lines, flushes } = pushed(sqs, async () => {
+      ran += 1;
+    });
+    const out = await handler(
+      {
+        Records: [bad, recordOf('b'), bad, recordOf('c'), bad],
+      } as never,
+      context(),
+    );
+    const what = JSON.stringify(bad);
+    assert.equal(ran, 2, what);
+    assert.deepEqual(listed(out), ['bad', 'bad', 'bad'], what);
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['completed', 'completed'],
+      what,
+    );
+    assert.equal(sqs.deletes(), 2, what);
+    assert.ok(
+      sqs.calls.every((call) => call.input.ReceiptHandle !== 'rh-bad'),
+      what,
+    );
+    assert.equal(
+      lines.filter((l) => l.level === 'error').length,
+      3,
+      `one line per record: ${what}`,
+    );
+    assert.equal(flushes.length, 1, what);
+  }
+});
+
+// What is wrong with it is said first: neither its time nor its source changes the answer.
+test('a bad record gets only its own line, with no time left and from an unknown source too', async () => {
+  const sqs = fakeSqs();
+  const { handler, lines } = pushed(sqs, async () =>
+    assert.fail('must not run'),
+  );
+  const bad = { ...recordOf('a'), receiptHandle: '' };
+  const late = await handler({ Records: [bad] }, contextOf(100));
+  const foreign = await handler(
+    {
+      Records: [
+        { ...bad, eventSourceARN: 'arn:aws:sqs:us-east-1:1:someone-else' },
+      ],
+    },
+    context(),
+  );
+  assert.deepEqual(listed(late), ['a']);
+  assert.deepEqual(listed(foreign), ['a']);
+  assert.equal(lines.length, 2);
+  for (const line of lines) {
+    assert.match(line.message, /message a has no usable receiptHandle/);
+  }
+  assert.deepEqual(sqs.calls, []);
 });
 
 test('a receive count of several digits is counted', async () => {

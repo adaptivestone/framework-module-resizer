@@ -382,9 +382,9 @@ export class SqsTaskQueue extends TaskQueue implements DeliveryQueue {
     }
     const receiveCount = message.Attributes?.ApproximateReceiveCount;
     if (receiveCount === undefined && !this.#warnedNoReceiveCount) {
-      // Clients before @aws-sdk/client-sqs 3.572 drop MessageSystemAttributeNames, and a pushed
-      // event can leave the count out: every delivery then reads as attempt 1, so a failing task
-      // would be retried forever.
+      // Clients before @aws-sdk/client-sqs 3.572 drop MessageSystemAttributeNames: every delivery
+      // then reads as attempt 1, so a failing task would be retried forever. A pushed record gets
+      // here with its count, since the handler lists one without it.
       this.#warnedNoReceiveCount = true;
       this.#logger.warn(
         'resize sqs: a message came without ApproximateReceiveCount — attempts cannot be counted, so failing tasks are never dead-lettered; a worker needs @aws-sdk/client-sqs >= 3.572',
