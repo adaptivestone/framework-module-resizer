@@ -26,7 +26,8 @@ export interface SqsHandlerOptions {
   // The queue(s) this function consumes: one name or a list; default 'default'. Records go to their
   // queue by event source.
   queue?: string | readonly string[];
-  // The Resizers to serve; default: every Resizer registered at the first invocation.
+  // The Resizers to serve; default: every Resizer registered when the start checks are built, which
+  // is at the first invocation, and again on the invocation after checks that rejected or were dropped.
   resizers?: readonly Resizer[];
   // Process-wide Sharp tuning, applied once, at the first invocation. Omitted: left as it is.
   sharp?: { concurrency: number; cache: boolean };
