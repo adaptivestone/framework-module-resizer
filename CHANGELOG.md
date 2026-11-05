@@ -323,8 +323,12 @@ it lists what to change before you run `npm i`.
   A test requires every code in it, and holds the values to the audited table.
 - `## Config reference` moved above `## Drivers` in the README, so it ends inside the 64 KiB npm shows.
 - `AGENTS.md` holds what a new integration needs, at most 5,000 words, from about 16,000. The rest moved
-  to `README.md` and `UPGRADING.md`, one link away. A test keeps it there, and every link between the
-  documents is checked.
+  to `README.md` and `UPGRADING.md`, one link away. It shows how to serve local files in development
+  and the migration that creates the indexes, both run on a framework host. A test keeps it there, and
+  every link between the documents is checked, files on GitHub and `./dist/…` paths included.
+- A media schema without `resizeMediaSchemaFragment` fails nothing at boot: `uploadOriginal()`
+  succeeds, `save()` drops the original, and reads count `no-original`. The README and `AGENTS.md`
+  have a row for it.
 
 **Internal**
 

@@ -675,3 +675,17 @@ test('the not-started row says what a function needs, with an explicit stopBefor
     assert.ok(row.includes(needle), needle);
   }
 });
+
+test('a forgotten media schema has a symptom row, since nothing fails at boot', () => {
+  const row = readmeSubsection('### Symptoms without a code')
+    .split('\n')
+    .find((line) => line.includes('reads count `no-original`'));
+  assert.ok(row, 'no row');
+  for (const needle of [
+    '`uploadOriginal()` succeeded',
+    '`verify()` passes',
+    '`resizeMediaSchemaFragment`',
+  ]) {
+    assert.ok(row.includes(needle), needle);
+  }
+});

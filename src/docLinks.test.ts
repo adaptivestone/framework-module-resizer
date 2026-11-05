@@ -1,6 +1,8 @@
-// Links between this repository's documents: every relative link names a file that exists, every
-// anchor names a heading, and a shipped document links only to files the package ships. Links into
-// the guide, and from it, are checked against a build of the docs site at release (see RELEASE.md).
+// Links between this repository's documents: every relative link, and every link to a file of this
+// repository on GitHub, names a file that exists, every anchor names a heading, and a shipped document
+// links only to files the package ships. A link into dist/ is checked against the source it is built
+// from. Links into the guide, and from it, are checked against a build of the docs site at release
+// (see RELEASE.md).
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
@@ -14,7 +16,20 @@ const exists = (file: string): boolean => existsSync(new URL(file, repo));
 const SHIPPED = ['README.md', 'AGENTS.md', 'UPGRADING.md'];
 const DOCS = [...SHIPPED, 'RELEASE.md', 'CHANGELOG.md'];
 const MODULE_URL =
-  /github\.com\/adaptivestone\/framework-module-resizer(?:\/blob\/[^/\s)]+\/([A-Z]+\.md))?#([\w-]+)/g;
+  /github\.com\/adaptivestone\/framework-module-resizer(?:\/blob\/[^/\s)]+\/([^\s)#]+\.md))?#([\w-]+)/g;
+// A file of this repository on GitHub, with or without an anchor.
+const MODULE_FILE =
+  /github\.com\/adaptivestone\/framework-module-resizer\/(?:blob|tree)\/[^/\s)]+\/([^\s)#`'"<>]+)/g;
+
+// dist/ exists only after a build: dist/a/b.d.ts and dist/a/b.js are built from src/a/b.ts, and a
+// hand-written src/a/b.d.ts (src/types.d.ts) is copied as it is.
+const sourcesOf = (path: string): string[] => {
+  if (!path.startsWith('dist/')) {
+    return [path];
+  }
+  const source = path.replace(/^dist\//, 'src/');
+  return [source.replace(/(?:\.d\.ts|\.js)$/, '.ts'), source];
+};
 
 const relativeLinks = (file: string) => [
   ...withoutFences(read(file)).matchAll(
@@ -42,7 +57,7 @@ test('every link between the documents reaches a file and a heading', () => {
     for (const [, path, anchor] of relativeLinks(file)) {
       links += 1;
       const target = path || file;
-      if (!target.startsWith('dist/') && !exists(target)) {
+      if (!sourcesOf(target).some(exists)) {
         broken.push(`${file}: ${target}`);
       } else if (
         anchor &&
@@ -52,12 +67,19 @@ test('every link between the documents reaches a file and a heading', () => {
         broken.push(`${file}: ${target}#${anchor}`);
       }
     }
+    for (const [, found] of read(file).matchAll(MODULE_FILE)) {
+      links += 1;
+      const path = found.replace(/[.,;:]+$/, ''); // the end of a sentence, not of the path
+      if (!exists(path)) {
+        broken.push(`${file}: github ${path}`);
+      }
+    }
     for (const [, path, anchor] of read(file).matchAll(MODULE_URL)) {
       links += 1;
       const target = path ?? 'README.md';
       const ok =
         (target === 'README.md' && anchor === 'readme') ||
-        docAnchors(read(target)).has(anchor);
+        (exists(target) && docAnchors(read(target)).has(anchor));
       if (!ok) {
         broken.push(`${file}: github ${target}#${anchor}`);
       }

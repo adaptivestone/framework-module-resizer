@@ -124,9 +124,9 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    - `storage`: `{ driver: 'local', rootDir, publicBaseUrl, privateRootDir? }` or
      `{ driver: 's3', bucketPublic, bucketPrivate?, publicBaseUrl?, region?, endpoint?,
      forcePathStyle? }` (credentials from the AWS chain). Local: the framework serves no static
-     files, see the guide's "Serve local files". Serve exactly `rootDir`, never a parent:
-     `privateRootDir` sits beside it by default, and the module cannot detect that. The scaffold takes
-     `publicBaseUrl` from `RESIZE_PUBLIC_BASE_URL`: set it in every deployed environment;
+     files, so serve exactly `rootDir`, never a parent, as below: `privateRootDir` sits beside it by
+     default, and the module cannot detect that. The scaffold takes `publicBaseUrl` from
+     `RESIZE_PUBLIC_BASE_URL`: set it in every deployed environment;
    - `queue`: the name of a `queues` entry, or `false` = eager only.
 
    and the PROCESS-WIDE sections, read only from `src/config/resize.ts`:
@@ -144,6 +144,22 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    out). The framework merges it field by field, and the module merges the image settings over the
    package defaults (arrays and `encode.formats` replace): do not add a merge of your own. Every key
    is in the [Config reference](./README.md#config-reference).
+
+   Local files in development, from the framework's own server; `/media` and `var/media` are the
+   scaffold's `publicBaseUrl` path and `rootDir`. In production a reverse proxy or a CDN serves
+   `rootDir`, never the API:
+
+   ```ts
+   // src/bootHttp.ts — pass it as new Server({ folders, bootHttp })
+   import type { BootHttpHook } from '@adaptivestone/framework/server.js';
+
+   const bootHttp: BootHttpHook = async (app) => {
+     if (process.env['NODE_ENV'] === 'production') return; // a reverse proxy or a CDN serves these files
+     const { default: express } = await import('express'); // npm i -D express
+     app.httpServer?.express.use('/media', express.static('var/media', { dotfiles: 'ignore', index: false, immutable: true, maxAge: '1y' }));
+   };
+   export default bootHttp;
+   ```
 
 6. Ensure the media model carries `original` and `previews[]`. Spread the exported fragment instead
    of hand-writing those fields. It is exported by `…/framework.js` and `…/drivers/mongo.js`, not by
@@ -169,8 +185,11 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    `verify()` and worker start reject with `RESIZE_MONGO_INDEX_MISSING` until the gate index exists.
    The worker runs on the framework CLI, which turns `autoIndex` off, so it builds none and waits for
    none: create them through a migration that runs before the API and the workers, or, on a new
-   database only, let the API build them first. Never add index creation to HTTP bootstrap or the
-   first enqueue. Upgrading: the order is in [`UPGRADING.md`](./UPGRADING.md).
+   database only, let the API build them first. In a framework host,
+   `npm run cli migration/create -- --name=resizeIndexes` writes one; give its `up()`
+   `await this.app.getModelOrThrow('ResizeTask').createIndexes();` and run
+   `npm run cli migration/migrate`. Never add index creation to HTTP bootstrap or the first
+   enqueue. Upgrading: the order is in [`UPGRADING.md`](./UPGRADING.md).
 
 8. Lazy / pre-warm modes: keep `queues: { default: { driver: 'database' } }` (or an SQS entry)
    and `queue: 'default'`, and set `worker: { enabled: true }` in `src/config/resize.ts`, then run
@@ -398,7 +417,7 @@ The first things a new integration meets. Every other code is in
 
 | Symptom | Cause → fix |
 |---|---|
-| ``resize config: `mediaModelName` is required``, `RESIZE_CONFIG_MEDIA_MODEL_MISSING` | set it in the host `src/config/resize.ts` (or the `configName` file named in the message) |
+| ``resize config: `mediaModelName` is required``, `RESIZE_CONFIG_MEDIA_MODEL_MISSING`, or `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` | set `mediaModelName` in the host `src/config/resize.ts` (or the `configName` file named in the message) to your media model's registered name: the scaffold guesses `'File'`. `verify()`, worker start and the first call in the API that uses the model, such as `generate()`, throw it; `uploadOriginal()` still succeeds |
 | `RESIZE_APP_NOT_INITIALIZED` | a `FrameworkResizer` read the framework app before the `Server` was constructed — construct the Server before the first call (importing `src/resizer.ts` earlier is fine); in tests, install a fake app with `setAppInstance` from `@adaptivestone/framework/helpers/appInstance.js` |
 | `RESIZE_CONFIG_QUEUE_UNKNOWN` on first use or from `verify()` | the Resizer's queue name is not an entry of `queues` in `src/config/resize.ts` — add `queues.<name>`, set `queue`/`queueName` to a defined name, or `queue: false` for eager only |
 | `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config named in the message, or pass `storage` to `new FrameworkResizer()` |
@@ -415,6 +434,7 @@ The first things a new integration meets. Every other code is in
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx --no -- resize-scaffold` |
 | `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: dead-lettered on its first delivery, since no retry can help — replace the original |
 | the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews` — add `...resizeMediaPaths` to the query |
+| reads count `no-original` though `uploadOriginal()` succeeded | step 6 was skipped: the media schema has no `original`, so `save()` dropped it, and `verify()` passes — spread `resizeMediaSchemaFragment`, then store the original again |
 | `resize worker: task … is dead (…)` at `error` | the line holds the code, the reason and the cause — fix the cause first; the next read after `coordination.cooldownMs` queues the media again |
 | a variant stays missing for ~10 min after its task was dead-lettered | `coordination.cooldownMs` (default 600000): the dead task holds the gate until the cooldown ends — fix the cause in the logs first |
 | tasks stay `pending` on one queue | no worker consumes that queue — start `npm run cli ResizeWorker -- --queue=<name>` |

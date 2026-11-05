@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { describe, test } from 'node:test';
 // The real export surface — if AGENTS.md names something this entry doesn't export, fail.
@@ -139,6 +140,55 @@ describe('AGENTS.md stays what a new integration needs', () => {
       doc.includes(
         'The guide and GitHub show the newest release; this file matches the version you have installed.',
       ),
+    );
+  });
+
+  test('its local-files snippet is the recipe serveLocalFiles.test.ts runs on the framework server', async () => {
+    const flat = (text: string) => text.replace(/\s+/g, ' ');
+    const tested = await readFile(
+      new URL('./framework/serveLocalFiles.test.ts', import.meta.url),
+      'utf8',
+    );
+    const recipe = /const bootHttp: BootHttpHook = [\s\S]*?\n\};/.exec(
+      tested,
+    )?.[0];
+    assert.ok(recipe, 'serveLocalFiles.test.ts holds no bootHttp recipe');
+    const doc = flat(await readAgents());
+    assert.ok(doc.includes(flat(recipe)), 'AGENTS.md lacks the tested recipe');
+    assert.ok(doc.includes('new Server({ folders, bootHttp })'));
+  });
+
+  test('step 7 shows the migration that creates the indexes, with commands the framework has', async () => {
+    const doc = (await readAgents()).replace(/\s+/g, ' ');
+    for (const needle of [
+      'npm run cli migration/create',
+      "await this.app.getModelOrThrow('ResizeTask').createIndexes();",
+      'npm run cli migration/migrate',
+    ]) {
+      assert.ok(doc.includes(needle), needle);
+    }
+    // The framework's CLI names a command by its file under dist/commands, in lower case.
+    const commands = new URL(
+      'commands/migration/',
+      import.meta.resolve('@adaptivestone/framework/server.js'),
+    );
+    for (const file of ['Create.js', 'Migrate.js']) {
+      assert.ok(existsSync(new URL(file, commands)), `migration/${file}`);
+    }
+  });
+
+  test('its troubleshooting table names the likeliest config error and a forgotten step 6', async () => {
+    const rows = section(await readAgents(), '## Troubleshooting')
+      .split('\n')
+      .filter((line) => line.startsWith('| '));
+    const row = (needle: string) => rows.find((line) => line.includes(needle));
+    assert.match(
+      row('`RESIZE_CONFIG_MEDIA_MODEL_MISSING`') ?? '',
+      /`RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN`.*'File'/,
+    );
+    assert.match(
+      row('`no-original`') ?? '',
+      /`uploadOriginal\(\)` succeeded.*`resizeMediaSchemaFragment`/,
     );
   });
 
