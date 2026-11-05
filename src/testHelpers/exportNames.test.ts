@@ -525,36 +525,53 @@ test('the word "import" inside a string on a fence line starts no statement', as
 });
 
 // A doc edit must fail the guard, never hang `npm test`, and node:test cannot interrupt a
-// synchronous scan: so the scan runs in a child process with a deadline. Each input is read in
-// well under the budget only when the scan is linear in the fence length.
-// The open braces never close, so that input is checked for its time only, and so are the string
-// names (many items, an escape that never closes its `{`).
+// synchronous scan: so the scan runs in a child process with a deadline. Each input is read at two
+// sizes, and the larger must not cost far more than its share: 8 times the input costs about 8 times
+// the time when the scan is linear (at most 13 measured), and about 64 times when it is quadratic. A
+// budget in milliseconds flakes on a busy runner, and passes a quadratic `indexOf` loop on a fast one.
+// So the costs are CPU time, which a busy machine does not inflate as it does the clock, the least of
+// three runs, and a cost under the floor is no problem whatever its growth (timings that small are
+// noise). The open braces never close, so that input is checked for its cost only, and so are the
+// string names (many items, an escape that never closes its `{`).
 test('the scan is linear on a long statement without a specifier, a comment that never closes, or many open braces', () => {
   const url = new URL('./exportNames.ts', import.meta.url).href;
   const script = `import { docImports } from ${JSON.stringify(url)};
-const spaces = ' '.repeat(100000);
 const inputs = [
-  ['semicolon', 'import' + spaces + ';', true],
-  ['unterminated', 'import' + spaces, true],
-  ['comments', '/* '.repeat(50000), true],
-  ['braces', 'import ' + '{'.repeat(100000) + " from '${PKG}'", false],
-  ['quotes', 'import ' + '\\'"'.repeat(50000), true],
-  ['backslashes', 'import { "' + '\\\\'.repeat(100000), true],
-  ['string names', 'import { ' + '"a,}b" as X, '.repeat(20000) + "} from '${PKG}'", false],
-  ['open escape', 'import { "\\\\u{' + 'f'.repeat(100000) + "\\" as X } from '${PKG}'", false],
+  ['semicolon', (n) => 'import' + ' '.repeat(n) + ';', true],
+  ['unterminated', (n) => 'import' + ' '.repeat(n), true],
+  ['comments', (n) => '/* '.repeat(n / 2), true],
+  ['braces', (n) => 'import ' + '{'.repeat(n) + " from '${PKG}'", false],
+  ['quotes', (n) => 'import ' + '\\'"'.repeat(n / 2), true],
+  ['backslashes', (n) => 'import { "' + '\\\\'.repeat(n), true],
+  ['string names', (n) => 'import { ' + '"a,}b" as X, '.repeat(n / 5) + "} from '${PKG}'", false],
+  ['open escape', (n) => 'import { "\\\\u{' + 'f'.repeat(n) + "\\" as X } from '${PKG}'", false],
 ];
+const SMALL = 12500;
+const LARGE = 100000;
+const FLOOR_MS = 50;
+const MOST_GROWTH = 24;
+const fence = (body) => '\`\`\`ts\\n' + body + '\\n\`\`\`';
+const cpuMs = (md) => {
+  const before = process.cpuUsage();
+  docImports(md);
+  const { user, system } = process.cpuUsage(before);
+  return (user + system) / 1000;
+};
+const leastOfThree = (md) => Math.min(cpuMs(md), cpuMs(md), cpuMs(md));
 const slow = [];
 for (const [name, body, none] of inputs) {
-  const start = performance.now();
-  const found = docImports('\`\`\`ts\\n' + body + '\\n\`\`\`');
-  const ms = performance.now() - start;
-  if ((none && found.length !== 0) || ms > 200) slow.push(name + ': ' + found.length + ' imports in ' + ms.toFixed(0) + ' ms');
+  const large = fence(body(LARGE));
+  const found = docImports(large);
+  const small = leastOfThree(fence(body(SMALL)));
+  const ms = leastOfThree(large);
+  if ((none && found.length !== 0) || (ms > FLOOR_MS && ms > small * MOST_GROWTH)) slow.push(name + ': ' + found.length + ' imports, ' + small.toFixed(1) + ' ms at ' + SMALL + ', ' + ms.toFixed(1) + ' ms at ' + LARGE);
 }
 if (slow.length > 0) { console.error(slow.join('\\n')); process.exit(1); }`;
   const result = spawnSync(
     process.execPath,
     ['--experimental-strip-types', '--input-type=module', '-e', script],
-    { timeout: 5_000, encoding: 'utf8' },
+    // Only for a scan that never ends: a slow one fails on its growth first.
+    { timeout: 30_000, encoding: 'utf8' },
   );
   assert.equal(result.error, undefined, 'the scan was killed at its deadline');
   assert.equal(result.signal, null, 'the scan was killed at its deadline');

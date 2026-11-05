@@ -277,27 +277,26 @@ test('the refusal of a bad engine names `verify` too', () => {
   );
 });
 
-test('an `engine` key in a config is refused, naming the option', () => {
-  assert.throws(
-    () =>
-      new Resizer({
-        storage: memoryStorage().storage,
-        media: fakeMedia(),
-        config: {
-          ...makeImageConfig(),
-          engine: new SharpEngine(),
-        } as ResizeConfig,
-        logger: silent,
-      }),
-    (err: ResizeError) => {
-      assert.ok(err instanceof ResizeConfigError);
-      assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
-      assert.match(err.message, /`engine` is not a config key/);
-      assert.match(err.message, /new Resizer\(\{ engine \}\)/);
-      return true;
-    },
-  );
-});
+for (const option of ['engine', 'decoders']) {
+  test(`a \`${option}\` key in a config is refused, naming the option`, () => {
+    assert.throws(
+      () =>
+        new Resizer({
+          storage: memoryStorage().storage,
+          media: fakeMedia(),
+          config: { ...makeImageConfig(), [option]: [] } as ResizeConfig,
+          logger: silent,
+        }),
+      (err: ResizeError) => {
+        assert.ok(err instanceof ResizeConfigError);
+        assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+        assert.ok(err.message.includes(`\`${option}\` is not a config key`));
+        assert.ok(err.message.includes(`new Resizer({ ${option} })`));
+        return true;
+      },
+    );
+  });
+}
 
 test('a format with no encode.formats entry points to jpeg first, and to what a jpg entry needs', () => {
   assert.throws(

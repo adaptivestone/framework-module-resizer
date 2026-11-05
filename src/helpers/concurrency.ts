@@ -4,7 +4,8 @@
 /**
  * Run `worker` over `items` with at most `concurrency` in flight (a small promise pool, not
  * unbounded Promise.all). Each runner pulls the next index and, before pulling, checks the
- * abort signal — so a lost lease stops NEW variants without cancelling in-flight ones.
+ * abort signal — so a lost lease stops NEW variants. One in flight is not cancelled here: a variant
+ * with steps checks the signal itself between them (see render.ts).
  */
 export async function runBounded<T>(
   items: T[],

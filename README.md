@@ -886,7 +886,8 @@ A decoder turns the stored bytes of one source kind into pixels: `uploadOriginal
 original only through the decoders, and the worker and `generate()` render every source through
 them. The built-in decoders read every format the installed Sharp reads from a buffer (except SVG
 and `raw`), and SVG (rendered in a separate process). To add a source kind, pass decoders to the
-Resizer: `new Resizer({ decoders: [new PdfDecoder()] })` (or `new FrameworkResizer({ decoders })`).
+Resizer: `new Resizer({ decoders: [new PdfDecoder()] })` (or `new FrameworkResizer({ decoders })`); a
+`decoders` key in a config is `RESIZE_CONFIG_INVALID`.
 They are asked first, in order, before the built-in Sharp and SVG decoders, so a host decoder can
 also take over a built-in format. Pass the same decoders in every process that uploads or
 generates previews (API and worker). An entry that is not a decoder (a non-empty `formats` list of
@@ -1033,8 +1034,14 @@ no image library: it reads `raster.info` and `raster.data` (`width × height × 
 row, 8-bit sRGB with straight alpha) and resolves with `{ data, info }`. `rasterToSharp` and
 `sharpToRaster` are helpers for a step written with Sharp, and no part of the engine contract: they
 run Sharp, whichever engine the Resizer has. A `rasterToSharp` chain in a `variantStep`, from a raster
-the module handed over or made from one through `sharpToRaster`, keeps its limit on any engine. A step
-on another library has none, so it bounds its own time (see Pipelines).
+the module handed over or made from one through `sharpToRaster` (a raster read back from a `.clone()`
+has none), keeps its limit on any engine. A step on another library has none, so it bounds its own time
+(see Pipelines).
+
+A step's result marked `info.premultiplied: true` is converted to straight alpha, unless its
+`info.format` is `'raw'`. That is Sharp's own `{ data, info }` from `toBuffer({ resolveWithObject: true })`,
+whose flag is true on straight bytes after a resize, so such a result is read as straight alpha. A step
+that premultiplies its own bytes must not spread Sharp's `info`.
 
 The engine is not part of `encodeSig` and declares no version. Switching engines does not regenerate
 stored previews; bump each pipeline's `version` to do that. An engine that animates a format other
@@ -1070,7 +1077,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain, from a raster the module handed over or made from one through `sharpToRaster`, gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain, from a raster the module handed over or made from one through `sharpToRaster` (a raster read back from a `.clone()` has none), gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1130,8 +1137,8 @@ alpha 255, which costs an AVIF about 200 bytes per file, which matters only on v
 `.removeAlpha()` when `r.info.channels === 3`.
 
 A `rasterToSharp` chain in a `variantStep`, from a raster the module handed over or made from one
-through `sharpToRaster`, runs under `limits.processingTimeoutSeconds`: past it Sharp rejects, and only
-that variant fails. Each chain and the encode have their own limit, so the longest a variant holds a
+through `sharpToRaster` (a raster read back from a `.clone()` has none), runs under
+`limits.processingTimeoutSeconds`: past it Sharp rejects, and only that variant fails. Each chain and the encode have their own limit, so the longest a variant holds a
 thread is (chains + 1) × the limit. The chain's own `.timeout({ seconds: 60 })` replaces the limit on
 that chain, and `.timeout({ seconds: 0 })` turns it off there. The limit follows those raster objects,
 so a raster spread into a new object or built by the step has none, and neither has a fresh `sharp()`.

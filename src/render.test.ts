@@ -490,6 +490,26 @@ test("Sharp's own { data, info } from a step is read as straight alpha, on both 
   }
 });
 
+test("a step that spreads Sharp's info over its own premultiplied bytes is read as straight alpha", async () => {
+  const spreads = async (raster: Raster) => {
+    const { info } = await rasterToSharp(raster)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    return {
+      data: solid(20, 10, [100, 50, 25, 128]).data,
+      info: { ...info, premultiplied: true },
+    } as unknown as Raster;
+  };
+  const out = await runBeforeSteps(solid(20, 10, [1, 2, 3, 255]), [spreads], {
+    media: { id: 'm1' },
+    source: encodeOptions().source,
+    ctx: {},
+  });
+  // Not divided: the flag on such a result is not believed, so a step must not build one this way.
+  assert.deepEqual(pixelAt(out, 0, 0), [100, 50, 25, 128]);
+  assert.equal(out.info.premultiplied, undefined);
+});
+
 test('the flag on a raster a step built itself is still believed', async () => {
   const marked = (raster: Raster): Raster => ({
     data: solid(20, 10, [100, 50, 25, 128]).data,

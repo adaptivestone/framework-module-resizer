@@ -34,7 +34,8 @@ export function rasterInput(raster: Raster): SharpOptions {
 
 // The limit a chain started with, by Sharp instance (every chain call returns the same one), so
 // `sharpToRaster` can pass it on: a second chain in one step, on the first one's result, starts under
-// the limit too. A chain's own `.timeout()` is not read: it is that chain's alone.
+// the limit too. A chain's own `.timeout()` is not read: it is that chain's alone. A `.clone()` is a
+// new instance with no entry: it keeps Sharp's timeout, but a raster read back from it has none.
 const chainLimits = new WeakMap<Sharp, number>();
 
 /**
@@ -42,7 +43,8 @@ const chainLimits = new WeakMap<Sharp, number>();
  * refused here, before Sharp reads it as raw bytes of the wrong size. On a raster the core handed to
  * a variantStep, or read back from a chain on one through `sharpToRaster`, the chain starts with
  * `limits.processingTimeoutSeconds`; the chain's own `.timeout()` replaces it, and
- * `.timeout({ seconds: 0 })` turns it off. A raster the host built, and a fresh `sharp()`, have none.
+ * `.timeout({ seconds: 0 })` turns it off. A raster the host built, a raster read back from a
+ * `.clone()`, and a fresh `sharp()` have none.
  */
 export function rasterToSharp(raster: Raster): Sharp {
   const problem = rasterProblem(raster);

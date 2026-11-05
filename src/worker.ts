@@ -261,7 +261,7 @@ export interface RunWorkerOptions {
   // The queue(s) to consume: one name or a list (a name listed twice is consumed once); default
   // 'default'. Every name must be served, else the worker does not start.
   queue?: string | readonly string[];
-  signal: AbortSignal; // stops the worker: finish in-flight tasks, then return
+  signal: AbortSignal; // stops the worker: a running task keeps the variants past their steps and goes back to the queue, then it returns
   logger?: ResizeLogger; // the worker's own messages; default console
   // Process-wide Sharp tuning, applied once (keep Resizers' config.concurrency × concurrency ≈
   // CPU cores). Omitted: Sharp's settings are left as they are.

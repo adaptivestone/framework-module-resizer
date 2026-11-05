@@ -479,7 +479,9 @@ test('a timed-out task runs no further step and no encode, while a variant past 
   const tasks = new MemoryTaskQueue({
     timing: {
       idlePollMs: 5,
-      taskTimeoutMs: 50,
+      // Long enough for the first variant to reach its encode on a busy machine: at 50 ms the timer
+      // could fire first, and the test failed under load.
+      taskTimeoutMs: 500,
       maxAttempts: 1,
       retryBackoffMs: { base: 60_000, max: 60_000 },
     },

@@ -67,12 +67,15 @@ function validateRequiredResizeConfigFields(
       );
     }
   }
-  // Framework merging keeps unknown keys, so an engine here would never run, and nothing would say so.
-  if (root.engine !== undefined) {
-    invalid(
-      'resize config: `engine` is not a config key — pass it in code, as the `engine` option: new Resizer({ engine }), createResizer(config, { engine }) or new FrameworkResizer({ engine })',
-      'RESIZE_CONFIG_INVALID',
-    );
+  // Options in code, not config keys. Framework merging keeps unknown keys, so one here would never
+  // run, and nothing would say so.
+  for (const option of ['engine', 'decoders']) {
+    if (root[option] !== undefined) {
+      invalid(
+        `resize config: \`${option}\` is not a config key — pass it in code, as the \`${option}\` option: new Resizer({ ${option} }), createResizer(config, { ${option} }) or new FrameworkResizer({ ${option} })`,
+        'RESIZE_CONFIG_INVALID',
+      );
+    }
   }
   const upload = root.upload;
   if (!isRecord(upload)) {

@@ -147,6 +147,8 @@
   (`JPG`, which Sharp accepted) now fail with `RESIZE_ENGINE_FORMAT_UNSUPPORTED`. Remove the entry, or
   rename the id, which regenerates its previews. A package default outside `formats` that the host
   left alone is not checked, so `formats: ['jpeg', 'webp']` on a build without HEIF keeps working.
+- A `decoders` key in a config, which every route dropped silently, so those decoders never ran, is now
+  `RESIZE_CONFIG_INVALID`. Pass it in code, as the `decoders` option.
 
 **Changed behaviour**
 
@@ -221,8 +223,8 @@
   (`sharp(raster.data, { raw: raster.info })`, or a raster spread into a new object), and any other
   host code in a step, is unbounded. In 0.3.0 a step's Sharp work was one chain with the encode, under
   `limits.processingTimeoutSeconds`. A `rasterToSharp` chain, from a raster the module handed over or
-  made from one through `sharpToRaster`, stays under the limit, with the encode after it under its
-  own, so a variant holds a thread for at most (chains + 1) × the limit; its own
+  made from one through `sharpToRaster` (a raster read back from a `.clone()` has none), stays under
+  the limit, with the encode after it under its own, so a variant holds a thread for at most (chains + 1) × the limit; its own
   `.timeout({ seconds })` replaces the limit, and `.timeout({ seconds: 0 })` turns it off. Unbounded
   work can starve other tasks and dead-letter healthy ones, because stuck Sharp calls hold libuv's
   threads, and a timed-out delivery keeps its memory until the running step ends.

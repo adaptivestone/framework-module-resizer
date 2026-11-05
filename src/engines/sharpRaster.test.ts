@@ -106,9 +106,10 @@ test('a raster read back from a limited chain carries the limit, and only that o
     ),
     7,
   );
-  // The host's own raster, a fresh sharp(), and a raster no limit was put on: none.
+  // The host's own raster, a fresh sharp(), a clone, and a raster no limit was put on: none.
   const unlimited = [
     rasterToSharp({ ...handed }),
+    rasterToSharp(handed).clone(),
     sharp(handed.data, {
       raw: { width: 4, height: 2, channels: 3 },
     }),
