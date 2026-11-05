@@ -689,3 +689,15 @@ test('a forgotten media schema has a symptom row, since nothing fails at boot', 
     assert.ok(row.includes(needle), needle);
   }
 });
+
+test('the docs say how far the excluded SDK range reaches', () => {
+  for (const file of ['README.md', 'CHANGELOG.md', 'UPGRADING.md']) {
+    const text = read(file).replace(/\s+/g, ' ');
+    assert.ok(
+      text.includes(
+        '`--legacy-peer-deps`, `--force`, pnpm and yarn install them',
+      ),
+      file,
+    );
+  }
+});

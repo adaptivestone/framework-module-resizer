@@ -1052,7 +1052,8 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     response with no length, which `S3Storage` reads, is likewise caught only by that check, after
     the read. The peer range excludes `@aws-sdk/client-s3` 3.729 to 3.734: they collect a body with
     a full-object checksum before `send` resolves, so `S3Storage`'s own check would run after the
-    read.
+    read. Only npm's default resolver enforces that range: `--legacy-peer-deps`, `--force`, pnpm
+    and yarn install them, and `S3Storage` does not check the version at run time.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.

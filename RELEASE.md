@@ -28,6 +28,19 @@ npm run smoke          # builds, packs, installs into a throwaway consumer, veri
 `dist` the tarball ships), not the TS source the test suite runs against — the exports map, the
 rewritten relative import paths, the optional-subpath loud-fail contract, and the bin.
 
+### Links across the two repositories
+
+`src/docLinks.test.ts` checks links between this repository's documents. Links to and from the guide
+need a build of the docs site, on the branch to publish. Merge this repository before publishing the
+guide: the guide links this repository's default branch.
+
+```bash
+cd <docs site checkout> && npm ci && npx --no -- docusaurus build
+# the output must not hold "broken anchors"
+cd <this repository> && node checkDocLinks.ts <docs site checkout>
+# into the guide: N, into this module's docs: N, broken: 0
+```
+
 ## 2. Version bump policy
 
 Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
