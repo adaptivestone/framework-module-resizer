@@ -8,6 +8,7 @@ import { Catalog } from './catalog.ts';
 import type { MediaStore } from './contracts/media.ts';
 import { getPreviewIdentity } from './images.ts';
 import {
+  describeRef,
   PreviewRecorder,
   rowsNotKept,
   rowsWithoutIdentity,
@@ -681,4 +682,109 @@ test('a hostile ref on an uploaded row still gets its log line', async () => {
   const result = await recorder.record('m1', scope, [hostile]);
   assert.equal(result.failure, undefined);
   assert.match(String(logs.error[0][0]), /cannot be printed/);
+});
+
+test('describeRef: key order does not matter, at any depth, and refs of another value stay apart', () => {
+  const ref = (storageRef: unknown) => ({ storageRef }) as Preview;
+  assert.equal(
+    describeRef(
+      ref({ key: 'k', bucket: 'b', extra: { z: 1, a: [{ y: 1, x: 2 }] } }),
+    ),
+    describeRef(
+      ref({ extra: { a: [{ x: 2, y: 1 }], z: 1 }, bucket: 'b', key: 'k' }),
+    ),
+  );
+  assert.equal(
+    describeRef(ref({ key: 'k', bucket: 'b' })),
+    '{"bucket":"b","key":"k"}',
+  );
+  assert.notEqual(
+    describeRef(ref({ key: 'k', bucket: 'b' })),
+    describeRef(ref({ key: 'k', bucket: 'c' })),
+  );
+  assert.equal(describeRef(ref('plain/key.webp')), '"plain/key.webp"');
+});
+
+test('describeRef: reads a ref as the database stores it, and never throws', () => {
+  const ref = (storageRef: unknown) => ({ storageRef }) as Preview;
+  assert.equal(
+    describeRef(ref({ toJSON: (key: string) => ({ under: key }) })),
+    '{"under":"storageRef"}',
+  );
+  assert.equal(describeRef(ref(1n)), '1');
+  assert.equal(describeRef(ref(undefined)), 'undefined');
+  const unprintable = {
+    toJSON() {
+      throw new Error('no JSON');
+    },
+    toString() {
+      throw new Error('no text');
+    },
+  };
+  assert.equal(
+    describeRef(ref(unprintable)),
+    '(a storage ref that cannot be printed)',
+  );
+  assert.equal(
+    describeRef(null as unknown as Preview),
+    '(a storage ref that cannot be printed)',
+  );
+});
+
+test('rowsNotKept: a ref read back with its keys in another order is the same ref', () => {
+  const row: Preview = {
+    ...preview('20x20', 'a'),
+    origin: 'o1',
+    encodeSig: 's1',
+    storageRef: { bucket: 'b', key: 'a', namespace: 'n' },
+  };
+  const reordered = { key: 'a', bucket: 'b', namespace: 'n' };
+  assert.deepEqual(rowsNotKept([row], [{ ...row, storageRef: reordered }]), []);
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, storageRef: reordered, encodeSig: 's2' }]),
+    [{ identity: row.identity, fields: ['encodeSig'] }],
+  );
+  assert.deepEqual(
+    rowsWithoutIdentity(
+      [row],
+      [{ ...row, storageRef: reordered, identity: 'its own form' }],
+    ),
+    [row.identity],
+  );
+});
+
+test('a failed replace does not name as lost an upload the store holds with its keys in another order', async () => {
+  const row: Preview = {
+    ...preview('20x20', 'x'),
+    storageRef: { bucket: 'b', key: 'held' },
+  };
+  const other: Preview = {
+    ...preview('30x30', 'y'),
+    storageRef: { bucket: 'b', key: 'lost' },
+  };
+  const { logger, logs } = recordingLogger();
+  const recorder = new PreviewRecorder({
+    catalog: new Catalog({ config }),
+    logger,
+    media: fakeMedia({
+      load: async () => ({
+        id: 'm1',
+        original,
+        previews: [{ ...row, storageRef: { key: 'held', bucket: 'b' } }],
+      }),
+      replacePreviews: async () => {
+        throw new Error('the answer was lost');
+      },
+    }),
+  });
+
+  const result = await recorder.record('m1', scope, [row, other], {
+    replacing: new Set([row.identity as string, other.identity as string]),
+  });
+
+  assert.ok(result.failure);
+  const line = String(logs.error[0][0]);
+  assert.match(line, /1 of 2 uploaded preview\(s\) are not recorded/);
+  assert.match(line, /"lost"/);
+  assert.doesNotMatch(line, /"held"/);
 });

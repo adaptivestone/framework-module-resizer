@@ -403,6 +403,19 @@ function signedLocator(ref: StorageRef): StorageRef {
 }
 
 /**
+ * A removed row's ref as generate() reports it, copied: none when the store's row holds no ref or
+ * cannot be read, since the write is done and only that row is affected.
+ */
+function readableRef(row: Preview): StorageRef[] {
+  try {
+    const ref = copyLocator(row.storageRef);
+    return ref == null ? [] : [ref];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * What a render reads of the original, taken once: `original` holds the driver's copy of the
  * locator (download and upload parent), `signed` the same original with the locator in the form
  * every signature of this render is computed from.
@@ -612,10 +625,10 @@ interface RenderPendingResult {
   // identity: its answer can already lack the field it lost.
   written: Preview[];
   failedCount: number;
-  // The stored rows the persist replaced (outdated, or a concurrent row of the same identity), but
-  // not one whose ref a row of this write holds, and the identities of the stored previews that
-  // replaced them.
-  removed: Preview[];
+  // The refs of the stored rows the persist replaced (outdated, or a concurrent row of the same
+  // identity), but not a ref a row of this write or the original holds, and the identities of the
+  // stored previews that replaced them.
+  removedRefs: StorageRef[];
   replaced: Set<string>;
   // What each failed variant failed with, by identity, in the order they failed.
   failures: Map<string, unknown>;
@@ -722,7 +735,7 @@ export class Processor {
       failedCount,
       failures,
       finalFailures,
-      removed,
+      removedRefs,
       replaced,
       backfilled,
     } = await this.#renderPending({
@@ -770,9 +783,7 @@ export class Processor {
     return {
       created: generated,
       failed: failedCount,
-      ...(removed.length > 0
-        ? { replaced: removed.map((row) => row.storageRef) }
-        : {}),
+      ...(removedRefs.length > 0 ? { replaced: removedRefs } : {}),
     };
   }
 
@@ -1158,7 +1169,7 @@ export class Processor {
 
     let generated: Preview[] = [];
     let failedCount = 0;
-    let removed: Preview[] = [];
+    let removedRefs: StorageRef[] = [];
     const leftOut: Preview[] = [];
     const replaced = new Set<string>();
     const failures = new Map<string, unknown>();
@@ -1167,7 +1178,7 @@ export class Processor {
       generated,
       written: [],
       failedCount,
-      removed,
+      removedRefs,
       replaced,
       failures,
       finalFailures,
@@ -1566,11 +1577,18 @@ export class Processor {
           recordVariant(plan.identity, plan.variant.format, ms, 'failed');
         }
       }
-      // A driver that names a file by its bytes can give a new row the ref of the row it replaced:
-      // that file is in use, so it is not reported to a host that deletes what it is told is gone.
-      // A row the store left out of its answer counts: the store may hold it all the same.
-      const live = new Set([...generated, ...leftOut].map(describeRef));
-      removed = recorded.removed.filter((row) => !live.has(describeRef(row)));
+      // A driver that names a file by its bytes can give a new row the ref of the row it replaced,
+      // and a preview the ref of its own original: that file is in use, so it is not reported to a
+      // host that deletes what it is told is gone. A row the store left out of its answer counts:
+      // the store may hold it all the same.
+      const live = new Set(
+        [...generated, ...leftOut, original].map(describeRef),
+      );
+      const removed = recorded.removed.filter(
+        (row) => !live.has(describeRef(row)),
+      );
+      // Read before the taps, which get these rows: a tap cannot change what generate() returns.
+      removedRefs = removed.flatMap(readableRef);
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
       }
@@ -1595,7 +1613,7 @@ export class Processor {
       generated,
       written: [...generated, ...leftOut],
       failedCount,
-      removed,
+      removedRefs,
       replaced,
       failures,
       finalFailures,

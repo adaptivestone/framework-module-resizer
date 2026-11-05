@@ -2,14 +2,16 @@
 // gets — completion, retry with backoff, dead-lettering, non-retryable errors, crash loops,
 // timeouts, lost leases, graceful shutdown and resilient claiming — plus the gate lock it holds on
 // a queue without gatesByTask, the dead-letter cooldown it passes to a queue with it, what it logs
-// when a task fails, and a host logger that throws.
+// when a task fails, a host logger that throws, and a task observer that never settles.
 import assert from 'node:assert/strict';
 import { describe, type TestContext, test } from 'node:test';
 import { format } from 'node:util';
 import {
   backoffMs,
   Consumer,
+  type ConsumerDeps,
   gateDeadlineIn,
+  OBSERVER_STOP_GRACE_MS,
   untilDeadline,
 } from './consumer.ts';
 import type { LockStore } from './contracts/locks.ts';
@@ -132,7 +134,7 @@ async function runUntil(
   done: () => boolean,
   opts: Pick<
     ConsumeOptions,
-    'logger' | 'resizers' | 'coordinationOf' | 'metricsOf'
+    'logger' | 'resizers' | 'coordinationOf' | 'metricsOf' | 'onEvent'
   > = {},
 ) {
   const events: { event: TaskEvent; task: LeasedTask; error?: unknown }[] = [];
@@ -3467,6 +3469,253 @@ describe('what the worker logs', () => {
     );
     const gap = claims[1] - claims[0];
     assert.ok(gap < 500, `the next claim came after ${gap} ms`);
+  });
+});
+
+// A task observer is host code the loop waits for, so one that never settles must not stop the loop:
+// the wait has a bound, and what still runs then goes on beside the next task.
+describe('a task observer that never settles', () => {
+  // What makes each event happen on a delivery of media m1.
+  const leadsTo: Record<TaskEvent, ConsumerDeps['handle']> = {
+    completed: async () => {},
+    failed: async () => {
+      throw new Error('the bucket did not answer');
+    },
+    deadLettered: async () => {
+      throw new ResizeError('no retry can help', {
+        code: 'RESIZE_TEST_FINAL',
+        retryable: false,
+      });
+    },
+  };
+  const everyEvent = Object.keys(leadsTo) as TaskEvent[];
+  const never = () => new Promise<void>(() => {});
+  const observerLines = (warnings: string[]) =>
+    warnings.filter((line) => /observers of task/.test(line));
+  const warnsInto = (warnings: string[]) => ({
+    ...silent,
+    warn: (line: unknown) => {
+      warnings.push(String(line));
+    },
+  });
+
+  for (const event of everyEvent) {
+    test(`${event}: the loop goes on after taskTimeoutMs, and one warn line names the event, the task and the wait`, async () => {
+      const tasks = new MemoryTaskQueue({
+        timing: { ...fastTiming, taskTimeoutMs: 30 },
+      });
+      await tasks.add(newTask());
+      await tasks.add(newTask({ mediaId: 'm2' }));
+      const warnings: string[] = [];
+      const stop = new AbortController();
+      const loop = consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async (task, opts) => {
+          if (task.mediaId === 'm1' && task.attempts === 1) {
+            await leadsTo[event](task, opts);
+          }
+        },
+        onEvent: (seen, task) =>
+          seen === event && task.mediaId === 'm1' && task.attempts === 1
+            ? never()
+            : undefined,
+        logger: warnsInto(warnings),
+      });
+      const m2 = () => tasks.rows.find((row) => row.task.mediaId === 'm2');
+      const until = performance.now() + 5000;
+      try {
+        while (m2()?.status !== 'completed') {
+          assert.ok(performance.now() < until, 'the loop stopped at the tap');
+          await new Promise((r) => setTimeout(r, 5));
+        }
+      } finally {
+        stop.abort();
+        await loop;
+      }
+      const lines = observerLines(warnings);
+      assert.equal(lines.length, 1);
+      assert.match(
+        lines[0],
+        new RegExp(
+          `the ${event} observers of task ${tasks.rows[0].id} did not settle within \\d+ ms \\(taskTimeoutMs is 30 ms\\)`,
+        ),
+      );
+    });
+  }
+
+  test('a fast tap is still awaited in order, before the next task', async () => {
+    const tasks = new MemoryTaskQueue({ timing: fastTiming });
+    await tasks.add(newTask());
+    await tasks.add(newTask({ mediaId: 'm2' }));
+    const order: string[] = [];
+    const warnings: string[] = [];
+    await runUntil(
+      tasks,
+      async (task) => {
+        order.push(`handle ${task.mediaId}`);
+      },
+      () => order.length === 6,
+      {
+        logger: warnsInto(warnings),
+        onEvent: async (_event, task) => {
+          order.push(`tap ${task.mediaId}`);
+          await new Promise((r) => setTimeout(r, 20));
+          order.push(`tapped ${task.mediaId}`);
+        },
+      },
+    );
+    assert.deepEqual(order, [
+      'handle m1',
+      'tap m1',
+      'tapped m1',
+      'handle m2',
+      'tap m2',
+      'tapped m2',
+    ]);
+    assert.deepEqual(observerLines(warnings), []);
+  });
+
+  test('a tap that rejects after the bound is logged, and is no unhandled rejection', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fastTiming, taskTimeoutMs: 20 },
+    });
+    await tasks.add(newTask());
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    await runUntil(
+      tasks,
+      async () => {},
+      () => errors.length === 1,
+      {
+        logger: {
+          ...warnsInto(warnings),
+          error: (line: unknown) => {
+            errors.push(String(line));
+          },
+        },
+        onEvent: async () => {
+          await new Promise((r) => setTimeout(r, 60));
+          throw new Error('the host could not delete it');
+        },
+      },
+    );
+    assert.equal(observerLines(warnings).length, 1);
+    assert.match(errors[0], /completed event handler failed/);
+  });
+
+  // A stop must return within the grace, so these wait for it in real time, side by side.
+  describe('during a stop', { concurrency: true }, () => {
+    // Far beyond what any test here waits: only the grace can end these waits.
+    const longTask = { ...fastTiming, leaseMs: 60_000, taskTimeoutMs: 600_000 };
+    const slack = 1500;
+
+    for (const event of everyEvent) {
+      test(`${event}: a stop returns within the grace, and the warn line says it was a stop`, async () => {
+        const tasks = new MemoryTaskQueue({ timing: longTask });
+        await tasks.add(newTask());
+        const warnings: string[] = [];
+        const stop = new AbortController();
+        const { promise: reached, resolve } = Promise.withResolvers<void>();
+        const loop = consume(tasks, {
+          queue: 'default',
+          signal: stop.signal,
+          handle: leadsTo[event],
+          onEvent: (seen) => {
+            if (seen === event) {
+              resolve();
+              return never();
+            }
+          },
+          logger: warnsInto(warnings),
+        });
+        await reached;
+        const stopped = performance.now();
+        stop.abort();
+        await loop;
+        const waited = performance.now() - stopped;
+        assert.ok(waited >= OBSERVER_STOP_GRACE_MS - 50, `only ${waited} ms`);
+        assert.ok(waited < OBSERVER_STOP_GRACE_MS + slack, `${waited} ms`);
+        const lines = observerLines(warnings);
+        assert.equal(lines.length, 1);
+        assert.match(
+          lines[0],
+          new RegExp(
+            `the ${event} observers of task .+ did not settle within \\d+ ms \\(the worker is stopping, and waits ${OBSERVER_STOP_GRACE_MS} ms at most\\)`,
+          ),
+        );
+      });
+    }
+
+    test('the grace is measured from the stop, not from the tap', async () => {
+      const tasks = new MemoryTaskQueue({ timing: longTask });
+      await tasks.add(newTask());
+      const stop = new AbortController();
+      let stopped = 0;
+      const loop = consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        // The stop lands while the task runs, and the task takes 3 s more to end.
+        handle: async () => {
+          stopped = performance.now();
+          stop.abort();
+          await new Promise((r) => setTimeout(r, 3000));
+        },
+        onEvent: never,
+        logger: silent,
+      });
+      await loop;
+      const waited = performance.now() - stopped;
+      assert.ok(waited >= OBSERVER_STOP_GRACE_MS - 50, `only ${waited} ms`);
+      assert.ok(waited < OBSERVER_STOP_GRACE_MS + slack, `${waited} ms`);
+    });
+
+    test('with the grace used up, a tap that answers at once still runs and is not blamed', async () => {
+      const tasks = new MemoryTaskQueue({ timing: longTask });
+      await tasks.add(newTask());
+      const warnings: string[] = [];
+      const stop = new AbortController();
+      let tapped = 0;
+      await consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async () => {
+          stop.abort();
+          await new Promise((r) => setTimeout(r, OBSERVER_STOP_GRACE_MS + 100));
+        },
+        onEvent: async () => {
+          tapped += 1;
+        },
+        logger: warnsInto(warnings),
+      });
+      assert.equal(tapped, 1);
+      assert.deepEqual(observerLines(warnings), []);
+    });
+
+    test('a tap that settles within the grace is waited for', async () => {
+      const tasks = new MemoryTaskQueue({ timing: longTask });
+      await tasks.add(newTask());
+      const warnings: string[] = [];
+      const stop = new AbortController();
+      let tapped = false;
+      const { promise: reached, resolve } = Promise.withResolvers<void>();
+      const loop = consume(tasks, {
+        queue: 'default',
+        signal: stop.signal,
+        handle: async () => {},
+        onEvent: async () => {
+          resolve();
+          await new Promise((r) => setTimeout(r, 200));
+          tapped = true;
+        },
+        logger: warnsInto(warnings),
+      });
+      await reached;
+      stop.abort();
+      await loop;
+      assert.equal(tapped, true);
+      assert.deepEqual(observerLines(warnings), []);
+    });
   });
 });
 

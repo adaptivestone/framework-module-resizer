@@ -2422,3 +2422,91 @@ describe('a worker over real rows', () => {
     );
   });
 });
+
+// The hook and generate().replaced compare the ref a removed row reads back with the refs of the
+// write, so this needs real BSON: what a ref holds decides whether it reads back the same.
+describe('a ref compared through BSON, on a driver that names files by their bytes', () => {
+  const png = () =>
+    sharp({
+      create: { width: 64, height: 64, channels: 3, background: '#336699' },
+    })
+      .png()
+      .toBuffer();
+
+  /** Generate a row whose ref `refOf` built, bump the pipeline version, generate it again. */
+  async function regenerate(refOf: (key: string) => object) {
+    const { storage } = memoryStorage();
+    const upload = storage.upload.bind(storage);
+    storage.upload = async (args) => {
+      const { key } = (await upload({
+        ...args,
+        key: `previews/same-bytes-${args.visibility}`,
+      })) as { key: string };
+      return refOf(key);
+    };
+    const pipeline: { version?: string } = {};
+    const resizer = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: { info() {}, warn() {}, error() {} },
+      storage,
+      media: new MongoMediaStore({ model: Media() as never }),
+      pipelines: { default: pipeline },
+    });
+    const fired: Preview[] = [];
+    resizer.hook('onPreviewReplaced', (row) => {
+      fired.push(row);
+    });
+    const doc = await Media().create({
+      original: { storageRef: { key: 'original' }, width: 64, height: 64 },
+      previews: [],
+    });
+    storage.download = png;
+    const sizes = [{ width: 20, height: 20 }];
+    const load = async () =>
+      (await Media().findById(doc.id).lean()) as unknown as MediaLike;
+    const asMedia = async (): Promise<MediaLike> => ({
+      ...(await load()),
+      id: doc.id,
+    });
+    await resizer.generate({ media: await asMedia(), sizes });
+    const before = (await load()).previews?.[0];
+    pipeline.version = 'v2';
+    const { created, replaced } = await resizer.generate({
+      media: await asMedia(),
+      sizes,
+    });
+    assert.equal(created.length, 1);
+    return { fired, replaced, before, after: (await load()).previews?.[0] };
+  }
+
+  test('nested keys, numbers, dates and object ids read back the same: the kept ref is not reported', async () => {
+    const stamp = new Date('2026-11-05T10:00:00.000Z');
+    const id = new mongoose.Types.ObjectId();
+    const { fired, replaced, before, after } = await regenerate((key) => ({
+      namespace: 'team/a',
+      key,
+      bucket: 'public',
+      extra: { z: 1, a: [{ y: 1.5, x: 'two' }], stamp, id },
+    }));
+
+    assert.deepEqual(fired, []);
+    assert.equal(replaced, undefined);
+    assert.deepEqual(after?.storageRef, before?.storageRef);
+    assert.notEqual(after?.encodeSig, before?.encodeSig);
+  });
+
+  test('a Buffer in a ref reads back as a bson Binary, so a kept ref is still reported: such a driver uses the sweep', async () => {
+    const { fired, replaced, after } = await regenerate((key) => ({
+      key,
+      token: Buffer.from('abc'),
+    }));
+
+    assert.equal(fired.length, 1);
+    assert.equal(replaced?.length, 1);
+    assert.ok(after);
+    assert.equal(
+      (after.storageRef as { key: string }).key,
+      (fired[0].storageRef as { key: string }).key,
+    );
+  });
+});

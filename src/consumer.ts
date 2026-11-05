@@ -7,7 +7,8 @@
 // logger that throws never stops the loop. A task's failure is logged here, whatever the metrics
 // sink is. A thrown value may be host code, so it is read only through the guarded helpers of
 // helpers/log.ts: it cannot stop the loop, and the module's own line is always one line. The stack
-// of an unexpected error follows that line as the logger prints it, so later lines are not ours.
+// of an unexpected error follows that line as the logger prints it, so later lines are not ours. A
+// task observer is host code too: the loop waits for it up to a bound (OBSERVER_STOP_GRACE_MS).
 import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
@@ -77,6 +78,7 @@ export interface ConsumerDeps {
   // goes on the task's completed outcome. The signal aborts on a lost lease, a timeout or the
   // shutdown.
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<unknown>;
+  // Awaited after each task's end, up to a bound (OBSERVER_STOP_GRACE_MS).
   events?: TaskEventHandler;
   logger: ResizeLogger;
   // Optional: the Resizers this worker serves, passed to every claim, so a queue that filters
@@ -92,11 +94,19 @@ export interface ConsumerDeps {
   metricsOf?: (task: LeasedTask) => ResizeMetrics | undefined;
 }
 
+// The stop of one consume loop: its signal, and, once that has aborted, the end of the grace.
+interface LoopStop {
+  signal: AbortSignal;
+  graceEnd?: GateDeadline;
+}
+
 // The queue a claimed task was claimed from and when (performance.now()): its outcome's `queue`
-// label and the start of its run time.
+// label and the start of its run time. `stop`: its loop's stop, which cuts the wait for its
+// observers.
 interface ClaimStart {
   queue: string;
   start: number;
+  stop: LoopStop;
 }
 
 // The `outcome` label of a task event on the metrics sink.
@@ -231,6 +241,13 @@ const never = () => false;
 
 const nothing = () => {};
 
+// A task's observers are awaited in order, before the next task, for at most its queue's
+// taskTimeoutMs: one that never settles must not stop the loop, starve the other Resizers on it, or
+// keep the worker from flushing its metrics and logging its stop. Once the loop is stopping they
+// get at most this long, from the stop: a deploy must not wait out taskTimeoutMs for them. A tap
+// past the bound keeps running beside the next task, since nothing can cancel host code.
+export const OBSERVER_STOP_GRACE_MS = 5_000;
+
 export class Consumer {
   readonly #deps: ConsumerDeps;
   // How long one gate call, or all the gate calls at a task's end, may take (see GateLock).
@@ -262,6 +279,16 @@ export class Consumer {
     const claimOptions: ClaimOptions | undefined = resizers
       ? { resizers }
       : undefined;
+    // Set by the abort, so the grace is measured from it wherever the loop is by then.
+    const stop: LoopStop = { signal };
+    const startGrace = () => {
+      stop.graceEnd = gateDeadlineIn(OBSERVER_STOP_GRACE_MS);
+    };
+    if (signal.aborted) {
+      startGrace();
+    } else {
+      signal.addEventListener('abort', startGrace, { once: true });
+    }
     let claimFailures = 0;
     // The start of the wait a claimed task records: the loop's start, then the end of each claimed
     // task. Empty polls and failed claims are part of the wait.
@@ -324,7 +351,7 @@ export class Consumer {
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
             { code: 'RESIZE_TASK_MAX_ATTEMPTS', retryable: false },
           ),
-          { forceDead: true, claim: { queue, start: claimedAt } },
+          { forceDead: true, claim: { queue, start: claimedAt, stop } },
         );
         waitStart = performance.now();
         continue;
@@ -337,6 +364,7 @@ export class Consumer {
       await this.#runTask(task, coordination, signal, {
         queue,
         start: claimedAt,
+        stop,
       });
       waitStart = performance.now();
     }
@@ -578,15 +606,68 @@ export class Consumer {
         ...(task.queue === claim.queue ? {} : { payloadQueue: task.queue }),
       },
     );
-    try {
-      await this.#deps.events?.(event, toLeasedTask(task), error);
-    } catch (err) {
+    const { events, logger, timing } = this.#deps;
+    const waitStart = performance.now();
+    const observers = Promise.try(() =>
+      events?.(event, toLeasedTask(task), error),
+    ).then(nothing, (err) => {
       // A throwing observer must not undo the task's state or stop the loop.
       logNeverThrow(
-        this.#deps.logger,
+        logger,
         `resize worker: ${event} event handler failed`,
         err,
       );
+    });
+    if (!(await this.#observersInTime(observers, claim.stop))) {
+      const bound = claim.stop.signal.aborted
+        ? `the worker is stopping, and waits ${OBSERVER_STOP_GRACE_MS} ms at most`
+        : `taskTimeoutMs is ${timing.taskTimeoutMs} ms`;
+      logNeverThrow(
+        logger,
+        `resize worker: the ${event} observers of task ${task.taskId} did not settle within ${Math.round(performance.now() - waitStart)} ms (${bound}) — the worker goes on, and they keep running`,
+        undefined,
+        'warn',
+      );
+    }
+  }
+
+  /**
+   * Wait for a task's observers up to the bound OBSERVER_STOP_GRACE_MS states; whatever is still
+   * pending then goes on alone. Resolves true when they settled in time. Each end of the wait gives
+   * an answer already there one timer turn to win, so with the grace used up an observer that
+   * answers at once still counts.
+   */
+  async #observersInTime(
+    observers: Promise<void>,
+    stop: LoopStop,
+  ): Promise<boolean> {
+    const limit = untilDeadline(
+      gateDeadlineIn(this.#deps.timing.taskTimeoutMs),
+    );
+    const graceOver = Promise.withResolvers<typeof TIMED_OUT>();
+    let grace: ReturnType<typeof untilDeadline> | undefined;
+    const waitForGrace = () => {
+      grace = untilDeadline(
+        stop.graceEnd ?? gateDeadlineIn(OBSERVER_STOP_GRACE_MS),
+      );
+      void grace.late.then(graceOver.resolve);
+    };
+    if (stop.signal.aborted) {
+      waitForGrace();
+    } else {
+      stop.signal.addEventListener('abort', waitForGrace, { once: true });
+    }
+    try {
+      const answer = await Promise.race([
+        observers,
+        limit.late,
+        graceOver.promise,
+      ]);
+      return answer !== TIMED_OUT;
+    } finally {
+      limit.cancel();
+      grace?.cancel();
+      stop.signal.removeEventListener('abort', waitForGrace);
     }
   }
 

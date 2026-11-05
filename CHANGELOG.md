@@ -72,21 +72,23 @@
   earlier stop being served until the root is fixed. `new LocalFsStorage()` throws at construction.
   The replacement for `''` is `'.'`, which is the same folder.
 - **A media store must keep what the worker writes.** After its writes the worker reloads the media
-  and compares the rows under each `storageRef` it wrote. When rows exist there and none matches
-  what was written in `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline` and
-  `filters`, or none has a `contentType`, the task dead-letters with `RESIZE_MEDIA_ROW_NOT_KEPT`
-  (`retryable: false`), naming the fields. So does a row that comes back with those fields as written
-  but no `storageRef`. A custom store that dropped one of these, and so rendered again on every read
-  without a log line, now fails visibly. A store with no `identity` column, or its own form of it,
-  keeps working: a read does not use it. It gets one `warn` per Resizer, because `invalidate()` finds
-  such rows only by identity, so it leaves them, and a `replacePreviews` that removes by stored
-  identity leaves them too. A reload that lags raises nothing, except on a driver that names files by
-  their bytes, where it can show another row under the same ref, an older row after a replacement
-  (naming `encodeSig`) or another size key's row on a first render (naming `sizeKey`): the task is
-  dead, though its rows are stored and the next read is fresh. `MongoMediaStore` with the current
-  fragment and a driver that names files at random, as the shipped ones do, is not affected.
-  `verify()` now also rejects a strict row schema without `sizeKey`, `format`, `contentType` or
-  `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never serve such a row.
+  and compares the rows under each `storageRef` it wrote (refs compare with sorted keys, and log
+  lines print them that way, so a store that reorders a ref's keys holds the same ref). When rows
+  exist there and none matches what was written in `origin`, `encodeSig`, `sizeKey`, `format`,
+  `resizer`, `pipeline` and `filters`, or none has a `contentType`, the task dead-letters with
+  `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields. So does a row that comes back
+  with those fields as written but no `storageRef`. A custom store that dropped one of these, and so
+  rendered again on every read without a log line, now fails visibly. A store with no `identity`
+  column, or its own form of it, keeps working: a read does not use it. It gets one `warn` per
+  Resizer, because `invalidate()` finds such rows only by identity, so it leaves them, and a
+  `replacePreviews` that removes by stored identity leaves them too. A reload that lags raises
+  nothing, except on a driver that names files by their bytes, where it can show another row under
+  the same ref, an older row after a replacement (naming `encodeSig`) or another size key's row on a
+  first render (naming `sizeKey`): the task is dead, though its rows are stored and the next read is
+  fresh. `MongoMediaStore` with the current fragment and a driver that names files at random, as the
+  shipped ones do, is not affected. `verify()` now also rejects a strict row schema without
+  `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
+  could never serve such a row.
 
 **Changed behaviour**
 
@@ -171,8 +173,17 @@
 
 **Fixes**
 
-- `GenerateResult.replaced` no longer names a ref a new row of the same write holds again: on a
-  driver that names files by their bytes, a host deleting those refs deleted a file in use.
+- `GenerateResult.replaced` no longer names a ref a new row of the same write or the original holds:
+  on a driver that names files by their bytes, a host deleting those refs deleted a file in use.
+  Refs compare as JSON with sorted keys, so a value that reads back in another form (a Buffer in a
+  custom ref, as a bson `Binary`) is still named: such a driver uses a sweep. `generate()` reads the
+  refs before the observers run, so a tap cannot change them, and a removed row it cannot read no
+  longer makes `generate()` throw after its write.
+- A task observer (`afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`) that never settles no
+  longer stops the worker. It stopped the loop for good: other tasks stayed `pending`, a Resizer on
+  the same loop starved, metrics were not flushed, and a stop hung with no line logged. The worker
+  now awaits it up to `taskTimeoutMs`, or up to 5 s from a stop, logs one `warn`, and goes on while
+  the tap keeps running beside the next task.
 - A row `MongoMediaStore.replacePreviews` writes stores an `_id` exactly when an appended row would,
   unless working it out fails, so it reads the same id on every load. A row replaced under 0.3.0 has
   none stored and reads a new random one on each load until it is next replaced: nothing migrates it,

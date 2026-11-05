@@ -1,5 +1,8 @@
 // Hook names and tap signatures. Waterfall hooks thread a value through their taps (default =
-// identity); observer hooks are fire-and-forget side effects (return ignored; errors logged).
+// identity); observer hooks are side effects, awaited (return ignored; errors logged). A worker
+// awaits a task observer up to taskTimeoutMs, or OBSERVER_STOP_GRACE_MS during a stop (consumer.ts);
+// a preview observer runs inside its task, so taskTimeoutMs bounds it there. generate() sets no
+// bound: a tap that never settles means generate() never returns.
 // NOT pipelines (those are per-media-type pixel work, see pipeline.ts).
 import type {
   MissingPreview,
@@ -23,8 +26,8 @@ export type HookName = WaterfallName | ObserverName;
 
 // Per-hook tap signatures. The public `hook(name, fn)` + the `hooks:` constructor option infer
 // `fn`'s exact shape from `name`, so a typo'd tap body or a wrong return shape is a COMPILE error
-// instead of silent `any`. Waterfalls thread + return their value; observers are fire-and-forget
-// (return ignored). `task` is always the backend-agnostic LeasedTask; its `attempts` counts the
+// instead of silent `any`. Waterfalls thread + return their value; observers are awaited up to the
+// bounds above (return ignored). `task` is always the backend-agnostic LeasedTask; its `attempts` counts the
 // task's deliveries, this one included (1 on the first). The worker observers receive `ctx === {}`.
 export interface HookSignatures {
   resolveSizes: (
@@ -43,8 +46,8 @@ export interface HookSignatures {
     preview: Preview,
     ctx: Record<string, unknown>,
   ) => unknown;
-  // A row a write removed. The module does not delete that row's file, so a host can delete
-  // `removed.storageRef`.
+  // A row a write removed, unless a row of that write or the original holds its ref. The module does
+  // not delete that row's file, so a host can delete `removed.storageRef`. Delivered at most once.
   onPreviewReplaced: (
     removed: Preview,
     ctx: Record<string, unknown>,

@@ -16,7 +16,12 @@ import type { Catalog } from './catalog.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
-import { getFilterSig, previewScope } from './images.ts';
+import {
+  canonicalizeFilterValue,
+  getFilterSig,
+  previewScope,
+} from './images.ts';
+import { locatorJson } from './signatures.ts';
 import type {
   MediaLike,
   Preview,
@@ -25,16 +30,27 @@ import type {
 } from './types.d.ts';
 
 /**
- * One uploaded locator for a log line; an opaque ref that JSON cannot encode is still named. A ref
- * is host data: when it cannot be printed either, the line must still be written. Refs are compared
- * by it too: two that read the same count as one file, so a file is never reported gone by mistake.
+ * A ref's JSON form, as the database stores it, with its keys sorted at every depth: a store can
+ * hand them back in another order (a Postgres jsonb column does). Undefined when it has none.
+ * Throws what `JSON.stringify` throws.
  */
-export function describeRef(preview: Preview): string {
+function sortedRef(ref: Preview['storageRef']): string | undefined {
+  return JSON.stringify(canonicalizeFilterValue(locatorJson(ref)));
+}
+
+/**
+ * One uploaded locator, for a log line and to compare two refs: an opaque ref that JSON cannot
+ * encode is still named. A ref is host data: when it cannot be printed either, the line must still
+ * be written. Equal text means one file, so a store that reorders a ref's keys changes nothing, but
+ * a value that reads back in another form (a Buffer in a custom ref, as a bson Binary) is another
+ * text, so that one file counts as two.
+ */
+export function describeRef(row: Pick<Preview, 'storageRef'>): string {
   try {
-    return JSON.stringify(preview.storageRef) ?? String(preview.storageRef);
+    return sortedRef(row.storageRef) ?? String(row.storageRef);
   } catch {
     try {
-      return String(preview.storageRef);
+      return String(row.storageRef);
     } catch {
       return '(a storage ref that cannot be printed)';
     }
@@ -119,12 +135,13 @@ const readMisses = (fields: KeptField[]): number =>
   fields.filter((field) => READ_FIELDS.has(field)).length;
 
 /**
- * Which ref group a row belongs to: its ref as JSON, `null` when it holds no ref, undefined when it
- * cannot be told apart from another (a ref JSON cannot encode, or a row that cannot be read).
+ * Which ref group a row belongs to: its ref as JSON with sorted keys, `null` when it holds no ref,
+ * undefined when it cannot be told apart from another (a ref JSON cannot encode, or a row that
+ * cannot be read).
  */
 function refGroup(row: Preview): string | null | undefined {
   try {
-    return row.storageRef == null ? null : JSON.stringify(row.storageRef);
+    return row.storageRef == null ? null : sortedRef(row.storageRef);
   } catch {
     return undefined;
   }

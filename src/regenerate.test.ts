@@ -2584,3 +2584,245 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
     assert.notDeepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
   });
 }
+
+/** What a Postgres jsonb column does to a ref's keys: shorter ones first, then by name. */
+function jsonbOrder(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(jsonbOrder);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  const keys = Object.keys(value).sort(
+    (a, b) => a.length - b.length || (a < b ? -1 : 1),
+  );
+  return Object.fromEntries(
+    keys.map((key) => [
+      key,
+      jsonbOrder((value as Record<string, unknown>)[key]),
+    ]),
+  );
+}
+
+/** A store that answers and loads every row's ref with its keys as a jsonb column orders them. */
+const jsonbRefs = (inner: MediaStore): MediaStore => {
+  const reordered = (row: Preview): Preview => ({
+    ...row,
+    storageRef: jsonbOrder(row.storageRef) as Preview['storageRef'],
+  });
+  return fakeMedia({
+    load: async (id) => {
+      const doc = await inner.loadMedia(id);
+      return doc && { ...doc, previews: doc.previews?.map(reordered) };
+    },
+    appendPreviews: (id, rows, dims) => inner.appendPreviews(id, rows, dims),
+    replacePreviews: async (id, identities, rows) => {
+      const result = await inner.replacePreviews(id, identities, rows);
+      return { ...result, removed: result.removed.map(reordered) };
+    },
+  });
+};
+
+/** Byte-named storage whose ref has more than one key, in an order jsonb does not keep. */
+function namespacedByBytes(w: ReturnType<typeof world>): void {
+  contentAddressed(w);
+  const upload = w.storage.upload.bind(w.storage);
+  w.storage.upload = async (args) => ({
+    bucket: 'public',
+    ...((await upload(args)) as { key: string }),
+    namespace: 'team/a',
+  });
+}
+
+test('a store that hands a ref back with its keys in another order: a ref a new row keeps is not reported', async () => {
+  const w = world({ wrap: jsonbRefs });
+  namespacedByBytes(w);
+  const pipeline: Pipeline = {};
+  const r = w.resizer(webpConfig(80), undefined, { default: pipeline });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(r);
+  assert.deepEqual(Object.keys(rowsOf(doc)[0].storageRef as object), [
+    'bucket',
+    'key',
+    'namespace',
+  ]);
+  pipeline.version = 'v2';
+
+  const { created, replaced } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(created.length, 1);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+  assert.ok(w.files.has(keyOf(rowsOf(doc)[0])));
+});
+
+test('a store that hands refs back in another order and loses encodeSig: the store check still finds the row, so the task is dead', async () => {
+  const w = world({
+    wrap: (inner) => jsonbRefs(losing('encodeSig')(inner) as never),
+  });
+  namespacedByBytes(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+  assert.match(errors[0].message, /did not keep encodeSig/);
+});
+
+test('a store that hands refs back in another order, keeping every field: the task completes and the next read is fresh', async () => {
+  const w = world({ wrap: jsonbRefs });
+  namespacedByBytes(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  const loaded = await r.media.loadMedia('m1');
+  const { decision } = await w.read(r, loaded as MediaLike);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale, undefined);
+});
+
+test("a preview byte-identical to its own original, on a flat byte-named driver: the original's ref is not reported, so the next render still finds it", async () => {
+  const w = world();
+  contentAddressed(w);
+  const config = (compressionLevel: number) =>
+    makeImageConfig({
+      formats: ['png'],
+      encode: { formats: { png: { compressionLevel } } },
+    });
+  const own: SizeInput[] = [{ width: 64, height: 64 }];
+  const first = w.resizer(config(6));
+  // A file the encoder gives back unchanged: what one preview of the source came out as.
+  const media = await bareMedia(w, first);
+  const { created } = await first.generate({
+    media: structuredClone(media),
+    sizes: own,
+    formats: ['png'],
+  });
+  const body = w.files.get(keyOf(created[0])) as Buffer;
+  resetResizerForTests();
+
+  const r = w.resizer(config(6));
+  const original = await r.uploadOriginal({ body, visibility: 'public' });
+  const doc: MediaLike = { id: 'm2', original, previews: [] };
+  w.docs.set('m2', doc);
+  const { created: same } = await r.generate({
+    media: structuredClone(doc),
+    sizes: own,
+    formats: ['png'],
+  });
+  // What this test is about: the preview landed on the original's own file.
+  assert.deepEqual(same[0].storageRef, original.storageRef);
+  resetResizerForTests();
+
+  const later = w.resizer(config(1));
+  const fired: Preview[] = [];
+  later.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+    w.files.delete(keyOf(row));
+  });
+  const { created: redone, replaced } = await later.generate({
+    media: structuredClone(doc),
+    sizes: own,
+    formats: ['png'],
+  });
+  assert.equal(redone.length, 1);
+  assert.notDeepEqual(redone[0].storageRef, original.storageRef);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+
+  // The original's file is still there, so another size renders.
+  const { created: next } = await later.generate({
+    media: structuredClone(doc),
+    sizes: [{ width: 20, height: 20 }],
+    formats: ['png'],
+  });
+  assert.equal(next.length, 1);
+});
+
+for (const [name, change] of Object.entries({
+  'swaps the ref': (row: Preview) => {
+    row.storageRef = { key: 'forged' };
+  },
+  'removes the ref': (row: Preview) => {
+    Reflect.deleteProperty(row, 'storageRef');
+  },
+  'changes the ref in place': (row: Preview) => {
+    (row.storageRef as { key: string }).key = 'forged';
+  },
+})) {
+  test(`a tap that ${name} cannot change what generate() returns`, async () => {
+    const { w, doc, old } = await storedThenChanged();
+    const expected = structuredClone(old.storageRef);
+    const r = w.resizer(webpConfig(70));
+    r.hook('onPreviewReplaced', change);
+
+    const { replaced } = await r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    });
+
+    assert.deepEqual(replaced, [expected]);
+  });
+}
+
+for (const [name, row] of Object.entries({
+  'no row at all': null,
+  'a row whose ref cannot be read': {
+    get storageRef(): never {
+      throw new Error('a ref that cannot be read');
+    },
+  },
+  'a row with no ref': { identity: 'x' },
+})) {
+  test(`generate() over ${name} in what the store removed: it resolves, and replaced names the refs it can read`, async () => {
+    const { w, doc, old } = await storedThenChanged();
+    const r = replacingWith(w, async (id, identities, rows) => {
+      const result = await w.store.replacePreviews(id, identities, rows);
+      return {
+        ...result,
+        removed: [...result.removed, row as unknown as Preview],
+      };
+    });
+
+    const { created, replaced } = await r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    });
+
+    assert.equal(created.length, 1);
+    assert.deepEqual(replaced, [old.storageRef]);
+  });
+
+  test(`generate() over only ${name} in what the store removed: replaced stays unset`, async () => {
+    const { w, doc } = await storedThenChanged();
+    const r = replacingWith(w, async (id, identities, rows) => ({
+      ...(await w.store.replacePreviews(id, identities, rows)),
+      removed: [row as unknown as Preview],
+    }));
+
+    const result = await r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    });
+
+    assert.equal('replaced' in result, false);
+  });
+}

@@ -302,7 +302,12 @@ be loaded, since it may be a shared one. Resizers built only in other processes 
 construct every Resizer in the worker process too. Each task runs with the Resizer named in it and
 that Resizer's [coordination](#coordination), so a dead-letter gets that Resizer's `cooldownMs`.
 The task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
-`onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included).
+`onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included). The
+worker awaits them in order, before its next task, up to `taskTimeoutMs`, or up to 5 s from a stop.
+Past that it logs one `warn` and goes on, and a tap still running keeps running beside the next
+task. A preview observer (`onPreviewGenerated`, `onPreviewReplaced`) runs inside its task, so
+`taskTimeoutMs` bounds it, during a stop too. `generate()` sets no bound: a tap that never settles
+means `generate()` never returns.
 When a task's handler ends, the worker first waits for a lease renewal still in flight, on every
 task queue (a gating one too), within the same `min(leaseMs, 30000)` ms its gate calls get: a
 renewal that then answers `false` means the lease was lost, so there is no completion, failure or
@@ -1507,30 +1512,38 @@ ones are required and queued like missing ones.
 **The worker and `generate()`** render the stale variants again and count only fresh rows as done.
 The worker judges freshness by its own settings: a queued variant that is fresh for it is skipped
 (nothing is uploaded) and counts as covered. The new rows of a stale identity replace the old ones
-in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists
-the storage refs of the rows the write of `generate()` removed (set only when there are some):
-the outdated rows, or a row of the same identity another worker stored meanwhile. A ref a new row
-of that write holds again is left out, because that file is in use. `generate()` swaps the rows in
-the caller's `media.previews` too. Each replacing write logs one `info` line:
-"resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs
-<refs>". Its count and refs are the rows that write removed, so they can include such a
-concurrent copy too.
+in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists the
+storage refs of the rows the write of `generate()` removed (set only when there are some): the
+outdated rows, or a row of the same identity another worker stored meanwhile. A ref a new row of
+that write or the original holds is left out, because that file is in use. `generate()` swaps the
+rows in the caller's `media.previews` too. Each replacing write logs one `info` line: "resize:
+replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs <refs>".
+Its count and refs are the rows that write removed, so they can include such a concurrent copy too.
 
 **The module never deletes old files.** Clean them up in an `onPreviewReplaced` observer, which gets
 each row a write of `generate()` or the worker removed, so it can delete `row.storageRef`; from that
 log line; or with a sweep that deletes objects under the `previews/` prefix (below a ref's
 `namespace`) that no row references. Leave out every `original.storageRef`: an adopted public
-original sits in the same bucket, and no preview row references it. A crash right after the write
-loses the observer's call, so keep the sweep if every file must go. A response or a cached page
-built before the write still names the old URL, so delete after your longest cache time if that
-matters. The observer does not fire for `invalidate()`, which returns its refs, or for
-`persist: false`. A removed row can be a copy another worker stored meanwhile; its file is just as
-unreferenced. The shipped drivers give every preview a new key. A driver that names files by their
-bytes gets no report when a new row keeps the old ref, but two size keys with equal bytes can share
-a ref, and the tap gets no media id: such a driver should use the sweep, which sees every row. The
-same goes for that log line, which still names a ref a new row kept. A row without an `identity`
-(written before 0.3.0) stays beside its replacement and keeps its file referenced, so a sweep never
-finds that file: delete such rows (and their files) yourself.
+original sits in the same bucket, and no preview row references it. A report is delivered at most
+once: a crash, a tap that outlasts its timeout and a failed delete each lose one, a write that
+commits but whose acknowledgement is lost leaves no `resize: replaced` line either, and that line is
+`info`, so keep the sweep if every file must go. A response or a cached page built before the write
+still names the old URL, so delete after your longest cache time if that matters. The observer does
+not fire for `invalidate()`, which returns its refs, or for `persist: false`. A removed row can be a
+copy another worker stored meanwhile; its file is just as unreferenced. Do deletes in a tap: an
+async listener on the event bus that rejects kills the process, since the module cannot catch it and
+the framework's `app.events` is a plain `EventEmitter`.
+
+The shipped drivers give every preview a new key. On a driver that names files by their bytes, a ref
+that a new row of the write or the original holds is not reported. Refs compare as JSON with sorted
+keys, so reordered keys are one ref, but a value that reads back in another form (a Buffer in a
+custom ref, as a bson `Binary`) counts as another, and that file is reported although it is in use.
+Such a driver also shares a ref across two size keys, two pipelines, two Resizers or two media with
+equal bytes, and a host that copies a media document shares files on any driver. The tap gets one
+row and no media id, so it cannot see any of that: such a host should use the sweep, which sees
+every row. The same goes for that log line, which still names a ref a new row kept. A row without an
+`identity` (written before 0.3.0) stays beside its replacement and keeps its file referenced, so a
+sweep never finds that file: delete such rows (and their files) yourself.
 
 **A media without stored dimensions** (`original.width` and `original.height` must both be numbers;
 a stored `null` counts as missing) has no row the read path can prove fresh, since it cannot

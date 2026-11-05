@@ -569,8 +569,9 @@ pair. Old rows: rows without `origin` and
 `encodeSig` (written by 0.2.x or earlier) are stale: served until replaced, regenerated on their next
 read, and their old files stay in storage (clean up in an `onPreviewReplaced` observer, from the
 "replaced … outdated preview(s)" log line, or sweep objects under the `previews/` prefix (below a
-ref's `namespace`) that no row references, leaving out every `original.storageRef`: an adopted public original sits in the same
-bucket, and no preview row references it; see the README `Freshness` section). Rows without an
+ref's `namespace`) that no row references, leaving out every `original.storageRef`: an adopted
+public original sits in the same bucket, and no preview row references it; see the README
+`Freshness` section). Rows without an
 `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a
 sweep never finds their files: the host deletes those rows and files itself.
 
@@ -580,7 +581,22 @@ Observers (worker side, and for the first two `generate()` too): `onPreviewGener
 `onPreviewReplaced`, `afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`; the three task
 observers (`afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`) receive the task with
 `attempts` (its deliveries, 1 on the first). `onPreviewReplaced(row, ctx)` gets each row a write
-removed: delete `row.storageRef` there rather than parsing the log line.
+removed: delete `row.storageRef` there rather than parsing the log line. A URL handed out before the
+write, or cached by a CDN, still points at it, so delay the delete or sweep. A report is delivered
+at most once: a crash, a tap that outlasts its timeout and a failed delete each lose one, a write
+that commits but whose acknowledgement is lost leaves no `resize: replaced` line either, and that
+line is `info`. So keep a sweep if every file must go: delete objects under the `previews/` prefix
+(below a ref's `namespace`) that no row references, leaving out every `original.storageRef`. Use
+only the sweep on a driver that names files by their bytes, where two size keys, two pipelines, two
+Resizers or two media with equal bytes share a ref, and a value that reads back in another form (a
+Buffer in a custom ref, as a bson `Binary`) gets a kept ref reported, and when a host copies media
+documents, which shares files on any driver: the tap gets one row and no media id. Delete in a tap,
+not in an event bus listener: an async listener that rejects kills the process, since the module
+cannot catch it and `app.events` is a plain `EventEmitter`. A worker awaits a task observer up to
+`taskTimeoutMs`, or up to 5 s from a stop, then logs one `warn` and goes on while the tap keeps
+running beside the next task; a preview observer runs inside its task, so `taskTimeoutMs` bounds it,
+during a stop too. `generate()` sets no bound: a tap that never settles means `generate()` never
+returns.
 Pipelines: `beforeSteps` run once on the decoded first frame, as a `Raster` in and a `Raster` out
 (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
 pixels, not a library object, so the engine stays replaceable); `variantSteps` run on each size's
@@ -750,6 +766,7 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
 | Sharp's `Input file is missing` from a `beforeStep` | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
 | `resize worker: task … is dead (…)` at `error` | the task was dead-lettered; the line holds the code, the reason (`last attempt`, `not retryable`, `delivered more often than maxAttempts`) and the cause — fix the cause first, then the next read after `coordination.cooldownMs` queues the media again. The line is one line; the error goes to your logger as the second argument, and what it prints is your logger's. A logger that formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry whose line holds a sequence such as `%c3` or `%s` |
+| the warning `resize worker: the … observers of task … did not settle within … ms` | a task observer (`afterTaskComplete`, `onTaskFailed` or `onTaskDeadLettered`) was still running after `taskTimeoutMs`, or 5 s from a stop. The task's state stands, the worker goes on, and the tap keeps running beside the next task — fix the tap |
 | a variant stays missing for ~10 min after its task was dead-lettered | `coordination.cooldownMs` (default 600000): the dead task holds the gate of its media, pipeline and queue until the cooldown ends, so reads queue nothing and `prewarm()` reports `RESIZE_TASK_IN_FLIGHT` (SQS: `RESIZE_ENQUEUE_LOCK_CONTENDED`) — fix the cause in the logs first |
 | `RESIZE_MONGO_MODEL_REQUIRED` | `new MongoMediaStore()` / `new MongoLockStore()` / `new MongoTaskQueue()` needs exactly one of `model` or `getModel` — or use `mongoParts(connection, { mediaModel })` |
 | `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` at worker start | `mediaModelName` does not match a registered host model — fix the name |
