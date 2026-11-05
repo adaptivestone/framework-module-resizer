@@ -32,11 +32,12 @@ export abstract class MediaStore {
    * dimensions, and a store that drops them makes every read of such a media queue a task that
    * downloads the original. Write them only while the original holds no stored pair (both numbers),
    * so they cannot land on an original swapped in during the render; a store that writes them
-   * anyway behaves as before. The store keeps one row per `identity`: a preview whose identity is already stored on the media is skipped, so
-   * two workers that rendered the same variant leave one row. The core identifies a stored row by
-   * its scope (`resizer` and `pipeline`, `default` when unset), size key, format and filters,
-   * derived from the row's own fields; it never identifies a row by a stored `identity` string. So
-   * "a preview whose identity is already stored" means a usable row with the same four. Resolve
+   * anyway behaves as before. The store keeps one row per `identity`: a preview whose identity is
+   * already stored on the media is skipped, so two workers that rendered the same variant leave
+   * one row. The core identifies a stored row by its scope (`resizer` and `pipeline`, `default`
+   * when unset), size key, format and filters, derived from the row's own fields; it never
+   * identifies a row by a stored `identity` string. So "a preview whose identity is already
+   * stored" means a usable row with the same four. Resolve
    * with the previews that were stored (`[]` when none were, e.g. the media is gone). Of the
    * previews left out, the core counts one whose identity is already stored as covered, and any
    * other as not recorded. Resolving with nothing is never a way to say "all of them": the core

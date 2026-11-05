@@ -504,7 +504,7 @@ describe('MongoMediaStore: the dimension backfill writes only while the pair is 
   });
 });
 
-describe('MongoMediaStore: preview rows have no _id', () => {
+describe('MongoMediaStore: new preview rows store no _id', () => {
   test('neither an appended nor a replaced row stores one, and two loads read the same rows', async () => {
     const store = mediaStore();
     const id = await newMedia();
@@ -579,6 +579,279 @@ describe('MongoMediaStore: preview rows have no _id', () => {
     assert.equal(decision.ready.length, 1);
     assert.equal(decision.ready[0].stale, undefined);
     assert.equal(tasks.rows.length, 1);
+  });
+
+  // A loaded media, as far as a host's code that removes a row reaches into it.
+  interface LoadedRow {
+    _id?: unknown;
+    id?: unknown;
+    identity?: string;
+    deleteOne(): unknown;
+  }
+  type LoadedRows = LoadedRow[] & {
+    id(id: unknown): LoadedRow | null;
+    pull(...values: unknown[]): unknown;
+    remove(...values: unknown[]): unknown;
+  };
+  interface LoadedMedia {
+    previews: LoadedRows;
+    markModified(path: string): void;
+    save(): Promise<unknown>;
+  }
+
+  const OLD_1 = new mongoose.Types.ObjectId();
+  const OLD_2 = new mongoose.Types.ObjectId();
+  const identityOf = (name: string) => `default:default:${name}:webp:`;
+  const namedRow = (name: string, _id?: mongoose.Types.ObjectId) => ({
+    ...preview(identityOf(name), name),
+    sizeKey: name,
+    ...(_id ? { _id } : {}),
+  });
+  // Written past the schema: two rows as 0.3.0 appended them, and two with no `_id`.
+  const mixedMedia = async (
+    model: ReturnType<typeof mediaModelWith> = Media(),
+  ) => {
+    const { insertedId } = await model.collection.insertOne({
+      previews: [
+        namedRow('old1', OLD_1),
+        namedRow('old2', OLD_2),
+        namedRow('new1'),
+        namedRow('new2'),
+      ],
+    } as never);
+    return {
+      id: insertedId,
+      doc: (await model.findById(insertedId)) as unknown as LoadedMedia,
+    };
+  };
+  const storedRows = async (
+    id: unknown,
+    model: ReturnType<typeof mediaModelWith> = Media(),
+  ) =>
+    (
+      (await model.collection.findOne({ _id: id } as never)) as unknown as {
+        previews: Array<{ sizeKey: string; _id?: unknown }>;
+      }
+    ).previews;
+  const storedKeys = async (
+    id: unknown,
+    model?: ReturnType<typeof mediaModelWith>,
+  ) => (await storedRows(id, model)).map((row) => row.sizeKey);
+  const OLD_REMOVED = ['old2', 'new1', 'new2'];
+  const NEW_REMOVED = ['old1', 'old2', 'new2'];
+  const ALL = ['old1', 'old2', 'new1', 'new2'];
+
+  test('row._id: an older row reads its stored id, a new row reads undefined, hydrated and lean', async () => {
+    const { id, doc } = await mixedMedia();
+    const stored = [String(OLD_1), String(OLD_2), undefined, undefined];
+    const text = (rows: Array<{ _id?: unknown }>) =>
+      rows.map((row) => (row._id === undefined ? undefined : String(row._id)));
+
+    assert.deepEqual(text(doc.previews), stored);
+    assert.deepEqual(
+      doc.previews.map((row) => row.id),
+      [String(OLD_1), String(OLD_2), null, null],
+    );
+    const lean = (await Media().findById(id).lean()) as unknown as {
+      previews: Array<{ _id?: unknown }>;
+    };
+    assert.deepEqual(text(lean.previews), stored);
+  });
+
+  test('markModified and a push invent no id when saved, and an older row keeps its own', async () => {
+    const { id, doc } = await mixedMedia();
+    doc.previews.push(namedRow('pushed') as unknown as LoadedRow);
+    doc.markModified('previews');
+    await doc.save();
+
+    const rows = await storedRows(id);
+    assert.deepEqual(
+      rows.map((row) => [row.sizeKey, '_id' in row]),
+      [
+        ['old1', true],
+        ['old2', true],
+        ['new1', false],
+        ['new2', false],
+        ['pushed', false],
+      ],
+    );
+    assert.equal(String(rows[0]._id), String(OLD_1));
+  });
+
+  // What removing one row by hand does on a mixed array, saved. Measured the same on mongoose 9.0.0
+  // and 9.11.4. The README and the changelog name the two forms that lose rows, so a change here
+  // changes what they tell a host.
+  for (const [name, remove, left] of [
+    [
+      'an older row, row.deleteOne(): that row',
+      (doc) => doc.previews[0].deleteOne(),
+      OLD_REMOVED,
+    ],
+    [
+      'an older row, previews.id(oid).deleteOne(): that row',
+      (doc) => doc.previews.id(OLD_1)?.deleteOne(),
+      OLD_REMOVED,
+    ],
+    [
+      'an older row, previews.pull(oid): that row',
+      (doc) => doc.previews.pull(OLD_1),
+      OLD_REMOVED,
+    ],
+    [
+      'an older row, previews.pull({ _id }): that row',
+      (doc) => doc.previews.pull({ _id: OLD_1 }),
+      OLD_REMOVED,
+    ],
+    [
+      'an older row, previews.remove(oid): that row',
+      (doc) => doc.previews.remove(OLD_1),
+      OLD_REMOVED,
+    ],
+    [
+      'an older row, a filter on String(_id): that row',
+      (doc) => {
+        const first = doc.previews[0];
+        doc.previews = doc.previews.filter(
+          (row) => String(row._id) !== String(first._id),
+        ) as LoadedRows;
+      },
+      OLD_REMOVED,
+    ],
+    [
+      'a new row, previews.pull(row._id): nothing',
+      (doc) => doc.previews.pull(doc.previews[2]._id),
+      ALL,
+    ],
+    [
+      'a new row, previews.remove(row._id): nothing',
+      (doc) => doc.previews.remove(doc.previews[2]._id),
+      ALL,
+    ],
+    [
+      'a new row, previews.pull({ _id: row._id }): EVERY row, the older ones too',
+      (doc) => doc.previews.pull({ _id: doc.previews[2]._id }),
+      [],
+    ],
+    [
+      'a new row, a filter on String(_id): every row without an _id',
+      (doc) => {
+        const first = doc.previews[2];
+        doc.previews = doc.previews.filter(
+          (row) => String(row._id) !== String(first._id),
+        ) as LoadedRows;
+      },
+      ['old1', 'old2'],
+    ],
+    [
+      'a new row, previews.pull(row): that row',
+      (doc) => doc.previews.pull(doc.previews[2]),
+      NEW_REMOVED,
+    ],
+    [
+      'a new row, previews.pull({ identity }): that row',
+      (doc) => doc.previews.pull({ identity: identityOf('new1') }),
+      NEW_REMOVED,
+    ],
+    [
+      'an older row, previews.pull({ identity }): that row',
+      (doc) => doc.previews.pull({ identity: identityOf('old1') }),
+      OLD_REMOVED,
+    ],
+    [
+      'a new row, a filter on identity: that row',
+      (doc) => {
+        doc.previews = doc.previews.filter(
+          (row) => row.identity !== identityOf('new1'),
+        ) as LoadedRows;
+      },
+      NEW_REMOVED,
+    ],
+  ] as [string, (doc: LoadedMedia) => unknown, string[]][]) {
+    test(`removing by hand on a mixed array: ${name}`, async () => {
+      const { id, doc } = await mixedMedia();
+      await remove(doc);
+      await doc.save();
+      assert.deepEqual(await storedKeys(id), left);
+    });
+  }
+
+  test('a new row: row.deleteOne() and previews.id(row._id).deleteOne() fail loudly, and remove nothing', async () => {
+    const { id, doc } = await mixedMedia();
+    const row = doc.previews[2];
+
+    await assert.rejects(async () => row.deleteOne());
+    assert.equal(doc.previews.id(row._id), null);
+
+    await doc.save();
+    assert.deepEqual(await storedKeys(id), ALL);
+  });
+
+  test('invalidate() removes a mixed array by identity and returns every ref', async () => {
+    const { storage } = memoryStorage();
+    const r = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      storage,
+      media: mediaStore(),
+    });
+    const { id, doc } = await mixedMedia();
+
+    const refs = await r.invalidate({ media: doc as unknown as MediaLike });
+
+    assert.equal(refs.length, 4);
+    assert.deepEqual(await storedKeys(id), []);
+  });
+
+  test('a hand-written row schema with the documented _id acts as the fragment does', async () => {
+    const model = mediaModelWith('HandWrittenIdMedia', [
+      new mongoose.Schema({
+        _id: { type: 'ObjectId', auto: false },
+        storageRef: { type: 'Mixed' },
+        identity: { type: String },
+        origin: { type: String },
+        encodeSig: { type: String },
+        sizeKey: { type: String },
+        format: { type: String },
+        contentType: { type: String },
+        fit: { type: Boolean },
+      }),
+    ]);
+    const store = new MongoMediaStore({ model });
+    assert.doesNotThrow(() => store.verify());
+
+    const { id, doc } = await mixedMedia(model);
+    assert.deepEqual(
+      doc.previews.map((row) => row.id),
+      [String(OLD_1), String(OLD_2), null, null],
+    );
+    doc.previews.pull(OLD_1);
+    await doc.save();
+    assert.deepEqual(await storedKeys(id, model), OLD_REMOVED);
+
+    await store.appendPreviews(String(id), [namedRow('appended')]);
+    const rows = await storedRows(id, model);
+    assert.deepEqual(
+      rows.map((row) => [row.sizeKey, '_id' in row]),
+      [
+        ['old2', true],
+        ['new1', false],
+        ['new2', false],
+        ['appended', false],
+      ],
+    );
+  });
+
+  test('rows declared with _id: false: a removal by the id of an older row removes every row, which is why the fragment does not', async () => {
+    const { _id: _rowId, ...rowFields } = resizeMediaSchemaFragment.previews[0];
+    const model = mediaModelWith('IdFalseMedia', [
+      new mongoose.Schema(rowFields as never, { _id: false }),
+    ]);
+    const { id, doc } = await mixedMedia(model);
+
+    doc.previews.pull(OLD_1);
+    await doc.save();
+
+    assert.deepEqual(await storedKeys(id, model), []);
   });
 });
 
@@ -948,11 +1221,8 @@ describe('MongoMediaStore.verify(): the media model must store preview identitie
   });
 
   test('rows declared through an explicit row schema without identity are rejected too', () => {
-    const {
-      identity: _identity,
-      _id: _rowId,
-      ...rowFields
-    } = resizeMediaSchemaFragment.previews[0];
+    const { identity: _identity, ...rowFields } =
+      resizeMediaSchemaFragment.previews[0];
     const store = new MongoMediaStore({
       model: mediaModelWith('RowSchemaMedia', [new mongoose.Schema(rowFields)]),
     });
@@ -1169,6 +1439,34 @@ describe('MongoMediaStore: the preview metadata', () => {
         err.message.includes('no file to serve') &&
         !err.message.includes('previews.identity'),
     );
+  });
+
+  test('a nested shape counts as declared for storageRef only', () => {
+    for (const field of [
+      'identity',
+      'origin',
+      'encodeSig',
+      'sizeKey',
+      'format',
+      'contentType',
+    ]) {
+      const store = new MongoMediaStore({
+        model: mediaModelWith(`Nested${field}Media`, [
+          {
+            ...resizeMediaSchemaFragment.previews[0],
+            [field]: { value: { type: String } },
+          },
+        ]),
+      });
+      assert.throws(
+        () => store.verify(),
+        (err: unknown) =>
+          err instanceof ResizeSetupError &&
+          err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+          err.message.includes(`previews.${field}`),
+        field,
+      );
+    }
   });
 
   test('a storageRef declared as Mixed, as a sub-schema or as nested paths passes verify()', () => {

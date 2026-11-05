@@ -506,8 +506,11 @@ cast rejects with Mongoose's `ValidationError` before anything is written; `stor
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
 sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType` or
-`storageRef` (a `storageRef` may be Mixed, a sub-schema or nested paths; a mixed or plain `previews`
-array, or rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and
+`storageRef` (a mixed or plain `previews` array, or rows with `strict: false`, pass; `bytes` and
+`createdAt` are not checked; a `storageRef` may be Mixed, or a sub-schema or nested paths that
+declare every key of the driver's ref: strict rows drop the rest, so a task completes and a read
+serves nothing, with an `error` line, and `verify()` cannot tell, since the key set is the driver's
+own) and
 logs one warning
 when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
 `logger` option, default `console`), `MongoLockStore.verify()`
@@ -640,7 +643,11 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     cast them) when it declares them as a type that does not read back as a number (not Number,
     Int32 or Mixed); its `verify()` warns once about it. Write them only while the original holds
     no stored pair (both numbers), so they cannot land on an original swapped in during the render.
-    `MongoMediaStore` does; a store that writes them anyway behaves as before.
+    `MongoMediaStore` does, except that an older worker in a rolling deploy still writes with no
+    such condition. Its update form needs MongoDB 4.2, the driver's own floor (its
+    `MIN_SUPPORTED_SERVER_VERSION`; tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook
+    that calls `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it. A store
+    that writes them anyway behaves as before.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -1557,11 +1564,32 @@ with the previews of new uploads, which wait behind it, so plan worker capacity 
 there. Call `generate()` to bring a catalog up to date; it is idempotent and renders only what is
 missing or stale.
 
-**Mongo `_id`.** Rows of the current `resizeMediaSchemaFragment` have no `_id`. An older row keeps
-its stored one until it is replaced. A hand-written schema that declares rows as sub-documents without
-`_id: false` stores an `_id` on an appended row, but a replaced row is written without one, so
-Mongoose makes up a new random `_id` each time that row is loaded, which changes any response or
-cache key built from it. Key preview rows by `identity`, never by `_id`.
+**Mongo `_id`.** New rows of the current `resizeMediaSchemaFragment` store no `_id`: it declares
+`_id: { type: 'ObjectId', auto: false }` on them. An older row keeps its stored one until it is
+replaced. On a new row `row._id` reads `undefined`, though its type says `ObjectId | null`, and
+`row.id` reads `null`. Key preview rows by `identity`, never by `_id`.
+
+**Removing a row.** Remove one row by `identity`, with `previews.pull({ identity: row.identity })`
+or a filter on `identity`, or call `invalidate()` for all of a media's rows. A removal by `_id` works
+on an older row only:
+
+| On a new row | What it does |
+|---|---|
+| `previews.pull({ _id: row._id })` | Removes every row, older ones included |
+| `previews.filter((p) => String(p._id) !== String(row._id))` | Removes every row without an `_id` |
+| `row.deleteOne()` | Throws |
+| `previews.id(row._id)` | Is `null`, and stops compiling under strict null checks |
+| `previews.pull(row._id)`, `previews.remove(row._id)` | Remove nothing |
+
+The first two save with no error, and the first compiles as it is: the next read renders those
+previews again, and their old files stay in storage with no log line.
+
+**A hand-written row schema** declares the same `_id: { type: 'ObjectId', auto: false }`, which
+compiles in `new Schema()`. With an automatic `_id`, an appended row stores one, but a replaced row is
+written without one, so Mongoose makes up a new random `_id` each time that row is loaded, which
+changes any response or cache key built from it. Never use `_id: false` on rows: Mongoose casts a
+stored `_id` away, so `row.deleteOne()`, `previews.pull(oid)` or a filter on `String(_id)` on an older
+row removes every row.
 
 ## Operations
 

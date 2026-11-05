@@ -107,15 +107,22 @@ describe('resizeMediaSchemaFragment — host usage', () => {
 });
 
 describe('resizeMediaSchemaFragment — preview rows', () => {
-  test('have no sub-document _id', () => {
-    assert.equal(resizeMediaSchemaFragment.previews[0]._id, false);
+  test('declare an _id that Mongoose never generates, and do not switch it off', () => {
+    assert.deepEqual(resizeMediaSchemaFragment.previews[0]._id, {
+      type: 'ObjectId',
+      auto: false,
+    });
     const schema = new mongoose.Schema({ ...resizeMediaSchemaFragment });
     const rows = schema.path('previews') as unknown as {
       schema: mongoose.Schema;
     };
-    assert.equal(rows.schema.path('_id'), undefined);
+    const id = rows.schema.path('_id') as unknown as {
+      instance: string;
+      options: { auto?: boolean };
+    };
+    assert.equal(id.instance, 'ObjectId');
+    assert.equal(id.options.auto, false);
     assert.ok(rows.schema.path('identity'));
-    assert.equal('id' in rows.schema.virtuals, false);
   });
 });
 

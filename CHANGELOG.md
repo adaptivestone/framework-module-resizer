@@ -87,13 +87,27 @@
   fragment and a driver that names files at random, as the shipped ones do, is not affected.
   `verify()` now also rejects a strict row schema without `sizeKey`, `format`, `contentType` or
   `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never serve such a row.
-- **Preview rows have no `_id`.** `resizeMediaSchemaFragment` declares `_id: false` on them. A row
-  replaced under 0.3.0 had none stored, so Mongoose made up a new random one on every load, and a
-  response built from the row changed on every request. Key rows by `identity`. `row._id` is now
-  `undefined` for new rows, and its type no longer says `ObjectId`; the `row.id` virtual goes too.
-  An older row keeps its stored `_id` until it is replaced. A host that passes
-  `resizeMediaSchemaFragment.previews[0]` to `new Schema()` directly takes `_id` out of it first,
-  because Mongoose's type refuses it there.
+- **New preview rows store no `_id`.** `resizeMediaSchemaFragment` declares
+  `_id: { type: 'ObjectId', auto: false }` on them. A row replaced under 0.3.0 had none stored, so
+  Mongoose made up a new random one on every load, and a response built from the row changed on
+  every request. Key rows by `identity`. An older row keeps its stored `_id` until it is replaced,
+  and a removal by that `_id` removes that row alone. On a new row `row._id` reads `undefined` and
+  `row.id` reads `null`. The type of `row._id` goes from `ObjectId` to `ObjectId | null`, so
+  `row._id.toString()` and `previews.id(row._id)` stop compiling under strict null checks. It never
+  says `undefined`, so `String(row._id)` compiles and gives `'undefined'`.
+- **Removing a new row by its `_id` can lose rows: check your code before upgrading.** On a new row,
+  `previews.pull({ _id: row._id })` removes every row, older ones included, and
+  `previews.filter((p) => String(p._id) !== String(row._id))` removes every row without an `_id`.
+  Both save with no error, and the first compiles as it is: the next read renders those previews
+  again, and their old files stay in storage with no log line. `row.deleteOne()` throws,
+  `previews.id(row._id)` is `null`, and `previews.pull(row._id)` and `previews.remove(row._id)`
+  remove nothing. Remove one row by `identity`, with `previews.pull({ identity: row.identity })` or
+  a filter on `identity`, or call `invalidate()` for all of a media's rows.
+- A hand-written row schema declares the same `_id: { type: 'ObjectId', auto: false }`, which
+  compiles in `new Schema()`, as does `resizeMediaSchemaFragment.previews[0]` passed whole. An
+  automatic `_id` keeps the random id on a replaced row. Never use `_id: false` on rows: Mongoose
+  casts a stored `_id` away, so `row.deleteOne()`, `previews.pull(oid)` or a filter on `String(_id)`
+  on an older row removes every row.
 
 **Changed behaviour**
 
@@ -151,8 +165,11 @@
   it logged on every read, so a busy API does not flood its log. `resize.read` with the outcome
   `failed` still counts every read. `prewarm()` logs as before.
 - `MongoMediaStore` records the measured dimensions only while the original holds no stored pair, so
-  they cannot land on an original swapped in during a render. Two originals without dimensions
-  swapped during one render still get the first one's pair.
+  they cannot land on an original swapped in during a render, except from an older worker in a
+  rolling deploy, whose write has no such condition. Two originals without dimensions swapped during
+  one render still get the first one's pair. The update form needs MongoDB 4.2, the driver's own
+  floor (its `MIN_SUPPORTED_SERVER_VERSION`; tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate`
+  pre hook that calls `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
 
 **Features**
 

@@ -6,8 +6,8 @@
 //
 // PLAIN POJO — NO imports at all (especially NO `mongoose` and NO
 // `@adaptivestone/framework`, so this file loads without either): only global constructors
-// (String/Number/Boolean/Date) and the 'Mixed' string alias. Where Mongoose infers loosely
-// (Mixed / subdoc arrays) the HOST layers the framework's TsTypeOverride<Original> /
+// (String/Number/Boolean/Date) and the 'Mixed' and 'ObjectId' string aliases. Where Mongoose infers
+// loosely (Mixed / subdoc arrays) the HOST layers the framework's TsTypeOverride<Original> /
 // TsTypeOverride<Preview[]> for exact field types — see the usage note below.
 //
 // Opt-in, scaffolded as a commented example: hosts may have a media model of their own.
@@ -36,9 +36,12 @@ export const resizeMediaSchemaFragment = {
   // identity.
   previews: [
     {
-      // No sub-document id: a row replaced through an update pipeline has none stored, and Mongoose
-      // would make up a new random one on every load.
-      _id: false,
+      // Declared, and never generated: a row replaced through an update pipeline has none stored,
+      // and an automatic `_id` would make up a new random one on every load. Not `_id: false`: that
+      // casts the stored id of an older row away, so a host's removal by id (`row.deleteOne()`,
+      // `previews.pull(oid)`) matches every row and removes them all. A row without an id is removed
+      // by its `identity`, or with invalidate().
+      _id: { type: 'ObjectId', auto: false },
       storageRef: { type: 'Mixed' },
       // The full preview identity (resizer:pipeline:sizeKey:format:filters). The database
       // stores one row per identity, so it needs this path: strict mode would strip it.

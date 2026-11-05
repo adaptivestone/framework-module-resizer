@@ -775,9 +775,10 @@ export class Processor {
   }
 
   /**
-   * The dimensions the persist recorded, set on the caller's in-memory original too, so a
-   * same-request resolve() can prove the new rows fresh. The store has them already, so an
-   * original that cannot be changed (a frozen one, say) is only logged.
+   * The dimensions the persist sent to the store, set on the caller's in-memory original too, so a
+   * same-request resolve() can prove the new rows fresh. The store usually holds them already, but
+   * not after an original swapped in during the render, which keeps its own pair. Either way the
+   * persist is done, so an original that cannot be changed (a frozen one, say) is only logged.
    */
   #setDims(
     media: MediaLike,

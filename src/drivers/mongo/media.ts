@@ -295,9 +295,14 @@ const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
 ];
 
 // Whether strict rows declare `path`. Mongoose's path() gives nothing for a shape declared as
-// nested paths (a `storageRef` of `{ key: String }`), though the rows keep what that shape declares.
+// nested paths, though the rows keep what that shape declares. Only `storageRef` may be such a
+// shape, being the driver's own object: every other required field is a string, so a nested one
+// can never hold what the worker writes.
 function declaresRowPath(rows: Partial<SchemaLike>, path: string): boolean {
-  return Boolean(rows.path?.(path)) || rows.pathType?.(path) === 'nested';
+  return (
+    Boolean(rows.path?.(path)) ||
+    (path === 'storageRef' && rows.pathType?.(path) === 'nested')
+  );
 }
 
 export class MongoMediaStore extends MediaStore {
@@ -329,7 +334,9 @@ export class MongoMediaStore extends MediaStore {
    * from every row: without `identity` every worker that renders a variant would add its own row,
    * without the signatures no row could say what it was made from, and without the last four no
    * read could serve a row); a mixed or plain array, or rows with `strict: false`, keep any field.
-   * A `storageRef` may be declared in any form: Mixed, a sub-schema or nested paths.
+   * A `storageRef` may be Mixed, or a strict sub-schema or nested paths that declare every key of
+   * the driver's ref: strict rows drop the rest, and this check cannot tell, since the key set is
+   * the driver's own.
    * Such rows without `fit` only get a warning, once per store: freshness still holds without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
    * without `width` or `height`, or any `original` declaring one with a type that does not read
    * back as a number (not Number, Int32 or Mixed), also gets one warning per store (it does not

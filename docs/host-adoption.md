@@ -279,8 +279,13 @@ export default {
   `{ type: String }`, `storageRef` as `{ type: 'Mixed' }`, and `fit` as `{ type: Boolean }` (the
   fragment already has them, with `bytes` and `createdAt`); `resizer.verify()` throws
   `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first seven, and logs one warning without `fit`.
-  Rows written earlier have no identity and are not migrated. A custom model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate`
-  (and optionally `castObject`), and must accept an update pipeline (statement 2). A
+  Rows written earlier have no identity and are not migrated. Declare `_id` on the rows as
+  `{ type: 'ObjectId', auto: false }`, as the fragment does, so new rows store none: an automatic
+  `_id` is a new random id on each load of a replaced row, and `_id: false` makes a removal by the
+  id of an older row remove every row. Remove a new row by `identity` or with `invalidate()`:
+  `previews.pull({ _id: row._id })` on one removes every row. A custom model-shaped
+  `MongoMediaModel` needs `findById` and `findOneAndUpdate` (and optionally `castObject`), and must
+  accept an update pipeline (statement 2). A
   `findOneAndUpdate` middleware on the media model runs once per preview write (and once for the
   dimension backfill) and receives a document with only `_id`, or `null` when the preview was
   already stored or the media is gone, or, for a backfill, when the pair is already stored; it also

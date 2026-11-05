@@ -297,7 +297,11 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    signatures record what each row was made from, and a read finds and serves a row by the other
    four.
    Give them `fit` (`{ type: Boolean }`) too; `verify()` logs one warning without it.
-   Rows of the fragment have no `_id`: key them by `identity`.
+   New rows of the fragment store no `_id` (`row._id` reads `undefined`; older rows keep theirs):
+   key them by `identity`, and remove one by `identity` or with `invalidate()`, because
+   `previews.pull({ _id: row._id })` on such a row removes every row. A hand-written row schema
+   declares `_id: { type: 'ObjectId', auto: false }`, never `_id: false`, under which a removal by
+   the id of an older row removes every row.
    With strict types, pass a loaded Mongoose document as `media: doc as MediaLike`
    (`import type { MediaLike }`), or type the model's `original`/`previews` paths with
    `Original`/`Preview` (framework hosts: `TsTypeOverride`).
