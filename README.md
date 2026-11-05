@@ -1414,13 +1414,15 @@ when it is `true`, the module gave no verdict on the file, so answer with your o
 `ResizeOriginalError` is not retryable by default, since the same bytes get the same refusal. The
 exceptions say what they are:
 
-- `RESIZE_ORIGINAL_INSPECT_FAILED` (`retryable: true`): a decoder failed for a reason other than the
-  bytes, such as a timeout, a host decoder's own failure, a healthy file this build cannot decode or
-  an engine failure with no detail. Retry may help, and `cause` says why.
-- `RESIZE_ORIGINAL_VERIFY_FAILED` (`retryable: true`): the `upload.verify: 'decode'` check failed for
-  a reason other than damage, such as a timeout or a healthy file this build cannot decode. It gave
-  no verdict on the image, and `cause` says why. A host decoder's own error with `retryable: false`
-  (an encrypted PDF, say) is not this code: it keeps its code and `retryable`, as at `inspect`.
+- `RESIZE_ORIGINAL_INSPECT_FAILED` (`retryable: true`): a decoder failed with an error the module
+  does not classify as damage (a timeout, a host decoder's own failure, a healthy file this build
+  cannot decode, or an engine failure with no detail), so the file may still be damaged. Retry may
+  help, and `cause` says why.
+- `RESIZE_ORIGINAL_VERIFY_FAILED` (`retryable: true`): the `upload.verify: 'decode'` check failed with
+  an error the module does not classify as damage (a timeout, or a healthy file this build cannot
+  decode), so the image may still be damaged. It gave no verdict on the image, and `cause` says why.
+  A host decoder's own error with `retryable: false` (an encrypted PDF, say) is not this code: it
+  keeps its code and `retryable`, as at `inspect`.
 
 `RESIZE_ORIGINAL_DAMAGED` (`retryable: false`) comes only from that check. Damage `inspect` finds
 first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays
@@ -2278,7 +2280,7 @@ damage in a later frame shows up on the worker as a dead task, `RESIZE_SOURCE_DA
 | Public SVG | `ResizeOriginalError` | `RESIZE_ORIGINAL_SVG_PUBLIC` | `false` |
 | Public, and its decoder has no `publicOriginals: true` | `ResizeOriginalError` | `RESIZE_ORIGINAL_PUBLIC_REFUSED` | `false` |
 | The decode finds damage | `ResizeOriginalError` | `RESIZE_ORIGINAL_DAMAGED` | `false` |
-| The decode fails for another reason | `ResizeOriginalError` | `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` |
+| The decode fails with an error not classified as damage | `ResizeOriginalError` | `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` |
 | A host decoder's final refusal (`retryable: false`), at `inspect` or in the decode | `ResizeOriginalError` | its own code | `false` |
 | A decoder's setup or config error | as thrown, the same object | its own code | its own |
 
@@ -2394,7 +2396,7 @@ Every code the module raises, sorted so you can search for it. `retryable` is wh
 | `RESIZE_ORIGINAL_EMPTY` | `false` | The upload, or the object to adopt, has no bytes: refuse the file. |
 | `RESIZE_ORIGINAL_FORMAT_DISABLED` | `false` | `uploadOriginal()`: the format is not in `upload.formats`. Add it, or refuse the file. |
 | `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` | `false` | See `RESIZE_SOURCE_FORMAT_UNSUPPORTED`. |
-| `RESIZE_ORIGINAL_INSPECT_FAILED` | `true` | From `uploadOriginal()` or `adoptOriginal()`: a decoder failed to read the upload for a reason other than the bytes: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
+| `RESIZE_ORIGINAL_INSPECT_FAILED` | `true` | From `uploadOriginal()` or `adoptOriginal()`: a decoder failed to read the upload with an error the module does not classify as damage, so the file may still be damaged: a timeout, a host decoder's own failure, a file this build cannot decode, or an engine failure with no detail (a file holding only PNG magic bytes gets this one). Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing. Bytes the engine calls malformed or unknown are `RESIZE_ORIGINAL_INVALID` (`retryable: false`), with the engine's line in the message |
 | `RESIZE_ORIGINAL_INVALID` | `false` | The bytes are malformed or unknown to the engine, and the message carries its line. Refuse the file. |
 | `RESIZE_ORIGINAL_METADATA_MISSING` | `false` | A decoder found no width or height in the upload or the object to adopt: refuse the file. |
 | `RESIZE_ORIGINAL_PUBLIC_REFUSED` | `false` | From `uploadOriginal()` or `adoptOriginal()`: a public original of a host decoder's source kind, whose decoder does not set `publicOriginals: true`: a public upload stores nothing, and an adopted object reads as public when `storage.publicUrl` returns for its ref — pass `visibility: 'private'` or move the object to private storage, or set `publicOriginals` on the decoder (a host decoder that takes over a built-in format needs it too). SVG is `RESIZE_ORIGINAL_SVG_PUBLIC` whatever the flag says |
@@ -2403,7 +2405,7 @@ Every code the module raises, sorted so you can search for it. `retryable` is wh
 | `RESIZE_ORIGINAL_TOO_LARGE` | `false` | From `uploadOriginal()`: the body is over `upload.maxBytes` or `limits.sourceBytes`, the message says which, and nothing is stored. Refuse the file, or raise the limit; above `limits.sourceBytes` raise both, since a task could not read it. From `adoptOriginal()`: the object is over the call's own `maxBytes`; the shipped drivers read nothing, except on an S3 response with no length, which is read whole first. Over `limits.sourceBytes` it is `RESIZE_SOURCE_TOO_LARGE`. |
 | `RESIZE_ORIGINAL_TOO_MANY_PIXELS` | `false` | The upload, or the object to adopt, is over `limits.sourcePixels` or Sharp's pixel limit: refuse the file, or raise the limit before rollout. |
 | `RESIZE_ORIGINAL_UPLOAD_FAILED` | `true` | `storage.upload` failed for an original, and `cause` says why. Retry after fixing it. A refusal by the driver comes only this way, so read `cause.code`: with `RESIZE_S3_PRIVATE_BUCKET_REQUIRED`, `RESIZE_S3_KEY_TOO_LONG` or `RESIZE_STORAGE_NAMESPACE_INVALID` a retry fails the same way until the setting or the `namespace` changes. |
-| `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` | From `uploadOriginal()` or `adoptOriginal()`: the `upload.verify: 'decode'` check, or an adoption's, failed for a reason other than damage: a timeout, or a healthy file this build cannot decode. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
+| `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` | From `uploadOriginal()` or `adoptOriginal()`: the `upload.verify: 'decode'` check, or an adoption's, failed with an error the module does not classify as damage (a timeout, or a healthy file this build cannot decode), so the image may still be damaged. It gave no verdict on the image. Nothing was stored, and `cause` says why — retry; a file this build cannot decode keeps failing, and would not render on a worker either. A host decoder's own error with `retryable: false` is not this code: it keeps its code and `retryable`, as at `inspect` |
 | `RESIZE_ORIGINAL_VISIBILITY_INVALID` | `false` | `uploadOriginal({ visibility })` is not `'public'` or `'private'`: pass one of those. |
 | `RESIZE_PEER_MISSING` | `true` | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or this code for a driver selected in the config (a config file, or the config passed to `createResizer()`) or from `signedUrl()`: an optional peer is not installed — install the packages named, see [Install](#install). A queue whose backend lacks its SDK beside another available backend is only not served in that process (`RESIZE_QUEUE_NOT_SERVED`, naming the package); `verify()` rejects with `RESIZE_PEER_MISSING` only when it is the Resizer's own queue |
 | `RESIZE_PIPELINE_STEP_INVALID` | `true` | A `beforeStep` or `variantStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image, or `rasterToSharp` something that is not a `Raster` — return `{ data, info }`, or `sharpToRaster(…)` from a Sharp chain |
