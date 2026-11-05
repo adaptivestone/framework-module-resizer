@@ -60,10 +60,11 @@ change). The final `0.3.0` followed `0.3.0-rc.5` with no host-facing change.
 > run `npm version` on top of it (that would skip a version); tag the release commit by hand.
 
 **Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
-heading, with `**Breaking changes**` / `**Features**` / `**Fixes**` / `**Internal**` groups —
-the format the sibling `framework-module-email` uses. It is NOT in `files`, so it stays on GitHub and never
-ships in the tarball (same as the sibling). Write it for a host developer deciding whether to
-upgrade: what breaks, what is new, and what they must change.
+heading, with `**Breaking changes**` / `**Changed behaviour**` / `**Features**` / `**Fixes**` /
+`**Documentation**` / `**Internal**` groups — the format the sibling `framework-module-email`
+uses. It is NOT in `files`, so it stays on GitHub and never ships in the tarball (same as the
+sibling). Write it for a host developer deciding whether to upgrade: what breaks, what is new, and
+what they must change.
 
 ## 3. Publish
 
@@ -96,8 +97,8 @@ harmless; point it at the final release with `npm dist-tag add
 @adaptivestone/framework-module-resize@X.Y.Z next` if you want `@next` to stay the newest.
 
 `prepublishOnly` runs `npm run build` automatically, so `dist/` is always rebuilt from source at
-publish time; `files: ["dist", "AGENTS.md"]` (plus the auto-included `README.md` + `LICENSE`) is
-all that ships.
+publish time; `files: ["dist", "AGENTS.md", "UPGRADING.md"]` (plus the auto-included `README.md` +
+`LICENSE`) is all that ships.
 
 > If the org later decides to standardize access in-manifest, add `"publishConfig": { "access":
 > "public" }` to `package.json` and drop the flag. As of this release the siblings rely on the
@@ -152,14 +153,14 @@ _Placeholder — the one check the automated smoke can't do: wire the published 
 actual framework host and run it against real infra._
 
 - [ ] In a real `@adaptivestone/framework` host: `npm i @adaptivestone/framework-module-resize`
-      (`@next` for a release candidate), run `npx resize-scaffold`, and in `src/config/resize.ts`
-      set `mediaModelName` and `storage` (S3), keep `queue: 'default'` and
+      (`@next` for a release candidate), run `npx --no -- resize-scaffold`, and in
+      `src/config/resize.ts` set `mediaModelName` and `storage` (S3), keep `queue: 'default'` and
       `queues: { default: { driver: 'database' } }`, and set `worker: { enabled: true }`.
       `src/resizer.ts` stays
       `new FrameworkResizer({ pipelines })`. Create the `ResizeTask` indexes through the host's
       migration, and call `await resizer.verify()` after `server.init()`.
-- [ ] `npx resize-scaffold --check` passes, and `npm run gen` (the framework's AST codegen) types
-      `getModel('ResizeTask')` through the scaffolded shim.
+- [ ] `npx --no -- resize-scaffold --check` passes, and `npm run gen` (the framework's AST
+      codegen) types `getModel('ResizeTask')` through the scaffolded shim.
 - [ ] Boot the server, upload an image, confirm a `resolve()` read queues the missing variants and
       `npm run cli ResizeWorker` generates and persists the previews (database queue + S3
       storage). If the host uses SQS, repeat with
@@ -167,7 +168,7 @@ actual framework host and run it against real infra._
 - [ ] Stop the worker during a task (SIGTERM): the task goes back to `pending` and the next
       worker finishes it.
 - [ ] Confirm eager mode (`generate()`, no `queue` or `queues` in the config) on a host scaffolded with
-      `--eager`; `npx resize-scaffold --check --eager` passes.
+      `--eager`; `npx --no -- resize-scaffold --check --eager` passes.
 
 ### Push delivery (needs an AWS account)
 

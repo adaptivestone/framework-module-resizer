@@ -384,3 +384,76 @@ test('the push delivery section leads with the settings a host must get right, i
     'the section must open by saying it has not run on real AWS',
   );
 });
+
+test('UPGRADING.md: fences close, subpaths exist, and only the old shape it shows on purpose is stale', async () => {
+  const text = read('UPGRADING.md');
+  assert.deepEqual(fenceProblems(text), []);
+  assert.deepEqual(
+    importProblems(docImports(text), await packageEntries(), exportKeys()),
+    [
+      "import { defaultFrameworkResizeConfig } from '@adaptivestone/framework-module-resize/config/resize.js' (…/config/resize.js): 'defaultFrameworkResizeConfig' is not a value export of the entry",
+    ],
+  );
+  const keys = new Set(exportKeys());
+  for (const m of text.matchAll(
+    /…(\/[A-Za-z0-9._/-]+\.js(?:on)?)(?![A-Za-z0-9_])/g,
+  )) {
+    assert.ok(keys.has(`.${m[1]}`), `…${m[1]}`);
+  }
+});
+
+test('UPGRADING.md names every 0.4.0 trap, and what comes before npm i comes first', () => {
+  const text = read('UPGRADING.md');
+  const from = text.indexOf('## From 0.3.x to 0.4.0');
+  const to = text.indexOf('## From 0.2.x to 0.3.0');
+  assert.ok(from >= 0 && to > from, 'UPGRADING.md sections not found');
+  const section = text.slice(from, to).replace(/\s+/g, ' ');
+  for (const needle of [
+    'storage.publicUrl',
+    '3.729 to 3.734',
+    '--legacy-peer-deps',
+    'limits.sourceBytes',
+    'upload.maxBytes',
+    '2147483647',
+    'previews stored earlier stop being served',
+    'contentType',
+    'storageRef',
+    'RESIZE_MEDIA_ROW_NOT_KEPT',
+    'An `engine` or `decoders` key',
+    '975 MB',
+    '590 MB',
+    'A pipeline without steps pays nothing',
+    'What a rewritten step writes',
+    'at most 2 levels',
+    'list the objects first',
+    'older than a day and more than twice `taskTimeoutMs`',
+    'call `invalidate()`',
+    'does not run steps',
+    'raster.info',
+    'RESIZE_ORIGINAL_INSPECT_FAILED',
+    'RESIZE_ORIGINAL_TOO_MANY_PIXELS',
+    'RESIZE_TASK_MAX_ATTEMPTS',
+    'summaryIntervalMs',
+    'resolveWithObject',
+    'this.where',
+    'reports nothing new',
+    './README.md#push-delivery-preview',
+    'getResizer().verify()',
+  ]) {
+    assert.ok(section.includes(needle), needle);
+  }
+  const install = section.indexOf('npm i @adaptivestone/');
+  assert.ok(
+    install > section.indexOf('3.729 to 3.734'),
+    'the SDK pin comes first',
+  );
+  assert.ok(
+    install > section.indexOf('getResizer().verify()'),
+    'verify() comes first',
+  );
+  assert.equal(
+    text.slice(0, from).includes('npm i '),
+    false,
+    'no install in the head',
+  );
+});

@@ -8,6 +8,7 @@ driver, and turns the record on your media document into image URLs.
 - **Guide:** [framework.adaptivestone.com/docs/resize](https://framework.adaptivestone.com/docs/resize)
   covers setup, workflows, pipelines, security and troubleshooting.
 - **Coding agents:** read [`AGENTS.md`](./AGENTS.md), the integration guide shipped with this package.
+- **Upgrading:** read [`UPGRADING.md`](./UPGRADING.md), also shipped with this package.
 - This README is the package overview and the reference for drivers, config and operations.
 
 ## Workflows
@@ -155,30 +156,21 @@ marked modified, and saving the stale list would drop rows a worker stored since
    `RESIZE_MONGO_INDEX_MISSING` without the gate index, on a fresh database too. On a new database
    only, an API with `autoIndex` on can build them first (Mongoose's own build at boot, no code of
    yours), and its `verify()` waits for that build. When upgrading, create the gate index through
-   a migration before the new API and workers start (the order is in `CHANGELOG.md`). A migration
-   that runs before both always works, also when a new pipeline needs the worker deployed before
-   the API requests it.
+   a migration before the new API and workers start (the order is in
+   [`UPGRADING.md`](./UPGRADING.md)). A migration that runs before both always works, also when a
+   new pipeline needs the worker deployed before the API requests it.
 4. Run `npm run cli ResizeWorker` as a separate process (it consumes `'default'`;
    `-- --queue=default --queue=bulk` consumes several queues).
 
 The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
 worker has the same Resizers as the API. Keep that import, and run
 `npx --no -- resize-scaffold --check` in CI to catch drift (`--check --eager` for an eager app). Right
-after an upgrade it reports drift for every `src/config/resize.ts`, and every `resize.<NODE_ENV>.ts`
-override of it, scaffolded by an earlier version (a top-level `queue: { … }` object, or
-`defaultFrameworkResizeConfig` imported from `…/config/resize.js`; only full-line `//` comments are
-skipped, and a second Resizer's `configName` file is not checked) and for every ejected
-`ResizeTask` model without `startedAt` and `finishedAt`. This is intended: rewrite the config to
-the shape in [Config reference](#config-reference) (or move it aside, re-run
-`npx --no -- resize-scaffold` and copy your settings back), and add `startedAt: { type: Date }` and
-`finishedAt: { type: Date }` to an ejected model (or move `src/models/ResizeTask.ts` aside (or
-delete it), re-run `npx --no -- resize-scaffold --eject`, then restore your customizations; the
-scaffold never overwrites a file, so re-running `--eject` alone changes nothing). The config file is
-never diffed. The model shim extends
-the default export of `…/framework/ResizeTaskModel.js`, which lets `npm run gen` type
-`getModel('ResizeTask')`; `--check` reports a shim from an older scaffold (fix: delete
-`src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold`; `--force` would also overwrite
-`src/resizer.ts` and `src/config/resize.ts`).
+after an upgrade it reports every config and ejected model written before 0.3.0: see
+[`UPGRADING.md`](./UPGRADING.md#six-things-to-know-after-the-upgrade). The config file is never
+diffed. The model shim extends the default export of `…/framework/ResizeTaskModel.js`, which lets
+`npm run gen` type `getModel('ResizeTask')`; `--check` reports a shim from an older scaffold (fix:
+delete `src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold`; `--force` would also
+overwrite `src/resizer.ts` and `src/config/resize.ts`).
 
 ## Without the framework
 
@@ -1410,18 +1402,8 @@ override may move only some queues to another backend (only `queues.default` to 
 `npm run cli ResizeWorker -- --queue=default --queue=bulk`.
 
 Without the framework, buckets, URLs and queue URLs are driver options. Removed keys fail with
-`RESIZE_CONFIG_REMOVED_KEY`, and the message says where the value goes: the 0.2.x keys
-`webpAvifOnly`, `encode.quality`, `encode.effort`, `encode.mozjpeg`, `encode.chromaSubsampling` and
-`encode.flattenBackground`; `queue` and `worker` in a core config (timing goes to the task queue;
-framework hosts define queues in `queues` and keep `worker` in `src/config/resize.ts`);
-`worker.concurrency` in a framework config file (use the top-level `concurrency`); a `queue`
-object in a framework config file (define the queue in `queues` of `src/config/resize.ts` and set
-`queue` to its name); `queues.<name>.queues` (give each SQS queue its own entry); `lockTtlMs` in a
-task queue's `timing` or a `queues` entry (use [coordination](#coordination): `failed` →
-`cooldownMs`, `dispatch` → `gateTtlMs`, drop `worker`); `storage.publicUrl` and the `S3Storage`
-option `publicUrl` (use `publicBaseUrl`); and the worker's `--config` flag and
-`runResizeWorker({ configName })` (the worker reads `worker` and `queues` from
-`src/config/resize.ts`).
+`RESIZE_CONFIG_REMOVED_KEY`, and the message says where the value goes: see
+[Removed keys](./UPGRADING.md#removed-keys).
 
 ### Coordination
 

@@ -17,6 +17,10 @@ describe('AGENTS.md drift guard (the doc ships with the package — it must not 
       pkg.files.includes('AGENTS.md'),
       'package.json "files" must include AGENTS.md (npm auto-includes only README/LICENSE)',
     );
+    assert.ok(
+      pkg.files.includes('UPGRADING.md'),
+      'package.json "files" must include UPGRADING.md: AGENTS.md links to it',
+    );
   });
 
   test('every full-name subpath mentioned exists in the exports map', async () => {

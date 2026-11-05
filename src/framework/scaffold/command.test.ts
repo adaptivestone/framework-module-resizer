@@ -1311,6 +1311,9 @@ describe('runScaffold — local storage', () => {
     const sources = [
       join(repo, 'README.md'),
       join(repo, 'AGENTS.md'),
+      join(repo, 'UPGRADING.md'),
+      join(repo, 'RELEASE.md'),
+      join(repo, 'CHANGELOG.md'),
       fileURLToPath(new URL('./command.ts', import.meta.url)),
       ...(await readdir(templates)).map((name) => join(templates, name)),
     ];

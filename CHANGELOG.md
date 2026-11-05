@@ -308,6 +308,14 @@
   with every part in code first used before the `Server` exists, and a CLI command with an
   asynchronous sink call `await getResizer().metrics.flush?.()` themselves.
 
+**Documentation**
+
+- `UPGRADING.md` ships with the package and holds all upgrade material: what a host must do for each
+  version, the traps of 0.4.0 and the list of removed keys. It replaces `docs/host-adoption.md`, which
+  did not ship.
+- The 0.3.0 docs gave a sweep of preview objects with no age rule. It can delete the file of a row about
+  to be written, and a read still calls that row ready. `UPGRADING.md` gives the rule and the repair.
+
 **Internal**
 
 - `runWorker`'s wiring moved into `prepareServing`, which push delivery shares.
@@ -476,11 +484,11 @@ the image engine behind a port.
   skipped, a `queue` entry inside `queues` is not drift, and a second Resizer's `configName` file
   is not checked), and for every ejected `ResizeTask` model (one without `startedAt` and
   `finishedAt`). This is intended. To clear it, rewrite the config to the new shape (or move it
-  aside, re-run `npx resize-scaffold` and copy your settings back), and add
+  aside, re-run `npx --no -- resize-scaffold` and copy your settings back), and add
   `startedAt: { type: Date }` and `finishedAt: { type: Date }` to an ejected model (or
-  move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`, then
-  restore your customizations; the scaffold never overwrites a file, so re-running `--eject` alone
-  changes nothing). The config file is still never diffed. An ejected model without the two times
+  move `src/models/ResizeTask.ts` aside (or delete it), re-run
+  `npx --no -- resize-scaffold --eject`, then restore your customizations; the scaffold never
+  overwrites a file, so re-running `--eject` alone changes nothing). The config file is still never diffed. An ejected model without the two times
   keeps working: they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
 - **Old preview rows.** Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are
   stale to the freshness check: each is served until its replacement is stored,
@@ -853,8 +861,8 @@ the image engine behind a port.
   `@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js` export (the model class as
   its default export), which lets the framework's `npm run gen` type `getModel('ResizeTask')`.
   `resize-scaffold --check` reports a shim that still imports `…/framework.js` as drift: delete
-  `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite
-  `src/resizer.ts` and `src/config/resize.ts`).
+  `src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold` (`--force` would also
+  overwrite `src/resizer.ts` and `src/config/resize.ts`).
 - An ejected or hand-written `ResizeTask` model must declare the `resizer`, `queue`,
   `availableAt`, `active` and `cooldownUntil` fields (and the `{ queue, status, availableAt }`
   index and the gate index); Mongoose would drop undeclared fields, filing every task under
@@ -1296,7 +1304,7 @@ the image engine behind a port.
   CLI process. It is now `import '../resizer.ts'` plus a re-export of the module's command.
   `resize-scaffold --check` reports a command that does not import it as drift, and the framework
   worker rejects an empty registry with `RESIZE_NO_RESIZER` and that fix in the message. Hosts:
-  delete `src/commands/ResizeWorker.ts` and re-run `npx resize-scaffold`.
+  delete `src/commands/ResizeWorker.ts` and re-run `npx --no -- resize-scaffold`.
 - `LocalFsStorage` normalizes root paths before deriving the private root and rejects a
   `privateRootDir` equal to or inside the public root. A trailing slash no longer places private
   originals in the public folder.

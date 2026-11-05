@@ -625,6 +625,10 @@ try {
     throw new Error('installed package is missing AGENTS.md');
   }
   console.log('  ok  AGENTS.md ships with the package');
+  if (!existsSync(join(installedPackage, 'UPGRADING.md'))) {
+    throw new Error('installed package is missing UPGRADING.md');
+  }
+  console.log('  ok  UPGRADING.md ships with the package');
 
   // Compile a real TypeScript consumer against the installed package. Use this repository's
   // pinned compiler directly; do not install or resolve another TypeScript in the consumer.
