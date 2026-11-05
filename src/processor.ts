@@ -39,6 +39,7 @@ import {
   ResizeStorageError,
 } from './errors.ts';
 import { expectedOrigin, sameOriginal, storedDims } from './freshness.ts';
+import { asBuffer, isBytes } from './helpers/bytes.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow, notRetryable } from './helpers/log.ts';
@@ -69,7 +70,7 @@ import {
   SizedRasters,
   straightAlpha,
 } from './render.ts';
-import { previewOrigin } from './signatures.ts';
+import { locatorJson, previewOrigin } from './signatures.ts';
 import type {
   GenerateOpts,
   GenerateResult,
@@ -85,10 +86,6 @@ import type {
   SizeInput,
   StorageRef,
 } from './types.d.ts';
-
-/** Normalize a driver download to a Node Buffer for the decoder. */
-const asBuffer = (b: Buffer | Uint8Array): Buffer =>
-  Buffer.isBuffer(b) ? b : Buffer.from(b);
 
 /**
  * An unregistered pipeline must not render: its previews would be stored under that pipeline's
@@ -146,7 +143,7 @@ function withMediaId(err: ResizeMediaError, mediaId: string): ResizeMediaError {
   const code = fieldOf(err, 'code');
   const retryable = fieldOf(err, 'retryable');
   return new ResizeMediaError(
-    `${typeof message === 'string' ? message : 'resize: the decoder refused the source'} (media ${mediaId})`,
+    `${typeof message === 'string' ? message : 'resize: the source was refused'} (media ${mediaId})`,
     {
       mediaId,
       ...(typeof code === 'string' ? { code } : {}),
@@ -397,9 +394,8 @@ function snapshotSettings(config: ResizeConfig): ResizeConfig {
  * recipe leaves it out of every signature, so any value signs the same.
  */
 function signedLocator(ref: StorageRef): StorageRef {
-  const json = JSON.stringify({ storageRef: ref });
-  const { storageRef } = JSON.parse(json) as { storageRef?: StorageRef };
-  return storageRef === undefined ? ref : storageRef;
+  const json = locatorJson(ref);
+  return json === undefined ? ref : json;
 }
 
 /**
@@ -429,9 +425,11 @@ function snapshotOriginal(original: Original): {
 }
 
 /**
- * Download the original once and identify its bytes. The detected format is the truth: a stored
- * format that does not match is logged once and the bytes are rendered as what they are. One frame
- * must fit `limits.sourcePixels`; how many frames are decoded is bounded by the plan.
+ * Download the original once and identify its bytes. The bytes must fit `limits.sourceBytes`: a
+ * driver is asked to refuse a larger object before reading it, and one that cannot is caught here,
+ * after the memory is spent but before any decoder sees them. The detected format is the truth: a
+ * stored format that does not match is logged once and the bytes are rendered as what they are. One
+ * frame must fit `limits.sourcePixels`; how many frames are decoded is bounded by the plan.
  */
 async function loadSource(
   parts: {
@@ -445,7 +443,29 @@ async function loadSource(
   mediaId: string,
 ): Promise<LoadedSource> {
   const { storage, decoders, limits, logger, who } = parts;
-  const bytes = asBuffer(await storage.download(original.storageRef));
+  let downloaded: Buffer | Uint8Array;
+  try {
+    downloaded = await storage.download(original.storageRef, {
+      maxBytes: limits.sourceBytes,
+    });
+  } catch (err) {
+    // A driver's refusal cannot name the media; a generate() caller gets it from both refusals.
+    throw lacksMediaId(err) ? withMediaId(err, mediaId) : err;
+  }
+  if (!isBytes(downloaded)) {
+    throw new ResizeSetupError(
+      `resize: storage.download() resolved with something other than bytes for media ${mediaId} — it must resolve with a Buffer or a Uint8Array`,
+      { code: 'RESIZE_STORAGE_DOWNLOAD_INVALID' },
+    );
+  }
+  // Before asBuffer, which copies a Uint8Array: a file about to be refused costs no second copy.
+  if (downloaded.byteLength > limits.sourceBytes) {
+    throw new ResizeMediaError(
+      `resize: source is ${downloaded.byteLength} bytes, over limits.sourceBytes (${limits.sourceBytes}) for media ${mediaId}`,
+      { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+    );
+  }
+  const bytes = asBuffer(downloaded);
   let identified: IdentifiedSource;
   try {
     identified = await decoders.identify(bytes, limits, original.format);

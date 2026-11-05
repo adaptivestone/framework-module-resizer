@@ -20,7 +20,7 @@ import type {
 } from '../types.d.ts';
 import { databaseQueueDriver } from './databaseQueue.ts';
 
-const S3_PEERS = ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner'];
+const S3_PEERS = ['@aws-sdk/client-s3'];
 const SQS_PEERS = ['@aws-sdk/client-sqs'];
 
 const local: StorageDriver<LocalStorageConfig> = {

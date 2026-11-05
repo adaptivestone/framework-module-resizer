@@ -248,6 +248,17 @@ describe('encodeSignature', () => {
     );
   });
 
+  test('limits.sourceBytes is not signed', () => {
+    const cover = (format: string) => ({ format, fit: false });
+    const small = makeImageConfig({ limits: { sourceBytes: 1 } });
+    for (const format of ['jpeg', 'webp']) {
+      assert.equal(
+        encodeSignature(small, cover(format)),
+        encodeSignature(makeImageConfig(), cover(format)),
+      );
+    }
+  });
+
   test('limits.failOn is not signed: changing it regenerates nothing', () => {
     const cover = (format: string) => ({ format, fit: false });
     const lax = makeImageConfig({ limits: { failOn: 'none' } });

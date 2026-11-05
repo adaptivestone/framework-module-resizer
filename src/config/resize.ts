@@ -29,6 +29,7 @@ const defaultResizeConfig: ResizeConfig = {
   limits: {
     inputPixels: 268402689,
     sourcePixels: 50_000_000,
+    sourceBytes: 256 * 1024 * 1024,
     resultDimension: 5000,
     animationFrames: 64,
     processingTimeoutSeconds: 30,

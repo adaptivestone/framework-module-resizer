@@ -46,6 +46,20 @@ describe('LogMetrics', () => {
     mock.timers.reset();
   });
 
+  test('an adoption reaches only the debug line: it is a bounded script, not traffic', () => {
+    const logger = recordingLogger();
+    const metrics = new LogMetrics(logger, { debug: true });
+    metrics.timing('resize.adopt', 5, {
+      resizer: 'default',
+      outcome: 'adopted',
+      format: 'png',
+    });
+    metrics.flush();
+    assert.deepEqual(logger.lines.info, []);
+    assert.equal(logger.lines.debug.length, 1);
+    assert.match(String(logger.lines.debug[0][0]), /resize\.adopt/);
+  });
+
   test('request-path events are summed into one info line per window, only when something was counted', () => {
     const logger = recordingLogger();
     const metrics = new LogMetrics(logger);

@@ -106,7 +106,7 @@ function schemaError(model: TaskModel): ResizeSetupError | undefined {
   const error =
     missing.length > 0
       ? new ResizeSetupError(
-          `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
+          `resize: the ResizeTask model has no ${missing.join(', ')} field(s), so Mongoose would drop them from every task — delete src/models/ResizeTask.ts and re-run npx --no -- resize-scaffold (add --eject for a full editable model); for a hand-written model, port the fields from resizeTaskFields()`,
           { code: 'RESIZE_MONGO_MODEL_OUTDATED' },
         )
       : null;

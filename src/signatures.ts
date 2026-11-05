@@ -8,6 +8,17 @@ import { createHash } from 'node:crypto';
 import { canonicalizeFilterValue } from './images.ts';
 import type { ResizeConfig, StorageRef } from './types.d.ts';
 
+/**
+ * The locator's JSON form, under the `storageRef` key the origin recipe serializes it under
+ * (`toJSON('storageRef')` included), so it is what the database stores and what every origin signs.
+ * `undefined` when it has none. Throws what `JSON.stringify` throws: a circular locator, a BigInt, a
+ * getter that throws.
+ */
+export function locatorJson(ref: StorageRef): StorageRef | undefined {
+  const json = JSON.stringify({ storageRef: ref });
+  return (JSON.parse(json) as { storageRef?: StorageRef }).storageRef;
+}
+
 // The formats whose rows sign `config.animated`, `limits.animationFrames` and the pixel budget. A
 // deliberate frozen copy of the formats isAnimatedFormat knows, not an import of it: this list is
 // part of the recipe. If Sharp later animates another format, isAnimatedFormat may grow, but the

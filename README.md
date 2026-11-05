@@ -36,13 +36,15 @@ part that uses it:
 |---|---|
 | `…/framework.js` (framework apps) | `@adaptivestone/framework` ≥ 5.1 and `mongoose` 9 (already in a framework app) |
 | `…/drivers/mongo.js` | `mongoose` 9 |
-| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` `@aws-sdk/s3-request-presigner` ≥ 3.572 |
+| S3: `storage: { driver: 's3' }` or `S3Storage` (`…/drivers/s3.js`) | `@aws-sdk/client-s3` ≥ 3.572, not 3.729 to 3.734; add `@aws-sdk/s3-request-presigner` only if you call `signedUrl` |
 | SQS: a `queues` entry with `driver: 'sqs'`, or `SqsTaskQueue` (`…/drivers/sqs.js`) | `@aws-sdk/client-sqs` ≥ 3.572 |
 
 A missing optional peer fails at your own import line when you import a driver subpath. A driver
 chosen in the config fails when the Resizer first loads it (the first call, or `verify()`) with
-`ResizeSetupError` `RESIZE_PEER_MISSING`, which names the packages and the config file. A queue
-whose SDK is missing beside queues on another backend is only not served in that process (see
+`ResizeSetupError` `RESIZE_PEER_MISSING`, which names the packages and the config file. The
+presigner is loaded only by `signedUrl`, so a missing one rejects that call with
+`RESIZE_PEER_MISSING` and stops nothing else. A queue whose SDK is missing beside queues on another
+backend is only not served in that process (see
 **Backends** under [Config reference](#config-reference)). An older
 SQS client does not return receive counts, so failing tasks would never be dead-lettered;
 `SqsTaskQueue` warns if that happens.
@@ -50,8 +52,11 @@ SQS client does not return receive counts, so failing tasks would never be dead-
 ## Quick start (framework, eager)
 
 ```bash
-npx resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
+npx --no -- resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
 ```
+
+Run it after the install. `--no` refuses to fetch a package of that name from the registry when
+this one is missing, and `--` hands the options to this command, not to npm.
 
 ```ts
 // src/config/resize.ts
@@ -63,9 +68,16 @@ import {
 export default {
   ...defaultFrameworkResizeConfig,
   mediaModelName: 'File',
-  storage: { driver: 'local', rootDir: './var/media', publicBaseUrl: '/media' },
+  storage: { driver: 'local', rootDir: './var/media', privateRootDir: './var/media-private',
+    publicBaseUrl: process.env['RESIZE_PUBLIC_BASE_URL'] || 'http://localhost:3300/media' },
 } satisfies FrameworkResizeConfig;
 ```
+
+The framework serves no static files: serve exactly `./var/media` at `publicBaseUrl` (guide:
+[Serve local files](https://framework.adaptivestone.com/docs/resize#serve-local-files)), and set
+`RESIZE_PUBLIC_BASE_URL` in every deployed environment. In the run that writes this config, the
+scaffold also appends `/var/` to `.gitignore`, because private originals must never reach version
+control.
 
 ```ts
 // src/resizer.ts — behaviour only; the drivers come from the config file
@@ -122,12 +134,16 @@ const { decision } = await getResizer().resolve({ media: file, sizes });
 const picture = formatPictureUrls(decision, { id: String(file.id) });
 ```
 
+`formatPictureUrls` maps each size key and format to `{ url, contentType }`. Its entries also carry
+`width` and `height`, the preview's real size, when the row has them: a size key does not promise a
+size, since a preview can be smaller than its box.
+
 `generate()` stores the new rows itself and also appends them to `file.previews`, so a
 same-request `resolve()` sees them. Reload the media before saving it after `generate()` or
 `invalidate()`; the module wrote the rows itself (on a Mongoose document the changed `previews` is
 marked modified, and saving the stale list would drop rows a worker stored since it was loaded).
 
-**Background generation.** Run `npx resize-scaffold` (without `--eager`) to add the
+**Background generation.** Run `npx --no -- resize-scaffold` (without `--eager`) to add the
 `ResizeTask` model and the `ResizeWorker` command, then:
 
 1. In `src/config/resize.ts`, define the queue and name it: `queues: { default: { driver:
@@ -147,20 +163,21 @@ marked modified, and saving the stale list would drop rows a worker stored since
 
 The scaffolded command is `import '../resizer.ts'` plus a re-export of the module's command, so the
 worker has the same Resizers as the API. Keep that import, and run
-`npx resize-scaffold --check` in CI to catch drift (`--check --eager` for an eager app). Right
+`npx --no -- resize-scaffold --check` in CI to catch drift (`--check --eager` for an eager app). Right
 after an upgrade it reports drift for every `src/config/resize.ts`, and every `resize.<NODE_ENV>.ts`
 override of it, scaffolded by an earlier version (a top-level `queue: { … }` object, or
 `defaultFrameworkResizeConfig` imported from `…/config/resize.js`; only full-line `//` comments are
 skipped, and a second Resizer's `configName` file is not checked) and for every ejected
 `ResizeTask` model without `startedAt` and `finishedAt`. This is intended: rewrite the config to
-the shape in [Config reference](#config-reference) (or move it aside, re-run `npx resize-scaffold`
-and copy your settings back), and add `startedAt: { type: Date }` and `finishedAt: { type: Date }`
-to an ejected model (or move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx
-resize-scaffold --eject`, then restore your customizations; the scaffold never overwrites a file, so
-re-running `--eject` alone changes nothing). The config file is never diffed. The model shim extends
+the shape in [Config reference](#config-reference) (or move it aside, re-run
+`npx --no -- resize-scaffold` and copy your settings back), and add `startedAt: { type: Date }` and
+`finishedAt: { type: Date }` to an ejected model (or move `src/models/ResizeTask.ts` aside (or
+delete it), re-run `npx --no -- resize-scaffold --eject`, then restore your customizations; the
+scaffold never overwrites a file, so re-running `--eject` alone changes nothing). The config file is
+never diffed. The model shim extends
 the default export of `…/framework/ResizeTaskModel.js`, which lets `npm run gen` type
 `getModel('ResizeTask')`; `--check` reports a shim from an older scaffold (fix: delete
-`src/models/ResizeTask.ts` and re-run `npx resize-scaffold`; `--force` would also overwrite
+`src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold`; `--force` would also overwrite
 `src/resizer.ts` and `src/config/resize.ts`).
 
 ## Without the framework
@@ -306,7 +323,7 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 | `…/drivers/s3.js` | `S3Storage` (the `'s3'` storage driver) and its options type `S3StorageOptions` |
 | `…/drivers/mongo.js` | `mongoParts` (and its types `MongoParts`, `MongoPartsOptions`), `MongoDatabase` (the `'mongo'` database driver), `MongoMediaStore` (and `MongoMediaModel`, `MongoMediaStoreOptions`, `MongoMediaUpdateOptions`), `MongoLockStore` (and `MongoLockModel`, `MongoLockStoreOptions`), `MongoTaskQueue` (and `MongoTaskQueueOptions`), `createResizeModels` (and `CreateResizeModelsOptions`), the schemas `resizeTaskFields`, `resizeTaskIndexes`, `resizeLockFields`, `resizeLockIndexes` and `resizeSchemaOptions`, `resizeMediaSchemaFragment`, `resizeMediaPaths` |
 | `…/drivers/sqs.js` | `SqsTaskQueue` (the `'sqs'` queue driver) and its options type `SqsTaskQueueOptions` |
-| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig` (and their deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig`, `FrameworkS3StorageConfig`), `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported) |
+| `…/framework.js` | Framework adapter: `FrameworkResizer`, `FrameworkMediaStore`, `FrameworkLockStore`, `ResizeTaskModel`, `ResizeWorker`, `runResizeWorker`, `defaultFrameworkResizeConfig`, `defaultWorkerOptions`, `resizeMediaSchemaFragment` and `resizeMediaPaths` (re-exported), and the types `FrameworkResizeConfig`, `PartialFrameworkResizeConfig`, `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`, `FrameworkResizerOptions`, `FrameworkMediaStoreOptions` and `TResizeTask`, plus the queue entry types `QueueConfig`, `DatabaseQueueConfig` and `SqsQueueConfig` (re-exported) |
 | `…/framework/ResizeTaskModel.js` | `ResizeTaskModel` as the default export, for the scaffolded model shim, and its document type `TResizeTask` |
 | `…/package.json` | The package manifest (a JSON module, default export only; import it `with { type: 'json' }`), for tools that read the installed version |
 
@@ -318,9 +335,10 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 - `runWorker`, the framework-free worker, and its options `RunWorkerOptions`;
 - routing: `RoutingTaskQueue` (each queue name goes to the backend that carries it), `carrierOf`,
   and the types `Route` and `RoutingTaskQueueOptions`;
-- the contracts a driver extends, with their types: `ResizeStorage` (`StorageUploadArgs`),
-  `MediaStore` (`ReplacedPreviews`), `LockStore`, and `TaskQueue` (`NewTask`, `TaskAddResult`,
-  `ClaimOptions`, `ClaimedTask`, `LeasedTask`, `FailOptions`, `TaskEvent`, `TaskEventHandler`);
+- the contracts a driver extends, with their types: `ResizeStorage` (`StorageUploadArgs`,
+  `StorageDownloadOptions`), `MediaStore` (`ReplacedPreviews`), `LockStore`, and `TaskQueue`
+  (`NewTask`, `TaskAddResult`, `ClaimOptions`, `ClaimedTask`, `LeasedTask`, `FailOptions`,
+  `TaskEvent`, `TaskEventHandler`);
 - the decoder contract `SourceDecoder` and the decoder types `SourceInfo`, `Raster`, `RasterInfo`,
   `DecodeBox`, `RenderOptions`;
 - metrics: the contract `ResizeMetrics`, the sinks `LogMetrics` (its options `LogMetricsOptions`)
@@ -328,7 +346,7 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
 - the errors: `ResizeError`, `ResizeConfigError`, `ResizeSetupError`, `ResizeMediaError`,
   `ResizeNoOriginalError`, `ResizeOriginalError`, `ResizeGenerateError`, `ResizeStorageError`,
   `ResizeSecurityError`, and their options `ResizeErrorOptions`;
-- the helpers: `formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`,
+- the helpers: `formatPictureUrls`, `getSizeKey`, `parseSizeKey`, `isCatalogCovered`, `hasOriginal`,
   `rasterToSharp`, `sharpToRaster`;
 - the hook and pipeline types: `HookName`, `HookFn`, `HookSignatures`, `HookTaps`, `WaterfallName`,
   `ObserverName`, `Pipeline`, `BeforeStep`, `VariantStep`;
@@ -339,8 +357,9 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
   - the Resizer calls: for `resolve()`, `ResolveOpts`, `SizeInput`, `ReadDecision`, `ReadyEntry`
     and `MissingPreview`; for `prewarm()`, `PrewarmOpts`, `PrewarmResult`, `PrewarmStatus`,
     `EnqueueReceipt` and `EnqueueIssue`; for `generate()`, `GenerateOpts` and `GenerateResult`;
-    for `invalidate()`, `InvalidateOpts`; for `uploadOriginal()`, `UploadOriginalOpts`; and
-    `PictureUrls`, what `formatPictureUrls` makes of a decision;
+    for `invalidate()`, `InvalidateOpts`; for `uploadOriginal()`, `UploadOriginalOpts`; for
+    `adoptOriginal()`, `AdoptOriginalOpts`; and `PictureUrls`, what `formatPictureUrls` makes of a
+    decision;
   - the media and preview shapes: `MediaLike`, `Original`, `OriginalFormat`, `Preview`,
     `PreviewFormat`, `PreviewScope`, `Filters`, `StorageRef`;
   - the config sections: the image settings `ResizeConfig`, `ResizeLimits` and `ResizeFailOn`, and `DeepPartial`
@@ -352,9 +371,7 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
   - the queue entries and timing: `QueueConfig`, `DatabaseQueueConfig`, `SqsQueueConfig`,
     `QueueTimingOptions`;
   - the logger, the event bus and a part built on first use: `ResizeLogger`, `ResizeEventBus`,
-    `LazyPart`;
-  - the deprecated aliases `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
-    `FrameworkS3StorageConfig`, each the same type under its core name.
+    `LazyPart`.
 
 `FrameworkWorkerConfig` and `CoordinationOptions` come from the main entry, which exports every
 config type; `…/framework.js` re-exports only the config types its row names.
@@ -413,12 +430,20 @@ and keeps the parts that loaded.
 
 | Option | | |
 |---|---|---|
-| `rootDir` | required | Public previews go here; serve only this directory |
-| `publicBaseUrl` | required | URL prefix, e.g. `/media` |
+| `rootDir` | required | Public previews go here; serve exactly this directory |
+| `publicBaseUrl` | required | URL prefix, e.g. `/media`; `''` gives root-relative URLs |
 | `privateRootDir` | optional | Private originals; default `rootDir` + `-private`, and never inside `rootDir` |
 
-The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Do not put
-symlinks into the public tree. Serve `rootDir` with a long-lived cache too, for example
+`rootDir` and `privateRootDir` must hold more than whitespace (`RESIZE_CONFIG_INVALID`): an empty one
+resolves to the working directory, and `'.'` says that on purpose. Never serve a parent of `rootDir`,
+because `privateRootDir` sits beside it by default and the module cannot detect that. Its check that
+`privateRootDir` is outside `rootDir` compares paths, so a symlink between the roots, or a
+case-insensitive volume, can defeat it. An override that moves `rootDir` must move an explicit
+`privateRootDir` too: it no longer follows.
+
+The ref is `{ path, visibility, namespace? }`. Reads and writes check real paths. Its paths stay in
+the strict alphabet, because they are filesystem paths. Do not put symlinks into the public tree.
+Serve `rootDir` with a long-lived cache too, for example
 `express.static(rootDir, { immutable: true, maxAge: '1y' })`: every file name the module writes
 there is new (previews and public raster originals), so a file never changes under its URL; if you
 write your own files under `rootDir`, give each a new name.
@@ -429,12 +454,17 @@ write your own files under `rootDir`, give each a new name.
 |---|---|---|
 | `bucketPublic` | required | Previews |
 | `bucketPrivate` | for private uploads | Originals; must differ from `bucketPublic` |
-| `publicBaseUrl` | optional | CDN/base URL (`publicUrl` is a deprecated alias) |
+| `publicBaseUrl` | optional | CDN/base URL |
 | `client` | optional | An existing `S3Client`; otherwise one is built from `region` / `endpoint` / `forcePathStyle` |
 
 The ref is `{ bucket, key, namespace? }`. Every read accepts only the two configured buckets, so a
-tampered `bucket` cannot reach another bucket. `publicUrl()` does no I/O, and public access is a
-bucket policy, not a per-object ACL. Without `publicBaseUrl`, URLs are virtual-hosted
+tampered `bucket` cannot reach another bucket. A read accepts any key except one with a control
+character, a `.` or `..` part, a leading `/` or an empty part, so a key holding a client's file name
+can be adopted; `publicUrl` encodes each part. Keys the module writes, and `namespace`, keep the
+strict alphabet `[A-Za-z0-9_.-]`, and previews never take a part of a stored key. Never build a ref
+from a client's input: within those buckets it would publish previews of someone else's object.
+`publicUrl()` does no I/O, and public access is a bucket policy, not a per-object ACL. Without
+`publicBaseUrl`, URLs are virtual-hosted
 (`https://<bucket>.s3.<region>.amazonaws.com/<key>`), or path-style with `endpoint` or
 `forcePathStyle` (`<endpoint>/<bucket>/<key>`; without an endpoint,
 `https://s3.<region>.amazonaws.com/<bucket>/<key>`). China regions (`cn-…`) use
@@ -544,15 +574,30 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `ResizeStorage`: `upload`, `download`, `publicUrl` (pure, no I/O), and optionally
   `signedUrl(ref, ttlSeconds)`. The module never calls `signedUrl`; a host calls it to give an
   owner the private original.
-  - The ref you return from `upload()` is opaque to the module and comes back unchanged, and it must
-    stay the same on every load: a ref that changes per load (a per-access nonce, say) reads as a
-    replaced original.
+  - The ref you return from `upload()` is opaque to the module and comes back unchanged. It is
+    JSON-compatible and byte-stable for ever, because its JSON form is signed into every preview's
+    `origin`: a ref that changes per load (a per-access nonce, say) reads as a replaced original.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
-    original's ref, for previews). Never both.
+    original's ref, for previews). Never both. It must tolerate a `parentRef` it did not write: an
+    adopted object's ref comes from the host.
+  - `download()` must accept every ref the host adopts, and refuse one outside its scope with a
+    `ResizeError`, which `adoptOriginal()` passes through unchanged.
+  - `download()` resolves with a `Buffer` or a `Uint8Array` (an `ArrayBuffer` is read too). Anything
+    else is `ResizeSetupError` `RESIZE_STORAGE_DOWNLOAD_INVALID` from `generate()` and on a task,
+    where it is retried, and `RESIZE_ORIGINAL_DOWNLOAD_FAILED` from `adoptOriginal()`.
+  - `publicUrl()` must refuse a ref it would not expose, because `adoptOriginal()` relies on that to
+    tell a public object from a private one.
   - `download()` reports a missing object with a `ResizeStorageError` with the code
     `RESIZE_STORAGE_NOT_FOUND`, retryable, as both shipped drivers do: each retry costs one 404,
     and an object can appear later (a row written before its PUT finishes). An S3 role without
     `s3:ListBucket` gets 403 for a missing key, which stays raw.
+  - `download(ref, opts?)`: when `opts.maxBytes` is given, refuse a larger object before reading
+    it, with `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`, `retryable: false`. A driver that ignores
+    it still works; the core checks the length afterwards, but the memory is already spent. A
+    response with no length, which `S3Storage` reads, is likewise caught only by that check, after
+    the read. The peer range excludes `@aws-sdk/client-s3` 3.729 to 3.734: they collect a body with
+    a full-object checksum before `send` resolves, so `S3Storage`'s own check would run after the
+    read.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
@@ -823,9 +868,10 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   limits allow. The core resizes it to each exact size either way, and a raster source smaller
   than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
   its engine can. With `upload.verify: 'decode'` a host's `render` also runs in the API process
-  during `uploadOriginal()`, with no `opts.signal`, so the decoder bounds its own time; a source
-  that reports `vector` is not rendered there. A raster whose `data` length does not match its
-  `info` is `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
+  during `uploadOriginal()`, and it always runs during `adoptOriginal()`, with no `opts.signal`, so
+  the decoder bounds its own time; a source that reports `vector` is not rendered there. A raster
+  whose `data` length does not match its `info` is `RESIZE_DECODER_INVALID`; one with more pixels
+  (width × height × frames) than
   `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
   (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
   `generate()`, as the same object with the media id set on it; one that cannot take it (frozen)
@@ -833,6 +879,9 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   as `cause`.
 - Optionally `verify()`: awaited by `resizer.verify()` and at worker start; throw there when the
   decoder cannot work (e.g. a missing engine).
+- `publicOriginals`: optional. Set `true` when public uploads of this source kind are safe. Without
+  it, `uploadOriginal({ visibility: 'public' })` and `adoptOriginal` of a public object throw
+  `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it. SVG is refused whatever the flag says.
 
 **Which decoder reads a source.** At upload the decoders are asked in order, and the first that
 accepts the bytes measures them: its `format` is stored as `original.format` and its
@@ -882,7 +931,9 @@ exceptions say what they are:
 first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays
 `RESIZE_ORIGINAL_INVALID`. The check decodes the first frame only: an animation damaged in a later
 frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can
-pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes.
+pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes. A JPEG
+cut in its last rows can pass too (measured at 1200×900, up to about 1% of its tail), and a larger
+render then dead-letters it.
 
 ## Config reference
 
@@ -895,9 +946,9 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | Key | Default | Notes |
 |---|---|---|
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
-| `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
+| `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
-| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, and flipped bytes can pass, since a decode does not always find them. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
+| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
@@ -905,6 +956,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
 | `limits.sourcePixels` | `50000000` | Largest frame, rejected before decoding |
+| `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
@@ -1168,7 +1220,8 @@ framework hosts define queues in `queues` and keep `worker` in `src/config/resiz
 object in a framework config file (define the queue in `queues` of `src/config/resize.ts` and set
 `queue` to its name); `queues.<name>.queues` (give each SQS queue its own entry); `lockTtlMs` in a
 task queue's `timing` or a `queues` entry (use [coordination](#coordination): `failed` →
-`cooldownMs`, `dispatch` → `gateTtlMs`, drop `worker`); and the worker's `--config` flag and
+`cooldownMs`, `dispatch` → `gateTtlMs`, drop `worker`); `storage.publicUrl` and the `S3Storage`
+option `publicUrl` (use `publicBaseUrl`); and the worker's `--config` flag and
 `runResizeWorker({ configName })` (the worker reads `worker` and `queues` from
 `src/config/resize.ts`).
 
@@ -1286,11 +1339,14 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 | `resize.preview.stale` | count | the stale previews one read found | `pipeline` | `mediaId` |
 | `resize.upload` | timing | ms of `uploadOriginal()` | `outcome`: `stored` or `rejected`; `format` (stored); `code` (rejected, for a module error) | — |
 | `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
+| `resize.adopt` | timing | ms of `adoptOriginal()` | `outcome`: `adopted` or `rejected`; `format` (adopted); `code` (rejected, for a module error) | — |
 | `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode), `rawFormat` (`format: 'unconfigured'`) |
 | `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
 | `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `rendered` (on `completed`: the variants this delivery stored), `payloadQueue` (when the task names another queue) |
 | `resize.claim` | timing | ms the worker's loop waited for this task | `queue` | `taskId` |
 
+- **`resize.adopt`** reaches the debug line of `LogMetrics` only, and not its summary: an adoption is
+  a bounded script, not traffic.
 - **`resize.read` outcomes**, in the order a read decides them: `unknown-pipeline` (the pipeline is
   not registered), `ready` (nothing was missing or stale), `suppressed` (nothing was left to queue
   after `beforeEnqueue` and the dropped formats, or the caller passed `enqueueMissing: false`),
@@ -1427,9 +1483,11 @@ swaps the rows in the caller's `media.previews` too. Each replacing write logs o
 concurrent copy too.
 
 **Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
-preview objects no row references. A row without an `identity` (written before 0.3.0) stays beside
-its replacement and keeps its file referenced, so a sweep never finds that file: delete such rows
-(and their files) yourself.
+objects under the `previews/` prefix (below a ref's `namespace`) that no row references. Leave out
+every `original.storageRef`: an adopted public original sits in the same bucket, and no preview row
+references it. A row without an `identity` (written before 0.3.0) stays beside its replacement and
+keeps its file referenced, so a sweep never finds that file: delete such rows (and their files)
+yourself.
 
 **A media without stored dimensions** (`original.width` and `original.height` must both be numbers;
 a stored `null` counts as missing) has no row the read path can prove fresh, since it cannot
@@ -1492,15 +1550,16 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   new task. `startedAt` is when the latest delivery started (every claim sets it), and
   `finishedAt` when the task completed or was dead-lettered (a retry leaves both as they are); they
   are for inspection only, and the worker never reads them. An ejected or hand-written model
-  without them keeps working (the times are dropped), but `resize-scaffold --check` reports it.
+  without them keeps working (the times are dropped), but `npx --no -- resize-scaffold --check`
+  reports it.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.
     The module sets it on every `ResizeSecurityError` and on ten codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
     dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
-    source has no dimensions or exceeds the
-    pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
+    source has no dimensions or exceeds the pixel or byte limits
+    (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
     before storage by `uploadOriginal()`), an SVG render ran past
     `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`), or the task was delivered more
@@ -1604,8 +1663,11 @@ await ResizeTask.updateOne(
 - **What a read logs:** a read writes a log line only for what an operator must fix, and only once
   per Resizer (once more after its task queue is set up again): an unregistered pipeline name
   (`error`, once per name, for at most 100 names), a format list without `encode.formats` entries
-  (`error`, once per list, for at most 100 lists), and, when the caller passed
-  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. Every read is counted
+  (`error`, once per list, for at most 100 lists), a Resizer that could not start (`error`, once per
+  error message, for at most 100 messages), and, when the caller passed `enqueueMissing: true` to a
+  Resizer without a task queue, one `warn`. Each read of a Resizer that could not start builds it
+  again: a build that fails with a new message logs that message, and a good build ends this with no
+  line of its own, so a read then serves as usual. Every read is counted
   instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A stored preview whose
   `publicUrl` throws, and an enqueue that throws, are still logged on every read. `prewarm()` logs
   as before.
@@ -1727,8 +1789,62 @@ const refs = await getResizer().invalidate({ media: file, pipeline: 'photo' }); 
 ```
 
 - **Your app's responsibilities:** deleting media and their storage objects (the refs that
-  `invalidate` returns too), access checks, the response shape, migrating legacy data, and domain
-  image analysis such as face blurring (in pipeline steps).
+  `invalidate` returns too), access checks, the response shape, moving legacy data onto the module
+  (the module's part is [`adoptOriginal()`](#adoptoriginal)), and domain image analysis such as face
+  blurring (in pipeline steps).
+
+### `adoptOriginal()`
+
+`resizer.adoptOriginal({ storageRef, maxBytes? })` measures and decodes an object already in storage
+and resolves with the `Original` that `uploadOriginal()` would return for it. It writes nothing and
+queues nothing: save the result as it is, and do not change it later, because a changed ref
+regenerates that media's previews. The result holds the ref's JSON form, which is what a save stores,
+so a `namespace: undefined` in the ref you pass is not in it. `hasOriginal(media)` tells whether a
+media is on the module yet. The how-to, with the backfill loop, is in the guide:
+[Adopting on an app with existing media](https://framework.adaptivestone.com/docs/resize#adopting).
+
+`limits.sourceBytes` is its cap, shared with the workers. `upload.maxBytes` and `upload.formats` do
+not apply. Each call holds the object in memory: about one object on local storage, and on S3 about
+2.3 times it with a current AWS SDK and about 3.3 times with SDK 3.572, per concurrent call (measured
+at 250 MiB). So on a request path, where a client chose the file, pass `maxBytes`, or run the adoption
+from a job. It lowers the cap for this call and cannot raise it. Over it, the shipped drivers read
+nothing, except on an S3 response with no length, where the object is read whole and then refused
+with the same code. Real S3 sends a length.
+
+The download has no timeout of its own, so set one on your storage client: for S3, pass
+`new S3Storage({ …, client })` with `requestHandler: { socketTimeout: 5000 }`. Use a value under
+6000 ms, because on current SDKs a larger one does not end a body that stalls after its headers
+(measured against a local server, not real S3).
+
+It refuses what a worker could never render, and a public SVG, so it always decodes the object, on a
+Sharp thread, in the process that calls it. The check decodes the first frame. With `animated: true`,
+damage in a later frame shows up on the worker as a dead task, `RESIZE_SOURCE_DAMAGED`.
+
+| Case | Class | Code | `retryable` |
+|---|---|---|---|
+| No `storageRef`, or one JSON cannot represent (circular, a BigInt) | `ResizeOriginalError` | `RESIZE_ORIGINAL_STORAGE_REF_INVALID` | `false` (at upload, where a driver returned nothing, it is a `ResizeStorageError` and `true`) |
+| `maxBytes` is not a positive safe integer | `ResizeSetupError` | `RESIZE_ADOPT_MAX_BYTES_INVALID` | `false` |
+| Over the call's own `maxBytes` | `ResizeOriginalError` | `RESIZE_ORIGINAL_TOO_LARGE` | `false` |
+| A driver's own `ResizeError`: a third bucket, a refused key or ref, a missing object, over the limit | as thrown, the same object | its code, e.g. `RESIZE_S3_BUCKET_NOT_ALLOWED`, `RESIZE_STORAGE_KEY_INVALID`, `RESIZE_STORAGE_NOT_FOUND`, `RESIZE_SOURCE_TOO_LARGE` | its own |
+| Any other driver error, or a driver that resolved with something other than bytes | `ResizeStorageError` | `RESIZE_ORIGINAL_DOWNLOAD_FAILED` | `true` |
+| A driver that ignored `maxBytes`, over `limits.sourceBytes` | `ResizeMediaError` | `RESIZE_SOURCE_TOO_LARGE` | `false` |
+| Empty object | `ResizeOriginalError` | `RESIZE_ORIGINAL_EMPTY` | `false` |
+| Not an image, unknown format, one frame over the pixel limit | `ResizeOriginalError` | `RESIZE_ORIGINAL_INVALID`, `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`, `RESIZE_ORIGINAL_TOO_MANY_PIXELS` | `false` |
+| An unrecognised engine failure during `inspect` | `ResizeOriginalError` | `RESIZE_ORIGINAL_INSPECT_FAILED` | `true` |
+| Public SVG | `ResizeOriginalError` | `RESIZE_ORIGINAL_SVG_PUBLIC` | `false` |
+| Public, and its decoder has no `publicOriginals: true` | `ResizeOriginalError` | `RESIZE_ORIGINAL_PUBLIC_REFUSED` | `false` |
+| The decode finds damage | `ResizeOriginalError` | `RESIZE_ORIGINAL_DAMAGED` | `false` |
+| The decode fails for another reason | `ResizeOriginalError` | `RESIZE_ORIGINAL_VERIFY_FAILED` | `true` |
+| A host decoder's final refusal (`retryable: false`), at `inspect` or in the decode | `ResizeOriginalError` | its own code | `false` |
+| A decoder's setup or config error | as thrown, the same object | its own code | its own |
+
+**Which keys are refused.** `S3Storage` reads any key except one with a control character, a `.` or
+`..` part, a leading `/` or an empty part: `uploads//cat.jpg`, `dir/` and a name holding a tab are
+`RESIZE_STORAGE_KEY_INVALID` (`retryable: false`). A key that holds a client's file name is fine.
+`LocalFsStorage` paths stay in `[A-Za-z0-9_.-]`, because they are filesystem paths. For such an
+object, copy it to a new key and adopt that. On S3 a `namespace` must leave room for a preview's key
+within S3's 1024-byte limit, and a preview adds about 50 bytes to it. Too long adopts, then every
+preview fails with `RESIZE_S3_KEY_TOO_LONG` and the task is dead at once: omit or shorten it.
 
 ### `prewarm()` issues
 

@@ -42,6 +42,7 @@ const mod = await import(PKG);
 const expected = [
   'formatPictureUrls',
   'getSizeKey',
+  'hasOriginal',
   'isCatalogCovered',
   'parseSizeKey',
   'ResizeError',
@@ -288,6 +289,21 @@ assert.equal(typeof sqs.SqsTaskQueue, 'function', 'SqsTaskQueue should be a clas
 const s3 = await import(PKG + '/drivers/s3.js');
 assert.equal(typeof s3.S3Storage, 'function', 'S3Storage should be a class');
 console.log('  ok  sqs + s3 subpaths import; SqsTaskQueue + S3Storage are classes');
+
+// This install has no presigner, so the import above shows no static import of it came back, and
+// this is a real module-not-found from Node, not a test hook's copy of its wording.
+assert.throws(
+  () => import.meta.resolve('@aws-sdk/s3-request-presigner'),
+  { code: 'ERR_MODULE_NOT_FOUND' },
+  'this step must run without the presigner',
+);
+const storage = new s3.S3Storage({ bucketPublic: 'cdn', bucketPrivate: 'priv', region: 'us-east-1' });
+await assert.rejects(storage.signedUrl({ bucket: 'priv', key: 'a.jpg' }, 60), (err) => {
+  assert.equal(err.code, 'RESIZE_PEER_MISSING');
+  assert.ok(err.message.includes('@aws-sdk/s3-request-presigner'));
+  return true;
+});
+console.log('  ok  without the presigner the s3 subpath loads, and signedUrl rejects with RESIZE_PEER_MISSING');
 `;
 
 // Compiled inside the throwaway consumer so package resolution and declarations come from the
@@ -663,7 +679,7 @@ try {
   const scaffoldDir = join(consumer, 'scaffold-scratch');
   mkdirSync(scaffoldDir);
   console.log('→ Running the resize-scaffold bin');
-  run('npx', ['--no-install', 'resize-scaffold'], scaffoldDir);
+  run('npx', ['--no', '--', 'resize-scaffold'], scaffoldDir);
   const scaffoldFiles = [
     'src/resizer.ts',
     'src/models/ResizeTask.ts',
@@ -688,7 +704,15 @@ try {
     throw new Error('AGENTS.md pointer is missing its idempotency marker');
   }
   console.log('  ok  scaffold wrote the AGENTS.md pointer');
-  run('npx', ['--no-install', 'resize-scaffold', '--check'], scaffoldDir);
+  const gitignore = join(scaffoldDir, '.gitignore');
+  if (
+    !existsSync(gitignore) ||
+    !readFileSync(gitignore, 'utf8').includes('/var/')
+  ) {
+    throw new Error('resize-scaffold did not add /var/ to .gitignore');
+  }
+  console.log('  ok  scaffold added /var/ to .gitignore');
+  run('npx', ['--no', '--', 'resize-scaffold', '--check'], scaffoldDir);
   console.log('  ok  resize-scaffold --check exited 0');
 
   // (d2) the emitted files compile against the installed package and peers, as in a framework
@@ -734,7 +758,7 @@ try {
   writeEsmPackage(eagerDir);
   run(
     'npx',
-    ['--no-install', 'resize-scaffold', '--eager', '--agents', 'skip'],
+    ['--no', '--', 'resize-scaffold', '--eager', '--agents', 'skip'],
     eagerDir,
   );
   const eagerSrc = join(eagerDir, 'src');
@@ -749,11 +773,7 @@ try {
       `resize-scaffold --eager emitted ${JSON.stringify(eagerFiles)}, expected ${JSON.stringify(expectedEagerFiles)}`,
     );
   }
-  run(
-    'npx',
-    ['--no-install', 'resize-scaffold', '--check', '--eager'],
-    eagerDir,
-  );
+  run('npx', ['--no', '--', 'resize-scaffold', '--check', '--eager'], eagerDir);
   compileScaffold(eagerDir);
   console.log('  ok  an --eager scaffold passes --check --eager and compiles');
 
@@ -763,7 +783,7 @@ try {
   writeEsmPackage(ejectDir);
   run(
     'npx',
-    ['--no-install', 'resize-scaffold', '--eject', '--agents', 'skip'],
+    ['--no', '--', 'resize-scaffold', '--eject', '--agents', 'skip'],
     ejectDir,
   );
   // The same four files as the default form, with the full model in place of the shim.
@@ -781,11 +801,12 @@ try {
       'resize-scaffold --eject did not emit the full model: src/models/ResizeTask.ts does not contain `extends BaseModel`',
     );
   }
-  run('npx', ['--no-install', 'resize-scaffold', '--check'], ejectDir);
+  run('npx', ['--no', '--', 'resize-scaffold', '--check'], ejectDir);
   compileScaffold(ejectDir);
   console.log('  ok  an --eject scaffold passes --check and compiles');
 
-  // (e) install the AWS SDKs, then the sqs/s3 subpaths must import and expose their classes.
+  // (e) install the AWS SDKs a host needs, then the sqs/s3 subpaths must import and expose their
+  // classes. The presigner stays out on purpose: only signedUrl may ask for it.
   console.log('→ Installing the AWS SDKs, re-checking the optional subpaths');
   run(
     'npm',
@@ -794,7 +815,6 @@ try {
       '--no-audit',
       '--no-fund',
       '@aws-sdk/client-s3',
-      '@aws-sdk/s3-request-presigner',
       '@aws-sdk/client-sqs',
     ],
     consumer,

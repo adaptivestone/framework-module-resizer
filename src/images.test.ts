@@ -12,6 +12,7 @@ import {
   getFilterSig,
   getPreviewIdentity,
   getSizeKey,
+  hasOriginal,
   isCatalogCovered,
   parseSizeKey,
   previewScope,
@@ -21,6 +22,23 @@ import {
   toMissingPreview,
 } from './images.ts';
 import type { MissingPreview, SizeInput } from './types.d.ts';
+
+test('hasOriginal is true only when a storage locator is stored', () => {
+  for (const media of [
+    undefined,
+    null,
+    {},
+    { original: null },
+    { original: {} },
+    { original: { storageRef: null } },
+  ]) {
+    assert.equal(hasOriginal(media), false);
+  }
+  // A falsy scalar locator is valid, as for uploadOriginal, and every read treats {} as a locator.
+  for (const storageRef of [{ bucket: 'b', key: 'k' }, {}, 0, '']) {
+    assert.equal(hasOriginal({ original: { storageRef } }), true);
+  }
+});
 
 describe('getSizeKey', () => {
   test('fit → "fit"', () => {

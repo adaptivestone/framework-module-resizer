@@ -1,10 +1,18 @@
 // Local filesystem driver. Each persisted ref identifies both a relative path and its root.
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { DriverContext } from '../contracts/drivers.ts';
-import { ResizeStorage } from '../contracts/storage.ts';
-import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
-import { optionalString, stringValue } from '../helpers/configSection.ts';
+import {
+  ResizeStorage,
+  type StorageDownloadOptions,
+} from '../contracts/storage.ts';
+import {
+  ResizeConfigError,
+  ResizeMediaError,
+  ResizeSecurityError,
+  ResizeStorageError,
+} from '../errors.ts';
+import { invalidConfigValue, stringValue } from '../helpers/configSection.ts';
 import type { LocalStorageConfig, StorageRef } from '../types.d.ts';
 import { validateLogicalKey, validateNamespace } from './placement.ts';
 
@@ -47,6 +55,35 @@ async function assertRealPathInsideRoot(
   }
 }
 
+/**
+ * An empty root resolves to the working directory: `rootDir: ''` put previews there and originals in
+ * `<cwd>-private`, and `privateRootDir: ''` put private originals there. A whitespace-only root makes
+ * a folder of that name, which the scaffold's `/var/` rule does not cover. `'.'` asks for the working
+ * directory on purpose.
+ */
+const isRoot = (value: unknown): value is string =>
+  typeof value === 'string' && value.trim() !== '';
+
+/** The root `name` a constructor was given. */
+function assertRoot(name: string, value: unknown): void {
+  if (!isRoot(value)) {
+    throw new ResizeConfigError(
+      `resize fs: ${name} must be a non-empty string`,
+      {
+        code: 'RESIZE_CONFIG_INVALID',
+      },
+    );
+  }
+}
+
+/** The root at `path` of the config `where`. */
+function configRoot(value: unknown, path: string, where: string): string {
+  if (!isRoot(value)) {
+    throw invalidConfigValue(path, where, 'a non-empty string');
+  }
+  return value;
+}
+
 export class LocalFsStorage extends ResizeStorage {
   readonly #rootDir: string;
   readonly #privateRootDir: string;
@@ -54,6 +91,11 @@ export class LocalFsStorage extends ResizeStorage {
 
   constructor(opts: LocalFsStorageOptions) {
     super();
+    assertRoot('rootDir', opts.rootDir);
+    // Left out or null takes the default.
+    if (opts.privateRootDir != null) {
+      assertRoot('privateRootDir', opts.privateRootDir);
+    }
     this.#rootDir = resolve(opts.rootDir);
     this.#privateRootDir = resolve(
       opts.privateRootDir ?? `${this.#rootDir}-private`,
@@ -76,25 +118,24 @@ export class LocalFsStorage extends ResizeStorage {
   /**
    * The storage of a config's `storage` section (driver 'local'). Only this driver's keys are read:
    * an environment file that switched the driver leaves the other driver's keys (e.g. bucketPublic)
-   * in the merged section. A missing key, or a key that is not a string, is RESIZE_CONFIG_INVALID
-   * naming `ctx.where`; '' is accepted as before (`publicBaseUrl: ''` gives root-relative URLs).
+   * in the merged section. A missing key, or a key of the wrong type, is RESIZE_CONFIG_INVALID
+   * naming `ctx.where`. '' is allowed only for `publicBaseUrl`, where it gives root-relative URLs.
    */
   static fromConfig(
     section: LocalStorageConfig,
     ctx: DriverContext,
   ): LocalFsStorage {
     const { where } = ctx;
-    const rootDir = stringValue(section.rootDir, 'storage.rootDir', where);
+    const rootDir = configRoot(section.rootDir, 'storage.rootDir', where);
     const publicBaseUrl = stringValue(
       section.publicBaseUrl,
       'storage.publicBaseUrl',
       where,
     );
-    const privateRootDir = optionalString(
-      section.privateRootDir,
-      'storage.privateRootDir',
-      where,
-    );
+    const privateRootDir =
+      section.privateRootDir === undefined
+        ? undefined
+        : configRoot(section.privateRootDir, 'storage.privateRootDir', where);
     return new LocalFsStorage({
       rootDir,
       publicBaseUrl,
@@ -134,13 +175,25 @@ export class LocalFsStorage extends ResizeStorage {
     return ref as unknown as LocalFsStorageRef;
   }
 
-  async download(ref: StorageRef): Promise<Buffer> {
+  async download(
+    ref: StorageRef,
+    opts?: StorageDownloadOptions,
+  ): Promise<Buffer> {
     const parsed = this.#ref(ref);
     const root =
       parsed.visibility === 'private' ? this.#privateRootDir : this.#rootDir;
     const abs = resolveInsideRoot(root, parsed.path);
     try {
       await assertRealPathInsideRoot(root, abs);
+      if (opts?.maxBytes !== undefined) {
+        const { size } = await stat(abs);
+        if (size > opts.maxBytes) {
+          throw new ResizeMediaError(
+            `resize fs: object is ${size} bytes, over the ${opts.maxBytes} byte limit (limits.sourceBytes)`,
+            { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+          );
+        }
+      }
       return await readFile(abs);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;

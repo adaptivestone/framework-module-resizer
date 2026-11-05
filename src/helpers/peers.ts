@@ -24,6 +24,19 @@ function peerMissing(
 }
 
 /**
+ * The package a module-not-found error names, or undefined for any other error. A relative path
+ * or a deep import names something else, so it matches no peer's name.
+ */
+export function missingPackageOf(err: unknown): string | undefined {
+  if (!isModuleNotFound(err)) {
+    return undefined;
+  }
+  return /^Cannot find (?:package|module) ['"]([^'"]+)['"]/.exec(
+    err.message,
+  )?.[1];
+}
+
+/**
  * Import a driver module. A missing package among `peers` is ResizeSetupError RESIZE_PEER_MISSING
  * naming `driver` and `where` (the config that selects it); any other failure stays as it is.
  */
@@ -36,13 +49,9 @@ export async function importDriver<T>(
   try {
     return await load();
   } catch (err) {
-    if (isModuleNotFound(err)) {
-      const missing = /^Cannot find (?:package|module) ['"]([^'"]+)['"]/.exec(
-        err.message,
-      )?.[1];
-      if (missing && peers.includes(missing)) {
-        throw peerMissing(driver, missing, peers, where, err);
-      }
+    const missing = missingPackageOf(err);
+    if (missing && peers.includes(missing)) {
+      throw peerMissing(driver, missing, peers, where, err);
     }
     throw err;
   }

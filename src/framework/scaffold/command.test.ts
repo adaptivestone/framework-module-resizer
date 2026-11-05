@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import {
+  chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -33,22 +37,26 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-// runScaffold prints per-file status via console.log; capture it so tests can assert on the
-// ok/drift/missing/skipped lines while keeping the fixed runScaffold(argv, cwd) signature.
+// runScaffold prints per-file status via console.log and a failure via console.error; capture both
+// so tests can assert on the lines while keeping the fixed runScaffold(argv, cwd) signature.
 async function run(
   argv: string[],
   cwd = root,
-): Promise<{ code: number; out: string }> {
+): Promise<{ code: number; out: string; err: string }> {
   const lines: string[] = [];
-  const orig = console.log;
+  const errors: string[] = [];
+  const orig = { log: console.log, error: console.error };
   console.log = (...a: unknown[]) => {
     lines.push(a.map(String).join(' '));
   };
+  console.error = (...a: unknown[]) => {
+    errors.push(a.map(String).join(' '));
+  };
   try {
     const code = await runScaffold(argv, cwd);
-    return { code, out: lines.join('\n') };
+    return { code, out: lines.join('\n'), err: errors.join('\n') };
   } finally {
-    console.log = orig;
+    Object.assign(console, orig);
   }
 }
 
@@ -418,7 +426,7 @@ describe('runScaffold — --check', () => {
     assert.match(out, /drift/);
     assert.match(
       out,
-      /delete the file and re-run resize-scaffold for a fresh shim/,
+      /delete the file and re-run npx --no -- resize-scaffold for a fresh shim/,
     );
     assert.doesNotMatch(out, /--force/);
   });
@@ -451,7 +459,7 @@ describe('runScaffold — --check', () => {
     assert.match(out, /framework\/ResizeTaskModel\.js/);
     assert.match(
       out,
-      /delete the file and re-run resize-scaffold for a fresh shim/,
+      /delete the file and re-run npx --no -- resize-scaffold for a fresh shim/,
     );
     assert.doesNotMatch(out, /--force/);
     assert.equal(
@@ -496,7 +504,10 @@ describe('runScaffold — --check', () => {
         out,
         /port the resizer, queue, availableAt, active, cooldownUntil, startedAt and finishedAt fields \(and the gate index\)/,
       );
-      assert.match(out, /delete the file and re-run resize-scaffold --eject/);
+      assert.match(
+        out,
+        /delete the file and re-run npx --no -- resize-scaffold --eject/,
+      );
       assert.doesNotMatch(out, /--force/);
       assert.equal(
         await read(MODEL),
@@ -550,7 +561,7 @@ describe('runScaffold — --check', () => {
     const { code, out } = await run(['--check']);
     assert.equal(code, 1);
     assert.match(out, /drift\s+src\/commands\/ResizeWorker\.ts — must import/);
-    assert.match(out, /re-run resize-scaffold/);
+    assert.match(out, /re-run npx --no -- resize-scaffold/);
   });
 
   test('a host command that builds its Resizers from ../resizer.ts passes', async () => {
@@ -613,7 +624,7 @@ describe('runScaffold — --check', () => {
         );
         assert.ok(
           out.includes(
-            "define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run resize-scaffold and copy your settings back",
+            "define each queue once as queues: { default: { driver: 'database' } }, set queue: 'default' (a name), and import defaultFrameworkResizeConfig and defaultWorkerOptions from @adaptivestone/framework-module-resize/framework.js (CHANGELOG 0.3.0); or move the file aside, re-run npx --no -- resize-scaffold and copy your settings back",
           ),
           label,
         );
@@ -724,7 +735,7 @@ describe('runScaffold — --check', () => {
         line?.includes('then delete the old queue: { … } object'),
         line,
       );
-      assert.doesNotMatch(line ?? '', /re-run resize-scaffold/);
+      assert.doesNotMatch(line ?? '', /resize-scaffold/);
     }
     await writeFile(
       join(root, production),
@@ -915,6 +926,400 @@ describe('packaging smoke', () => {
       pkg.bin['resize-scaffold'],
       './dist/framework/scaffold/command.js',
     );
+  });
+});
+
+describe('runScaffold — local storage', () => {
+  const IGNORE_BLOCK =
+    '# Local resize storage: private originals and previews\n/var/\n';
+
+  for (const flags of [[], ['--eager']]) {
+    test(`the ${flags[0] ?? 'default'} config writes the private root and an absolute URL from the environment`, async () => {
+      await run(flags);
+      const source = await read(CONFIG);
+      assert.match(source, /privateRootDir: '\.\/var\/media-private'/);
+      assert.match(
+        source,
+        /publicBaseUrl: process\.env\['RESIZE_PUBLIC_BASE_URL'\] \|\| 'http:\/\/localhost:3300\/media'/,
+      );
+      assert.doesNotMatch(source, /publicBaseUrl: '\/media'/);
+      assert.doesNotMatch(source, /TODO\(REQUIRED\)/);
+      assert.match(source, /Never serve a folder above/);
+      assert.doesNotMatch(source, /s3-request-presigner/);
+      // Read as one text across its wrapped lines.
+      const text = source.replace(/\n\s*\/\/\s*/g, ' ');
+      assert.match(
+        text,
+        /set RESIZE_PUBLIC_BASE_URL in every deployed environment/,
+      );
+      assert.match(
+        text,
+        /An override that moves `rootDir` must move `privateRootDir` too/,
+      );
+      assert.match(
+        text,
+        /With a wrong name, verify\(\) and generate\(\) throw RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN, uploadOriginal\(\) succeeds, and resolve\(\) returns the variants as missing/,
+      );
+    });
+  }
+
+  test('--check passes on a config scaffolded with the dot form, since it is never diffed', async () => {
+    await run([]);
+    await writeFile(
+      join(root, CONFIG),
+      (await read(CONFIG)).replace(
+        "process.env['RESIZE_PUBLIC_BASE_URL']",
+        'process.env.RESIZE_PUBLIC_BASE_URL',
+      ),
+    );
+    const { code, out } = await run(['--check']);
+    assert.equal(code, 0, out);
+  });
+
+  test('the run that writes the config creates .gitignore with /var/', async () => {
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.match(out, /created\s+\.gitignore/);
+  });
+
+  test('an existing .gitignore gets the rule appended after a blank line', async () => {
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), `node_modules\n\n${IGNORE_BLOCK}`);
+    assert.match(out, /appended\s+\.gitignore/);
+  });
+
+  test('an empty .gitignore gets the rule with no blank lines before it', async () => {
+    await writeFile(join(root, '.gitignore'), '');
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.match(out, /appended\s+\.gitignore/);
+  });
+
+  // [line, what git does with it]. Measured with `git check-ignore`, and measured again below where
+  // the suite can run git. git strips only trailing spaces: a leading space or a tab is pattern.
+  const GIT_READS: Array<[string, boolean]> = [
+    ['var', true],
+    ['var/', true],
+    ['/var', true],
+    ['/var/', true],
+    ['var/*', true],
+    ['/var/**', true],
+    ['/var/ ', true],
+    ['/var/   ', true],
+    ['var  ', true],
+    ['  /var/  ', false],
+    [' /var/', false],
+    ['\t/var/', false],
+    ['var/\t', false],
+    ['/var/\t ', false],
+    ['src/var', false],
+    ['# /var/', false],
+    ['!/var/', false],
+    ['/var/media', false],
+    ['/variables/', false],
+  ];
+
+  for (const [line, ignored] of GIT_READS) {
+    test(`the line ${JSON.stringify(line)} ${ignored ? 'is a rule: the file is left alone' : 'is no rule: the rule is added'}`, async () => {
+      const before = `node_modules\n${line}\ndist\n`;
+      await writeFile(join(root, '.gitignore'), before);
+      const { out } = await run([]);
+      if (ignored) {
+        assert.equal(await read('.gitignore'), before);
+        assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+      } else {
+        assert.equal(await read('.gitignore'), `${before}\n${IGNORE_BLOCK}`);
+        assert.match(out, /appended\s+\.gitignore/);
+      }
+    });
+  }
+
+  // The real git, without the machine's own excludes. It runs in CI; a machine without it skips.
+  const gitIgnores = (ignoreFile: string, dir: string): boolean => {
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    execFileSync('git', ['init', '-q', dir], { env });
+    writeFileSync(join(dir, '.gitignore'), ignoreFile);
+    try {
+      execFileSync(
+        'git',
+        ['-C', dir, 'check-ignore', '-q', 'var/media-private/a.jpg'],
+        { env },
+      );
+      return true;
+    } catch (err) {
+      // 1 is git's "not ignored"; anything else is git failing.
+      if ((err as { status?: number }).status === 1) {
+        return false;
+      }
+      throw err;
+    }
+  };
+  let hasGit = true;
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+  } catch {
+    hasGit = false;
+  }
+  const skipWithoutGit = hasGit ? false : 'git is not installed';
+
+  test('the table above is what git does, and after a run the private originals are ignored', {
+    skip: skipWithoutGit,
+  }, async () => {
+    for (const [line, ignored] of GIT_READS) {
+      const dir = await mkdtemp(join(tmpdir(), 'resize-gitignore-'));
+      try {
+        const before = `node_modules\n${line}\ndist\n`;
+        assert.equal(gitIgnores(before, dir), ignored, JSON.stringify(line));
+        await run([], dir);
+        assert.equal(
+          gitIgnores(await readFile(join(dir, '.gitignore'), 'utf8'), dir),
+          true,
+          `after a run, with ${JSON.stringify(line)}`,
+        );
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  // [the file, whether git still ignores the private originals]
+  const NEGATIONS: Array<[string, boolean]> = [
+    ['var/\n!var/\n', false],
+    ['/var/\n!/var/\n', false],
+    ['var/*\n!var/media-private/\n', false],
+    ['/var/\n!/var/media-private/\n', true],
+    ['!var/\nvar/\n', true],
+    ['var\n!var  \n', false],
+    ['var/\n!**/var/\n', false],
+  ];
+
+  for (const [file] of NEGATIONS) {
+    test(`a ! line for var in ${JSON.stringify(file)} gets a warning, and the file is left alone`, async () => {
+      await writeFile(join(root, '.gitignore'), file);
+      const { code, out } = await run([]);
+      assert.equal(code, 0);
+      assert.equal(await read('.gitignore'), file);
+      assert.match(
+        out,
+        /warning\s+\.gitignore — a ! line can bring var\/ back into version control, private originals included: check with git check-ignore var\/media-private\/x/,
+      );
+      assert.doesNotMatch(out, /exists \(skipped\)\s*\.gitignore/);
+    });
+  }
+
+  test('the negation table is what git does', {
+    skip: skipWithoutGit,
+  }, async () => {
+    for (const [file, ignored] of NEGATIONS) {
+      const dir = await mkdtemp(join(tmpdir(), 'resize-gitignore-'));
+      try {
+        assert.equal(gitIgnores(file, dir), ignored, JSON.stringify(file));
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('a ! line for another folder gets no warning', async () => {
+    await writeFile(
+      join(root, '.gitignore'),
+      '/var/\n!/variables/\n!src/var/\n',
+    );
+    const { out } = await run([]);
+    assert.doesNotMatch(out, /warning/);
+    assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+  });
+
+  test('a .gitignore with CRLF line endings is read correctly', async () => {
+    const before = 'node_modules\r\n/var/\r\n';
+    await writeFile(join(root, '.gitignore'), before);
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), before);
+    assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+  });
+
+  test('a ! line with no rule beside it does not count: the rule goes after it, and wins', async () => {
+    await writeFile(join(root, '.gitignore'), '!/var/\n');
+    const { out } = await run([]);
+    assert.equal(await read('.gitignore'), `!/var/\n\n${IGNORE_BLOCK}`);
+    assert.doesNotMatch(out, /warning/);
+  });
+
+  test('a re-run that keeps the config does not touch .gitignore', async () => {
+    await run([]);
+    await rm(join(root, '.gitignore'));
+    const { out } = await run([]);
+    assert.equal(await exists('.gitignore'), false);
+    assert.doesNotMatch(out, /\.gitignore/);
+  });
+
+  test("a run over a host's own config leaves it and .gitignore alone", async () => {
+    const hostConfig = 'export default { mine: true };\n';
+    await mkdir(join(root, 'src/config'), { recursive: true });
+    await writeFile(join(root, CONFIG), hostConfig);
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    await run(['--eager']);
+    assert.equal(await read(CONFIG), hostConfig);
+    assert.equal(await read('.gitignore'), 'node_modules\n');
+  });
+
+  test('--force writes the config, so it adds the rule', async () => {
+    await run([]);
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    const { out } = await run(['--force']);
+    assert.equal(await read('.gitignore'), `node_modules\n\n${IGNORE_BLOCK}`);
+    assert.match(out, /appended\s+\.gitignore/);
+  });
+
+  test('--force keeps a rule that is already there', async () => {
+    await run([]);
+    const { out } = await run(['--force']);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.match(out, /exists \(skipped\)\s*\.gitignore/);
+  });
+
+  test('--check writes no .gitignore', async () => {
+    await run(['--check']);
+    assert.equal(await exists('.gitignore'), false);
+    await run([]);
+    await rm(join(root, '.gitignore'));
+    const { code } = await run(['--check']);
+    assert.equal(code, 0);
+    assert.equal(await exists('.gitignore'), false);
+  });
+
+  test('--eager adds the rule too', async () => {
+    await run(['--eager']);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+  });
+
+  test('--out puts the rule in that project root', async () => {
+    await run(['--out', 'app']);
+    assert.equal(await read('app/.gitignore'), IGNORE_BLOCK);
+    assert.equal(await exists('.gitignore'), false);
+  });
+
+  test('a directory named .gitignore stops the run before the config, and the re-run retries', async () => {
+    await mkdir(join(root, '.gitignore'));
+    const { code, err } = await run([]);
+    assert.equal(code, 1);
+    assert.match(err, /could not write \.gitignore/);
+    assert.equal(await exists(CONFIG), false);
+    assert.equal(await exists(RESIZER), false);
+
+    await rm(join(root, '.gitignore'), { recursive: true });
+    const again = await run([]);
+    assert.equal(again.code, 0);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.equal(await exists(CONFIG), true);
+  });
+
+  // chmod does not stop root.
+  const skipAsRoot = process.getuid?.() === 0 ? 'running as root' : false;
+
+  test('a read-only .gitignore stops the run before the config, and the re-run retries', {
+    skip: skipAsRoot,
+  }, async () => {
+    await writeFile(join(root, '.gitignore'), 'node_modules\n');
+    await chmod(join(root, '.gitignore'), 0o444);
+    const { code, err } = await run([]);
+    assert.equal(code, 1);
+    assert.match(err, /could not write \.gitignore/);
+    assert.equal(await exists(CONFIG), false);
+
+    await chmod(join(root, '.gitignore'), 0o644);
+    assert.equal((await run([])).code, 0);
+    assert.equal(await read('.gitignore'), `node_modules\n\n${IGNORE_BLOCK}`);
+    assert.equal(await exists(CONFIG), true);
+  });
+
+  test('a read-only AGENTS.md fails the run and names it, with the rule already in place', {
+    skip: skipAsRoot,
+  }, async () => {
+    await writeFile(join(root, 'AGENTS.md'), 'mine\n');
+    await chmod(join(root, 'AGENTS.md'), 0o444);
+    const { code, err } = await run([]);
+    assert.equal(code, 1);
+    assert.match(err, /could not write the agents pointer: .*AGENTS\.md/);
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+    assert.equal(await read('AGENTS.md'), 'mine\n');
+
+    // The config is there by now, so the re-run finishes the pointer and keeps the rule.
+    await chmod(join(root, 'AGENTS.md'), 0o644);
+    assert.equal((await run([])).code, 0);
+    assert.match(
+      await read('AGENTS.md'),
+      /^mine\n\n<!-- framework-module-resize/,
+    );
+    assert.equal(await read('.gitignore'), IGNORE_BLOCK);
+  });
+
+  test('next steps name the local serving rule and the right indexes', async () => {
+    const { out } = await run([]);
+    assert.match(out, /Serve local files/);
+    assert.match(out, /never var\/ itself/);
+    assert.match(
+      out,
+      /Set RESIZE_PUBLIC_BASE_URL in every deployed environment/,
+    );
+    assert.doesNotMatch(out, /ResizeTask and Lock/);
+    assert.match(out, /'File' is a guess/);
+  });
+
+  test('eager next steps end with generate() at upload', async () => {
+    const { out } = await run(['--eager']);
+    assert.match(out, /call generate\(\) at upload/);
+    assert.doesNotMatch(out, /npm run cli ResizeWorker/);
+  });
+
+  test('next steps say the queue is defined when the run wrote the config', async () => {
+    const { out } = await run([]);
+    assert.match(
+      out,
+      /`queues` in src\/config\/resize\.ts defines the 'default' queue/,
+    );
+    assert.doesNotMatch(out, /was kept/);
+  });
+
+  test('next steps tell the host to add the queue when the run kept an eager config', async () => {
+    await run(['--eager']);
+    const eagerConfig = await read(CONFIG);
+    const { out } = await run([]);
+    assert.equal(await read(CONFIG), eagerConfig, 'the host config stays');
+    assert.doesNotMatch(out, /defines the 'default' queue/);
+    assert.match(
+      out,
+      /src\/config\/resize\.ts was kept: if it has no `queues`, add queues: \{ default: \{ driver: 'database' \} \} and queue: 'default'/,
+    );
+  });
+
+  test('the usage names one invocation, after the install, in the form that cannot fetch', async () => {
+    const { out } = await run(['--help']);
+    assert.match(
+      out,
+      /Usage: npx --no -- resize-scaffold \[options\] {3}\(after npm i @adaptivestone\/framework-module-resize\)/,
+    );
+    assert.match(out, /\.gitignore/);
+  });
+
+  test('no command a host copies can fetch a package named resize-scaffold', async () => {
+    // Plain `npx resize-scaffold` installs that name from the registry when the package is missing,
+    // and `npx --no resize-scaffold --eager` hands --eager to npm, which refuses it on npm 12.
+    const repo = fileURLToPath(new URL('../../../', import.meta.url));
+    const templates = fileURLToPath(new URL('./templates/', import.meta.url));
+    const sources = [
+      join(repo, 'README.md'),
+      join(repo, 'AGENTS.md'),
+      fileURLToPath(new URL('./command.ts', import.meta.url)),
+      ...(await readdir(templates)).map((name) => join(templates, name)),
+    ];
+    for (const file of sources) {
+      const text = (await readFile(file, 'utf8')).replace(/\s+/g, ' ');
+      assert.doesNotMatch(text, /npx resize-scaffold/, file);
+      assert.doesNotMatch(text, /npx --no resize-scaffold/, file);
+      assert.doesNotMatch(text, /npx --no-install resize-scaffold/, file);
+    }
   });
 });
 
