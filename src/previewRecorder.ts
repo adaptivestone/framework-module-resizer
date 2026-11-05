@@ -129,12 +129,20 @@ function refGroup(row: Preview): string | null | undefined {
   }
 }
 
+/** A row a reload holds under a written row's ref, with the fields it differs in. */
+interface HeldRow {
+  held: Preview;
+  fields: KeptField[];
+}
+
 /** A written row beside what a reload holds for it. */
 interface WrittenRow {
   row: Preview;
-  // The rows under its storageRef that can be read, each with the fields it differs in.
-  under: { held: Preview; fields: KeptField[] }[];
-  // Nothing is under its ref, and a row a read would take for it came back without a ref.
+  // The rows under its storageRef that can be read.
+  under: HeldRow[];
+  // Nothing is under its ref, and a row with every compared field as written came back without a
+  // ref. Matching on what a read uses alone is not enough: an old row with no ref and no
+  // signatures, of the same size and format, would count, and a healthy store would dead-letter.
   lostRef: boolean;
 }
 
@@ -164,24 +172,42 @@ function compareWritten(
     });
     const lostRef =
       !groups.has(key) &&
-      (groups.get(null) ?? []).some((held) => {
-        const fields = differences(held, row);
-        return fields !== undefined && readMisses(fields) === 0;
-      });
+      (groups.get(null) ?? []).some(
+        (held) => differences(held, row)?.length === 0,
+      );
     return [{ row, under, lostRef }];
   });
+}
+
+/** Whether a read-back row holds the written row's `identity`; undefined when it cannot be read. */
+function sameIdentity(held: Preview, row: Preview): boolean | undefined {
+  try {
+    return held.identity === row.identity;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether `a` is closer to `row` than `b`, in the order rowsNotKept states. */
+function isCloser(a: HeldRow, b: HeldRow, row: Preview): boolean {
+  const order =
+    readMisses(a.fields) - readMisses(b.fields) ||
+    a.fields.length - b.fields.length ||
+    Number(sameIdentity(b.held, row) === true) -
+      Number(sameIdentity(a.held, row) === true);
+  return order < 0;
 }
 
 /**
  * The `written` rows the store did not keep as written, judged by the rows `readBack` holds under
  * each one's storageRef. No row under a ref says nothing: the reload may lag, and a store that
- * reshapes its refs is not detected. A row a read would take for this one, with no ref at all, says
- * the store lost the ref. A row or a ref that cannot be read is skipped. A content-addressed store
- * can return one ref for two rows with equal bytes, so a written row is kept when any row of its
- * group matches it; when none does, the fields named are those of the group's closest row: the
+ * reshapes its refs is not detected. A row with every compared field as written, and no ref at all,
+ * says the store lost the ref. A row or a ref that cannot be read is skipped. A content-addressed
+ * store can return one ref for two rows with equal bytes, so a written row is kept when any row of
+ * its group matches it; when none does, the fields named are those of the group's closest row: the
  * fewest differences in what a read finds a row by (another size key's row can differ in one field
- * too), then the fewest differences, the first on a tie, since a list of "fields no row holds" can
- * come out empty.
+ * too), then the fewest differences, then a matching `identity`, which decides nothing else, then
+ * the first, since a list of "fields no row holds" can come out empty.
  */
 export function rowsNotKept(
   written: readonly Preview[],
@@ -189,19 +215,19 @@ export function rowsNotKept(
 ): RowNotKept[] {
   const notKept: RowNotKept[] = [];
   for (const { row, under, lostRef } of compareWritten(written, readBack)) {
-    let closest: KeptField[] | undefined = lostRef ? ['storageRef'] : undefined;
-    for (const { fields } of under) {
-      const closer =
-        !closest ||
-        (readMisses(fields) - readMisses(closest) ||
-          fields.length - closest.length) < 0;
-      if (closer) {
-        closest = fields;
+    if (lostRef) {
+      notKept.push({ identity: String(row.identity), fields: ['storageRef'] });
+      continue;
+    }
+    let closest: HeldRow | undefined;
+    for (const candidate of under) {
+      if (!closest || isCloser(candidate, closest, row)) {
+        closest = candidate;
       }
     }
     // No group: nothing to judge. An empty list: some row of the group matches.
-    if (closest && closest.length > 0) {
-      notKept.push({ identity: String(row.identity), fields: closest });
+    if (closest && closest.fields.length > 0) {
+      notKept.push({ identity: String(row.identity), fields: closest.fields });
     }
   }
   return notKept;
@@ -209,23 +235,17 @@ export function rowsNotKept(
 
 /**
  * The identities of the `written` rows the store kept with another `identity`, or with none. Such a
- * row is served, but invalidate() and replacePreviews find rows only by identity. An identity that
- * cannot be read says nothing.
+ * row is served, but invalidate() finds rows only by identity, so it leaves them, and so does a
+ * replacePreviews that removes by stored identity. An identity that cannot be read says nothing.
  */
 export function rowsWithoutIdentity(
   written: readonly Preview[],
   readBack: readonly Preview[] | null | undefined,
 ): string[] {
-  const holdsIdentity = (held: Preview, row: Preview): boolean => {
-    try {
-      return held.identity === row.identity;
-    } catch {
-      return true;
-    }
-  };
   return compareWritten(written, readBack).flatMap(({ row, under }) => {
     const kept = under.filter(({ fields }) => fields.length === 0);
-    return kept.length > 0 && !kept.some(({ held }) => holdsIdentity(held, row))
+    return kept.length > 0 &&
+      kept.every(({ held }) => sameIdentity(held, row) === false)
       ? [String(row.identity)]
       : [];
   });

@@ -18,8 +18,9 @@ export interface ReplacedPreviews {
  * it wrote: `storageRef`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType`, `resizer`,
  * `pipeline` and `filters` must read back as given, or the task dead-letters with
  * RESIZE_MEDIA_ROW_NOT_KEPT. A row that is not back yet raises nothing. A kept row whose `identity`
- * is absent or differs gets one warning per Resizer: reads do not use it, but invalidate() and
- * replacePreviews find rows only by identity, so such rows stay behind.
+ * is absent or differs gets one warning per Resizer: reads do not use it, but invalidate() finds
+ * such rows only by identity, so it leaves them, and a replacePreviews that removes by stored
+ * identity leaves them too.
  */
 export abstract class MediaStore {
   /** Load a media document; `null` (deleted media) makes its task a logged no-op. */

@@ -488,7 +488,7 @@ test('rowsNotKept: the group rule picks a row by what a read uses, not by identi
   ]);
 });
 
-test('rowsNotKept: a row that comes back without a storageRef, matching on what a read uses, names storageRef', () => {
+test('rowsNotKept: a row that comes back without a storageRef, every compared field as written, names storageRef', () => {
   const row = signed('20x20', 'a');
   const { storageRef: _ref, ...back } = row;
   assert.deepEqual(rowsNotKept([row], [back as Preview]), [
@@ -503,6 +503,57 @@ test('rowsNotKept: a row that comes back without a storageRef, matching on what 
   assert.deepEqual(rowsNotKept([row], [another as Preview]), []);
   // The row is there under its ref: nothing was lost.
   assert.deepEqual(rowsNotKept([row], [back as Preview, row]), []);
+});
+
+test('rowsNotKept: an old row without a ref, of the same size and format, is not this row: it has no signatures', () => {
+  const row = signed('20x20', 'a');
+  // A flat row from before rows had a storageRef, which 0.3.0 left unmigrated.
+  const flat = {
+    key: 'old.jpg',
+    bucket: 'b',
+    sizeKey: row.sizeKey,
+    format: row.format,
+    contentType: row.contentType,
+  } as unknown as Preview;
+  assert.deepEqual(rowsNotKept([row], [flat]), []);
+  // One signature matching does not make it this row either.
+  assert.deepEqual(rowsNotKept([row], [{ ...flat, origin: row.origin }]), []);
+});
+
+for (const field of ['format', 'filters', 'pipeline'] as const) {
+  test(`rowsNotKept: one ref for two rows, one lost ${field}: a tie with the other size key's row goes to the row of this identity`, () => {
+    const scoped = (sizeKey: string): Preview => ({
+      ...signed(sizeKey, 'same'),
+      pipeline: 'x',
+      filters: { blur: 2 },
+      identity: `default:x:${sizeKey}:jpeg:blur:2`,
+    });
+    const a = scoped('20x20');
+    const b = scoped('40x40');
+    const { [field]: _lost, ...lost } = b;
+    // Each differs in one field a read uses, and the other size key's row comes first.
+    assert.deepEqual(rowsNotKept([b], [a, lost as Preview]), [
+      { identity: b.identity as string, fields: [field] },
+    ]);
+  });
+}
+
+test('rowsNotKept: a tie with no identity to break it stays with the first row, and an identity that cannot be read breaks none', () => {
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  const { format: _format, identity: _identity, ...lost } = b;
+  assert.deepEqual(rowsNotKept([b], [a, lost as Preview]), [
+    { identity: b.identity as string, fields: ['sizeKey'] },
+  ]);
+  const { format: _lostFormat, ...kept } = b;
+  assert.deepEqual(
+    rowsNotKept([b], [throwing(a, 'identity'), kept as Preview]),
+    [{ identity: b.identity as string, fields: ['format'] }],
+  );
+  assert.deepEqual(
+    rowsNotKept([b], [a, throwing(kept as Preview, 'identity')]),
+    [{ identity: b.identity as string, fields: ['sizeKey'] }],
+  );
 });
 
 test('rowsWithoutIdentity: names a kept row whose identity is absent or differs, and no other', () => {

@@ -606,18 +606,20 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     `contentType`, `resizer`, `pipeline`, `filters` and `storageRef` as they were given. After a
     task's writes the worker reloads the media and looks at the rows under each `storageRef` it
     wrote. No such row raises nothing (a lagging reload; a store that reshapes refs is not
-    detected), unless a row a read would take for it came back with no `storageRef` at all. Rows
-    there, and none matches what was written in those fields: the task fails with
+    detected), unless a row with all those fields as written came back with no `storageRef` at all.
+    Rows there, and none matches what was written in those fields: the task fails with
     `ResizeSetupError` `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields, because
     such a store makes reads render the preview again and again. `fit` is exempt, and `contentType`
     counts only when it is lost: a read needs one, in any form. A store that returns one ref for two
     rows is judged against all of them, and a row the check cannot read is skipped. On a driver that
-    names files by their bytes, a lagging reload after a replacement shows the older row under the
-    same ref: the task is dead although its rows are stored, and the next read is fresh.
+    names files by their bytes, a lagging reload can show another row under the same ref, an older
+    row after a replacement or another size key's row on a first render: the task is dead although
+    its rows are stored, and the next read is fresh.
   - `loadMedia` should return a stored row's `identity` as given too, but losing it fails no task: a
     read does not use it, so a store keyed by the identity it computes works. A kept row whose
-    `identity` is absent or differs gets one `warn` per Resizer, because `invalidate()` and
-    `replacePreviews` find rows only by identity, so such rows stay behind.
+    `identity` is absent or differs gets one `warn` per Resizer, because `invalidate()` finds such
+    rows only by identity, so it leaves them, and a `replacePreviews` that removes by stored identity
+    leaves them too.
   - `appendPreviews` stores a preview only when its `identity` is not stored on the media yet, and
     must resolve with the previews it stored (`[]` when none); resolving with something other than
     an array (e.g. `undefined`) fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.

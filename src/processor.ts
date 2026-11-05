@@ -1054,7 +1054,7 @@ export class Processor {
           this.#warnedIdentity = true;
           logNeverThrow(
             logger,
-            `resize worker: the media store did not keep the identity of ${rows.length} preview row(s) of media ${task.mediaId}: invalidate() and replacePreviews find rows only by identity, so these rows stay behind — store and return identity as given: ${rows.join('; ')}`,
+            `resize worker: the media store did not keep the identity of ${rows.length} preview row(s) of media ${task.mediaId}: invalidate() finds such rows only by identity, so it leaves them, and a replacePreviews that removes by stored identity leaves them too — store and return identity as given: ${rows.join('; ')}`,
             undefined,
             'warn',
           );

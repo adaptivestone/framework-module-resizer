@@ -1612,7 +1612,7 @@ for (const [form, column] of [
     assert.equal(warned.length, 1);
     assert.equal(
       warned[0][0],
-      'resize worker: the media store did not keep the identity of 1 preview row(s) of media m1: invalidate() and replacePreviews find rows only by identity, so these rows stay behind — store and return identity as given: default:default:20x20:webp:none',
+      'resize worker: the media store did not keep the identity of 1 preview row(s) of media m1: invalidate() finds such rows only by identity, so it leaves them, and a replacePreviews that removes by stored identity leaves them too — store and return identity as given: default:default:20x20:webp:none',
     );
   });
 }
@@ -1639,6 +1639,18 @@ test('a store keyed by the computed identity: a replacement is not blocked, and 
   assert.deepEqual(decision.missing, []);
   assert.equal(decision.ready[0].stale ?? false, false);
   assert.notDeepEqual(doc.previews?.[0].storageRef, before.storageRef);
+});
+
+test('a store keyed by the computed identity, with no identity column: invalidate() leaves its rows, as the warning says', async () => {
+  const w = world({ wrap: tableStore(() => undefined) });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(await r.invalidate({ media: doc }), []);
+
+  assert.equal(doc.previews?.length, 1);
 });
 
 test('a store that keeps contentType in its own form: the row is served, so the task completes and the next read is fresh', async () => {
@@ -1686,6 +1698,95 @@ test('a store whose rows keep their identity: no identity warning', async () => 
   assert.deepEqual(statuses(w), [['completed', 1]]);
   assert.deepEqual(lines('warn', /did not keep the identity/), []);
 });
+
+// ---- An old row without a ref is not the row a task wrote.
+
+/** A flat row from before rows had a storageRef, which 0.3.0 left unmigrated. */
+const flatRow = (): Preview =>
+  ({
+    key: 'old.webp',
+    bucket: 'b',
+    sizeKey: '20x20',
+    format: 'webp',
+    contentType: 'image/webp',
+  }) as unknown as Preview;
+
+/** The docMedia() store, with `after` run between each append and the reload that follows it. */
+const appending =
+  (
+    after: (
+      inner: ReturnType<typeof docMedia>,
+      id: string,
+      rows: Preview[],
+    ) => Promise<unknown>,
+  ) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore =>
+    fakeMedia({
+      load: (id) => inner.loadMedia(id),
+      appendPreviews: async (id, previews, dims) => {
+        const stored = await inner.appendPreviews(id, previews, dims);
+        await after(inner, id, stored);
+        return stored;
+      },
+      replacePreviews: (id, identities, rows) =>
+        inner.replacePreviews(id, identities, rows),
+    });
+
+const identitiesOf = (rows: Preview[]): string[] =>
+  rows.map((row) => row.identity as string);
+
+for (const [name, wrap] of [
+  [
+    'invalidate() landing between the write and the reload',
+    appending((inner, id, rows) =>
+      inner.replacePreviews(id, identitiesOf(rows), []),
+    ),
+  ],
+  [
+    'another worker replacing the row under its own ref',
+    appending((inner, id, rows) =>
+      inner.replacePreviews(
+        id,
+        identitiesOf(rows),
+        rows.map((row) => ({ ...row, storageRef: { key: 'theirs.webp' } })),
+      ),
+    ),
+  ],
+  [
+    'a custom store reshaping its refs',
+    (inner: ReturnType<typeof docMedia>): MediaStore =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: async (id, previews, dims) => {
+          await inner.appendPreviews(
+            id,
+            previews.map((row) => ({
+              ...row,
+              storageRef: { path: keyOf(row) },
+            })),
+            dims,
+          );
+          return previews;
+        },
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  ],
+] as const) {
+  test(`an old row without a ref, of the same size and format, and ${name}: the task completes`, async () => {
+    const w = world({ wrap });
+    const { logger, logs } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+    doc.previews = [flatRow()];
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    assert.deepEqual(logs.error, []);
+  });
+}
 
 // ---- The check must never fail a task whose work is done.
 
@@ -1872,6 +1973,121 @@ test('one ref for two rows, and the store lost encodeSig of one: only that row i
     errors[0].message,
     /default:default:200x200:webp:none \(encodeSig\)$/,
   );
+});
+
+for (const field of ['format', 'filters', 'pipeline'] as const) {
+  test(`one ref for two rows, and the store lost ${field} of one: that field is named, not the other size key's`, async () => {
+    const w = world({
+      wrap: losing(field, (row) => row.sizeKey === '200x200'),
+    });
+    contentAddressed(w);
+    const r = w.resizer(webpConfig(80), undefined, { default: {}, x: {} });
+    const doc = await bareMedia(w, r);
+    const errors = deadErrors(r);
+
+    await r.resolve({
+      media: doc,
+      sizes: twoBoxes.map((size) => ({ ...size, filters: { blur: 2 } })),
+      formats: ['webp'],
+      pipeline: 'x',
+    });
+    await w.work(r);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.match(
+      errors[0].message,
+      new RegExp(
+        `did not keep ${field} of 1 preview row.*:200x200:.* \\(${field}\\)$`,
+      ),
+    );
+  });
+}
+
+/** The docMedia() store. While `lag.on`, each second load shows the rows the first one showed. */
+const lagging =
+  (lag: { on: boolean }) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore => {
+    let held: Preview[] | undefined;
+    return fakeMedia({
+      load: async (id) => {
+        const doc = await inner.loadMedia(id);
+        if (!doc || !lag.on) {
+          return doc;
+        }
+        if (!held) {
+          held = [...(doc.previews ?? [])];
+          return doc;
+        }
+        const previews = held;
+        held = undefined;
+        return { ...doc, previews };
+      },
+      appendPreviews: (id, previews, dims) =>
+        inner.appendPreviews(id, previews, dims),
+      replacePreviews: (id, identities, rows) =>
+        inner.replacePreviews(id, identities, rows),
+    });
+  };
+
+// The two forms of one accepted corner, on a driver that names files by their bytes: the row under
+// the written ref is another one, because this task's row is not back yet.
+test('a lagging reload on a byte-named driver, another size key already under the ref: a first render is dead naming sizeKey, its rows are stored, and the next read is fresh', async () => {
+  const lag = { on: false };
+  const w = world({ wrap: lagging(lag) });
+  contentAddressed(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+  await w.read(r, doc, [twoBoxes[0]]);
+  await w.work(r);
+
+  lag.on = true;
+  await w.read(r, doc, [twoBoxes[1]]);
+  await w.work(r);
+  lag.on = false;
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['dead', 1],
+  ]);
+  assert.match(errors[0].message, /did not keep sizeKey of 1 preview row/);
+  assert.equal(doc.previews?.length, 2);
+  const { decision } = await w.read(r, doc, twoBoxes);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(
+    decision.ready.some((entry) => entry.stale),
+    false,
+  );
+});
+
+test('a lagging reload on a byte-named driver after a replacement: the task is dead naming encodeSig, its row is stored, and the next read is fresh', async () => {
+  const lag = { on: false };
+  const w = world({ wrap: lagging(lag) });
+  contentAddressed(w);
+  const first = w.resizer(webpConfig(80), undefined, { default: {} });
+  const doc = await bareMedia(w, first);
+  await w.read(first, doc);
+  await w.work(first);
+  resetResizerForTests();
+
+  // Another pipeline version over equal bytes: another signature under the same ref.
+  const r = w.resizer(webpConfig(80), undefined, {
+    default: { version: '2' },
+  });
+  const errors = deadErrors(r);
+  lag.on = true;
+  await w.read(r, doc);
+  await w.work(r);
+  lag.on = false;
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['dead', 1],
+  ]);
+  assert.match(errors[0].message, /did not keep encodeSig of 1 preview row/);
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
 });
 
 test('a store that loses encodeSig from a replaced row: the task is dead too', async () => {

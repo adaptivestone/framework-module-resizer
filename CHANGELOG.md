@@ -75,16 +75,18 @@
   and compares the rows under each `storageRef` it wrote. When rows exist there and none matches
   what was written in `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline` and
   `filters`, or none has a `contentType`, the task dead-letters with `RESIZE_MEDIA_ROW_NOT_KEPT`
-  (`retryable: false`), naming the fields. So does a row that comes back without its `storageRef`. A
-  custom store that dropped one of these, and so rendered again on every read without a log line,
-  now fails visibly. A store with no `identity` column, or its own form of it, keeps working: a read
-  does not use it. It gets one `warn` per Resizer, because `invalidate()` and `replacePreviews` find
-  rows only by identity, so such rows stay behind. A reload that lags raises nothing, except on a
-  driver that names files by their bytes, where a lagging reload after a replacement is dead naming
-  `encodeSig`, though its rows are stored and the next read is fresh. `MongoMediaStore` with the
-  current fragment is not affected. `verify()` now also rejects a strict row schema without
-  `sizeKey`, `format` or `contentType` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never
-  serve such a row.
+  (`retryable: false`), naming the fields. So does a row that comes back with those fields as written
+  but no `storageRef`. A custom store that dropped one of these, and so rendered again on every read
+  without a log line, now fails visibly. A store with no `identity` column, or its own form of it,
+  keeps working: a read does not use it. It gets one `warn` per Resizer, because `invalidate()` finds
+  such rows only by identity, so it leaves them, and a `replacePreviews` that removes by stored
+  identity leaves them too. A reload that lags raises nothing, except on a driver that names files by
+  their bytes, where it can show another row under the same ref, an older row after a replacement
+  (naming `encodeSig`) or another size key's row on a first render (naming `sizeKey`): the task is
+  dead, though its rows are stored and the next read is fresh. `MongoMediaStore` with the current
+  fragment and a driver that names files at random, as the shipped ones do, is not affected.
+  `verify()` now also rejects a strict row schema without `sizeKey`, `format` or `contentType`
+  (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never serve such a row.
 
 **Changed behaviour**
 

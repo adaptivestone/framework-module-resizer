@@ -1229,6 +1229,9 @@ describe('MongoMediaStore options', () => {
 });
 
 describe('a worker over real rows', () => {
+  const identitiesOf = (rows: Preview[]): string[] =>
+    rows.map((row) => row.identity as string);
+
   /** A first render and then a replacement, with a namespaced ref, a fit row and a filtered row. */
   const renderAndReplace = async (load?: MediaStore['loadMedia']) => {
     const png = await sharp({
@@ -1316,6 +1319,101 @@ describe('a worker over real rows', () => {
   test('hydrated rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a namespaced ref, a fit row, a filtered row, first rendered and then replaced', async () => {
     await renderAndReplace();
   });
+
+  for (const [name, race] of [
+    ['no race', async () => {}],
+    [
+      'invalidate() landing between the write and the reload',
+      async (store, id, rows) => {
+        await store.replacePreviews(id, identitiesOf(rows), []);
+      },
+    ],
+    [
+      'another worker replacing the row under its own ref',
+      async (store, id, rows) => {
+        await store.replacePreviews(
+          id,
+          identitiesOf(rows),
+          rows.map((row) => ({ ...row, storageRef: { key: 'theirs.webp' } })),
+        );
+      },
+    ],
+  ] as [
+    string,
+    (store: MongoMediaStore, id: string, rows: Preview[]) => Promise<void>,
+  ][]) {
+    test(`a 0.2.x row without a ref, of the same size and format, and ${name}: a healthy store's task completes`, async () => {
+      const png = await sharp({
+        create: {
+          width: 64,
+          height: 48,
+          channels: 3,
+          background: { r: 0, g: 200, b: 0 },
+        },
+      })
+        .png()
+        .toBuffer();
+      const logger: ResizeLogger = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      };
+      const { storage } = memoryStorage();
+      const tasks = new MemoryTaskQueue({
+        timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+      });
+      const inner = mediaStore();
+      const r = new Resizer({
+        config: makeImageConfig({ formats: ['webp'] }),
+        logger,
+        storage,
+        media: fakeMedia({
+          load: (id) => inner.loadMedia(id),
+          appendPreviews: async (id, previews, dims) => {
+            const stored = await inner.appendPreviews(id, previews, dims);
+            await race(inner, id, stored);
+            return stored;
+          },
+          replacePreviews: (id, identities, rows) =>
+            inner.replacePreviews(id, identities, rows),
+        }),
+        tasks,
+      });
+      const original = await r.uploadOriginal({
+        body: png,
+        visibility: 'private',
+      });
+      // Written past the schema, as a row of that version is in the collection.
+      const { insertedId } = await Media().collection.insertOne({
+        original,
+        previews: [
+          {
+            key: 'old.webp',
+            bucket: 'b',
+            sizeKey: '20x20',
+            format: 'webp',
+            contentType: 'image/webp',
+          },
+        ],
+      } as never);
+      const id = String(insertedId);
+
+      await r.resolve({
+        media: (await inner.loadMedia(id)) as MediaLike,
+        sizes: [{ width: 20, height: 20 }],
+      });
+      await workUntil({ logger, resizers: [r] }, () =>
+        tasks.rows.every(
+          (row) => row.status === 'completed' || row.status === 'dead',
+        ),
+      );
+
+      assert.deepEqual(
+        tasks.rows.map((row) => [row.status, row.attempts]),
+        [['completed', 1]],
+      );
+    });
+  }
 
   test('lean rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a store that loads with lean() reads back plain rows, with their _id', async () => {
     await renderAndReplace(
