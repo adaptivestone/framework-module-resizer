@@ -55,8 +55,8 @@ test('type exports come from export lists, own declarations and types.d.ts', asy
     'defaultCoordination',
     'defaultQueueOptions',
   ]);
-  assert.equal((await packageEntries()).length, 8);
-  assert.equal(exportKeys().length, 9);
+  assert.equal((await packageEntries()).length, 9);
+  assert.equal(exportKeys().length, 10);
   assert.ok(exportKeys().includes('./package.json'));
 });
 

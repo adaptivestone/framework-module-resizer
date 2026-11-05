@@ -65,6 +65,28 @@ async function runTask(
   return processorOf(resizer).processTask(task, taskOpts);
 }
 
+// Who a message of the serving speaks for. A worker's text is what its host's alerts match, and a
+// Lambda host has no worker to be told about. The lines of a running task (src/consumer.ts,
+// src/processor.ts) say `resize worker:` for both: the Consumer does not change for push delivery.
+interface Voice {
+  tag: string; // what a message starts with
+  self: string; // what a message calls the process
+  // What would happen to the tasks of a Resizer it does not serve, on a task queue it consumes.
+  unserved: string;
+}
+const WORKER_VOICE: Voice = {
+  tag: 'resize worker',
+  self: 'worker',
+  unserved: 'the worker would claim their tasks without running them',
+};
+const HANDLER_VOICE: Voice = {
+  tag: 'resize lambda',
+  self: 'handler',
+  unserved: 'their messages would reach this handler, which cannot run them',
+};
+const voiceOf = (pushed: boolean | undefined): Voice =>
+  pushed ? HANDLER_VOICE : WORKER_VOICE;
+
 /**
  * Refuse to start when a Resizer of this process that the worker does not serve carries `queue`
  * on one of `consumed`, the consumed backends that cannot filter claims: the worker would claim
@@ -80,6 +102,7 @@ async function refuseUnservedSharers(
   queue: string,
   consumed: Set<TaskQueue>,
   unserved: Resizer[],
+  voice: Voice,
 ): Promise<void> {
   const sharing: string[] = [];
   const unknown: string[] = [];
@@ -101,16 +124,16 @@ async function refuseUnservedSharers(
   const problems: string[] = [];
   if (sharing.length > 0) {
     problems.push(
-      `Resizer(s) ${sharing.join(', ')} share a task queue this worker consumes for queue '${queue}' but are not in the \`resizers\` list — the worker would claim their tasks without running them; list them too, or give them their own task queue`,
+      `Resizer(s) ${sharing.join(', ')} share a task queue this ${voice.self} consumes for queue '${queue}' but are not in the \`resizers\` list — ${voice.unserved}; list them too, or give them their own task queue`,
     );
   }
   if (unknown.length > 0) {
     problems.push(
-      `the task queue of Resizer(s) ${unknown.join(', ')} failed to load, so whether it is one this worker consumes for queue '${queue}' could not be determined — fix that task queue (the load error is the cause)`,
+      `the task queue of Resizer(s) ${unknown.join(', ')} failed to load, so whether it is one this ${voice.self} consumes for queue '${queue}' could not be determined — fix that task queue (the load error is the cause)`,
     );
   }
   if (problems.length > 0) {
-    throw new ResizeSetupError(`resize worker: ${problems.join('; ')}`, {
+    throw new ResizeSetupError(`${voice.tag}: ${problems.join('; ')}`, {
       code: 'RESIZE_QUEUE_SHARED_RESIZER_UNLISTED',
       cause: loadError,
     });
@@ -129,6 +152,7 @@ async function carriersOf(
   queue: string,
   served: Resizer[],
   logger: ResizeLogger,
+  voice: Voice,
 ): Promise<{ carriers: Map<TaskQueue, TaskQueue>; routing: Resizer[] }> {
   const carriers = new Map<TaskQueue, TaskQueue>();
   const routing: Resizer[] = [];
@@ -145,7 +169,7 @@ async function carriersOf(
       // The build error itself, as verify() rejects with it; the log line names the queue.
       logNeverThrow(
         logger,
-        `resize worker: queue '${queue}' of Resizer '${resizer.name}': its backend could not be built`,
+        `${voice.tag}: queue '${queue}' of Resizer '${resizer.name}': its backend could not be built`,
         err,
       );
       throw err;
@@ -155,7 +179,7 @@ async function carriersOf(
         skipped.add(tasks);
         logNeverThrow(
           logger,
-          `resize worker: a task queue does not serve queue '${queue}' — skipping it`,
+          `${voice.tag}: a task queue does not serve queue '${queue}' — skipping it`,
           undefined,
           'info',
         );
@@ -172,7 +196,7 @@ async function carriersOf(
       .map(({ tasks }) => (tasks ? unavailableReason(tasks, queue) : undefined))
       .find((found) => found !== undefined);
     throw new ResizeSetupError(
-      `resize worker: no task queue serves queue '${queue}'${reason ? ` (${unavailableText(reason)})` : ''}`,
+      `${voice.tag}: no task queue serves queue '${queue}'${reason ? ` (${unavailableText(reason)})` : ''}`,
       reason
         ? { code: 'RESIZE_QUEUE_NOT_SERVED', cause: reason.error }
         : { code: 'RESIZE_QUEUE_NOT_SERVED' },
@@ -182,25 +206,27 @@ async function carriersOf(
 }
 
 /**
- * The queue names a worker consumes, each once, in the order given: one name or a list of them;
- * default 'default'. An empty list, or a name that is not a non-empty string, is
- * RESIZE_QUEUE_INVALID, so a typo in the list is never consumed as a name of its own. The message
- * shows the value (see shownValue).
+ * The queue names a worker, or with `pushed` a Lambda handler, consumes, each once, in the order
+ * given: one name or a list of them; default 'default'. An empty list, or a name that is not a
+ * non-empty string, is RESIZE_QUEUE_INVALID, so a typo in the list is never consumed as a name of
+ * its own. The message shows the value (see shownValue).
  */
 export function queueNamesOf(
   queue: string | readonly string[] | undefined,
+  pushed?: boolean,
 ): string[] {
+  const { tag } = voiceOf(pushed);
   const names = typeof queue === 'string' ? [queue] : (queue ?? ['default']);
   if (!Array.isArray(names) || names.length === 0) {
     throw new ResizeSetupError(
-      'resize worker: `queue` must be a queue name or a non-empty list of them',
+      `${tag}: \`queue\` must be a queue name or a non-empty list of them`,
       { code: 'RESIZE_QUEUE_INVALID' },
     );
   }
   for (const name of names) {
     if (typeof name !== 'string' || name.trim().length === 0) {
       throw new ResizeSetupError(
-        `resize worker: every queue name must be a non-empty string (got ${shownValue(name)})`,
+        `${tag}: every queue name must be a non-empty string (got ${shownValue(name)})`,
         { code: 'RESIZE_QUEUE_INVALID' },
       );
     }
@@ -313,7 +339,8 @@ export interface Serving {
 export async function prepareServing(
   opts: ServingOptions,
 ): Promise<Serving | undefined> {
-  const queues = queueNamesOf(opts.queue);
+  const queues = queueNamesOf(opts.queue, opts.pushed);
+  const voice = voiceOf(opts.pushed);
   const logger = opts.logger ?? console;
   // The served Resizers, taken once now, so one constructed later is not served (and neither is
   // it compared below); a Resizer listed twice is served once.
@@ -322,7 +349,7 @@ export async function prepareServing(
   if (resizers.length === 0) {
     throw new ResizeSetupError(
       opts.resizers
-        ? 'resize worker: the `resizers` list is empty — pass the Resizers this worker serves'
+        ? `${voice.tag}: the \`resizers\` list is empty — pass the Resizers this ${voice.self} serves`
         : opts.pushed
           ? "resize lambda: no Resizer constructed — import the file that constructs your Resizers in the handler's file, before the first invocation"
           : 'resize worker: no Resizer constructed — construct your Resizers in the worker process before starting it',
@@ -334,7 +361,7 @@ export async function prepareServing(
   for (const { name } of resizers) {
     if (names.has(name)) {
       throw new ResizeSetupError(
-        `resize worker: the \`resizers\` list names '${name}' twice — list each Resizer once`,
+        `${voice.tag}: the \`resizers\` list names '${name}' twice — list each Resizer once`,
         { code: 'RESIZE_DUPLICATE_RESIZER' },
       );
     }
@@ -345,7 +372,7 @@ export async function prepareServing(
   if (!resizers.some((resizer) => resizer.tasks)) {
     logNeverThrow(
       logger,
-      'resize worker: no Resizer has a task queue (eager-only wiring)',
+      `${voice.tag}: no Resizer has a task queue (eager-only wiring)`,
     );
     return undefined;
   }
@@ -353,7 +380,10 @@ export async function prepareServing(
   // whose backend fails to build stops the start instead of being skipped.
   const lanes: ServedLane[] = [];
   for (const queue of queues) {
-    lanes.push({ queue, ...(await carriersOf(queue, resizers, logger)) });
+    lanes.push({
+      queue,
+      ...(await carriersOf(queue, resizers, logger, voice)),
+    });
   }
   // A backend that filters claims never hands this worker an unserved Resizer's task, so it may be
   // shared. Only the others are compared; with none, no unserved Resizer's task queue is loaded.
@@ -363,7 +393,7 @@ export async function prepareServing(
       [...carriers.keys()].filter((carrier) => !carrier.claimFilters),
     );
     if (unfiltered.size > 0) {
-      await refuseUnservedSharers(queue, unfiltered, unserved);
+      await refuseUnservedSharers(queue, unfiltered, unserved, voice);
     }
   }
   // Fail before claiming anything: a bad config, queue or store (e.g. a wrong mediaModelName)
@@ -406,7 +436,7 @@ export async function prepareServing(
     } catch (err) {
       logNeverThrow(
         logger,
-        `resize worker: the coordination of Resizer '${owner.name}' could not be read — task ${task.taskId} gets the default cooldown and no gate lock`,
+        `${voice.tag}: the coordination of Resizer '${owner.name}' could not be read — task ${task.taskId} gets the default cooldown and no gate lock`,
         err,
       );
       return undefined;
@@ -420,7 +450,7 @@ export async function prepareServing(
     if (!owner) {
       logNeverThrow(
         logger,
-        `resize worker: ${event} for task ${task.taskId} dropped — ${notServed(task)}`,
+        `${voice.tag}: ${event} for task ${task.taskId} dropped — ${notServed(task)}`,
       );
       return;
     }
@@ -460,7 +490,7 @@ export async function prepareServing(
     const report = (task: LeasedTask) => {
       if (!reported.has(task.resizer)) {
         reported.add(task.resizer);
-        logNeverThrow(logger, `resize worker: ${notServed(task)} — ${fate}`);
+        logNeverThrow(logger, `${voice.tag}: ${notServed(task)} — ${fate}`);
       }
     };
     return {
@@ -487,7 +517,7 @@ export async function prepareServing(
         const owner = ownerOf(task);
         if (!owner) {
           report(task);
-          throw new ResizeSetupError(`resize worker: ${notServed(task)}`, {
+          throw new ResizeSetupError(`${voice.tag}: ${notServed(task)}`, {
             code: 'RESIZE_NO_RESIZER',
           });
         }

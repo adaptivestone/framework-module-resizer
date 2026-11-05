@@ -18,8 +18,8 @@
 // judges that row as any other: a row from an older original is stale and is queued again. A record
 // with too little time is not started, and is not adopted either.
 //
-// Internal: no entry re-exports this file, and it may change in any release; `createSqsHandler()`
-// (src/lambda.ts) is the public way in.
+// Internal, and it may change in any release, apart from the event and handler types that
+// src/lambda.ts re-exports: `createSqsHandler()` there is the public way in.
 import { Consumer, type ConsumerDeps } from './consumer.ts';
 import type { DeliveryQueue } from './contracts/delivery.ts';
 import {
@@ -32,6 +32,7 @@ import {
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
 import type { ResizeLogger } from './types.d.ts';
+import { flushMetrics, prepareServing, type ServingOptions } from './worker.ts';
 
 export interface SqsRecordLike {
   messageId: string;
@@ -531,5 +532,53 @@ export function batchHandler(
     }
     await wired.flush(Math.max(0, left() - margin / 2));
     return { batchItemFailures };
+  };
+}
+
+// Whether a task queue can take pushed messages. By shape, as core may not import a driver.
+function isDeliveryQueue(queue: TaskQueue): queue is TaskQueue & DeliveryQueue {
+  const { carriesSource, taskOfDelivery, release } =
+    queue as Partial<DeliveryQueue>;
+  return (
+    typeof carriesSource === 'function' &&
+    typeof taskOfDelivery === 'function' &&
+    typeof release === 'function' &&
+    !queue.gatesByTask
+  );
+}
+
+/**
+ * What a batchHandler serves, from the same start checks as a worker: rejects when one of them does,
+ * or when a consumed name cannot take pushed messages (on a router, the other names may).
+ */
+export async function wiringOf(opts: ServingOptions): Promise<DeliveryWiring> {
+  const serving = await prepareServing({ ...opts, pushed: true });
+  if (!serving) {
+    throw new ResizeSetupError(
+      'resize lambda: no Resizer has a task queue, so a pushed message has nothing to run on — give a Resizer an SQS queue',
+      { code: 'RESIZE_DELIVERY_UNSUPPORTED' },
+    );
+  }
+  const lanes = serving.lanes.flatMap(({ queue, carriers }) =>
+    [...carriers].map(([carrier, timingSource]): DeliveryLane => {
+      if (!isDeliveryQueue(carrier)) {
+        throw new ResizeSetupError(
+          `resize lambda: queue '${queue}' is on a task queue that cannot take pushed messages: only the SQS driver can — consume it with a worker process, or leave it out of createSqsHandler({ queue })`,
+          { code: 'RESIZE_DELIVERY_UNSUPPORTED' },
+        );
+      }
+      return {
+        queue,
+        carrier,
+        deps: serving.depsOf(queue, carrier, timingSource),
+      };
+    }),
+  );
+  return {
+    lanes,
+    processingSecondsOf: (task) =>
+      serving.ownerOf(task)?.config.limits.processingTimeoutSeconds,
+    flush: (waitMs) => flushMetrics(serving.resizers, waitMs),
+    logger: serving.logger,
   };
 }

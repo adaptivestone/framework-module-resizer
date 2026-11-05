@@ -6,6 +6,7 @@
 //   …/drivers/s3.js     S3Storage                      (optional peers: AWS S3 SDK)
 //   …/drivers/mongo.js  mongoParts, MongoMediaStore, MongoLockStore, MongoTaskQueue, …
 //   …/drivers/sqs.js    SqsTaskQueue                   (optional peer: AWS SQS SDK)
+//   …/lambda.js         createSqsHandler               (push delivery, preview)
 //   …/framework.js      the framework adapter: FrameworkResizer, FrameworkMediaStore, …
 
 // --- contracts: the abstract classes a custom driver or decoder extends (or any object of the

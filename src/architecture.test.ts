@@ -1,5 +1,5 @@
 // Core files read nothing process-wide (getApp, getResizeConfig, getResizer, listResizers): each
-// gets what it needs from its caller. Only the entry points (index.ts, worker.ts) and the
+// gets what it needs from its caller. Only the entry points (index.ts, worker.ts, lambda.ts) and the
 // framework adapter import resizer.ts (pinned in importGraph.test.ts). Core is every top-level
 // src/ file except worker.ts (an entry point that looks Resizers up by name), registry.ts (the
 // generic registry class; the process-wide instance lives in resizer.ts), index.ts (the main
@@ -85,9 +85,12 @@ test('only images.ts decides which stored rows count', () => {
 // through logNeverThrow, which falls back to the console. Optional calls (`logger?.error(`) and
 // references (`logger.error.bind`) count as direct too.
 test('the worker loop logs only through logNeverThrow', () => {
-  const direct = ['consumer.ts', 'delivery.ts', 'worker.ts'].filter((f) =>
-    /\blogger\??\.(info|warn|error)\b/.test(read(f)),
-  );
+  const direct = [
+    'consumer.ts',
+    'delivery.ts',
+    'lambda.ts',
+    'worker.ts',
+  ].filter((f) => /\blogger\??\.(info|warn|error)\b/.test(read(f)));
   assert.deepEqual(direct, []);
   // The pattern itself: each of these forms is caught.
   for (const call of [

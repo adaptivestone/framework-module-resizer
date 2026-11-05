@@ -100,6 +100,7 @@ for (const driver of [
   'ResizeWorker',
   'runResizeWorker',
   'FrameworkResizer',
+  'createSqsHandler',
 ]) {
   assert.ok(!(driver in mod), 'driver/adapter must stay subpath-only, not on main entry: ' + driver);
 }
@@ -154,6 +155,7 @@ const safe = [
   ['/framework.js', 'resizeMediaPaths'],
   ['/framework.js', 'defaultFrameworkResizeConfig'],
   ['/framework.js', 'defaultWorkerOptions'],
+  ['/lambda.js', 'createSqsHandler'],
 ];
 for (const [sub, exp] of safe) {
   const m = await import(PKG + sub);
@@ -196,8 +198,8 @@ console.log(
 `;
 
 // Runs in a consumer installed WITHOUT peer dependencies (no @adaptivestone/framework, no
-// mongoose): the main entry, the config, and the fs and Mongo drivers must load, a custom driver
-// extends a contract class, and a core Resizer must work.
+// mongoose): the main entry, the config, the fs and Mongo drivers and the lambda entry must load, a
+// custom driver extends a contract class, and a core Resizer must work.
 const CHECK_FRAMEWORK_FREE = `import assert from 'node:assert/strict';
 
 const PKG = '@adaptivestone/framework-module-resize';
@@ -249,6 +251,9 @@ assert.equal(typeof mongo.mongoParts, 'function');
 assert.equal(typeof mongo.MongoDatabase.fromConfig, 'function');
 assert.equal(typeof fs.LocalFsStorage.fromConfig, 'function');
 console.log('  ok  drivers/fs.js and drivers/mongo.js load without mongoose; custom drivers extend MediaStore and LockStore');
+const lambda = await import(PKG + '/lambda.js');
+assert.equal(typeof lambda.createSqsHandler, 'function');
+console.log('  ok  lambda.js loads with no peer at all: no framework, no mongoose, no AWS SDK');
 // createResizer builds the local storage through its built-in driver, imported on first use.
 const factory = mod.createResizer(
   { formats: ['webp'], storage: { driver: 'local', rootDir: './var/factory', publicBaseUrl: '/factory' } },
@@ -338,6 +343,10 @@ import {
   type FrameworkResizeConfig,
 } from '@adaptivestone/framework-module-resize/framework.js';
 import ResizeTaskModel from '@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js';
+import { createSqsHandler, type SqsHandler } from '@adaptivestone/framework-module-resize/lambda.js';
+
+// Push delivery: the handler file's one line. Importing the entry needs no AWS SDK and no AWS types.
+export const pushHandler: SqsHandler = createSqsHandler();
 
 // The scaffold imports the defining model file so framework codegen can detect its ancestor.
 class ResizeTask extends ResizeTaskModel {}
