@@ -624,8 +624,9 @@ with no error: dedupe). Nothing else in a step is bounded: Sharp work that does 
 `rasterToSharp` (`sharp(raster.data, { raw: raster.info })`, a fresh `sharp()`, a raster spread into a
 new object or built by the step), any other host code, and `beforeSteps`. Such work can starve other
 tasks and dead-letter healthy ones, because stuck Sharp calls hold libuv's threads, and a timed-out
-delivery keeps its memory until its variants in progress end; they can still store their rows, so a
-step slower than `taskTimeoutMs` still ends with its row. An optional pipeline `version` (string) is part of each preview row's
+delivery keeps its memory until its variants in progress end. They can still store their rows, so a
+step slower than `taskTimeoutMs` still stores its row, and the next delivery finds it fresh and
+completes, if one is left; with none left the task ends dead with its row stored. An optional pipeline `version` (string) is part of each preview row's
 `encodeSig`: bump it when a step's output changes, and the pipeline's stored previews are
 regenerated on their next read.
 
@@ -674,13 +675,14 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants). A `variantStep` receives and returns a
   one-frame `Raster`, never a Sharp object. Fit the logo on both sides: Sharp refuses an overlay
-  larger than the preview on either side, so one scaled by `r.info.width` alone fails on a banner:
+  larger than the preview on either side, so one scaled by `r.info.width` alone fails on a banner.
+  `withoutEnlargement` keeps a smaller logo at its own size:
 
   ```ts
   async (r) => {
     const { width, height } = r.info;
     const input = await sharp(logo)
-      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside' })
+      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside', withoutEnlargement: true })
       .toBuffer();
     return sharpToRaster(rasterToSharp(r).composite([{ input, gravity: 'southeast' }]));
   };

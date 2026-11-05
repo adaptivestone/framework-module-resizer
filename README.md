@@ -1136,17 +1136,18 @@ variantSteps: [
   async (r) => {
     const { width, height } = r.info;
     const input = await sharp(logo)
-      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside' })
+      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside', withoutEnlargement: true })
       .toBuffer();
     return sharpToRaster(rasterToSharp(r).composite([{ input, gravity: 'southeast' }]));
   },
 ],
 ```
 
-Fit the overlay on both sides, with `.resize(w, h, { fit: 'inside' })`: Sharp refuses one larger than
-the preview on either side (`Image to composite must have same dimensions or smaller`). Scaled by
-`r.info.width` alone, a 400×400 logo failed on 6 of 9 variants of a 4000×300 banner. `composite` on an
-opaque preview returns 4 channels with
+Fit the overlay on both sides, with `.resize(w, h, { fit: 'inside', withoutEnlargement: true })`: Sharp
+refuses one larger than the preview on either side (`Image to composite must have same dimensions or
+smaller`). Scaled by `r.info.width` alone, a 400×400 logo failed on 6 of 9 variants of a 4000×300
+banner. `withoutEnlargement` keeps a smaller logo at its own size: without it, a 64×64 logo came out
+300×300 on a 1600×1200 preview. `composite` on an opaque preview returns 4 channels with
 alpha 255, which costs an AVIF about 200 bytes per file, which matters only on very flat images: add
 `.removeAlpha()` when `r.info.channels === 3`.
 
@@ -1166,8 +1167,10 @@ ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants besid
 `taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
 where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not its
 variants in progress: each keeps its thread and memory until it ends, and can still store its row. So
-a step slower than `taskTimeoutMs` still ends with its row: a later delivery finds it fresh and
-completes. Such a late write can also replace a newer row, even one from a newer original: the next
+a step slower than `taskTimeoutMs` still stores its row, and the next delivery finds it fresh and
+completes, if one is left. With none left, because the step outlasts them (5000 ms at `taskTimeoutMs`
+1000) or `maxAttempts` is 1, the task ends dead with its row stored, as on 0.3.0. Such a late write can
+also replace a newer row, even one from a newer original: the next
 read finds that row stale and queues it again. `generate()` has no such bound.
 
 A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source

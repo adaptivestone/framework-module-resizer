@@ -406,12 +406,18 @@ test('the limit moves no byte: a fast step writes the same files with it turned 
 });
 
 test('a healthy task completes beside slow variants: the limit frees the threads they hold', async () => {
+  // What it proves, on any machine: chains that hold all of libuv's threads leave the healthy task's
+  // Sharp calls waiting, and only the limit cutting a chain lets them run. Nothing here races a clock:
+  // on a busy machine a cut comes seconds late, and the healthy task waits for it. The deadline and
+  // `taskTimeoutMs` are for a stuck worker. Without the limit the first upload comes with no cut.
+  const deadline = 120_000;
+  const threads = Number(process.env.UV_THREADPOOL_SIZE) || 4;
   const tasks = new MemoryTaskQueue({
     timing: {
       idlePollMs: 5,
-      taskTimeoutMs: 2000,
+      taskTimeoutMs: deadline,
       maxAttempts: 3,
-      retryBackoffMs: { base: 60_000, max: 60_000 },
+      retryBackoffMs: { base: deadline, max: deadline },
     },
   });
   const bodies = new Map([
@@ -419,16 +425,30 @@ test('a healthy task completes beside slow variants: the limit frees the threads
     ['healthy', await plain(40, 20)],
   ]);
   const stored = new Map<string, Preview[]>();
+  let chainsEntered = 0;
+  let cuts = 0;
+  let cutsAtFirstUpload: number | undefined;
   new Resizer({
     config: makeImageConfig({
       formats: ['webp'],
+      concurrency: threads,
       limits: { processingTimeoutSeconds: 1 },
     }),
-    logger: silent,
+    logger: {
+      ...silent,
+      warn: (_msg, err) => {
+        if (/timeout/.test(String(err))) {
+          cuts++;
+        }
+      },
+    },
     storage: {
       download: async (ref) =>
         bodies.get((ref as { key: string }).key) as Buffer,
-      upload: async () => ({ key: 'preview' }),
+      upload: async () => {
+        cutsAtFirstUpload ??= cuts;
+        return { key: 'preview' };
+      },
       publicUrl: () => '',
     },
     media: fakeMedia({
@@ -442,7 +462,12 @@ test('a healthy task completes beside slow variants: the limit frees the threads
     tasks,
     pipelines: {
       slow: {
-        variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).blur(400))],
+        variantSteps: [
+          async (r) => {
+            chainsEntered++;
+            return sharpToRaster(rasterToSharp(r).blur(400));
+          },
+        ],
       },
     },
   });
@@ -454,33 +479,60 @@ test('a healthy task completes beside slow variants: the limit frees the threads
   });
   await tasks.add({
     resizer: 'default',
-    queue: 'default',
+    queue: 'bulk',
     mediaId: 'slow',
     pipeline: 'slow',
-    previews: [
-      webp(2000, 1000),
-      webp(1990, 995),
-      webp(1980, 990),
-      webp(1970, 985),
-    ],
+    previews: Array.from({ length: threads }, (_, i) =>
+      webp(2000 - i * 10, 1000 - i * 5),
+    ),
   });
-  await tasks.add({
-    resizer: 'default',
-    queue: 'default',
-    mediaId: 'healthy',
-    pipeline: 'default',
-    previews: [webp(20, 10)],
+  const stop = new AbortController();
+  const working = runWorker({
+    logger: silent,
+    queue: ['bulk', 'default'],
+    signal: stop.signal,
   });
-  const [slow, healthy] = tasks.rows;
-  await workUntil(
-    { logger: silent },
-    () => healthy.status === 'completed' || healthy.status === 'dead',
-  );
-  assert.equal(healthy.status, 'completed');
-  assert.equal(healthy.attempts, 1);
-  assert.equal(stored.get('healthy')?.length, 1);
-  assert.equal(stored.get('slow')?.length ?? 0, 0);
-  assert.equal(slow.attempts, 1);
+  const giveUpAt = Date.now() + deadline;
+  const until = async (done: () => boolean) => {
+    while (!done()) {
+      assert.ok(Date.now() < giveUpAt, 'the worker never got there');
+      await delay(5);
+    }
+  };
+  try {
+    // A chain's first call is a short metadata read, so a chain entered is not yet a thread held. A
+    // chain cut this early, on a busy machine, means the others cannot all be running at once.
+    await until(
+      () =>
+        (chainsEntered === threads && sharp.counters().process >= threads) ||
+        cuts > 0,
+    );
+    await tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'healthy',
+      pipeline: 'default',
+      previews: [webp(20, 10)],
+    });
+    const [slow, healthy] = tasks.rows;
+    await until(
+      () => healthy.status === 'completed' || healthy.status === 'dead',
+    );
+    assert.equal(healthy.status, 'completed');
+    assert.equal(healthy.attempts, 1);
+    assert.equal(stored.get('healthy')?.length, 1);
+    assert.ok(
+      (cutsAtFirstUpload as number) > 0,
+      'the healthy task got a thread with no chain cut',
+    );
+    // The rest of the chains fail too, not all with this message, as on 0.3.0.
+    await until(() => slow.status === 'pending');
+    assert.equal(stored.get('slow')?.length ?? 0, 0);
+    assert.equal(slow.attempts, 1);
+  } finally {
+    stop.abort();
+    await working;
+  }
 });
 
 /** A worker on an in-memory queue whose media store keeps its rows, as a real one does. */
