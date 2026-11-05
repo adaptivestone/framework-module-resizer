@@ -285,6 +285,8 @@ const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
     'encodeSig',
     'a preview would not record the encode settings it was made with',
   ],
+  ['sizeKey', 'a read would never find a preview by its size'],
+  ['format', 'a read would never find a preview by its format'],
 ];
 
 export class MongoMediaStore extends MediaStore {

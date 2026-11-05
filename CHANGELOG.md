@@ -71,6 +71,15 @@
   `verify()`, and `resolve()` then logs an `error` and returns an empty decision, so previews stored
   earlier stop being served until the root is fixed. `new LocalFsStorage()` throws at construction.
   The replacement for `''` is `'.'`, which is the same folder.
+- **A media store must keep what the worker writes.** After its writes the worker reloads the media
+  and compares the rows under each `storageRef` it wrote. When rows exist there and none matches
+  what was written in `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline`
+  and `filters`, the task dead-letters with `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming
+  the fields. A custom store that dropped one of these, and so rendered again on every read without
+  a log line, now fails visibly. So does a store with no `identity` column. A reload that lags
+  raises nothing. `MongoMediaStore` with the current fragment is not affected. `verify()` now also
+  rejects a strict row schema without `sizeKey` or `format` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a
+  read could never find such a row.
 
 **Changed behaviour**
 

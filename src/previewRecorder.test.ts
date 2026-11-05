@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { Catalog } from './catalog.ts';
 import type { MediaStore } from './contracts/media.ts';
 import { getPreviewIdentity } from './images.ts';
-import { PreviewRecorder } from './previewRecorder.ts';
+import { PreviewRecorder, rowsNotKept } from './previewRecorder.ts';
 import { fakeMedia } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
@@ -354,4 +354,87 @@ test('a failed append of the dimensions alone is logged as such, and returned', 
     "resize: recording the original's dimensions failed for media m1 (64×48); no uploaded preview is affected",
   );
   assert.equal(logs.error[0][1], db);
+});
+
+// A row as the worker writes it: signed.
+const signed = (sizeKey: string, key: string): Preview => ({
+  ...preview(sizeKey, key),
+  origin: 'o1',
+  encodeSig: 'e1',
+});
+
+test('rowsNotKept: a row read back as written is kept, whatever else the store added or dropped', () => {
+  const row: Preview = { ...signed('20x20', 'a'), fit: true, bytes: 5 };
+  const { fit: _fit, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [{ ...back, bytes: 6 }]), []);
+});
+
+test('rowsNotKept: no row under the ref raises nothing (a lagging reload, or a reshaped ref)', () => {
+  const row = signed('20x20', 'a');
+  for (const back of [
+    undefined,
+    null,
+    [],
+    [signed('20x20', 'other')],
+    [{ ...row, encodeSig: 'x', storageRef: { key: 'a', extra: 1 } }],
+  ]) {
+    assert.deepEqual(rowsNotKept([row], back), []);
+  }
+});
+
+test('rowsNotKept: names every field the row under the ref lost or changed, in one order', () => {
+  const row = signed('20x20', 'a');
+  const { encodeSig: _sig, origin: _origin, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [{ ...back, format: 'webp' }]), [
+    {
+      identity: row.identity as string,
+      fields: ['origin', 'encodeSig', 'format'],
+    },
+  ]);
+});
+
+test('rowsNotKept: one ref for two rows: each written row finds its own in the group', () => {
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  assert.deepEqual(rowsNotKept([a, b], [a, b]), []);
+  // The first row under the ref is another size key's: comparing with it alone is a false alarm.
+  assert.deepEqual(rowsNotKept([b], [a, b]), []);
+});
+
+test('rowsNotKept: one ref for two rows, one lost a field: that row and that field, from the closest row of the group', () => {
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  const { encodeSig: _sig, ...lost } = b;
+  assert.deepEqual(rowsNotKept([a, b], [a, lost]), [
+    { identity: b.identity as string, fields: ['encodeSig'] },
+  ]);
+});
+
+test('rowsNotKept: a read-back row without a ref, and a ref JSON cannot encode, do not throw', () => {
+  const big: Preview = { ...signed('20x20', 'a'), storageRef: { n: 1n } };
+  const noRef = { sizeKey: '20x20' } as Preview;
+  assert.deepEqual(rowsNotKept([big], [noRef, big]), []);
+});
+
+test('rowsNotKept: a read finds a row by its resizer, pipeline and filters too', () => {
+  const row: Preview = {
+    ...signed('20x20', 'a'),
+    resizer: 'listings',
+    pipeline: 'x',
+    filters: { blur: 2, mode: 'soft' },
+  };
+  const { resizer: _r, pipeline: _p, filters: _f, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [back]), [
+    {
+      identity: row.identity as string,
+      fields: ['resizer', 'pipeline', 'filters'],
+    },
+  ]);
+  // Another key order and an absent default say nothing.
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, filters: { mode: 'soft', blur: 2 } }]),
+    [],
+  );
+  const { resizer: _d, pipeline: _e, ...plain } = signed('20x20', 'b');
+  assert.deepEqual(rowsNotKept([signed('20x20', 'b')], [plain]), []);
 });

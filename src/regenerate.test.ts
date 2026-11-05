@@ -6,11 +6,13 @@
 // nothing for rows that turn out fresh. Real Sharp, in-memory storage, media documents and task
 // queue; resetResizerForTests() between two Resizers of one name stands in for a redeploy.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { afterEach, test } from 'node:test';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
+import type { ResizeError } from './errors.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
@@ -1300,4 +1302,299 @@ test('a locator holding a Buffer: the row is signed as the read path signs it, s
   const { decision } = await w.read(r, doc);
   assert.deepEqual(decision.missing, []);
   assert.equal(decision.ready[0].stale ?? false, false);
+});
+
+// ---- The media store must keep what the worker writes.
+
+/** A store that loses `field` from the rows it stores, and answers with the rows it was given. */
+const losing =
+  (field: keyof Preview, only: (row: Preview) => boolean = () => true) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore => {
+    const strip = (rows: Preview[]): Preview[] =>
+      rows.map((row) => {
+        if (!only(row)) {
+          return row;
+        }
+        const { [field]: _lost, ...rest } = row;
+        return rest as Preview;
+      });
+    return fakeMedia({
+      load: (id) => inner.loadMedia(id),
+      appendPreviews: async (id, previews, dims) => {
+        await inner.appendPreviews(id, strip(previews), dims);
+        return previews;
+      },
+      replacePreviews: async (id, identities, rows) => {
+        const { removed } = await inner.replacePreviews(
+          id,
+          identities,
+          strip(rows),
+        );
+        return { stored: rows, removed };
+      },
+    });
+  };
+
+/** Upload the png as the original of media m1, with no previews stored yet. */
+async function bareMedia(
+  w: ReturnType<typeof world>,
+  r: Resizer,
+): Promise<MediaLike> {
+  const original = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+  return doc;
+}
+
+/** The errors of the tasks `r` dead-letters from now on. */
+function deadErrors(r: Resizer): ResizeError[] {
+  const errors: ResizeError[] = [];
+  r.hook('onTaskDeadLettered', (_task, err) => {
+    errors.push(err as ResizeError);
+  });
+  return errors;
+}
+
+const statuses = (w: ReturnType<typeof world>) =>
+  w.tasks.rows.map((row) => [row.status, row.attempts]);
+
+/** Storage that names a preview by its bytes: equal bytes give one ref. */
+function contentAddressed(w: ReturnType<typeof world>): void {
+  const upload = w.storage.upload.bind(w.storage);
+  w.storage.upload = (args) =>
+    upload({
+      ...args,
+      key: `previews/${createHash('sha256').update(args.body).digest('hex')}`,
+    });
+}
+
+// Both boxes are larger than the 64×64 source, so both previews are the source at its own size:
+// equal bytes, two size keys.
+const twoBoxes: SizeInput[] = [
+  { width: 100, height: 100 },
+  { width: 200, height: 200 },
+];
+
+for (const field of [
+  'identity',
+  'origin',
+  'encodeSig',
+  'sizeKey',
+  'format',
+] as const) {
+  test(`a store that loses ${field}: the first task is dead with RESIZE_MEDIA_ROW_NOT_KEPT naming it, after one upload`, async () => {
+    const w = world({ wrap: losing(field) });
+    const { logger, lines } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+    const files = w.files.size;
+    const errors = deadErrors(r);
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.equal(w.files.size, files + 1);
+    assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+    assert.equal(errors[0].retryable, false);
+    assert.equal(
+      errors[0].message,
+      `resize worker: the media store did not keep ${field} of 1 preview row(s) of media m1, so reads may render them again and again — a MediaStore must store and return identity, origin, encodeSig, sizeKey, format, resizer, pipeline and filters as given: default:default:20x20:webp:none (${field})`,
+    );
+    if (field === 'encodeSig') {
+      // An operator finds it in the dead line (src/consumer.ts).
+      assert.equal(lines('error', /RESIZE_MEDIA_ROW_NOT_KEPT/).length, 1);
+    }
+  });
+}
+
+// `losing` answers with the rows it was given. This store answers with what it really stored, so
+// the recorder leaves the row out, and the check must still see it.
+for (const field of ['sizeKey', 'format'] as const) {
+  test(`a store that answers with the rows as it stored them, without ${field}: dead at once too, after one upload`, async () => {
+    const w = world({
+      wrap: (inner) =>
+        fakeMedia({
+          load: (id) => inner.loadMedia(id),
+          appendPreviews: async (id, previews, dims) => {
+            const rows = previews.map((row) => {
+              const { [field]: _lost, ...rest } = row;
+              return rest as Preview;
+            });
+            await inner.appendPreviews(id, rows, dims);
+            return rows;
+          },
+          replacePreviews: (id, identities, rows) =>
+            inner.replacePreviews(id, identities, rows),
+        }),
+    });
+    const r = w.resizer(webpConfig(80));
+    const doc = await bareMedia(w, r);
+    const files = w.files.size;
+    const errors = deadErrors(r);
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.equal(w.files.size, files + 1);
+    assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+  });
+}
+
+for (const [field, pipeline, filters] of [
+  ['pipeline', 'x', undefined],
+  ['filters', 'default', { blur: 2 }],
+] as const) {
+  test(`a store that loses ${field}: reads would miss the row, so the task is dead too`, async () => {
+    const w = world({ wrap: losing(field) });
+    const r = w.resizer(webpConfig(80), undefined, { default: {}, x: {} });
+    const doc = await bareMedia(w, r);
+    const errors = deadErrors(r);
+
+    await r.resolve({
+      media: doc,
+      sizes: [{ width: 20, height: 20, ...(filters ? { filters } : {}) }],
+      formats: ['webp'],
+      pipeline,
+    });
+    await w.work(r);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+    assert.match(errors[0].message, new RegExp(`did not keep ${field} of 1`));
+  });
+}
+
+// The case the group rule exists for.
+test('a content-addressed store gives two size keys one ref: the task completes and the next read queues nothing', async () => {
+  const w = world();
+  contentAddressed(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc, twoBoxes);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  const rows = doc.previews ?? [];
+  assert.deepEqual(
+    rows.map((row) => row.sizeKey),
+    ['100x100', '200x200'],
+  );
+  // The case itself: one written row's first row under the ref is another size key's.
+  assert.deepEqual(rows[0].storageRef, rows[1].storageRef);
+  const again = await w.read(r, doc, twoBoxes);
+  assert.equal(again.decision.missing.length, 0);
+  assert.equal(w.tasks.rows.length, 1);
+});
+
+test('one ref for two rows, and the store lost encodeSig of one: only that row is named', async () => {
+  const w = world({
+    wrap: losing('encodeSig', (row) => row.sizeKey === '200x200'),
+  });
+  contentAddressed(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+
+  await w.read(r, doc, twoBoxes);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.match(
+    errors[0].message,
+    /did not keep encodeSig of 1 preview row\(s\)/,
+  );
+  assert.match(
+    errors[0].message,
+    /default:default:200x200:webp:none \(encodeSig\)$/,
+  );
+});
+
+test('a store that loses encodeSig from a replaced row: the task is dead too', async () => {
+  const w = world();
+  const doc = await w.seed(w.resizer(webpConfig(80)));
+  resetResizerForTests();
+  const r = new Resizer({
+    config: webpConfig(70),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    media: losing('encodeSig')(w.store),
+    tasks: w.tasks,
+  });
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+});
+
+test('a reload that lags behind the write raises nothing: the task completes as before', async () => {
+  let loads = 0;
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: async (id) => {
+          const doc = await inner.loadMedia(id);
+          loads += 1;
+          return loads > 1 && doc ? { ...doc, previews: [] } : doc;
+        },
+        appendPreviews: (id, previews, dims) =>
+          inner.appendPreviews(id, previews, dims),
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.ok(loads > 1);
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+});
+
+test("an original swapped during the worker's download stays the retryable RESIZE_WORKER_INCOMPLETE, and its retry completes", async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const other = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const download = w.storage.download;
+  let swapped = false;
+  w.storage.download = async (ref) => {
+    const bytes = await download(ref);
+    if (!swapped) {
+      swapped = true;
+      doc.original = other;
+    }
+    return bytes;
+  };
+  const failed: string[] = [];
+  r.hook('onTaskFailed', (_task, err) => {
+    failed.push((err as ResizeError).code);
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(failed, ['RESIZE_WORKER_INCOMPLETE']);
+  assert.deepEqual(statuses(w), [['completed', 2]]);
+});
+
+test('generate() reads nothing back: a store that loses encodeSig does not fail the call', async () => {
+  const w = world({ wrap: losing('encodeSig') });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  const { created } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(created.length, 1);
 });

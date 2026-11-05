@@ -60,6 +60,7 @@ import {
   checkReplaced,
   PreviewRecorder,
   requireReplacePreviews,
+  rowsNotKept,
 } from './previewRecorder.ts';
 import { checkRaster } from './raster.ts';
 import {
@@ -604,6 +605,9 @@ interface RenderPendingArgs {
 interface RenderPendingResult {
   // Previews this call stored (or, with persist:false, produced).
   generated: Preview[];
+  // The rows of `generated`, and those the store left out although it holds no row of their
+  // identity: its answer can already lack the field it lost.
+  written: Preview[];
   failedCount: number;
   // The stored rows the persist replaced (outdated, or a concurrent row of the same identity), and
   // the identities of the stored previews that replaced them.
@@ -846,11 +850,12 @@ export class Processor {
   }
 
   /**
-   * One queued task: the core, then a check that every requested identity is stored fresh. The
-   * worker loop (src/consumer.ts) runs it through the worker; it SUCCEEDS by returning and FAILS by
-   * throwing (which engages the queue's retry → dead-letter). It takes no locks: the lease keeps
-   * the task to one worker at a time, and the media store keeps one row per preview identity. It
-   * resolves how many variants the task asked for and how many this delivery stored.
+   * One queued task: the core, then a check that the store kept what this delivery wrote and that
+   * every requested identity is stored fresh. The worker loop (src/consumer.ts) runs it through the
+   * worker; it SUCCEEDS by returning and FAILS by throwing (which engages the queue's retry →
+   * dead-letter). It takes no locks: the lease keeps the task to one worker at a time, and the media
+   * store keeps one row per preview identity. It resolves how many variants the task asked for and
+   * how many this delivery stored.
    */
   async processTask(
     task: LeasedTask,
@@ -889,6 +894,7 @@ export class Processor {
     const { signed: held } = snapshotOriginal(media.original);
     const {
       generated,
+      written,
       failedCount,
       failures,
       finalFailures,
@@ -950,6 +956,23 @@ export class Processor {
       this.#warnedBackfill = true;
       logger.warn(
         `resize worker: the media store did not record the original's dimensions of media ${task.mediaId} — every read of such a media queues a task that downloads the original; a MediaStore must save backfillDims in appendPreviews`,
+      );
+    }
+    // The coverage below counts this worker's own rows, so it cannot see a store that lost a field
+    // of them. Rows are compared with what was written, not with the current settings: a settings
+    // change or a swapped original is staleness, and must not raise this.
+    const notKept = rowsNotKept(written, refreshed.previews);
+    if (notKept.length > 0) {
+      const fields = [...new Set(notKept.flatMap((row) => row.fields))].join(
+        ', ',
+      );
+      const rows = notKept
+        .map((row) => `${row.identity} (${row.fields.join(', ')})`)
+        .join('; ');
+      // The fields come before the row list: a dead line cuts the error's text at 1000 characters.
+      throw new ResizeSetupError(
+        `resize worker: the media store did not keep ${fields} of ${notKept.length} preview row(s) of media ${task.mediaId}, so reads may render them again and again — a MediaStore must store and return identity, origin, encodeSig, sizeKey, format, resizer, pipeline and filters as given: ${rows}`,
+        { code: 'RESIZE_MEDIA_ROW_NOT_KEPT', retryable: false },
       );
     }
     const covered = catalog.freshIdentities(
@@ -1087,11 +1110,13 @@ export class Processor {
     let generated: Preview[] = [];
     let failedCount = 0;
     let removed: Preview[] = [];
+    const leftOut: Preview[] = [];
     const replaced = new Set<string>();
     const failures = new Map<string, unknown>();
     const finalFailures = new Set<string>();
     const nothing = (): RenderPendingResult => ({
       generated,
+      written: [],
       failedCount,
       removed,
       replaced,
@@ -1488,6 +1513,7 @@ export class Processor {
         } else {
           // The media store left it out and does not hold it (or the media is gone): logged by
           // the recorder, and not stored.
+          leftOut.push(row);
           recordVariant(plan.identity, plan.variant.format, ms, 'failed');
         }
       }
@@ -1510,6 +1536,7 @@ export class Processor {
 
     return {
       generated,
+      written: [...generated, ...leftOut],
       failedCount,
       removed,
       replaced,

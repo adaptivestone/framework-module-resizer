@@ -275,9 +275,9 @@ export default {
   without `gatesByTask` (SQS). Set it to your worst queue wait, not to the old
   dispatch value.
 - A hand-written media schema that declares preview rows as strict sub-documents must declare
-  `identity`, `origin` and `encodeSig` in them, each `{ type: String }`, and `fit` as
+  `identity`, `origin`, `encodeSig`, `sizeKey` and `format` in them, each `{ type: String }`, and `fit` as
   `{ type: Boolean }` (the fragment already has them, with `bytes` and `createdAt`);
-  `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first three, and logs
+  `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first five, and logs
   one warning without `fit`. Rows written earlier have no identity and are
   not migrated. A custom model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate`
   (and optionally `castObject`), and must accept an update pipeline (statement 2). A

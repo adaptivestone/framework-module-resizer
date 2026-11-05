@@ -503,8 +503,9 @@ cast rejects with Mongoose's `ValidationError` before anything is written; `stor
 `filters` are stored as given, cast or not); without it they are written as given, minus their
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
-sub-documents without `identity`, `origin` or `encodeSig` (a mixed or plain `previews` array, or
-rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and logs one warning
+sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey` or `format` (a mixed or plain
+`previews` array, or rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and
+logs one warning
 when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
 `logger` option, default `console`), `MongoLockStore.verify()`
 with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock schema has no `owner` field (for example
@@ -601,6 +602,14 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
+  - `loadMedia` must return each stored row's `identity`, `origin`, `encodeSig`, `sizeKey`, `format`,
+    `resizer`, `pipeline`, `filters` and `storageRef` as they were given. After a task's writes the
+    worker reloads the media and looks at the rows under each `storageRef` it wrote. No such row
+    raises nothing (a lagging reload; a store that reshapes refs is not detected). Rows there, and
+    none matches what was written in those fields: the task fails with `ResizeSetupError`
+    `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields, because such a store makes
+    reads render the preview again and again. `fit` is exempt. A store that returns one ref for two
+    rows is judged against all of them.
   - `appendPreviews` stores a preview only when its `identity` is not stored on the media yet, and
     must resolve with the previews it stored (`[]` when none); resolving with something other than
     an array (e.g. `undefined`) fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.
@@ -1555,7 +1564,7 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.
-    The module sets it on every `ResizeSecurityError` and on ten codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
+    The module sets it on every `ResizeSecurityError` and on eleven codes: the media store did not keep what a task wrote (`RESIZE_MEDIA_ROW_NOT_KEPT`), the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
     dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
     source has no dimensions or exceeds the pixel or byte limits
@@ -1570,7 +1579,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     from other libraries are retried, whatever fields they carry. The rule for `false`: no later
     delivery of the same input can succeed, where a later delivery includes one after a rolling
     deploy reaches this worker, so `RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay
-    `true`, and so does every unclear case. `ResizeOriginalError` and `ResizeConfigError` default
+    `true`, and so does every unclear case. `RESIZE_MEDIA_ROW_NOT_KEPT` is the one exception: a
+    deployed store fix would help, but every retry until then costs a render, an upload and an
+    orphaned file. `ResizeOriginalError` and `ResizeConfigError` default
     to `false`, like `ResizeSecurityError`, and any other `ResizeError` to `true`;
     `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false` and
     the media still holds the original they were rendered from, and `generate()`'s

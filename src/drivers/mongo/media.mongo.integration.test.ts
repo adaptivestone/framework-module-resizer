@@ -3,14 +3,18 @@
 // records, the startup check for a media model without those fields, and the `model` / `getModel`
 // options.
 import assert from 'node:assert/strict';
-import { after, before, describe, test } from 'node:test';
+import { after, afterEach, before, describe, test } from 'node:test';
 import { types } from 'node:util';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import sharp from 'sharp';
 import { ResizeSetupError } from '../../errors.ts';
+import { Resizer, resetResizerForTests } from '../../resizer.ts';
 import { encodeSignature, previewOrigin } from '../../signatures.ts';
+import { MemoryTaskQueue, memoryStorage } from '../../testHelpers/fakes.ts';
 import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
-import type { Preview } from '../../types.d.ts';
+import { workUntil } from '../../testHelpers/work.ts';
+import type { MediaLike, Preview, ResizeLogger } from '../../types.d.ts';
 import { MongoMediaStore, type MongoMediaStoreOptions } from './index.ts';
 import { resizeMediaSchemaFragment } from './mediaFragment.ts';
 
@@ -30,6 +34,8 @@ after(async () => {
   await connection.close();
   await server.stop();
 });
+
+afterEach(resetResizerForTests);
 
 const Media = () =>
   connection.models.IdentityMedia ??
@@ -1213,6 +1219,75 @@ describe('MongoMediaStore options', () => {
     assert.throws(
       () => new MongoMediaStore({ model: Media(), getModel: Media }),
       required,
+    );
+  });
+});
+
+describe('a worker over real rows', () => {
+  test('hydrated rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a namespaced ref, a fit row, a filtered row, first rendered and then replaced', async () => {
+    const png = await sharp({
+      create: {
+        width: 64,
+        height: 48,
+        channels: 3,
+        background: { r: 200, g: 0, b: 0 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const logger: ResizeLogger = {
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    };
+    const { storage } = memoryStorage();
+    const tasks = new MemoryTaskQueue({
+      timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+    });
+    const store = mediaStore();
+    const resizerAt = (quality: number) =>
+      new Resizer({
+        config: makeImageConfig({
+          formats: ['webp'],
+          encode: { formats: { webp: { quality } } },
+        }),
+        logger,
+        storage,
+        media: store,
+        tasks,
+      });
+    let r = resizerAt(80);
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+      namespace: 'avatars',
+    });
+    const id = String((await Media().create({ original }))._id);
+    const sizes = [
+      { width: 20, height: 20 },
+      { fit: true },
+      { width: 30, filters: { blur: 2, mode: 'soft' } },
+    ];
+    const render = async () => {
+      await r.resolve({
+        media: (await store.loadMedia(id)) as MediaLike,
+        sizes,
+      });
+      await workUntil({ logger, resizers: [r] }, () =>
+        tasks.rows.every(
+          (row) => row.status === 'completed' || row.status === 'dead',
+        ),
+      );
+    };
+
+    await render();
+    resetResizerForTests();
+    r = resizerAt(70);
+    await render();
+
+    assert.deepEqual(
+      tasks.rows.map((row) => row.status),
+      ['completed', 'completed'],
     );
   });
 });
