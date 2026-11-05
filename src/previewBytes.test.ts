@@ -1,6 +1,7 @@
 // The files a render writes. Each case spells out, with Sharp itself, the chain that wrote the files
 // of 0.3.0, and compares its bytes with what `generate()` uploads. Both sides run in one process on
-// one Sharp, so a Sharp upgrade moves them together: this fails only when the module's chain changes.
+// one Sharp, so a Sharp upgrade moves them together: bytes that differ mean the module's chain
+// changed. An `assert.equal` on a size pins Sharp's own rounding, so an upgrade can fail those alone.
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import sharp, {
@@ -28,7 +29,8 @@ const config = makeImageConfig({
       webp: { quality: 82, effort: 2 },
       png: {},
       avif: { quality: 64, effort: 2 },
-      gif: {},
+      gif: { loop: 5 }, // host options beat the source's timing
+      tiff: {},
     },
   },
 });
@@ -371,6 +373,80 @@ test('no steps, an animation: WebP and GIF keep the frames, JPEG gets the first'
   };
   await assertSame(files, '32w', animated, ['webp', 'gif']);
   await assertSame(files, '32w', frames[0], ['jpeg']);
+});
+
+test('no steps, an animation at its own size keeps its frames; other formats get the first', async () => {
+  const stack = Buffer.concat([
+    pixels(64, 48, 3),
+    pixels(64, 48, 3).reverse(),
+    pixels(64, 48, 3),
+  ]);
+  const bytes = await sharp(stack, {
+    raw: { width: 64, height: 144, channels: 3, pageHeight: 48 },
+  })
+    .gif({ delay: [100, 200, 300], loop: 3 })
+    .toBuffer();
+  const files = await uploaded(
+    bytes,
+    [{ fit: true }],
+    ['webp', 'gif', 'avif', 'png', 'tiff'],
+  );
+  const base = await decoded(bytes, { width: 64, height: 48 }, 3);
+  await assertSame(
+    files,
+    'fit',
+    {
+      data: base.data,
+      info: { ...base.info, frames: 3, delay: [100, 200, 300], loop: 3 },
+    },
+    ['webp', 'gif'],
+  );
+  const { width, height, channels } = base.info;
+  await assertSame(
+    files,
+    'fit',
+    {
+      data: base.data.subarray(0, width * height * channels),
+      info: { width, height, channels },
+    },
+    ['avif', 'png', 'tiff'],
+  );
+});
+
+test('no steps, a large photo: fit scales down to maxSize, not sharpened', async () => {
+  // `{ width: 2400 }` keeps the decode at full size: a fit alone is decoded at the fit's own size,
+  // and the resize never runs. maxSize.height decides: the width alone would allow 2000×1333.
+  const bytes = await image(2400, 1600, 3).jpeg({ quality: 90 }).toBuffer();
+  const files = await uploaded(bytes, [{ fit: true }, { width: 2400 }], STILL);
+  const base = await decoded(bytes, { width: 2400, height: 1600 });
+  await assertSame(
+    files,
+    'fit',
+    await resizedAsBefore(base, { ...fill(1800, 1200), sharpen: false }),
+    STILL,
+  );
+});
+
+test('no steps, a small source: a width-only size and a one-side box enlarge', async () => {
+  const bytes = await image(100, 60, 3).jpeg({ quality: 90 }).toBuffer();
+  const files = await uploaded(
+    bytes,
+    [{ width: 200 }, { width: 80, height: 80 }],
+    STILL,
+  );
+  const base = await decoded(bytes, { width: 100, height: 60 });
+  await assertSame(
+    files,
+    '200w',
+    await resizedAsBefore(base, fill(200, 120)),
+    STILL,
+  );
+  await assertSame(
+    files,
+    '80x80',
+    await resizedAsBefore(base, cover(80, 80)),
+    STILL,
+  );
 });
 
 test('beforeSteps: the reduction to the box scales both axes by one factor', async () => {
