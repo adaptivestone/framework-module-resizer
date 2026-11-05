@@ -46,8 +46,8 @@ const MIN_STOP_BEFORE_TIMEOUT_MS = SETTLE_MARGIN_MS + 1000;
 /**
  * Push delivery (preview): the handler of an SQS trigger, for a standard queue. It may be called
  * before the Resizers exist: they are looked up, and every start check runs, at the first invocation.
- * A check that rejects throws from the invocation and touches no record, and the next invocation
- * checks again.
+ * A check that rejects throws from the invocation, which makes no queue call but uses a receive of
+ * each record in it, and the next invocation checks again.
  *
  * The trigger must set `ReportBatchItemFailures`, or retries are lost silently: Lambda then reads the
  * returned list as a success and deletes every message of the batch.

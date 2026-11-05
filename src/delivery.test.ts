@@ -828,7 +828,7 @@ test('an empty batch runs the checks and lists nothing', async () => {
   assert.deepEqual(sqs.calls, []);
 });
 
-test('the checks run once, and rejected checks throw, touch no record and run again next time', async () => {
+test('the checks run once, and rejected checks throw, make no queue call and run again next time', async () => {
   const sqs = fakeSqs();
   const { wiring } = pushed(sqs, async () => assert.fail('must not run'));
   let runs = 0;

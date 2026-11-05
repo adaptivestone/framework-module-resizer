@@ -29,10 +29,13 @@ export const DEAD_URL =
 export const GATE_KEY = gateKey('default', 'default', 'm1', 'default');
 
 /**
- * What one SQS command does on its `nth` call, from 1: an `Error` makes the call throw, a promise
- * makes it wait, and undefined lets it answer.
+ * What one SQS command does on its `nth` call, from 1, given the call's input: an `Error` makes the
+ * call throw, a promise makes it wait, and undefined lets it answer.
  */
-type Hold = (nth: number) => Error | Promise<void> | undefined;
+type Hold = (
+  nth: number,
+  input: Record<string, unknown>,
+) => Error | Promise<void> | undefined;
 
 export type FakeSqs = ReturnType<typeof fakeSqs>;
 
@@ -51,7 +54,7 @@ export function fakeSqs(hold: Partial<Record<string, Hold>> = {}) {
           input: Record<string, unknown>;
         };
         calls.push({ name, input });
-        const held = await hold[name]?.(named(name).length);
+        const held = await hold[name]?.(named(name).length, input);
         if (held instanceof Error) {
           throw held;
         }

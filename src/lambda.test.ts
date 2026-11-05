@@ -237,7 +237,7 @@ test('a Resizer constructed after the first invocation is not served: its task f
   );
 });
 
-test('a consumed name on a task queue that cannot take pushes is refused, touches no record and is checked again next time', async () => {
+test('a consumed name on a task queue that cannot take pushes is refused, makes no queue call and is checked again next time', async () => {
   let checks = 0;
   const { sqs } = realResizer({
     tasks: new PlainTaskQueue(),
@@ -657,6 +657,46 @@ test('a full run, then its duplicate delivery, renders once', async () => {
   assert.equal(rows.get('m1')?.length, 2);
   assert.equal(uploads(), 2, 'the duplicate rendered nothing');
   assert.equal(sqs.deletes(), 2);
+});
+
+test('a lease SQS would refuse counted from the receipt is capped: the task runs and stores its rows', async () => {
+  // SQS's 12 h run from the receipt, and this message waited a minute before the invocation. It calls
+  // a value past that invalid, which reads as a lost receipt, so at 43200 s no task would ever run.
+  const receivedAgoSeconds = 60;
+  const sqs = fakeSqs({
+    ChangeMessageVisibilityCommand: (_nth, { VisibilityTimeout }) =>
+      receivedAgoSeconds + (VisibilityTimeout as number) > 43_200
+        ? Object.assign(new Error('past the 12 hour limit'), {
+            name: 'InvalidParameterValue',
+          })
+        : undefined,
+  });
+  const { rows, uploads } = realResizer({
+    sqs,
+    tasks: new SqsTaskQueue({
+      queueUrl: QUEUE_URL,
+      client: sqs.client as never,
+      logger: silentLogger,
+      timing: { leaseMs: 43_200_000 },
+    }),
+  });
+  const { logger, lines } = recording();
+  const handler = batchHandler(() => wiringOf({ logger }), {
+    settleMarginMs: 100,
+  });
+  const out = await handler(
+    { Records: [recordOf('a', { body: bodyOf(2) })] },
+    contextOf(60_000),
+  );
+  assert.deepEqual(out.batchItemFailures, []);
+  assert.equal(rows.get('m1')?.length, 2);
+  assert.equal(uploads(), 2);
+  assert.equal(sqs.deletes(), 1);
+  assert.deepEqual(sqs.visibility(), [39_600], 'it asked 11 h');
+  assert.ok(
+    !lines.some(({ message }) => /lost its receipt/.test(message)),
+    'the adoption was accepted',
+  );
 });
 
 test('a stop mid-task keeps the finished variants, and the retry renders only the rest', async () => {

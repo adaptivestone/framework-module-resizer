@@ -718,7 +718,7 @@ timed(
 // N from the numbers the line prints: a default reserve takes half of what is left, so the budget
 // reaches the least at twice that; an explicit one takes itself. Time already spent counts too.
 timed(
-  'the not-started error line names the function timeout to raise to',
+  'the not-started error line names the time a task needs to start, and where the README starts',
   async () => {
     const rows: {
       name: string;
@@ -755,11 +755,60 @@ timed(
       assert.match(
         line?.message ?? '',
         new RegExp(
-          `the function timeout is too small for this reserve; raise it to at least ${target}\\.`,
+          `the function timeout is too small: it needs at least ${target} to start a task, plus the slowest task's time; the README starts at 300 s\\.`,
         ),
         name,
       );
     }
+  },
+);
+
+timed(
+  'a delivery never asks for more than 11 h: a longer lease is capped for the Consumer too',
+  async () => {
+    const sqs = fakeSqs();
+    let gateMs = 0;
+    const { handler, locks } = pushed(
+      sqs,
+      async () => {
+        await sleep(20);
+        gateMs = (locks.entry(GATE_KEY)?.expiresAt ?? 0) - Date.now();
+      },
+      { margin: MARGIN, timing: { leaseMs: 43_200_000 } },
+    );
+    await locks.acquire(GATE_KEY, 'g1', 1000);
+    const out = await handler({ Records: [recordOf('a')] }, contextOf(60_000));
+    assert.deepEqual(out.batchItemFailures, []);
+    assert.deepEqual(sqs.visibility(), [39_600]);
+    // Its gate lasts the capped lease and one heartbeat, 16.5 h, where 12 h and 6 h would be 18 h.
+    assert.ok(
+      gateMs > 59_000_000 && gateMs <= 59_400_000,
+      `the running gate lasted ${gateMs} ms`,
+    );
+  },
+);
+
+timed(
+  'a delivery never asks for more than 11 h: a longer backoff is capped, and its line says so',
+  async () => {
+    const sqs = fakeSqs();
+    const { handler, lines } = pushed(
+      sqs,
+      async () => {
+        throw new Error('boom');
+      },
+      {
+        margin: MARGIN,
+        timing: { retryBackoffMs: { base: 90_000_000, max: 90_000_000 } },
+      },
+    );
+    const out = await handler({ Records: [recordOf('a')] }, contextOf(60_000));
+    assert.deepEqual(out.batchItemFailures, [{ itemIdentifier: 'a' }]);
+    assert.deepEqual(sqs.visibility(), [60, 39_600]);
+    assert.ok(
+      lines.some(({ message }) => /retrying in 39600000 ms/.test(message)),
+      'the line says what was asked',
+    );
   },
 );
 

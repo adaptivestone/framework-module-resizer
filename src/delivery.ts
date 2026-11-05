@@ -103,6 +103,27 @@ export function defaultReserveMs(
   return Math.min(processingSeconds * 1000 + 5000, Math.floor(remainingMs / 2));
 }
 
+// The most a delivery asks of SQS. Its 12 h limit on a message's visibility counts from the receipt,
+// and it refuses a value past what is left of them, an answer that reads as a lost receipt, so with
+// a longer lease no task would ever run. The hour left covers the poller's hold before the
+// invocation, and no function outlives 15 minutes, so no later call reaches the limit. A crash at
+// such a lease comes back after 11 h. A pull worker's calls stay as they are.
+const MAX_DELIVERY_VISIBILITY_MS = 39_600_000;
+
+/** A queue's timing for one delivery: the lease and the backoff within what SQS would take. */
+function deliveryTiming(
+  timing: ConsumerDeps['timing'],
+): ConsumerDeps['timing'] {
+  return {
+    ...timing,
+    leaseMs: Math.min(timing.leaseMs, MAX_DELIVERY_VISIBILITY_MS),
+    retryBackoffMs: {
+      ...timing.retryBackoffMs,
+      max: Math.min(timing.retryBackoffMs.max, MAX_DELIVERY_VISIBILITY_MS),
+    },
+  };
+}
+
 // How a delivery ended. Only 'completed', 'dead' and 'discarded' took the message out of the queue.
 type DeliveryEnd =
   | 'completed'
@@ -278,10 +299,11 @@ function laneOf(
 async function adopt(
   lane: DeliveryLane,
   task: ClaimedTask,
+  leaseMs: number,
   onFailure: (err: unknown) => void,
 ): Promise<boolean> {
   try {
-    return await lane.carrier.renew(task, lane.deps.timing.leaseMs);
+    return await lane.carrier.renew(task, leaseMs);
   } catch (err) {
     onFailure(err);
     return true;
@@ -328,7 +350,7 @@ function logNotStarted(
     const spent = enteredWithMs - left();
     logNeverThrow(
       logger,
-      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small for this reserve; raise it to at least ${Math.ceil((spent + leftToStart) / 1000)} s. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
+      `resize lambda: message ${id}, the first record of this invocation, was not started: ${time} — the function timeout is too small: it needs at least ${Math.ceil((spent + leftToStart) / 1000)} s to start a task, plus the slowest task's time; the README starts at 300 s. ${willDie ? `And ${dying}` : `It is listed for a retry ${retry}`}`,
     );
     return;
   }
@@ -401,10 +423,13 @@ async function deliver(
     defaultReserveMs(left(), wired.processingSecondsOf(task) ?? 0);
   const needed = Math.max(margin, run.longest);
   const budget = () => left() - reserve;
+  const timing = deliveryTiming(lane.deps.timing);
   // A record that will not start is not adopted, and an adoption's time comes out of the budget, not
   // out of the reserve, as the budget is read again after it.
   if (budget() >= needed) {
-    const adoption = adopt(lane, task, (err) => run.onAdoptionFailure(id, err));
+    const adoption = adopt(lane, task, timing.leaseMs, (err) =>
+      run.onAdoptionFailure(id, err),
+    );
     if (!(await settledWithin(adoption, left() - margin))) {
       // No Consumer ran, so no later dead-letter line follows: this is the only report.
       run.expired = true;
@@ -432,7 +457,7 @@ async function deliver(
       index,
       Math.max(0, budget()),
       needed,
-      task.attempts > lane.deps.timing.maxAttempts,
+      task.attempts > timing.maxAttempts,
     );
   }
   const stop = new AbortController();
@@ -451,10 +476,10 @@ async function deliver(
     // them instead.
     timing: start
       ? {
-          ...lane.deps.timing,
-          taskTimeoutMs: Math.min(lane.deps.timing.taskTimeoutMs, budget()),
+          ...timing,
+          taskTimeoutMs: Math.min(timing.taskTimeoutMs, budget()),
         }
-      : lane.deps.timing,
+      : timing,
     handle: (leased, opts) => {
       const running = lane.deps.handle(leased, opts);
       const ended = () => {
@@ -487,8 +512,9 @@ async function deliver(
 
 /**
  * The handler of an SQS trigger: checks the event, runs `wiring` once (it runs again after it
- * rejected, which throws from the invocation and touches no record, and it is waited for until the
- * margin at most), then delivers the records in order and lists those that stay in the queue.
+ * rejected, which throws from the invocation, makes no queue call and uses a receive of each record,
+ * and it is waited for until the margin at most), then delivers the records in order and lists those
+ * that stay in the queue.
  */
 export function batchHandler(
   wiring: () => Promise<DeliveryWiring>,
