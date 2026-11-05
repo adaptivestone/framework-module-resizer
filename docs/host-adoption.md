@@ -279,16 +279,14 @@ export default {
   `{ type: String }`, `storageRef` as `{ type: 'Mixed' }`, and `fit` as `{ type: Boolean }` (the
   fragment already has them, with `bytes` and `createdAt`); `resizer.verify()` throws
   `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first seven, and logs one warning without `fit`.
-  Rows written earlier have no identity and are not migrated. Declare `_id` on the rows as
-  `{ type: 'ObjectId', auto: false }`, as the fragment does, so new rows store none: an automatic
-  `_id` is a new random id on each load of a replaced row, and `_id: false` makes a removal by the
-  id of an older row remove every row. Remove a new row by `identity` or with `invalidate()`:
-  `previews.pull({ _id: row._id })` on one removes every row. A custom model-shaped
-  `MongoMediaModel` needs `findById` and `findOneAndUpdate` (and optionally `castObject`), and must
-  accept an update pipeline (statement 2). A
-  `findOneAndUpdate` middleware on the media model runs once per preview write (and once for the
-  dimension backfill) and receives a document with only `_id`, or `null` when the preview was
-  already stored or the media is gone, or, for a backfill, when the pair is already stored; it also
+  Rows written earlier have no identity and are not migrated. A replaced row stores an `_id` exactly
+  when an appended one would; one replaced under 0.3.0 has none stored and reads a new random one on
+  each load until it is next replaced, so remove it by `identity` or with `invalidate()`. A custom
+  model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate` (and optionally `castObject`,
+  and `schema` and `base` for a replaced row's `_id`), and must accept an update pipeline
+  (statement 2). A `findOneAndUpdate` middleware on the media model runs once per preview write (and
+  once for the dimension backfill) and receives a document with only `_id`, or `null` when the
+  preview was already stored or the media is gone, or, for a backfill, when the pair is already stored; it also
   sees the update pipeline of `replacePreviews`.
 - A custom `MediaStore` must implement `replacePreviews(mediaId, identities, rows)`: in one
   atomic write per media, remove every stored row whose `identity` is in `identities` or belongs
@@ -343,9 +341,9 @@ export default {
   been drained. Task rows from before the gate have no `active` field and are not
   gates, so during a rolling deploy a read can queue a second task for such a media.
   The next `add()` takes over a row that a worker from before the gate completed or
-  dead-lettered (such a worker leaves it active and sets no cooldown). There are no dispatch or worker locks any more: the only lock is the
-  gate lock of a task queue without `gatesByTask` (SQS), which lasts
-  `coordination.gateTtlMs` until a worker extends it. An older SQS worker ignores
+  dead-lettered (such a worker leaves it active and sets no cooldown). There are no dispatch or
+  worker locks any more: the only lock is the gate lock of a task queue without `gatesByTask`
+  (SQS), which lasts `coordination.gateTtlMs` until a worker extends it. An older SQS worker ignores
   the lock's owner, so the gate lock of a task it ran expires only after
   `gateTtlMs`. Lock rows that an older version wrote are never read again and expire
   by their TTL.

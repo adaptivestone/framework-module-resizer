@@ -297,11 +297,9 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    signatures record what each row was made from, and a read finds and serves a row by the other
    four.
    Give them `fit` (`{ type: Boolean }`) too; `verify()` logs one warning without it.
-   New rows of the fragment store no `_id` (`row._id` reads `undefined`; older rows keep theirs):
-   key them by `identity`, and remove one by `identity` or with `invalidate()`, because
-   `previews.pull({ _id: row._id })` on such a row removes every row. A hand-written row schema
-   declares `_id: { type: 'ObjectId', auto: false }`, never `_id: false`, under which a removal by
-   the id of an older row removes every row.
+   A replaced row stores an `_id` exactly when an appended one would. One replaced under 0.3.0 has
+   none stored and reads a new random one on each load until it is next replaced, so key rows by
+   `identity`, and remove such a row by `identity` or with `invalidate()`.
    With strict types, pass a loaded Mongoose document as `media: doc as MediaLike`
    (`import type { MediaLike }`), or type the model's `original`/`previews` paths with
    `Original`/`Preview` (framework hosts: `TsTypeOverride`).

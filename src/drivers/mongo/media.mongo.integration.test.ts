@@ -504,88 +504,14 @@ describe('MongoMediaStore: the dimension backfill writes only while the pair is 
   });
 });
 
-describe('MongoMediaStore: new preview rows store no _id', () => {
-  test('neither an appended nor a replaced row stores one, and two loads read the same rows', async () => {
-    const store = mediaStore();
-    const id = await newMedia();
-    await store.appendPreviews(id, [preview(ID_A)]);
-    await store.replacePreviews(id, [ID_B], [preview(ID_B)]);
-
-    assert.deepEqual(
-      (await storedPreviews(id)).map((row) => '_id' in row),
-      [false, false],
-    );
-    const one = await Media().findById(id);
-    const two = await Media().findById(id);
-    assert.deepEqual(one?.toObject().previews, two?.toObject().previews);
-  });
-
-  test('an older row with a stored _id keeps it when loaded, and is replaced by its identity', async () => {
-    const id = await newMedia();
-    const stored = new mongoose.Types.ObjectId();
-    await Media().collection.updateOne(
-      { _id: new mongoose.Types.ObjectId(id) },
-      { $push: { previews: { ...preview(ID_A), _id: stored } } } as never,
-    );
-
-    const loaded = await Media().findById(id);
-    const row = loaded?.toObject().previews[0] as { _id?: unknown };
-    assert.equal(String(row._id), String(stored));
-
-    const { removed } = await mediaStore().replacePreviews(
-      id,
-      [ID_A],
-      [preview(ID_A, 'new')],
-    );
-    assert.equal(removed.length, 1);
-    assert.deepEqual(
-      (await storedPreviews(id)).map((r) => '_id' in r),
-      [false],
-    );
-  });
-
-  test('the upgrade renders nothing: a row stored with an _id reads fresh through the current fragment, and queues no task', async () => {
-    // One collection, written through rows that keep their `_id`, as 0.3.0's fragment did.
-    const { _id: _rowId, ...rowFields } = resizeMediaSchemaFragment.previews[0];
-    const named = (name: string, definition: object) =>
-      connection.models[name] ??
-      connection.model(
-        name,
-        new mongoose.Schema(definition as never, { minimize: false }),
-        'upgraded_media',
-      );
-    const before = named('UpgradeBeforeMedia', {
-      original: resizeMediaSchemaFragment.original,
-      previews: [rowFields],
-    });
-    const current = named('UpgradeCurrentMedia', {
-      ...resizeMediaSchemaFragment,
-    });
-    const sizes = [{ width: 20, height: 20 }];
-    const { r, id, tasks } = await firstRender(before, sizes);
-    const [stored] = (
-      (await current.findById(id).lean()) as { previews: Preview[] }
-    ).previews;
-    assert.ok('_id' in stored);
-
-    const { decision } = await r.resolve({
-      media: (await new MongoMediaStore({ model: current }).loadMedia(
-        id,
-      )) as MediaLike,
-      sizes,
-    });
-
-    assert.equal(decision.missing.length, 0);
-    assert.equal(decision.ready.length, 1);
-    assert.equal(decision.ready[0].stale, undefined);
-    assert.equal(tasks.rows.length, 1);
-  });
-
+describe('MongoMediaStore: a replaced row stores an _id exactly when an appended one would', () => {
+  type RawRow = { sizeKey: string; identity?: string; _id?: unknown };
   // A loaded media, as far as a host's code that removes a row reaches into it.
   interface LoadedRow {
     _id?: unknown;
     id?: unknown;
     identity?: string;
+    sizeKey: string;
     deleteOne(): unknown;
   }
   type LoadedRows = LoadedRow[] & {
@@ -595,198 +521,483 @@ describe('MongoMediaStore: new preview rows store no _id', () => {
   };
   interface LoadedMedia {
     previews: LoadedRows;
+    toObject(): { previews: unknown[] };
     markModified(path: string): void;
     save(): Promise<unknown>;
   }
+  type AnyModel = ReturnType<typeof mediaModelWith>;
 
-  const OLD_1 = new mongoose.Types.ObjectId();
-  const OLD_2 = new mongoose.Types.ObjectId();
-  const identityOf = (name: string) => `default:default:${name}:webp:`;
-  const namedRow = (name: string, _id?: mongoose.Types.ObjectId) => ({
-    ...preview(identityOf(name), name),
-    sizeKey: name,
-    ...(_id ? { _id } : {}),
-  });
-  // Written past the schema: two rows as 0.3.0 appended them, and two with no `_id`.
-  const mixedMedia = async (
-    model: ReturnType<typeof mediaModelWith> = Media(),
-  ) => {
-    const { insertedId } = await model.collection.insertOne({
-      previews: [
-        namedRow('old1', OLD_1),
-        namedRow('old2', OLD_2),
-        namedRow('new1'),
-        namedRow('new2'),
-      ],
-    } as never);
-    return {
-      id: insertedId,
-      doc: (await model.findById(insertedId)) as unknown as LoadedMedia,
-    };
-  };
-  const storedRows = async (
-    id: unknown,
-    model: ReturnType<typeof mediaModelWith> = Media(),
-  ) =>
+  // The rows as stored, read past Mongoose.
+  const rawRows = async (id: string, model: AnyModel = Media()) =>
     (
-      (await model.collection.findOne({ _id: id } as never)) as unknown as {
-        previews: Array<{ sizeKey: string; _id?: unknown }>;
+      (await model.collection.findOne({
+        _id: new mongoose.Types.ObjectId(id),
+      } as never)) as unknown as { previews: RawRow[] }
+    ).previews;
+  const loaded = async (id: string, model: AnyModel = Media()) =>
+    (await model.findById(id)) as unknown as LoadedMedia;
+  const leanRows = async (id: string, model: AnyModel = Media()) =>
+    (
+      (await model.findById(id).lean()) as unknown as {
+        previews: Array<{ _id?: unknown }>;
       }
     ).previews;
-  const storedKeys = async (
-    id: unknown,
-    model?: ReturnType<typeof mediaModelWith>,
-  ) => (await storedRows(id, model)).map((row) => row.sizeKey);
-  const OLD_REMOVED = ['old2', 'new1', 'new2'];
-  const NEW_REMOVED = ['old1', 'old2', 'new2'];
-  const ALL = ['old1', 'old2', 'new1', 'new2'];
-
-  test('row._id: an older row reads its stored id, a new row reads undefined, hydrated and lean', async () => {
-    const { id, doc } = await mixedMedia();
-    const stored = [String(OLD_1), String(OLD_2), undefined, undefined];
-    const text = (rows: Array<{ _id?: unknown }>) =>
-      rows.map((row) => (row._id === undefined ? undefined : String(row._id)));
-
-    assert.deepEqual(text(doc.previews), stored);
-    assert.deepEqual(
-      doc.previews.map((row) => row.id),
-      [String(OLD_1), String(OLD_2), null, null],
+  const kindOf = (value: unknown): string =>
+    value === undefined
+      ? 'none'
+      : ((value as { _bsontype?: string } | null)?._bsontype ?? typeof value);
+  const idText = (rows: Array<{ _id?: unknown }>) =>
+    rows.map((row) => String(row._id));
+  const identityOf = (name: string) => `default:default:${name}:webp:`;
+  const namedRow = (name: string): Preview => ({
+    ...preview(identityOf(name), name),
+    sizeKey: name,
+  });
+  const newMediaOn = async (model: AnyModel) =>
+    String(
+      (await model.collection.insertOne({ previews: [] } as never)).insertedId,
     );
-    const lean = (await Media().findById(id).lean()) as unknown as {
-      previews: Array<{ _id?: unknown }>;
-    };
-    assert.deepEqual(text(lean.previews), stored);
+  // Written past the schema: rows as 0.3.0 left them after a replacement.
+  const mediaWithoutIds = async (names: string[]) =>
+    String(
+      (
+        await Media().collection.insertOne({
+          previews: names.map(namedRow),
+        } as never)
+      ).insertedId,
+    );
+
+  test('an appended and a replaced row store a real ObjectId, and read the same hydrated, lean and on every load', async () => {
+    const store = mediaStore();
+    const id = await newMedia();
+    await store.appendPreviews(id, [preview(ID_A)]);
+    const { stored } = await store.replacePreviews(id, [ID_B], [preview(ID_B)]);
+
+    const raw = await rawRows(id);
+    assert.deepEqual(
+      raw.map((row) => kindOf(row._id)),
+      ['ObjectId', 'ObjectId'],
+    );
+    const ids = idText(raw);
+    const one = await loaded(id);
+    const two = await loaded(id);
+    assert.deepEqual(idText(one.previews), ids);
+    assert.deepEqual(idText(two.previews), ids);
+    assert.deepEqual(one.toObject().previews, two.toObject().previews);
+    assert.deepEqual(idText(await leanRows(id)), ids);
+    assert.deepEqual(idText(stored as never), [ids[1]]);
   });
 
-  test('markModified and a push invent no id when saved, and an older row keeps its own', async () => {
-    const { id, doc } = await mixedMedia();
-    doc.previews.push(namedRow('pushed') as unknown as LoadedRow);
-    doc.markModified('previews');
-    await doc.save();
-
-    const rows = await storedRows(id);
-    assert.deepEqual(
-      rows.map((row) => [row.sizeKey, '_id' in row]),
+  const rowFields = resizeMediaSchemaFragment.previews[0];
+  const countingId = { next: 0 };
+  // Each row schema with the kind of `_id` an appended row gets under it, read from the stored
+  // row. Measured the same on mongoose 9.0.0 and 9.11.4.
+  for (const [name, previews, kind] of [
+    ['the fragment', [rowFields], 'ObjectId'],
+    ['an explicit row schema', [new mongoose.Schema(rowFields)], 'ObjectId'],
+    [
+      'rows with strict: false',
+      [new mongoose.Schema(rowFields, { strict: false })],
+      'ObjectId',
+    ],
+    [
+      'an _id with auto: true',
+      [{ ...rowFields, _id: { type: 'ObjectId', auto: true } }],
+      'ObjectId',
+    ],
+    [
+      'an ObjectId _id with its own default',
       [
-        ['old1', true],
-        ['old2', true],
-        ['new1', false],
-        ['new2', false],
-        ['pushed', false],
+        {
+          ...rowFields,
+          _id: {
+            type: 'ObjectId',
+            default: () => new mongoose.Types.ObjectId(),
+          },
+        },
       ],
-    );
-    assert.equal(String(rows[0]._id), String(OLD_1));
-  });
+      'ObjectId',
+    ],
+    [
+      'a String _id with its own default',
+      [
+        {
+          ...rowFields,
+          _id: { type: String, default: () => `row-${++countingId.next}` },
+        },
+      ],
+      'string',
+    ],
+    [
+      'an ObjectId _id whose default gives a hex string',
+      [
+        {
+          ...rowFields,
+          _id: {
+            type: 'ObjectId',
+            default: () => new mongoose.Types.ObjectId().toHexString(),
+          },
+        },
+      ],
+      'ObjectId',
+    ],
+    [
+      'rows with _id: false',
+      [new mongoose.Schema(rowFields, { _id: false })],
+      'none',
+    ],
+    [
+      'an _id with auto: false',
+      [{ ...rowFields, _id: { type: 'ObjectId', auto: false } }],
+      'none',
+    ],
+    [
+      'a declared ObjectId _id with no default',
+      [{ ...rowFields, _id: { type: 'ObjectId' } }],
+      'none',
+    ],
+    [
+      'a declared String _id with no default',
+      [{ ...rowFields, _id: { type: String } }],
+      'none',
+    ],
+    ['an array of Mixed', [{ type: 'Mixed' }], 'none'],
+    ['a plain array', [], 'none'],
+    ['a Mixed path', { type: 'Mixed' }, 'none'],
+  ] as [string, unknown, string][]) {
+    test(`${name}: an appended and a replaced row both store ${kind}, and two loads are equal`, async () => {
+      const model = mediaModelWith(
+        `IdShape${name.replaceAll(/[^A-Za-z]/g, '')}`,
+        previews,
+      );
+      const store = new MongoMediaStore({ model });
+      const id = await newMediaOn(model);
+      await store.appendPreviews(id, [preview(ID_A)]);
+      await store.replacePreviews(id, [ID_B], [preview(ID_B)]);
 
-  // What removing one row by hand does on a mixed array, saved. Measured the same on mongoose 9.0.0
-  // and 9.11.4. The README and the changelog name the two forms that lose rows, so a change here
-  // changes what they tell a host.
-  for (const [name, remove, left] of [
-    [
-      'an older row, row.deleteOne(): that row',
-      (doc) => doc.previews[0].deleteOne(),
-      OLD_REMOVED,
-    ],
-    [
-      'an older row, previews.id(oid).deleteOne(): that row',
-      (doc) => doc.previews.id(OLD_1)?.deleteOne(),
-      OLD_REMOVED,
-    ],
-    [
-      'an older row, previews.pull(oid): that row',
-      (doc) => doc.previews.pull(OLD_1),
-      OLD_REMOVED,
-    ],
-    [
-      'an older row, previews.pull({ _id }): that row',
-      (doc) => doc.previews.pull({ _id: OLD_1 }),
-      OLD_REMOVED,
-    ],
-    [
-      'an older row, previews.remove(oid): that row',
-      (doc) => doc.previews.remove(OLD_1),
-      OLD_REMOVED,
-    ],
-    [
-      'an older row, a filter on String(_id): that row',
-      (doc) => {
-        const first = doc.previews[0];
-        doc.previews = doc.previews.filter(
-          (row) => String(row._id) !== String(first._id),
-        ) as LoadedRows;
-      },
-      OLD_REMOVED,
-    ],
-    [
-      'a new row, previews.pull(row._id): nothing',
-      (doc) => doc.previews.pull(doc.previews[2]._id),
-      ALL,
-    ],
-    [
-      'a new row, previews.remove(row._id): nothing',
-      (doc) => doc.previews.remove(doc.previews[2]._id),
-      ALL,
-    ],
-    [
-      'a new row, previews.pull({ _id: row._id }): EVERY row, the older ones too',
-      (doc) => doc.previews.pull({ _id: doc.previews[2]._id }),
-      [],
-    ],
-    [
-      'a new row, a filter on String(_id): every row without an _id',
-      (doc) => {
-        const first = doc.previews[2];
-        doc.previews = doc.previews.filter(
-          (row) => String(row._id) !== String(first._id),
-        ) as LoadedRows;
-      },
-      ['old1', 'old2'],
-    ],
-    [
-      'a new row, previews.pull(row): that row',
-      (doc) => doc.previews.pull(doc.previews[2]),
-      NEW_REMOVED,
-    ],
-    [
-      'a new row, previews.pull({ identity }): that row',
-      (doc) => doc.previews.pull({ identity: identityOf('new1') }),
-      NEW_REMOVED,
-    ],
-    [
-      'an older row, previews.pull({ identity }): that row',
-      (doc) => doc.previews.pull({ identity: identityOf('old1') }),
-      OLD_REMOVED,
-    ],
-    [
-      'a new row, a filter on identity: that row',
-      (doc) => {
-        doc.previews = doc.previews.filter(
-          (row) => row.identity !== identityOf('new1'),
-        ) as LoadedRows;
-      },
-      NEW_REMOVED,
-    ],
-  ] as [string, (doc: LoadedMedia) => unknown, string[]][]) {
-    test(`removing by hand on a mixed array: ${name}`, async () => {
-      const { id, doc } = await mixedMedia();
-      await remove(doc);
-      await doc.save();
-      assert.deepEqual(await storedKeys(id), left);
+      const raw = await rawRows(id, model);
+      assert.deepEqual(
+        raw.map((row) => row.identity),
+        [ID_A, ID_B],
+      );
+      assert.deepEqual(
+        raw.map((row) => kindOf(row._id)),
+        [kind, kind],
+      );
+      const one = await loaded(id, model);
+      const two = await loaded(id, model);
+      assert.deepEqual(one.toObject().previews, two.toObject().previews);
     });
   }
 
-  test('a new row: row.deleteOne() and previews.id(row._id).deleteOne() fail loudly, and remove nothing', async () => {
-    const { id, doc } = await mixedMedia();
-    const row = doc.previews[2];
+  for (const [name, wrap, kind] of [
+    ['no schema', () => ({}), 'none'],
+    [
+      'a schema without its Mongoose instance',
+      (m) => ({ schema: m.schema }),
+      'none',
+    ],
+    [
+      'a schema and its Mongoose instance, without castObject',
+      (m) => ({ schema: m.schema, base: m.base }),
+      'ObjectId',
+    ],
+    [
+      'castObject without a schema',
+      (m) => ({ castObject: (doc: never) => m.castObject(doc) }),
+      'none',
+    ],
+  ] as [string, (m: AnyModel) => object, string][]) {
+    test(`a model-shaped object with ${name} stores ${kind} on a replaced row`, async () => {
+      const model = Media();
+      const shaped = {
+        ...wrap(model),
+        findById: (id: string) => model.findById(id),
+        findOneAndUpdate: (filter: object, update: object, options: object) =>
+          model.findOneAndUpdate(filter, update as never, options as never),
+      } as MongoMediaStoreOptions['model'];
+      const id = await newMedia();
 
-    await assert.rejects(async () => row.deleteOne());
-    assert.equal(doc.previews.id(row._id), null);
+      await new MongoMediaStore({ model: shaped }).replacePreviews(
+        id,
+        [ID_A],
+        [preview(ID_A)],
+      );
 
-    await doc.save();
-    assert.deepEqual(await storedKeys(id), ALL);
+      assert.deepEqual(
+        (await rawRows(id)).map((row) => kindOf(row._id)),
+        [kind],
+      );
+    });
+  }
+
+  test('a row that carries an _id keeps it, and one that holds null gets its own', async () => {
+    const store = mediaStore();
+    const id = await newMedia();
+    const given = new mongoose.Types.ObjectId();
+    const hex = new mongoose.Types.ObjectId().toHexString();
+
+    await store.replacePreviews(
+      id,
+      [],
+      [
+        { ...preview(ID_A), _id: given } as Preview,
+        { ...preview(ID_B), _id: hex } as Preview,
+        { ...namedRow('held-null'), _id: null } as Preview,
+      ],
+    );
+
+    const raw = await rawRows(id);
+    assert.deepEqual(
+      raw.map((row) => kindOf(row._id)),
+      ['ObjectId', 'ObjectId', 'ObjectId'],
+    );
+    assert.equal(String(raw[0]._id), String(given));
+    assert.equal(String(raw[1]._id), hex);
   });
 
-  test('invalidate() removes a mixed array by identity and returns every ref', async () => {
+  test('each replaced row gets its own id, and a replacement of an identity gets a new one', async () => {
+    const store = mediaStore();
+    const id = await newMedia();
+    await store.replacePreviews(id, [], [preview(ID_A), preview(ID_B)]);
+    const first = idText(await rawRows(id));
+    assert.equal(new Set(first).size, 2);
+
+    await store.replacePreviews(id, [ID_A], [preview(ID_A, 'next')]);
+
+    const second = await rawRows(id);
+    assert.deepEqual(
+      second.map((row) => row.identity),
+      [ID_B, ID_A],
+    );
+    assert.equal(String(second[0]._id), first[1]);
+    assert.notEqual(String(second[1]._id), first[0]);
+  });
+
+  test('a row replaced under 0.3.0 has no stored _id: a load makes up a random one and stores nothing, until the row is next replaced', async () => {
+    const id = await mediaWithoutIds(['old']);
+
+    const [one] = (await loaded(id)).previews;
+    const [two] = (await loaded(id)).previews;
+    assert.notEqual(String(one._id), String(two._id));
+    assert.equal((await leanRows(id))[0]._id, undefined);
+    assert.equal((await rawRows(id))[0]._id, undefined);
+
+    await mediaStore().replacePreviews(
+      id,
+      [identityOf('old')],
+      [namedRow('old')],
+    );
+
+    const [stored] = await rawRows(id);
+    assert.equal(kindOf(stored._id), 'ObjectId');
+    assert.equal(
+      String((await loaded(id)).previews[0]._id),
+      String(stored._id),
+    );
+  });
+
+  test("a row replaced under 0.3.0: a host's own save of the array stores the id it read", async () => {
+    const id = await mediaWithoutIds(['old']);
+    const doc = await loaded(id);
+    const read = String(doc.previews[0]._id);
+
+    doc.markModified('previews');
+    await doc.save();
+
+    assert.equal(String((await rawRows(id))[0]._id), read);
+  });
+
+  test('the upgrade renders nothing: a row with a stored _id and a row without one read fresh, queue no task and are left as they are', async () => {
+    const sizes = [
+      { width: 20, height: 20 },
+      { width: 30, height: 30 },
+    ];
+    const model = Media();
+    const { r, id, tasks } = await firstRender(model, sizes);
+    // One row as 0.3.0 left a replaced row.
+    await model.collection.updateOne({ _id: new mongoose.Types.ObjectId(id) }, {
+      $unset: { 'previews.0._id': 1 },
+    } as never);
+    const stored = await rawRows(id);
+    assert.deepEqual(
+      stored.map((row) => kindOf(row._id)),
+      ['none', 'ObjectId'],
+    );
+
+    const { decision } = await r.resolve({
+      media: (await new MongoMediaStore({ model }).loadMedia(id)) as MediaLike,
+      sizes,
+    });
+
+    assert.equal(decision.missing.length, 0);
+    assert.deepEqual(
+      decision.ready.map((entry) => entry.stale),
+      [undefined, undefined],
+    );
+    assert.equal(tasks.rows.length, 1);
+    assert.deepEqual(await rawRows(id), stored);
+  });
+
+  // Two rows each way, so a form that matches more than its row shows.
+  const NAMES = ['a1', 'a2', 'r1', 'r2'];
+  const mediaOfFour = async () => {
+    const store = mediaStore();
+    const id = await newMedia();
+    await store.appendPreviews(id, [namedRow('a1'), namedRow('a2')]);
+    await store.replacePreviews(id, [], [namedRow('r1'), namedRow('r2')]);
+    return { id, doc: await loaded(id) };
+  };
+
+  // A host's removal of one row, each as a host would write it.
+  const REMOVALS: [
+    string,
+    (doc: LoadedMedia, row: LoadedRow, id: string) => unknown,
+  ][] = [
+    ['row.deleteOne()', (_doc, row) => row.deleteOne()],
+    [
+      'previews.id(row._id).deleteOne()',
+      (doc, row) => doc.previews.id(row._id)?.deleteOne(),
+    ],
+    ['previews.pull(row._id)', (doc, row) => doc.previews.pull(row._id)],
+    [
+      'previews.pull({ _id: row._id })',
+      (doc, row) => doc.previews.pull({ _id: row._id }),
+    ],
+    ['previews.remove(row._id)', (doc, row) => doc.previews.remove(row._id)],
+    [
+      'previews.remove({ _id: row._id })',
+      (doc, row) => doc.previews.remove({ _id: row._id }),
+    ],
+    [
+      'a filter on String(_id)',
+      (doc, row) => {
+        doc.previews = doc.previews.filter(
+          (p) => String(p._id) !== String(row._id),
+        ) as LoadedRows;
+      },
+    ],
+    [
+      'splice at findIndex on String(_id)',
+      (doc, row) => {
+        doc.previews.splice(
+          doc.previews.findIndex((p) => String(p._id) === String(row._id)),
+          1,
+        );
+      },
+    ],
+    [
+      'Model.updateOne with $pull',
+      async (_doc, row, id) => {
+        await Media().updateOne({ _id: id }, {
+          $pull: { previews: { _id: row._id } },
+        } as never);
+      },
+    ],
+    [
+      'Model.findByIdAndUpdate with $pull',
+      async (_doc, row, id) => {
+        await Media().findByIdAndUpdate(id, {
+          $pull: { previews: { _id: row._id } },
+        } as never);
+      },
+    ],
+    [
+      'Model.updateOne with $pull, by the id of a lean row',
+      async (_doc, row, id) => {
+        const lean = (await Media().findById(id).lean()) as unknown as {
+          previews: Array<{ _id?: unknown; sizeKey: string }>;
+        };
+        const leanRow = lean.previews.find((p) => p.sizeKey === row.sizeKey);
+        await Media().updateOne({ _id: id }, {
+          $pull: { previews: { _id: leanRow?._id } },
+        } as never);
+      },
+    ],
+  ];
+
+  // Measured the same on mongoose 9.0.0 and 9.11.4: with no error, each form removes that row alone,
+  // on an appended row and on one from replacePreviews.
+  for (const [form, remove] of REMOVALS) {
+    for (const target of ['a1', 'r1']) {
+      test(`${form} removes that row alone, on ${target === 'a1' ? 'an appended row' : 'a row from replacePreviews'}`, async () => {
+        const { id, doc } = await mediaOfFour();
+        const row = doc.previews[NAMES.indexOf(target)];
+
+        await remove(doc, row, id);
+        await doc.save();
+
+        assert.deepEqual(
+          (await rawRows(id)).map((stored) => stored.sizeKey),
+          NAMES.filter((name) => name !== target),
+        );
+      });
+    }
+  }
+
+  // The same forms on a row replaced under 0.3.0, which has no stored `_id`: as on 0.3.0, a load
+  // makes up an id that matches nothing stored, and a lean read gives none, which matches every row
+  // without one. Measured the same on mongoose 9.0.0 and 9.11.4.
+  const LEFT_ON_A_ROW_WITHOUT_AN_ID: Record<string, string[]> = {
+    'a filter on String(_id)': ['a1', 'n2'],
+    'splice at findIndex on String(_id)': ['a1', 'n2'],
+    'Model.updateOne with $pull, by the id of a lean row': ['a1'],
+  };
+  const mediaWithOldRows = async () => {
+    const { insertedId } = await Media().collection.insertOne({
+      previews: [
+        { ...namedRow('a1'), _id: new mongoose.Types.ObjectId() },
+        namedRow('n1'),
+        namedRow('n2'),
+      ],
+    } as never);
+    const id = String(insertedId);
+    return { id, doc: await loaded(id) };
+  };
+  for (const [form, remove] of REMOVALS) {
+    const left = LEFT_ON_A_ROW_WITHOUT_AN_ID[form] ?? ['a1', 'n1', 'n2'];
+    test(`a row without a stored _id, ${form}: leaves ${left.join(', ')}`, async () => {
+      const { id, doc } = await mediaWithOldRows();
+
+      await remove(doc, doc.previews[1], id);
+      await doc.save();
+
+      assert.deepEqual(
+        (await rawRows(id)).map((stored) => stored.sizeKey),
+        left,
+      );
+    });
+  }
+
+  test('a row without a stored _id: previews.pull({ identity }) removes that row alone', async () => {
+    const { id, doc } = await mediaWithOldRows();
+
+    doc.previews.pull({ identity: identityOf('n1') });
+    await doc.save();
+
+    assert.deepEqual(
+      (await rawRows(id)).map((stored) => stored.sizeKey),
+      ['a1', 'n2'],
+    );
+  });
+
+  test('markModified and save() keep every stored id, and a pushed row gets its own', async () => {
+    const { id, doc } = await mediaOfFour();
+    const ids = idText(await rawRows(id));
+
+    doc.markModified('previews');
+    await doc.save();
+    assert.deepEqual(idText(await rawRows(id)), ids);
+
+    doc.previews.push(namedRow('pushed') as unknown as LoadedRow);
+    await doc.save();
+    const rows = await rawRows(id);
+    assert.deepEqual(idText(rows.slice(0, 4)), ids);
+    assert.equal(kindOf(rows[4]._id), 'ObjectId');
+    assert.ok(!ids.includes(String(rows[4]._id)));
+  });
+
+  test('invalidate() removes rows with a stored id and rows without one, and returns every ref', async () => {
     const { storage } = memoryStorage();
     const r = new Resizer({
       config: makeImageConfig({ formats: ['webp'] }),
@@ -794,64 +1005,16 @@ describe('MongoMediaStore: new preview rows store no _id', () => {
       storage,
       media: mediaStore(),
     });
-    const { id, doc } = await mixedMedia();
+    const { id, doc } = await mediaOfFour();
+    await Media().collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $unset: { 'previews.0._id': 1 } } as never,
+    );
 
     const refs = await r.invalidate({ media: doc as unknown as MediaLike });
 
     assert.equal(refs.length, 4);
-    assert.deepEqual(await storedKeys(id), []);
-  });
-
-  test('a hand-written row schema with the documented _id acts as the fragment does', async () => {
-    const model = mediaModelWith('HandWrittenIdMedia', [
-      new mongoose.Schema({
-        _id: { type: 'ObjectId', auto: false },
-        storageRef: { type: 'Mixed' },
-        identity: { type: String },
-        origin: { type: String },
-        encodeSig: { type: String },
-        sizeKey: { type: String },
-        format: { type: String },
-        contentType: { type: String },
-        fit: { type: Boolean },
-      }),
-    ]);
-    const store = new MongoMediaStore({ model });
-    assert.doesNotThrow(() => store.verify());
-
-    const { id, doc } = await mixedMedia(model);
-    assert.deepEqual(
-      doc.previews.map((row) => row.id),
-      [String(OLD_1), String(OLD_2), null, null],
-    );
-    doc.previews.pull(OLD_1);
-    await doc.save();
-    assert.deepEqual(await storedKeys(id, model), OLD_REMOVED);
-
-    await store.appendPreviews(String(id), [namedRow('appended')]);
-    const rows = await storedRows(id, model);
-    assert.deepEqual(
-      rows.map((row) => [row.sizeKey, '_id' in row]),
-      [
-        ['old2', true],
-        ['new1', false],
-        ['new2', false],
-        ['appended', false],
-      ],
-    );
-  });
-
-  test('rows declared with _id: false: a removal by the id of an older row removes every row, which is why the fragment does not', async () => {
-    const { _id: _rowId, ...rowFields } = resizeMediaSchemaFragment.previews[0];
-    const model = mediaModelWith('IdFalseMedia', [
-      new mongoose.Schema(rowFields as never, { _id: false }),
-    ]);
-    const { id, doc } = await mixedMedia(model);
-
-    doc.previews.pull(OLD_1);
-    await doc.save();
-
-    assert.deepEqual(await storedKeys(id, model), []);
+    assert.deepEqual(await rawRows(id), []);
   });
 });
 
@@ -908,7 +1071,11 @@ describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', 
       [[ID_A, { path: 'a1.webp' }]],
     );
     assert.equal(Object.getPrototypeOf(result.removed[0]), Object.prototype);
-    assert.deepEqual(result.stored, [next]);
+    const { _id: storedId, ...storedFields } = result.stored[0] as Preview & {
+      _id?: unknown;
+    };
+    assert.deepEqual(storedFields, next);
+    assert.ok(storedId instanceof mongoose.Types.ObjectId);
     assert.equal(types.isProxy(result.stored), false);
     assert.equal(Object.getPrototypeOf(result.stored[0]), Object.prototype);
     // One write, an update pipeline, whose result is the pre-image projected on `previews`.
@@ -968,7 +1135,11 @@ describe('MongoMediaStore.replacePreviews: swap rows by identity in one write', 
     assert.deepEqual(await rowsOf(replaced), await rowsOf(appended));
     assert.equal(Object.hasOwn(stored, 'origin'), false);
     assert.equal(stored.bytes, 12);
-    assert.deepEqual(result, { stored: [stored], removed: [] });
+    const { _id: _storedId, ...storedFields } = result.stored[0] as Preview & {
+      _id?: unknown;
+    };
+    assert.deepEqual(storedFields, stored);
+    assert.deepEqual(result.removed, []);
   });
 
   test('replacePreviews on loose rows (strict: false) keeps every key the row carries', async () => {
@@ -1985,6 +2156,7 @@ describe('a worker over real rows', () => {
       warnings.filter((line) => /the identity of/.test(String(line))),
       [],
     );
+    return id;
   };
 
   test('hydrated rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a namespaced ref, a fit row, a filtered row, first rendered and then replaced', async () => {
@@ -2086,27 +2258,56 @@ describe('a worker over real rows', () => {
     });
   }
 
-  test('lean rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a store that loads with lean() reads back plain rows', async () => {
+  test('lean rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a store that loads with lean() reads back plain rows, with their _id', async () => {
     await renderAndReplace(
       async (id) => (await Media().findById(id).lean()) as MediaLike | null,
     );
   });
 
-  // A hand-written schema that declares rows as sub-documents stores an `_id` on an appended row.
-  const rowsWithId = () => {
-    const { _id: _rowId, ...rowFields } = resizeMediaSchemaFragment.previews[0];
-    return mediaModelWith('RowsWithIdMedia', [rowFields]);
-  };
+  test('a replacement through a worker stores a real _id on every row, and two loads are equal', async () => {
+    const id = await renderAndReplace();
 
-  test('rows of a schema that keeps their _id raise no RESIZE_MEDIA_ROW_NOT_KEPT, hydrated', async () => {
-    await renderAndReplace(undefined, rowsWithId());
+    const raw = (
+      (await Media().collection.findOne({
+        _id: new mongoose.Types.ObjectId(id),
+      } as never)) as unknown as { previews: Array<{ _id?: unknown }> }
+    ).previews;
+    assert.deepEqual(
+      raw.map((row) => (row._id as { _bsontype?: string })._bsontype),
+      ['ObjectId', 'ObjectId', 'ObjectId'],
+    );
+    const one = await Media().findById(id);
+    const two = await Media().findById(id);
+    assert.deepEqual(one?.toObject().previews, two?.toObject().previews);
   });
 
-  test('rows of a schema that keeps their _id raise no RESIZE_MEDIA_ROW_NOT_KEPT, lean', async () => {
+  // A hand-written schema that keeps no `_id` on its rows.
+  const rowsWithoutId = () =>
+    mediaModelWith('RowsWithoutIdMedia', [
+      new mongoose.Schema(resizeMediaSchemaFragment.previews[0], {
+        _id: false,
+      }),
+    ]);
+
+  test('rows declared with _id: false raise no RESIZE_MEDIA_ROW_NOT_KEPT and store no _id, hydrated', async () => {
+    const id = await renderAndReplace(undefined, rowsWithoutId());
+
+    const raw = (
+      (await rowsWithoutId().collection.findOne({
+        _id: new mongoose.Types.ObjectId(id),
+      } as never)) as unknown as { previews: object[] }
+    ).previews;
+    assert.deepEqual(
+      raw.map((row) => '_id' in row),
+      [false, false, false],
+    );
+  });
+
+  test('rows declared with _id: false raise no RESIZE_MEDIA_ROW_NOT_KEPT, lean', async () => {
     await renderAndReplace(
       async (id) =>
-        (await rowsWithId().findById(id).lean()) as MediaLike | null,
-      rowsWithId(),
+        (await rowsWithoutId().findById(id).lean()) as MediaLike | null,
+      rowsWithoutId(),
     );
   });
 });

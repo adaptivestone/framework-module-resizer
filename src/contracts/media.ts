@@ -58,8 +58,8 @@ export abstract class MediaStore {
    * call before anything is written (MongoMediaStore: a value its schema cannot cast, with
    * Mongoose's ValidationError, which is not a ResizeError; `storageRef` and `filters` are stored
    * as given, cast or not). It takes no dimensions: a caller that must backfill them uses
-   * appendPreviews(mediaId, [], dims), which writes them whether or not it stores a row. The module
-   * reads no row `_id`: key rows by `identity`.
+   * appendPreviews(mediaId, [], dims), which writes them whether or not it stores a row. The core
+   * reads no row `_id`, so a store needs none: key rows by `identity`.
    */
   abstract replacePreviews(
     mediaId: string,

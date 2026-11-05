@@ -107,11 +107,8 @@ describe('resizeMediaSchemaFragment — host usage', () => {
 });
 
 describe('resizeMediaSchemaFragment — preview rows', () => {
-  test('declare an _id that Mongoose never generates, and do not switch it off', () => {
-    assert.deepEqual(resizeMediaSchemaFragment.previews[0]._id, {
-      type: 'ObjectId',
-      auto: false,
-    });
+  test('keep the default _id: the fragment declares none, and the compiled rows have an automatic ObjectId', () => {
+    assert.equal('_id' in resizeMediaSchemaFragment.previews[0], false);
     const schema = new mongoose.Schema({ ...resizeMediaSchemaFragment });
     const rows = schema.path('previews') as unknown as {
       schema: mongoose.Schema;
@@ -121,7 +118,7 @@ describe('resizeMediaSchemaFragment — preview rows', () => {
       options: { auto?: boolean };
     };
     assert.equal(id.instance, 'ObjectId');
-    assert.equal(id.options.auto, false);
+    assert.equal(id.options.auto, true);
     assert.ok(rows.schema.path('identity'));
   });
 });

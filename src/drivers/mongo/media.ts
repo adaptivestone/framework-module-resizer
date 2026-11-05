@@ -23,7 +23,8 @@ export interface MongoMediaUpdateOptions {
  * its `previews` before the write, as a plain object) or null. replacePreviews sends an update
  * pipeline (an array update) through `findOneAndUpdate`, so host middleware on that hook must
  * accept an array update. When the model also exposes its `schema`, verify() checks it keeps the
- * preview fields the store relies on.
+ * preview fields the store relies on, and with its `base` (the Mongoose instance) replacePreviews
+ * stores the `_id` an appended row would get.
  */
 export interface MongoMediaModel {
   modelName?: string;
@@ -230,6 +231,40 @@ function previewRowSchema(
   return typeof rows?.path === 'function' ? rows : undefined;
 }
 
+// The `_id` a row appended through `$push` would get: `$push` casts its row, so it gets the
+// schema's automatic id or the default of a declared `_id`. Anything else gets none: no `_id` path
+// (`_id: false`, a mixed or plain array, a model without a schema), `auto: false`, a declared `_id`
+// with no default. The class is the model's own Mongoose instance's, so no import of mongoose here.
+function appendedRowId(model: MongoMediaModel, row: Preview): unknown {
+  const idPath = previewRowSchema(model)?.path?.('_id') as
+    | { options?: { auto?: unknown; default?: unknown } }
+    | undefined;
+  const made = idPath?.options?.default;
+  if (made !== undefined) {
+    return typeof made === 'function' ? made.call(row, row) : made;
+  }
+  const { base } = model as {
+    base?: { Types?: { ObjectId?: new () => unknown } };
+  };
+  const ObjectId = base?.Types?.ObjectId;
+  return idPath?.options?.auto === true && ObjectId
+    ? new ObjectId()
+    : undefined;
+}
+
+// Mongoose does not cast an update pipeline, so nothing generates an `_id` on the rows a
+// replacement writes, and a row stored without one would read a new random id on every load. Each
+// row gets what an appended row would; an `_id` it already carries stays.
+function withRowIds(model: MongoMediaModel, rows: Preview[]): Preview[] {
+  return rows.map((row) => {
+    if ((row as { _id?: unknown })._id != null) {
+      return row;
+    }
+    const _id = appendedRowId(model, row);
+    return _id == null ? row : ({ ...row, _id } as Preview);
+  });
+}
+
 // Whether a model's preview rows are declared with `strict: false`, read once per model: a schema
 // does not change once its model is compiled.
 const looseRowModels = new WeakMap<object, boolean>();
@@ -336,8 +371,8 @@ export class MongoMediaStore extends MediaStore {
    * read could serve a row); a mixed or plain array, or rows with `strict: false`, keep any field.
    * A `storageRef` may be Mixed, or a strict sub-schema or nested paths that declare every key of
    * the driver's ref: strict rows drop the rest, and this check cannot tell, since the key set is
-   * the driver's own.
-   * Such rows without `fit` only get a warning, once per store: freshness still holds without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
+   * the driver's own. Such rows without `fit` only get a warning, once per store: freshness still
+   * holds without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
    * without `width` or `height`, or any `original` declaring one with a type that does not read
    * back as a number (not Number, Int32 or Mixed), also gets one warning per store (it does not
    * throw, so a setup that passed before keeps passing): Mongoose drops the dimensions the worker
@@ -449,9 +484,9 @@ export class MongoMediaStore extends MediaStore {
    * pipeline, so the rows are cast to the schema first when the model can (strict rows lose the
    * keys their schema does not declare, loose rows keep them, as with appendPreviews; `storageRef`
    * and `filters` are stored as given, cast or not); a value that cannot be cast rejects with
-   * Mongoose's ValidationError before anything is written. The rows it writes carry no
-   * sub-document `_id`, and under the current fragment neither do appended rows; the module reads
-   * none.
+   * Mongoose's ValidationError before anything is written. A row it writes stores an `_id` exactly
+   * when an appended row would: the schema's automatic id or the default of a declared `_id`, on a
+   * model that exposes its `schema` and `base`, as any Mongoose model does.
    */
   async replacePreviews(
     mediaId: string,
@@ -459,7 +494,7 @@ export class MongoMediaStore extends MediaStore {
     rows: Preview[],
   ): Promise<ReplacedPreviews> {
     const model = this.mediaModel();
-    const unique = uniqueRows(rows);
+    const unique = withRowIds(model, uniqueRows(rows));
     // A copy: Mongoose casts into its own array type, and callers get plain arrays.
     let written = unique;
     if (model.castObject) {
