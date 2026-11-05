@@ -133,8 +133,9 @@ Then **publish a GitHub Release** for the tag, as both sibling repos do for ever
 the matching `CHANGELOG.md` section as the body:
 
 ```bash
-# `1d;$d` drops the `# X.Y.Z` heading and the next version's heading — the body starts at
-# **Breaking changes**, matching how the sibling repos' release bodies read.
+# `1d;$d` drops the `# X.Y.Z` heading and the next version's heading — the body starts at the
+# pointer to UPGRADING.md, then **Breaking changes**, matching how the sibling repos' release
+# bodies read.
 gh release create vX.Y.Z --title "X.Y.Z" \
   --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d')
 ```

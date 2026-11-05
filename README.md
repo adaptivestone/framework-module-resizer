@@ -8,7 +8,9 @@ driver, and turns the record on your media document into image URLs.
 - **Guide:** [framework.adaptivestone.com/docs/resize](https://framework.adaptivestone.com/docs/resize)
   covers setup, workflows, pipelines, security and troubleshooting.
 - **Coding agents:** read [`AGENTS.md`](./AGENTS.md), the integration guide shipped with this package.
-- **Upgrading:** read [`UPGRADING.md`](./UPGRADING.md), also shipped with this package.
+- **Upgrading:** before you upgrade, read
+  [`UPGRADING.md`](https://github.com/adaptivestone/framework-module-resizer/blob/main/UPGRADING.md):
+  it lists what to change before you run `npm i`. It also ships with this package.
 - **Errors:** every code is in [Error codes](#error-codes), further down this file.
 - **On npmjs.com** this page stops at 64 KiB, so links to later sections do nothing there. Read the
   [whole file on GitHub](https://github.com/adaptivestone/framework-module-resizer#readme), which shows

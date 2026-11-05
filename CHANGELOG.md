@@ -1,5 +1,9 @@
 # 0.4.0
 
+Before you upgrade, read
+[`UPGRADING.md`](https://github.com/adaptivestone/framework-module-resizer/blob/main/UPGRADING.md):
+it lists what to change before you run `npm i`.
+
 **Breaking changes**
 
 - A damaged source now fails. `limits.failOn` (new, default `'error'`) replaces the hard-coded
@@ -491,8 +495,9 @@ the image engine behind a port.
   `startedAt: { type: Date }` and `finishedAt: { type: Date }` to an ejected model (or
   move `src/models/ResizeTask.ts` aside (or delete it), re-run
   `npx --no -- resize-scaffold --eject`, then restore your customizations; the scaffold never
-  overwrites a file, so re-running `--eject` alone changes nothing). The config file is still never diffed. An ejected model without the two times
-  keeps working: they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
+  overwrites a file, so re-running `--eject` alone changes nothing). The config file is still never
+  diffed. An ejected model without the two times keeps working: they are dropped, and
+  `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
 - **Old preview rows.** Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are
   stale to the freshness check: each is served until its replacement is stored,
   regenerated on its next read, `prewarm()` or `generate()`, and its old file stays in storage, so

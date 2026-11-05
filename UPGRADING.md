@@ -19,16 +19,16 @@ memory before it is refused. npm's default resolver stops a host pinned to one o
 so the install below fails. Nothing else does: `--legacy-peer-deps`, `--force`, pnpm and yarn install
 them, and the module does not check the version at run time. Move to 3.735 or later.
 
-**Add `await getResizer().verify()` after `Server.init()`.** 0.3.0 accepted the settings below, and
-0.4.0 refuses them. Unless a row says otherwise, a refusal from a config file comes at first use or
-`verify()`. On a framework host with no boot `verify()`, the first `resolve()` logs one `error` and
-returns an empty decision, and so does every later read: **previews stored earlier stop being served
-until the value is fixed.** `verify()` does not run steps, so it says nothing about them: see
-[Pipeline steps](#pipeline-steps).
+**Add `await getResizer().verify()` after `Server.init()` (or `startServer()`).** 0.3.0 accepted the
+settings below, and 0.4.0 refuses them. Unless a row says otherwise, a refusal from a config file
+comes at first use or `verify()`. On a framework host with no boot `verify()`, the first `resolve()`
+logs one `error` and returns an empty decision, and so does every later read: **previews stored
+earlier stop being served until the value is fixed.** `verify()` does not run steps, so it says
+nothing about them: see [Pipeline steps](#pipeline-steps).
 
 | Setting | Code | Fix |
 |---|---|---|
-| `storage.publicUrl`, which 0.3.0 ignored, so previews used the bucket's own URL. The `S3Storage` option `publicUrl` throws at construction | `RESIZE_CONFIG_REMOVED_KEY` | Use `publicBaseUrl`. Check the URLs it gives: the value 0.3.0 ignored applies now |
+| An S3 `storage.publicUrl`, which 0.3.0 ignored, so previews used the bucket's own URL. The `S3Storage` option `publicUrl` throws at construction. A `'local'` section still ignores the key, with no error | `RESIZE_CONFIG_REMOVED_KEY` | Use `publicBaseUrl`. Check the URLs it gives: the value 0.3.0 ignored applies now |
 | `leaseMs`, `idlePollMs` or `taskTimeoutMs` above `2147483647`, the longest a Node timer takes. A `leaseMs` of 24.8 to 49.7 days ran on 0.3.0 | `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or `RESIZE_CONFIG_QUEUE_INVALID` | Lower it. A task queue passed in code keeps serving stored previews, queues nothing, and logs once per queue name |
 | `new LogMetrics(logger, { summaryIntervalMs })` above `2147483647` | `RESIZE_METRICS_INVALID`, at construction | Lower it |
 | `limits.processingTimeoutSeconds` above `3600`, where every Sharp call threw | `RESIZE_CONFIG_INVALID` | Lower it |
@@ -106,8 +106,9 @@ What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `
 - **Memory, for a pipeline with a step only.** A worker holds a copy of the size's pixels and the step's
   result per variant in progress. Measured with one `composite` step at the default `concurrency` of 4
   on a 24 MP JPEG, at 5000, 4000, 3000 and 2000 wide, in JPEG and WebP: about 975 MB peak RSS against
-  about 590 MB on 0.3.0. At 1920 wide and below: about 185 MB against 130 MB. A pipeline without steps
-  pays nothing. Size worker containers before you deploy.
+  about 590 MB on 0.3.0. At 1920 wide and below: about 185 MB against 130 MB. On a 24 MP PNG with
+  alpha at 5000 to 2000 wide: about 1.9 GB against about 1.5 GB. A pipeline without steps pays
+  nothing. Size worker containers before you deploy.
 - **What a rewritten step writes.** Stored previews stay, and only new previews change. Look at the
   first ones, and bump the pipeline's `version` to remake the old ones. A single `composite` writes the
   same files on an opaque source and on every format that keeps alpha. On a flattened format and a
@@ -147,6 +148,9 @@ What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `
   ejected model written by 0.3.0 stays current. A config it leaves alone keeps
   `publicBaseUrl: '/media'`: re-scaffolding writes the new shape, with an explicit `privateRootDir`, so
   an override that moves `rootDir` must then move it too.
+- **Add `/var/` to `.gitignore`** on a host scaffolded by 0.3.0. With the scaffold's local storage,
+  its private originals sit under `./var/media-private`, and no rule keeps them out of git. The 0.4.0
+  scaffold adds the rule only in the run that writes a config, and `--check` does not report it.
 - **The scaffold's spelling is `npx --no -- resize-scaffold`.** Without `--no`, a run with the package
   missing fetches whatever the registry holds under that name. Without the `--`, npm takes the options
   for itself.
@@ -346,7 +350,7 @@ Each fails with `RESIZE_CONFIG_REMOVED_KEY`, and the message says where the valu
 | `queue.queues: { bulk: url }` (SQS), `queues.<name>.queues` | one `queues` entry per name: `bulk: { driver: 'sqs', queueUrl: url, … }` |
 | `queue.lockTtlMs` (or `queues.<name>.lockTtlMs`, or a task queue's `timing.lockTtlMs`) | `coordination`: `dispatch` → `gateTtlMs` (a different lock: the old one held one variant for 60 s, the new one holds a queued task's media; set it to your worst queue wait), `failed` → `cooldownMs`; drop `worker` |
 | `npm run cli ResizeWorker -- --config=<name>`, `runResizeWorker({ configName })` | nothing: the worker reads `worker` and `queues` from `src/config/resize.ts` |
-| `storage.publicUrl`, or the `S3Storage` option `publicUrl` | `publicBaseUrl` |
+| An S3 `storage.publicUrl`, or the `S3Storage` option `publicUrl` | `publicBaseUrl` |
 
 ### Six things to know after the upgrade
 

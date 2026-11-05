@@ -441,6 +441,10 @@ test('UPGRADING.md names every 0.4.0 trap, and what comes before npm i comes fir
     'reports nothing new',
     './README.md#push-delivery-preview',
     'getResizer().verify()',
+    'startServer()',
+    'An S3 `storage.publicUrl`',
+    '1.9 GB',
+    'Add `/var/` to `.gitignore`',
   ]) {
     assert.ok(section.includes(needle), needle);
   }
@@ -457,6 +461,23 @@ test('UPGRADING.md names every 0.4.0 trap, and what comes before npm i comes fir
     text.slice(0, from).includes('npm i '),
     false,
     'no install in the head',
+  );
+});
+
+test('the README top and the 0.4.0 changelog send a host to UPGRADING.md before npm i', () => {
+  // UPGRADING.md reaches node_modules only through the npm i it warns about, so npmjs.com's README
+  // and the GitHub Release text (the changelog section) point at it by its GitHub URL.
+  const pointer =
+    /Before you upgrade, read \[`UPGRADING\.md`\]\(https:\/\/github\.com\/adaptivestone\/framework-module-resizer\/blob\/main\/UPGRADING\.md\): it lists what to change before you run `npm i`\./i;
+  const readme = read('README.md');
+  const top = readme.slice(0, readme.indexOf('\n## ')).replace(/\s+/g, ' ');
+  assert.match(top, pointer, 'the README top, above its first section');
+  const opening = /^# 0\.4\.0\n\n([\s\S]*?)\n\n/m.exec(read('CHANGELOG.md'));
+  assert.ok(opening, 'CHANGELOG.md has a # 0.4.0 section');
+  assert.match(
+    opening[1].replace(/\s+/g, ' '),
+    pointer,
+    'the first paragraph of # 0.4.0',
   );
 });
 
