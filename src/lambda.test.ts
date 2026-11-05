@@ -260,16 +260,14 @@ test('a consumed name on a task queue that cannot take pushes is refused, touche
   assert.equal(checks, 2);
 });
 
-test('a task queue can take pushes when it has carriesSource, taskOfDelivery and release, and no gatesByTask', async () => {
+test('a task queue can take pushes when it has carriesSource and taskOfDelivery, and no gatesByTask', async () => {
+  // No `release`: push delivery never gives a task back to the queue.
   class PushableQueue extends PlainTaskQueue {
     carriesSource(): boolean {
       return true;
     }
     async taskOfDelivery(): Promise<'left'> {
       return 'left';
-    }
-    async release(): Promise<boolean> {
-      return true;
     }
   }
   const pushable = async (over: Record<string, unknown>): Promise<void> => {
@@ -285,7 +283,6 @@ test('a task queue can take pushes when it has carriesSource, taskOfDelivery and
   for (const lacking of [
     { carriesSource: undefined },
     { taskOfDelivery: undefined },
-    { release: undefined },
     { gatesByTask: true },
   ]) {
     await assert.rejects(pushable(lacking), {

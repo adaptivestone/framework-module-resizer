@@ -108,7 +108,6 @@ type DeliveryEnd =
   | 'completed'
   | 'dead'
   | 'retry'
-  | 'given-back'
   | 'lease-lost'
   | 'left'
   | 'discarded';
@@ -248,16 +247,13 @@ class OneShotQueue extends TaskQueue {
     return held;
   }
 
-  async release(task: ClaimedTask): Promise<boolean> {
-    // A record not started stays as it is: visibility 0 would let a function that is too short use
-    // up a task's receives in seconds, and a tail record take its receives from a queue with work
-    // left. `false`, as nothing was given back, also keeps the Consumer from saying it is back.
-    if (!this.#start) {
-      return false;
-    }
-    const held = await this.#carrier.release(task);
-    this.end = held ? 'given-back' : 'lease-lost';
-    return held;
+  // Only a record not started comes here, as the stop of a started task lands after it ended. It
+  // stays as it is: visibility 0 would let a function that is too short use up a task's receives in
+  // seconds, and a tail record take its receives from a queue with work left. The method must exist,
+  // since a Consumer with no `release` gives back through `fail`, which sets the visibility. `false`,
+  // as nothing was given back, also keeps the Consumer from saying it is back.
+  async release(): Promise<boolean> {
+    return false;
   }
 }
 
@@ -582,12 +578,10 @@ export function batchHandler(
 
 // Whether a task queue can take pushed messages. By shape, as core may not import a driver.
 function isDeliveryQueue(queue: TaskQueue): queue is TaskQueue & DeliveryQueue {
-  const { carriesSource, taskOfDelivery, release } =
-    queue as Partial<DeliveryQueue>;
+  const { carriesSource, taskOfDelivery } = queue as Partial<DeliveryQueue>;
   return (
     typeof carriesSource === 'function' &&
     typeof taskOfDelivery === 'function' &&
-    typeof release === 'function' &&
     !queue.gatesByTask
   );
 }

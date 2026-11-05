@@ -24,5 +24,4 @@ export interface DeliveryQueue {
     message: DeliveredMessage,
     queue: string,
   ): Promise<DeliveredTask>;
-  release(task: ClaimedTask): Promise<boolean>;
 }
