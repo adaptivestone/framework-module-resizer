@@ -168,10 +168,10 @@
 
 **Fixes**
 
-- A row `MongoMediaStore.replacePreviews` writes stores an `_id` exactly when an appended row would, so
-  it reads the same id on every load. A row replaced under 0.3.0 has none stored and reads a new random
-  one on each load until it is next replaced: nothing migrates it, reading it renders nothing, and it is
-  removed by `identity` or with `invalidate()`.
+- A row `MongoMediaStore.replacePreviews` writes stores an `_id` exactly when an appended row would,
+  unless working it out fails, so it reads the same id on every load. A row replaced under 0.3.0 has
+  none stored and reads a new random one on each load until it is next replaced: nothing migrates it,
+  reading it renders nothing, and it is removed by `identity` or with `invalidate()`.
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
 - The dispatcher's once-log sets are capped at 100 keys, and every once-log stores at most 1000

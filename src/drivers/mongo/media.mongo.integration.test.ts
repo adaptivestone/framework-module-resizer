@@ -2156,7 +2156,9 @@ describe('a worker over real rows', () => {
       warnings.filter((line) => /the identity of/.test(String(line))),
       [],
     );
-    return id;
+    const read = async () =>
+      r.resolve({ media: (await store.loadMedia(id)) as MediaLike, sizes });
+    return { id, read, warnings };
   };
 
   test('hydrated rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a namespaced ref, a fit row, a filtered row, first rendered and then replaced', async () => {
@@ -2265,7 +2267,7 @@ describe('a worker over real rows', () => {
   });
 
   test('a replacement through a worker stores a real _id on every row, and two loads are equal', async () => {
-    const id = await renderAndReplace();
+    const { id } = await renderAndReplace();
 
     const raw = (
       (await Media().collection.findOne({
@@ -2290,7 +2292,7 @@ describe('a worker over real rows', () => {
     ]);
 
   test('rows declared with _id: false raise no RESIZE_MEDIA_ROW_NOT_KEPT and store no _id, hydrated', async () => {
-    const id = await renderAndReplace(undefined, rowsWithoutId());
+    const { id } = await renderAndReplace(undefined, rowsWithoutId());
 
     const raw = (
       (await rowsWithoutId().collection.findOne({
@@ -2302,6 +2304,115 @@ describe('a worker over real rows', () => {
       [false, false, false],
     );
   });
+
+  // A declared `_id` default is the host's code, and it runs here on a plain row, where Mongoose
+  // runs it on a subdocument. It must not fail a task that writing no `_id` would complete.
+  type RowThis = {
+    get(path: string): unknown;
+    parent(): { _id: unknown };
+  };
+  const rowFields = resizeMediaSchemaFragment.previews[0];
+  const idDefault = (type: unknown, value: unknown) => [
+    { ...rowFields, _id: { type, default: value } },
+  ];
+  // A model that answers as the real one does, except for what `extra` adds.
+  const shapedModel = (extra: PropertyDescriptorMap) => {
+    const m = Media();
+    return Object.defineProperties(
+      {
+        schema: m.schema,
+        collection: m.collection,
+        castObject: (doc: never) => m.castObject(doc),
+        create: (doc: never) => m.create(doc),
+        findById: (id: string) => m.findById(id),
+        findOneAndUpdate: (filter: object, update: object, options: object) =>
+          m.findOneAndUpdate(filter, update as never, options as never),
+      },
+      extra,
+    ) as unknown as ReturnType<typeof Media>;
+  };
+  for (const [name, model] of [
+    [
+      'the ObjectId class as its _id default',
+      () =>
+        mediaModelWith(
+          'IdDefaultClassMedia',
+          idDefault('ObjectId', mongoose.Types.ObjectId),
+        ),
+    ],
+    [
+      'an _id default that reads this.get()',
+      () =>
+        mediaModelWith(
+          'IdDefaultGetMedia',
+          idDefault(String, function (this: RowThis) {
+            return this.get('identity');
+          }),
+        ),
+    ],
+    [
+      'an _id default that calls this.parent()',
+      () =>
+        mediaModelWith(
+          'IdDefaultParentMedia',
+          idDefault(String, function (this: RowThis) {
+            return String(this.parent()._id);
+          }),
+        ),
+    ],
+    [
+      'an _id default that throws',
+      () =>
+        mediaModelWith(
+          'IdDefaultThrowsMedia',
+          idDefault(String, () => {
+            throw new Error('no id here');
+          }),
+        ),
+    ],
+    [
+      'a base getter that throws',
+      () =>
+        shapedModel({
+          base: {
+            get() {
+              throw new Error('no base here');
+            },
+          },
+        }),
+    ],
+    [
+      'a base whose ObjectId is not a constructor',
+      () =>
+        shapedModel({
+          base: { value: { Types: { ObjectId: () => 'not a class' } } },
+        }),
+    ],
+  ] as [string, () => ReturnType<typeof Media>][]) {
+    test(`${name}: a replacement completes, its rows read fresh and store no _id`, async () => {
+      const { id, read, warnings } = await renderAndReplace(undefined, model());
+
+      assert.deepEqual(warnings, []);
+      const { decision } = await read();
+      assert.equal(decision.missing.length, 0);
+      assert.equal(decision.ready.length, 3);
+      assert.deepEqual(
+        decision.ready.map((entry) => entry.stale),
+        [undefined, undefined, undefined],
+      );
+      const raw = (
+        (await Media()
+          .db.collection(model().collection.name)
+          .findOne({
+            _id: new mongoose.Types.ObjectId(id),
+          } as never)) as unknown as { previews: object[] }
+      ).previews;
+      assert.deepEqual(
+        raw.map((row) => '_id' in row),
+        [false, false, false],
+      );
+    });
+  }
 
   test('rows declared with _id: false raise no RESIZE_MEDIA_ROW_NOT_KEPT, lean', async () => {
     await renderAndReplace(

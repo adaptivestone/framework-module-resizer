@@ -235,21 +235,28 @@ function previewRowSchema(
 // schema's automatic id or the default of a declared `_id`. Anything else gets none: no `_id` path
 // (`_id: false`, a mixed or plain array, a model without a schema), `auto: false`, a declared `_id`
 // with no default. The class is the model's own Mongoose instance's, so no import of mongoose here.
+// A default is the host's code, run here on a plain row where Mongoose runs it on a subdocument
+// (`this.get()`, `this.parent()`), so it can fail where an append does not. A failure here gives no
+// `_id`, which is what 0.3.0 wrote, and must not fail a task that writing none would complete.
 function appendedRowId(model: MongoMediaModel, row: Preview): unknown {
-  const idPath = previewRowSchema(model)?.path?.('_id') as
-    | { options?: { auto?: unknown; default?: unknown } }
-    | undefined;
-  const made = idPath?.options?.default;
-  if (made !== undefined) {
-    return typeof made === 'function' ? made.call(row, row) : made;
+  try {
+    const idPath = previewRowSchema(model)?.path?.('_id') as
+      | { options?: { auto?: unknown; default?: unknown } }
+      | undefined;
+    const made = idPath?.options?.default;
+    if (made !== undefined) {
+      return typeof made === 'function' ? made.call(row, row) : made;
+    }
+    const { base } = model as {
+      base?: { Types?: { ObjectId?: new () => unknown } };
+    };
+    const ObjectId = base?.Types?.ObjectId;
+    return idPath?.options?.auto === true && ObjectId
+      ? new ObjectId()
+      : undefined;
+  } catch {
+    return undefined;
   }
-  const { base } = model as {
-    base?: { Types?: { ObjectId?: new () => unknown } };
-  };
-  const ObjectId = base?.Types?.ObjectId;
-  return idPath?.options?.auto === true && ObjectId
-    ? new ObjectId()
-    : undefined;
 }
 
 // Mongoose does not cast an update pipeline, so nothing generates an `_id` on the rows a
@@ -486,7 +493,8 @@ export class MongoMediaStore extends MediaStore {
    * and `filters` are stored as given, cast or not); a value that cannot be cast rejects with
    * Mongoose's ValidationError before anything is written. A row it writes stores an `_id` exactly
    * when an appended row would: the schema's automatic id or the default of a declared `_id`, on a
-   * model that exposes its `schema` and `base`, as any Mongoose model does.
+   * model that exposes its `schema` and `base`, as any Mongoose model does; when working that out
+   * fails, it stores none.
    */
   async replacePreviews(
     mediaId: string,

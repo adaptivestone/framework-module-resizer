@@ -1566,14 +1566,14 @@ with the previews of new uploads, which wait behind it, so plan worker capacity 
 there. Call `generate()` to bring a catalog up to date; it is idempotent and renders only what is
 missing or stale.
 
-**Mongo `_id`.** A row stores an `_id` exactly when the media schema gives an appended row one. The
-current `resizeMediaSchemaFragment` keeps Mongoose's automatic `_id`, and `replacePreviews` stores the
-same on the rows it writes, so `row._id` reads the same on every load. A row replaced under 0.3.0 has
-none stored: it reads a new random `_id` on each load (a lean read gives none) until it is next
-replaced. Nothing migrates it, and reading it renders nothing. Remove such a row by `identity` or with
-`invalidate()`: `row.deleteOne()`, `previews.pull(row._id)` or a `$pull` by the id it read removes
-nothing, and a `$pull` by the id of a lean read removes every row without a stored `_id`. Keying rows by
-`identity` avoids both.
+**Mongo `_id`.** A row stores an `_id` exactly when the media schema gives an appended row one,
+unless working it out fails. The current `resizeMediaSchemaFragment` keeps Mongoose's automatic
+`_id`, and `replacePreviews` stores the same on the rows it writes, so `row._id` reads the same on
+every load. A row replaced under 0.3.0 has none stored: it reads a new random `_id` on each load (a
+lean read gives none) until it is next replaced. Nothing migrates it, and reading it renders
+nothing. Remove such a row by `identity` or with `invalidate()`: `row.deleteOne()`,
+`previews.pull(row._id)` or a `$pull` by the id it read removes nothing, and a `$pull` by the id of
+a lean read removes every row without a stored `_id`. Keying rows by `identity` avoids both.
 
 ## Operations
 

@@ -280,14 +280,15 @@ export default {
   fragment already has them, with `bytes` and `createdAt`); `resizer.verify()` throws
   `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first seven, and logs one warning without `fit`.
   Rows written earlier have no identity and are not migrated. A replaced row stores an `_id` exactly
-  when an appended one would; one replaced under 0.3.0 has none stored and reads a new random one on
-  each load until it is next replaced, so remove it by `identity` or with `invalidate()`. A custom
-  model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate` (and optionally `castObject`,
-  and `schema` and `base` for a replaced row's `_id`), and must accept an update pipeline
-  (statement 2). A `findOneAndUpdate` middleware on the media model runs once per preview write (and
-  once for the dimension backfill) and receives a document with only `_id`, or `null` when the
-  preview was already stored or the media is gone, or, for a backfill, when the pair is already stored; it also
-  sees the update pipeline of `replacePreviews`.
+  when an appended one would, unless working it out fails; one replaced under 0.3.0 has none stored
+  and reads a new random one on each load until it is next replaced, so remove it by `identity` or
+  with `invalidate()`. A custom model-shaped `MongoMediaModel` needs `findById` and
+  `findOneAndUpdate` (and optionally `castObject`, and `schema` and `base` for a replaced row's
+  `_id`), and must accept an update pipeline (statement 2). A `findOneAndUpdate` middleware on the
+  media model runs once per preview write (and once for the dimension backfill) and receives a
+  document with only `_id`, or `null` when the preview was already stored or the media is gone, or,
+  for a backfill, when the pair is already stored; it also sees the update pipeline of
+  `replacePreviews`.
 - A custom `MediaStore` must implement `replacePreviews(mediaId, identities, rows)`: in one
   atomic write per media, remove every stored row whose `identity` is in `identities` or belongs
   to one of `rows`, then store `rows`, and resolve with `{ stored, removed }` (`ReplacedPreviews`),
