@@ -159,7 +159,7 @@ What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `
   `git rm -r --cached var` (it keeps them on disk) and commit. The 0.4.0 scaffold adds the rule
   only in the run that writes a config, and `--check` does not report it.
 - **The scaffold's spelling is `npx --no -- resize-scaffold`.** Without `--no`, a run with the package
-  missing fetches whatever the registry holds under that name. Without the `--`, npm takes the options
+  missing installs and runs whatever the registry holds under that name. Without the `--`, npm takes the options
   for itself.
 - **Debug lines.** `FrameworkResizer`'s default sink writes none: pass
   `new LogMetrics(logger, { debug: true })` to keep them.

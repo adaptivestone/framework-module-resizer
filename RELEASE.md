@@ -31,15 +31,20 @@ rewritten relative import paths, the optional-subpath loud-fail contract, and th
 ### Links across the two repositories
 
 `src/docLinks.test.ts` checks links between this repository's documents. Links to and from the guide
-need a build of the docs site, on the branch to publish. Merge this repository before publishing the
-guide: the guide links this repository's default branch.
+need a build of the docs site, on the branch to publish. Run it from the commit you will merge.
+Publish the guide right after the merge, before `npm publish`. Before the merge, the guide's new links
+into this repository's default branch find nothing there. After it, until the guide is published,
+the README's and `AGENTS.md`'s links to the guide's new sections (`adopting`, `serve-local-files`,
+`push-delivery`) land at the top of the page, since the published guide lacks them.
 
 ```bash
 cd <docs site checkout> && npm ci && npx --no -- docusaurus build
 # the output must not hold "broken anchors"
 cd <this repository> && node checkDocLinks.ts <docs site checkout>
-# into the guide: N, into this module's docs: N, broken: 0
+# into the guide: N, into this module's docs: N, pinned to a tag (not checked): N, broken: 0
 ```
+
+A link pinned to a tag reads that release's files, so the check counts it and skips it.
 
 ## 2. Version bump policy
 
@@ -334,9 +339,9 @@ Nothing below can run in CI or in a build. Each was left out of the build, not s
       IDAT CRC: those previews looked healthy under 0.3.0.
 - [ ] **A frontend** handling the empty-`sizes` window, which needs a frontend.
 - [ ] **The npm name `resize-scaffold`:** free today. The docs say `npx --no -- resize-scaffold`,
-      which never fetches it, but a host that types the command without `--no`, with the package
-      missing, would run whatever is published there. Claiming the name is cheap insurance, and only
-      the owner can do it.
+      which never installs or runs it: with this package missing, npx only looks the name up in the
+      registry and stops with an error. A host that leaves out `--no` would run whatever is published
+      there. Claiming the name is cheap insurance, and only the owner can do it.
 
 ## Notes
 

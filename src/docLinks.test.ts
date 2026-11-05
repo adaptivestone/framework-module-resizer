@@ -22,12 +22,19 @@ const MODULE_FILE =
   /github\.com\/adaptivestone\/framework-module-resizer\/(?:blob|tree)\/[^/\s)]+\/([^\s)#`'"<>]+)/g;
 
 // dist/ exists only after a build: dist/a/b.d.ts and dist/a/b.js are built from src/a/b.ts, and a
-// hand-written src/a/b.d.ts (src/types.d.ts) is copied as it is.
+// hand-written src/a/b.d.ts (src/types.d.ts) is copied as it is. The build leaves out tests and test
+// helpers (the `exclude` of tsconfig.json), so a dist/ path to one has no source.
 const sourcesOf = (path: string): string[] => {
   if (!path.startsWith('dist/')) {
     return [path];
   }
   const source = path.replace(/^dist\//, 'src/');
+  if (
+    source.startsWith('src/testHelpers/') ||
+    /\.test\.(?:d\.ts|js|ts)$/.test(source)
+  ) {
+    return [];
+  }
   return [source.replace(/(?:\.d\.ts|\.js)$/, '.ts'), source];
 };
 

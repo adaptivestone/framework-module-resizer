@@ -162,6 +162,8 @@ describe('AGENTS.md stays what a new integration needs', () => {
     const doc = (await readAgents()).replace(/\s+/g, ' ');
     for (const needle of [
       'npm run cli migration/create',
+      // The framework's migration/create writes into the folder and never makes it.
+      'create `src/migrations` first if it is missing',
       "await this.app.getModelOrThrow('ResizeTask').createIndexes();",
       'npm run cli migration/migrate',
     ]) {

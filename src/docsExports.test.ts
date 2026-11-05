@@ -748,3 +748,16 @@ test('RELEASE.md lists every check only the owner can run', () => {
     assert.ok(checks.includes(needle), needle);
   }
 });
+
+test('the docs say `--no` refuses to install, since npx still looks the name up', () => {
+  // With the package missing, `npx --no` asks the registry for the name and stops with an error: it
+  // never installs or runs it, but it does fetch the name's metadata.
+  for (const file of ['README.md', 'AGENTS.md', 'UPGRADING.md', 'RELEASE.md']) {
+    const text = read(file).replace(/\s+/g, ' ');
+    assert.doesNotMatch(
+      text,
+      /refuses to fetch|never fetches|missing fetches/,
+      file,
+    );
+  }
+});

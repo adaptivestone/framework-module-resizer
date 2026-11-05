@@ -57,7 +57,7 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    ```
 
 2. Scaffold the integration files (never overwrites existing files; `--force` to regenerate). Always
-   this spelling: `--no` refuses to fetch a package of that name from the registry, and `--` hands
+   this spelling: `--no` refuses to install a package of that name from the registry, and `--` hands
    the options to this command, not to npm.
 
    ```bash
@@ -186,7 +186,8 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    The worker runs on the framework CLI, which turns `autoIndex` off, so it builds none and waits for
    none: create them through a migration that runs before the API and the workers, or, on a new
    database only, let the API build them first. In a framework host,
-   `npm run cli migration/create -- --name=resizeIndexes` writes one; give its `up()`
+   `npm run cli migration/create -- --name=resizeIndexes` writes one (create `src/migrations`
+   first if it is missing); give its `up()`
    `await this.app.getModelOrThrow('ResizeTask').createIndexes();` and run
    `npm run cli migration/migrate`. Never add index creation to HTTP bootstrap or the first
    enqueue. Upgrading: the order is in [`UPGRADING.md`](./UPGRADING.md).

@@ -63,7 +63,7 @@ SQS client does not return receive counts, so failing tasks would never be dead-
 npx --no -- resize-scaffold --eager   # src/resizer.ts + src/config/resize.ts
 ```
 
-Run it after the install. `--no` refuses to fetch a package of that name from the registry when
+Run it after the install. `--no` refuses to install a package of that name from the registry when
 this one is missing, and `--` hands the options to this command, not to npm.
 
 ```ts
