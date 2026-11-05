@@ -85,8 +85,15 @@
   (naming `encodeSig`) or another size key's row on a first render (naming `sizeKey`): the task is
   dead, though its rows are stored and the next read is fresh. `MongoMediaStore` with the current
   fragment and a driver that names files at random, as the shipped ones do, is not affected.
-  `verify()` now also rejects a strict row schema without `sizeKey`, `format` or `contentType`
-  (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never serve such a row.
+  `verify()` now also rejects a strict row schema without `sizeKey`, `format`, `contentType` or
+  `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never serve such a row.
+- **Preview rows have no `_id`.** `resizeMediaSchemaFragment` declares `_id: false` on them. A row
+  replaced under 0.3.0 had none stored, so Mongoose made up a new random one on every load, and a
+  response built from the row changed on every request. Key rows by `identity`. `row._id` is now
+  `undefined` for new rows, and its type no longer says `ObjectId`; the `row.id` virtual goes too.
+  An older row keeps its stored `_id` until it is replaced. A host that passes
+  `resizeMediaSchemaFragment.previews[0]` to `new Schema()` directly takes `_id` out of it first,
+  because Mongoose's type refuses it there.
 
 **Changed behaviour**
 
@@ -143,6 +150,9 @@
 - `resolve()` on a Resizer that could not start logs its `error` once per Resizer and error, where
   it logged on every read, so a busy API does not flood its log. `resize.read` with the outcome
   `failed` still counts every read. `prewarm()` logs as before.
+- `MongoMediaStore` records the measured dimensions only while the original holds no stored pair, so
+  they cannot land on an original swapped in during a render. Two originals without dimensions
+  swapped during one render still get the first one's pair.
 
 **Features**
 

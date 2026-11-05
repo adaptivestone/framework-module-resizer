@@ -36,6 +36,9 @@ export const resizeMediaSchemaFragment = {
   // identity.
   previews: [
     {
+      // No sub-document id: a row replaced through an update pipeline has none stored, and Mongoose
+      // would make up a new random one on every load.
+      _id: false,
       storageRef: { type: 'Mixed' },
       // The full preview identity (resizer:pipeline:sizeKey:format:filters). The database
       // stores one row per identity, so it needs this path: strict mode would strip it.

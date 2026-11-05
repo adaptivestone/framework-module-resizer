@@ -275,15 +275,16 @@ export default {
   without `gatesByTask` (SQS). Set it to your worst queue wait, not to the old
   dispatch value.
 - A hand-written media schema that declares preview rows as strict sub-documents must declare
-  `identity`, `origin`, `encodeSig`, `sizeKey`, `format` and `contentType` in them, each `{ type: String }`, and `fit` as
-  `{ type: Boolean }` (the fragment already has them, with `bytes` and `createdAt`);
-  `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first six, and logs
-  one warning without `fit`. Rows written earlier have no identity and are
-  not migrated. A custom model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate`
+  `identity`, `origin`, `encodeSig`, `sizeKey`, `format` and `contentType` in them, each
+  `{ type: String }`, `storageRef` as `{ type: 'Mixed' }`, and `fit` as `{ type: Boolean }` (the
+  fragment already has them, with `bytes` and `createdAt`); `resizer.verify()` throws
+  `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first seven, and logs one warning without `fit`.
+  Rows written earlier have no identity and are not migrated. A custom model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate`
   (and optionally `castObject`), and must accept an update pipeline (statement 2). A
   `findOneAndUpdate` middleware on the media model runs once per preview write (and once for the
   dimension backfill) and receives a document with only `_id`, or `null` when the preview was
-  already stored or the media is gone; it also sees the update pipeline of `replacePreviews`.
+  already stored or the media is gone, or, for a backfill, when the pair is already stored; it also
+  sees the update pipeline of `replacePreviews`.
 - A custom `MediaStore` must implement `replacePreviews(mediaId, identities, rows)`: in one
   atomic write per media, remove every stored row whose `identity` is in `identities` or belongs
   to one of `rows`, then store `rows`, and resolve with `{ stored, removed }` (`ReplacedPreviews`),

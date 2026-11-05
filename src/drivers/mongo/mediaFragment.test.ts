@@ -106,6 +106,19 @@ describe('resizeMediaSchemaFragment — host usage', () => {
   });
 });
 
+describe('resizeMediaSchemaFragment — preview rows', () => {
+  test('have no sub-document _id', () => {
+    assert.equal(resizeMediaSchemaFragment.previews[0]._id, false);
+    const schema = new mongoose.Schema({ ...resizeMediaSchemaFragment });
+    const rows = schema.path('previews') as unknown as {
+      schema: mongoose.Schema;
+    };
+    assert.equal(rows.schema.path('_id'), undefined);
+    assert.ok(rows.schema.path('identity'));
+    assert.equal('id' in rows.schema.virtuals, false);
+  });
+});
+
 describe('resizeMediaSchemaFragment — §15/§16 no-import invariant', () => {
   test('the fragment source is import-free (no mongoose, no framework)', () => {
     const src = readFileSync(

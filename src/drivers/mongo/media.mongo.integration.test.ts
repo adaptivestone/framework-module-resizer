@@ -108,6 +108,52 @@ function preview(identity: string | undefined, path = identity): Preview {
   } as Preview;
 }
 
+// A worker's first render of a new media on `model`, over a MemoryTaskQueue.
+async function firstRender(
+  model: ReturnType<typeof mediaModelWith>,
+  sizes: { width: number; height: number }[],
+) {
+  const png = await sharp({
+    create: {
+      width: 64,
+      height: 48,
+      channels: 3,
+      background: { r: 0, g: 0, b: 200 },
+    },
+  })
+    .png()
+    .toBuffer();
+  const logger: ResizeLogger = {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  };
+  const { storage } = memoryStorage();
+  const tasks = new MemoryTaskQueue({
+    timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+  });
+  const store = new MongoMediaStore({ model });
+  const r = new Resizer({
+    config: makeImageConfig({ formats: ['webp'] }),
+    logger,
+    storage,
+    media: store,
+    tasks,
+  });
+  const original = await r.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  const id = String((await model.create({ original }))._id);
+  await r.resolve({ media: (await store.loadMedia(id)) as MediaLike, sizes });
+  await workUntil({ logger, resizers: [r] }, () =>
+    tasks.rows.every(
+      (row) => row.status === 'completed' || row.status === 'dead',
+    ),
+  );
+  return { r, id, tasks };
+}
+
 const ID_A = 'default:default:16x16:webp:';
 const ID_B = 'default:default:32x32:webp:';
 
@@ -266,6 +312,273 @@ describe('MongoMediaStore.appendPreviews: one row per preview identity', () => {
     const reloaded = await Hooked.findById(doc._id).lean();
     assert.equal(reloaded?.previews?.length, 1);
     assert.equal(reloaded?.original?.width, 64);
+  });
+});
+
+describe('MongoMediaStore: the dimension backfill writes only while the pair is absent', () => {
+  for (const [name, dims, width, height] of [
+    ['both stored', { width: 80, height: 60 }, 80, 60],
+    ['none stored', {}, 4000, 3000],
+    ['a null width', { width: null, height: 60 }, 4000, 3000],
+    ['a width alone', { width: 80 }, 4000, 3000],
+  ] as const) {
+    test(`${name}: the original then holds ${width}×${height}`, async () => {
+      const doc = await Media().create({
+        original: { storageRef: { path: 'o.png' }, ...dims },
+      });
+      const id = String(doc._id);
+      await mediaStore().appendPreviews(id, [], { width: 4000, height: 3000 });
+      const loaded = await mediaStore().loadMedia(id);
+      assert.equal(loaded?.original?.width, width);
+      assert.equal(loaded?.original?.height, height);
+    });
+  }
+
+  // A media model with the given `original` and schema options (registered once per name).
+  const modelOf = (
+    name: string,
+    original: unknown,
+    options: Record<string, unknown> = {},
+  ) =>
+    connection.models[name] ??
+    connection.model(
+      name,
+      new mongoose.Schema(
+        { original, previews: resizeMediaSchemaFragment.previews } as never,
+        { minimize: false, ...options },
+      ),
+    );
+  const dims = { width: 1, height: 2 };
+  // `original.width` is undeclared here.
+  const undeclaredWidth = {
+    storageRef: { type: 'Mixed' },
+    height: { type: Number },
+  };
+
+  test('a Decimal128 dimension in a Mixed original does not count as stored: the backfill replaces it', async () => {
+    const model = modelOf('BackfillDecimalMedia', {
+      type: mongoose.Schema.Types.Mixed,
+    });
+    const store = new MongoMediaStore({ model });
+    const doc = await model.create({
+      original: {
+        width: mongoose.Types.Decimal128.fromString('80'),
+        height: 60,
+      },
+    });
+    await store.appendPreviews(String(doc._id), [], dims);
+    const loaded = await store.loadMedia(String(doc._id));
+    assert.equal(loaded?.original?.width, 1);
+    assert.equal(loaded?.original?.height, 2);
+  });
+
+  test('a Mixed original is filtered the same', async () => {
+    const model = modelOf('BackfillMixedMedia', {
+      type: mongoose.Schema.Types.Mixed,
+    });
+    const store = new MongoMediaStore({ model });
+    const held = await model.create({ original: { width: 80, height: 60 } });
+    const bare = await model.create({
+      original: { storageRef: { path: 'o' } },
+    });
+    await store.appendPreviews(String(held._id), [], dims);
+    await store.appendPreviews(String(bare._id), [], dims);
+    assert.equal(
+      (await store.loadMedia(String(held._id)))?.original?.width,
+      80,
+    );
+    assert.equal((await store.loadMedia(String(bare._id)))?.original?.width, 1);
+  });
+
+  test('strictQuery: true: a stored pair stays', async () => {
+    const model = modelOf('BackfillStrictQueryMedia', undeclaredWidth, {
+      strictQuery: true,
+    });
+    const held = await model.create({ original: { height: 6 } });
+    // Written around the schema.
+    await model.collection.updateOne(
+      { _id: held._id },
+      { $set: { 'original.width': 5 } },
+    );
+    const store = new MongoMediaStore({ model });
+    await store.appendPreviews(String(held._id), [], dims);
+    assert.equal(
+      (await store.loadMedia(String(held._id)))?.original?.height,
+      6,
+    );
+  });
+
+  test("strictQuery: 'throw' does not reject the filter of an undeclared dimension", async () => {
+    const model = modelOf('BackfillStrictQueryThrowMedia', undeclaredWidth, {
+      strictQuery: 'throw',
+    });
+    const bare = await model.create({ original: { height: 6 } });
+    const store = new MongoMediaStore({ model });
+    await assert.doesNotReject(
+      store.appendPreviews(String(bare._id), [], dims),
+    );
+  });
+
+  test('an original swapped in with its own dimensions during the render keeps them, with no warning', async () => {
+    const png = (width: number, height: number) =>
+      sharp({
+        create: {
+          width,
+          height,
+          channels: 3,
+          background: { r: 200, g: 0, b: 0 },
+        },
+      })
+        .png()
+        .toBuffer();
+    const warnings: string[] = [];
+    const logger: ResizeLogger = {
+      info: () => {},
+      warn: (message) => void warnings.push(String(message)),
+      error: () => {},
+    };
+    const { storage } = memoryStorage();
+    const tasks = new MemoryTaskQueue({
+      timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
+    });
+    const store = mediaStore();
+    const r = new Resizer({
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger,
+      storage,
+      media: store,
+      tasks,
+    });
+    const a = await r.uploadOriginal({
+      body: await png(400, 300),
+      visibility: 'private',
+    });
+    const b = await r.uploadOriginal({
+      body: await png(80, 60),
+      visibility: 'private',
+    });
+    const { width: _width, height: _height, ...bare } = a;
+    const id = String((await Media().create({ original: bare }))._id);
+    const download = storage.download.bind(storage);
+    let swapped = false;
+    storage.download = async (ref) => {
+      const bytes = await download(ref);
+      if (!swapped) {
+        swapped = true;
+        await Media().updateOne({ _id: id }, { $set: { original: b } });
+      }
+      return bytes;
+    };
+    const sizes = [{ width: 20, height: 20 }];
+
+    await r.resolve({
+      media: (await store.loadMedia(id)) as MediaLike,
+      sizes,
+    });
+    await workUntil({ logger, resizers: [r] }, () =>
+      tasks.rows.every(
+        (row) => row.status === 'completed' || row.status === 'dead',
+      ),
+    );
+
+    assert.deepEqual(
+      tasks.rows.map((row) => [row.status, row.attempts]),
+      [['completed', 2]],
+    );
+    const loaded = (await store.loadMedia(id)) as MediaLike;
+    assert.equal(loaded.original?.width, 80);
+    assert.equal(loaded.original?.height, 60);
+    assert.deepEqual(
+      warnings.filter((m) =>
+        m.includes("did not record the original's dimensions"),
+      ),
+      [],
+    );
+    const { decision } = await r.resolve({
+      media: loaded,
+      sizes,
+      enqueueMissing: false,
+    });
+    assert.equal(decision.missing.length, 0);
+    assert.equal(decision.ready[0].stale, undefined);
+  });
+});
+
+describe('MongoMediaStore: preview rows have no _id', () => {
+  test('neither an appended nor a replaced row stores one, and two loads read the same rows', async () => {
+    const store = mediaStore();
+    const id = await newMedia();
+    await store.appendPreviews(id, [preview(ID_A)]);
+    await store.replacePreviews(id, [ID_B], [preview(ID_B)]);
+
+    assert.deepEqual(
+      (await storedPreviews(id)).map((row) => '_id' in row),
+      [false, false],
+    );
+    const one = await Media().findById(id);
+    const two = await Media().findById(id);
+    assert.deepEqual(one?.toObject().previews, two?.toObject().previews);
+  });
+
+  test('an older row with a stored _id keeps it when loaded, and is replaced by its identity', async () => {
+    const id = await newMedia();
+    const stored = new mongoose.Types.ObjectId();
+    await Media().collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $push: { previews: { ...preview(ID_A), _id: stored } } } as never,
+    );
+
+    const loaded = await Media().findById(id);
+    const row = loaded?.toObject().previews[0] as { _id?: unknown };
+    assert.equal(String(row._id), String(stored));
+
+    const { removed } = await mediaStore().replacePreviews(
+      id,
+      [ID_A],
+      [preview(ID_A, 'new')],
+    );
+    assert.equal(removed.length, 1);
+    assert.deepEqual(
+      (await storedPreviews(id)).map((r) => '_id' in r),
+      [false],
+    );
+  });
+
+  test('the upgrade renders nothing: a row stored with an _id reads fresh through the current fragment, and queues no task', async () => {
+    // One collection, written through rows that keep their `_id`, as 0.3.0's fragment did.
+    const { _id: _rowId, ...rowFields } = resizeMediaSchemaFragment.previews[0];
+    const named = (name: string, definition: object) =>
+      connection.models[name] ??
+      connection.model(
+        name,
+        new mongoose.Schema(definition as never, { minimize: false }),
+        'upgraded_media',
+      );
+    const before = named('UpgradeBeforeMedia', {
+      original: resizeMediaSchemaFragment.original,
+      previews: [rowFields],
+    });
+    const current = named('UpgradeCurrentMedia', {
+      ...resizeMediaSchemaFragment,
+    });
+    const sizes = [{ width: 20, height: 20 }];
+    const { r, id, tasks } = await firstRender(before, sizes);
+    const [stored] = (
+      (await current.findById(id).lean()) as { previews: Preview[] }
+    ).previews;
+    assert.ok('_id' in stored);
+
+    const { decision } = await r.resolve({
+      media: (await new MongoMediaStore({ model: current }).loadMedia(
+        id,
+      )) as MediaLike,
+      sizes,
+    });
+
+    assert.equal(decision.missing.length, 0);
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+    assert.equal(tasks.rows.length, 1);
   });
 });
 
@@ -635,8 +948,11 @@ describe('MongoMediaStore.verify(): the media model must store preview identitie
   });
 
   test('rows declared through an explicit row schema without identity are rejected too', () => {
-    const { identity: _identity, ...rowFields } =
-      resizeMediaSchemaFragment.previews[0];
+    const {
+      identity: _identity,
+      _id: _rowId,
+      ...rowFields
+    } = resizeMediaSchemaFragment.previews[0];
     const store = new MongoMediaStore({
       model: mediaModelWith('RowSchemaMedia', [new mongoose.Schema(rowFields)]),
     });
@@ -836,6 +1152,60 @@ describe('MongoMediaStore: the preview metadata', () => {
         model: mediaModelWith('NoBytesMedia', [withoutSizeAndTime]),
       }).verify(),
     );
+  });
+
+  test('strict preview rows without storageRef are RESIZE_MONGO_MEDIA_MODEL_OUTDATED naming it', () => {
+    const { storageRef: _storageRef, ...rowFields } =
+      resizeMediaSchemaFragment.previews[0];
+    const store = new MongoMediaStore({
+      model: mediaModelWith('NoStorageRefMedia', [rowFields]),
+    });
+    assert.throws(
+      () => store.verify(),
+      (err: unknown) =>
+        err instanceof ResizeSetupError &&
+        err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
+        err.message.includes('previews.storageRef') &&
+        err.message.includes('no file to serve') &&
+        !err.message.includes('previews.identity'),
+    );
+  });
+
+  test('a storageRef declared as Mixed, as a sub-schema or as nested paths passes verify()', () => {
+    const { storageRef: _storageRef, ...rowFields } =
+      resizeMediaSchemaFragment.previews[0];
+    for (const [name, storageRef] of [
+      ['MixedRefMedia', { type: mongoose.Schema.Types.Mixed }],
+      ['SubSchemaRefMedia', new mongoose.Schema({ key: String })],
+      ['NestedRefMedia', { key: { type: String } }],
+    ] as const) {
+      const store = new MongoMediaStore({
+        model: mediaModelWith(name, [{ ...rowFields, storageRef }]),
+      });
+      assert.doesNotThrow(() => store.verify(), name);
+    }
+  });
+
+  test('a storageRef of nested paths really serves: a worker stores the row, and a read finds it fresh', async () => {
+    const { storageRef: _storageRef, ...rowFields } =
+      resizeMediaSchemaFragment.previews[0];
+    const model = mediaModelWith('NestedRefMedia', [
+      { ...rowFields, storageRef: { key: { type: String } } },
+    ]);
+    const sizes = [{ width: 20, height: 20 }];
+    const { r, id, tasks } = await firstRender(model, sizes);
+
+    assert.deepEqual(
+      tasks.rows.map((row) => [row.status, row.attempts]),
+      [['completed', 1]],
+    );
+    const { decision } = await r.resolve({
+      media: (await new MongoMediaStore({ model }).loadMedia(id)) as MediaLike,
+      sizes,
+      enqueueMissing: false,
+    });
+    assert.equal(decision.missing.length, 0);
+    assert.equal(decision.ready[0].stale, undefined);
   });
 
   test('strict preview rows without fit pass verify() with one warning; the fragment gets none', () => {
@@ -1233,7 +1603,10 @@ describe('a worker over real rows', () => {
     rows.map((row) => row.identity as string);
 
   /** A first render and then a replacement, with a namespaced ref, a fit row and a filtered row. */
-  const renderAndReplace = async (load?: MediaStore['loadMedia']) => {
+  const renderAndReplace = async (
+    load?: MediaStore['loadMedia'],
+    model = Media(),
+  ) => {
     const png = await sharp({
       create: {
         width: 64,
@@ -1255,7 +1628,7 @@ describe('a worker over real rows', () => {
     const tasks = new MemoryTaskQueue({
       timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
     });
-    const inner = mediaStore();
+    const inner = new MongoMediaStore({ model });
     const store = load
       ? fakeMedia({
           load,
@@ -1282,7 +1655,7 @@ describe('a worker over real rows', () => {
       visibility: 'private',
       namespace: 'avatars',
     });
-    const id = String((await Media().create({ original }))._id);
+    const id = String((await model.create({ original }))._id);
     const sizes = [
       { width: 20, height: 20 },
       { fit: true },
@@ -1415,9 +1788,27 @@ describe('a worker over real rows', () => {
     });
   }
 
-  test('lean rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a store that loads with lean() reads back plain rows, with their _id', async () => {
+  test('lean rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a store that loads with lean() reads back plain rows', async () => {
     await renderAndReplace(
       async (id) => (await Media().findById(id).lean()) as MediaLike | null,
+    );
+  });
+
+  // A hand-written schema that declares rows as sub-documents stores an `_id` on an appended row.
+  const rowsWithId = () => {
+    const { _id: _rowId, ...rowFields } = resizeMediaSchemaFragment.previews[0];
+    return mediaModelWith('RowsWithIdMedia', [rowFields]);
+  };
+
+  test('rows of a schema that keeps their _id raise no RESIZE_MEDIA_ROW_NOT_KEPT, hydrated', async () => {
+    await renderAndReplace(undefined, rowsWithId());
+  });
+
+  test('rows of a schema that keeps their _id raise no RESIZE_MEDIA_ROW_NOT_KEPT, lean', async () => {
+    await renderAndReplace(
+      async (id) =>
+        (await rowsWithId().findById(id).lean()) as MediaLike | null,
+      rowsWithId(),
     );
   });
 });

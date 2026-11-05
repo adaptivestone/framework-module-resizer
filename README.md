@@ -492,7 +492,9 @@ default every name); `mongoParts` passes one `timing` for every name. A model-sh
 needs `findById` and `findOneAndUpdate`, and optionally `castObject`. Previews and the backfilled
 dimensions are appended with `findOneAndUpdate`, one write per preview plus one for the backfill,
 so the media model's `findOneAndUpdate` middleware runs for each; the document it receives has only
-`_id`, and is `null` when the preview was already stored or the media is gone. `replacePreviews`
+`_id`, and is `null` when the preview was already stored or the media is gone, or, for a backfill,
+when the pair is already stored. A model-shaped `MongoMediaModel` gets `$or`, `$not` and `$type` in
+the backfill's filter, and `strictQuery: false` in its options. `replacePreviews`
 (which `invalidate` uses) is one `findOneAndUpdate` with an update pipeline, an array update, and
 `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`, so a
 custom model-shaped `MongoMediaModel` must accept an update pipeline, and a `findOneAndUpdate`
@@ -503,8 +505,9 @@ cast rejects with Mongoose's `ValidationError` before anything is written; `stor
 `filters` are stored as given, cast or not); without it they are written as given, minus their
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
-sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format` or `contentType` (a
-mixed or plain `previews` array, or rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and
+sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType` or
+`storageRef` (a `storageRef` may be Mixed, a sub-schema or nested paths; a mixed or plain `previews`
+array, or rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and
 logs one warning
 when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
 `logger` option, default `console`), `MongoLockStore.verify()`
@@ -635,7 +638,9 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     when the media schema declares a strict `original` without `width` and `height` (rejects them
     under `strict: 'throw'`), and stores them with the wrong type (or rejects them when it cannot
     cast them) when it declares them as a type that does not read back as a number (not Number,
-    Int32 or Mixed); its `verify()` warns once about it.
+    Int32 or Mixed); its `verify()` warns once about it. Write them only while the original holds
+    no stored pair (both numbers), so they cannot land on an original swapped in during the render.
+    `MongoMediaStore` does; a store that writes them anyway behaves as before.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -649,8 +654,8 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     backfill them uses `appendPreviews(id, [], dims)`). A row the store cannot store rejects the
     call before anything is written: `MongoMediaStore` casts the rows to the model's schema first,
     so a value that cannot be cast rejects with Mongoose's `ValidationError`, which is not a
-    `ResizeError`. The rows `MongoMediaStore.replacePreviews` writes carry no sub-document `_id`
-    (appended rows do); the module reads none, so do not rely on a preview row's `_id`.
+    `ResizeError`. The module reads no row `_id`: key rows by `identity` (see
+    [Freshness](#freshness)).
 - `LockStore`: `acquire(key, owner, ttlMs)` (`true` when the key was free or its lock had expired;
   `false` while a live lock holds it, even one with the same owner), `extend(key, owner, ttlMs)`
   (only the owner's live lock), `release(key, owner)` (only while `owner` holds it, expired or
@@ -1552,8 +1557,11 @@ with the previews of new uploads, which wait behind it, so plan worker capacity 
 there. Call `generate()` to bring a catalog up to date; it is idempotent and renders only what is
 missing or stale.
 
-**Mongo `_id`.** Rows that `replacePreviews` writes carry no sub-document `_id`, so a replaced row
-loses the `_id` it had: key preview rows by `identity`, never by `_id`.
+**Mongo `_id`.** Rows of the current `resizeMediaSchemaFragment` have no `_id`. An older row keeps
+its stored one until it is replaced. A hand-written schema that declares rows as sub-documents without
+`_id: false` stores an `_id` on an appended row, but a replaced row is written without one, so
+Mongoose makes up a new random `_id` each time that row is loaded, which changes any response or
+cache key built from it. Key preview rows by `identity`, never by `_id`.
 
 ## Operations
 
