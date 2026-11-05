@@ -73,13 +73,18 @@
   The replacement for `''` is `'.'`, which is the same folder.
 - **A media store must keep what the worker writes.** After its writes the worker reloads the media
   and compares the rows under each `storageRef` it wrote. When rows exist there and none matches
-  what was written in `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline`
-  and `filters`, the task dead-letters with `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming
-  the fields. A custom store that dropped one of these, and so rendered again on every read without
-  a log line, now fails visibly. So does a store with no `identity` column. A reload that lags
-  raises nothing. `MongoMediaStore` with the current fragment is not affected. `verify()` now also
-  rejects a strict row schema without `sizeKey` or `format` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a
-  read could never find such a row.
+  what was written in `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline` and
+  `filters`, or none has a `contentType`, the task dead-letters with `RESIZE_MEDIA_ROW_NOT_KEPT`
+  (`retryable: false`), naming the fields. So does a row that comes back without its `storageRef`. A
+  custom store that dropped one of these, and so rendered again on every read without a log line,
+  now fails visibly. A store with no `identity` column, or its own form of it, keeps working: a read
+  does not use it. It gets one `warn` per Resizer, because `invalidate()` and `replacePreviews` find
+  rows only by identity, so such rows stay behind. A reload that lags raises nothing, except on a
+  driver that names files by their bytes, where a lagging reload after a replacement is dead naming
+  `encodeSig`, though its rows are stored and the next read is fresh. `MongoMediaStore` with the
+  current fragment is not affected. `verify()` now also rejects a strict row schema without
+  `sizeKey`, `format` or `contentType` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never
+  serve such a row.
 
 **Changed behaviour**
 

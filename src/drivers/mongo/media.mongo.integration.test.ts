@@ -8,10 +8,15 @@ import { types } from 'node:util';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
+import type { MediaStore } from '../../contracts/media.ts';
 import { ResizeSetupError } from '../../errors.ts';
 import { Resizer, resetResizerForTests } from '../../resizer.ts';
 import { encodeSignature, previewOrigin } from '../../signatures.ts';
-import { MemoryTaskQueue, memoryStorage } from '../../testHelpers/fakes.ts';
+import {
+  fakeMedia,
+  MemoryTaskQueue,
+  memoryStorage,
+} from '../../testHelpers/fakes.ts';
 import { makeImageConfig } from '../../testHelpers/resizeConfig.ts';
 import { workUntil } from '../../testHelpers/work.ts';
 import type { MediaLike, Preview, ResizeLogger } from '../../types.d.ts';
@@ -1224,7 +1229,8 @@ describe('MongoMediaStore options', () => {
 });
 
 describe('a worker over real rows', () => {
-  test('hydrated rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a namespaced ref, a fit row, a filtered row, first rendered and then replaced', async () => {
+  /** A first render and then a replacement, with a namespaced ref, a fit row and a filtered row. */
+  const renderAndReplace = async (load?: MediaStore['loadMedia']) => {
     const png = await sharp({
       create: {
         width: 64,
@@ -1235,16 +1241,27 @@ describe('a worker over real rows', () => {
     })
       .png()
       .toBuffer();
+    const warnings: unknown[] = [];
+    const errors: unknown[] = [];
     const logger: ResizeLogger = {
       info: () => {},
-      warn: () => {},
-      error: () => {},
+      warn: (line) => void warnings.push(line),
+      error: (line) => void errors.push(line),
     };
     const { storage } = memoryStorage();
     const tasks = new MemoryTaskQueue({
       timing: { idlePollMs: 5, retryBackoffMs: { base: 5, max: 5 } },
     });
-    const store = mediaStore();
+    const inner = mediaStore();
+    const store = load
+      ? fakeMedia({
+          load,
+          appendPreviews: (id, previews, dims) =>
+            inner.appendPreviews(id, previews, dims),
+          replacePreviews: (id, identities, rows) =>
+            inner.replacePreviews(id, identities, rows),
+        })
+      : inner;
     const resizerAt = (quality: number) =>
       new Resizer({
         config: makeImageConfig({
@@ -1288,6 +1305,21 @@ describe('a worker over real rows', () => {
     assert.deepEqual(
       tasks.rows.map((row) => row.status),
       ['completed', 'completed'],
+    );
+    assert.deepEqual(errors, []);
+    assert.deepEqual(
+      warnings.filter((line) => /the identity of/.test(String(line))),
+      [],
+    );
+  };
+
+  test('hydrated rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a namespaced ref, a fit row, a filtered row, first rendered and then replaced', async () => {
+    await renderAndReplace();
+  });
+
+  test('lean rows raise no RESIZE_MEDIA_ROW_NOT_KEPT: a store that loads with lean() reads back plain rows, with their _id', async () => {
+    await renderAndReplace(
+      async (id) => (await Media().findById(id).lean()) as MediaLike | null,
     );
   });
 });

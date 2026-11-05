@@ -339,7 +339,7 @@ describe('FrameworkMediaStore.verify: the media schema', () => {
     );
   });
 
-  test('a media model with strict rows without sizeKey or format is a setup error naming them', () => {
+  test('a media model with strict rows without sizeKey, format or contentType is a setup error naming them', () => {
     installApp(
       withRows('File', {
         identity: { type: String },
@@ -354,11 +354,12 @@ describe('FrameworkMediaStore.verify: the media schema', () => {
         err.code === 'RESIZE_MONGO_MEDIA_MODEL_OUTDATED' &&
         err.message.includes('previews.sizeKey') &&
         err.message.includes('previews.format') &&
+        err.message.includes('previews.contentType') &&
         !err.message.includes('previews.origin'),
     );
   });
 
-  test('a media model with previews.identity, origin, encodeSig, sizeKey and format, or without a schema, passes', () => {
+  test('a media model with previews.identity, origin, encodeSig, sizeKey, format and contentType, or without a schema, passes', () => {
     installApp(
       withRows('File', {
         identity: { type: String },
@@ -366,6 +367,7 @@ describe('FrameworkMediaStore.verify: the media schema', () => {
         encodeSig: { type: String },
         sizeKey: { type: String },
         format: { type: String },
+        contentType: { type: String },
       }),
     );
     assert.doesNotThrow(() => mediaStore.verify());

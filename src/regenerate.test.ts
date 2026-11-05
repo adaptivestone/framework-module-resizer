@@ -13,6 +13,7 @@ import sharp from 'sharp';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeError } from './errors.ts';
+import { getPreviewIdentity, previewScope } from './images.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
@@ -1376,11 +1377,12 @@ const twoBoxes: SizeInput[] = [
 ];
 
 for (const field of [
-  'identity',
   'origin',
   'encodeSig',
   'sizeKey',
   'format',
+  'contentType',
+  'storageRef',
 ] as const) {
   test(`a store that loses ${field}: the first task is dead with RESIZE_MEDIA_ROW_NOT_KEPT naming it, after one upload`, async () => {
     const w = world({ wrap: losing(field) });
@@ -1399,7 +1401,7 @@ for (const field of [
     assert.equal(errors[0].retryable, false);
     assert.equal(
       errors[0].message,
-      `resize worker: the media store did not keep ${field} of 1 preview row(s) of media m1, so reads may render them again and again — a MediaStore must store and return identity, origin, encodeSig, sizeKey, format, resizer, pipeline and filters as given: default:default:20x20:webp:none (${field})`,
+      `resize worker: the media store did not keep ${field} of 1 preview row(s) of media m1, so reads may render them again and again — a MediaStore must store and return storageRef, origin, encodeSig, sizeKey, format, contentType, resizer, pipeline and filters as given: default:default:20x20:webp:none (${field})`,
     );
     if (field === 'encodeSig') {
       // An operator finds it in the dead line (src/consumer.ts).
@@ -1410,7 +1412,12 @@ for (const field of [
 
 // `losing` answers with the rows it was given. This store answers with what it really stored, so
 // the recorder leaves the row out, and the check must still see it.
-for (const field of ['sizeKey', 'format'] as const) {
+for (const field of [
+  'sizeKey',
+  'format',
+  'contentType',
+  'storageRef',
+] as const) {
   test(`a store that answers with the rows as it stored them, without ${field}: dead at once too, after one upload`, async () => {
     const w = world({
       wrap: (inner) =>
@@ -1465,6 +1472,361 @@ for (const [field, pipeline, filters] of [
     assert.match(errors[0].message, new RegExp(`did not keep ${field} of 1`));
   });
 }
+
+test('a store that loses resizer: reads of a named Resizer would miss the row, so the task is dead too', async () => {
+  const w = world();
+  const r = new Resizer({
+    name: 'listings',
+    config: webpConfig(80),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    media: losing('resizer')(w.store),
+    tasks: w.tasks,
+  });
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+  assert.match(
+    errors[0].message,
+    /did not keep resizer of 1 preview row\(s\).*listings:default:20x20:webp:none \(resizer\)$/,
+  );
+});
+
+// Its answer says nothing was stored, so attempt 1 finds the row it just wrote, sees other
+// signatures on it, and takes it for another worker's: blocked, not judged, and retried. Attempt 2
+// replaces that row, and a row a replace left out is judged.
+test("a store that answers [] and loses encodeSig: attempt 1 cannot tell its row from another worker's, so attempt 2 is dead, after two uploads", async () => {
+  const strip = (rows: Preview[]): Preview[] =>
+    rows.map(({ encodeSig: _lost, ...row }) => row);
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: async (id, previews, dims) => {
+          await inner.appendPreviews(id, strip(previews), dims);
+          return [];
+        },
+        replacePreviews: async (id, identities, rows) => {
+          const { removed } = await inner.replacePreviews(
+            id,
+            identities,
+            strip(rows),
+          );
+          return { stored: [], removed };
+        },
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const files = w.files.size;
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 2]]);
+  assert.equal(w.files.size, files + 2);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+});
+
+/**
+ * A store keyed by the identity it computes from each row's fields, as a table with its own key can
+ * be. Its `identity` column holds what `column` makes of the identity it was given.
+ */
+const tableStore =
+  (column: (identity: string) => string | null | undefined) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore => {
+    const keyOf = (row: Preview): string =>
+      getPreviewIdentity(
+        previewScope(row),
+        row.sizeKey,
+        row.format,
+        row.filters,
+      );
+    const asStored = ({ identity, ...row }: Preview): Preview => {
+      const value = column(String(identity));
+      return (
+        value === undefined ? row : { ...row, identity: value }
+      ) as Preview;
+    };
+    return fakeMedia({
+      load: (id) => inner.loadMedia(id),
+      appendPreviews: async (id, previews, dims) => {
+        await inner.appendPreviews(id, [], dims);
+        const doc = (await inner.loadMedia(id)) as MediaLike;
+        const rows = doc.previews ?? [];
+        const held = new Set(rows.map(keyOf));
+        const added = previews.filter((row) => !held.has(keyOf(row)));
+        doc.previews = [...rows, ...added.map(asStored)];
+        return added;
+      },
+      replacePreviews: async (id, identities, written) => {
+        const doc = (await inner.loadMedia(id)) as MediaLike;
+        const rows = doc.previews ?? [];
+        const gone = new Set([...identities, ...written.map(keyOf)]);
+        doc.previews = [
+          ...rows.filter((row) => !gone.has(keyOf(row))),
+          ...written.map(asStored),
+        ];
+        return {
+          stored: written,
+          removed: rows.filter((row) => gone.has(keyOf(row))),
+        };
+      },
+    });
+  };
+
+for (const [form, column] of [
+  ['absent', () => undefined],
+  ['null', () => null],
+  ['in its own form', (identity: string) => `own/${identity}`],
+] as const) {
+  test(`a store keyed by the computed identity, its identity column ${form}: tasks complete, reads are fresh, and one warning says what stays behind`, async () => {
+    const w = world({ wrap: tableStore(column) });
+    const { logger, logs, lines } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    const { decision } = await w.read(r, doc);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(decision.ready[0].stale ?? false, false);
+    assert.equal(w.tasks.rows.length, 1);
+
+    // A second task, and no second line: one warning per Resizer.
+    await w.read(r, doc, [{ width: 30, height: 30 }]);
+    await w.work(r, logger);
+    assert.deepEqual(statuses(w), [
+      ['completed', 1],
+      ['completed', 1],
+    ]);
+    assert.deepEqual(logs.error, []);
+    const warned = lines('warn', /did not keep the identity/);
+    assert.equal(warned.length, 1);
+    assert.equal(
+      warned[0][0],
+      'resize worker: the media store did not keep the identity of 1 preview row(s) of media m1: invalidate() and replacePreviews find rows only by identity, so these rows stay behind — store and return identity as given: default:default:20x20:webp:none',
+    );
+  });
+}
+
+test('a store keyed by the computed identity: a replacement is not blocked, and the new row is served', async () => {
+  const w = world({ wrap: tableStore(() => undefined) });
+  const first = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, first);
+  await w.read(first, doc);
+  await w.work(first);
+  const [before] = doc.previews ?? [];
+  resetResizerForTests();
+
+  const r = w.resizer(webpConfig(70));
+  const stale = await w.read(r, doc);
+  assert.equal(stale.decision.ready[0].stale, true);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['completed', 1],
+  ]);
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
+  assert.notDeepEqual(doc.previews?.[0].storageRef, before.storageRef);
+});
+
+test('a store that keeps contentType in its own form: the row is served, so the task completes and the next read is fresh', async () => {
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: async (id, previews, dims) => {
+          await inner.appendPreviews(
+            id,
+            previews.map((row) => ({
+              ...row,
+              contentType: row.contentType.toUpperCase(),
+            })),
+            dims,
+          );
+          return previews;
+        },
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
+  assert.equal(w.tasks.rows.length, 1);
+});
+
+test('a store whose rows keep their identity: no identity warning', async () => {
+  const w = world();
+  const { logger, lines } = recordingLogger();
+  const r = w.resizer(webpConfig(80), logger);
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r, logger);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  assert.deepEqual(lines('warn', /did not keep the identity/), []);
+});
+
+// ---- The check must never fail a task whose work is done.
+
+const hostileRef = (): Preview['storageRef'] => ({
+  toJSON() {
+    throw new TypeError('no JSON');
+  },
+  toString() {
+    throw new TypeError('no string');
+  },
+});
+
+const throwingIdentity = (row: Preview): Preview =>
+  Object.defineProperty({ ...row }, 'identity', {
+    enumerable: true,
+    get() {
+      throw new TypeError('no identity');
+    },
+  });
+
+/** A row of nothing this file requests. */
+const unrelatedRow = (storageRef: Preview['storageRef']): Preview => ({
+  storageRef,
+  sizeKey: '999x999',
+  format: 'webp',
+  contentType: 'image/webp',
+  identity: 'default:default:999x999:webp:none',
+});
+
+/** The docMedia() store, but `rows` decides what each load shows of the rows it holds. */
+const showing =
+  (rows: (held: Preview[]) => Preview[]) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore =>
+    fakeMedia({
+      load: async (id) => {
+        const doc = await inner.loadMedia(id);
+        return doc && { ...doc, previews: rows(doc.previews ?? []) };
+      },
+      appendPreviews: (id, previews, dims) =>
+        inner.appendPreviews(id, previews, dims),
+      replacePreviews: (id, identities, written) =>
+        inner.replacePreviews(id, identities, written),
+    });
+
+for (const [name, wrap] of [
+  [
+    'a ref whose JSON and String() both throw, on an unrelated row',
+    showing((held) => [unrelatedRow(hostileRef()), ...held]),
+  ],
+  [
+    'a throwing identity getter, on an unrelated row',
+    showing((held) => [
+      throwingIdentity(unrelatedRow({ key: 'unrelated' })),
+      ...held,
+    ]),
+  ],
+  [
+    'a throwing identity getter, on the row under the written ref',
+    showing((held) => held.map(throwingIdentity)),
+  ],
+] as const) {
+  test(`${name}: the task completes at its first attempt`, async () => {
+    const w = world({ wrap });
+    const { logger, logs } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    assert.deepEqual(logs.error, []);
+    assert.equal(rowsOf(doc).length, 1);
+  });
+}
+
+test('a ref whose JSON and String() both throw, on the row under the written ref: the task completes at its first attempt', async () => {
+  const w = world();
+  const { logger, logs } = recordingLogger();
+  const r = w.resizer(webpConfig(80), logger);
+  const doc = await bareMedia(w, r);
+  // Only the preview's locator: the original's was stored above.
+  w.storage.upload = async () => hostileRef();
+
+  await w.read(r, doc);
+  await w.work(r, logger);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  assert.deepEqual(logs.error, []);
+  assert.equal(rowsOf(doc).length, 1);
+});
+
+test('a check that throws logs one line, and each task keeps its result', async () => {
+  // Each reload holds rows that cannot be read the first time, which nothing in the check guards
+  // row by row: the worker's own guard is what is left. Every task loads twice.
+  let loads = 0;
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: async (id) => {
+          const doc = await inner.loadMedia(id);
+          loads += 1;
+          if (!doc || loads % 2 === 1) {
+            return doc;
+          }
+          let thrown = false;
+          return Object.defineProperty({ ...doc }, 'previews', {
+            get() {
+              if (!thrown) {
+                thrown = true;
+                throw new TypeError('no rows');
+              }
+              return doc.previews;
+            },
+          });
+        },
+        appendPreviews: (id, previews, dims) =>
+          inner.appendPreviews(id, previews, dims),
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  });
+  const { logger, logs, lines } = recordingLogger();
+  const r = w.resizer(webpConfig(80), logger);
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r, logger);
+  await w.read(r, doc, [{ width: 30, height: 30 }]);
+  await w.work(r, logger);
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['completed', 1],
+  ]);
+  assert.deepEqual(logs.error, []);
+  const warned = lines('warn', /could not check what the media store kept/);
+  assert.equal(warned.length, 1);
+  assert.match(String(warned[0][0]), /media m1.*keeps its result/);
+  assert.match(String(warned[0][1]), /no rows/);
+});
 
 // The case the group rule exists for.
 test('a content-addressed store gives two size keys one ref: the task completes and the next read queues nothing', async () => {

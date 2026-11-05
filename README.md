@@ -503,8 +503,8 @@ cast rejects with Mongoose's `ValidationError` before anything is written; `stor
 `filters` are stored as given, cast or not); without it they are written as given, minus their
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
-sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey` or `format` (a mixed or plain
-`previews` array, or rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and
+sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format` or `contentType` (a
+mixed or plain `previews` array, or rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and
 logs one warning
 when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
 `logger` option, default `console`), `MongoLockStore.verify()`
@@ -602,14 +602,22 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
-  - `loadMedia` must return each stored row's `identity`, `origin`, `encodeSig`, `sizeKey`, `format`,
-    `resizer`, `pipeline`, `filters` and `storageRef` as they were given. After a task's writes the
-    worker reloads the media and looks at the rows under each `storageRef` it wrote. No such row
-    raises nothing (a lagging reload; a store that reshapes refs is not detected). Rows there, and
-    none matches what was written in those fields: the task fails with `ResizeSetupError`
-    `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields, because such a store makes
-    reads render the preview again and again. `fit` is exempt. A store that returns one ref for two
-    rows is judged against all of them.
+  - `loadMedia` must return each stored row's `origin`, `encodeSig`, `sizeKey`, `format`,
+    `contentType`, `resizer`, `pipeline`, `filters` and `storageRef` as they were given. After a
+    task's writes the worker reloads the media and looks at the rows under each `storageRef` it
+    wrote. No such row raises nothing (a lagging reload; a store that reshapes refs is not
+    detected), unless a row a read would take for it came back with no `storageRef` at all. Rows
+    there, and none matches what was written in those fields: the task fails with
+    `ResizeSetupError` `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields, because
+    such a store makes reads render the preview again and again. `fit` is exempt, and `contentType`
+    counts only when it is lost: a read needs one, in any form. A store that returns one ref for two
+    rows is judged against all of them, and a row the check cannot read is skipped. On a driver that
+    names files by their bytes, a lagging reload after a replacement shows the older row under the
+    same ref: the task is dead although its rows are stored, and the next read is fresh.
+  - `loadMedia` should return a stored row's `identity` as given too, but losing it fails no task: a
+    read does not use it, so a store keyed by the identity it computes works. A kept row whose
+    `identity` is absent or differs gets one `warn` per Resizer, because `invalidate()` and
+    `replacePreviews` find rows only by identity, so such rows stay behind.
   - `appendPreviews` stores a preview only when its `identity` is not stored on the media yet, and
     must resolve with the previews it stored (`[]` when none); resolving with something other than
     an array (e.g. `undefined`) fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.

@@ -59,8 +59,10 @@ import {
 import {
   checkReplaced,
   PreviewRecorder,
+  type RowNotKept,
   requireReplacePreviews,
   rowsNotKept,
+  rowsWithoutIdentity,
 } from './previewRecorder.ts';
 import { checkRaster } from './raster.ts';
 import {
@@ -659,6 +661,10 @@ export class Processor {
   readonly #warnedAllFresh = new Set<string>();
   // Whether a media store that dropped the dimension backfill was warned about.
   #warnedBackfill = false;
+  // Whether a media store that kept rows without their identity was warned about.
+  #warnedIdentity = false;
+  // Whether a check of what the store kept that failed was logged.
+  #warnedKeptCheck = false;
 
   constructor(deps: ProcessorDeps) {
     this.#deps = deps;
@@ -961,7 +967,7 @@ export class Processor {
     // The coverage below counts this worker's own rows, so it cannot see a store that lost a field
     // of them. Rows are compared with what was written, not with the current settings: a settings
     // change or a swapped original is staleness, and must not raise this.
-    const notKept = rowsNotKept(written, refreshed.previews);
+    const notKept = this.#checkKept(task, written, refreshed);
     if (notKept.length > 0) {
       const fields = [...new Set(notKept.flatMap((row) => row.fields))].join(
         ', ',
@@ -971,7 +977,7 @@ export class Processor {
         .join('; ');
       // The fields come before the row list: a dead line cuts the error's text at 1000 characters.
       throw new ResizeSetupError(
-        `resize worker: the media store did not keep ${fields} of ${notKept.length} preview row(s) of media ${task.mediaId}, so reads may render them again and again — a MediaStore must store and return identity, origin, encodeSig, sizeKey, format, resizer, pipeline and filters as given: ${rows}`,
+        `resize worker: the media store did not keep ${fields} of ${notKept.length} preview row(s) of media ${task.mediaId}, so reads may render them again and again — a MediaStore must store and return storageRef, origin, encodeSig, sizeKey, format, contentType, resizer, pipeline and filters as given: ${rows}`,
         { code: 'RESIZE_MEDIA_ROW_NOT_KEPT', retryable: false },
       );
     }
@@ -1027,6 +1033,46 @@ export class Processor {
       });
     }
     return { requested: requested.length, rendered: generated.length };
+  }
+
+  /**
+   * What the store did not keep of the rows this delivery wrote, with one warning per Resizer for
+   * rows it kept without their identity. It never throws: the work is done, so a check that cannot
+   * read what came back must not fail the task, which then keeps its result.
+   */
+  #checkKept(
+    task: LeasedTask,
+    written: Preview[],
+    refreshed: MediaLike,
+  ): RowNotKept[] {
+    const { logger } = this.#deps;
+    try {
+      const { previews } = refreshed;
+      if (!this.#warnedIdentity) {
+        const rows = rowsWithoutIdentity(written, previews);
+        if (rows.length > 0) {
+          this.#warnedIdentity = true;
+          logNeverThrow(
+            logger,
+            `resize worker: the media store did not keep the identity of ${rows.length} preview row(s) of media ${task.mediaId}: invalidate() and replacePreviews find rows only by identity, so these rows stay behind — store and return identity as given: ${rows.join('; ')}`,
+            undefined,
+            'warn',
+          );
+        }
+      }
+      return rowsNotKept(written, previews);
+    } catch (err) {
+      if (!this.#warnedKeptCheck) {
+        this.#warnedKeptCheck = true;
+        logNeverThrow(
+          logger,
+          `resize worker: could not check what the media store kept of media ${task.mediaId}; the task keeps its result`,
+          err,
+          'warn',
+        );
+      }
+      return [];
+    }
   }
 
   /**

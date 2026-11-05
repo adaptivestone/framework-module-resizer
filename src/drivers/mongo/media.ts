@@ -287,6 +287,7 @@ const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
   ],
   ['sizeKey', 'a read would never find a preview by its size'],
   ['format', 'a read would never find a preview by its format'],
+  ['contentType', 'a read could never serve a preview'],
 ];
 
 export class MongoMediaStore extends MediaStore {
@@ -313,12 +314,12 @@ export class MongoMediaStore extends MediaStore {
 
   /**
    * Startup check: the media model must resolve, and its preview rows must keep `identity`,
-   * `origin` and `encodeSig`. Only rows declared as sub-documents with a strict shape lose them
-   * (Mongoose strict mode strips an undeclared field from every row: without `identity` every
-   * worker that renders a variant would add its own row, and without the signatures no row could
-   * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
-   * field. Such rows without `fit` only get a warning, once per store: freshness still holds
-   * without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
+   * `origin`, `encodeSig`, `sizeKey`, `format` and `contentType`. Only rows declared as
+   * sub-documents with a strict shape lose them (Mongoose strict mode strips an undeclared field
+   * from every row: without `identity` every worker that renders a variant would add its own row,
+   * without the signatures no row could say what it was made from, and without the last three no
+   * read could serve a row); a mixed or plain array, or rows with `strict: false`, keep any field.
+   * Such rows without `fit` only get a warning, once per store: freshness still holds without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
    * without `width` or `height`, or any `original` declaring one with a type that does not read
    * back as a number (not Number, Int32 or Mixed), also gets one warning per store (it does not
    * throw, so a setup that passed before keeps passing): Mongoose drops the dimensions the worker

@@ -9,8 +9,9 @@
 // the result's `failure`, beside what the store kept before it failed (an earlier write of the
 // same persist, or the part a failed append stored), so the caller can tell which variants were
 // stored before it rethrows. It renders nothing and fires no observer: the Processor fires
-// onPreviewGenerated over the rows it returns. rowsNotKept() is the worker's later check that the
-// rows a reload holds under each written storageRef are the rows that were written.
+// onPreviewGenerated over the rows it returns. rowsNotKept() and rowsWithoutIdentity() are the
+// worker's later check that the rows a reload holds under each written storageRef are the rows that
+// were written.
 import type { Catalog } from './catalog.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import { ResizeSetupError } from './errors.ts';
@@ -23,12 +24,19 @@ import type {
   ResizeLogger,
 } from './types.d.ts';
 
-/** One uploaded locator for a log line; an opaque ref that JSON cannot encode is still named. */
+/**
+ * One uploaded locator for a log line; an opaque ref that JSON cannot encode is still named. A ref
+ * is host data: when it cannot be printed either, the line must still be written.
+ */
 function describeRef(preview: Preview): string {
   try {
     return JSON.stringify(preview.storageRef) ?? String(preview.storageRef);
   } catch {
-    return String(preview.storageRef);
+    try {
+      return String(preview.storageRef);
+    } catch {
+      return '(a storage ref that cannot be printed)';
+    }
   }
 }
 
@@ -47,20 +55,27 @@ function filterSig(row: Preview): string {
 }
 
 // What a store must read back as written, compared as they are. `fit` is left out on purpose: a
-// store may not keep it, and freshness then accepts either signature.
-const KEPT_FIELDS = [
-  'identity',
-  'origin',
-  'encodeSig',
-  'sizeKey',
-  'format',
-] as const;
+// store may not keep it, and freshness then accepts either signature. So is `identity`: a read
+// never uses it, so a store keyed by the identity it computes works without it, and that row only
+// gets a warning (rowsWithoutIdentity).
+const KEPT_FIELDS = ['origin', 'encodeSig', 'sizeKey', 'format'] as const;
 
 export type KeptField =
   | (typeof KEPT_FIELDS)[number]
+  | 'contentType'
   | 'resizer'
   | 'pipeline'
-  | 'filters';
+  | 'filters'
+  | 'storageRef';
+
+// What a read finds a row by, so the fields that tell one size key's row from another's.
+const READ_FIELDS: ReadonlySet<KeptField> = new Set([
+  'sizeKey',
+  'format',
+  'resizer',
+  'pipeline',
+  'filters',
+]);
 
 /** A written row a reload holds in another form, and the fields of the closest row there. */
 export interface RowNotKept {
@@ -69,51 +84,118 @@ export interface RowNotKept {
 }
 
 /**
+ * The fields `held` differs from `row` in, or undefined when a row cannot be read: rows and refs
+ * are host data, and a getter can throw. Such a row says nothing about a write.
+ */
+function differences(held: Preview, row: Preview): KeptField[] | undefined {
+  try {
+    const fields: KeptField[] = KEPT_FIELDS.filter(
+      (field) => held[field] !== row[field],
+    );
+    // A read cannot serve a row without one, but takes any: a store's own form of it still works.
+    if (!held.contentType) {
+      fields.push('contentType');
+    }
+    // A read finds a row by these too, with their defaults: a store that loses one makes that read
+    // miss the row.
+    const [own, wrote] = [previewScope(held), previewScope(row)];
+    if (own.resizer !== wrote.resizer) {
+      fields.push('resizer');
+    }
+    if (own.pipeline !== wrote.pipeline) {
+      fields.push('pipeline');
+    }
+    if (filterSig(held) !== filterSig(row)) {
+      fields.push('filters');
+    }
+    return fields;
+  } catch {
+    return undefined;
+  }
+}
+
+const readMisses = (fields: KeptField[]): number =>
+  fields.filter((field) => READ_FIELDS.has(field)).length;
+
+/**
+ * Which ref group a row belongs to: its ref as JSON, `null` when it holds no ref, undefined when it
+ * cannot be told apart from another (a ref JSON cannot encode, or a row that cannot be read).
+ */
+function refGroup(row: Preview): string | null | undefined {
+  try {
+    return row.storageRef == null ? null : JSON.stringify(row.storageRef);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A written row beside what a reload holds for it. */
+interface WrittenRow {
+  row: Preview;
+  // The rows under its storageRef that can be read, each with the fields it differs in.
+  under: { held: Preview; fields: KeptField[] }[];
+  // Nothing is under its ref, and a row a read would take for it came back without a ref.
+  lostRef: boolean;
+}
+
+/** The written rows that can be judged. With nothing written, no row read back is touched. */
+function compareWritten(
+  written: readonly Preview[],
+  readBack: readonly Preview[] | null | undefined,
+): WrittenRow[] {
+  if (written.length === 0) {
+    return [];
+  }
+  const groups = new Map<string | null, Preview[]>();
+  for (const held of readBack ?? []) {
+    const key = refGroup(held);
+    if (key !== undefined) {
+      groups.set(key, [...(groups.get(key) ?? []), held]);
+    }
+  }
+  return written.flatMap((row) => {
+    const key = refGroup(row);
+    if (key == null) {
+      return [];
+    }
+    const under = (groups.get(key) ?? []).flatMap((held) => {
+      const fields = differences(held, row);
+      return fields ? [{ held, fields }] : [];
+    });
+    const lostRef =
+      !groups.has(key) &&
+      (groups.get(null) ?? []).some((held) => {
+        const fields = differences(held, row);
+        return fields !== undefined && readMisses(fields) === 0;
+      });
+    return [{ row, under, lostRef }];
+  });
+}
+
+/**
  * The `written` rows the store did not keep as written, judged by the rows `readBack` holds under
  * each one's storageRef. No row under a ref says nothing: the reload may lag, and a store that
- * reshapes its refs is not detected. A content-addressed store can return one ref for two rows
- * with equal bytes, so a written row is kept when any row of its group matches it; when none does,
- * the fields named are those of the group's closest row (the fewest differing fields, the first on
- * a tie), since a list of "fields no row holds" can come out empty.
+ * reshapes its refs is not detected. A row a read would take for this one, with no ref at all, says
+ * the store lost the ref. A row or a ref that cannot be read is skipped. A content-addressed store
+ * can return one ref for two rows with equal bytes, so a written row is kept when any row of its
+ * group matches it; when none does, the fields named are those of the group's closest row: the
+ * fewest differences in what a read finds a row by (another size key's row can differ in one field
+ * too), then the fewest differences, the first on a tie, since a list of "fields no row holds" can
+ * come out empty.
  */
 export function rowsNotKept(
   written: readonly Preview[],
   readBack: readonly Preview[] | null | undefined,
 ): RowNotKept[] {
-  const groups = new Map<string, Preview[]>();
-  for (const row of readBack ?? []) {
-    // A row without a locator says nothing about a write.
-    if (row?.storageRef == null) {
-      continue;
-    }
-    const ref = describeRef(row);
-    const group = groups.get(ref);
-    if (group) {
-      group.push(row);
-    } else {
-      groups.set(ref, [row]);
-    }
-  }
   const notKept: RowNotKept[] = [];
-  for (const row of written) {
-    let closest: KeptField[] | undefined;
-    for (const candidate of groups.get(describeRef(row)) ?? []) {
-      const fields: KeptField[] = KEPT_FIELDS.filter(
-        (field) => candidate[field] !== row[field],
-      );
-      // A read finds a row by these too, with their defaults: a store that loses one makes that
-      // read miss the row, whatever `identity` says.
-      const [held, wrote] = [previewScope(candidate), previewScope(row)];
-      if (held.resizer !== wrote.resizer) {
-        fields.push('resizer');
-      }
-      if (held.pipeline !== wrote.pipeline) {
-        fields.push('pipeline');
-      }
-      if (filterSig(candidate) !== filterSig(row)) {
-        fields.push('filters');
-      }
-      if (!closest || fields.length < closest.length) {
+  for (const { row, under, lostRef } of compareWritten(written, readBack)) {
+    let closest: KeptField[] | undefined = lostRef ? ['storageRef'] : undefined;
+    for (const { fields } of under) {
+      const closer =
+        !closest ||
+        (readMisses(fields) - readMisses(closest) ||
+          fields.length - closest.length) < 0;
+      if (closer) {
         closest = fields;
       }
     }
@@ -123,6 +205,30 @@ export function rowsNotKept(
     }
   }
   return notKept;
+}
+
+/**
+ * The identities of the `written` rows the store kept with another `identity`, or with none. Such a
+ * row is served, but invalidate() and replacePreviews find rows only by identity. An identity that
+ * cannot be read says nothing.
+ */
+export function rowsWithoutIdentity(
+  written: readonly Preview[],
+  readBack: readonly Preview[] | null | undefined,
+): string[] {
+  const holdsIdentity = (held: Preview, row: Preview): boolean => {
+    try {
+      return held.identity === row.identity;
+    } catch {
+      return true;
+    }
+  };
+  return compareWritten(written, readBack).flatMap(({ row, under }) => {
+    const kept = under.filter(({ fields }) => fields.length === 0);
+    return kept.length > 0 && !kept.some(({ held }) => holdsIdentity(held, row))
+      ? [String(row.identity)]
+      : [];
+  });
 }
 
 /**

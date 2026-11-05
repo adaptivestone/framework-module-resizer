@@ -7,7 +7,11 @@ import { test } from 'node:test';
 import { Catalog } from './catalog.ts';
 import type { MediaStore } from './contracts/media.ts';
 import { getPreviewIdentity } from './images.ts';
-import { PreviewRecorder, rowsNotKept } from './previewRecorder.ts';
+import {
+  PreviewRecorder,
+  rowsNotKept,
+  rowsWithoutIdentity,
+} from './previewRecorder.ts';
 import { fakeMedia } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
@@ -437,4 +441,193 @@ test('rowsNotKept: a read finds a row by its resizer, pipeline and filters too',
   );
   const { resizer: _d, pipeline: _e, ...plain } = signed('20x20', 'b');
   assert.deepEqual(rowsNotKept([signed('20x20', 'b')], [plain]), []);
+});
+
+test('rowsNotKept: a row that lost its contentType cannot be served, so it is named', () => {
+  const row = signed('20x20', 'a');
+  const { contentType: _type, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [back as Preview]), [
+    { identity: row.identity as string, fields: ['contentType'] },
+  ]);
+});
+
+test("rowsNotKept: a contentType in the store's own form still serves the row, so only losing it counts", () => {
+  const row = signed('20x20', 'a');
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, contentType: 'IMAGE/JPEG' }]),
+    [],
+  );
+  assert.deepEqual(rowsNotKept([row], [{ ...row, contentType: '' }]), [
+    { identity: row.identity as string, fields: ['contentType'] },
+  ]);
+});
+
+test('rowsNotKept: identity does not decide: absent, null or in its own form, the row is kept', () => {
+  const row = signed('20x20', 'a');
+  const { identity: _identity, ...absent } = row;
+  for (const back of [
+    absent,
+    { ...row, identity: null },
+    { ...row, identity: 'own/20x20' },
+  ]) {
+    assert.deepEqual(rowsNotKept([row], [back as Preview]), []);
+  }
+});
+
+test('rowsNotKept: the group rule picks a row by what a read uses, not by identity', () => {
+  const noIdentity = ({ identity: _identity, ...row }: Preview) =>
+    row as Preview;
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  assert.deepEqual(rowsNotKept([a, b], [noIdentity(a), noIdentity(b)]), []);
+  // Another size key's row differs in one field too, sizeKey, but a read would never take it for
+  // this row: the row of this size key decides.
+  const { encodeSig: _sig, ...lost } = noIdentity(b);
+  assert.deepEqual(rowsNotKept([b], [noIdentity(a), lost as Preview]), [
+    { identity: b.identity as string, fields: ['encodeSig'] },
+  ]);
+});
+
+test('rowsNotKept: a row that comes back without a storageRef, matching on what a read uses, names storageRef', () => {
+  const row = signed('20x20', 'a');
+  const { storageRef: _ref, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [back as Preview]), [
+    { identity: row.identity as string, fields: ['storageRef'] },
+  ]);
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...back, storageRef: null } as unknown as Preview]),
+    [{ identity: row.identity as string, fields: ['storageRef'] }],
+  );
+  // Another row's: a read would not take it for this one.
+  const { storageRef: _other, ...another } = signed('40x40', 'b');
+  assert.deepEqual(rowsNotKept([row], [another as Preview]), []);
+  // The row is there under its ref: nothing was lost.
+  assert.deepEqual(rowsNotKept([row], [back as Preview, row]), []);
+});
+
+test('rowsWithoutIdentity: names a kept row whose identity is absent or differs, and no other', () => {
+  const row = signed('20x20', 'a');
+  const { identity: _identity, ...absent } = row;
+  assert.deepEqual(rowsWithoutIdentity([row], [row]), []);
+  for (const back of [
+    absent,
+    { ...row, identity: null },
+    { ...row, identity: 'own/20x20' },
+  ]) {
+    assert.deepEqual(rowsWithoutIdentity([row], [back as Preview]), [
+      row.identity,
+    ]);
+  }
+  // Not kept, or not back: the task's fate is decided elsewhere.
+  const { origin: _origin, ...lost } = absent;
+  assert.deepEqual(rowsWithoutIdentity([row], [lost as Preview]), []);
+  assert.deepEqual(rowsWithoutIdentity([row], []), []);
+  assert.deepEqual(rowsWithoutIdentity([row], undefined), []);
+  // One ref for two rows: another size key's identity says nothing about this row.
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  assert.deepEqual(rowsWithoutIdentity([a, b], [a, b]), []);
+  // Two rows kept for one identity: one that holds it is enough.
+  assert.deepEqual(rowsWithoutIdentity([row], [absent as Preview, row]), []);
+});
+
+// ---- The check must never fail a task whose work is done.
+
+const hostileRef = (): Preview['storageRef'] => ({
+  toJSON() {
+    throw new TypeError('no JSON');
+  },
+  toString() {
+    throw new TypeError('no string');
+  },
+});
+
+const throwing = (row: Preview, field: keyof Preview): Preview =>
+  Object.defineProperty({ ...row }, field, {
+    enumerable: true,
+    get() {
+      throw new TypeError(`no ${field}`);
+    },
+  });
+
+test('a ref whose JSON and String() both throw: an unrelated row, and a row under the written ref, are skipped', () => {
+  const row = signed('20x20', 'a');
+  const hostile = { ...signed('40x40', 'b'), storageRef: hostileRef() };
+  assert.deepEqual(rowsNotKept([row], [hostile, row]), []);
+  assert.deepEqual(rowsWithoutIdentity([row], [hostile, row]), []);
+  // A written row with that ref cannot be judged, whatever came back with it.
+  const written = { ...row, storageRef: hostileRef() };
+  const { encodeSig: _sig, ...lost } = written;
+  assert.deepEqual(rowsNotKept([written], [lost as Preview, hostile]), []);
+  assert.deepEqual(rowsWithoutIdentity([written], [lost as Preview]), []);
+});
+
+test('two refs JSON cannot encode are not one locator: an unrelated row raises nothing', () => {
+  const row: Preview = { ...signed('20x20', 'a'), storageRef: { n: 1n } };
+  const other: Preview = { ...signed('40x40', 'b'), storageRef: { n: 2n } };
+  assert.deepEqual(rowsNotKept([row], [other]), []);
+});
+
+test('a throwing identity getter: an unrelated row, and a row under the written ref, raise nothing', () => {
+  const row = signed('20x20', 'a');
+  const unrelated = throwing(signed('40x40', 'b'), 'identity');
+  const under = throwing(row, 'identity');
+  for (const back of [[unrelated, row], [under], [unrelated]]) {
+    assert.deepEqual(rowsNotKept([row], back), []);
+    assert.deepEqual(rowsWithoutIdentity([row], back), []);
+  }
+});
+
+test('a row whose compared field throws is skipped; the rows beside it still decide', () => {
+  const row = signed('20x20', 'a');
+  const unreadable = throwing(row, 'encodeSig');
+  assert.deepEqual(rowsNotKept([row], [unreadable]), []);
+  assert.deepEqual(rowsNotKept([row], [unreadable, row]), []);
+  const { origin: _origin, ...lost } = row;
+  assert.deepEqual(rowsNotKept([row], [unreadable, lost as Preview]), [
+    { identity: row.identity as string, fields: ['origin'] },
+  ]);
+  // A null among the rows reads as a row that cannot be read.
+  assert.deepEqual(rowsNotKept([row], [null as unknown as Preview, row]), []);
+});
+
+test('nothing written: the rows that came back are never read', () => {
+  const unreadable = {
+    [Symbol.iterator]() {
+      throw new TypeError('no rows');
+    },
+  } as unknown as Preview[];
+  assert.deepEqual(rowsNotKept([], unreadable), []);
+  assert.deepEqual(rowsWithoutIdentity([], unreadable), []);
+});
+
+test('a failed replace with a hostile ref on a reloaded row still returns the store error, and logs its line', async () => {
+  const db = new Error('db');
+  const hostile = { ...signed('40x40', 'b'), storageRef: hostileRef() };
+  const media = fakeMedia({
+    load: async (): Promise<MediaLike> => ({ original, previews: [hostile] }),
+    replacePreviews: async () => {
+      throw db;
+    },
+  });
+  const { recorder, logs } = recorderOver(media);
+  const replacement = preview('20x20', 'new.jpg');
+  const result = await recorder.record('m1', scope, [replacement], {
+    replacing: new Set([replacement.identity as string]),
+  });
+  assert.equal(result.failure?.error, db);
+  assert.equal(logs.error.length, 1);
+  assert.match(String(logs.error[0][0]), /new\.jpg/);
+});
+
+test('a hostile ref on an uploaded row still gets its log line', async () => {
+  const hostile = { ...preview('20x20', 'x'), storageRef: hostileRef() };
+  const media = fakeMedia({
+    load: async (): Promise<MediaLike> => ({ original, previews: [] }),
+    appendPreviews: async () => [],
+  });
+  const { recorder, logs } = recorderOver(media);
+  const result = await recorder.record('m1', scope, [hostile]);
+  assert.equal(result.failure, undefined);
+  assert.match(String(logs.error[0][0]), /cannot be printed/);
 });
