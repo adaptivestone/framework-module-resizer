@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { afterEach, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
+import type { ImageEngine } from './contracts/engine.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type {
@@ -17,6 +18,7 @@ import type {
   TaskEvent,
   TaskQueue,
 } from './contracts/taskQueue.ts';
+import { SharpEngine } from './engines/sharp.ts';
 import {
   ResizeError,
   ResizeGenerateError,
@@ -2005,6 +2007,97 @@ describe('a worker for several queues', () => {
     assert.equal(mostInFlight, 1);
     stop.abort();
     await working;
+  });
+
+  test('a worker does not start on an engine that cannot write a configured format', async () => {
+    const engine: ImageEngine = {
+      id: 'none',
+      formats: ['png'],
+      animatedFormats: [],
+      resize: async (frame) => frame,
+      encode: async () => {
+        throw new Error('not used');
+      },
+    };
+    const r = queuedResizer(
+      'a',
+      new PlainTaskQueue({ timing: fast }),
+      fakeMedia(),
+      { locks: memoryLocks(), engine },
+    );
+    await assert.rejects(
+      runWorker({
+        queue: ['default'],
+        signal: AbortSignal.abort(),
+        logger: silent,
+        resizers: [r],
+      }),
+      { code: 'RESIZE_ENGINE_FORMAT_UNSUPPORTED' },
+    );
+  });
+
+  test('a worker renders each task through the engine of its own Resizer', async () => {
+    const inner = new SharpEngine();
+    /** A SharpEngine that says who encoded a file, in the file's own bytes. */
+    const stamped = (id: string): ImageEngine => ({
+      id,
+      formats: inner.formats,
+      animatedFormats: inner.animatedFormats,
+      resize: (frame, req, opts) => inner.resize(frame, req, opts),
+      encode: async (raster) => ({
+        data: Buffer.from(id),
+        format: 'webp',
+        contentType: 'image/webp',
+        width: raster.info.width,
+        height: raster.info.height,
+      }),
+    });
+    const tasks = new MemoryTaskQueue({ timing: fast });
+    const stores = new Map<string, Map<string, Preview[]>>();
+    const uploaded = new Map<string, string>();
+    const resizerOn = (name: string, engineId: string) => {
+      const previews = new Map<string, Preview[]>();
+      stores.set(name, previews);
+      return queuedResizer(
+        name,
+        tasks,
+        fakeMedia({
+          load: async (id) => ({
+            id,
+            original: { storageRef: { key: id } },
+            previews: [],
+          }),
+          previews,
+        }),
+        {
+          engine: stamped(engineId),
+          storage: {
+            download: async () => png,
+            upload: async ({ key, body }) => {
+              uploaded.set(key, body.toString());
+              return { key };
+            },
+            publicUrl: () => '',
+          },
+        },
+      );
+    };
+    const resizers = [resizerOn('a', 'engine-a'), resizerOn('b', 'engine-b')];
+    for (const name of ['a', 'b']) {
+      await tasks.add(taskOf(name));
+    }
+    await workUntil({ logger: silent, resizers }, () =>
+      tasks.rows.every((row) => row.status === 'completed'),
+    );
+    for (const [name, engineId] of [
+      ['a', 'engine-a'],
+      ['b', 'engine-b'],
+    ]) {
+      const [row] = stores.get(name)?.get('m1') ?? [];
+      const { key } = row.storageRef as { key: string };
+      assert.equal(uploaded.get(key), engineId);
+      assert.equal(row.format, 'webp');
+    }
   });
 
   test('Resizers that share a router or a task queue verify its carrier and their lock store once at worker start', async () => {

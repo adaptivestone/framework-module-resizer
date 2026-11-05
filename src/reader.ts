@@ -781,7 +781,7 @@ function logUnconfiguredFormats(
     return;
   }
   logger.error(
-    `${label}: formats ${list}${origin} have no encode.formats entry — skipped (use a configured Sharp format id, e.g. 'jpeg', not 'jpg')`,
+    `${label}: formats ${list}${origin} have no encode.formats entry — skipped (use a configured format id, e.g. 'jpeg')`,
   );
 }
 

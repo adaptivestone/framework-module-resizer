@@ -1,51 +1,13 @@
-// The boundary between a Raster and Sharp: the shape check for rasters that decoders and steps
-// return, the raw input options, and the read-back of Sharp's raw output. Every conversion between
-// the two lives here, so the engine can later be put behind a port at this one place.
+// The boundary between a Raster and Sharp: the raw input options, and the read-back of Sharp's raw
+// output. Every conversion between the two lives here, for SharpEngine and for a Sharp-based step.
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
-import type { Raster, RasterInfo } from './contracts/decoder.ts';
-import { ResizeSetupError } from './errors.ts';
-
-const isPositiveInteger = (n: unknown): n is number =>
-  typeof n === 'number' && Number.isInteger(n) && n > 0;
-
-/** Why `value` is not a Raster, or undefined when it is one. */
-export function rasterProblem(value: unknown): string | undefined {
-  if (typeof value !== 'object' || value === null) {
-    return 'it is not an object';
-  }
-  const { data, info } = value as { data?: unknown; info?: unknown };
-  if (!Buffer.isBuffer(data)) {
-    return '`data` is not a Buffer';
-  }
-  if (typeof info !== 'object' || info === null) {
-    return '`info` is not an object';
-  }
-  const { width, height, channels, frames = 1 } = info as RasterInfo;
-  for (const [name, n] of Object.entries({ width, height, channels, frames })) {
-    if (!isPositiveInteger(n)) {
-      return `\`info.${name}\` (${String(n)}) is not a positive integer`;
-    }
-  }
-  if (channels > 4) {
-    return `\`info.channels\` (${channels}) is not 1–4`;
-  }
-  const expected = width * height * channels * frames;
-  if (data.length !== expected) {
-    return `\`data\` holds ${data.length} bytes, not width × height × channels × frames (${expected})`;
-  }
-  return undefined;
-}
-
-/** Rejects a decoder's raster that is not a Raster. */
-export function checkRaster(raster: Raster): void {
-  const problem = rasterProblem(raster);
-  if (problem !== undefined) {
-    throw new ResizeSetupError(
-      `resize: a decoder returned an invalid raster: ${problem}`,
-      { code: 'RESIZE_DECODER_INVALID' },
-    );
-  }
-}
+import type { Raster, RasterInfo } from '../contracts/decoder.ts';
+import { ResizeSetupError } from '../errors.ts';
+import {
+  limitStepRaster,
+  rasterProblem,
+  stepRasterTimeout,
+} from '../helpers/raster.ts';
 
 /** Sharp's raw input options for the raster's pixels, frames stacked top to bottom. */
 function rawOptions(raster: Raster): NonNullable<SharpOptions['raw']> {
@@ -70,9 +32,19 @@ export function rasterInput(raster: Raster): SharpOptions {
   return { raw: rawOptions(raster), limitInputPixels: width * height * frames };
 }
 
+// The limit a chain started with, by Sharp instance (every chain call returns the same one), so
+// `sharpToRaster` can pass it on: a second chain in one step, on the first one's result, starts under
+// the limit too. A chain's own `.timeout()` is not read: it is that chain's alone. A `.clone()` is a
+// new instance with no entry: it keeps Sharp's timeout, but a raster read back from it has none.
+const chainLimits = new WeakMap<Sharp, number>();
+
 /**
- * Sharp over the raster's pixels, for a Sharp-based beforeStep. A value that is not a Raster is
- * refused here, before Sharp reads it as raw bytes of the wrong size.
+ * Sharp over the raster's pixels, for a Sharp-based step. A value that is not a Raster is
+ * refused here, before Sharp reads it as raw bytes of the wrong size. On a raster the core handed to
+ * a variantStep, or read back from a chain on one through `sharpToRaster`, the chain starts with
+ * `limits.processingTimeoutSeconds`; the chain's own `.timeout()` replaces it, and
+ * `.timeout({ seconds: 0 })` turns it off. A raster the host built, a raster read back from a
+ * `.clone()`, and a fresh `sharp()` have none.
  */
 export function rasterToSharp(raster: Raster): Sharp {
   const problem = rasterProblem(raster);
@@ -82,7 +54,13 @@ export function rasterToSharp(raster: Raster): Sharp {
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
-  return sharp(raster.data, rasterInput(raster));
+  const img = sharp(raster.data, rasterInput(raster));
+  const seconds = stepRasterTimeout(raster);
+  if (seconds === undefined) {
+    return img;
+  }
+  chainLimits.set(img, seconds);
+  return img.timeout({ seconds });
 }
 
 /**
@@ -143,7 +121,7 @@ export async function readRaster(img: Sharp): Promise<Raster> {
   return raster;
 }
 
-/** Reads a Sharp-based beforeStep's result back as a one-frame sRGB raster. */
+/** Reads a Sharp-based step's result back as a one-frame sRGB raster. */
 export async function sharpToRaster(img: Sharp): Promise<Raster> {
   // The input's own frames, before any resize: stacked frames (a page height below the height)
   // were loaded, whatever size the output has. A still opened with a page count, or one page of an
@@ -155,7 +133,7 @@ export async function sharpToRaster(img: Sharp): Promise<Raster> {
     input.height > input.pageHeight
   ) {
     throw new ResizeSetupError(
-      `resize: a beforeStep must return one frame, not ${Math.round(input.height / input.pageHeight)} stacked frames`,
+      `resize: a pipeline step must return one frame, not ${Math.round(input.height / input.pageHeight)} stacked frames`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
@@ -164,21 +142,25 @@ export async function sharpToRaster(img: Sharp): Promise<Raster> {
   );
   if (stalePageHeight !== undefined) {
     throw new ResizeSetupError(
-      `resize: a beforeStep must return one frame, not a multi-page image resized as one (a page height of ${stalePageHeight} over ${raster.info.height} rows)`,
+      `resize: a pipeline step must return one frame, not a multi-page image resized as one (a page height of ${stalePageHeight} over ${raster.info.height} rows)`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
   if (problem !== undefined) {
     throw new ResizeSetupError(
-      `resize: a beforeStep returned pixels Sharp could not describe consistently: ${problem}`,
+      `resize: a pipeline step returned pixels Sharp could not describe consistently: ${problem}`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
   if ((raster.info.frames ?? 1) > 1) {
     throw new ResizeSetupError(
-      `resize: a beforeStep must return one frame, not ${raster.info.frames}`,
+      `resize: a pipeline step must return one frame, not ${raster.info.frames}`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
+  }
+  const seconds = chainLimits.get(img);
+  if (seconds !== undefined) {
+    limitStepRaster(raster, seconds);
   }
   return raster;
 }

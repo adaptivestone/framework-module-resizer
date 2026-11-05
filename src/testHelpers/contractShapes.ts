@@ -5,8 +5,10 @@
 // host logger with any `debug` value is a `ResizeLogger`. A contract change that breaks plain
 // objects fails CI here.
 import type { SourceDecoder } from '../contracts/decoder.ts';
+import type { ImageEngine } from '../contracts/engine.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
+import type { VariantStep } from '../contracts/pipeline.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { NoopMetrics } from '../metrics.ts';
@@ -45,6 +47,30 @@ export const publicDecoder: SourceDecoder = {
     data: Buffer.alloc(3),
     info: { width: 1, height: 1, channels: 3 },
   }),
+};
+
+// An engine is a plain object too; its `verify` stays optional.
+export const plainEngine: ImageEngine = {
+  id: 'plain',
+  formats: ['webp'],
+  animatedFormats: [],
+  resize: async (frame) => frame,
+  encode: async (raster) => ({
+    data: raster.data,
+    format: 'webp',
+    contentType: 'image/webp',
+    width: raster.info.width,
+    height: raster.info.height,
+  }),
+};
+// Written out: spreading a value typed as the class drops its methods from the type.
+export const verifiedEngine: ImageEngine = {
+  id: 'verified',
+  formats: plainEngine.formats,
+  animatedFormats: plainEngine.animatedFormats,
+  resize: plainEngine.resize,
+  encode: plainEngine.encode,
+  verify: async () => {},
 };
 
 export const tasks: TaskQueue = {
@@ -180,3 +206,8 @@ const hostLogger = {
   debug: 'verbose',
 };
 export const hostDebugLogger: ResizeLogger = hostLogger;
+
+// A variantStep takes and returns a Raster, like a beforeStep: no library object in either list.
+export const rasterStep: VariantStep = (raster) => raster;
+// @ts-expect-error — a variantStep receives a Raster, not a Sharp instance.
+export const oldStep: VariantStep = (img) => img.composite([]);

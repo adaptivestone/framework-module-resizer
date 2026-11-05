@@ -102,6 +102,57 @@
   `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
   could never serve such a row.
 
+- **`variantSteps` take and return a `Raster`.** `VariantStep` is now
+  `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one): `raster` is that
+  size's pixels (one frame, `{ data, info }`: raw 8-bit sRGB, 3 or 4 channels, upright), and the step
+  resolves with one frame. The raster is the step's own copy, so it may write to it. Host steps see
+  no library object in either list, so the image engine is replaceable. Migration, with both helpers
+  from the main entry:
+
+  ```ts
+  variantSteps: [(img) => img.composite([{ input: logo, gravity: 'southeast' }])], // before
+  variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))], // now
+  ```
+
+  A logo larger than a preview on either side fails on both forms: fit it first, as the README's
+  `Pipelines` section shows.
+
+  What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`; `hasAlpha` is
+  `channels === 2 || channels === 4`. An old step that calls a Sharp method fails inside the step
+  with a plain `TypeError` (`img.composite is not a function`): its variant fails, and the task fails
+  with the retryable `RESIZE_WORKER_INCOMPLETE`. TypeScript rejects it at compile time. A step that
+  resolves with anything else (a `Buffer`, a Sharp instance) fails with
+  `RESIZE_PIPELINE_STEP_INVALID`. `encodeSig` does not change, so stored previews are not regenerated,
+  and a broken step shows up only on new media or new sizes: `verify()` does not run steps, so check
+  the logs after the first upload. A single step that only composites an overlay writes the same
+  files as 0.3.0 on an opaque source (with `png` added to `encode.flatten.formats`, it writes RGB
+  where 0.3.0 wrote RGBA, with no pixel difference) and on every format that keeps alpha. On a
+  flattened format, a transparent source can move wherever the preview has partly transparent pixels:
+  at most 2 levels before the JPEG encoder, up to 20 of 255 measured in the JPEG. Other steps can
+  write different files, on new previews only: (a) on a transparent source and a flattened format,
+  the step now runs before the flatten, where Sharp ran it after, so most operations change that
+  format's pixels (`negate()` also negates alpha: use `negate({ alpha: false })`; `removeAlpha()` shows
+  the colours under transparent pixels, which are black after a resize); (b) several steps now run in
+  order, each on the last one's result, where 0.3.0 gathered them in one Sharp chain: a second
+  `composite`, `blur` or `resize` replaced the first, and Sharp chose the order; (c)
+  `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error: `greyscale()` on a
+  transparent source loses alpha, so a JPEG shows the colours under transparent pixels, which are
+  black after a resize (use `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in
+  colour (use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`), and metadata calls
+  in a step do nothing (`withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this
+  way disappears, and `withIccProfile` also shifts the colours, so leave it out). Bump the pipeline's
+  `version` when a step's output changes.
+- `verify()` and worker start now check every entry of `formats`, and every `encode.formats` entry the
+  host wrote or changed, against `engine.formats`. `SharpEngine.formats` lists the ids Sharp's
+  `toFormat` accepts, aliases included (`jpg`, `jpe`, `tif`, `heic`, `tile`), so a host with
+  `formats: ['jpg']` keeps working and keeps its previews. A format this Sharp build cannot write
+  (`jxl` on the prebuilt binaries), even in an unused entry the host wrote, and an id in another case
+  (`JPG`, which Sharp accepted) now fail with `RESIZE_ENGINE_FORMAT_UNSUPPORTED`. Remove the entry, or
+  rename the id, which regenerates its previews. A package default outside `formats` that the host
+  left alone is not checked, so `formats: ['jpeg', 'webp']` on a build without HEIF keeps working.
+- A `decoders` key in a config, which every route dropped silently, so those decoders never ran, is now
+  `RESIZE_CONFIG_INVALID`. Pass it in code, as the `decoders` option.
+
 **Changed behaviour**
 
 - The scaffold writes an explicit `privateRootDir` and an absolute `publicBaseUrl` from
@@ -163,6 +214,38 @@
   one render still get the first one's pair. The update form needs MongoDB 4.2, and the driver in use
   may require more (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
   `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
+- A raster a host decoder marks `premultiplied` now converts to straight alpha in plain JS. It can
+  differ from 0.3.0 by 1 level per channel, and it blocks the event loop (182 ms at 24 MP, 372 ms at
+  50 MP, against Sharp's 56 ms and 126 ms off the loop), which matters for eager `generate()` on an API
+  route and holds for a `beforeStep` or `variantStep` result marked `premultiplied` too, and for an
+  engine's `resize` result. The built-in decoders and `SharpEngine` never mark one, so their previews
+  do not change, and nothing regenerates.
+- A variant step that adds transparency to an opaque preview now gets the `encode.flatten` background
+  on a flattened format; in 0.3.0 those areas of a JPEG came out black. A pipeline hit by this bumps
+  its `version`.
+- Sharp work in a `variantStep` that does not go through `rasterToSharp`
+  (`sharp(raster.data, { raw: raster.info })`, or a raster spread into a new object), and any other
+  host code in a step, is unbounded. In 0.3.0 a step's Sharp work was one chain with the encode, under
+  `limits.processingTimeoutSeconds`. A `rasterToSharp` chain, from a raster the module handed over or
+  made from one through `sharpToRaster` (a raster read back from a `.clone()` has none), stays under
+  the limit, with the encode after it under its own, so a variant holds a thread for at most (chains + 1) × the limit; its own
+  `.timeout({ seconds })` replaces the limit, and `.timeout({ seconds: 0 })` turns it off. Unbounded
+  work can starve other tasks and dead-letter healthy ones, because stuck Sharp calls hold libuv's
+  threads, and a timed-out delivery keeps its memory until its variants in progress end.
+- A step that resolves with Sharp's own `{ data, info }` from `toBuffer({ resolveWithObject: true })`
+  no longer has its colours shifted: after a resize Sharp's `premultiplied` flag is true on straight
+  bytes, and the module now ignores that flag on a result whose `info.format` is `'raw'`, on both kinds
+  of step. This also changes new previews of a `beforeStep` that returned it, which shifted colours on
+  0.3.0 too; stored previews stay, so bump that pipeline's `version` to remake them.
+- With `variantSteps`, a worker holds one copy of the size's pixels and the step's result per variant
+  in progress, up to `width × height × (channels + 4)` bytes each, up to `concurrency` at once.
+  Measured with one `composite` step on a 24 MP JPEG at the default `concurrency` of 4, the process's
+  peak RSS is about 185 MB where 0.3.0 had about 130 MB (sizes up to 1920 wide), and about 975 MB
+  where 0.3.0 had about 590 MB (sizes from 5000 down to 2000 wide).
+- Messages about formats say `format id`, not `Sharp format id`, and only the config's refusal names
+  `jpg`: it points to `jpeg` first, and says a `jpg` entry needs `encode.flatten.formats` to name it, or
+  transparent pixels turn black. Naming it there changes its signature, so its previews regenerate. A
+  log search on the old words needs updating.
 
 **Features**
 
@@ -182,6 +265,13 @@
 - `onPreviewReplaced(row, ctx)`: an observer that gets each row a write of `generate()` or the worker
   removed, so a host can delete old files without parsing a log line. The event bus receives it as
   `resize:onPreviewReplaced`. The log line stays.
+- **Image engine.** Resizing and encoding go through `ImageEngine` (`resize`, `encode`, `formats`,
+  `animatedFormats`, `id`, optional `verify`). `new Resizer({ engine })`,
+  `createResizer(config, { engine })` and `new FrameworkResizer({ engine })` take one; the default,
+  `SharpEngine`, writes the same files as 0.3.0. Decoders are separate, and the built-in ones stay;
+  Sharp stays a dependency. The engine is not part of `encodeSig`: switching does not regenerate
+  stored previews; bump each pipeline's `version` to do that. An `engine` key in a config is
+  `RESIZE_CONFIG_INVALID`. New codes: `RESIZE_ENGINE_INVALID`, `RESIZE_ENGINE_FORMAT_UNSUPPORTED`.
 
 **Fixes**
 

@@ -2488,12 +2488,11 @@ test('generate() that goes on to throw has still reported what its write removed
       pipelines: {
         default: {
           variantSteps: [
-            async (img) => {
-              const { width } = await img.metadata();
-              if (width === 30) {
+            async (raster) => {
+              if (raster.info.width === 30) {
                 throw new Error('this size cannot be made');
               }
-              return img;
+              return raster;
             },
           ],
         },

@@ -32,6 +32,8 @@ const EXPECTED_VALUE_EXPORTS = [
   'ResizeStorage',
   'parseSizeKey',
   'rasterToSharp',
+  'ImageEngine',
+  'SharpEngine',
   'SourceDecoder',
   'resetResizerForTests',
   'runWorker',
@@ -80,6 +82,8 @@ describe('public API surface (src/index.ts)', () => {
       'LockStore',
       'TaskQueue',
       'SourceDecoder',
+      'ImageEngine',
+      'SharpEngine',
     ]) {
       const v = asRecord[name];
       assert.equal(typeof v, 'function', `${name} should be a class/function`);

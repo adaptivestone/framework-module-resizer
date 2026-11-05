@@ -9,6 +9,7 @@
 import { Catalog } from './catalog.ts';
 import defaultResizeConfig, { defaultCoordination } from './config/resize.ts';
 import type { SourceDecoder } from './contracts/decoder.ts';
+import type { ImageEngine } from './contracts/engine.ts';
 import type { HookName, HookSignatures, HookTaps } from './contracts/hooks.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
@@ -23,6 +24,7 @@ import {
 } from './coordination.ts';
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { Dispatcher } from './dispatcher.ts';
+import { createEngine, verifyEngine } from './engineCheck.ts';
 import { ResizeSetupError } from './errors.ts';
 import { firstTime, logNeverThrow, messageText } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
@@ -93,6 +95,7 @@ export interface ResizerOptions {
   queueName?: string | (() => string);
   pipelines?: Record<string, Pipeline>; // the named pipelines, fixed at construction
   decoders?: SourceDecoder[]; // asked before the built-in Sharp and SVG decoders; FrameworkResizer passes it through
+  engine?: ImageEngine; // resizes and encodes; default SharpEngine. Pass it in every process that renders or calls verify(). Not part of encodeSig.
   // Initial taps — each name infers its typed signature (single fn or array); hook() adds more.
   hooks?: HookTaps;
 }
@@ -186,7 +189,7 @@ const locksRequired = (name: string) =>
   );
 
 /**
- * A named resize engine: config, drivers, pipelines and hooks. Most hosts construct one
+ * A named Resizer: config, drivers, pipelines and hooks. Most hosts construct one
  * (named 'default'); a host that needs different storage, media models or formats constructs
  * more, each under its own name. Drivers are fixed at construction: objects, or functions called
  * once on first use (see `ready()`).
@@ -221,6 +224,8 @@ export class Resizer {
   readonly #hooks: HookBus;
   // The decoders that read originals, built once: the Processor renders every task through them.
   readonly #decoders: DecoderSet;
+  // The pixel work after the decode: resizing and encoding.
+  readonly #engine: ImageEngine;
   #builtServices: Services | undefined;
   // A Resizer with a task queue: its Dispatcher, or why it could not be built (each call retries).
   #dispatcher: Dispatcher | undefined;
@@ -343,6 +348,8 @@ export class Resizer {
     this.#pipelines = new PipelineRegistry(opts.pipelines);
     // The host's decoders are checked here (RESIZE_DECODER_INVALID), before the name is registered.
     this.#decoders = createDecoderSet(opts.decoders);
+    // The same for the engine (RESIZE_ENGINE_INVALID).
+    this.#engine = createEngine(opts.engine);
     this.#hooks = new HookBus({
       logger: this.logger,
       events: opts.events,
@@ -497,6 +504,7 @@ export class Resizer {
           media,
           storage,
           decoders: this.#decoders,
+          engine: this.#engine,
           pipelines: this.#pipelines,
           hooks: this.#hooks,
           config,
@@ -624,11 +632,12 @@ export class Resizer {
    * check that the Resizer can set up its queued work (the coordination, and a lock store beside a
    * task queue without gatesByTask that is not a router); run the media store's verify() and check
    * it has replacePreviews; run the lock store's verify() (with a router, only when the carrier of
-   * this Resizer's queue needs it), then each decoder's optional verify(); then check this
-   * Resizer's queueName: a name whose backend is unavailable rejects with the reason, then its
-   * carrier (a backend that fails to build rejects), its timing, the carrier's own verify(), and
-   * that it is served (and, on a router, a lock store when the carrier lacks gatesByTask). Only the
-   * carrier of this Resizer's own queue is built and checked. Framework hosts call it after
+   * this Resizer's queue needs it), then each decoder's optional verify(), then the engine's
+   * optional verify() and its `formats` against the config; then check this Resizer's queueName: a
+   * name whose backend is unavailable rejects with the reason, then its carrier (a backend that
+   * fails to build rejects), its timing, the carrier's own verify(), and that it is served (and, on
+   * a router, a lock store when the carrier lacks gatesByTask). Only the carrier of this Resizer's
+   * own queue is built and checked. Framework hosts call it after
    * `Server.init()` to fail at boot instead of at the first upload or read; it is the one call
    * that rejects for a task queue that cannot be used (the read path degrades instead). The worker
    * runs the same checks for the queue names it consumes. It also logs a warning when
@@ -651,8 +660,8 @@ export class Resizer {
   /**
    * The checks of verify() that need no queue name: the parts, the config, the Resizer-wide queue
    * set-up, the media store, the lock store (unless the task queue is a router: its lock store is
-   * checked with a carrier that needs it) and the decoders. Builds no route and reads no timing.
-   * A lock store already in `verified` is not checked again.
+   * checked with a carrier that needs it), the decoders and the engine. Builds no route and reads
+   * no timing. A lock store already in `verified` is not checked again.
    */
   async #verifyServices(verified: Set<object> | undefined): Promise<void> {
     // ready() resolves while the task queue cannot be used; verify() rejects with the reason.
@@ -668,6 +677,7 @@ export class Resizer {
       await verifyPart(this.locks, verified);
     }
     await this.#decoders.verify();
+    await verifyEngine(this.#engine, this.config, this.name);
   }
 
   /**

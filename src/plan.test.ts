@@ -27,7 +27,7 @@ function rules(
   override: DeepPartial<ResizeConfig> = {},
   pipeline: Parameters<typeof planRules>[2] = {},
 ): PlanRules {
-  return planRules(makeImageConfig(override), scope, pipeline);
+  return planRules(makeImageConfig(override), scope, pipeline, ['gif', 'webp']);
 }
 
 function info(
@@ -207,7 +207,7 @@ test('each plan carries the preview identity of its scope', () => {
   const [plan] = planVariants(
     info(100, 100),
     [request],
-    planRules(makeImageConfig(), listings, {}),
+    planRules(makeImageConfig(), listings, {}, ['gif', 'webp']),
   );
   assert.equal(plan.variant, request);
   assert.equal(

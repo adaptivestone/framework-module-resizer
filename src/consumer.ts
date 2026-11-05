@@ -481,7 +481,9 @@ export class Consumer {
     ended = true;
     if (timedOut) {
       // Abort at once: the handler must not wait behind a pending gate call. The detached handler
-      // is harmless: later writes are token-fenced, and previews it pushes are valid ones.
+      // runs on: its queue writes are token-fenced, but its media writes are not, so a late one can
+      // replace a newer row, even one from a newer original. The next read finds that row stale and
+      // queues it again.
       taskController.abort();
     }
     // From here on every wait of this task shares one deadline: the task's end, and with it the

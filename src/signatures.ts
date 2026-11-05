@@ -20,8 +20,8 @@ export function locatorJson(ref: StorageRef): StorageRef | undefined {
 }
 
 // The formats whose rows sign `config.animated`, `limits.animationFrames` and the pixel budget. A
-// deliberate frozen copy of the formats isAnimatedFormat knows, not an import of it: this list is
-// part of the recipe. If Sharp later animates another format, isAnimatedFormat may grow, but the
+// deliberate frozen copy of what `SharpEngine.animatedFormats` holds, not an import of it: this list
+// is part of the recipe. An engine that animates another format does not grow it, because the
 // signatures already stored for that format's rows must not change.
 const ANIMATED_FORMATS: readonly string[] = Object.freeze(['gif', 'webp']);
 
