@@ -28,6 +28,24 @@ npm run smoke          # builds, packs, installs into a throwaway consumer, veri
 `dist` the tarball ships), not the TS source the test suite runs against — the exports map, the
 rewritten relative import paths, the optional-subpath loud-fail contract, and the bin.
 
+### Links across the two repositories
+
+`src/docLinks.test.ts` checks links between this repository's documents. Links to and from the guide
+need a build of the docs site, on the branch to publish. Run it from the commit you will merge.
+Publish the guide right after the merge, before `npm publish`. Before the merge, the guide's new links
+into this repository's default branch find nothing there. After it, until the guide is published,
+the README's and `AGENTS.md`'s links to the guide's new sections (`adopting`, `serve-local-files`,
+`push-delivery`) land at the top of the page, since the published guide lacks them.
+
+```bash
+cd <docs site checkout> && npm ci && npx --no -- docusaurus build
+# the output must not hold "broken anchors"
+cd <this repository> && node checkDocLinks.ts <docs site checkout>
+# into the guide: N, into this module's docs: N, pinned to a tag (not checked): N, broken: 0
+```
+
+A link pinned to a tag reads that release's files, so the check counts it and skips it.
+
 ## 2. Version bump policy
 
 Semver. Pre-1.0 (`0.x`), the minor is the breaking channel:
@@ -60,12 +78,15 @@ change). The final `0.3.0` followed `0.3.0-rc.5` with no host-facing change.
 > run `npm version` on top of it (that would skip a version); tag the release commit by hand.
 
 **Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
-heading, with `**Breaking changes**` / `**Features**` / `**Fixes**` / `**Internal**` groups —
-the format the sibling `framework-module-email` uses. It is NOT in `files`, so it stays on GitHub and never
-ships in the tarball (same as the sibling). Write it for a host developer deciding whether to
-upgrade: what breaks, what is new, and what they must change.
+heading, with `**Breaking changes**` / `**Changed behaviour**` / `**Features**` / `**Fixes**` /
+`**Documentation**` / `**Internal**` groups — the format the sibling `framework-module-email`
+uses. It ships in the tarball (`files`, since 0.4.0), so its links to the other shipped documents
+are relative (`./UPGRADING.md`) and a host reads the version it installed. Write it for a host
+developer deciding whether to upgrade: what breaks, what is new, and what they must change.
 
 ## 3. Publish
+
+**0.4.0:** merge and run the checks that gate the publish first, as [§6](#6-the-owners-checks-for-040) says.
 
 This is a **scoped** package (`@adaptivestone/…`). npm defaults scoped packages to **restricted**
 (private) access, so the **first** publish must opt into public access explicitly. Neither this
@@ -96,8 +117,8 @@ harmless; point it at the final release with `npm dist-tag add
 @adaptivestone/framework-module-resize@X.Y.Z next` if you want `@next` to stay the newest.
 
 `prepublishOnly` runs `npm run build` automatically, so `dist/` is always rebuilt from source at
-publish time; `files: ["dist", "AGENTS.md"]` (plus the auto-included `README.md` + `LICENSE`) is
-all that ships.
+publish time; `files: ["dist", "AGENTS.md", "UPGRADING.md", "CHANGELOG.md"]` (plus the
+auto-included `README.md` + `LICENSE`) is all that ships.
 
 > If the org later decides to standardize access in-manifest, add `"publishConfig": { "access":
 > "public" }` to `package.json` and drop the flag. As of this release the siblings rely on the
@@ -108,10 +129,9 @@ all that ships.
 Tag the release commit `vX.Y.Z`, and a release candidate `vX.Y.Z-rc.N` (e.g. `v0.3.0-rc.1`).
 
 > **Note:** the sibling repos tag **without** the `v` prefix (`framework` uses `5.3.1`,
-> `framework-module-email` uses `2.0.0`). This repo's existing tags are mixed: `v0.1.0` has the
-> prefix, `0.2.0` does not, and 0.2.1 has no tag at all (`git tag` lists them). This file keeps
-> the `v` prefix, npm's default; pick one convention before the next release and use it from
-> then on.
+> `framework-module-email` uses `2.0.0`). This repo's older tags are mixed: `v0.1.0` has the
+> prefix, `0.2.0` does not, and 0.2.1 has no tag at all (`git tag` lists them). From `v0.3.0` on
+> it uses the `v` prefix, npm's default.
 
 ```bash
 git tag v0.1.0
@@ -132,10 +152,13 @@ Then **publish a GitHub Release** for the tag, as both sibling repos do for ever
 the matching `CHANGELOG.md` section as the body:
 
 ```bash
-# `1d;$d` drops the `# X.Y.Z` heading and the next version's heading — the body starts at
-# **Breaking changes**, matching how the sibling repos' release bodies read.
+# `1d;$d` drops the `# X.Y.Z` heading and the next version's heading — the body starts at the
+# pointer to UPGRADING.md when the section has one, then **Breaking changes**, matching how the
+# sibling repos' release bodies read. The last sed points the relative links (`./UPGRADING.md`),
+# which a release page cannot follow, at the tag's files.
 gh release create vX.Y.Z --title "X.Y.Z" \
-  --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d')
+  --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d' \
+    | sed 's#](\./#](https://github.com/adaptivestone/framework-module-resizer/blob/vX.Y.Z/#g')
 ```
 
 For a release candidate, mark the GitHub Release as a prerelease and take the body from the
@@ -143,7 +166,8 @@ For a release candidate, mark the GitHub Release as a prerelease and take the bo
 
 ```bash
 gh release create vX.Y.0-rc.N --prerelease --title "X.Y.0-rc.N" \
-  --notes-file <(sed -n '/^# X.Y.0$/,/^# /p' CHANGELOG.md | sed '1d;$d')
+  --notes-file <(sed -n '/^# X.Y.0$/,/^# /p' CHANGELOG.md | sed '1d;$d' \
+    | sed 's#](\./#](https://github.com/adaptivestone/framework-module-resizer/blob/vX.Y.0-rc.N/#g')
 ```
 
 ## 5. Manual post-publish verification — try in a real host backend
@@ -152,14 +176,14 @@ _Placeholder — the one check the automated smoke can't do: wire the published 
 actual framework host and run it against real infra._
 
 - [ ] In a real `@adaptivestone/framework` host: `npm i @adaptivestone/framework-module-resize`
-      (`@next` for a release candidate), run `npx resize-scaffold`, and in `src/config/resize.ts`
-      set `mediaModelName` and `storage` (S3), keep `queue: 'default'` and
+      (`@next` for a release candidate), run `npx --no -- resize-scaffold`, and in
+      `src/config/resize.ts` set `mediaModelName` and `storage` (S3), keep `queue: 'default'` and
       `queues: { default: { driver: 'database' } }`, and set `worker: { enabled: true }`.
       `src/resizer.ts` stays
       `new FrameworkResizer({ pipelines })`. Create the `ResizeTask` indexes through the host's
       migration, and call `await resizer.verify()` after `server.init()`.
-- [ ] `npx resize-scaffold --check` passes, and `npm run gen` (the framework's AST codegen) types
-      `getModel('ResizeTask')` through the scaffolded shim.
+- [ ] `npx --no -- resize-scaffold --check` passes, and `npm run gen` (the framework's AST
+      codegen) types `getModel('ResizeTask')` through the scaffolded shim.
 - [ ] Boot the server, upload an image, confirm a `resolve()` read queues the missing variants and
       `npm run cli ResizeWorker` generates and persists the previews (database queue + S3
       storage). If the host uses SQS, repeat with
@@ -167,7 +191,7 @@ actual framework host and run it against real infra._
 - [ ] Stop the worker during a task (SIGTERM): the task goes back to `pending` and the next
       worker finishes it.
 - [ ] Confirm eager mode (`generate()`, no `queue` or `queues` in the config) on a host scaffolded with
-      `--eager`; `npx resize-scaffold --check --eager` passes.
+      `--eager`; `npx --no -- resize-scaffold --check --eager` passes.
 
 ### Push delivery (needs an AWS account)
 
@@ -303,6 +327,48 @@ The per-task line reads `resize: task … of media … in … ms (… attempt n,
 | C17 | A package without `@aws-sdk/*`: log `import.meta.resolve('@aws-sdk/client-sqs')` from `/var/task` at init, then deliver one task | Either it resolves to the runtime's copy, and the docs can say a host need not ship the SDK once its version is checked against the peer range, or the task is refused with `RESIZE_PEER_MISSING`, as the docs assume | The log | Document which, and the runtime's SDK version |
 | C18 | SQS's 12 h limit, which counts from the receipt. With `leaseMs: 43200000` on the queue's entry, one good task. Then, with the trigger off (`--no-enabled`): `aws sqs send-message`, `aws sqs receive-message`, wait a minute, and `aws sqs change-message-visibility --visibility-timeout` with its receipt, 43200 and then 39600. AWS's page counts the 12 h from when the message is "first received", so if you can leave it 11 h, ask 39600, receive it again after they pass, and ask 39600 once more. Delete it, and turn the trigger on | The capped adoption is accepted: previews stored, no `lost its receipt` line. At the prompt, 39600 is accepted, and 43200 is refused, with the code `isLostReceipt` reads as a lost receipt (`InvalidParameterValue`), which AWS's page does not name. On the second receive 39600 is accepted too, so each receive starts its own 12 h, as the cap assumes | The log, the media's row, the CLI's answer | Lower the cap in `src/delivery.ts`. A different code, or 43200 accepted: note it in the README's settings table |
 | C19 | What a redrive does to the receive count, which AWS's pages do not state. With the trigger off, `aws sqs start-message-move-task --source-arn "$DEAD_ARN" --destination-arn "$QUEUE_ARN"`, for one body SQS moved and one the module wrote (C3): with no destination, AWS fails a message written with `SendMessage` as `CouldNotDetermineMessageSource`. Wait for `aws sqs list-message-move-tasks --source-arn "$DEAD_ARN"` to read `COMPLETED`, then `aws sqs receive-message --queue-url "$QUEUE_URL" --attribute-names ApproximateReceiveCount`. AWS says each is a new message, with a new ID, enqueue time and retention period | The move task reads `COMPLETED`, with both moved. 1 on the first receive, so a redriven task gets all its attempts: the README can then offer a redrive beside `prewarm()`. Delete both, and turn the trigger on | The CLI's answers: `Results[0].Status`, `FailureReason` and `ApproximateNumberOfMessagesMoved`, then `Attributes.ApproximateReceiveCount` | Anything above 1: say in `How a record ends` that a redriven task starts that far along, and keep `prewarm()` as the way |
+
+## 6. The owner's checks for 0.4.0
+
+Nothing below can run in CI or in a build. Each was left out of the build, not skipped silently.
+
+**Real S3** and **A count on real originals** pass before `npm publish`. Real S3 runs code that has
+never touched real S3 (`adoptOriginal`, the key rule), and the `failOn` default cannot change once
+0.4.0 is on `latest` without a breaking 0.5.0. The push delivery list does not gate the publish,
+since the feature ships marked preview.
+
+- [ ] **Real S3:** one adopted object, including a key with a space, through `adoptOriginal` and a
+      worker.
+- [ ] **Real SQS:** a queued task through a worker.
+- [ ] **Real Lambda:** the [push delivery list](#push-delivery-needs-an-aws-account),
+      C2 and C5 first. Until C1, C2, C5 and C8 pass, push delivery stays "preview".
+- [ ] **A count on real originals:** decode a sample at `failOn: 'error'` and `'warning'` and count
+      refusals. If `'warning'` refuses about as few, it is the stricter default worth taking. Note how
+      many of the files `'error'` refuses render the same pixels at `'none'`, such as a PNG with a bad
+      IDAT CRC: those previews looked healthy under 0.3.0.
+- [ ] **A frontend** handling the empty-`sizes` window, which needs a frontend.
+- [ ] **The npm name `resize-scaffold`:** free today. The docs say `npx --no -- resize-scaffold`,
+      which never installs or runs it: with this package missing, npx only looks the name up in the
+      registry and stops with an error. A host that leaves out `--no` would run whatever is published
+      there. Claiming the name is cheap insurance, and only the owner can do it.
+- [ ] **The npm page,** after `npm publish`: npmjs.com shows the README up to 64 KiB. Check that it
+      shows the whole `## Config reference`.
+
+### Merging 0.4.0
+
+0.4.0 is six stacked PRs, #71 (`feat/0.4-a-operate`, into `main`) to #76 (`feat/0.4-f-docs-release`).
+Merge them in order, each with a merge commit, not a squash: a squash makes each next PR replay the
+earlier commits. After each merge the next PR's base must be `main`: GitHub retargets it when you
+delete the merged branch. Then confirm that nothing is left out, and tag that merge commit:
+
+```bash
+git checkout main && git pull
+git diff feat/0.4-f-docs-release main   # prints nothing
+git tag v0.4.0                          # main's head: the merge commit of #76
+git push origin v0.4.0
+```
+
+Then publish the guide (§1), run `npm publish` (§3) and publish the GitHub Release (§4).
 
 ## Notes
 

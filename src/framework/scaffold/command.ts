@@ -211,7 +211,8 @@ function planFiles(opts: { eject: boolean; eager: boolean }): FileSpec[] {
   return [resizer, model, command, config];
 }
 
-const pad = (s: string): string => s.padEnd(16);
+// One column wider than the longest status, `exists (skipped)`, so a space always follows it.
+const pad = (s: string): string => s.padEnd(17);
 
 /** Write mode: create missing dirs, write each file only if absent (or with --force). */
 async function writeFiles(
@@ -410,7 +411,7 @@ ${NEXT_COMMON}
 const USAGE = `resize-scaffold — vendor the resize module's integration files into a host project.
 
 Usage: npx --no -- resize-scaffold [options]   (after npm i @adaptivestone/framework-module-resize)
-       --no refuses to fetch a package of that name from the registry; -- hands the options to this command
+       --no refuses to install a package of that name from the registry; -- hands the options to this command
 
 Emits (into process.cwd(), or --out <dir>):
   src/resizer.ts            construction site — new FrameworkResizer({ pipelines, hooks })

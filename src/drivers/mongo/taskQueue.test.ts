@@ -941,16 +941,36 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(errors.length, 1);
       assert.match(
         String(errors[0][0]),
-        /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(logged once\)$/,
+        /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(code RESIZE_MONGO_INDEX_MISSING, logged once\)$/,
       );
-      assert.equal(
-        (errors[0][1] as { code?: unknown }).code,
-        'RESIZE_MONGO_INDEX_MISSING',
-      );
+      // The line alone: passed after it, the error would be printed again by a logger that appends
+      // an error's message and stack, as the framework's does.
+      assert.equal(errors[0].length, 1);
       assert.equal((await tasks.add(request())).status, 'added');
       await settled();
       assert.equal(errors.length, 1, 'logged once');
       assert.equal(listed.length, 1);
+    });
+
+    test('a failed Mongoose index build follows the line as its own error', async () => {
+      const build = new Error(
+        'E11000 duplicate key error collection: resizetasks',
+      );
+      const { model } = checkedModel(async () => [], {
+        init: async () => {
+          throw build;
+        },
+      });
+      const { errors } = configureQueue(() => model);
+      assert.equal((await tasks.add(request())).status, 'added');
+      await settled();
+      assert.equal(errors.length, 1);
+      assert.match(
+        String(errors[0][0]),
+        /has no gate index.* \(code RESIZE_MONGO_INDEX_MISSING, logged once\)$/,
+      );
+      assert.equal(errors[0].length, 2);
+      assert.equal(errors[0][1], build);
     });
 
     test('an index on the gate keys of another shape logs what that shape costs', async () => {
@@ -985,7 +1005,7 @@ describe('MongoTaskQueue setup', () => {
         assert.equal(errors.length, 1, cost);
         assert.ok(
           String(errors[0][0]).endsWith(
-            ` — until it exists, ${cost} (logged once)`,
+            ` — until it exists, ${cost} (code RESIZE_MONGO_INDEX_MISSING, logged once)`,
           ),
           String(errors[0][0]),
         );
@@ -1244,7 +1264,7 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(errors.length, 1);
       assert.match(
         String(errors[0][0]),
-        /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(logged once\)$/,
+        /has no gate index.* — until it exists, concurrent adds can each store a duplicate active task \(code RESIZE_MONGO_INDEX_MISSING, logged once\)$/,
       );
       // The check creates nothing, and without the index a later read still finds the active row.
       assert.deepEqual(await model.collection.indexes(), before);
@@ -1278,7 +1298,7 @@ describe('MongoTaskQueue setup', () => {
       assert.equal(errors.length, 1);
       assert.match(
         String(errors[0][0]),
-        / — until it exists, every add after a completed task is in flight with no id and nothing is queued \(logged once\)$/,
+        / — until it exists, every add after a completed task is in flight with no id and nothing is queued \(code RESIZE_MONGO_INDEX_MISSING, logged once\)$/,
       );
       // What the line says: no duplicate, and after the task completes nothing is stored again.
       const claimed = await tasks.claim('default', 300);

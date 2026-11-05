@@ -1,5 +1,9 @@
 # 0.4.0
 
+Before you upgrade, read
+[`UPGRADING.md`](./UPGRADING.md):
+it lists what to change before you run `npm i`.
+
 **Breaking changes**
 
 - A damaged source now fails. `limits.failOn` (new, default `'error'`) replaces the hard-coded
@@ -53,14 +57,16 @@
 - **Removed, as promised:** the types `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
   `FrameworkS3StorageConfig` (use `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`), and the
   `S3Storage` option `publicUrl` (use `publicBaseUrl`). The option now throws
-  `RESIZE_CONFIG_REMOVED_KEY` when `S3Storage` is constructed. In a config section the same code
-  comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews used
-  the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so call
-  `verify()` at boot.
+  `RESIZE_CONFIG_REMOVED_KEY` when `S3Storage` is constructed. In an S3 `storage` section the same
+  code comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews
+  used the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so
+  call `verify()` at boot.
 - **`@aws-sdk/client-s3` 3.729 to 3.734 are out of the peer range,** which is now
   `^3.572.0 <3.729.0 || ^3.735.0`. They collect a body with a full-object checksum inside `send()`,
   so on them the byte limit (`limits.sourceBytes`, `adoptOriginal({ maxBytes })`) runs after the
-  read. A host pinned to one of those versions fails `npm install` until it bumps to 3.735 or later.
+  read. npm's default resolver refuses them (`ERESOLVE`), so a host pinned to one bumps to 3.735 or
+  later. Nothing else stops them: `--legacy-peer-deps`, `--force`, pnpm and yarn install them, and
+  the module does not check the version at run time.
 - **A host decoder's originals are private unless the decoder sets `publicOriginals: true`.** A
   public upload otherwise throws `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it; a host
   decoder that takes over a built-in format adds one line.
@@ -76,10 +82,10 @@
   `RESIZE_CONFIG_QUEUE_INVALID`. At `taskTimeoutMs: 3000000000` every task timed out after about 1
   ms and was dead-lettered, but a `leaseMs` of 24.8 to 49.7 days ran on 0.3.0, and it is refused
   too. From a config file the refusal comes at first use or `verify()`. On a framework host with no
-  boot `verify()`, the first `resolve()` logs one `error` and returns an empty decision, and so does
-  every later read, so previews stored earlier stop being served until the value is fixed. A task
-  queue passed in code keeps serving them and queues nothing, and `resolve()` logs the refusal once
-  per queue name. `LogMetrics` refuses such a `summaryIntervalMs` at construction
+  boot `verify()`, the first `resolve()` logs it once as an `error`, and every read then serves
+  nothing, with no further line, so previews stored earlier stop being served until the value is
+  fixed. A task queue passed in code keeps serving them and queues nothing, and `resolve()` logs the
+  refusal once per queue name. `LogMetrics` refuses such a `summaryIntervalMs` at construction
   (`RESIZE_METRICS_INVALID`). `limits.processingTimeoutSeconds` above 3600, where every Sharp call
   threw, is `RESIZE_CONFIG_INVALID`, with the same first-use refusal from a config file.
 - **A media store must keep what the worker writes.** After its writes the worker reloads the media
@@ -101,6 +107,11 @@
   shipped ones do, is not affected. `verify()` now also rejects a strict row schema without
   `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
   could never serve such a row.
+- **A custom model-shaped `MongoMediaModel` must accept a new filter.** The write of the original's
+  dimensions in `MongoMediaStore` had the filter `{ _id }`. It now adds `$or`, `$not` and `$type`,
+  so the write lands only while the original holds no stored pair, and its options add
+  `strictQuery: false` (`MongoMediaUpdateOptions`). A Mongoose model accepts both as it is. Why the
+  write is guarded is under **Changed behaviour**.
 
 - **`variantSteps` take and return a `Raster`.** `VariantStep` is now
   `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one): `raster` is that
@@ -185,9 +196,11 @@
 - `resolve()` warns once per Resizer when the module's fields were not loaded. A sub-field projection
   that drops `original.storageRef` counts for a hydrated document only; a lean row stays silent.
   After the first added task, `MongoTaskQueue` checks the gate index once per model in the background
-  and logs an `error` when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
-  indexed query instead of a failed insert; the first add costs about 1 ms more, and the unique
-  index still settles races. The gate read and `findActive` read from the primary.
+  and logs one `error` line when it is missing, which ends in
+  `(code RESIZE_MONGO_INDEX_MISSING, logged once)`. The error is not passed after the line, so the
+  framework's logger prints it once; a failed Mongoose index build follows it as its own error.
+  `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one indexed query instead of
+  a failed insert; the first add costs about 1 ms more, and the unique index still settles races. The gate read and `findActive` read from the primary.
 - A custom driver whose `download()` resolves with something other than bytes gets
   `ResizeSetupError` `RESIZE_STORAGE_DOWNLOAD_INVALID` from `generate()` and on a task, where it is
   retried. It was a raw `TypeError`, or a string decoded as if it were the file. An `ArrayBuffer` is
@@ -213,7 +226,8 @@
   rolling deploy, whose write has no such condition. Two originals without dimensions swapped during
   one render still get the first one's pair. The update form needs MongoDB 4.2, and the driver in use
   may require more (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
-  `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
+  `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it. What a custom
+  model-shaped `MongoMediaModel` must accept for it is under **Breaking changes**.
 - A raster a host decoder marks `premultiplied` now converts to straight alpha in plain JS. It can
   differ from 0.3.0 by 1 level per channel, and it blocks the event loop (182 ms at 24 MP, 372 ms at
   50 MP, against Sharp's 56 ms and 126 ms off the loop), which matters for eager `generate()` on an API
@@ -257,9 +271,10 @@
 - `hasOriginal(media)` and `resizer.adoptOriginal({ storageRef, maxBytes? })`: put an object you
   already hold on the module without re-uploading it. It measures and decodes the object, returns
   the `Original` that `uploadOriginal` would return for it, with the ref in its JSON form, and writes
-  nothing. `maxBytes` lowers `limits.sourceBytes` for one call, for an adoption on a request path. New
-  codes `RESIZE_ORIGINAL_DOWNLOAD_FAILED`, `RESIZE_ORIGINAL_PUBLIC_REFUSED`,
-  `RESIZE_ADOPT_MAX_BYTES_INVALID`.
+  nothing. `maxBytes` lowers `limits.sourceBytes` for one call, for an adoption on a request path. Each
+  call is timed as the new metric `resize.adopt` (`outcome` `adopted` or `rejected`), which
+  `LogMetrics` writes on its debug line only. New codes `RESIZE_ORIGINAL_DOWNLOAD_FAILED`,
+  `RESIZE_ORIGINAL_PUBLIC_REFUSED`, `RESIZE_ADOPT_MAX_BYTES_INVALID`.
 - `formatPictureUrls` entries carry `width` and `height` when the row has them, since a size key
   does not promise a size. A host that snapshots its API JSON sees two new fields.
 - `onPreviewReplaced(row, ctx)`: an observer that gets each row a write of `generate()` or the worker
@@ -277,8 +292,9 @@
   worker, on either host shape, with no new peer. Standard queues only: FIFO queues are not
   supported. The trigger must set `ReportBatchItemFailures`, or retries are lost silently, and a
   batch that does not fit one function timeout can kill healthy tasks unrun: see the README section,
-  which leads with the settings to get right. It has not run on real AWS yet, so it stays a preview until the check
-  list in `RELEASE.md` passes. Workers are unchanged: `src/consumer.ts` did not change for this.
+  which leads with the settings to get right. It has not run on real AWS yet, so it stays a preview until the
+  [check list](https://github.com/adaptivestone/framework-module-resizer/blob/main/RELEASE.md#push-delivery-needs-an-aws-account)
+  passes. Workers are unchanged: `src/consumer.ts` did not change for this.
   New codes: `RESIZE_DELIVERY_UNSUPPORTED`, `RESIZE_SQS_EVENT_INVALID`.
 
 **Fixes**
@@ -307,6 +323,28 @@
   `startServer()` and its CLI emit. A script on `new Server()` and `init()`, a `FrameworkResizer`
   with every part in code first used before the `Server` exists, and a CLI command with an
   asynchronous sink call `await getResizer().metrics.flush?.()` themselves.
+
+**Documentation**
+
+- `UPGRADING.md` ships with the package and holds all upgrade material: what a host must do for each
+  version, the traps of 0.4.0 and the list of removed keys. It replaces `docs/host-adoption.md`, which
+  did not ship.
+- `CHANGELOG.md` ships with the package too, and `UPGRADING.md` links to it there, so an agent in a
+  host reads the changes of the installed version, not the newest text on GitHub.
+- The 0.3.0 docs gave a sweep of preview objects with no age rule. It can delete the file of a row about
+  to be written, and a read still calls that row ready. `UPGRADING.md` gives the rule and the repair.
+- The README has one full error table, `## Error codes`: every code with its `retryable` and what to do.
+  A test requires every code in it, and holds the values to the audited table.
+- `## Config reference` moved above `## Drivers` in the README, so it ends inside the 64 KiB npm shows.
+- `AGENTS.md` holds what a new integration needs, at most 5,000 words, from about 16,000. The rest moved
+  to `README.md` and `UPGRADING.md`, one link away. It shows how to serve local files in development
+  and the migration that creates the indexes, both run on a framework host. A test keeps it there, and
+  every link between the documents is checked, files on GitHub and `./dist/…` paths included.
+- A media schema without `resizeMediaSchemaFragment` fails nothing at boot: `uploadOriginal()`
+  succeeds, `save()` drops the original, and reads count `no-original`. The README and `AGENTS.md`
+  have a row for it.
+- The excluded `@aws-sdk/client-s3` range is said to stop npm's default resolver only. Links between
+  this module's documents and the guide have a release check, `checkDocLinks.ts`.
 
 **Internal**
 
@@ -476,12 +514,13 @@ the image engine behind a port.
   skipped, a `queue` entry inside `queues` is not drift, and a second Resizer's `configName` file
   is not checked), and for every ejected `ResizeTask` model (one without `startedAt` and
   `finishedAt`). This is intended. To clear it, rewrite the config to the new shape (or move it
-  aside, re-run `npx resize-scaffold` and copy your settings back), and add
+  aside, re-run `npx --no -- resize-scaffold` and copy your settings back), and add
   `startedAt: { type: Date }` and `finishedAt: { type: Date }` to an ejected model (or
-  move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`, then
-  restore your customizations; the scaffold never overwrites a file, so re-running `--eject` alone
-  changes nothing). The config file is still never diffed. An ejected model without the two times
-  keeps working: they are dropped, and `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
+  move `src/models/ResizeTask.ts` aside (or delete it), re-run
+  `npx --no -- resize-scaffold --eject`, then restore your customizations; the scaffold never
+  overwrites a file, so re-running `--eject` alone changes nothing). The config file is still never
+  diffed. An ejected model without the two times keeps working: they are dropped, and
+  `RESIZE_MONGO_MODEL_OUTDATED` does not list them.
 - **Old preview rows.** Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are
   stale to the freshness check: each is served until its replacement is stored,
   regenerated on its next read, `prewarm()` or `generate()`, and its old file stays in storage, so
@@ -853,8 +892,8 @@ the image engine behind a port.
   `@adaptivestone/framework-module-resize/framework/ResizeTaskModel.js` export (the model class as
   its default export), which lets the framework's `npm run gen` type `getModel('ResizeTask')`.
   `resize-scaffold --check` reports a shim that still imports `…/framework.js` as drift: delete
-  `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force` would also overwrite
-  `src/resizer.ts` and `src/config/resize.ts`).
+  `src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold` (`--force` would also
+  overwrite `src/resizer.ts` and `src/config/resize.ts`).
 - An ejected or hand-written `ResizeTask` model must declare the `resizer`, `queue`,
   `availableAt`, `active` and `cooldownUntil` fields (and the `{ queue, status, availableAt }`
   index and the gate index); Mongoose would drop undeclared fields, filing every task under
@@ -1296,7 +1335,7 @@ the image engine behind a port.
   CLI process. It is now `import '../resizer.ts'` plus a re-export of the module's command.
   `resize-scaffold --check` reports a command that does not import it as drift, and the framework
   worker rejects an empty registry with `RESIZE_NO_RESIZER` and that fix in the message. Hosts:
-  delete `src/commands/ResizeWorker.ts` and re-run `npx resize-scaffold`.
+  delete `src/commands/ResizeWorker.ts` and re-run `npx --no -- resize-scaffold`.
 - `LocalFsStorage` normalizes root paths before deriving the private root and rejects a
   `privateRootDir` equal to or inside the public root. A trailing slash no longer places private
   originals in the public folder.

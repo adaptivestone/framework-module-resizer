@@ -213,7 +213,15 @@ export class MongoTaskQueue extends TaskQueue {
           isModuleError(err) &&
           codeText(err) === 'RESIZE_MONGO_INDEX_MISSING'
         ) {
-          logNeverThrow(this.#logger, messageText(err), err);
+          // The line says it all, code included, as the worker's dead line does. Passed after it,
+          // the error would be printed again by a logger that appends an error's message and stack
+          // (the framework's prints the sentence three times). A failed Mongoose index build is not
+          // the module's: it follows, as the logger prints an error.
+          logNeverThrow(
+            this.#logger,
+            messageText(err),
+            (err as { cause?: unknown }).cause,
+          );
           return;
         }
         gateChecked.delete(model); // unknown: the next add asks again
@@ -677,7 +685,7 @@ async function checkGateIndex(
       : 'has no gate index',
     buildError,
     opts.background
-      ? ` — until it exists, ${missingGateCost(onGateKeys)} (logged once)`
+      ? ` — until it exists, ${missingGateCost(onGateKeys)} (code RESIZE_MONGO_INDEX_MISSING, logged once)`
       : '',
   );
 }
