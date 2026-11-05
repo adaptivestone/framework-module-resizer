@@ -520,7 +520,6 @@ for (const [code, retryable, trigger] of rows) {
 const elsewhere: [code: string, retryable: boolean, file: string][] = [
   ['RESIZE_SOURCE_METADATA_MISSING', false, 'uploader.test.ts'],
   ['RESIZE_SVG_RENDER_TIMEOUT', false, 'helpers/svgRaster.test.ts'],
-  ['RESIZE_TASK_ABORTED', true, 'render.test.ts'],
   ['RESIZE_TASK_MAX_ATTEMPTS', false, 'consumer.test.ts'],
   ['RESIZE_TASK_TIMEOUT', true, 'consumer.test.ts'],
   ['RESIZE_WORKER_INCOMPLETE', true, 'worker.test.ts'], // false only when every missing variant failed with false

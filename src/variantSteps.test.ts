@@ -1,6 +1,7 @@
 // variantSteps through the whole path: `new Resizer`, `generate()`, the stored files and rows.
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import sharp, {
   type FormatEnum,
   type OutputOptions,
@@ -9,7 +10,7 @@ import sharp, {
 } from 'sharp';
 import type { Raster } from './contracts/decoder.ts';
 import type { ImageEngine } from './contracts/engine.ts';
-import type { Pipeline } from './contracts/pipeline.ts';
+import type { Pipeline, VariantStep } from './contracts/pipeline.ts';
 import { SharpEngine } from './engines/sharp.ts';
 import { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
 import { ResizeGenerateError } from './errors.ts';
@@ -21,7 +22,14 @@ import {
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
 import { workUntil } from './testHelpers/work.ts';
-import type { MediaLike, Preview, ResizeLimits, SizeInput } from './types.d.ts';
+import type {
+  MediaLike,
+  Preview,
+  QueueTimingOptions,
+  ResizeLimits,
+  SizeInput,
+} from './types.d.ts';
+import { runWorker } from './worker.ts';
 
 afterEach(resetResizerForTests);
 
@@ -475,112 +483,123 @@ test('a healthy task completes beside slow variants: the limit frees the threads
   assert.equal(slow.attempts, 1);
 });
 
-test('a timed-out task runs no further step and no encode, while a variant past its steps can still store its row', async () => {
-  const tasks = new MemoryTaskQueue({
-    timing: {
-      idlePollMs: 5,
-      // Long enough for the first variant to reach its encode on a busy machine: at 50 ms the timer
-      // could fire first, and the test failed under load.
-      taskTimeoutMs: 500,
-      maxAttempts: 1,
-      retryBackoffMs: { base: 60_000, max: 60_000 },
-    },
-  });
+/** A worker on an in-memory queue whose media store keeps its rows, as a real one does. */
+function slowStepWorker(
+  variantSteps: VariantStep[],
+  previews: Array<{ sizeKey: string; width: number; height: number }>,
+  timing: Partial<QueueTimingOptions>,
+  concurrency = 4,
+) {
+  const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5, ...timing } });
   const stored = new Map<string, Preview[]>();
-  const stepsRun: string[] = [];
-  const encoded: string[] = [];
-  const sharpEngine = new SharpEngine();
-  const uploaded: string[] = [];
-  /** Resolves when the task's signal aborts: the wait outlasts `taskTimeoutMs`. */
-  const aborted = (signal: AbortSignal | undefined) =>
-    new Promise<void>((resolve) => {
-      signal?.addEventListener('abort', () => resolve(), { once: true });
-    });
-  let release: () => void = () => {};
-  const released = new Promise<void>((resolve) => {
-    release = resolve;
-  });
   new Resizer({
-    config: makeImageConfig({ formats: ['webp'], concurrency: 2 }),
+    config: makeImageConfig({ formats: ['webp'], concurrency }),
     logger: silent,
     storage: {
       download: async () => plain(40, 20),
-      upload: async ({ key }) => {
-        uploaded.push(key);
-        return { key };
-      },
+      upload: async ({ key }) => ({ key }),
       publicUrl: () => '',
     },
     media: fakeMedia({
       load: async (id) => ({
         id,
-        original: { storageRef: { key: id } },
-        previews: [],
+        original: { storageRef: { key: id }, width: 40, height: 20 },
+        previews: stored.get(id) ?? [],
       }),
       previews: stored,
     }),
     tasks,
-    engine: {
-      id: 'waiting',
-      formats: sharpEngine.formats,
-      animatedFormats: [],
-      resize: (frame, req, opts) => sharpEngine.resize(frame, req, opts),
-      encode: async (raster, req, opts) => {
-        encoded.push(`${raster.info.width}`);
-        // The variant past its steps: its encode is running when the task's timer fires.
-        await aborted(opts.signal);
-        release();
-        return sharpEngine.encode(raster, req, opts);
+    pipelines: { default: { variantSteps } },
+  });
+  const add = () =>
+    tasks.add({
+      resizer: 'default',
+      queue: 'default',
+      mediaId: 'm1',
+      pipeline: 'default',
+      previews: previews.map(({ sizeKey, width, height }) => ({
+        sizeKey,
+        format: 'webp',
+        requestedWidth: width,
+        requestedHeight: height,
+      })),
+    });
+  return { tasks, stored, add };
+}
+
+const overlay = (r: Raster) =>
+  sharpToRaster(
+    rasterToSharp(r).composite([
+      {
+        input: {
+          create: { width: 4, height: 4, channels: 3, background: '#fff' },
+        },
+        gravity: 'southeast',
       },
-    },
-    pipelines: {
-      default: {
-        variantSteps: [
-          async (r, { variant }) => {
-            stepsRun.push(`${variant.sizeKey} first`);
-            if (variant.sizeKey === '20x10') {
-              await released;
-            }
-            return r;
-          },
-          (r, { variant }) => {
-            stepsRun.push(`${variant.sizeKey} second`);
-            return r;
-          },
-        ],
+    ]),
+  );
+
+// A delivery's media writes are not fenced, and that is what heals this: the timed-out delivery goes
+// on, stores its row late, and a later delivery finds it fresh. Stopping such a variant, before its
+// encode or before a later step, turns it into a task that dies after maxAttempts with no rows.
+for (const steps of [1, 2]) {
+  test(`a step slower than taskTimeoutMs ends completed with its row, on a pipeline of ${steps} step${steps === 1 ? '' : 's'}`, async () => {
+    let slowRuns = 0;
+    const slow: VariantStep = async (r) => {
+      slowRuns++;
+      // Its timer starts after the task's, so it always ends after the task timed out.
+      await delay(250);
+      return overlay(r);
+    };
+    const { tasks, stored, add } = slowStepWorker(
+      steps === 1 ? [slow] : [slow, overlay],
+      [{ sizeKey: '20x10', width: 20, height: 10 }],
+      {
+        taskTimeoutMs: 100,
+        maxAttempts: 3,
+        // Longer than the late write takes, so the next delivery finds its row.
+        retryBackoffMs: { base: 400, max: 400 },
       },
-    },
+    );
+    await add();
+    const [row] = tasks.rows;
+    await workUntil(
+      { logger: silent },
+      () => row.status === 'completed' || row.status === 'dead',
+    );
+    assert.equal(row.status, 'completed');
+    assert.ok(row.attempts >= 2, 'a delivery timed out on the way');
+    assert.equal(stored.get('m1')?.length, 1);
+    assert.equal(stored.get('m1')?.[0].sizeKey, '20x10');
+    // The last delivery rendered nothing: it found the late row.
+    assert.equal(slowRuns, row.attempts - 1);
   });
-  const webp = (width: number, height: number) => ({
-    sizeKey: `${width}x${height}`,
-    format: 'webp',
-    requestedWidth: width,
-    requestedHeight: height,
-  });
-  await tasks.add({
-    resizer: 'default',
-    queue: 'default',
-    mediaId: 'm1',
-    pipeline: 'default',
-    previews: [webp(30, 15), webp(20, 10)],
-  });
+}
+
+test('a worker stopped during a step saves the variant in progress and gives the task back; the variant not started stays for the next worker', async () => {
+  const stop = new AbortController();
+  const { tasks, stored, add } = slowStepWorker(
+    [
+      async (r) => {
+        stop.abort();
+        await delay(20);
+        return r;
+      },
+      overlay,
+    ],
+    [
+      { sizeKey: '20x10', width: 20, height: 10 },
+      { sizeKey: '10x5', width: 10, height: 5 },
+    ],
+    { taskTimeoutMs: 5000, maxAttempts: 3 },
+    1,
+  );
+  await add();
+  await runWorker({ logger: silent, signal: stop.signal });
   const [row] = tasks.rows;
-  await workUntil(
-    { logger: silent },
-    () => row.status === 'dead' && (stored.get('m1')?.length ?? 0) === 1,
-  );
-  // The stopped variant's second step never ran.
-  assert.deepEqual(stepsRun.sort(), [
-    '20x10 first',
-    '30x15 first',
-    '30x15 second',
-  ]);
-  assert.deepEqual(encoded, ['30']);
-  assert.equal(uploaded.length, 1);
-  assert.deepEqual(
-    stored.get('m1')?.map((preview) => preview.sizeKey),
-    ['30x15'],
-  );
+  // Its second step and its encode ran after the stop.
+  assert.equal(stored.get('m1')?.length, 1);
+  assert.equal(row.status, 'pending');
 });
 
 /** A 200×100 source with smooth colours, whose columns take their alpha from `alpha`. */

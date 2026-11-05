@@ -386,9 +386,8 @@ export class Consumer {
     // the same tick, so after a crash a redelivery that starts once the lease has ended still finds
     // its gate held.
     const runningGateMs = leaseMs + heartbeatMs;
-    // Per-task lease-loss signal; worker shutdown also aborts the current task: a variant past its
-    // steps finishes, a variant between steps stops there, the rest are skipped, the task goes back
-    // to the queue, and the loop exits promptly.
+    // Per-task lease-loss signal; worker shutdown also aborts the current task, so it finishes
+    // its current variant, skips the rest, goes back to the queue, and the loop exits promptly.
     const taskController = new AbortController();
     const onShutdown = () => taskController.abort();
     signal.addEventListener('abort', onShutdown, { once: true });

@@ -17,7 +17,7 @@ import type {
   ResizeRequest,
 } from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
-import { ResizeError, ResizeMediaError, ResizeSetupError } from './errors.ts';
+import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { limitStepRaster, rasterProblem } from './helpers/raster.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
 import type { MediaLike, ResizeConfig, ResizeLimits } from './types.d.ts';
@@ -394,32 +394,18 @@ export interface EncodeOptions {
 export type EncodedVariant = EncodedImage;
 
 /**
- * Past its timeout, its lease or the shutdown, a task's result counts for nothing, so its variants
- * stop spending threads and memory. What is already past its steps goes on, and the delivery can
- * still store those rows (see the consumer: media writes are not fenced).
- */
-function stopIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw new ResizeError(
-      'resize: the task stopped, so the remaining steps and the encode of this variant did not run',
-      { code: 'RESIZE_TASK_ABORTED' },
-    );
-  }
-}
-
-/**
  * The variant's steps in order, from its own copy of the sized pixels: other formats share them.
  * The copy gets its own ArrayBuffer: `Buffer.from` would take a small one from Node's shared pool,
  * where a step writing through `data.buffer` reaches the other formats and unrelated Buffers. Each
- * raster handed to a step carries the limit, for `rasterToSharp` to read. A running step cannot be
- * interrupted, but a stopped task's remaining steps and encode do not run.
+ * raster handed to a step carries the limit, for `rasterToSharp` to read. A stopped task does not
+ * stop them: a variant in progress finishes and stores its row, which is how a step slower than
+ * `taskTimeoutMs` still ends with one (see the consumer: media writes are not fenced).
  */
 async function runVariantSteps(
   sized: Raster,
   plan: VariantPlan,
   opts: EncodeOptions,
 ): Promise<Raster> {
-  stopIfAborted(opts.signal);
   const data = Buffer.allocUnsafeSlow(sized.data.length);
   sized.data.copy(data);
   let raster: Raster = { data, info: { ...sized.info } };
@@ -436,7 +422,6 @@ async function runVariantSteps(
         'variantStep',
       ),
     );
-    stopIfAborted(opts.signal);
   }
   return raster;
 }

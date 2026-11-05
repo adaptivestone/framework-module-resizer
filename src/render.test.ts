@@ -15,7 +15,7 @@ import type {
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
 import { SharpEngine } from './engines/sharp.ts';
 import { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
-import { ResizeError, ResizeSetupError } from './errors.ts';
+import { type ResizeError, ResizeSetupError } from './errors.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
 import {
   type EncodeOptions,
@@ -543,80 +543,42 @@ test("a chained step's input owns its memory after a result marked premultiplied
   assert.deepEqual(seen, [800, 800]);
 });
 
-test('an aborted task stops between steps: no later step and no encode', async () => {
+test("a task's signal does not stop a variant's steps or its encode: only the engine gets it", async () => {
   const controller = new AbortController();
   const ran: string[] = [];
-  const encodes: Raster[] = [];
+  const signals: Array<AbortSignal | undefined> = [];
   const recording = {
     id: 'recording',
     formats: engine.formats,
     animatedFormats: engine.animatedFormats,
     resize: engine.resize.bind(engine),
     encode: (raster: Raster, req: EncodeRequest, opts: EngineCallOptions) => {
-      encodes.push(raster);
+      signals.push(opts.signal);
       return engine.encode(raster, req, opts);
     },
   } as ImageEngine;
-  const step =
-    (name: string, abortHere = false): VariantStep =>
-    (raster) => {
-      ran.push(name);
-      if (abortHere) {
-        controller.abort();
-      }
-      return raster;
-    };
-  const plan = variantPlan(sizePlan(20, 10), 'webp');
-  const opts = (steps: VariantStep[]) => ({
-    ...encodeOptions(steps),
-    engine: recording,
-    signal: controller.signal,
-  });
-  const stopped = (err: ResizeError) => {
-    assert.equal(err.code, 'RESIZE_TASK_ABORTED');
-    assert.equal(err.retryable, true);
-    assert.ok(ResizeError.isResizeError(err));
-    return true;
-  };
-  // Between two steps.
-  await assert.rejects(
-    encodeVariant(
-      solid(20, 10, [1, 2, 3]),
-      plan,
-      opts([step('first', true), step('second')]),
-    ),
-    stopped,
-  );
-  assert.deepEqual(ran, ['first']);
-  // After the last step: the encode does not run.
-  ran.length = 0;
-  const after = new AbortController();
-  await assert.rejects(
-    encodeVariant(solid(20, 10, [1, 2, 3]), plan, {
-      ...opts([
+  const out = await encodeVariant(
+    solid(20, 10, [1, 2, 3]),
+    variantPlan(sizePlan(20, 10), 'webp'),
+    {
+      ...encodeOptions([
         (raster) => {
-          ran.push('only');
-          after.abort();
+          ran.push('first');
+          controller.abort();
+          return raster;
+        },
+        (raster) => {
+          ran.push('second');
           return raster;
         },
       ]),
-      signal: after.signal,
-    }),
-    stopped,
+      engine: recording,
+      signal: controller.signal,
+    },
   );
-  assert.deepEqual(ran, ['only']);
-  // Already aborted: not even the first step.
-  ran.length = 0;
-  await assert.rejects(
-    encodeVariant(solid(20, 10, [1, 2, 3]), plan, opts([step('never')])),
-    stopped,
-  );
-  assert.deepEqual(ran, []);
-  assert.equal(encodes.length, 0);
-  // Without steps nothing changes: a variant in progress finishes, as it always did.
-  const done = await encodeVariant(solid(20, 10, [1, 2, 3]), plan, opts([]));
-  assert.equal(done.format, 'webp');
-  assert.equal(encodes.length, 1);
+  assert.ok(out.data.length > 0);
+  assert.deepEqual(ran, ['first', 'second']);
+  assert.deepEqual(signals, [controller.signal]);
 });
 
 test('a step that resolves with a Buffer is told to return its pixels, not an image file', async () => {

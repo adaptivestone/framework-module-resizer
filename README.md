@@ -1028,6 +1028,9 @@ code.
 The core sets no timer on an engine's calls. An engine applies `limits.processingTimeoutSeconds`
 itself, and stops when `signal` aborts, where its library can; `generate()` passes no `signal`. A call
 that never settles holds its task until a worker's `taskTimeoutMs`; `generate()` has no such bound.
+An engine that stops on `signal` stores no late row, where `SharpEngine`, which ignores it, does: a
+step slower than `taskTimeoutMs` then ends dead after `maxAttempts` with no row, so such a pipeline
+needs a longer `taskTimeoutMs`.
 
 Steps do not change with the engine. Both kinds receive and resolve with a `Raster`, so a step needs
 no image library: it reads `raster.info` and `raster.data` (`width × height × channels` bytes, row by
@@ -1150,11 +1153,11 @@ Nothing else in a step is bounded: Sharp work that does not go through `rasterTo
 through `rasterToSharp` as well, as in 0.3.0. Such work can starve other tasks and dead-letter healthy
 ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants beside one healthy task, at
 `taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
-where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not the
-running step, which keeps its thread and memory until it ends. That variant's remaining steps and its
-encode then do not run (`RESIZE_TASK_ABORTED` on its warning). A variant already past its steps goes
-on and can still store its row, and such a late write can replace a newer row, even one from a newer
-original: the next read finds that row stale and queues it again. `generate()` has no such bound.
+where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not its
+variants in progress: each keeps its thread and memory until it ends, and can still store its row. So
+a step slower than `taskTimeoutMs` still ends with its row: a later delivery finds it fresh and
+completes. Such a late write can also replace a newer row, even one from a newer original: the next
+read finds that row stale and queues it again. `generate()` has no such bound.
 
 A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source
 (with `png` added to `encode.flatten.formats`, it writes RGB where 0.3.0 wrote RGBA, with no pixel

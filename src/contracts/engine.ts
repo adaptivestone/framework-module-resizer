@@ -5,7 +5,7 @@ import type { DecodeBox, Raster } from './decoder.ts';
 
 export interface EngineCallOptions {
   limits: ResizeLimits; // the core sets no timer: the engine applies `processingTimeoutSeconds` itself
-  signal?: AbortSignal; // the task's; absent in generate(); an engine that cannot cancel ignores it
+  signal?: AbortSignal; // the task's; absent in generate(); an engine that cannot cancel ignores it, and one that stops on it stores no late row (see the README)
 }
 
 export interface ResizeRequest {
