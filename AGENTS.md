@@ -673,9 +673,19 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   and the host's own doc, and `MediaLike` has no host fields, so TypeScript needs a cast.
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
   watermark scales away to unreadable on small variants). A `variantStep` receives and returns a
-  one-frame `Raster`, never a Sharp object:
-  `async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))`.
-  Scale the logo by `r.info.width`: Sharp refuses an overlay larger than the preview.
+  one-frame `Raster`, never a Sharp object. Fit the logo on both sides: Sharp refuses an overlay
+  larger than the preview on either side, so one scaled by `r.info.width` alone fails on a banner:
+
+  ```ts
+  async (r) => {
+    const { width, height } = r.info;
+    const input = await sharp(logo)
+      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside' })
+      .toBuffer();
+    return sharpToRaster(rasterToSharp(r).composite([{ input, gravity: 'southeast' }]));
+  };
+  ```
+
 - When you port a `variantStep` to a `Raster`, look at its first new previews: stored previews stay,
   other steps than a single `composite` can write different files, and so can a `composite` on a
   transparent source in a JPEG, at most 2 levels before the JPEG encoder, up to 20 of 255 measured in

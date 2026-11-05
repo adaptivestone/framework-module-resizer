@@ -114,6 +114,9 @@
   variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))], // now
   ```
 
+  A logo larger than a preview on either side fails on both forms: fit it first, as the README's
+  `Pipelines` section shows.
+
   What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`; `hasAlpha` is
   `channels === 2 || channels === 4`. An old step that calls a Sharp method fails inside the step
   with a plain `TypeError` (`img.composite is not a function`): its variant fails, and the task fails
