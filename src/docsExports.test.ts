@@ -701,3 +701,50 @@ test('the docs say how far the excluded SDK range reaches', () => {
     );
   }
 });
+
+test('package.json, the lockfile and the changelog name one version', () => {
+  const { version } = JSON.parse(read('package.json')) as { version: string };
+  const lock = JSON.parse(read('package-lock.json')) as {
+    version: string;
+    packages: Record<string, { version: string }>;
+  };
+  assert.equal(lock.version, version);
+  assert.equal(lock.packages[''].version, version);
+  // A release candidate stays under its X.Y.0 heading, and the next release's heading may go in
+  // before its bump: the heading may run ahead of package.json, never behind it.
+  const heading = /^# (\d+)\.(\d+)\.(\d+)$/.exec(
+    read('CHANGELOG.md').split('\n')[0],
+  );
+  assert.ok(heading, 'CHANGELOG.md opens with # X.Y.Z');
+  const [major, minor, patch] = version
+    .replace(/-.*$/, '')
+    .split('.')
+    .map(Number);
+  const [h1, h2, h3] = heading.slice(1).map(Number);
+  assert.ok(
+    h1 > major ||
+      (h1 === major && (h2 > minor || (h2 === minor && h3 >= patch))),
+    `${heading[0]} is behind ${version}`,
+  );
+});
+
+test('RELEASE.md lists every check only the owner can run', () => {
+  const text = read('RELEASE.md');
+  const start = text.indexOf("## 6. The owner's checks");
+  assert.ok(start >= 0);
+  const checks = text.slice(start);
+  for (const needle of [
+    '**Real S3:**',
+    '`adoptOriginal`',
+    'a key with a space',
+    '**Real SQS:**',
+    '**Real Lambda:**',
+    '#push-delivery-needs-an-aws-account',
+    'C2 and C5 first',
+    '**A count on real originals:**',
+    '**A frontend**',
+    '**The npm name `resize-scaffold`:**',
+  ]) {
+    assert.ok(checks.includes(needle), needle);
+  }
+});

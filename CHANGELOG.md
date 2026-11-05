@@ -107,6 +107,10 @@ it lists what to change before you run `npm i`.
   shipped ones do, is not affected. `verify()` now also rejects a strict row schema without
   `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
   could never serve such a row.
+- **A custom model-shaped `MongoMediaModel` must accept a new filter.** The write of the original's
+  dimensions in `MongoMediaStore` had the filter `{ _id }`. It now adds `$or`, `$not` and `$type`,
+  so the write lands only while the original holds no stored pair, and its options add
+  `strictQuery: false` (`MongoMediaUpdateOptions`). A Mongoose model accepts both as it is.
 
 - **`variantSteps` take and return a `Raster`.** `VariantStep` is now
   `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one): `raster` is that

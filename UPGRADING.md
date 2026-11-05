@@ -73,6 +73,9 @@ npm i @adaptivestone/framework-module-resize
   read with no log line. Store those fields as given.
 - **A `findOneAndUpdate` pre hook on the media model** that calls `this.where({ $or })` replaces the
   store's guard on the dimension write, with no error. Use `this.and([...])`.
+- **A custom model-shaped `MongoMediaModel`** gets `$or`, `$not` and `$type` in the filter of the
+  dimension write, where it got `{ _id }`, and `strictQuery: false` in its options. Accept them, as
+  it accepts the update pipeline of `replacePreviews`. A Mongoose model needs nothing.
 - **A host decoder's originals are private** unless the decoder sets `publicOriginals: true`
   (`RESIZE_ORIGINAL_PUBLIC_REFUSED`). A raster it marks `premultiplied` now converts in plain JS, which
   blocks the event loop (182 ms at 24 MP): that matters for `generate()` on an API route.

@@ -319,6 +319,25 @@ The per-task line reads `resize: task … of media … in … ms (… attempt n,
 | C18 | SQS's 12 h limit, which counts from the receipt. With `leaseMs: 43200000` on the queue's entry, one good task. Then, with the trigger off (`--no-enabled`): `aws sqs send-message`, `aws sqs receive-message`, wait a minute, and `aws sqs change-message-visibility --visibility-timeout` with its receipt, 43200 and then 39600. AWS's page counts the 12 h from when the message is "first received", so if you can leave it 11 h, ask 39600, receive it again after they pass, and ask 39600 once more. Delete it, and turn the trigger on | The capped adoption is accepted: previews stored, no `lost its receipt` line. At the prompt, 39600 is accepted, and 43200 is refused, with the code `isLostReceipt` reads as a lost receipt (`InvalidParameterValue`), which AWS's page does not name. On the second receive 39600 is accepted too, so each receive starts its own 12 h, as the cap assumes | The log, the media's row, the CLI's answer | Lower the cap in `src/delivery.ts`. A different code, or 43200 accepted: note it in the README's settings table |
 | C19 | What a redrive does to the receive count, which AWS's pages do not state. With the trigger off, `aws sqs start-message-move-task --source-arn "$DEAD_ARN" --destination-arn "$QUEUE_ARN"`, for one body SQS moved and one the module wrote (C3): with no destination, AWS fails a message written with `SendMessage` as `CouldNotDetermineMessageSource`. Wait for `aws sqs list-message-move-tasks --source-arn "$DEAD_ARN"` to read `COMPLETED`, then `aws sqs receive-message --queue-url "$QUEUE_URL" --attribute-names ApproximateReceiveCount`. AWS says each is a new message, with a new ID, enqueue time and retention period | The move task reads `COMPLETED`, with both moved. 1 on the first receive, so a redriven task gets all its attempts: the README can then offer a redrive beside `prewarm()`. Delete both, and turn the trigger on | The CLI's answers: `Results[0].Status`, `FailureReason` and `ApproximateNumberOfMessagesMoved`, then `Attributes.ApproximateReceiveCount` | Anything above 1: say in `How a record ends` that a redriven task starts that far along, and keep `prewarm()` as the way |
 
+## 6. The owner's checks for 0.4.0
+
+Nothing below can run in CI or in a build. Each was left out of the build, not skipped silently.
+
+- [ ] **Real S3:** one adopted object, including a key with a space, through `adoptOriginal` and a
+      worker.
+- [ ] **Real SQS:** a queued task through a worker.
+- [ ] **Real Lambda:** the [push delivery list](#push-delivery-needs-an-aws-account),
+      C2 and C5 first. Until C1, C2, C5 and C8 pass, push delivery stays "preview".
+- [ ] **A count on real originals:** decode a sample at `failOn: 'error'` and `'warning'` and count
+      refusals. If `'warning'` refuses about as few, it is the stricter default worth taking. Note how
+      many of the files `'error'` refuses render the same pixels at `'none'`, such as a PNG with a bad
+      IDAT CRC: those previews looked healthy under 0.3.0.
+- [ ] **A frontend** handling the empty-`sizes` window, which needs a frontend.
+- [ ] **The npm name `resize-scaffold`:** free today. The docs say `npx --no -- resize-scaffold`,
+      which never fetches it, but a host that types the command without `--no`, with the package
+      missing, would run whatever is published there. Claiming the name is cheap insurance, and only
+      the owner can do it.
+
 ## Notes
 
 - **No publish workflow on purpose.** Both sibling repos release manually; a tagged-release
