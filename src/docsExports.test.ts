@@ -466,19 +466,38 @@ test('UPGRADING.md names every 0.4.0 trap, and what comes before npm i comes fir
 
 test('the README top and the 0.4.0 changelog send a host to UPGRADING.md before npm i', () => {
   // UPGRADING.md reaches node_modules only through the npm i it warns about, so npmjs.com's README
-  // and the GitHub Release text (the changelog section) point at it by its GitHub URL.
-  const pointer =
-    /Before you upgrade, read \[`UPGRADING\.md`\]\(https:\/\/github\.com\/adaptivestone\/framework-module-resizer\/blob\/main\/UPGRADING\.md\): it lists what to change before you run `npm i`\./i;
+  // points at it by its GitHub URL. The changelog ships beside it, so it links relatively, and the
+  // GitHub Release body (the changelog section) gets the tag's URL from RELEASE.md's command.
+  const pointer = (target: string) =>
+    new RegExp(
+      `Before you upgrade, read \\[\`UPGRADING\\.md\`\\]\\(${target}\\): it lists what to change before you run \`npm i\`\\.`,
+      'i',
+    );
   const readme = read('README.md');
   const top = readme.slice(0, readme.indexOf('\n## ')).replace(/\s+/g, ' ');
-  assert.match(top, pointer, 'the README top, above its first section');
+  assert.match(
+    top,
+    pointer(
+      'https://github\\.com/adaptivestone/framework-module-resizer/blob/main/UPGRADING\\.md',
+    ),
+    'the README top, above its first section',
+  );
   const opening = /^# 0\.4\.0\n\n([\s\S]*?)\n\n/m.exec(read('CHANGELOG.md'));
   assert.ok(opening, 'CHANGELOG.md has a # 0.4.0 section');
   assert.match(
     opening[1].replace(/\s+/g, ' '),
-    pointer,
+    pointer('\\./UPGRADING\\.md'),
     'the first paragraph of # 0.4.0',
   );
+  const release = read('RELEASE.md');
+  for (const tag of ['vX.Y.Z', 'vX.Y.0-rc.N']) {
+    assert.ok(
+      release.includes(
+        `sed 's#](\\./#](https://github.com/adaptivestone/framework-module-resizer/blob/${tag}/#g'`,
+      ),
+      `the ${tag} release body points relative links at the tag`,
+    );
+  }
 });
 
 // The README text from a heading to the next `## ` heading, or, for a subsection, the next heading.

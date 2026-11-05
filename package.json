@@ -50,7 +50,8 @@
   "files": [
     "dist",
     "AGENTS.md",
-    "UPGRADING.md"
+    "UPGRADING.md",
+    "CHANGELOG.md"
   ],
   "author": "Andrei Lahunou",
   "license": "MIT",

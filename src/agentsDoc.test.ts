@@ -164,11 +164,14 @@ describe('AGENTS.md stays what a new integration needs', () => {
       'npm run cli migration/create',
       // The framework's migration/create writes into the folder and never makes it.
       'create `src/migrations` first if it is missing',
-      "await this.app.getModelOrThrow('ResizeTask').createIndexes();",
+      "const ResizeTask = this.app.getModel('ResizeTask'); if (!ResizeTask) throw new Error(",
+      'await ResizeTask.createIndexes();',
       'npm run cli migration/migrate',
     ]) {
       assert.ok(doc.includes(needle), needle);
     }
+    // getModelOrThrow first ships in framework 5.2.2, and the peer range starts at 5.1.0.
+    assert.ok(!doc.includes('getModelOrThrow'), 'getModelOrThrow');
     // The framework's CLI names a command by its file under dist/commands, in lower case.
     const commands = new URL(
       'commands/migration/',

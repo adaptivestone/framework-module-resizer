@@ -188,8 +188,9 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    database only, let the API build them first. In a framework host,
    `npm run cli migration/create -- --name=resizeIndexes` writes one (create `src/migrations`
    first if it is missing); give its `up()`
-   `await this.app.getModelOrThrow('ResizeTask').createIndexes();` and run
-   `npm run cli migration/migrate`. Never add index creation to HTTP bootstrap or the first
+   `const ResizeTask = this.app.getModel('ResizeTask'); if (!ResizeTask) throw new Error('the ResizeTask model is not registered'); await ResizeTask.createIndexes();`
+   (it type-checks on framework 5.1 and later, from 5.2.2 once `npm run gen` lists the model) and
+   run `npm run cli migration/migrate`. Never add index creation to HTTP bootstrap or the first
    enqueue. Upgrading: the order is in [`UPGRADING.md`](./UPGRADING.md).
 
 8. Lazy / pre-warm modes: keep `queues: { default: { driver: 'database' } }` (or an SQS entry)
@@ -414,18 +415,19 @@ still logged. See [Metrics](./README.md#metrics).
 The first things a new integration meets. Every other code is in
 [`## Error codes`](./README.md#error-codes), other symptoms in
 [Symptoms without a code](./README.md#symptoms-without-a-code), and what an upgrade changes in
-[`UPGRADING.md`](./UPGRADING.md).
+[`UPGRADING.md`](./UPGRADING.md). `npm run cli ResizeWorker` prints a start error as its stack: the
+message, not the code, so find its row by the message's words.
 
 | Symptom | Cause → fix |
 |---|---|
-| ``resize config: `mediaModelName` is required``, `RESIZE_CONFIG_MEDIA_MODEL_MISSING`, or `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` | set `mediaModelName` in the host `src/config/resize.ts` (or the `configName` file named in the message) to your media model's registered name: the scaffold guesses `'File'`. `verify()`, worker start and the first call in the API that uses the model, such as `generate()`, throw it; `uploadOriginal()` still succeeds |
+| ``resize config: `mediaModelName` is required``, `RESIZE_CONFIG_MEDIA_MODEL_MISSING`, or `RESIZE_CONFIG_MEDIA_MODEL_UNKNOWN` | set `mediaModelName` in the host `src/config/resize.ts` (or the `configName` file named in the message) to your media model's registered name: the scaffold guesses `'File'`. `…_MISSING` is thrown when the file is read, so every call fails, `uploadOriginal()` too. `…_UNKNOWN` comes from `verify()`, worker start and the first call in the API that uses the model, such as `generate()`; `uploadOriginal()` still succeeds |
 | `RESIZE_APP_NOT_INITIALIZED` | a `FrameworkResizer` read the framework app before the `Server` was constructed — construct the Server before the first call (importing `src/resizer.ts` earlier is fine); in tests, install a fake app with `setAppInstance` from `@adaptivestone/framework/helpers/appInstance.js` |
-| `RESIZE_CONFIG_QUEUE_UNKNOWN` on first use or from `verify()` | the Resizer's queue name is not an entry of `queues` in `src/config/resize.ts` — add `queues.<name>`, set `queue`/`queueName` to a defined name, or `queue: false` for eager only |
+| `RESIZE_CONFIG_QUEUE_UNKNOWN` on first use or from `verify()` | the Resizer's queue name is not an entry of `queues` in `src/config/resize.ts` — add `queues.<name>`, set `queue`/`queueName` to a defined name, or `queue: false` (`tasks: false` when the name came from the option) for eager only |
 | `RESIZE_CONFIG_STORAGE_MISSING` | add `storage: { driver: 'local', … }` (or `'s3'`) to the config named in the message, or pass `storage` to `new FrameworkResizer()` |
 | `RESIZE_CONFIG_INVALID` | the config is malformed, and the message names the part — fix it. `engine` and `decoders` keys in a config are refused: each is an option, in code |
 | `RESIZE_NOT_READY` | host code read `resizer.storage` / `media` / `locks` / `tasks` or a config-file `resizer.queueName` before the Resizer loaded them — `await resizer.ready()` first (the Resizer's methods do this themselves) |
 | `RESIZE_MONGO_INDEX_MISSING` from `verify()` or at worker start | the `ResizeTask` collection has no gate index, unique on `{ resizer: 1, fileId: 1, pipeline: 1, queue: 1 }` with `partialFilterExpression: { active: true }` — create it through your migration (e.g. `ResizeTask.createIndexes()`), before the worker starts |
-| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve: the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), or the framework's `Lock`, needed only beside a task queue without `gatesByTask` |
+| `RESIZE_MONGO_MODEL_MISSING` from `verify()` or at worker start | a model does not resolve (`… model is not registered`): the `ResizeTask` model (scaffold `src/models/ResizeTask.ts`), or the framework's `Lock`, needed only beside a task queue without `gatesByTask` |
 | `RESIZE_MONGO_NOT_CONNECTED` from `verify()` or at worker start | call `verify()` after the connection has opened (after `Server.init()` in a framework host) |
 | `RESIZE_PIPELINE_UNKNOWN` | the pipeline is not registered in that process — register it in `src/resizer.ts`; deploy the worker before the API requests a new or renamed pipeline |
 | `RESIZE_PIPELINE_STEP_INVALID` | a step resolved with something that is not a one-frame `Raster` — return `{ data, info }`, or `sharpToRaster(…)` from a Sharp chain |

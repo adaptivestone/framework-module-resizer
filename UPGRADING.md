@@ -2,7 +2,7 @@
 
 Read the section for the version you are on, and every section above it, in order from the bottom up:
 a host on 0.2.x reads both. This file says what a host may have to do. Every change is in the
-[changelog](https://github.com/adaptivestone/framework-module-resizer/blob/main/CHANGELOG.md).
+[changelog](./CHANGELOG.md).
 
 ## From 0.3.x to 0.4.0
 
@@ -22,8 +22,9 @@ them, and the module does not check the version at run time. Move to 3.735 or la
 **Add `await getResizer().verify()` after `Server.init()` (or `startServer()`).** 0.3.0 accepted the
 settings below, and 0.4.0 refuses them. Unless a row says otherwise, a refusal from a config file
 comes at first use or `verify()`. On a framework host with no boot `verify()`, the first `resolve()`
-logs one `error` and returns an empty decision, and so does every later read: **previews stored
-earlier stop being served until the value is fixed.** `verify()` does not run steps, so it says
+logs it once as an `error`, and every read then serves nothing, with no further line: **previews
+stored earlier stop being served until the value is fixed.** A quiet log after that line is not a
+recovery. `verify()` does not run steps, so it says
 nothing about them: see [Pipeline steps](#pipeline-steps).
 
 | Setting | Code | Fix |
@@ -103,6 +104,10 @@ variantSteps: [(img) => img.composite([{ input: logo, gravity: 'southeast' }])],
 variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))], // now
 ```
 
+A logo larger than a preview on either side fails on both forms (`Image to composite must have same
+dimensions or smaller`): fit it first, as **Pipelines** in the
+[Config reference](./README.md#config-reference) shows.
+
 What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `hasAlpha` is
 `channels === 2 || channels === 4`.
 
@@ -163,6 +168,20 @@ What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `
   for itself.
 - **Debug lines.** `FrameworkResizer`'s default sink writes none: pass
   `new LogMetrics(logger, { debug: true })` to keep them.
+
+### Visible without a change
+
+These need no code change. A strict response schema, an API snapshot test or an alert on any
+`error` line sees them:
+
+- **`formatPictureUrls` entries carry `width` and `height`** when the stored row has them:
+  `{ url, contentType, width, height }`. A size key does not promise a size.
+- **A read can log one `warn` per Resizer** for a media loaded without the module's fields
+  (`resize resolve: media … was loaded without its stored …`): add `...resizeMediaPaths` to the
+  query's projection.
+- **The database queue checks the gate index** in the background after the first added task, and
+  logs one `error` line when it is missing (`… has no gate index …`, ending in
+  `(code RESIZE_MONGO_INDEX_MISSING, logged once)`): create it through your migration.
 
 ### A sweep written from the 0.3.0 docs
 
@@ -663,7 +682,7 @@ regenerate on their next read. So, for a host on an earlier rc:
 
 `0.3.0-rc.5` removed and renamed nothing: it widened two types (the `NoopMetrics` parameters, and
 the timing keys of a custom queue driver's `queues` entry; see Fixes in the
-[changelog](https://github.com/adaptivestone/framework-module-resizer/blob/main/CHANGELOG.md)), and
+[changelog](./CHANGELOG.md)), and
 every public object `S3Storage` uploads (previews and public raster originals, and your own direct
 uploads, which must use new keys) carries `Cache-Control: public, max-age=31536000, immutable`, so
 purge your CDN when you delete one that must disappear sooner (browsers that already have it may

@@ -80,9 +80,9 @@ change). The final `0.3.0` followed `0.3.0-rc.5` with no host-facing change.
 **Update `CHANGELOG.md` in the same commit as the bump.** Newest version first, `# X.Y.Z`
 heading, with `**Breaking changes**` / `**Changed behaviour**` / `**Features**` / `**Fixes**` /
 `**Documentation**` / `**Internal**` groups — the format the sibling `framework-module-email`
-uses. It is NOT in `files`, so it stays on GitHub and never ships in the tarball (same as the
-sibling). Write it for a host developer deciding whether to upgrade: what breaks, what is new, and
-what they must change.
+uses. It ships in the tarball (`files`, since 0.4.0), so its links to the other shipped documents
+are relative (`./UPGRADING.md`) and a host reads the version it installed. Write it for a host
+developer deciding whether to upgrade: what breaks, what is new, and what they must change.
 
 ## 3. Publish
 
@@ -117,8 +117,8 @@ harmless; point it at the final release with `npm dist-tag add
 @adaptivestone/framework-module-resize@X.Y.Z next` if you want `@next` to stay the newest.
 
 `prepublishOnly` runs `npm run build` automatically, so `dist/` is always rebuilt from source at
-publish time; `files: ["dist", "AGENTS.md", "UPGRADING.md"]` (plus the auto-included `README.md` +
-`LICENSE`) is all that ships.
+publish time; `files: ["dist", "AGENTS.md", "UPGRADING.md", "CHANGELOG.md"]` (plus the
+auto-included `README.md` + `LICENSE`) is all that ships.
 
 > If the org later decides to standardize access in-manifest, add `"publishConfig": { "access":
 > "public" }` to `package.json` and drop the flag. As of this release the siblings rely on the
@@ -154,9 +154,11 @@ the matching `CHANGELOG.md` section as the body:
 ```bash
 # `1d;$d` drops the `# X.Y.Z` heading and the next version's heading — the body starts at the
 # pointer to UPGRADING.md when the section has one, then **Breaking changes**, matching how the
-# sibling repos' release bodies read.
+# sibling repos' release bodies read. The last sed points the relative links (`./UPGRADING.md`),
+# which a release page cannot follow, at the tag's files.
 gh release create vX.Y.Z --title "X.Y.Z" \
-  --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d')
+  --notes-file <(sed -n '/^# X.Y.Z$/,/^# /p' CHANGELOG.md | sed '1d;$d' \
+    | sed 's#](\./#](https://github.com/adaptivestone/framework-module-resizer/blob/vX.Y.Z/#g')
 ```
 
 For a release candidate, mark the GitHub Release as a prerelease and take the body from the
@@ -164,7 +166,8 @@ For a release candidate, mark the GitHub Release as a prerelease and take the bo
 
 ```bash
 gh release create vX.Y.0-rc.N --prerelease --title "X.Y.0-rc.N" \
-  --notes-file <(sed -n '/^# X.Y.0$/,/^# /p' CHANGELOG.md | sed '1d;$d')
+  --notes-file <(sed -n '/^# X.Y.0$/,/^# /p' CHANGELOG.md | sed '1d;$d' \
+    | sed 's#](\./#](https://github.com/adaptivestone/framework-module-resizer/blob/vX.Y.0-rc.N/#g')
 ```
 
 ## 5. Manual post-publish verification — try in a real host backend

@@ -1,7 +1,7 @@
 # 0.4.0
 
 Before you upgrade, read
-[`UPGRADING.md`](https://github.com/adaptivestone/framework-module-resizer/blob/main/UPGRADING.md):
+[`UPGRADING.md`](./UPGRADING.md):
 it lists what to change before you run `npm i`.
 
 **Breaking changes**
@@ -196,9 +196,11 @@ it lists what to change before you run `npm i`.
 - `resolve()` warns once per Resizer when the module's fields were not loaded. A sub-field projection
   that drops `original.storageRef` counts for a hydrated document only; a lean row stays silent.
   After the first added task, `MongoTaskQueue` checks the gate index once per model in the background
-  and logs an `error` when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
-  indexed query instead of a failed insert; the first add costs about 1 ms more, and the unique
-  index still settles races. The gate read and `findActive` read from the primary.
+  and logs one `error` line when it is missing, which ends in
+  `(code RESIZE_MONGO_INDEX_MISSING, logged once)`. The error is not passed after the line, so the
+  framework's logger prints it once; a failed Mongoose index build follows it as its own error.
+  `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one indexed query instead of
+  a failed insert; the first add costs about 1 ms more, and the unique index still settles races. The gate read and `findActive` read from the primary.
 - A custom driver whose `download()` resolves with something other than bytes gets
   `ResizeSetupError` `RESIZE_STORAGE_DOWNLOAD_INVALID` from `generate()` and on a task, where it is
   retried. It was a raw `TypeError`, or a string decoded as if it were the file. An `ArrayBuffer` is
@@ -290,8 +292,9 @@ it lists what to change before you run `npm i`.
   worker, on either host shape, with no new peer. Standard queues only: FIFO queues are not
   supported. The trigger must set `ReportBatchItemFailures`, or retries are lost silently, and a
   batch that does not fit one function timeout can kill healthy tasks unrun: see the README section,
-  which leads with the settings to get right. It has not run on real AWS yet, so it stays a preview until the check
-  list in `RELEASE.md` passes. Workers are unchanged: `src/consumer.ts` did not change for this.
+  which leads with the settings to get right. It has not run on real AWS yet, so it stays a preview until the
+  [check list](https://github.com/adaptivestone/framework-module-resizer/blob/main/RELEASE.md#push-delivery-needs-an-aws-account)
+  passes. Workers are unchanged: `src/consumer.ts` did not change for this.
   New codes: `RESIZE_DELIVERY_UNSUPPORTED`, `RESIZE_SQS_EVENT_INVALID`.
 
 **Fixes**
@@ -326,6 +329,8 @@ it lists what to change before you run `npm i`.
 - `UPGRADING.md` ships with the package and holds all upgrade material: what a host must do for each
   version, the traps of 0.4.0 and the list of removed keys. It replaces `docs/host-adoption.md`, which
   did not ship.
+- `CHANGELOG.md` ships with the package too, and `UPGRADING.md` links to it there, so an agent in a
+  host reads the changes of the installed version, not the newest text on GitHub.
 - The 0.3.0 docs gave a sweep of preview objects with no age rule. It can delete the file of a row about
   to be written, and a read still calls that row ready. `UPGRADING.md` gives the rule and the repair.
 - The README has one full error table, `## Error codes`: every code with its `retryable` and what to do.

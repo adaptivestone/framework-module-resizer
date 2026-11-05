@@ -13,8 +13,14 @@ const read = (file: string): string =>
   readFileSync(new URL(file, repo), 'utf8');
 const exists = (file: string): boolean => existsSync(new URL(file, repo));
 
-const SHIPPED = ['README.md', 'AGENTS.md', 'UPGRADING.md'];
-const DOCS = [...SHIPPED, 'RELEASE.md', 'CHANGELOG.md'];
+// The documents the tarball holds: README.md (npm adds it) and every Markdown file in `files`.
+const packFiles = (JSON.parse(read('package.json')) as { files: string[] })
+  .files;
+const SHIPPED = [
+  'README.md',
+  ...packFiles.filter((file) => file.endsWith('.md')),
+];
+const DOCS = [...new Set([...SHIPPED, 'RELEASE.md', 'CHANGELOG.md'])];
 const MODULE_URL =
   /github\.com\/adaptivestone\/framework-module-resizer(?:\/blob\/[^/\s)]+\/([^\s)#]+\.md))?#([\w-]+)/g;
 // A file of this repository on GitHub, with or without an anchor.
@@ -97,9 +103,8 @@ test('every link between the documents reaches a file and a heading', () => {
 });
 
 test('a shipped document links only to files the package ships', () => {
-  const pack = JSON.parse(read('package.json')) as { files: string[] };
   const ships = (path: string) =>
-    ['README.md', 'LICENSE', ...pack.files].some(
+    ['README.md', 'LICENSE', ...packFiles].some(
       (f) => path === f || path.startsWith(`${f}/`),
     );
   const problems: string[] = [];
@@ -112,8 +117,25 @@ test('a shipped document links only to files the package ships', () => {
     // A file named in plain text, outside a link, is a pointer a reader of node_modules cannot follow.
     const prose = withoutFences(read(doc)).replace(/\[[^\]]*\]\([^)]*\)/g, '');
     for (const [name] of prose.matchAll(/\b(?:RELEASE|CHANGELOG)\.md\b/g)) {
-      problems.push(`${doc}: names ${name}`);
+      if (!ships(name)) {
+        problems.push(`${doc}: names ${name}`);
+      }
     }
   }
   assert.deepEqual(problems, []);
+});
+
+test('the changelog ships, and the installed upgrade notes and changelog link to each other', () => {
+  // An agent in a host reads node_modules: a link to GitHub main shows a newer version's text.
+  assert.ok(SHIPPED.includes('CHANGELOG.md'), 'CHANGELOG.md is in `files`');
+  assert.ok(read('UPGRADING.md').includes('[changelog](./CHANGELOG.md)'));
+  assert.ok(read('CHANGELOG.md').includes('[`UPGRADING.md`](./UPGRADING.md)'));
+  // README.md keeps its absolute pointer: npm's page cannot follow a relative one.
+  for (const doc of SHIPPED.filter((file) => file !== 'README.md')) {
+    assert.doesNotMatch(
+      read(doc),
+      /framework-module-resizer\/blob\/[^/\s)]+\/(?:CHANGELOG|UPGRADING|AGENTS)\.md/,
+      doc,
+    );
+  }
 });
