@@ -6,6 +6,7 @@ import { afterEach, test } from 'node:test';
 import sharp from 'sharp';
 import type { ImageEngine } from './contracts/engine.ts';
 import type { LeasedTask } from './contracts/taskQueue.ts';
+import { ResizeSetupError } from './errors.ts';
 import { NoopMetrics } from './metrics.ts';
 import {
   Resizer,
@@ -20,7 +21,12 @@ import {
   ReleasingTaskQueue,
 } from './testHelpers/fakes.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
-import { flushMetrics, prepareServing } from './worker.ts';
+import {
+  flushMetrics,
+  prepareServing,
+  type RunWorkerOptions,
+  runWorker,
+} from './worker.ts';
 
 const silentLogger = { info() {}, warn() {}, error() {} };
 
@@ -70,6 +76,38 @@ test('a pushed serving never gives a task back: no accepts, and a task of anothe
   );
   assert.match(lines.join('\n'), /createSqsHandler\(\{ resizers \}\)/);
   assert.match(lines.join('\n'), /cannot go to another consumer/);
+});
+
+// `pushed` is prepareServing's switch, not a runWorker option. A JavaScript caller has no type to stop
+// it, and in a worker it would dead-letter another worker's task instead of giving it back.
+test('runWorker ignores a `pushed` it is passed: a task of another Resizer is given back, even at maxAttempts 1', async (t) => {
+  const tasks = new ReleasingTaskQueue({
+    timing: { maxAttempts: 1, idlePollMs: 1 },
+  });
+  const resizer = make({ tasks });
+  await tasks.add({
+    resizer: 'other',
+    queue: 'default',
+    mediaId: 'm',
+    pipeline: 'default',
+    previews: [],
+  });
+  const stop = new AbortController();
+  const [row] = tasks.rows;
+  const watch = setInterval(() => {
+    if (tasks.releaseCalls.length >= 3 || row.status === 'dead') {
+      stop.abort();
+    }
+  }, 1);
+  t.after(() => clearInterval(watch));
+  await runWorker({
+    signal: stop.signal,
+    resizers: [resizer],
+    logger: silentLogger,
+    pushed: true,
+  } as RunWorkerOptions);
+  assert.notEqual(row.status, 'dead');
+  assert.ok(tasks.releaseCalls.length >= 3, `${tasks.releaseCalls.length}`);
 });
 
 test('a pulled serving keeps accepts on a queue that can give back', async () => {
@@ -127,18 +165,26 @@ test('prepareServing resolves undefined and logs when no Resizer has a task queu
 test('prepareServing tunes Sharp last: a start check that fails leaves it as it is', async (t) => {
   const before = sharp.concurrency();
   t.after(() => sharp.concurrency(before));
-  const resizer = make({ tasks: new PlainTaskQueue({ queues: ['default'] }) });
+  // The task queue's own verify() is the last check of all, so tuning anywhere before it fails here.
+  const tasks = new PlainTaskQueue();
+  let broken = true;
+  tasks.verify = async () => {
+    if (broken) {
+      throw new ResizeSetupError('the last check');
+    }
+  };
+  const resizer = make({ tasks });
   const tuned = { concurrency: before + 1, cache: true };
   await assert.rejects(
     prepareServing({
-      queue: 'nobody',
       resizers: [resizer],
       sharp: tuned,
       logger: silentLogger,
     }),
-    { code: 'RESIZE_QUEUE_NOT_SERVED' },
+    { message: 'the last check' },
   );
   assert.equal(sharp.concurrency(), before);
+  broken = false;
   await prepareServing({
     resizers: [resizer],
     sharp: tuned,

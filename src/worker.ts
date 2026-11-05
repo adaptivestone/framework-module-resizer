@@ -530,7 +530,8 @@ export interface RunWorkerOptions {
  * has a task queue, so the process consumes nothing (an `error` line says so).
  */
 export async function runWorker(opts: RunWorkerOptions): Promise<boolean> {
-  const serving = await prepareServing(opts);
+  // `pushed` is no option of this function: a JavaScript caller cannot switch a worker to it.
+  const serving = await prepareServing({ ...opts, pushed: false });
   if (!serving) {
     return false;
   }
