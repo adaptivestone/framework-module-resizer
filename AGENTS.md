@@ -567,18 +567,20 @@ also save `backfillDims` in `appendPreviews` whenever it is given, also with `pr
 freshness check needs the original's dimensions. Write them only while the original holds no stored
 pair. Old rows: rows without `origin` and
 `encodeSig` (written by 0.2.x or earlier) are stale: served until replaced, regenerated on their next
-read, and their old files stay in storage (clean up from the "replaced … outdated preview(s)" log
-line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row
-references, leaving out every `original.storageRef`: an adopted public original sits in the same
+read, and their old files stay in storage (clean up in an `onPreviewReplaced` observer, from the
+"replaced … outdated preview(s)" log line, or sweep objects under the `previews/` prefix (below a
+ref's `namespace`) that no row references, leaving out every `original.storageRef`: an adopted public original sits in the same
 bucket, and no preview row references it; see the README `Freshness` section). Rows without an
 `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a
 sweep never finds their files: the host deletes those rows and files itself.
 
 Hooks are typed — register at construction (`hooks:`) or later via `getResizer().hook(name, fn)`.
 Waterfalls (read path, real `ctx`): `resolveSizes`, `beforeEnqueue`, `formatPublicUrls`.
-Observers (worker side): `onPreviewGenerated`, `afterTaskComplete`, `onTaskFailed`,
-`onTaskDeadLettered`; the three task observers (`afterTaskComplete`, `onTaskFailed`,
-`onTaskDeadLettered`) receive the task with `attempts` (its deliveries, 1 on the first).
+Observers (worker side, and for the first two `generate()` too): `onPreviewGenerated`,
+`onPreviewReplaced`, `afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`; the three task
+observers (`afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`) receive the task with
+`attempts` (its deliveries, 1 on the first). `onPreviewReplaced(row, ctx)` gets each row a write
+removed: delete `row.storageRef` there rather than parsing the log line.
 Pipelines: `beforeSteps` run once on the decoded first frame, as a `Raster` in and a `Raster` out
 (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
 pixels, not a library object, so the engine stays replaceable); `variantSteps` run on each size's
@@ -671,7 +673,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   only, so uploaded SVG markup never reaches a reader. The worker renders SVG into the requested
   raster preview formats through the normal durable task lifecycle.
 - Deleting storage objects is the HOST's job — the module only appends rows, and `invalidate`
-  only removes rows and returns their storage refs.
+  only removes rows and returns their storage refs; `onPreviewReplaced` reports each row a write
+  replaced.
 - A `storageRef` you write or pass to `adoptOriginal` comes from the host's own records, never from
   a client's input: within the two configured buckets it would publish previews of someone else's
   object. S3 reads any key except control characters, `.` or `..` parts, a leading `/` or an empty
@@ -716,9 +719,9 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `npx --no -- resize-scaffold --check` reports drift in `src/config/resize.ts` or a `resize.<NODE_ENV>.ts` override ("uses the old config shape") right after the upgrade | intended, for every config scaffolded by an earlier version: a top-level `queue: { … }` object (a `queue` entry inside `queues` is fine), or `defaultFrameworkResizeConfig` imported from `…/config/resize.js` (only full-line `//` comments are skipped) — rewrite it to the new shape (step 5), or move it aside, re-run `npx --no -- resize-scaffold` and copy your settings back. The config file is never diffed, and a second Resizer's `configName` file is not checked: review it yourself |
 | `RESIZE_MONGO_NOT_CONNECTED` from `verify()` or at worker start | the Mongoose connection of the `ResizeTask` model is closed (never opened, or disconnected: at once), or failed to open (after the driver's `serverSelectionTimeoutMS`, 30 s by default; the message names the driver's error) — call `verify()` after the connection has opened (after `Server.init()` in a framework host); an opening connection is awaited |
 | `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` from `verify()` or at worker start | the media schema declares preview rows as strict sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType` or `storageRef` (the message names them; a mixed or plain `previews` array, or rows with `strict: false`, pass) — spread the current `resizeMediaSchemaFragment`, or add each missing field to the row as `{ type: String }` (`storageRef` as `{ type: 'Mixed' }`). A strict row schema without `fit` does not throw: it logs one warning (fit rows then lose their flag and are judged by either signature); add `fit: { type: Boolean }` |
-| previews without `origin` / `encodeSig` (written by 0.2.x or earlier), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are stale — served until replaced and regenerated on their next read; their old files stay (clean up from the "replaced … outdated preview(s)" log line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row references, leaving out every `original.storageRef`). Rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a sweep never finds their files — delete those rows and files yourself |
+| previews without `origin` / `encodeSig` (written by 0.2.x or earlier), or rows that `invalidate` leaves behind | old rows: rows without `origin` and `encodeSig` are stale — served until replaced and regenerated on their next read; their old files stay (clean up in an `onPreviewReplaced` observer, from the "replaced … outdated preview(s)" log line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row references, leaving out every `original.storageRef`). Rows without an `identity` (written before 0.3.0) are never removed by `invalidate` or `replacePreviews`, and a sweep never finds their files — delete those rows and files yourself |
 | `RESIZE_METRICS_INVALID` at construction | the `metrics` option is not a sink (`null`, or no `count()` and `timing()` functions), or `new LogMetrics(logger, { summaryIntervalMs })` got an interval that is not a positive safe integer — pass `new LogMetrics(logger)`, `new NoopMetrics()` or your own `ResizeMetrics`, or leave `metrics` out for the default |
-| previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or without `origin` and `encodeSig` (written by 0.2.x or earlier) is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row references, leaving out every `original.storageRef`. The wave shares the queue with new uploads' previews: plan worker capacity |
+| previews are re-rendered after a config change or an upgrade | freshness working as designed: a stored preview made with other image settings, another pipeline `version`, another original, or without `origin` and `encodeSig` (written by 0.2.x or earlier) is stale, served until replaced, and regenerated on its next read, `prewarm()` or `generate()`. It costs a render and an upload per preview, and the old files stay in storage — clean up in an `onPreviewReplaced` observer, from the "resize: replaced … outdated preview(s) … storage refs" log line, or sweep objects under the `previews/` prefix (below a ref's `namespace`) that no row references, leaving out every `original.storageRef`. The wave shares the queue with new uploads' previews: plan worker capacity |
 | the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews`, so nothing is served or queued, or previews are served as stale, or previews are made again (the line says which) — add `...resizeMediaPaths` to the query. A lean row the module never wrote has neither field: one harmless line |
 | one task per read that renders nothing, and the warning "found every requested preview … already fresh" | the API and the worker run different image settings or pipeline versions (deploy them together), or `resolve()` got the media without its stored original (a projection that drops `original.width` / `height`, or a reshaped `storageRef`) — pass `original` as stored |
 | previews re-rendered over and over during a deploy | two worker versions with different settings run side by side (a rolling deploy, a canary), and each re-makes the other's rows: every read after a task ends queues them again, and each replaced preview costs one render, one upload and one orphaned file — deploy every worker at once, or change settings only after the old workers have stopped |

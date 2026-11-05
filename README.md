@@ -1509,18 +1509,28 @@ The worker judges freshness by its own settings: a queued variant that is fresh 
 (nothing is uploaded) and counts as covered. The new rows of a stale identity replace the old ones
 in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists
 the storage refs of the rows the write of `generate()` removed (set only when there are some):
-the outdated rows, or a row of the same identity another worker stored meanwhile. `generate()`
-swaps the rows in the caller's `media.previews` too. Each replacing write logs one `info` line:
+the outdated rows, or a row of the same identity another worker stored meanwhile. A ref a new row
+of that write holds again is left out, because that file is in use. `generate()` swaps the rows in
+the caller's `media.previews` too. Each replacing write logs one `info` line:
 "resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs
 <refs>". Its count and refs are the rows that write removed, so they can include such a
 concurrent copy too.
 
-**Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
-objects under the `previews/` prefix (below a ref's `namespace`) that no row references. Leave out
-every `original.storageRef`: an adopted public original sits in the same bucket, and no preview row
-references it. A row without an `identity` (written before 0.3.0) stays beside its replacement and
-keeps its file referenced, so a sweep never finds that file: delete such rows (and their files)
-yourself.
+**The module never deletes old files.** Clean them up in an `onPreviewReplaced` observer, which gets
+each row a write of `generate()` or the worker removed, so it can delete `row.storageRef`; from that
+log line; or with a sweep that deletes objects under the `previews/` prefix (below a ref's
+`namespace`) that no row references. Leave out every `original.storageRef`: an adopted public
+original sits in the same bucket, and no preview row references it. A crash right after the write
+loses the observer's call, so keep the sweep if every file must go. A response or a cached page
+built before the write still names the old URL, so delete after your longest cache time if that
+matters. The observer does not fire for `invalidate()`, which returns its refs, or for
+`persist: false`. A removed row can be a copy another worker stored meanwhile; its file is just as
+unreferenced. The shipped drivers give every preview a new key. A driver that names files by their
+bytes gets no report when a new row keeps the old ref, but two size keys with equal bytes can share
+a ref, and the tap gets no media id: such a driver should use the sweep, which sees every row. The
+same goes for that log line, which still names a ref a new row kept. A row without an `identity`
+(written before 0.3.0) stays beside its replacement and keeps its file referenced, so a sweep never
+finds that file: delete such rows (and their files) yourself.
 
 **A media without stored dimensions** (`original.width` and `original.height` must both be numbers;
 a stored `null` counts as missing) has no row the read path can prove fresh, since it cannot

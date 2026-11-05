@@ -7,15 +7,15 @@
 // once on that raster, which is then reduced to the box of the plan made from their result; each
 // exact size is resized once and each format encoded from it, then uploaded (bounded by
 // config.concurrency); one PreviewRecorder persist appends the new rows and replaces the stale ones
-// in one write each, and onPreviewGenerated fires over the rows it kept. The sizes come from the
-// pure plan (plan.ts), the pixel work from render.ts, and a source kind needs only a decoder: the
-// Processor itself imports no image engine. It also fires the task observers, and invalidate()
-// removes stored previews for `resizer.invalidate` (one media store write). It takes no locks: the
-// queue leases a task to one worker at a time, the lease token fences the task's writes, and the
-// media store keeps one row per preview identity when an expired lease lets two workers render the
-// same variant. Each variant is timed from its encode to the end
-// of its upload and recorded on the metrics sink once the persist says what became of it. It takes
-// its parts explicitly and knows no Resizer.
+// in one write each, onPreviewGenerated fires over the rows it kept, and onPreviewReplaced over the
+// rows it removed. The sizes come from the pure plan (plan.ts), the pixel work from render.ts, and a
+// source kind needs only a decoder: the Processor itself imports no image engine. It also fires the
+// task observers, and invalidate() removes stored previews for `resizer.invalidate` (one media store
+// write). It takes no locks: the queue leases a task to one worker at a time, the lease token fences
+// the task's writes, and the media store keeps one row per preview identity when an expired lease
+// lets two workers render the same variant. Each variant is timed from its encode to the end of its
+// upload and recorded on the metrics sink once the persist says what became of it. It takes its
+// parts explicitly and knows no Resizer.
 import type { Catalog } from './catalog.ts';
 import type {
   DecodeBox,
@@ -58,6 +58,7 @@ import {
 } from './plan.ts';
 import {
   checkReplaced,
+  describeRef,
   PreviewRecorder,
   type RowNotKept,
   requireReplacePreviews,
@@ -588,8 +589,8 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 
 // ---------------------------------------------------------------------------
 // The shared core. Both modes expand their inputs into a `requested` MissingPreview[] and call
-// #renderPending. `persist` toggles the single appendPreviews + onPreviewGenerated firing
-// (eager `persist:false` returns raw).
+// #renderPending. `persist` toggles the single appendPreviews + the onPreviewGenerated and
+// onPreviewReplaced firing (eager `persist:false` returns raw).
 // ---------------------------------------------------------------------------
 
 interface RenderPendingArgs {
@@ -611,8 +612,9 @@ interface RenderPendingResult {
   // identity: its answer can already lack the field it lost.
   written: Preview[];
   failedCount: number;
-  // The stored rows the persist replaced (outdated, or a concurrent row of the same identity), and
-  // the identities of the stored previews that replaced them.
+  // The stored rows the persist replaced (outdated, or a concurrent row of the same identity), but
+  // not one whose ref a row of this write holds, and the identities of the stored previews that
+  // replaced them.
   removed: Preview[];
   replaced: Set<string>;
   // What each failed variant failed with, by identity, in the order they failed.
@@ -1497,7 +1499,8 @@ export class Processor {
 
     // ONE persist for everything generated: one append of the new rows (+ display-dim backfill
     // when the original never carried dims) and one replace of the stale ones
-    // (previewRecorder.ts), then fire onPreviewGenerated per stored preview (ctx {}).
+    // (previewRecorder.ts), then fire onPreviewGenerated per stored preview and onPreviewReplaced
+    // per removed row (ctx {}).
     if (persist && (generated.length > 0 || backfillDims)) {
       const recorded = await this.#recorder.record(mediaId, scope, generated, {
         backfillDims,
@@ -1530,7 +1533,6 @@ export class Processor {
         throw error;
       }
       generated = recorded.stored;
-      removed = recorded.removed;
       for (const row of generated) {
         const identity = catalog.identity(scope, row);
         if (replacing.has(identity)) {
@@ -1564,8 +1566,16 @@ export class Processor {
           recordVariant(plan.identity, plan.variant.format, ms, 'failed');
         }
       }
+      // A driver that names a file by its bytes can give a new row the ref of the row it replaced:
+      // that file is in use, so it is not reported to a host that deletes what it is told is gone.
+      // A row the store left out of its answer counts: the store may hold it all the same.
+      const live = new Set([...generated, ...leftOut].map(describeRef));
+      removed = recorded.removed.filter((row) => !live.has(describeRef(row)));
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
+      }
+      for (const row of removed) {
+        await hooks.runObservers('onPreviewReplaced', row, {});
       }
     } else if (!persist) {
       for (const { plan, row } of rendered) {

@@ -165,9 +165,14 @@
   `RESIZE_ADOPT_MAX_BYTES_INVALID`.
 - `formatPictureUrls` entries carry `width` and `height` when the row has them, since a size key
   does not promise a size. A host that snapshots its API JSON sees two new fields.
+- `onPreviewReplaced(row, ctx)`: an observer that gets each row a write of `generate()` or the worker
+  removed, so a host can delete old files without parsing a log line. The event bus receives it as
+  `resize:onPreviewReplaced`. The log line stays.
 
 **Fixes**
 
+- `GenerateResult.replaced` no longer names a ref a new row of the same write holds again: on a
+  driver that names files by their bytes, a host deleting those refs deleted a file in use.
 - A row `MongoMediaStore.replacePreviews` writes stores an `_id` exactly when an appended row would,
   unless working it out fails, so it reads the same id on every load. A row replaced under 0.3.0 has
   none stored and reads a new random one on each load until it is next replaced: nothing migrates it,

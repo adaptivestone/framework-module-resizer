@@ -209,8 +209,9 @@ export default {
    - Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are stale: each is served
      until its replacement is stored, and regenerated on its next read, `prewarm()` or
      `generate()`. The old files stay in storage, since the module never deletes them: plan the
-     storage cost and clean them up (from the "resize: replaced … outdated preview(s)" log line, or
-     with a sweep of preview objects no row references; see "Freshness" in `README.md`).
+     storage cost and clean them up (in an `onPreviewReplaced` observer, from the "resize: replaced
+     … outdated preview(s)" log line, or with a sweep of preview objects no row references; see
+     "Freshness" in `README.md`).
    - The same holds after any change of image settings or of a pipeline `version`. That
      regeneration wave shares the queue with new uploads' previews: plan worker capacity for it.
    - Roll out image settings and pipeline versions to every worker at once (or after the old
@@ -456,8 +457,9 @@ from another original, with other image settings or pipeline `version`, or befor
 regenerate on their next read. So, for a host on an earlier rc:
 
 - plan worker capacity and storage for that wave, which shares the queue with new uploads;
-- clean up the old files, which the module never deletes (from the "resize: replaced …
-  outdated preview(s)" log line, or with a sweep of preview objects no row references);
+- clean up the old files, which the module never deletes (in an `onPreviewReplaced` observer, from
+  the "resize: replaced … outdated preview(s)" log line, or with a sweep of preview objects no row
+  references);
 - roll out image settings and pipeline versions with every worker at once (or after the old
   workers have stopped): two worker versions with different settings re-make each other's rows,
   and each replaced preview costs one render, one upload and one orphaned file;

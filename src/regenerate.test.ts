@@ -14,7 +14,11 @@ import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
 import type { ResizeError } from './errors.ts';
 import { getPreviewIdentity, previewScope } from './images.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import {
+  Resizer,
+  type ResizerOptions,
+  resetResizerForTests,
+} from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
   docMedia,
@@ -2176,3 +2180,407 @@ test('generate() reads nothing back: a store that loses encodeSig does not fail 
 
   assert.equal(created.length, 1);
 });
+
+/** Media m1 with its row stored under quality 80, and a redeploy with other settings to come. */
+async function storedThenChanged() {
+  const w = world();
+  const doc = await w.seed(w.resizer(webpConfig(80)));
+  const [old] = rowsOf(doc);
+  resetResizerForTests();
+  return { w, doc, old };
+}
+
+/** A Resizer with the new settings over the world's store, with its own replacePreviews. */
+function replacingWith(
+  w: ReturnType<typeof world>,
+  replacePreviews: MediaStore['replacePreviews'],
+  opts: Partial<ResizerOptions> = {},
+): Resizer {
+  return new Resizer({
+    config: webpConfig(70),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    tasks: w.tasks,
+    media: fakeMedia({
+      load: (id) => w.store.loadMedia(id),
+      appendPreviews: (id, rows, dims) =>
+        w.store.appendPreviews(id, rows, dims),
+      replacePreviews,
+    }),
+    ...opts,
+  });
+}
+
+test('the worker replacing a stale row fires onPreviewReplaced once, with the removed row and ctx {}, after onPreviewGenerated', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const r = w.resizer(webpConfig(70));
+  const order: string[] = [];
+  const calls: { row: Preview; ctx: Record<string, unknown> }[] = [];
+  r.hook('onPreviewGenerated', () => {
+    order.push('generated');
+  });
+  r.hook('onPreviewReplaced', (row, ctx) => {
+    order.push('replaced');
+    calls.push({ row, ctx });
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(order, ['generated', 'replaced']);
+  assert.deepEqual(calls[0].row.storageRef, old.storageRef);
+  assert.equal(calls[0].row.identity, old.identity);
+  assert.deepEqual(calls[0].ctx, {});
+  assert.notDeepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
+});
+
+test('generate() fires onPreviewReplaced too, for the refs its result names as replaced', async () => {
+  const { w, doc } = await storedThenChanged();
+  const r = w.resizer(webpConfig(70));
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  const { replaced } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(fired.length, 1);
+  assert.deepEqual(replaced, [fired[0].storageRef]);
+});
+
+test('onPreviewReplaced stays silent when no write removed a row: a first render, persist: false, invalidate()', async () => {
+  const w = world();
+  const fired: Preview[] = [];
+  const first = w.resizer(webpConfig(80));
+  first.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(first);
+  resetResizerForTests();
+  const later = w.resizer(webpConfig(70));
+  later.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await later.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+    persist: false,
+  });
+  const refs = await later.invalidate({ media: structuredClone(doc) });
+
+  assert.equal(refs.length, 1);
+  assert.deepEqual(fired, []);
+});
+
+test('a tap that throws costs nothing: the next tap runs, the task completes, and the failure is logged', async () => {
+  const { w, doc } = await storedThenChanged();
+  const { logger, lines } = recordingLogger();
+  const r = w.resizer(webpConfig(70), logger);
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', () => {
+    throw new Error('the host could not delete it');
+  });
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.equal(fired.length, 1);
+  assert.deepEqual(statuses(w).at(-1), ['completed', 1]);
+  assert.equal(
+    lines('error', /resize hook onPreviewReplaced failed/).length,
+    1,
+  );
+});
+
+test('every row the write removed is reported, also a copy another worker stored meanwhile', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const copy: Preview = { ...old, storageRef: { key: 'their-copy' } };
+  const r = replacingWith(w, async (id, identities, rows) => {
+    const result = await w.store.replacePreviews(id, identities, rows);
+    return { ...result, removed: [...result.removed, copy] };
+  });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(
+    fired.map((row) => row.storageRef),
+    [old.storageRef, copy.storageRef],
+  );
+});
+
+test('a rejected replace fires nothing: no row was removed', async () => {
+  const { w, doc } = await storedThenChanged();
+  const r = replacingWith(w, async () => {
+    throw new Error('the database is down');
+  });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await assert.rejects(
+    r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    }),
+    /the database is down/,
+  );
+  assert.deepEqual(fired, []);
+});
+
+test('the event bus receives resize:onPreviewReplaced with the removed row', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const emitted: unknown[][] = [];
+  const r = replacingWith(
+    w,
+    (id, identities, rows) => w.store.replacePreviews(id, identities, rows),
+    {
+      events: {
+        emit: (...args: unknown[]) => {
+          emitted.push(args);
+        },
+      },
+    },
+  );
+
+  await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  const event = emitted.find(([name]) => name === 'resize:onPreviewReplaced');
+  assert.ok(event);
+  assert.deepEqual((event[1] as Preview).storageRef, old.storageRef);
+});
+
+test('a replacement that keeps the ref of the row it replaced is not reported: that file is in use', async () => {
+  const w = world();
+  contentAddressed(w);
+  const pipeline: Pipeline = {};
+  const r = w.resizer(webpConfig(80), undefined, { default: pipeline });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(r);
+  pipeline.version = 'v2';
+
+  const media = structuredClone(doc);
+  const { created, replaced } = await r.generate({
+    media,
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(created.length, 1);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+  assert.equal(rowsOf(doc).length, 1);
+  // The swap in the caller's media goes by identity, so it still happens.
+  assert.deepEqual(
+    rowsOf(media).map((row) => row.encodeSig),
+    [created[0].encodeSig],
+  );
+});
+
+test('a ref another size key still holds, outside the write, is reported: seeing it needs a read, so such a driver uses the sweep', async () => {
+  const w = world();
+  contentAddressed(w);
+  const first = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, first);
+  await first.generate({
+    media: structuredClone(doc),
+    sizes: twoBoxes,
+    formats: ['webp'],
+  });
+  const [kept, other] = doc.previews ?? [];
+  assert.deepEqual(kept.storageRef, other.storageRef);
+  resetResizerForTests();
+  const r = w.resizer(webpConfig(70));
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await r.generate({
+    media: structuredClone(doc),
+    sizes: [twoBoxes[0]],
+    formats: ['webp'],
+  });
+
+  assert.deepEqual(
+    fired.map((row) => row.storageRef),
+    [kept.storageRef],
+  );
+  assert.ok(
+    doc.previews?.some(
+      (row) => keyOf(row) === (kept.storageRef as { key: string }).key,
+    ),
+  );
+});
+
+test('a store that holds the new row but leaves it out of its answer: a ref that row keeps is not reported', async () => {
+  const w = world();
+  contentAddressed(w);
+  const pipeline: Pipeline = {};
+  const r = new Resizer({
+    config: webpConfig(80),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    tasks: w.tasks,
+    pipelines: { default: pipeline },
+    media: fakeMedia({
+      load: (id) => w.store.loadMedia(id),
+      appendPreviews: (id, rows, dims) =>
+        w.store.appendPreviews(id, rows, dims),
+      replacePreviews: async (id, identities, rows) => ({
+        ...(await w.store.replacePreviews(id, identities, rows)),
+        stored: [],
+      }),
+    }),
+  });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(r);
+  const [old] = rowsOf(doc);
+  pipeline.version = 'v2';
+
+  const { created, replaced } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.deepEqual(created, []);
+  assert.deepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
+  assert.notEqual(rowsOf(doc)[0].encodeSig, old.encodeSig);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+});
+
+test('generate() that goes on to throw has still reported what its write removed', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const r = replacingWith(
+    w,
+    async (id, identities, rows) => ({
+      ...(await w.store.replacePreviews(id, identities, rows)),
+      stored: [],
+    }),
+    {
+      pipelines: {
+        default: {
+          variantSteps: [
+            async (img) => {
+              const { width } = await img.metadata();
+              if (width === 30) {
+                throw new Error('this size cannot be made');
+              }
+              return img;
+            },
+          ],
+        },
+      },
+    },
+  );
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await assert.rejects(
+    r.generate({
+      media: structuredClone(doc),
+      sizes: [...cell, { width: 30, height: 30 }],
+      formats: ['webp'],
+    }),
+    { name: 'ResizeGenerateError' },
+  );
+
+  assert.deepEqual(
+    fired.map((row) => row.storageRef),
+    [old.storageRef],
+  );
+});
+
+for (const [name, row] of Object.entries({
+  'a ref that cannot be read': {
+    get storageRef(): never {
+      throw new Error('a ref that cannot be read');
+    },
+  },
+  'no row at all': null,
+})) {
+  test(`a removed row that is ${name}: the observer gets it, and the task keeps its result`, async () => {
+    const { w, doc } = await storedThenChanged();
+    const { logger, logs } = recordingLogger();
+    const r = replacingWith(
+      w,
+      async (id, identities, rows) => {
+        const result = await w.store.replacePreviews(id, identities, rows);
+        return {
+          ...result,
+          removed: [...result.removed, row as unknown as Preview],
+        };
+      },
+      { logger },
+    );
+    let calls = 0;
+    r.hook('onPreviewReplaced', () => {
+      calls += 1;
+    });
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    assert.equal(calls, 2);
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    assert.deepEqual(logs.error, []);
+  });
+}
+
+// No observer is protected against a tap that never settles: the worker's task timeout is the
+// bound, the work is already stored, and the next delivery finds it fresh and fires nothing.
+for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
+  test(`a ${hook} tap that never settles costs one task timeout, and the next delivery completes`, async () => {
+    const w = world({ timing: { taskTimeoutMs: 500 } });
+    const doc = await w.seed(w.resizer(webpConfig(80)));
+    const [old] = rowsOf(doc);
+    resetResizerForTests();
+    const r = w.resizer(webpConfig(70));
+    let calls = 0;
+    r.hook(hook, () => {
+      calls += 1;
+      return new Promise<never>(() => {});
+    });
+    const failed: unknown[] = [];
+    r.hook('onTaskFailed', (_task, err) => {
+      failed.push((err as ResizeError).code);
+    });
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    assert.equal(calls, 1);
+    assert.deepEqual(failed, ['RESIZE_TASK_TIMEOUT']);
+    assert.deepEqual(statuses(w), [['completed', 2]]);
+    assert.notDeepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
+  });
+}

@@ -15,6 +15,7 @@ export type WaterfallName =
   | 'formatPublicUrls';
 export type ObserverName =
   | 'onPreviewGenerated'
+  | 'onPreviewReplaced'
   | 'afterTaskComplete'
   | 'onTaskFailed'
   | 'onTaskDeadLettered';
@@ -40,6 +41,12 @@ export interface HookSignatures {
   ) => unknown | Promise<unknown>;
   onPreviewGenerated: (
     preview: Preview,
+    ctx: Record<string, unknown>,
+  ) => unknown;
+  // A row a write removed. The module does not delete that row's file, so a host can delete
+  // `removed.storageRef`.
+  onPreviewReplaced: (
+    removed: Preview,
     ctx: Record<string, unknown>,
   ) => unknown;
   afterTaskComplete: (

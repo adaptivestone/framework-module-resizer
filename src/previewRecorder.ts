@@ -9,9 +9,9 @@
 // the result's `failure`, beside what the store kept before it failed (an earlier write of the
 // same persist, or the part a failed append stored), so the caller can tell which variants were
 // stored before it rethrows. It renders nothing and fires no observer: the Processor fires
-// onPreviewGenerated over the rows it returns. rowsNotKept() and rowsWithoutIdentity() are the
-// worker's later check that the rows a reload holds under each written storageRef are the rows that
-// were written.
+// onPreviewGenerated over the rows it returns, and onPreviewReplaced over those it removed.
+// rowsNotKept() and rowsWithoutIdentity() are the worker's later check that the rows a reload holds
+// under each written storageRef are the rows that were written.
 import type { Catalog } from './catalog.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import { ResizeSetupError } from './errors.ts';
@@ -26,9 +26,10 @@ import type {
 
 /**
  * One uploaded locator for a log line; an opaque ref that JSON cannot encode is still named. A ref
- * is host data: when it cannot be printed either, the line must still be written.
+ * is host data: when it cannot be printed either, the line must still be written. Refs are compared
+ * by it too: two that read the same count as one file, so a file is never reported gone by mistake.
  */
-function describeRef(preview: Preview): string {
+export function describeRef(preview: Preview): string {
   try {
     return JSON.stringify(preview.storageRef) ?? String(preview.storageRef);
   } catch {
