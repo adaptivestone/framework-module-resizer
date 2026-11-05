@@ -614,3 +614,29 @@ test('## Config reference ends inside what npm shows of the README', () => {
   assert.ok(readme.indexOf('\n## Config reference\n') < drivers);
   assert.ok(drivers < 65536, `## Config reference ends at ${drivers}`);
 });
+
+test('the README says which text matches the installed version, and what a small source gets', () => {
+  const readme = read('README.md').replace(/\s+/g, ' ');
+  for (const needle of [
+    'The guide and GitHub show the newest release; this file matches the version you have installed.',
+    '| `WxH` | Larger than the box on one side only | Exactly `WxH`, cropped, the short side enlarged |',
+    '`80×80` for `80x80`',
+    '`620×372` for `{ width: 620 }`',
+  ]) {
+    assert.ok(readme.includes(needle), needle);
+  }
+});
+
+test('the not-started row says what a function needs, with an explicit stopBeforeTimeoutMs too', () => {
+  const row = readmeSection('## Push delivery (preview)')
+    .split('\n')
+    .find((line) => line.startsWith('| `the first record … was not started`'));
+  assert.ok(row, 'no row');
+  for (const needle of [
+    "plus the slowest task's time",
+    '`stopBeforeTimeoutMs`',
+    'lower that',
+  ]) {
+    assert.ok(row.includes(needle), needle);
+  }
+});

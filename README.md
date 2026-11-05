@@ -7,6 +7,7 @@ driver, and turns the record on your media document into image URLs.
 
 - **Guide:** [framework.adaptivestone.com/docs/resize](https://framework.adaptivestone.com/docs/resize)
   covers setup, workflows, pipelines, security and troubleshooting.
+- The guide and GitHub show the newest release; this file matches the version you have installed.
 - **Coding agents:** read [`AGENTS.md`](./AGENTS.md), the integration guide shipped with this package.
 - **Upgrading:** before you upgrade, read
   [`UPGRADING.md`](https://github.com/adaptivestone/framework-module-resizer/blob/main/UPGRADING.md):
@@ -84,7 +85,9 @@ The framework serves no static files: serve exactly `./var/media` at `publicBase
 [Serve local files](https://framework.adaptivestone.com/docs/resize#serve-local-files)), and set
 `RESIZE_PUBLIC_BASE_URL` in every deployed environment. In the run that writes this config, the
 scaffold also appends `/var/` to `.gitignore`, because private originals must never reach version
-control.
+control. It skips that when a rule for it is already there, and `--check` never writes. A file it
+cannot write stops the run with exit 1, naming what failed; when that is `.gitignore`, no config is
+written, so the re-run retries. A `!` line for `var` beside a host's rule stays, and gets a warning.
 
 ```ts
 // src/resizer.ts — behaviour only; the drivers come from the config file
@@ -143,7 +146,20 @@ const picture = formatPictureUrls(decision, { id: String(file.id) });
 
 `formatPictureUrls` maps each size key and format to `{ url, contentType }`. Its entries also carry
 `width` and `height`, the preview's real size, when the row has them: a size key does not promise a
-size, since a preview can be smaller than its box.
+size, since a preview can be smaller than its box, or larger than the source:
+
+| Size | Source | Result |
+|---|---|---|
+| `WxH` | Raster, fits inside the box on both sides | Its own size: not enlarged, not cropped |
+| `WxH` | Larger than the box on one side only | Exactly `WxH`, cropped, the short side enlarged |
+| `WxH` | Larger on both sides | Exactly `WxH`, cropped |
+| `{ width }` or `{ height }` | Any | That side exactly, aspect kept: enlarged when the source is smaller on that side |
+| `{ fit: true }` | Any | Inside `maxSize`, never enlarged |
+
+For example, a `100×60` raster source gives `100×60` for `160x160`, `80×80` for `80x80`, `200×40`
+for `200x40` and `620×372` for `{ width: 620 }`. A pipeline with `variantSteps` always gets the full
+box, and so does an SVG: a `100×60` SVG gives `160×160` for `160x160`. Only `limits.resultDimension`
+scales a raster that fits down further.
 
 `generate()` stores the new rows itself and also appends them to `file.previews`, so a
 same-request `resolve()` sees them. Reload the media before saving it after `generate()` or
@@ -739,6 +755,8 @@ Without the framework, buckets, URLs and queue URLs are driver options. Removed 
 
 ### Coordination
 
+`coordination: null` is invalid, not the defaults; a missing section or value takes the defaults.
+
 A Resizer with a task queue keeps one **gate** per Resizer, media, pipeline and queue: at most
 one of their tasks is active at a time, whether it is queued, running, waiting for a retry, or
 cooling down after a dead-letter. While the gate is held, a read that finds variants missing
@@ -1298,6 +1316,20 @@ export default {
 `ResizerConfig<D>` is the same for `createResizer`: a section of a driver that is not registered,
 or a key of the wrong type, does not compile.
 
+### Stored originals: SVG and `namespace`
+
+`uploadOriginal()` stores the bytes unchanged. The format and dimensions come from the decoders'
+`inspect` (Sharp's metadata for raster images and SVG). SVG stays `.svg` (`image/svg+xml`) as a
+private original, and is an input format only. Its size comes from Sharp, including one derived from
+`viewBox`; a fractional natural size is stored rounded, at least 1 px a side; unreadable or unsized
+SVG is rejected. The module does not sanitize SVG markup. It renders an SVG once per task, before any
+pipeline step, in a separate Node process, at the largest size the requested previews need (with
+`beforeSteps`, at least its natural size). Steps get the rendered pixels, never markup.
+
+`namespace` is a placement hint, not authorization. Previews inherit it, so it appears in their
+public URLs: put nothing in it you would not publish, such as a user id. Set it at upload and keep
+it: it is part of `storageRef`.
+
 ### Decoders
 
 A decoder turns the stored bytes of one source kind into pixels: `uploadOriginal()` measures an
@@ -1763,7 +1795,8 @@ a lean read removes every row without a stored `_id`. Keying rows by `identity` 
 
 An SQS-triggered Lambda can run queued tasks instead of a worker process, with the same lease,
 retries, dead-letters and gate. **It has not run on real AWS.** Everything here was measured on one
-machine, with local stand-ins and a model, so it stays a preview until the check list in `RELEASE.md`
+machine, with local stand-ins and a model, so it stays a preview until the
+[check list](https://github.com/adaptivestone/framework-module-resizer/blob/main/RELEASE.md#push-delivery-needs-an-aws-account)
 passes. A long-lived worker is the simpler choice when a host already runs one. Only the SQS driver
 takes pushed messages, on standard queues: FIFO queues are not supported, since the driver sends no
 `MessageGroupId` and a record after a failed one still runs. The walkthrough, with a whole handler, is
@@ -1872,7 +1905,7 @@ Only `completed`, `dead` and a malformed message moved aside are left out of `ba
 
 No metric says a record was not started: `resize.claim` records 0, and no `resize.task` follows. So the time a short function gets before its tasks die needs a log-based alarm, on the `was not started` `error` line. Past `maxAttempts`, `resize.task` reads `outcome: 'dead'`, `code: 'RESIZE_TASK_MAX_ATTEMPTS'`.
 
-An outage or a bad deploy costs healthy tasks. A start check that rejects, or an import that fails, runs no task and makes no queue call, yet Lambda counts the invocation as failed, so it uses a receive of each record in it, and each comes back after the queue's visibility timeout. At a 300 s function, a visibility timeout of 1800 s and `maxReceiveCount` 7, with Mongo down or a wrong DSN: past about 2 h the first delivery after the fix is dead unrun, with `RESIZE_TASK_MAX_ATTEMPTS`, and past about 3 h SQS moves the message, with no module line, hook or cooldown. The dead-letter queue keeps a copy and a later read queues the media again, but a media only `prewarm()` queues stays without previews. So during a known outage disable the trigger, with `aws lambda update-event-source-mapping --uuid <UUID> --no-enabled`: Lambda stops polling, and the messages wait, up to the queue's retention. Afterwards call `prewarm()` again for what the dead-letter queue holds, whose bodies name each `mediaId` and `pipeline`. AWS's pages say a redrive makes each message a new one, with a new message ID, enqueue time and retention period; they do not state its receive count, which `attempts` reads, so a redrive stays on the check list (C19 in `RELEASE.md`), and `prewarm()` is the way until it passes.
+An outage or a bad deploy costs healthy tasks. A start check that rejects, or an import that fails, runs no task and makes no queue call, yet Lambda counts the invocation as failed, so it uses a receive of each record in it, and each comes back after the queue's visibility timeout. At a 300 s function, a visibility timeout of 1800 s and `maxReceiveCount` 7, with Mongo down or a wrong DSN: past about 2 h the first delivery after the fix is dead unrun, with `RESIZE_TASK_MAX_ATTEMPTS`, and past about 3 h SQS moves the message, with no module line, hook or cooldown. The dead-letter queue keeps a copy and a later read queues the media again, but a media only `prewarm()` queues stays without previews. So during a known outage disable the trigger, with `aws lambda update-event-source-mapping --uuid <UUID> --no-enabled`: Lambda stops polling, and the messages wait, up to the queue's retention. Afterwards call `prewarm()` again for what the dead-letter queue holds, whose bodies name each `mediaId` and `pipeline`. AWS's pages say a redrive makes each message a new one, with a new message ID, enqueue time and retention period; they do not state its receive count, which `attempts` reads, so a redrive stays on the [check list](https://github.com/adaptivestone/framework-module-resizer/blob/main/RELEASE.md#push-delivery-needs-an-aws-account) (C19), and `prewarm()` is the way until it passes.
 
 ### Stopping in time
 
@@ -1915,7 +1948,7 @@ Measured with `SIGSTOP` on one machine, not on Lambda's freeze: a delivery that 
 | `setting the visibility … failed` | The role lacks `sqs:ChangeMessageVisibility`. The task runs, but a crash waits the whole visibility timeout |
 | Failed tasks disappear | The trigger lacks `ReportBatchItemFailures` |
 | A task in the dead-letter queue with no `is dead` line and no `onTaskDeadLettered` | `maxReceiveCount` is too low, so SQS's redrive ran first, and nothing logs it: set it to `maxAttempts` + 2 |
-| `the first record … was not started` | The function timeout is too small. A task needs the time the line names just to start, plus the slowest task's time: start at 300 s, as a function just past that line's time stores no row for a task that does not fit (see [Stopping in time](#stopping-in-time)) |
+| `the first record … was not started` | The function timeout is too small. A task needs the time the line names just to start, plus the slowest task's time: start at 300 s, as a function just past that line's time stores no row for a task that does not fit (see [Stopping in time](#stopping-in-time)). With an explicit `stopBeforeTimeoutMs` the line names it: lower that, or give the function the time the line names |
 | `message … was not started` (`warn`), or `RESIZE_TASK_MAX_ATTEMPTS` on tasks that never rendered | A batch does not fit: set batch size 1. With batch size 1 already, an outage or a bad deploy used up their receives: see [How a record ends](#how-a-record-ends) |
 | `had not settled` | Raise the function timeout. Raise `stopBeforeTimeoutMs` only from a function of well over 5 s: an explicit reserve starts nothing under `stopBeforeTimeoutMs` + 2 s |
 | `the start checks had not finished` | Every record is listed. The checks start over after a second miss, so ones that need more than two invocations' time never finish, and a hang in a driver given as a function gets no retry — check the connection settings, such as a `serverSelectionTimeoutMS` longer than the function timeout |
@@ -2040,6 +2073,10 @@ await ResizeTask.updateOne(
 ); // a duplicate-key error (11000) means another task for this media, pipeline and queue is active
 ```
 
+- **Preview identity** is `resizer:pipeline:sizeKey:format:filterSig`. Stored previews are separate
+  per Resizer and per pipeline, so different renderings of the same media keep separate rows (rename a
+  pipeline, e.g. `watermark-v2`, to regenerate its images). Rows without `resizer` or `pipeline`
+  belong to `default`.
 - **Preview rows** carry, besides the fields `resolve()` reads, `bytes` (the encoded size),
   `createdAt` (when the row was stored), `origin` (a signature of the original it was made from:
   its storage ref and dimensions) and `encodeSig` (a signature of its format's encode settings,

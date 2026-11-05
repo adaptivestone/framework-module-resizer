@@ -322,6 +322,9 @@ it lists what to change before you run `npm i`.
 - The README has one full error table, `## Error codes`: every code with its `retryable` and what to do.
   A test requires every code in it, and holds the values to the audited table.
 - `## Config reference` moved above `## Drivers` in the README, so it ends inside the 64 KiB npm shows.
+- `AGENTS.md` holds what a new integration needs, at most 5,000 words, from about 16,000. The rest moved
+  to `README.md` and `UPGRADING.md`, one link away. A test keeps it there, and every link between the
+  documents is checked.
 
 **Internal**
 
