@@ -312,7 +312,7 @@ export interface ResizeLimits {
   sourceBytes: number; // default 268_435_456 — largest original a worker or adoptOriginal() reads into memory
   resultDimension: number; // default 5000 — clamp on the cover branch
   animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
-  processingTimeoutSeconds: number; // default 30, at most 3600 — timeout per decode, resize and encode operation, also on a variantStep's rasterToSharp chain
+  processingTimeoutSeconds: number; // default 30, at most 3600 — timeout per decode, resize and encode operation, also on a variantStep's rasterToSharp chain from a raster the module handed over or made from one through sharpToRaster
   failOn: ResizeFailOn; // default 'error' — a source refused at this level is RESIZE_SOURCE_DAMAGED; not signed
 }
 

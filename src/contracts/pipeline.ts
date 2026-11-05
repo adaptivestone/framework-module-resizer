@@ -24,8 +24,10 @@ export type BeforeStep = (
  * (upright, 8-bit sRGB), and resolves with one frame. The raster is the step's own copy, so it may
  * write to it. `variant` carries `filters` and `fit`. `rasterToSharp` / `sharpToRaster` wrap a step
  * written with Sharp, whatever the engine: `async (r) => sharpToRaster(rasterToSharp(r).blur(5))`,
- * and `rasterToSharp` puts `limits.processingTimeoutSeconds` on that chain (its own `.timeout()`
- * replaces it). Other host code in a step is unbounded, and can hold up other tasks.
+ * and `rasterToSharp` puts `limits.processingTimeoutSeconds` on a chain from this raster or one made
+ * from it through `sharpToRaster` (the chain's own `.timeout()` replaces it). Other host code in a
+ * step is unbounded, and can hold up other tasks. After a task stops, the running step goes on to its
+ * end, and the remaining steps and the encode do not run.
  */
 export type VariantStep = (
   raster: Raster,

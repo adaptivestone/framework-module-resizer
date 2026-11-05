@@ -3,7 +3,11 @@
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
 import type { Raster, RasterInfo } from '../contracts/decoder.ts';
 import { ResizeSetupError } from '../errors.ts';
-import { rasterProblem, stepRasterTimeout } from '../helpers/raster.ts';
+import {
+  limitStepRaster,
+  rasterProblem,
+  stepRasterTimeout,
+} from '../helpers/raster.ts';
 
 /** Sharp's raw input options for the raster's pixels, frames stacked top to bottom. */
 function rawOptions(raster: Raster): NonNullable<SharpOptions['raw']> {
@@ -28,11 +32,17 @@ export function rasterInput(raster: Raster): SharpOptions {
   return { raw: rawOptions(raster), limitInputPixels: width * height * frames };
 }
 
+// The limit a chain started with, by Sharp instance (every chain call returns the same one), so
+// `sharpToRaster` can pass it on: a second chain in one step, on the first one's result, starts under
+// the limit too. A chain's own `.timeout()` is not read: it is that chain's alone.
+const chainLimits = new WeakMap<Sharp, number>();
+
 /**
  * Sharp over the raster's pixels, for a Sharp-based step. A value that is not a Raster is
  * refused here, before Sharp reads it as raw bytes of the wrong size. On a raster the core handed to
- * a variantStep the chain starts with `limits.processingTimeoutSeconds`; the chain's own
- * `.timeout()` replaces it, and `.timeout({ seconds: 0 })` turns it off.
+ * a variantStep, or read back from a chain on one through `sharpToRaster`, the chain starts with
+ * `limits.processingTimeoutSeconds`; the chain's own `.timeout()` replaces it, and
+ * `.timeout({ seconds: 0 })` turns it off. A raster the host built, and a fresh `sharp()`, have none.
  */
 export function rasterToSharp(raster: Raster): Sharp {
   const problem = rasterProblem(raster);
@@ -44,7 +54,11 @@ export function rasterToSharp(raster: Raster): Sharp {
   }
   const img = sharp(raster.data, rasterInput(raster));
   const seconds = stepRasterTimeout(raster);
-  return seconds === undefined ? img : img.timeout({ seconds });
+  if (seconds === undefined) {
+    return img;
+  }
+  chainLimits.set(img, seconds);
+  return img.timeout({ seconds });
 }
 
 /**
@@ -141,6 +155,10 @@ export async function sharpToRaster(img: Sharp): Promise<Raster> {
       `resize: a pipeline step must return one frame, not ${raster.info.frames}`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
+  }
+  const seconds = chainLimits.get(img);
+  if (seconds !== undefined) {
+    limitStepRaster(raster, seconds);
   }
   return raster;
 }

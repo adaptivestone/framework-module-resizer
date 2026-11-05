@@ -247,6 +247,27 @@ test("a chained step's input carries the limit too", async () => {
   assert.match(String(warns[0][1]), /timeout/);
 });
 
+test('a second chain in one step keeps the limit', async () => {
+  const { result, warns } = await run(
+    {
+      variantSteps: [
+        async (r) => {
+          const first = await sharpToRaster(rasterToSharp(r).blur(1));
+          return sharpToRaster(rasterToSharp(first).blur(400));
+        },
+      ],
+    },
+    ['webp'],
+    await plain(2000, 1000),
+    {
+      sizes: [{ width: 2000, height: 1000 }],
+      limits: { processingTimeoutSeconds: 1 },
+    },
+  );
+  await assert.rejects(result);
+  assert.match(String(warns[0][1]), /timeout/);
+});
+
 /** An engine of the host's: it records what encode() gets, and writes a marker file. */
 function recordingEngine() {
   const sharpEngine = new SharpEngine();
@@ -452,6 +473,112 @@ test('a healthy task completes beside slow variants: the limit frees the threads
   assert.equal(stored.get('healthy')?.length, 1);
   assert.equal(stored.get('slow')?.length ?? 0, 0);
   assert.equal(slow.attempts, 1);
+});
+
+test('a timed-out task runs no further step and no encode, while a variant past its steps can still store its row', async () => {
+  const tasks = new MemoryTaskQueue({
+    timing: {
+      idlePollMs: 5,
+      taskTimeoutMs: 50,
+      maxAttempts: 1,
+      retryBackoffMs: { base: 60_000, max: 60_000 },
+    },
+  });
+  const stored = new Map<string, Preview[]>();
+  const stepsRun: string[] = [];
+  const encoded: string[] = [];
+  const sharpEngine = new SharpEngine();
+  const uploaded: string[] = [];
+  /** Resolves when the task's signal aborts: the wait outlasts `taskTimeoutMs`. */
+  const aborted = (signal: AbortSignal | undefined) =>
+    new Promise<void>((resolve) => {
+      signal?.addEventListener('abort', () => resolve(), { once: true });
+    });
+  let release: () => void = () => {};
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  new Resizer({
+    config: makeImageConfig({ formats: ['webp'], concurrency: 2 }),
+    logger: silent,
+    storage: {
+      download: async () => plain(40, 20),
+      upload: async ({ key }) => {
+        uploaded.push(key);
+        return { key };
+      },
+      publicUrl: () => '',
+    },
+    media: fakeMedia({
+      load: async (id) => ({
+        id,
+        original: { storageRef: { key: id } },
+        previews: [],
+      }),
+      previews: stored,
+    }),
+    tasks,
+    engine: {
+      id: 'waiting',
+      formats: sharpEngine.formats,
+      animatedFormats: [],
+      resize: (frame, req, opts) => sharpEngine.resize(frame, req, opts),
+      encode: async (raster, req, opts) => {
+        encoded.push(`${raster.info.width}`);
+        // The variant past its steps: its encode is running when the task's timer fires.
+        await aborted(opts.signal);
+        release();
+        return sharpEngine.encode(raster, req, opts);
+      },
+    },
+    pipelines: {
+      default: {
+        variantSteps: [
+          async (r, { variant }) => {
+            stepsRun.push(`${variant.sizeKey} first`);
+            if (variant.sizeKey === '20x10') {
+              await released;
+            }
+            return r;
+          },
+          (r, { variant }) => {
+            stepsRun.push(`${variant.sizeKey} second`);
+            return r;
+          },
+        ],
+      },
+    },
+  });
+  const webp = (width: number, height: number) => ({
+    sizeKey: `${width}x${height}`,
+    format: 'webp',
+    requestedWidth: width,
+    requestedHeight: height,
+  });
+  await tasks.add({
+    resizer: 'default',
+    queue: 'default',
+    mediaId: 'm1',
+    pipeline: 'default',
+    previews: [webp(30, 15), webp(20, 10)],
+  });
+  const [row] = tasks.rows;
+  await workUntil(
+    { logger: silent },
+    () => row.status === 'dead' && (stored.get('m1')?.length ?? 0) === 1,
+  );
+  // The stopped variant's second step never ran.
+  assert.deepEqual(stepsRun.sort(), [
+    '20x10 first',
+    '30x15 first',
+    '30x15 second',
+  ]);
+  assert.deepEqual(encoded, ['30']);
+  assert.equal(uploaded.length, 1);
+  assert.deepEqual(
+    stored.get('m1')?.map((preview) => preview.sizeKey),
+    ['30x15'],
+  );
 });
 
 /** A 200×100 source with smooth colours, whose columns take their alpha from `alpha`. */

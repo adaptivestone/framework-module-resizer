@@ -5,7 +5,12 @@ import { test } from 'node:test';
 import sharp from 'sharp';
 import type { Raster } from '../contracts/decoder.ts';
 import { ResizeError } from '../errors.ts';
-import { checkRaster, rasterProblem } from '../helpers/raster.ts';
+import {
+  checkRaster,
+  limitStepRaster,
+  rasterProblem,
+  stepRasterTimeout,
+} from '../helpers/raster.ts';
 import { rasterToSharp, readRaster, sharpToRaster } from './sharpRaster.ts';
 
 /** A raster of one solid colour (one value per channel). */
@@ -82,6 +87,36 @@ test('rasterToSharp and sharpToRaster round-trip the pixels', async () => {
   const grey = await sharpToRaster(rasterToSharp(solid(4, 4, [128])));
   assert.equal(grey.info.channels, 3);
   assert.equal(grey.data.length, 4 * 4 * 3);
+});
+
+test('a raster read back from a limited chain carries the limit, and only that one', async () => {
+  const handed = solid(4, 2, [10, 20, 30]);
+  limitStepRaster(handed, 7);
+  const next = await sharpToRaster(rasterToSharp(handed).blur(1));
+  assert.equal(stepRasterTimeout(next), 7);
+  // On and on: the next chain starts with the limit, and so does what it reads back.
+  assert.equal(
+    stepRasterTimeout(await sharpToRaster(rasterToSharp(next).blur(1))),
+    7,
+  );
+  // A chain's own timeout is that chain's: the next one starts with the limit again.
+  assert.equal(
+    stepRasterTimeout(
+      await sharpToRaster(rasterToSharp(handed).timeout({ seconds: 0 })),
+    ),
+    7,
+  );
+  // The host's own raster, a fresh sharp(), and a raster no limit was put on: none.
+  const unlimited = [
+    rasterToSharp({ ...handed }),
+    sharp(handed.data, {
+      raw: { width: 4, height: 2, channels: 3 },
+    }),
+    rasterToSharp(solid(4, 2, [10, 20, 30])),
+  ];
+  for (const img of unlimited) {
+    assert.equal(stepRasterTimeout(await sharpToRaster(img)), undefined);
+  }
 });
 
 test('sharpToRaster never forwards the premultiplied flag', async () => {

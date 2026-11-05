@@ -10,7 +10,8 @@ const isPositiveInteger = (n: unknown): n is number =>
 // chain in a step stays under `limits.processingTimeoutSeconds` as it did when the step was one
 // chain with the encode: a stuck chain holds a libuv thread, and other tasks then wait behind it. It
 // lives beside the object, not on it, so the `Raster` shape stays what a host and an engine see: a
-// raster spread into a new object is the host's own, and has no limit.
+// raster spread into a new object is the host's own, and has no limit. It is this copy's map, so a
+// `rasterToSharp` from a duplicate copy of the package reads none, with no error.
 const stepTimeouts = new WeakMap<Raster, number>();
 
 /** Marks a raster the core hands to a step: `rasterToSharp` puts this limit on its chain. */

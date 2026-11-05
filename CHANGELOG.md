@@ -219,11 +219,20 @@
 - Sharp work in a `variantStep` that does not go through `rasterToSharp`
   (`sharp(raster.data, { raw: raster.info })`, or a raster spread into a new object), and any other
   host code in a step, is unbounded. In 0.3.0 a step's Sharp work was one chain with the encode, under
-  `limits.processingTimeoutSeconds`. A `rasterToSharp` chain stays under the limit, with the encode
-  after it under its own; its own `.timeout({ seconds })` replaces the limit, and
-  `.timeout({ seconds: 0 })` turns it off. Unbounded work can starve other tasks and dead-letter
-  healthy ones, because stuck Sharp calls hold libuv's threads, and a timed-out delivery keeps its
-  memory until the step ends.
+  `limits.processingTimeoutSeconds`. A `rasterToSharp` chain, from a raster the module handed over or
+  made from one through `sharpToRaster`, stays under the limit, with the encode after it under its
+  own, so a variant holds a thread for at most (chains + 1) × the limit; its own
+  `.timeout({ seconds })` replaces the limit, and `.timeout({ seconds: 0 })` turns it off. Unbounded
+  work can starve other tasks and dead-letter healthy ones, because stuck Sharp calls hold libuv's
+  threads, and a timed-out delivery keeps its memory until the running step ends.
+- When a task stops (its `taskTimeoutMs`, a lost lease, a stopping worker), a variant's remaining steps
+  and its encode no longer run, and its warning names `RESIZE_TASK_ABORTED`. A variant already past its
+  steps goes on and can still store its row. A running step is not interrupted.
+- A step that resolves with Sharp's own `{ data, info }` from `toBuffer({ resolveWithObject: true })`
+  no longer has its colours shifted: after a resize Sharp's `premultiplied` flag is true on straight
+  bytes, and the module now ignores that flag on a result whose `info.format` is `'raw'`, on both kinds
+  of step. This also changes new previews of a `beforeStep` that returned it, which shifted colours on
+  0.3.0 too; stored previews stay, so bump that pipeline's `version` to remake them.
 - With `variantSteps`, a worker holds one copy of the size's pixels and the step's result per variant
   in progress, up to `width × height × (channels + 4)` bytes each, up to `concurrency` at once.
   Measured with one `composite` step on a 24 MP JPEG at the default `concurrency` of 4, the process's

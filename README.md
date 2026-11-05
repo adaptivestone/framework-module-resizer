@@ -1020,8 +1020,9 @@ Steps do not change with the engine. Both kinds receive and resolve with a `Rast
 no image library: it reads `raster.info` and `raster.data` (`width × height × channels` bytes, row by
 row, 8-bit sRGB with straight alpha) and resolves with `{ data, info }`. `rasterToSharp` and
 `sharpToRaster` are helpers for a step written with Sharp, and no part of the engine contract: they
-run Sharp, whichever engine the Resizer has. A `rasterToSharp` chain in a `variantStep` keeps its
-limit on any engine. A step on another library has none, so it bounds its own time (see Pipelines).
+run Sharp, whichever engine the Resizer has. A `rasterToSharp` chain in a `variantStep`, from a raster
+the module handed over or made from one through `sharpToRaster`, keeps its limit on any engine. A step
+on another library has none, so it bounds its own time (see Pipelines).
 
 The engine is not part of `encodeSig` and declares no version. Switching engines does not regenerate
 stored previews; bump each pipeline's `version` to do that. An engine that animates a format other
@@ -1056,7 +1057,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain, from a raster the module handed over or made from one through `sharpToRaster`, gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1115,11 +1116,14 @@ must have same dimensions or smaller`). `composite` on an opaque preview returns
 alpha 255, which costs an AVIF about 200 bytes per file, which matters only on very flat images: add
 `.removeAlpha()` when `r.info.channels === 3`.
 
-A `rasterToSharp` chain in a `variantStep` runs under `limits.processingTimeoutSeconds`: past it Sharp
-rejects, and only that variant fails. The limit is per chain, so each step and the encode after it
-get their own. The chain's own `.timeout({ seconds: 60 })` replaces the limit, and
-`.timeout({ seconds: 0 })` turns it off. The limit follows the raster object the module hands to the
-step, so a raster spread into a new object has none.
+A `rasterToSharp` chain in a `variantStep`, from a raster the module handed over or made from one
+through `sharpToRaster`, runs under `limits.processingTimeoutSeconds`: past it Sharp rejects, and only
+that variant fails. Each chain and the encode have their own limit, so the longest a variant holds a
+thread is (chains + 1) × the limit. The chain's own `.timeout({ seconds: 60 })` replaces the limit on
+that chain, and `.timeout({ seconds: 0 })` turns it off there. The limit follows those raster objects,
+so a raster spread into a new object or built by the step has none, and neither has a fresh `sharp()`.
+It does not cross a duplicate copy of the package: `rasterToSharp` from a second copy reads no limit,
+with no error, so dedupe the package.
 
 Nothing else in a step is bounded: Sharp work that does not go through `rasterToSharp`, such as
 `sharp(raster.data, { raw: raster.info })`, and any other host code. `beforeSteps` are unbounded too,
@@ -1127,8 +1131,10 @@ through `rasterToSharp` as well, as in 0.3.0. Such work can starve other tasks a
 ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants beside one healthy task, at
 `taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
 where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not the
-step: a timed-out delivery keeps its memory until the step ends, and can still store the preview.
-`generate()` has no such bound.
+running step, which keeps its thread and memory until it ends. That variant's remaining steps and its
+encode then do not run (`RESIZE_TASK_ABORTED` on its warning). A variant already past its steps goes
+on and can still store its row, and such a late write can replace a newer row, even one from a newer
+original: the next read finds that row stale and queues it again. `generate()` has no such bound.
 
 A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source
 (with `png` added to `encode.flatten.formats`, it writes RGB where 0.3.0 wrote RGBA, with no pixel

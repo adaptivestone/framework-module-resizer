@@ -17,7 +17,7 @@ import type {
   ResizeRequest,
 } from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
-import { ResizeMediaError, ResizeSetupError } from './errors.ts';
+import { ResizeError, ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { limitStepRaster, rasterProblem } from './helpers/raster.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
 import type { MediaLike, ResizeConfig, ResizeLimits } from './types.d.ts';
@@ -94,7 +94,8 @@ export function straightAlpha(raster: Raster): Raster {
   if (channels !== 2 && channels !== 4) {
     return { data: raster.data, info };
   }
-  const data = Buffer.allocUnsafe(raster.data.length);
+  // Off the shared pool: the result is the next step's input, which owns its memory.
+  const data = Buffer.allocUnsafeSlow(raster.data.length);
   const colours = channels - 1;
   for (let i = 0; i < data.length; i += channels) {
     const alpha = raster.data[i + colours];
@@ -151,7 +152,15 @@ function stepResult(
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
-  return value as Raster;
+  const raster = value as Raster;
+  // Sharp's own `{ data, info }` from `toBuffer({ resolveWithObject: true })`: after a resize its
+  // flag says premultiplied on straight bytes (see readRaster). A raster a step built has no
+  // `format`, and its flag is believed.
+  if ((raster.info as { format?: unknown }).format === 'raw') {
+    const { premultiplied: _dropped, ...info } = raster.info;
+    return { data: raster.data, info };
+  }
+  return raster;
 }
 
 /**
@@ -369,16 +378,32 @@ export interface EncodeOptions {
 export type EncodedVariant = EncodedImage;
 
 /**
+ * Past its timeout, its lease or the shutdown, a task's result counts for nothing, so its variants
+ * stop spending threads and memory. What is already past its steps goes on, and the delivery can
+ * still store those rows (see the consumer: media writes are not fenced).
+ */
+function stopIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new ResizeError(
+      'resize: the task stopped, so the remaining steps and the encode of this variant did not run',
+      { code: 'RESIZE_TASK_ABORTED' },
+    );
+  }
+}
+
+/**
  * The variant's steps in order, from its own copy of the sized pixels: other formats share them.
  * The copy gets its own ArrayBuffer: `Buffer.from` would take a small one from Node's shared pool,
  * where a step writing through `data.buffer` reaches the other formats and unrelated Buffers. Each
- * raster handed to a step carries the limit, for `rasterToSharp` to read.
+ * raster handed to a step carries the limit, for `rasterToSharp` to read. A running step cannot be
+ * interrupted, but a stopped task's remaining steps and encode do not run.
  */
 async function runVariantSteps(
   sized: Raster,
   plan: VariantPlan,
   opts: EncodeOptions,
 ): Promise<Raster> {
+  stopIfAborted(opts.signal);
   const data = Buffer.allocUnsafeSlow(sized.data.length);
   sized.data.copy(data);
   let raster: Raster = { data, info: { ...sized.info } };
@@ -395,6 +420,7 @@ async function runVariantSteps(
         'variantStep',
       ),
     );
+    stopIfAborted(opts.signal);
   }
   return raster;
 }

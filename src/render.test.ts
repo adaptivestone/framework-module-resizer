@@ -8,13 +8,14 @@ import type { Raster, SourceInfo } from './contracts/decoder.ts';
 import type {
   EncodedImage,
   EncodeRequest,
+  EngineCallOptions,
   ImageEngine,
   ResizeRequest,
 } from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
 import { SharpEngine } from './engines/sharp.ts';
 import { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
-import { type ResizeError, ResizeSetupError } from './errors.ts';
+import { ResizeError, ResizeSetupError } from './errors.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
 import {
   type EncodeOptions,
@@ -444,6 +445,158 @@ test('a premultiplied variantStep result reaches the engine as straight alpha', 
   );
   assert.equal(seen[0].info.premultiplied, undefined);
   assert.deepEqual(pixelAt(seen[0], 0, 0), [100, 100, 100, 128]);
+});
+
+test("Sharp's own { data, info } from a step is read as straight alpha, on both kinds of step", async () => {
+  const flags: unknown[] = [];
+  const sharpsOwn = async (raster: Raster) => {
+    const out = await rasterToSharp(raster)
+      .resize(10, 5)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    flags.push(out.info.premultiplied);
+    return out as unknown as Raster;
+  };
+  const seen: Raster[] = [];
+  const recording = {
+    id: 'recording',
+    formats: engine.formats,
+    animatedFormats: engine.animatedFormats,
+    resize: engine.resize.bind(engine),
+    encode: (raster: Raster, req: EncodeRequest, opts: EngineCallOptions) => {
+      seen.push(raster);
+      return engine.encode(raster, req, opts);
+    },
+  } as ImageEngine;
+  await encodeVariant(
+    solid(20, 10, [200, 100, 50, 128]),
+    variantPlan(sizePlan(20, 10), 'png'),
+    { ...encodeOptions([sharpsOwn]), engine: recording },
+  );
+  const before = await runBeforeSteps(
+    solid(20, 10, [200, 100, 50, 128]),
+    [sharpsOwn],
+    {
+      media: { id: 'm1' },
+      source: encodeOptions().source,
+      ctx: {},
+    },
+  );
+  // Sharp's flag says premultiplied on these straight bytes: what the core must not believe.
+  assert.deepEqual(flags, [true, true]);
+  for (const raster of [seen[0], before]) {
+    assert.equal(raster.info.premultiplied, undefined);
+    assertNear(pixelAt(raster, 0, 0), [200, 100, 50, 128]);
+  }
+});
+
+test('the flag on a raster a step built itself is still believed', async () => {
+  const marked = (raster: Raster): Raster => ({
+    data: solid(20, 10, [100, 50, 25, 128]).data,
+    info: { ...raster.info, premultiplied: true },
+  });
+  const out = await runBeforeSteps(solid(20, 10, [1, 2, 3, 255]), [marked], {
+    media: { id: 'm1' },
+    source: encodeOptions().source,
+    ctx: {},
+  });
+  assertNear(pixelAt(out, 0, 0), [199, 100, 50, 128]);
+});
+
+test("a chained step's input owns its memory after a result marked premultiplied", async () => {
+  const seen: number[] = [];
+  const chained: VariantStep[] = [
+    (raster) => ({
+      data: Buffer.from(raster.data),
+      info: { ...raster.info, premultiplied: true },
+    }),
+    (raster) => {
+      seen.push(raster.data.buffer.byteLength, raster.data.length);
+      return raster;
+    },
+  ];
+  await encodeVariant(
+    solid(20, 10, [50, 50, 50, 128]),
+    variantPlan(sizePlan(20, 10), 'webp'),
+    encodeOptions(chained),
+  );
+  assert.deepEqual(seen, [800, 800]);
+});
+
+test('an aborted task stops between steps: no later step and no encode', async () => {
+  const controller = new AbortController();
+  const ran: string[] = [];
+  const encodes: Raster[] = [];
+  const recording = {
+    id: 'recording',
+    formats: engine.formats,
+    animatedFormats: engine.animatedFormats,
+    resize: engine.resize.bind(engine),
+    encode: (raster: Raster, req: EncodeRequest, opts: EngineCallOptions) => {
+      encodes.push(raster);
+      return engine.encode(raster, req, opts);
+    },
+  } as ImageEngine;
+  const step =
+    (name: string, abortHere = false): VariantStep =>
+    (raster) => {
+      ran.push(name);
+      if (abortHere) {
+        controller.abort();
+      }
+      return raster;
+    };
+  const plan = variantPlan(sizePlan(20, 10), 'webp');
+  const opts = (steps: VariantStep[]) => ({
+    ...encodeOptions(steps),
+    engine: recording,
+    signal: controller.signal,
+  });
+  const stopped = (err: ResizeError) => {
+    assert.equal(err.code, 'RESIZE_TASK_ABORTED');
+    assert.equal(err.retryable, true);
+    assert.ok(ResizeError.isResizeError(err));
+    return true;
+  };
+  // Between two steps.
+  await assert.rejects(
+    encodeVariant(
+      solid(20, 10, [1, 2, 3]),
+      plan,
+      opts([step('first', true), step('second')]),
+    ),
+    stopped,
+  );
+  assert.deepEqual(ran, ['first']);
+  // After the last step: the encode does not run.
+  ran.length = 0;
+  const after = new AbortController();
+  await assert.rejects(
+    encodeVariant(solid(20, 10, [1, 2, 3]), plan, {
+      ...opts([
+        (raster) => {
+          ran.push('only');
+          after.abort();
+          return raster;
+        },
+      ]),
+      signal: after.signal,
+    }),
+    stopped,
+  );
+  assert.deepEqual(ran, ['only']);
+  // Already aborted: not even the first step.
+  ran.length = 0;
+  await assert.rejects(
+    encodeVariant(solid(20, 10, [1, 2, 3]), plan, opts([step('never')])),
+    stopped,
+  );
+  assert.deepEqual(ran, []);
+  assert.equal(encodes.length, 0);
+  // Without steps nothing changes: a variant in progress finishes, as it always did.
+  const done = await encodeVariant(solid(20, 10, [1, 2, 3]), plan, opts([]));
+  assert.equal(done.format, 'webp');
+  assert.equal(encodes.length, 1);
 });
 
 test('a step that resolves with a Buffer is told to return its pixels, not an image file', async () => {

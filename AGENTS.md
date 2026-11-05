@@ -614,13 +614,18 @@ on that size's pixels, after the resize and before the encode; both take a `Rast
 `Raster` (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
 pixels, not a library object, so the engine stays replaceable). A variantStep reads the preview's
 size from `raster.info` (`width`, `height`, `channels`) and owns its copy of the pixels.
-A `rasterToSharp` chain in a variantStep runs under `limits.processingTimeoutSeconds`, and past it
-only that variant fails; the chain's own `.timeout({ seconds })` replaces the limit, and
-`.timeout({ seconds: 0 })` turns it off. An AVIF encode is not interrupted by the limit. Nothing else
-in a step is bounded: Sharp work that does not go through `rasterToSharp`
-(`sharp(raster.data, { raw: raster.info })`, a raster spread into a new object), any other host code, and `beforeSteps`. Such work can starve other tasks and dead-letter
-healthy ones, because stuck Sharp calls hold libuv's threads, and a timed-out delivery keeps its
-memory until the step ends. An optional pipeline `version` (string) is part of each preview row's
+A `rasterToSharp` chain in a variantStep, from a raster the module handed over or made from one
+through `sharpToRaster`, runs under `limits.processingTimeoutSeconds`, and past it only that variant
+fails. Each chain and the encode have their own limit, so a variant holds a thread for at most
+(chains + 1) × the limit; the chain's own `.timeout({ seconds })` replaces it on that chain, and
+`.timeout({ seconds: 0 })` turns it off there. An AVIF encode is not interrupted by the limit, and the
+limit does not cross a duplicate copy of the package (`rasterToSharp` from a second copy reads none,
+with no error: dedupe). Nothing else in a step is bounded: Sharp work that does not go through
+`rasterToSharp` (`sharp(raster.data, { raw: raster.info })`, a fresh `sharp()`, a raster spread into a
+new object or built by the step), any other host code, and `beforeSteps`. Such work can starve other
+tasks and dead-letter healthy ones, because stuck Sharp calls hold libuv's threads, and a timed-out
+delivery keeps its memory until the running step ends; that variant's remaining steps and its encode
+then do not run. An optional pipeline `version` (string) is part of each preview row's
 `encodeSig`: bump it when a step's output changes, and the pipeline's stored previews are
 regenerated on their next read.
 
@@ -803,8 +808,9 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | Sharp's `Input file is missing` from a step | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
 | Sharp's `Input buffer contains unsupported image format` from a step | the step calls `sharp(raster.data)`: those bytes are raw pixels, not an image file — use `rasterToSharp(r)` |
 | `img.composite is not a function` (or any Sharp method) from a `variantStep` | an old step that treats its first argument as a Sharp instance; it is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)`, and read `metadata()` values from `r.info`. An old step with a `typeof img.composite === 'function'` check or a `try { } catch { return img; }` raises no error: it renders silently with no watermark, so search for those too |
-| Sharp's `timeout: …% complete` as the cause of a `variant … failed` warning from a `variantStep` | a `rasterToSharp` chain ran past `limits.processingTimeoutSeconds`, and only that variant failed — make the step cheaper, or give the chain its own `.timeout({ seconds })` (`0` turns it off) |
-| healthy tasks fail with `RESIZE_TASK_TIMEOUT` or are dead-lettered with no previews beside a slow step | Sharp work that does not go through `rasterToSharp` (`sharp(raster.data, { raw: raster.info })`, a raster spread into a new object), a chain with `.timeout({ seconds: 0 })`, or a slow `beforeStep` holds libuv's threads, and other tasks' Sharp calls wait behind it. `taskTimeoutMs` ends the task but not the step: a timed-out delivery keeps its memory until the step ends, and can still store the preview — run the work through `rasterToSharp`, or give it its own `.timeout({ seconds })` |
+| Sharp's `timeout: …% complete` as the cause of a `variant … failed` warning | a `rasterToSharp` chain in a `variantStep` ran past `limits.processingTimeoutSeconds`, and only that variant failed. A slow resize or encode gets the same text, so the warning does not say which. On a worker the task then retries and, after `maxAttempts`, is dead-lettered into the cooldown (`coordination.cooldownMs`) — for a step: make it cheaper, or give the chain its own `.timeout({ seconds })` (`0` turns it off); for a resize or encode: raise the limit |
+| `RESIZE_TASK_ABORTED` as the cause of a `variant … failed` warning | the task stopped while this variant's steps ran: its `taskTimeoutMs` passed, its lease was lost, or the worker is stopping. The running step went on to its end; the variant's remaining steps and its encode did not run. It is no fault of its own — read the task's own line, such as `RESIZE_TASK_TIMEOUT` |
+| healthy tasks fail with `RESIZE_TASK_TIMEOUT` or are dead-lettered with no previews beside a slow step | Sharp work that does not go through `rasterToSharp` (`sharp(raster.data, { raw: raster.info })`, a raster spread into a new object), a chain with `.timeout({ seconds: 0 })`, or a slow `beforeStep` holds libuv's threads, and other tasks' Sharp calls wait behind it. `taskTimeoutMs` ends the task but not the running step, which keeps its thread and memory until it ends. That variant's remaining steps and its encode then do not run; a variant already past its steps can still store its row, and such a late write can replace a newer row, which the next read finds stale and queues again — run the work through `rasterToSharp`, or give it its own `.timeout({ seconds })` |
 | `resize worker: task … is dead (…)` at `error` | the task was dead-lettered; the line holds the code, the reason (`last attempt`, `not retryable`, `delivered more often than maxAttempts`) and the cause — fix the cause first, then the next read after `coordination.cooldownMs` queues the media again. The line is one line; the error goes to your logger as the second argument, and what it prints is your logger's. A logger that formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry whose line holds a sequence such as `%c3` or `%s` |
 | the warning `resize worker: the … observers of task … did not settle within … ms` | a task observer (`afterTaskComplete`, `onTaskFailed` or `onTaskDeadLettered`) was still running after `taskTimeoutMs`, or, once the worker was stopping, 5 s after the later of the stop and the task's end (the line says which). The task's state stands, the worker goes on, and the tap keeps running beside the next task — fix the tap |
 | a preview URL fails while a read calls that preview ready, neither stale nor missing | its file was deleted, usually by a sweep without the age rule: a read never checks storage, so nothing renders it again — call `invalidate()` on that media, and the next read or `prewarm()` queues its previews again. Then fix the sweep: list objects first, read rows after, and delete only objects older than a day and more than twice `taskTimeoutMs` |
