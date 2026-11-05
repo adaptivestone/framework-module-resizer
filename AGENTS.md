@@ -50,9 +50,9 @@ stored previews only. For a pipeline without `variantSteps`, a raster original n
 requested `WxH` box gets a preview at its own size (no upscaling, no cropping, metadata removed;
 only the `limits.resultDimension` cap can scale it down); a pipeline with `variantSteps` always
 gets the full box its steps were written for. A width-only or height-only size larger than the
-source, and a box larger than the source on one side only, do enlarge it, so a size key does not
-promise a size: read `width` and `height` from `formatPictureUrls`. To hand the private original
-to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it, and on
+source enlarges it, and so does a box the source exceeds on one side only (an `80x80` box on a
+100×60 source gives 80×80), so a size key does not promise a size: read `width` and `height` from
+`formatPictureUrls`. To hand the private original to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself; the module never calls it, and on
 `S3Storage` only that call needs `@aws-sdk/s3-request-presigner`.
 
 ## Integrate (in order)

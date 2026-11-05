@@ -1068,7 +1068,7 @@ describe('prewarm — beside a generate() on the upload route', () => {
       .toBuffer();
     const { warn } = installFakeApp();
     const docs = new Map<string, MediaLike>();
-    const { storage } = memoryStorage();
+    const { storage, files } = memoryStorage();
     const tasks = new MemoryTaskQueue({ timing: { idlePollMs: 5 } });
     const r = new Resizer({
       storage,
@@ -1089,7 +1089,7 @@ describe('prewarm — beside a generate() on the upload route', () => {
       workUntil({ logger: currentLogger, resizers: [r] }, () =>
         tasks.rows.every((row) => row.status === 'completed'),
       );
-    return { r, tasks, stored, media, work, warn };
+    return { r, tasks, stored, media, work, warn, storage, files };
   }
 
   const small: SizeInput = { width: 20, height: 20 };
@@ -1158,5 +1158,59 @@ describe('prewarm — beside a generate() on the upload route', () => {
     assert.deepEqual(stored().previews, [row]);
     assert.equal(warn.length, 1);
     assert.match(String(warn[0][0]), /already fresh/);
+  });
+
+  test('a worker that claims during generate() renders too: one row per preview, and the second file has none', async () => {
+    const { r, tasks, stored, media, work, warn, storage, files } =
+      await route();
+    await r.resolve({ media, sizes: [small], formats: ['webp'] });
+    assert.equal(tasks.rows.length, 1);
+    // Neither side stores its row until both have uploaded: the interleaving the guide warns of.
+    const upload = storage.upload;
+    let uploads = 0;
+    let bothUploaded = () => {};
+    const both = new Promise<void>((resolve) => {
+      bothUploaded = resolve;
+    });
+    storage.upload = async (args) => {
+      const ref = await upload(args);
+      uploads += 1;
+      if (uploads === 2) {
+        bothUploaded();
+      }
+      await both;
+      return ref;
+    };
+
+    await Promise.all([
+      r.generate({ media, sizes: [small], formats: ['webp'] }),
+      work(),
+    ]);
+
+    const previewFiles = [...files.keys()].filter((key) =>
+      key.startsWith('previews/'),
+    );
+    assert.equal(previewFiles.length, 2);
+    const rows = stored().previews ?? [];
+    assert.equal(rows.length, 1);
+    assert.ok(previewFiles.includes(refKey(rows[0].storageRef)));
+    // The log names the file that has no row; the host's sweep finds it too.
+    const orphan = previewFiles.find(
+      (key) => key !== refKey(rows[0].storageRef),
+    );
+    assert.equal(warn.length, 1);
+    assert.match(
+      String(warn[0][0]),
+      /already stored by another worker; uploaded but not recorded storage refs/,
+    );
+    assert.ok(String(warn[0][0]).includes(String(orphan)));
+
+    const { decision } = await r.resolve({
+      media: structuredClone(stored()),
+      sizes: [small],
+      formats: ['webp'],
+    });
+    assert.equal(decision.missing.length, 0);
+    assert.equal(decision.ready.length, 1);
   });
 });

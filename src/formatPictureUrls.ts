@@ -3,6 +3,10 @@
 import { getFilterSig } from './images.ts';
 import type { PictureUrls, ReadDecision } from './types.d.ts';
 
+// A hand-built entry can hold anything, and JSON turns NaN into a null a client would render.
+const isSide = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0;
+
 export function formatPictureUrls(
   decision: ReadDecision,
   opts: { id?: string; mediaType?: string } = {},
@@ -28,9 +32,7 @@ export function formatPictureUrls(
     byFormat.set(entry.format, {
       url: entry.url,
       contentType: entry.contentType,
-      ...(typeof width === 'number' && typeof height === 'number'
-        ? { width, height }
-        : {}),
+      ...(isSide(width) && isSide(height) ? { width, height } : {}),
     });
   }
   const out: PictureUrls = {

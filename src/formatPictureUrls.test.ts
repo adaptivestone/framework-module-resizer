@@ -200,6 +200,31 @@ describe('formatPictureUrls', () => {
     }
   });
 
+  test('a dimension that is not a positive, finite number leaves both out', () => {
+    for (const bad of [Number.NaN, Infinity, -Infinity, 0, -1]) {
+      for (const row of [
+        { actualWidth: bad, actualHeight: 300 },
+        { actualWidth: 400, actualHeight: bad },
+        { actualWidth: bad, actualHeight: bad },
+      ]) {
+        const stored = entry({
+          sizeKey: '720x720',
+          format: 'webp',
+          url: '/a.webp',
+        });
+        stored.preview = { ...stored.preview, ...row };
+        const cell = formatPictureUrls({ ready: [stored], missing: [] }).sizes[
+          '720x720'
+        ].webp;
+        assert.deepEqual(
+          Object.keys(cell),
+          ['url', 'contentType'],
+          `${row.actualWidth}x${row.actualHeight}`,
+        );
+      }
+    }
+  });
+
   test('an entry an untyped host built, with no row, keeps its URL', () => {
     const { preview: _row, ...bare } = entry({
       sizeKey: '720x720',
