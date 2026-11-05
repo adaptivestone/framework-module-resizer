@@ -1450,6 +1450,8 @@ export class Processor {
       encode: settings.encode,
       limits: renderLimits,
       engine,
+      media,
+      source: info,
       signal,
     };
     // Each variant's stored row, by plan; read back in request order after the pool.

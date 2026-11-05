@@ -67,7 +67,7 @@ export {
   type TaskEventHandler,
   TaskQueue,
 } from './contracts/taskQueue.ts';
-// --- the Raster helpers: a Sharp-based beforeStep wraps the raster it receives and reads its
+// --- the Raster helpers: a Sharp-based step wraps the raster it receives and reads its
 // result back (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))`) ---
 export { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
 // --- error hierarchy: every module throw is a `ResizeError`; the subclass says what to DO ---

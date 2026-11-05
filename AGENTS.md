@@ -607,11 +607,15 @@ to 5 s after the later of the stop and the task's end, then logs one `warn` and 
 tap keeps running beside the next task; a preview observer runs inside its task, so it counts
 against `taskTimeoutMs`, during a stop too. `generate()` sets no bound: a tap that never settles
 means `generate()` never returns.
-Pipelines: `beforeSteps` run once on the decoded first frame, as a `Raster` in and a `Raster` out
-(`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
-pixels, not a library object, so the engine stays replaceable); `variantSteps` run on each size's
-pixels as a Sharp instance (its `metadata()` reports the preview's size, `format: 'raw'` and no
-EXIF), before encode. An optional pipeline `version` (string) is part of each preview row's
+Pipelines: `beforeSteps` run once on the decoded first frame, and `variantSteps` once per variant
+on that size's pixels, after the resize and before the encode; both take a `Raster` and return a
+`Raster` (`async (r) => sharpToRaster(rasterToSharp(r).blur(5))` wraps a Sharp step; host steps see
+pixels, not a library object, so the engine stays replaceable). A variantStep reads the preview's
+size from `raster.info` (`width`, `height`, `channels`) and owns its copy of the pixels.
+`limits.processingTimeoutSeconds` does not bound a step's Sharp work: add `.timeout({ seconds: 5 })`
+to its chain (`sharpToRaster(rasterToSharp(r).blur(5).timeout({ seconds: 5 }))`), and past it only
+that variant fails. A worker's `taskTimeoutMs` still ends the task, though Sharp keeps running. An
+optional pipeline `version` (string) is part of each preview row's
 `encodeSig`: bump it when a step's output changes, and the pipeline's stored previews are
 regenerated on their next read.
 
@@ -654,9 +658,18 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
   task; from one that cannot filter claims (SQS), such a task is given back to the queue (or
   retried when the queue cannot give tasks back).
 - `ctx` does NOT cross the queue: worker-side steps and observers see `ctx === {}`. Only eager
-  `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc.
+  `generate()` passes the caller's `ctx` to steps. Persist per-media data on the media doc (a step
+  reads it from `meta.media`).
 - Watermarks belong in `variantSteps`, never in `beforeSteps` (baked once onto the original, a
-  watermark scales away to unreadable on small variants).
+  watermark scales away to unreadable on small variants). A `variantStep` receives and returns a
+  one-frame `Raster`, never a Sharp object:
+  `async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))`.
+  Scale the logo by `r.info.width`: Sharp refuses an overlay larger than the preview.
+- When you port a `variantStep` to a `Raster`, look at its first new previews: stored previews stay,
+  and other steps than a single `composite` can write different files (see the README `Pipelines`
+  section). Three things go wrong with no error: `greyscale()` on a transparent source loses alpha
+  (use `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in colour (use `greyscale()` on an
+  opaque source, or `modulate({ saturation: 0 })`), and metadata calls in a step do nothing.
 - A `beforeStep` receives and returns a one-frame `Raster`, never a Sharp object or a `Buffer`;
   wrap Sharp work with `rasterToSharp` / `sharpToRaster`. For a raster source it sees the upright
   original at its own size; for a vector source (SVG) the pixels can be larger, so multiply
@@ -773,8 +786,10 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_SOURCE_TOO_LARGE` naming `limits.sourceBytes`, or `RESIZE_ORIGINAL_TOO_LARGE` naming it from `uploadOriginal()` | the original is larger than `limits.sourceBytes` (default 256 MiB), so a worker refuses to read it into memory: its task is dead-lettered at once, and `generate()` and `adoptOriginal()` reject with `RESIZE_SOURCE_TOO_LARGE`. An upload is refused and stores nothing — raise it, or replace the object |
 | the warning `resize: upload.maxBytes (…) is above limits.sourceBytes (…)` from `verify()` | the stricter limit wins, since a task could never read a larger stored file, so uploads over `limits.sourceBytes` are refused whatever `upload.maxBytes` says — raise `limits.sourceBytes` to accept them, or lower `upload.maxBytes` |
 | `RESIZE_DECODER_INVALID` | a `decoders` entry is not a decoder (at construction: it needs a non-empty `formats` list and `inspect` and `render` functions), or a decoder broke the contract (its `inspect` result, or a raster whose `data` length does not match its `info`) — fix the decoder |
-| `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
-| Sharp's `Input file is missing` from a `beforeStep` | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
+| `RESIZE_PIPELINE_STEP_INVALID` | a `beforeStep` or `variantStep` resolved with something that is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its size), or `sharpToRaster` got a multi-page image — return `sharpToRaster(…)` |
+| Sharp's `Input file is missing` from a step | an old step that still calls `sharp(buf)` on its first argument, which is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)` |
+| `img.composite is not a function` (or any Sharp method) from a `variantStep` | an old step that treats its first argument as a Sharp instance; it is now a `Raster` — rewrite it as `async (r) => sharpToRaster(rasterToSharp(r)…)`, and read `metadata()` values from `r.info`. An old step with a `typeof img.composite === 'function'` check or a `try { } catch { return img; }` raises no error: it renders silently with no watermark, so search for those too |
+| a slow `variantStep` runs past `limits.processingTimeoutSeconds`, or `RESIZE_TASK_TIMEOUT` on a task with one | the limit bounds the module's Sharp calls, not a step's own: a step is host code — add `.timeout({ seconds: 5 })` to its chain (`sharpToRaster(rasterToSharp(r).blur(5).timeout({ seconds: 5 }))`), and past it only that variant fails. `taskTimeoutMs` ends the task, though Sharp keeps running to the end of the step and that delivery can still store the preview; `generate()` has no such bound |
 | `resize worker: task … is dead (…)` at `error` | the task was dead-lettered; the line holds the code, the reason (`last attempt`, `not retryable`, `delivered more often than maxAttempts`) and the cause — fix the cause first, then the next read after `coordination.cooldownMs` queues the media again. The line is one line; the error goes to your logger as the second argument, and what it prints is your logger's. A logger that formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry whose line holds a sequence such as `%c3` or `%s` |
 | the warning `resize worker: the … observers of task … did not settle within … ms` | a task observer (`afterTaskComplete`, `onTaskFailed` or `onTaskDeadLettered`) was still running after `taskTimeoutMs`, or, once the worker was stopping, 5 s after the later of the stop and the task's end (the line says which). The task's state stands, the worker goes on, and the tap keeps running beside the next task — fix the tap |
 | a preview URL fails while a read calls that preview ready, neither stale nor missing | its file was deleted, usually by a sweep without the age rule: a read never checks storage, so nothing renders it again — call `invalidate()` on that media, and the next read or `prewarm()` queues its previews again. Then fix the sweep: list objects first, read rows after, and delete only objects older than a day and more than twice `taskTimeoutMs` |

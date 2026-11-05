@@ -7,6 +7,7 @@
 import type { SourceDecoder } from '../contracts/decoder.ts';
 import type { LockStore } from '../contracts/locks.ts';
 import type { MediaStore } from '../contracts/media.ts';
+import type { VariantStep } from '../contracts/pipeline.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
 import { NoopMetrics } from '../metrics.ts';
@@ -180,3 +181,8 @@ const hostLogger = {
   debug: 'verbose',
 };
 export const hostDebugLogger: ResizeLogger = hostLogger;
+
+// A variantStep takes and returns a Raster, like a beforeStep: no library object in either list.
+export const rasterStep: VariantStep = (raster) => raster;
+// @ts-expect-error — a variantStep receives a Raster, not a Sharp instance.
+export const oldStep: VariantStep = (img) => img.composite([]);

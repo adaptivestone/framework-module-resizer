@@ -1,5 +1,5 @@
-// The boundary between a Raster and Sharp: the shape check, and the helpers a Sharp-based
-// beforeStep uses to wrap a raster and read one back.
+// The boundary between a Raster and Sharp: the shape check, and the helpers a Sharp-based step
+// uses to wrap a raster and read one back.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
@@ -100,7 +100,7 @@ test('sharpToRaster rejects a multi-page image with RESIZE_PIPELINE_STEP_INVALID
       assert.ok(ResizeError.isResizeError(err));
       assert.equal(err.name, 'ResizeSetupError');
       assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
-      assert.match(err.message, /a beforeStep must return one frame/);
+      assert.match(err.message, /a pipeline step must return one frame/);
       return true;
     },
   );

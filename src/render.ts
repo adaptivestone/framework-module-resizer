@@ -1,10 +1,9 @@
 // The pixel work on decoded rasters: straight alpha once on the decoded raster, the beforeSteps
 // chain, the box reduction after it, one render per exact size, and the encode of each format from
-// it. No image library here: every pixel operation is a call on the engine (and, until variantSteps
-// take a Raster, the Sharp helper that runs them). What an engine returns is checked here, because
-// the core relies on it. Every function but `straightAlpha` takes a straight-alpha raster: the
-// Processor converts a premultiplied one first, and so does `runBeforeSteps` for a step's result,
-// so nothing here forwards a premultiplied flag.
+// it. No image library here: every pixel operation is a call on the engine. What an engine returns
+// is checked here, because the core relies on it. Every function but `straightAlpha` takes a
+// straight-alpha raster: the Processor converts a premultiplied one first, and so do both step
+// chains for a step's result, so nothing here forwards a premultiplied flag.
 import type {
   DecodeBox,
   Raster,
@@ -18,7 +17,6 @@ import type {
   ResizeRequest,
 } from './contracts/engine.ts';
 import type { BeforeStep, VariantStep } from './contracts/pipeline.ts';
-import { rasterToSharp, readRaster } from './engines/sharpRaster.ts';
 import { ResizeMediaError, ResizeSetupError } from './errors.ts';
 import { rasterProblem } from './helpers/raster.ts';
 import type { SizePlan, VariantPlan } from './plan.ts';
@@ -130,17 +128,24 @@ export interface BeforeStepMeta {
   ctx: Record<string, unknown>;
 }
 
-/** What a beforeStep resolved with, as a one-frame Raster, or a step error naming the problem. */
-function stepResult(value: unknown): Raster {
+/** What a step resolved with, as a one-frame Raster, or a step error naming the problem. */
+function stepResult(
+  value: unknown,
+  kind: 'beforeStep' | 'variantStep',
+): Raster {
   const frames = (value as { info?: RasterInfo } | null)?.info?.frames;
-  const problem =
-    rasterProblem(value) ??
-    (frames !== undefined && frames !== 1
-      ? `\`info.frames\` is ${frames}, not 1`
-      : undefined);
+  // The usual slip when porting a Sharp step: it forgot to read the pixels back.
+  const isSharp =
+    typeof (value as { toBuffer?: unknown } | null)?.toBuffer === 'function';
+  const problem = isSharp
+    ? 'it is a Sharp instance, not its pixels: return sharpToRaster(img)'
+    : (rasterProblem(value) ??
+      (frames !== undefined && frames !== 1
+        ? `\`info.frames\` is ${frames}, not 1`
+        : undefined));
   if (problem !== undefined) {
     throw new ResizeSetupError(
-      `resize: a beforeStep resolved with something that is not a one-frame Raster: ${problem} — a beforeStep receives and returns a Raster ({ data, info }); rasterToSharp / sharpToRaster wrap a Sharp step`,
+      `resize: a ${kind} resolved with something that is not a one-frame Raster: ${problem} — a ${kind} receives and returns a Raster ({ data, info }); rasterToSharp / sharpToRaster wrap a Sharp step`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
@@ -172,7 +177,7 @@ async function stepChain(
 ): Promise<Raster> {
   for (const step of steps) {
     const scale = raster.info.width / meta.source.width;
-    raster = stepResult(await step(raster, { ...meta, scale }));
+    raster = stepResult(await step(raster, { ...meta, scale }), 'beforeStep');
     raster = straightAlpha(raster);
   }
   return raster;
@@ -354,22 +359,37 @@ export interface EncodeOptions {
   encode: ResizeConfig['encode'];
   limits: ResizeLimits;
   engine: ImageEngine;
+  media: MediaLike;
+  source: SourceInfo;
   signal?: AbortSignal;
 }
 
 export type EncodedVariant = EncodedImage;
 
-// Until variantSteps take a Raster (the next task): the steps' Sharp chain, read back as pixels.
+/** The variant's steps in order, from its own copy of the sized pixels: other formats share them. */
 async function runVariantSteps(
   sized: Raster,
   plan: VariantPlan,
   opts: EncodeOptions,
 ): Promise<Raster> {
-  let img = rasterToSharp(sized);
+  let raster: Raster = {
+    data: Buffer.from(sized.data),
+    info: { ...sized.info },
+  };
   for (const step of opts.variantSteps) {
-    img = await step(img, { variant: plan.variant, ctx: opts.ctx });
+    raster = straightAlpha(
+      stepResult(
+        await step(raster, {
+          variant: plan.variant,
+          ctx: opts.ctx,
+          media: opts.media,
+          source: opts.source,
+        }),
+        'variantStep',
+      ),
+    );
   }
-  return readRaster(img);
+  return raster;
 }
 
 /** One preview file: variantSteps on the sized pixels, then the engine's flatten and encoder. */
@@ -383,11 +403,13 @@ export async function encodeVariant(
   const source = engine.animatedFormats.includes(format)
     ? sized
     : firstFrame(sized);
-  const { channels } = source.info;
   const raster =
     opts.variantSteps.length > 0
       ? await runVariantSteps(source, plan, opts)
       : source;
+  // From the step's result: transparency a step adds is flattened, and one it removes needs no
+  // background.
+  const { channels } = raster.info;
   const flatten =
     (channels === 2 || channels === 4) &&
     opts.encode.flatten.formats.includes(format);
@@ -401,7 +423,10 @@ export async function encodeVariant(
     { limits: opts.limits, signal: opts.signal },
   );
   checkEncoded(engine, encoded);
-  if (encoded.format === 'svg' || /^image\/svg/i.test(encoded.contentType)) {
+  if (
+    /^svg$/i.test(encoded.format) ||
+    /^image\/svg/i.test(encoded.contentType)
+  ) {
     throw new ResizeMediaError('resize: SVG cannot be published as a preview', {
       code: 'RESIZE_SVG_PUBLIC_PREVIEW',
     });

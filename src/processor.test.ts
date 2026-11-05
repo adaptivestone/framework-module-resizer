@@ -1383,24 +1383,33 @@ describe('decoding the source', () => {
       .toBuffer();
     const refs = new Map<string, WeakRef<Buffer>>();
     let most = 0;
-    const watch: VariantStep = async (img, { variant }) => {
-      const side = variant.requestedWidth ?? variant.requestedHeight;
-      const input = (
-        img as unknown as { options: { input: { buffer: Buffer } } }
-      ).options.input.buffer;
-      refs.set(String(side), new WeakRef(input));
+    // The step sees a copy, so the engine takes the reference to the sized pixels themselves.
+    const inner = new SharpEngine();
+    const recording: ImageEngine = {
+      id: 'recording',
+      formats: inner.formats,
+      animatedFormats: inner.animatedFormats,
+      encode: (raster, req, opts) => inner.encode(raster, req, opts),
+      resize: async (frame, req, opts) => {
+        const out = await inner.resize(frame, req, opts);
+        refs.set(`${req.width}x${req.height}`, new WeakRef(out.data));
+        return out;
+      },
+    };
+    const watch: VariantStep = async (raster) => {
       await new Promise((resolve) => setImmediate(resolve));
       gc();
       await new Promise((resolve) => setImmediate(resolve));
       gc();
       const alive = [...refs.values()].filter((r) => r.deref() !== undefined);
       most = Math.max(most, alive.length);
-      return img;
+      return raster;
     };
     const { deps, media } = decodeDeps(square, {
       config: { concurrency },
       pipeline: { variantSteps: [watch] },
     });
+    deps.engine = recording;
     const { created } = await new Processor(deps).generate({
       media: media(),
       sizes,
@@ -2465,8 +2474,10 @@ describe('processTask — variants', () => {
     const { storage, uploads } = makeStorage(redPng);
     const pipeline: Pipeline = {
       variantSteps: [
-        async (img, { variant: v }) =>
-          v.filters?.blur ? img.blur(Number(v.filters.blur)) : img,
+        async (r, { variant: v }) =>
+          v.filters?.blur
+            ? sharpToRaster(rasterToSharp(r).blur(Number(v.filters.blur)))
+            : r,
       ],
     };
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
@@ -3764,8 +3775,12 @@ describe('animated sources', () => {
       pipelines: {
         default: {
           variantSteps: [
-            async (img) =>
-              img.composite([{ input: mark, gravity: 'southeast' }]),
+            async (r) =>
+              sharpToRaster(
+                rasterToSharp(r).composite([
+                  { input: mark, gravity: 'southeast' },
+                ]),
+              ),
           ],
         },
       },
@@ -5108,9 +5123,13 @@ describe('a source smaller than the box', () => {
       pipelines: {
         default: {
           variantSteps: [
-            async (img) => {
+            async (r) => {
               steps += 1;
-              return img.composite([{ input: mark, gravity: 'southeast' }]);
+              return sharpToRaster(
+                rasterToSharp(r).composite([
+                  { input: mark, gravity: 'southeast' },
+                ]),
+              );
             },
           ],
         },

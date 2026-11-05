@@ -226,7 +226,6 @@ test('plan.ts, helpers/raster.ts, the engine and render.ts reach no storage, med
 
 test('only the allowed shipped files import sharp', () => {
   const allowed = [
-    'contracts/pipeline.ts', // the Sharp type of variantSteps
     'decoders/sharp.ts',
     'decoders/svg.ts',
     'engines/sharp.ts',
@@ -241,6 +240,17 @@ test('only the allowed shipped files import sharp', () => {
     }).includes('sharp'),
   );
   assert.deepEqual(importers.sort(), allowed);
+});
+
+test('the Processor, render.ts and the plan reach no sharp at runtime', () => {
+  for (const entry of [
+    'processor.ts',
+    'render.ts',
+    'helpers/raster.ts',
+    'plan.ts',
+  ]) {
+    assert.equal(walk(entry).bare.has('sharp'), false, entry);
+  }
 });
 
 test('helpers and contracts import only helpers, contracts, errors and types', () => {

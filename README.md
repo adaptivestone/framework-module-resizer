@@ -1000,7 +1000,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation, at most `3600`, the longest Sharp accepts |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation of the module, at most `3600`, the longest Sharp accepts. It does not bound a pipeline step's own Sharp work: a step sets its own `.timeout()` (see Pipelines) |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1033,15 +1033,55 @@ const pipelines = {
 upright original at its own size; a vector source (SVG) is rendered at least at its natural size
 and can be larger, so multiply coordinates stored in the source's units by `scale` (the width of
 the raster the step receives divided by `source.width`). When a step changes the size, every
-variant is planned from its result. A step that resolves with anything that is not a one-frame
-`Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its `info`)
-fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does `sharpToRaster` given a
-multi-page image. A `variantStep` is `(img, { variant, ctx }) => Sharp` (or a promise of one): it
-runs per variant, after the resize and before the encode, on a Sharp instance over that size's
-pixels, so `metadata()` reports the preview's size (with `format: 'raw'`, no EXIF, ICC profile,
-density or orientation, and `hasAlpha` as the sized pixels have it), a `resize()` resizes the
-preview, and operations Sharp used to apply before its resize (such as `trim()`) apply to the
-preview.
+variant is planned from its result. A `beforeStep` or `variantStep` that resolves with anything that
+is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not
+match its `info`) fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does
+`sharpToRaster` given a multi-page image.
+
+A `variantStep` is `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one). It
+runs per variant, after the resize and before the encode, on one frame of that size's pixels, and
+resolves with one frame. Read the preview's size from `raster.info` (`width`, `height`, `channels`).
+The raster is the step's own copy, so the step may write to it, and the formats of one size never
+see each other's marks. A `resize()` in a step resizes the preview, and operations Sharp used to
+apply before its resize (such as `trim()`) apply to the preview. The `encode.flatten` decision reads
+the channels of the last step's result, so transparency a step adds is flattened on a flattened
+format.
+
+```ts
+variantSteps: [
+  async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }])),
+],
+```
+
+Scale the overlay by `r.info.width`: Sharp refuses one larger than the preview (`Image to composite
+must have same dimensions or smaller`). `composite` on an opaque preview returns 4 channels with
+alpha 255, which costs AVIF about 10% at 1920 wide: add `.removeAlpha()` when `r.info.channels === 3`.
+
+`limits.processingTimeoutSeconds` bounds the module's own Sharp calls, not a step, in either list: a
+step is host code. 0.3.0 killed a slow `variantStep` at the limit, because it was one Sharp chain with
+the encode; now `blur(400)` on 24 MP runs for 447 s. Set a timeout on the step's own chain:
+`async (r) => sharpToRaster(rasterToSharp(r).blur(5).timeout({ seconds: 5 }))`. Sharp then rejects at
+that limit (`blur(400)` with it was killed at 5.4 s) and only that variant fails. Without one, a
+worker's `taskTimeoutMs` still ends the task (`RESIZE_TASK_TIMEOUT`), though Sharp keeps running to
+the end of the step and that delivery can still store the preview, and `generate()` has no such
+bound.
+
+A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source and
+on every format that keeps alpha; on a flattened format, a transparent source can move by a few
+levels (up to 11 of 255 measured) wherever the preview has partly transparent pixels. Other steps can
+write different files, on new previews only: `encodeSig` does not change, so stored previews stay,
+and `verify()` does not run steps, so look at the logs and the files after the first upload.
+
+- On a transparent source and a flattened format, the step now runs before the flatten, where Sharp
+  ran it after, so most operations change that format's pixels. `negate()` also negates alpha: use
+  `negate({ alpha: false })`. `removeAlpha()` shows the colours under transparent pixels.
+- Several steps now run in order, each on the last one's result, where 0.3.0 gathered them in one
+  Sharp chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order.
+- `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error. `greyscale()` on a
+  transparent source loses alpha: use `modulate({ saturation: 0 })`. `toColourspace('b-w')` stays in
+  colour: use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`. Metadata calls in a
+  step do nothing: `withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this way
+  disappears, and `withIccProfile` also shifts the colours, so leave it out.
 
 **Rounding.** Preview sizes are computed from the source's display dimensions and rounded once
 per side, so a preview side can differ by one pixel from what Sharp derived in earlier releases,
@@ -1697,7 +1737,14 @@ a lean read removes every row without a stored `_id`. Keying rows by `identity` 
   limit after `beforeSteps` (`min(limits.sourcePixels, limits.inputPixels)`) is checked once, on
   the dimensions of the raster the last step returned, so a step that grows the image has already
   allocated it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`,
-  `retryable: false`). Steps are host code.
+  `retryable: false`). Steps are host code. With `variantSteps`, a worker also holds one copy of the
+  size's pixels and the step's result per variant in progress, up to
+  `width × height × (channels + 4)` bytes each, up to `concurrency` at once: about 117 MB per variant
+  at a 5000-wide size of a 3:2 source. Measured with one `composite` step at the default
+  `concurrency` of 4, writing JPEG and WebP, the process's peak RSS is about 185 MB (0.3.0: about
+  130 MB) on a 24 MP JPEG at 1920, 1280 and 620 wide and 300×300, about 975 MB (0.3.0: about 590 MB)
+  on that JPEG at 5000, 4000, 3000 and 2000 wide, and about 1.9 GB (0.3.0: about 1.5 GB) on a 24 MP
+  PNG with alpha at those widths.
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that
   already exist fresh, and the media store keeps one row per preview identity, so a repeat never
   duplicates them. A task completes only when every requested

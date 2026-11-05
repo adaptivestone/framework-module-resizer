@@ -102,6 +102,41 @@
   `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
   could never serve such a row.
 
+- **`variantSteps` take and return a `Raster`.** `VariantStep` is now
+  `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one): `raster` is that
+  size's pixels (one frame, `{ data, info }`: raw 8-bit sRGB, 3 or 4 channels, upright), and the step
+  resolves with one frame. The raster is the step's own copy, so it may write to it. Host steps see
+  no library object in either list, so the image engine is replaceable. Migration, with both helpers
+  from the main entry:
+
+  ```ts
+  variantSteps: [(img) => img.composite([{ input: logo, gravity: 'southeast' }])], // before
+  variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))], // now
+  ```
+
+  What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`; `hasAlpha` is
+  `channels === 2 || channels === 4`. An old step that calls a Sharp method fails inside the step
+  with a plain `TypeError` (`img.composite is not a function`): its variant fails, and the task fails
+  with the retryable `RESIZE_WORKER_INCOMPLETE`. TypeScript rejects it at compile time. A step that
+  resolves with anything else (a `Buffer`, a Sharp instance) fails with
+  `RESIZE_PIPELINE_STEP_INVALID`. `encodeSig` does not change, so stored previews are not regenerated,
+  and a broken step shows up only on new media or new sizes: `verify()` does not run steps, so check
+  the logs after the first upload. A single step that only composites an overlay writes the same
+  files as 0.3.0 on an opaque source and on every format that keeps alpha; on a flattened format, a
+  transparent source can move by a few levels (up to 11 of 255 measured) wherever the preview has
+  partly transparent pixels. Other steps can write different files, on new previews only: (a) on a
+  transparent source and a flattened format, the step now runs before the flatten, where Sharp ran it
+  after, so most operations change that format's pixels (`negate()` also negates alpha: use
+  `negate({ alpha: false })`; `removeAlpha()` shows the colours under transparent pixels); (b) several
+  steps now run in order, each on the last one's result, where 0.3.0 gathered them in one Sharp
+  chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order; (c)
+  `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error: `greyscale()` on a
+  transparent source loses alpha (use `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in
+  colour (use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`), and metadata calls
+  in a step do nothing (`withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this
+  way disappears, and `withIccProfile` also shifts the colours, so leave it out). Bump the pipeline's
+  `version` when a step's output changes.
+
 **Changed behaviour**
 
 - The scaffold writes an explicit `privateRootDir` and an absolute `publicBaseUrl` from
@@ -164,8 +199,26 @@
   may require more (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
   `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
 - A raster a host decoder marks `premultiplied` now converts to straight alpha in plain JS. It can
-  differ from 0.3.0 by 1 level per channel, and it is slower. The built-in decoders never mark one,
-  so their previews do not change, and nothing regenerates.
+  differ from 0.3.0 by 1 level per channel, and it blocks the event loop (182 ms at 24 MP, 372 ms at
+  50 MP, against Sharp's 56 ms and 126 ms off the loop), which matters for eager `generate()` on an API
+  route and holds for a `beforeStep` or `variantStep` result marked `premultiplied` too. The built-in
+  decoders never mark one, so their previews do not change, and nothing regenerates.
+- A variant step that adds transparency to an opaque preview now gets the `encode.flatten` background
+  on a flattened format; in 0.3.0 those areas of a JPEG came out black. A pipeline hit by this bumps
+  its `version`.
+- `limits.processingTimeoutSeconds` no longer bounds a variant step's Sharp work. A step is host code,
+  like a `beforeStep`, which the limit never bounded; in 0.3.0 a variant step was one Sharp chain with
+  the encode, so the limit killed a slow one: `blur(400)` on 24 MP at a limit of 5 s was killed at
+  5.4 s, and now runs for 447 s. A step sets its own limit, which `sharpToRaster` honours:
+  `async (r) => sharpToRaster(rasterToSharp(r).blur(5).timeout({ seconds: 5 }))`. `blur(400)` with
+  that timeout is killed at 5.4 s, and only its variant fails. A worker's `taskTimeoutMs` still ends
+  the task (`RESIZE_TASK_TIMEOUT`), though Sharp keeps running to the end of the step and that
+  delivery can still store the preview. `generate()` has no such bound.
+- With `variantSteps`, a worker holds one copy of the size's pixels and the step's result per variant
+  in progress, up to `width × height × (channels + 4)` bytes each, up to `concurrency` at once.
+  Measured with one `composite` step on a 24 MP JPEG at the default `concurrency` of 4, the process's
+  peak RSS is about 185 MB where 0.3.0 had about 130 MB (sizes up to 1920 wide), and about 975 MB
+  where 0.3.0 had about 590 MB (sizes from 5000 down to 2000 wide).
 
 **Features**
 

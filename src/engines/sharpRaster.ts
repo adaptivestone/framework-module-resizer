@@ -29,7 +29,7 @@ export function rasterInput(raster: Raster): SharpOptions {
 }
 
 /**
- * Sharp over the raster's pixels, for a Sharp-based beforeStep. A value that is not a Raster is
+ * Sharp over the raster's pixels, for a Sharp-based step. A value that is not a Raster is
  * refused here, before Sharp reads it as raw bytes of the wrong size.
  */
 export function rasterToSharp(raster: Raster): Sharp {
@@ -101,7 +101,7 @@ export async function readRaster(img: Sharp): Promise<Raster> {
   return raster;
 }
 
-/** Reads a Sharp-based beforeStep's result back as a one-frame sRGB raster. */
+/** Reads a Sharp-based step's result back as a one-frame sRGB raster. */
 export async function sharpToRaster(img: Sharp): Promise<Raster> {
   // The input's own frames, before any resize: stacked frames (a page height below the height)
   // were loaded, whatever size the output has. A still opened with a page count, or one page of an
@@ -113,7 +113,7 @@ export async function sharpToRaster(img: Sharp): Promise<Raster> {
     input.height > input.pageHeight
   ) {
     throw new ResizeSetupError(
-      `resize: a beforeStep must return one frame, not ${Math.round(input.height / input.pageHeight)} stacked frames`,
+      `resize: a pipeline step must return one frame, not ${Math.round(input.height / input.pageHeight)} stacked frames`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
@@ -122,19 +122,19 @@ export async function sharpToRaster(img: Sharp): Promise<Raster> {
   );
   if (stalePageHeight !== undefined) {
     throw new ResizeSetupError(
-      `resize: a beforeStep must return one frame, not a multi-page image resized as one (a page height of ${stalePageHeight} over ${raster.info.height} rows)`,
+      `resize: a pipeline step must return one frame, not a multi-page image resized as one (a page height of ${stalePageHeight} over ${raster.info.height} rows)`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
   if (problem !== undefined) {
     throw new ResizeSetupError(
-      `resize: a beforeStep returned pixels Sharp could not describe consistently: ${problem}`,
+      `resize: a pipeline step returned pixels Sharp could not describe consistently: ${problem}`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }
   if ((raster.info.frames ?? 1) > 1) {
     throw new ResizeSetupError(
-      `resize: a beforeStep must return one frame, not ${raster.info.frames}`,
+      `resize: a pipeline step must return one frame, not ${raster.info.frames}`,
       { code: 'RESIZE_PIPELINE_STEP_INVALID' },
     );
   }

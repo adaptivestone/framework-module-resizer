@@ -7,6 +7,7 @@ import sharp from 'sharp';
 import type { Raster, SourceInfo } from './contracts/decoder.ts';
 import type {
   EncodedImage,
+  EncodeRequest,
   ImageEngine,
   ResizeRequest,
 } from './contracts/engine.ts';
@@ -113,8 +114,30 @@ function variantPlan(size: SizePlan, format: string): VariantPlan {
 }
 
 function encodeOptions(variantSteps: VariantStep[] = []): EncodeOptions {
-  return { variantSteps, ctx: {}, encode: config.encode, limits, engine };
+  return {
+    variantSteps,
+    ctx: {},
+    encode: config.encode,
+    limits,
+    engine,
+    media: { id: 'm1' },
+    source: {
+      format: 'png',
+      contentType: 'image/png',
+      width: 20,
+      height: 10,
+    },
+  };
 }
+
+const lying = (over: Partial<ImageEngine>): ImageEngine => ({
+  id: 'liar',
+  formats: ['webp'],
+  animatedFormats: [],
+  resize: (frame, req, o) => engine.resize(frame, req, o),
+  encode: (raster, req, o) => engine.encode(raster, req, o),
+  ...over,
+});
 
 test('renderSize returns the raster itself when nothing changes', async () => {
   const raster = solid(20, 10, [10, 20, 30]);
@@ -270,9 +293,9 @@ test('encodeVariant runs variantSteps on the sized pixels, in order', async () =
   const seen: [string, number | undefined][] = [];
   const record =
     (name: string): VariantStep =>
-    async (img) => {
-      seen.push([name, (await img.metadata()).width]);
-      return img;
+    async (raster) => {
+      seen.push([name, raster.info.width]);
+      return raster;
     };
   const size = sizePlan(20, 10);
   await encodeVariant(
@@ -284,6 +307,139 @@ test('encodeVariant runs variantSteps on the sized pixels, in order', async () =
     ['a', 20],
     ['b', 20],
   ]);
+});
+
+test('a variantStep gets its own copy of the pixels, for each format', async () => {
+  const sized = solid(20, 10, [10, 20, 30]);
+  const before = Buffer.from(sized.data);
+  const seen: number[] = [];
+  const mark: VariantStep = (raster) => {
+    seen.push(raster.data[0]);
+    raster.data[0] = 255;
+    return raster;
+  };
+  for (const format of ['webp', 'png']) {
+    await encodeVariant(
+      sized,
+      variantPlan(sizePlan(20, 10), format),
+      encodeOptions([mark]),
+    );
+  }
+  assert.deepEqual(seen, [10, 10]);
+  assert.ok(sized.data.equals(before));
+});
+
+test('a variantStep sees the variant, media, source and ctx', async () => {
+  let meta: Parameters<VariantStep>[1] | undefined;
+  const opts = encodeOptions([
+    (raster, m) => {
+      meta = m;
+      return raster;
+    },
+  ]);
+  const plan = variantPlan(sizePlan(20, 10), 'webp');
+  await encodeVariant(solid(20, 10, [1, 2, 3]), plan, opts);
+  assert.equal(meta?.variant, plan.variant);
+  assert.equal(meta?.media, opts.media);
+  assert.equal(meta?.source, opts.source);
+  assert.equal(meta?.ctx, opts.ctx);
+});
+
+test('transparency a variantStep adds is flattened on a flattened format', async () => {
+  const clear: VariantStep = (raster) =>
+    sharpToRaster(rasterToSharp(raster).ensureAlpha(0));
+  const { data } = await encodeVariant(
+    solid(20, 10, [10, 20, 30]),
+    variantPlan(sizePlan(20, 10), 'jpeg'),
+    encodeOptions([clear]),
+  );
+  for (const channel of await encodedPixel(data, 5, 5)) {
+    assert.ok(channel >= 250, String(channel));
+  }
+});
+
+test('a variantStep that removes alpha gets no background', async () => {
+  const requests: EncodeRequest[] = [];
+  const recording = lying({
+    encode: (raster, req, o) => {
+      requests.push(req);
+      return engine.encode(raster, req, o);
+    },
+  });
+  const opaque: VariantStep = (raster) =>
+    sharpToRaster(rasterToSharp(raster).removeAlpha());
+  await encodeVariant(
+    solid(20, 10, [10, 20, 30, 128]),
+    variantPlan(sizePlan(20, 10), 'jpeg'),
+    { ...encodeOptions([opaque]), engine: recording },
+  );
+  assert.equal(requests[0].background, undefined);
+});
+
+test('a step that resolves with a Sharp instance is told to return its pixels', async () => {
+  const lazy = (raster: Raster) => rasterToSharp(raster) as unknown as Raster;
+  const expected = (kind: string) => (err: ResizeError) => {
+    assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
+    assert.match(err.message, new RegExp(`a ${kind} resolved with`));
+    assert.match(
+      err.message,
+      /it is a Sharp instance, not its pixels: return sharpToRaster\(img\)/,
+    );
+    return true;
+  };
+  await assert.rejects(
+    encodeVariant(
+      solid(20, 10, [1, 2, 3]),
+      variantPlan(sizePlan(20, 10), 'webp'),
+      encodeOptions([lazy]),
+    ),
+    expected('variantStep'),
+  );
+  await assert.rejects(
+    runBeforeSteps(solid(20, 10, [1, 2, 3]), [lazy], {
+      media: { id: 'm1' },
+      source: encodeOptions().source,
+      ctx: {},
+    }),
+    expected('beforeStep'),
+  );
+});
+
+test('a premultiplied variantStep result reaches the engine as straight alpha', async () => {
+  const seen: Raster[] = [];
+  const recording = lying({
+    encode: (raster, req, o) => {
+      seen.push(raster);
+      return engine.encode(raster, req, o);
+    },
+  });
+  const marked: VariantStep = (raster) => ({
+    data: raster.data,
+    info: { ...raster.info, premultiplied: true },
+  });
+  await encodeVariant(
+    solid(20, 10, [50, 50, 50, 128]),
+    variantPlan(sizePlan(20, 10), 'png'),
+    { ...encodeOptions([marked]), engine: recording },
+  );
+  assert.equal(seen[0].info.premultiplied, undefined);
+  assert.deepEqual(pixelAt(seen[0], 0, 0), [100, 100, 100, 128]);
+});
+
+test('a variantStep that resolves with a Buffer is RESIZE_PIPELINE_STEP_INVALID', async () => {
+  const buffer = (raster: Raster) => raster.data as unknown as Raster;
+  await assert.rejects(
+    encodeVariant(
+      solid(20, 10, [1, 2, 3]),
+      variantPlan(sizePlan(20, 10), 'webp'),
+      encodeOptions([buffer]),
+    ),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
+      assert.match(err.message, /a variantStep resolved with/);
+      return true;
+    },
+  );
 });
 
 test('encodeVariant reports the encoded size and content type', async () => {
@@ -536,14 +692,6 @@ test('straightAlpha converts a premultiplied animation frame by frame and keeps 
   assertNear(pixelAt(straight, 0, 0, 1), [50, 100, 0, 128]);
 });
 
-const lying = (over: Partial<ImageEngine>): ImageEngine => ({
-  id: 'liar',
-  formats: ['webp'],
-  animatedFormats: [],
-  resize: (frame, req, o) => engine.resize(frame, req, o),
-  encode: (raster, req, o) => engine.encode(raster, req, o),
-  ...over,
-});
 const encodedAs = (fields: Partial<EncodedImage>): ImageEngine =>
   lying({
     encode: async () =>
@@ -609,6 +757,7 @@ test('a resize result of another size is RESIZE_ENGINE_INVALID', async () => {
 test('an engine that reports SVG by format or by contentType is refused', async () => {
   for (const fields of [
     { format: 'svg' },
+    { format: 'SVG' },
     { format: 'webp', contentType: 'IMAGE/SVG+XML' },
   ]) {
     await assert.rejects(
