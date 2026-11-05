@@ -71,6 +71,36 @@
   `verify()`, and `resolve()` then logs an `error` and returns an empty decision, so previews stored
   earlier stop being served until the root is fixed. `new LocalFsStorage()` throws at construction.
   The replacement for `''` is `'.'`, which is the same folder.
+- **Timing a timer cannot wait for is refused.** `leaseMs`, `idlePollMs` and `taskTimeoutMs` above
+  `2147483647`, the longest a Node timer takes, are `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
+  `RESIZE_CONFIG_QUEUE_INVALID`. At `taskTimeoutMs: 3000000000` every task timed out after about 1
+  ms and was dead-lettered, but a `leaseMs` of 24.8 to 49.7 days ran on 0.3.0, and it is refused
+  too. From a config file the refusal comes at first use or `verify()`. On a framework host with no
+  boot `verify()`, the first `resolve()` logs one `error` and returns an empty decision, and so does
+  every later read, so previews stored earlier stop being served until the value is fixed. A task
+  queue passed in code keeps serving them and queues nothing, and `resolve()` logs the refusal once
+  per queue name. `LogMetrics` refuses such a `summaryIntervalMs` at construction
+  (`RESIZE_METRICS_INVALID`). `limits.processingTimeoutSeconds` above 3600, where every Sharp call
+  threw, is `RESIZE_CONFIG_INVALID`, with the same first-use refusal from a config file.
+- **A media store must keep what the worker writes.** After its writes the worker reloads the media
+  and compares the rows under each `storageRef` it wrote (refs compare with sorted keys, and log
+  lines print them that way, so a store that reorders a ref's keys holds the same ref), as written
+  before any observer ran, so a tap that redacts its row is not blamed on the store. When rows exist
+  there and none matches what was written in `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`,
+  `pipeline` and `filters`, or none has a `contentType`, the task dead-letters with
+  `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields. So does a row that comes back
+  with those fields as written but no `storageRef`. A custom store that dropped one of these, and so
+  rendered again on every read without a log line, now fails visibly. A store with no `identity`
+  column, or its own form of it, keeps working: a read does not use it. It gets one `warn` per
+  Resizer, because `invalidate()` finds such rows only by identity, so it leaves them, and a
+  `replacePreviews` that removes by stored identity leaves them too. A reload that lags raises
+  nothing, except on a driver that names files by their bytes, where it can show another row under
+  the same ref, an older row after a replacement (naming `encodeSig`) or another size key's row on a
+  first render (naming `sizeKey`): the task is dead, though its rows are stored and the next read is
+  fresh. `MongoMediaStore` with the current fragment and a driver that names files at random, as the
+  shipped ones do, is not affected. `verify()` now also rejects a strict row schema without
+  `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
+  could never serve such a row.
 
 **Changed behaviour**
 
@@ -127,6 +157,12 @@
 - `resolve()` on a Resizer that could not start logs its `error` once per Resizer and error, where
   it logged on every read, so a busy API does not flood its log. `resize.read` with the outcome
   `failed` still counts every read. `prewarm()` logs as before.
+- `MongoMediaStore` records the measured dimensions only while the original holds no stored pair, so
+  they cannot land on an original swapped in during a render, except from an older worker in a
+  rolling deploy, whose write has no such condition. Two originals without dimensions swapped during
+  one render still get the first one's pair. The update form needs MongoDB 4.2, and the driver in use
+  may require more (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
+  `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it.
 
 **Features**
 
@@ -143,9 +179,28 @@
   `RESIZE_ADOPT_MAX_BYTES_INVALID`.
 - `formatPictureUrls` entries carry `width` and `height` when the row has them, since a size key
   does not promise a size. A host that snapshots its API JSON sees two new fields.
+- `onPreviewReplaced(row, ctx)`: an observer that gets each row a write of `generate()` or the worker
+  removed, so a host can delete old files without parsing a log line. The event bus receives it as
+  `resize:onPreviewReplaced`. The log line stays.
 
 **Fixes**
 
+- `GenerateResult.replaced` no longer names a ref a new row of the same write or the original holds:
+  on a driver that names files by their bytes, a host deleting those refs deleted a file in use.
+  Refs compare as JSON with sorted keys, so a value that reads back in another form (a Buffer in a
+  custom ref, as a bson `Binary`) is still named: such a driver uses a sweep. `generate()` reads the
+  refs before the observers run, so a tap cannot change them, and a removed row it cannot read no
+  longer makes `generate()` throw after its write.
+- A task observer (`afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`) that never settles no
+  longer stops the worker. It stopped the loop for good: other tasks stayed `pending`, a Resizer on
+  the same loop starved, metrics were not flushed, and a stop hung with no line logged. The worker
+  now awaits it up to `taskTimeoutMs` and, once it is stopping, up to 5 s after the later of the
+  stop and the task's end, logs one `warn`, and goes on while the tap keeps running beside the next
+  task.
+- A row `MongoMediaStore.replacePreviews` writes stores an `_id` exactly when an appended row would,
+  unless working it out fails, so it reads the same id on every load. A row replaced under 0.3.0 has
+  none stored and reads a new random one on each load until it is next replaced: nothing migrates it,
+  reading it renders nothing, and it is removed by `identity` or with `invalidate()`.
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
 - The dispatcher's once-log sets are capped at 100 keys, and every once-log stores at most 1000

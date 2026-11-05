@@ -7,7 +7,8 @@
 // logger that throws never stops the loop. A task's failure is logged here, whatever the metrics
 // sink is. A thrown value may be host code, so it is read only through the guarded helpers of
 // helpers/log.ts: it cannot stop the loop, and the module's own line is always one line. The stack
-// of an unexpected error follows that line as the logger prints it, so later lines are not ours.
+// of an unexpected error follows that line as the logger prints it, so later lines are not ours. A
+// task observer is host code too: the loop waits for it up to a bound (OBSERVER_STOP_GRACE_MS).
 import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
@@ -28,7 +29,7 @@ import {
   logNeverThrow,
   notRetryable,
 } from './helpers/log.ts';
-import { sleep } from './helpers/sleep.ts';
+import { MAX_TIMER_MS, sleep } from './helpers/sleep.ts';
 import { gateKey } from './lockKeys.ts';
 import { errorCodeLabel } from './metrics.ts';
 import type { QueueTiming } from './timing.ts';
@@ -77,6 +78,7 @@ export interface ConsumerDeps {
   // goes on the task's completed outcome. The signal aborts on a lost lease, a timeout or the
   // shutdown.
   handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<unknown>;
+  // Awaited after each task's end, up to a bound (OBSERVER_STOP_GRACE_MS).
   events?: TaskEventHandler;
   logger: ResizeLogger;
   // Optional: the Resizers this worker serves, passed to every claim, so a queue that filters
@@ -93,10 +95,12 @@ export interface ConsumerDeps {
 }
 
 // The queue a claimed task was claimed from and when (performance.now()): its outcome's `queue`
-// label and the start of its run time.
+// label and the start of its run time. `stop`: its loop's stop, which cuts the wait for its
+// observers.
 interface ClaimStart {
   queue: string;
   start: number;
+  stop: AbortSignal;
 }
 
 // The `outcome` label of a task event on the metrics sink.
@@ -231,6 +235,29 @@ const never = () => false;
 
 const nothing = () => {};
 
+// A task's observers are awaited in order, before the next task, for at most its queue's
+// taskTimeoutMs: one that never settles must not stop the loop, starve the other Resizers on it, or
+// keep the worker from flushing its metrics and logging its stop. Once the loop is stopping they
+// get at most this long, after the later of the stop and the start of their wait: a stop that came
+// long before the task ended must not take their time away, and a deploy must not wait out
+// taskTimeoutMs for them. So a stop adds at most this per loop after the running handler ends. A
+// tap past the bound keeps running beside the next task, since nothing can cancel host code.
+export const OBSERVER_STOP_GRACE_MS = 5_000;
+
+/**
+ * The wait after `failures` failed claims in a row. A valid idlePollMs fits a timer, but its
+ * multiple may not.
+ */
+export function claimRetryDelayMs(
+  idlePollMs: number,
+  failures: number,
+): number {
+  return Math.min(
+    idlePollMs * Math.min(2 ** (failures - 1), MAX_CLAIM_ERROR_BACKOFF),
+    MAX_TIMER_MS,
+  );
+}
+
 export class Consumer {
   readonly #deps: ConsumerDeps;
   // How long one gate call, or all the gate calls at a task's end, may take (see GateLock).
@@ -277,9 +304,7 @@ export class Consumer {
           break;
         }
         claimFailures += 1;
-        const waitMs =
-          idlePollMs *
-          Math.min(2 ** (claimFailures - 1), MAX_CLAIM_ERROR_BACKOFF);
+        const waitMs = claimRetryDelayMs(idlePollMs, claimFailures);
         logNeverThrow(
           logger,
           `resize worker: claiming a task failed (${claimFailures} in a row) — retrying in ${waitMs} ms`,
@@ -324,7 +349,7 @@ export class Consumer {
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
             { code: 'RESIZE_TASK_MAX_ATTEMPTS', retryable: false },
           ),
-          { forceDead: true, claim: { queue, start: claimedAt } },
+          { forceDead: true, claim: { queue, start: claimedAt, stop: signal } },
         );
         waitStart = performance.now();
         continue;
@@ -337,6 +362,7 @@ export class Consumer {
       await this.#runTask(task, coordination, signal, {
         queue,
         start: claimedAt,
+        stop: signal,
       });
       waitStart = performance.now();
     }
@@ -578,15 +604,65 @@ export class Consumer {
         ...(task.queue === claim.queue ? {} : { payloadQueue: task.queue }),
       },
     );
-    try {
-      await this.#deps.events?.(event, toLeasedTask(task), error);
-    } catch (err) {
+    const { events, logger, timing } = this.#deps;
+    const waitStart = performance.now();
+    const observers = Promise.try(() =>
+      events?.(event, toLeasedTask(task), error),
+    ).then(nothing, (err) => {
       // A throwing observer must not undo the task's state or stop the loop.
       logNeverThrow(
-        this.#deps.logger,
+        logger,
         `resize worker: ${event} event handler failed`,
         err,
       );
+    });
+    const ended = await this.#waitForObservers(observers, claim.stop);
+    if (ended !== 'settled') {
+      const bound =
+        ended === 'stop'
+          ? `the worker is stopping, and waits ${OBSERVER_STOP_GRACE_MS} ms at most`
+          : `taskTimeoutMs is ${timing.taskTimeoutMs} ms`;
+      logNeverThrow(
+        logger,
+        `resize worker: the ${event} observers of task ${task.taskId} did not settle within ${Math.round(performance.now() - waitStart)} ms (${bound}) — the worker goes on, and they keep running`,
+        undefined,
+        'warn',
+      );
+    }
+  }
+
+  /**
+   * Wait for a task's observers up to the bounds OBSERVER_STOP_GRACE_MS states; whatever is still
+   * pending then goes on alone. Resolves with what ended the wait, so a line names the right bound.
+   */
+  async #waitForObservers(
+    observers: Promise<void>,
+    stop: AbortSignal,
+  ): Promise<'settled' | 'timeout' | 'stop'> {
+    const limit = untilDeadline(
+      gateDeadlineIn(this.#deps.timing.taskTimeoutMs),
+    );
+    const graceOver = Promise.withResolvers<'stop'>();
+    let grace: ReturnType<typeof untilDeadline> | undefined;
+    const startGrace = () => {
+      grace = untilDeadline(gateDeadlineIn(OBSERVER_STOP_GRACE_MS));
+      void grace.late.then(() => graceOver.resolve('stop'));
+    };
+    if (stop.aborted) {
+      startGrace();
+    } else {
+      stop.addEventListener('abort', startGrace, { once: true });
+    }
+    try {
+      return await Promise.race([
+        observers.then(() => 'settled' as const),
+        limit.late.then(() => 'timeout' as const),
+        graceOver.promise,
+      ]);
+    } finally {
+      limit.cancel();
+      grace?.cancel();
+      stop.removeEventListener('abort', startGrace);
     }
   }
 

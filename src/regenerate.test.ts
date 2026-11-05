@@ -6,12 +6,19 @@
 // nothing for rows that turn out fresh. Real Sharp, in-memory storage, media documents and task
 // queue; resetResizerForTests() between two Resizers of one name stands in for a redeploy.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { afterEach, test } from 'node:test';
 import mongoose from 'mongoose';
 import sharp from 'sharp';
 import type { MediaStore } from './contracts/media.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
-import { Resizer, resetResizerForTests } from './resizer.ts';
+import type { ResizeError } from './errors.ts';
+import { getPreviewIdentity, previewScope } from './images.ts';
+import {
+  Resizer,
+  type ResizerOptions,
+  resetResizerForTests,
+} from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
   docMedia,
@@ -1301,3 +1308,1788 @@ test('a locator holding a Buffer: the row is signed as the read path signs it, s
   assert.deepEqual(decision.missing, []);
   assert.equal(decision.ready[0].stale ?? false, false);
 });
+
+// ---- The media store must keep what the worker writes.
+
+/** A store that loses `field` from the rows it stores, and answers with the rows it was given. */
+const losing =
+  (field: keyof Preview, only: (row: Preview) => boolean = () => true) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore => {
+    const strip = (rows: Preview[]): Preview[] =>
+      rows.map((row) => {
+        if (!only(row)) {
+          return row;
+        }
+        const { [field]: _lost, ...rest } = row;
+        return rest as Preview;
+      });
+    return fakeMedia({
+      load: (id) => inner.loadMedia(id),
+      appendPreviews: async (id, previews, dims) => {
+        await inner.appendPreviews(id, strip(previews), dims);
+        return previews;
+      },
+      replacePreviews: async (id, identities, rows) => {
+        const { removed } = await inner.replacePreviews(
+          id,
+          identities,
+          strip(rows),
+        );
+        return { stored: rows, removed };
+      },
+    });
+  };
+
+/** Upload the png as the original of media m1, with no previews stored yet. */
+async function bareMedia(
+  w: ReturnType<typeof world>,
+  r: Resizer,
+): Promise<MediaLike> {
+  const original = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+  return doc;
+}
+
+/** The errors of the tasks `r` dead-letters from now on. */
+function deadErrors(r: Resizer): ResizeError[] {
+  const errors: ResizeError[] = [];
+  r.hook('onTaskDeadLettered', (_task, err) => {
+    errors.push(err as ResizeError);
+  });
+  return errors;
+}
+
+const statuses = (w: ReturnType<typeof world>) =>
+  w.tasks.rows.map((row) => [row.status, row.attempts]);
+
+/** Storage that names a preview by its bytes: equal bytes give one ref. */
+function contentAddressed(w: ReturnType<typeof world>): void {
+  const upload = w.storage.upload.bind(w.storage);
+  w.storage.upload = (args) =>
+    upload({
+      ...args,
+      key: `previews/${createHash('sha256').update(args.body).digest('hex')}`,
+    });
+}
+
+// Both boxes are larger than the 64×64 source, so both previews are the source at its own size:
+// equal bytes, two size keys.
+const twoBoxes: SizeInput[] = [
+  { width: 100, height: 100 },
+  { width: 200, height: 200 },
+];
+
+for (const field of [
+  'origin',
+  'encodeSig',
+  'sizeKey',
+  'format',
+  'contentType',
+  'storageRef',
+] as const) {
+  test(`a store that loses ${field}: the first task is dead with RESIZE_MEDIA_ROW_NOT_KEPT naming it, after one upload`, async () => {
+    const w = world({ wrap: losing(field) });
+    const { logger, lines } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+    const files = w.files.size;
+    const errors = deadErrors(r);
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.equal(w.files.size, files + 1);
+    assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+    assert.equal(errors[0].retryable, false);
+    assert.equal(
+      errors[0].message,
+      `resize worker: the media store did not keep ${field} of 1 preview row(s) of media m1, so reads may render them again and again — a MediaStore must store and return storageRef, origin, encodeSig, sizeKey, format, contentType, resizer, pipeline and filters as given: default:default:20x20:webp:none (${field})`,
+    );
+    if (field === 'encodeSig') {
+      // An operator finds it in the dead line (src/consumer.ts).
+      assert.equal(lines('error', /RESIZE_MEDIA_ROW_NOT_KEPT/).length, 1);
+    }
+  });
+}
+
+// `losing` answers with the rows it was given. This store answers with what it really stored, so
+// the recorder leaves the row out, and the check must still see it.
+for (const field of [
+  'sizeKey',
+  'format',
+  'contentType',
+  'storageRef',
+] as const) {
+  test(`a store that answers with the rows as it stored them, without ${field}: dead at once too, after one upload`, async () => {
+    const w = world({
+      wrap: (inner) =>
+        fakeMedia({
+          load: (id) => inner.loadMedia(id),
+          appendPreviews: async (id, previews, dims) => {
+            const rows = previews.map((row) => {
+              const { [field]: _lost, ...rest } = row;
+              return rest as Preview;
+            });
+            await inner.appendPreviews(id, rows, dims);
+            return rows;
+          },
+          replacePreviews: (id, identities, rows) =>
+            inner.replacePreviews(id, identities, rows),
+        }),
+    });
+    const r = w.resizer(webpConfig(80));
+    const doc = await bareMedia(w, r);
+    const files = w.files.size;
+    const errors = deadErrors(r);
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.equal(w.files.size, files + 1);
+    assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+  });
+}
+
+for (const [field, pipeline, filters] of [
+  ['pipeline', 'x', undefined],
+  ['filters', 'default', { blur: 2 }],
+] as const) {
+  test(`a store that loses ${field}: reads would miss the row, so the task is dead too`, async () => {
+    const w = world({ wrap: losing(field) });
+    const r = w.resizer(webpConfig(80), undefined, { default: {}, x: {} });
+    const doc = await bareMedia(w, r);
+    const errors = deadErrors(r);
+
+    await r.resolve({
+      media: doc,
+      sizes: [{ width: 20, height: 20, ...(filters ? { filters } : {}) }],
+      formats: ['webp'],
+      pipeline,
+    });
+    await w.work(r);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+    assert.match(errors[0].message, new RegExp(`did not keep ${field} of 1`));
+  });
+}
+
+test('a store that loses resizer: reads of a named Resizer would miss the row, so the task is dead too', async () => {
+  const w = world();
+  const r = new Resizer({
+    name: 'listings',
+    config: webpConfig(80),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    media: losing('resizer')(w.store),
+    tasks: w.tasks,
+  });
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+  assert.match(
+    errors[0].message,
+    /did not keep resizer of 1 preview row\(s\).*listings:default:20x20:webp:none \(resizer\)$/,
+  );
+});
+
+// Its answer says nothing was stored, so attempt 1 finds the row it just wrote, sees other
+// signatures on it, and takes it for another worker's: blocked, not judged, and retried. Attempt 2
+// replaces that row, and a row a replace left out is judged.
+test("a store that answers [] and loses encodeSig: attempt 1 cannot tell its row from another worker's, so attempt 2 is dead, after two uploads", async () => {
+  const strip = (rows: Preview[]): Preview[] =>
+    rows.map(({ encodeSig: _lost, ...row }) => row);
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: async (id, previews, dims) => {
+          await inner.appendPreviews(id, strip(previews), dims);
+          return [];
+        },
+        replacePreviews: async (id, identities, rows) => {
+          const { removed } = await inner.replacePreviews(
+            id,
+            identities,
+            strip(rows),
+          );
+          return { stored: [], removed };
+        },
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const files = w.files.size;
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 2]]);
+  assert.equal(w.files.size, files + 2);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+});
+
+/**
+ * A store keyed by the identity it computes from each row's fields, as a table with its own key can
+ * be. Its `identity` column holds what `column` makes of the identity it was given.
+ */
+const tableStore =
+  (column: (identity: string) => string | null | undefined) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore => {
+    const keyOf = (row: Preview): string =>
+      getPreviewIdentity(
+        previewScope(row),
+        row.sizeKey,
+        row.format,
+        row.filters,
+      );
+    const asStored = ({ identity, ...row }: Preview): Preview => {
+      const value = column(String(identity));
+      return (
+        value === undefined ? row : { ...row, identity: value }
+      ) as Preview;
+    };
+    return fakeMedia({
+      load: (id) => inner.loadMedia(id),
+      appendPreviews: async (id, previews, dims) => {
+        await inner.appendPreviews(id, [], dims);
+        const doc = (await inner.loadMedia(id)) as MediaLike;
+        const rows = doc.previews ?? [];
+        const held = new Set(rows.map(keyOf));
+        const added = previews.filter((row) => !held.has(keyOf(row)));
+        doc.previews = [...rows, ...added.map(asStored)];
+        return added;
+      },
+      replacePreviews: async (id, identities, written) => {
+        const doc = (await inner.loadMedia(id)) as MediaLike;
+        const rows = doc.previews ?? [];
+        const gone = new Set([...identities, ...written.map(keyOf)]);
+        doc.previews = [
+          ...rows.filter((row) => !gone.has(keyOf(row))),
+          ...written.map(asStored),
+        ];
+        return {
+          stored: written,
+          removed: rows.filter((row) => gone.has(keyOf(row))),
+        };
+      },
+    });
+  };
+
+for (const [form, column] of [
+  ['absent', () => undefined],
+  ['null', () => null],
+  ['in its own form', (identity: string) => `own/${identity}`],
+] as const) {
+  test(`a store keyed by the computed identity, its identity column ${form}: tasks complete, reads are fresh, and one warning says what stays behind`, async () => {
+    const w = world({ wrap: tableStore(column) });
+    const { logger, logs, lines } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    const { decision } = await w.read(r, doc);
+    assert.deepEqual(decision.missing, []);
+    assert.equal(decision.ready[0].stale ?? false, false);
+    assert.equal(w.tasks.rows.length, 1);
+
+    // A second task, and no second line: one warning per Resizer.
+    await w.read(r, doc, [{ width: 30, height: 30 }]);
+    await w.work(r, logger);
+    assert.deepEqual(statuses(w), [
+      ['completed', 1],
+      ['completed', 1],
+    ]);
+    assert.deepEqual(logs.error, []);
+    const warned = lines('warn', /did not keep the identity/);
+    assert.equal(warned.length, 1);
+    assert.equal(
+      warned[0][0],
+      'resize worker: the media store did not keep the identity of 1 preview row(s) of media m1: invalidate() finds such rows only by identity, so it leaves them, and a replacePreviews that removes by stored identity leaves them too — store and return identity as given: default:default:20x20:webp:none',
+    );
+  });
+}
+
+test('a store keyed by the computed identity: a replacement is not blocked, and the new row is served', async () => {
+  const w = world({ wrap: tableStore(() => undefined) });
+  const first = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, first);
+  await w.read(first, doc);
+  await w.work(first);
+  const [before] = doc.previews ?? [];
+  resetResizerForTests();
+
+  const r = w.resizer(webpConfig(70));
+  const stale = await w.read(r, doc);
+  assert.equal(stale.decision.ready[0].stale, true);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['completed', 1],
+  ]);
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
+  assert.notDeepEqual(doc.previews?.[0].storageRef, before.storageRef);
+});
+
+test('a store keyed by the computed identity, with no identity column: invalidate() leaves its rows, as the warning says', async () => {
+  const w = world({ wrap: tableStore(() => undefined) });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(await r.invalidate({ media: doc }), []);
+
+  assert.equal(doc.previews?.length, 1);
+});
+
+test('a store that keeps contentType in its own form: the row is served, so the task completes and the next read is fresh', async () => {
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: async (id, previews, dims) => {
+          await inner.appendPreviews(
+            id,
+            previews.map((row) => ({
+              ...row,
+              contentType: row.contentType.toUpperCase(),
+            })),
+            dims,
+          );
+          return previews;
+        },
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
+  assert.equal(w.tasks.rows.length, 1);
+});
+
+test('a store whose rows keep their identity: no identity warning', async () => {
+  const w = world();
+  const { logger, lines } = recordingLogger();
+  const r = w.resizer(webpConfig(80), logger);
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r, logger);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  assert.deepEqual(lines('warn', /did not keep the identity/), []);
+});
+
+// ---- An old row without a ref is not the row a task wrote.
+
+/** A flat row from before rows had a storageRef, which 0.3.0 left unmigrated. */
+const flatRow = (): Preview =>
+  ({
+    key: 'old.webp',
+    bucket: 'b',
+    sizeKey: '20x20',
+    format: 'webp',
+    contentType: 'image/webp',
+  }) as unknown as Preview;
+
+/** The docMedia() store, with `after` run between each append and the reload that follows it. */
+const appending =
+  (
+    after: (
+      inner: ReturnType<typeof docMedia>,
+      id: string,
+      rows: Preview[],
+    ) => Promise<unknown>,
+  ) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore =>
+    fakeMedia({
+      load: (id) => inner.loadMedia(id),
+      appendPreviews: async (id, previews, dims) => {
+        const stored = await inner.appendPreviews(id, previews, dims);
+        await after(inner, id, stored);
+        return stored;
+      },
+      replacePreviews: (id, identities, rows) =>
+        inner.replacePreviews(id, identities, rows),
+    });
+
+const identitiesOf = (rows: Preview[]): string[] =>
+  rows.map((row) => row.identity as string);
+
+for (const [name, wrap] of [
+  [
+    'invalidate() landing between the write and the reload',
+    appending((inner, id, rows) =>
+      inner.replacePreviews(id, identitiesOf(rows), []),
+    ),
+  ],
+  [
+    'another worker replacing the row under its own ref',
+    appending((inner, id, rows) =>
+      inner.replacePreviews(
+        id,
+        identitiesOf(rows),
+        rows.map((row) => ({ ...row, storageRef: { key: 'theirs.webp' } })),
+      ),
+    ),
+  ],
+  [
+    'a custom store reshaping its refs',
+    (inner: ReturnType<typeof docMedia>): MediaStore =>
+      fakeMedia({
+        load: (id) => inner.loadMedia(id),
+        appendPreviews: async (id, previews, dims) => {
+          await inner.appendPreviews(
+            id,
+            previews.map((row) => ({
+              ...row,
+              storageRef: { path: keyOf(row) },
+            })),
+            dims,
+          );
+          return previews;
+        },
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  ],
+] as const) {
+  test(`an old row without a ref, of the same size and format, and ${name}: the task completes`, async () => {
+    const w = world({ wrap });
+    const { logger, logs } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+    doc.previews = [flatRow()];
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    assert.deepEqual(logs.error, []);
+  });
+}
+
+// ---- The check must never fail a task whose work is done.
+
+const hostileRef = (): Preview['storageRef'] => ({
+  toJSON() {
+    throw new TypeError('no JSON');
+  },
+  toString() {
+    throw new TypeError('no string');
+  },
+});
+
+const throwingIdentity = (row: Preview): Preview =>
+  Object.defineProperty({ ...row }, 'identity', {
+    enumerable: true,
+    get() {
+      throw new TypeError('no identity');
+    },
+  });
+
+/** A row of nothing this file requests. */
+const unrelatedRow = (storageRef: Preview['storageRef']): Preview => ({
+  storageRef,
+  sizeKey: '999x999',
+  format: 'webp',
+  contentType: 'image/webp',
+  identity: 'default:default:999x999:webp:none',
+});
+
+/** The docMedia() store, but `rows` decides what each load shows of the rows it holds. */
+const showing =
+  (rows: (held: Preview[]) => Preview[]) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore =>
+    fakeMedia({
+      load: async (id) => {
+        const doc = await inner.loadMedia(id);
+        return doc && { ...doc, previews: rows(doc.previews ?? []) };
+      },
+      appendPreviews: (id, previews, dims) =>
+        inner.appendPreviews(id, previews, dims),
+      replacePreviews: (id, identities, written) =>
+        inner.replacePreviews(id, identities, written),
+    });
+
+for (const [name, wrap] of [
+  [
+    'a ref whose JSON and String() both throw, on an unrelated row',
+    showing((held) => [unrelatedRow(hostileRef()), ...held]),
+  ],
+  [
+    'a throwing identity getter, on an unrelated row',
+    showing((held) => [
+      throwingIdentity(unrelatedRow({ key: 'unrelated' })),
+      ...held,
+    ]),
+  ],
+  [
+    'a throwing identity getter, on the row under the written ref',
+    showing((held) => held.map(throwingIdentity)),
+  ],
+] as const) {
+  test(`${name}: the task completes at its first attempt`, async () => {
+    const w = world({ wrap });
+    const { logger, logs } = recordingLogger();
+    const r = w.resizer(webpConfig(80), logger);
+    const doc = await bareMedia(w, r);
+
+    await w.read(r, doc);
+    await w.work(r, logger);
+
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    assert.deepEqual(logs.error, []);
+    assert.equal(rowsOf(doc).length, 1);
+  });
+}
+
+test('a ref whose JSON and String() both throw, on the row under the written ref: the task completes at its first attempt', async () => {
+  const w = world();
+  const { logger, logs } = recordingLogger();
+  const r = w.resizer(webpConfig(80), logger);
+  const doc = await bareMedia(w, r);
+  // Only the preview's locator: the original's was stored above.
+  w.storage.upload = async () => hostileRef();
+
+  await w.read(r, doc);
+  await w.work(r, logger);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  assert.deepEqual(logs.error, []);
+  assert.equal(rowsOf(doc).length, 1);
+});
+
+test('a check that throws logs one line, and each task keeps its result', async () => {
+  // Each reload holds rows that cannot be read the first time, which nothing in the check guards
+  // row by row: the worker's own guard is what is left. Every task loads twice.
+  let loads = 0;
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: async (id) => {
+          const doc = await inner.loadMedia(id);
+          loads += 1;
+          if (!doc || loads % 2 === 1) {
+            return doc;
+          }
+          let thrown = false;
+          return Object.defineProperty({ ...doc }, 'previews', {
+            get() {
+              if (!thrown) {
+                thrown = true;
+                throw new TypeError('no rows');
+              }
+              return doc.previews;
+            },
+          });
+        },
+        appendPreviews: (id, previews, dims) =>
+          inner.appendPreviews(id, previews, dims),
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  });
+  const { logger, logs, lines } = recordingLogger();
+  const r = w.resizer(webpConfig(80), logger);
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r, logger);
+  await w.read(r, doc, [{ width: 30, height: 30 }]);
+  await w.work(r, logger);
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['completed', 1],
+  ]);
+  assert.deepEqual(logs.error, []);
+  const warned = lines('warn', /could not check what the media store kept/);
+  assert.equal(warned.length, 1);
+  assert.match(String(warned[0][0]), /media m1.*keeps its result/);
+  assert.match(String(warned[0][1]), /no rows/);
+});
+
+// The case the group rule exists for.
+test('a content-addressed store gives two size keys one ref: the task completes and the next read queues nothing', async () => {
+  const w = world();
+  contentAddressed(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc, twoBoxes);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  const rows = doc.previews ?? [];
+  assert.deepEqual(
+    rows.map((row) => row.sizeKey),
+    ['100x100', '200x200'],
+  );
+  // The case itself: one written row's first row under the ref is another size key's.
+  assert.deepEqual(rows[0].storageRef, rows[1].storageRef);
+  const again = await w.read(r, doc, twoBoxes);
+  assert.equal(again.decision.missing.length, 0);
+  assert.equal(w.tasks.rows.length, 1);
+});
+
+test('one ref for two rows, and the store lost encodeSig of one: only that row is named', async () => {
+  const w = world({
+    wrap: losing('encodeSig', (row) => row.sizeKey === '200x200'),
+  });
+  contentAddressed(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+
+  await w.read(r, doc, twoBoxes);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.match(
+    errors[0].message,
+    /did not keep encodeSig of 1 preview row\(s\)/,
+  );
+  assert.match(
+    errors[0].message,
+    /default:default:200x200:webp:none \(encodeSig\)$/,
+  );
+});
+
+for (const field of ['format', 'filters', 'pipeline'] as const) {
+  test(`one ref for two rows, and the store lost ${field} of one: that field is named, not the other size key's`, async () => {
+    const w = world({
+      wrap: losing(field, (row) => row.sizeKey === '200x200'),
+    });
+    contentAddressed(w);
+    const r = w.resizer(webpConfig(80), undefined, { default: {}, x: {} });
+    const doc = await bareMedia(w, r);
+    const errors = deadErrors(r);
+
+    await r.resolve({
+      media: doc,
+      sizes: twoBoxes.map((size) => ({ ...size, filters: { blur: 2 } })),
+      formats: ['webp'],
+      pipeline: 'x',
+    });
+    await w.work(r);
+
+    assert.deepEqual(statuses(w), [['dead', 1]]);
+    assert.match(
+      errors[0].message,
+      new RegExp(
+        `did not keep ${field} of 1 preview row.*:200x200:.* \\(${field}\\)$`,
+      ),
+    );
+  });
+}
+
+/** The docMedia() store. While `lag.on`, each second load shows the rows the first one showed. */
+const lagging =
+  (lag: { on: boolean }) =>
+  (inner: ReturnType<typeof docMedia>): MediaStore => {
+    let held: Preview[] | undefined;
+    return fakeMedia({
+      load: async (id) => {
+        const doc = await inner.loadMedia(id);
+        if (!doc || !lag.on) {
+          return doc;
+        }
+        if (!held) {
+          held = [...(doc.previews ?? [])];
+          return doc;
+        }
+        const previews = held;
+        held = undefined;
+        return { ...doc, previews };
+      },
+      appendPreviews: (id, previews, dims) =>
+        inner.appendPreviews(id, previews, dims),
+      replacePreviews: (id, identities, rows) =>
+        inner.replacePreviews(id, identities, rows),
+    });
+  };
+
+// The two forms of one accepted corner, on a driver that names files by their bytes: the row under
+// the written ref is another one, because this task's row is not back yet.
+test('a lagging reload on a byte-named driver, another size key already under the ref: a first render is dead naming sizeKey, its rows are stored, and the next read is fresh', async () => {
+  const lag = { on: false };
+  const w = world({ wrap: lagging(lag) });
+  contentAddressed(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+  await w.read(r, doc, [twoBoxes[0]]);
+  await w.work(r);
+
+  lag.on = true;
+  await w.read(r, doc, [twoBoxes[1]]);
+  await w.work(r);
+  lag.on = false;
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['dead', 1],
+  ]);
+  assert.match(errors[0].message, /did not keep sizeKey of 1 preview row/);
+  assert.equal(doc.previews?.length, 2);
+  const { decision } = await w.read(r, doc, twoBoxes);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(
+    decision.ready.some((entry) => entry.stale),
+    false,
+  );
+});
+
+test('a lagging reload on a byte-named driver after a replacement: the task is dead naming encodeSig, its row is stored, and the next read is fresh', async () => {
+  const lag = { on: false };
+  const w = world({ wrap: lagging(lag) });
+  contentAddressed(w);
+  const first = w.resizer(webpConfig(80), undefined, { default: {} });
+  const doc = await bareMedia(w, first);
+  await w.read(first, doc);
+  await w.work(first);
+  resetResizerForTests();
+
+  // Another pipeline version over equal bytes: another signature under the same ref.
+  const r = w.resizer(webpConfig(80), undefined, {
+    default: { version: '2' },
+  });
+  const errors = deadErrors(r);
+  lag.on = true;
+  await w.read(r, doc);
+  await w.work(r);
+  lag.on = false;
+
+  assert.deepEqual(statuses(w), [
+    ['completed', 1],
+    ['dead', 1],
+  ]);
+  assert.match(errors[0].message, /did not keep encodeSig of 1 preview row/);
+  const { decision } = await w.read(r, doc);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale ?? false, false);
+});
+
+test('a store that loses encodeSig from a replaced row: the task is dead too', async () => {
+  const w = world();
+  const doc = await w.seed(w.resizer(webpConfig(80)));
+  resetResizerForTests();
+  const r = new Resizer({
+    config: webpConfig(70),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    media: losing('encodeSig')(w.store),
+    tasks: w.tasks,
+  });
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+});
+
+test('a reload that lags behind the write raises nothing: the task completes as before', async () => {
+  let loads = 0;
+  const w = world({
+    wrap: (inner) =>
+      fakeMedia({
+        load: async (id) => {
+          const doc = await inner.loadMedia(id);
+          loads += 1;
+          return loads > 1 && doc ? { ...doc, previews: [] } : doc;
+        },
+        appendPreviews: (id, previews, dims) =>
+          inner.appendPreviews(id, previews, dims),
+        replacePreviews: (id, identities, rows) =>
+          inner.replacePreviews(id, identities, rows),
+      }),
+  });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.ok(loads > 1);
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+});
+
+test("an original swapped during the worker's download stays the retryable RESIZE_WORKER_INCOMPLETE, and its retry completes", async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const other = await r.uploadOriginal({ body: png, visibility: 'private' });
+  const download = w.storage.download;
+  let swapped = false;
+  w.storage.download = async (ref) => {
+    const bytes = await download(ref);
+    if (!swapped) {
+      swapped = true;
+      doc.original = other;
+    }
+    return bytes;
+  };
+  const failed: string[] = [];
+  r.hook('onTaskFailed', (_task, err) => {
+    failed.push((err as ResizeError).code);
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(failed, ['RESIZE_WORKER_INCOMPLETE']);
+  assert.deepEqual(statuses(w), [['completed', 2]]);
+});
+
+test('generate() reads nothing back: a store that loses encodeSig does not fail the call', async () => {
+  const w = world({ wrap: losing('encodeSig') });
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  const { created } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(created.length, 1);
+});
+
+/** Media m1 with its row stored under quality 80, and a redeploy with other settings to come. */
+async function storedThenChanged() {
+  const w = world();
+  const doc = await w.seed(w.resizer(webpConfig(80)));
+  const [old] = rowsOf(doc);
+  resetResizerForTests();
+  return { w, doc, old };
+}
+
+/** A Resizer with the new settings over the world's store, with its own replacePreviews. */
+function replacingWith(
+  w: ReturnType<typeof world>,
+  replacePreviews: MediaStore['replacePreviews'],
+  opts: Partial<ResizerOptions> = {},
+): Resizer {
+  return new Resizer({
+    config: webpConfig(70),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    tasks: w.tasks,
+    media: fakeMedia({
+      load: (id) => w.store.loadMedia(id),
+      appendPreviews: (id, rows, dims) =>
+        w.store.appendPreviews(id, rows, dims),
+      replacePreviews,
+    }),
+    ...opts,
+  });
+}
+
+test('the worker replacing a stale row fires onPreviewReplaced once, with the removed row and ctx {}, after onPreviewGenerated', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const r = w.resizer(webpConfig(70));
+  const order: string[] = [];
+  const calls: { row: Preview; ctx: Record<string, unknown> }[] = [];
+  r.hook('onPreviewGenerated', () => {
+    order.push('generated');
+  });
+  r.hook('onPreviewReplaced', (row, ctx) => {
+    order.push('replaced');
+    calls.push({ row, ctx });
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(order, ['generated', 'replaced']);
+  assert.deepEqual(calls[0].row.storageRef, old.storageRef);
+  assert.equal(calls[0].row.identity, old.identity);
+  assert.deepEqual(calls[0].ctx, {});
+  assert.notDeepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
+});
+
+test('generate() fires onPreviewReplaced too, for the refs its result names as replaced', async () => {
+  const { w, doc } = await storedThenChanged();
+  const r = w.resizer(webpConfig(70));
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  const { replaced } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(fired.length, 1);
+  assert.deepEqual(replaced, [fired[0].storageRef]);
+});
+
+test('onPreviewReplaced stays silent when no write removed a row: a first render, persist: false, invalidate()', async () => {
+  const w = world();
+  const fired: Preview[] = [];
+  const first = w.resizer(webpConfig(80));
+  first.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(first);
+  resetResizerForTests();
+  const later = w.resizer(webpConfig(70));
+  later.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await later.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+    persist: false,
+  });
+  const refs = await later.invalidate({ media: structuredClone(doc) });
+
+  assert.equal(refs.length, 1);
+  assert.deepEqual(fired, []);
+});
+
+test('a tap that throws costs nothing: the next tap runs, the task completes, and the failure is logged', async () => {
+  const { w, doc } = await storedThenChanged();
+  const { logger, lines } = recordingLogger();
+  const r = w.resizer(webpConfig(70), logger);
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', () => {
+    throw new Error('the host could not delete it');
+  });
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.equal(fired.length, 1);
+  assert.deepEqual(statuses(w).at(-1), ['completed', 1]);
+  assert.equal(
+    lines('error', /resize hook onPreviewReplaced failed/).length,
+    1,
+  );
+});
+
+test('every row the write removed is reported, also a copy another worker stored meanwhile', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const copy: Preview = { ...old, storageRef: { key: 'their-copy' } };
+  const r = replacingWith(w, async (id, identities, rows) => {
+    const result = await w.store.replacePreviews(id, identities, rows);
+    return { ...result, removed: [...result.removed, copy] };
+  });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(
+    fired.map((row) => row.storageRef),
+    [old.storageRef, copy.storageRef],
+  );
+});
+
+test('a rejected replace fires nothing: no row was removed', async () => {
+  const { w, doc } = await storedThenChanged();
+  const r = replacingWith(w, async () => {
+    throw new Error('the database is down');
+  });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await assert.rejects(
+    r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    }),
+    /the database is down/,
+  );
+  assert.deepEqual(fired, []);
+});
+
+test('the event bus receives resize:onPreviewReplaced with the removed row', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const emitted: unknown[][] = [];
+  const r = replacingWith(
+    w,
+    (id, identities, rows) => w.store.replacePreviews(id, identities, rows),
+    {
+      events: {
+        emit: (...args: unknown[]) => {
+          emitted.push(args);
+        },
+      },
+    },
+  );
+
+  await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  const event = emitted.find(([name]) => name === 'resize:onPreviewReplaced');
+  assert.ok(event);
+  assert.deepEqual((event[1] as Preview).storageRef, old.storageRef);
+});
+
+test('a replacement that keeps the ref of the row it replaced is not reported: that file is in use', async () => {
+  const w = world();
+  contentAddressed(w);
+  const pipeline: Pipeline = {};
+  const r = w.resizer(webpConfig(80), undefined, { default: pipeline });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(r);
+  pipeline.version = 'v2';
+
+  const media = structuredClone(doc);
+  const { created, replaced } = await r.generate({
+    media,
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(created.length, 1);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+  assert.equal(rowsOf(doc).length, 1);
+  // The swap in the caller's media goes by identity, so it still happens.
+  assert.deepEqual(
+    rowsOf(media).map((row) => row.encodeSig),
+    [created[0].encodeSig],
+  );
+});
+
+test('a ref another size key still holds, outside the write, is reported: seeing it needs a read, so such a driver uses the sweep', async () => {
+  const w = world();
+  contentAddressed(w);
+  const first = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, first);
+  await first.generate({
+    media: structuredClone(doc),
+    sizes: twoBoxes,
+    formats: ['webp'],
+  });
+  const [kept, other] = doc.previews ?? [];
+  assert.deepEqual(kept.storageRef, other.storageRef);
+  resetResizerForTests();
+  const r = w.resizer(webpConfig(70));
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await r.generate({
+    media: structuredClone(doc),
+    sizes: [twoBoxes[0]],
+    formats: ['webp'],
+  });
+
+  assert.deepEqual(
+    fired.map((row) => row.storageRef),
+    [kept.storageRef],
+  );
+  assert.ok(
+    doc.previews?.some(
+      (row) => keyOf(row) === (kept.storageRef as { key: string }).key,
+    ),
+  );
+});
+
+test('a store that holds the new row but leaves it out of its answer: a ref that row keeps is not reported', async () => {
+  const w = world();
+  contentAddressed(w);
+  const pipeline: Pipeline = {};
+  const r = new Resizer({
+    config: webpConfig(80),
+    logger: recordingLogger().logger,
+    storage: w.storage,
+    tasks: w.tasks,
+    pipelines: { default: pipeline },
+    media: fakeMedia({
+      load: (id) => w.store.loadMedia(id),
+      appendPreviews: (id, rows, dims) =>
+        w.store.appendPreviews(id, rows, dims),
+      replacePreviews: async (id, identities, rows) => ({
+        ...(await w.store.replacePreviews(id, identities, rows)),
+        stored: [],
+      }),
+    }),
+  });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(r);
+  const [old] = rowsOf(doc);
+  pipeline.version = 'v2';
+
+  const { created, replaced } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.deepEqual(created, []);
+  assert.deepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
+  assert.notEqual(rowsOf(doc)[0].encodeSig, old.encodeSig);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+});
+
+test('generate() that goes on to throw has still reported what its write removed', async () => {
+  const { w, doc, old } = await storedThenChanged();
+  const r = replacingWith(
+    w,
+    async (id, identities, rows) => ({
+      ...(await w.store.replacePreviews(id, identities, rows)),
+      stored: [],
+    }),
+    {
+      pipelines: {
+        default: {
+          variantSteps: [
+            async (img) => {
+              const { width } = await img.metadata();
+              if (width === 30) {
+                throw new Error('this size cannot be made');
+              }
+              return img;
+            },
+          ],
+        },
+      },
+    },
+  );
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+
+  await assert.rejects(
+    r.generate({
+      media: structuredClone(doc),
+      sizes: [...cell, { width: 30, height: 30 }],
+      formats: ['webp'],
+    }),
+    { name: 'ResizeGenerateError' },
+  );
+
+  assert.deepEqual(
+    fired.map((row) => row.storageRef),
+    [old.storageRef],
+  );
+});
+
+for (const [name, row] of Object.entries({
+  'a ref that cannot be read': {
+    get storageRef(): never {
+      throw new Error('a ref that cannot be read');
+    },
+  },
+  'no row at all': null,
+})) {
+  test(`a removed row that is ${name}: the observer gets it, and the task keeps its result`, async () => {
+    const { w, doc } = await storedThenChanged();
+    const { logger, logs } = recordingLogger();
+    const r = replacingWith(
+      w,
+      async (id, identities, rows) => {
+        const result = await w.store.replacePreviews(id, identities, rows);
+        return {
+          ...result,
+          removed: [...result.removed, row as unknown as Preview],
+        };
+      },
+      { logger },
+    );
+    let calls = 0;
+    r.hook('onPreviewReplaced', () => {
+      calls += 1;
+    });
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    assert.equal(calls, 2);
+    assert.deepEqual(statuses(w), [['completed', 1]]);
+    assert.deepEqual(logs.error, []);
+  });
+}
+
+// No observer is protected against a tap that never settles: the worker's task timeout is the
+// bound, the work is already stored, and the next delivery finds it fresh and fires nothing.
+for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
+  test(`a ${hook} tap that never settles costs one task timeout, and the next delivery completes`, async () => {
+    const w = world({ timing: { taskTimeoutMs: 500 } });
+    const doc = await w.seed(w.resizer(webpConfig(80)));
+    const [old] = rowsOf(doc);
+    resetResizerForTests();
+    const r = w.resizer(webpConfig(70));
+    let calls = 0;
+    r.hook(hook, () => {
+      calls += 1;
+      return new Promise<never>(() => {});
+    });
+    const failed: unknown[] = [];
+    r.hook('onTaskFailed', (_task, err) => {
+      failed.push((err as ResizeError).code);
+    });
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    assert.equal(calls, 1);
+    assert.deepEqual(failed, ['RESIZE_TASK_TIMEOUT']);
+    assert.deepEqual(statuses(w), [['completed', 2]]);
+    assert.notDeepEqual(rowsOf(doc)[0].storageRef, old.storageRef);
+  });
+}
+
+/** What a Postgres jsonb column does to a ref's keys: shorter ones first, then by name. */
+function jsonbOrder(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(jsonbOrder);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  const keys = Object.keys(value).sort(
+    (a, b) => a.length - b.length || (a < b ? -1 : 1),
+  );
+  return Object.fromEntries(
+    keys.map((key) => [
+      key,
+      jsonbOrder((value as Record<string, unknown>)[key]),
+    ]),
+  );
+}
+
+/** A store that answers and loads every row's ref with its keys as a jsonb column orders them. */
+const jsonbRefs = (inner: MediaStore): MediaStore => {
+  const reordered = (row: Preview): Preview => ({
+    ...row,
+    storageRef: jsonbOrder(row.storageRef) as Preview['storageRef'],
+  });
+  return fakeMedia({
+    load: async (id) => {
+      const doc = await inner.loadMedia(id);
+      return doc && { ...doc, previews: doc.previews?.map(reordered) };
+    },
+    appendPreviews: (id, rows, dims) => inner.appendPreviews(id, rows, dims),
+    replacePreviews: async (id, identities, rows) => {
+      const result = await inner.replacePreviews(id, identities, rows);
+      return { ...result, removed: result.removed.map(reordered) };
+    },
+  });
+};
+
+/** Byte-named storage whose ref has more than one key, in an order jsonb does not keep. */
+function namespacedByBytes(w: ReturnType<typeof world>): void {
+  contentAddressed(w);
+  const upload = w.storage.upload.bind(w.storage);
+  w.storage.upload = async (args) => ({
+    bucket: 'public',
+    ...((await upload(args)) as { key: string }),
+    namespace: 'team/a',
+  });
+}
+
+test('a store that hands a ref back with its keys in another order: a ref a new row keeps is not reported', async () => {
+  const w = world({ wrap: jsonbRefs });
+  namespacedByBytes(w);
+  const pipeline: Pipeline = {};
+  const r = w.resizer(webpConfig(80), undefined, { default: pipeline });
+  const fired: Preview[] = [];
+  r.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+  });
+  const doc = await w.seed(r);
+  assert.deepEqual(Object.keys(rowsOf(doc)[0].storageRef as object), [
+    'bucket',
+    'key',
+    'namespace',
+  ]);
+  pipeline.version = 'v2';
+
+  const { created, replaced } = await r.generate({
+    media: structuredClone(doc),
+    sizes: cell,
+    formats: ['webp'],
+  });
+
+  assert.equal(created.length, 1);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+  assert.ok(w.files.has(keyOf(rowsOf(doc)[0])));
+});
+
+test('a store that hands refs back in another order and loses encodeSig: the store check still finds the row, so the task is dead', async () => {
+  const w = world({
+    wrap: (inner) => jsonbRefs(losing('encodeSig')(inner) as never),
+  });
+  namespacedByBytes(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+  const errors = deadErrors(r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['dead', 1]]);
+  assert.equal(errors[0].code, 'RESIZE_MEDIA_ROW_NOT_KEPT');
+  assert.match(errors[0].message, /did not keep encodeSig/);
+});
+
+test('a store that hands refs back in another order, keeping every field: the task completes and the next read is fresh', async () => {
+  const w = world({ wrap: jsonbRefs });
+  namespacedByBytes(w);
+  const r = w.resizer(webpConfig(80));
+  const doc = await bareMedia(w, r);
+
+  await w.read(r, doc);
+  await w.work(r);
+
+  assert.deepEqual(statuses(w), [['completed', 1]]);
+  const loaded = await r.media.loadMedia('m1');
+  const { decision } = await w.read(r, loaded as MediaLike);
+  assert.deepEqual(decision.missing, []);
+  assert.equal(decision.ready[0].stale, undefined);
+});
+
+test("a preview byte-identical to its own original, on a flat byte-named driver: the original's ref is not reported, so the next render still finds it", async () => {
+  const w = world();
+  contentAddressed(w);
+  const config = (compressionLevel: number) =>
+    makeImageConfig({
+      formats: ['png'],
+      encode: { formats: { png: { compressionLevel } } },
+    });
+  const own: SizeInput[] = [{ width: 64, height: 64 }];
+  const first = w.resizer(config(6));
+  // A file the encoder gives back unchanged: what one preview of the source came out as.
+  const media = await bareMedia(w, first);
+  const { created } = await first.generate({
+    media: structuredClone(media),
+    sizes: own,
+    formats: ['png'],
+  });
+  const body = w.files.get(keyOf(created[0])) as Buffer;
+  resetResizerForTests();
+
+  const r = w.resizer(config(6));
+  const original = await r.uploadOriginal({ body, visibility: 'public' });
+  const doc: MediaLike = { id: 'm2', original, previews: [] };
+  w.docs.set('m2', doc);
+  const { created: same } = await r.generate({
+    media: structuredClone(doc),
+    sizes: own,
+    formats: ['png'],
+  });
+  // What this test is about: the preview landed on the original's own file.
+  assert.deepEqual(same[0].storageRef, original.storageRef);
+  resetResizerForTests();
+
+  const later = w.resizer(config(1));
+  const fired: Preview[] = [];
+  later.hook('onPreviewReplaced', (row) => {
+    fired.push(row);
+    w.files.delete(keyOf(row));
+  });
+  const { created: redone, replaced } = await later.generate({
+    media: structuredClone(doc),
+    sizes: own,
+    formats: ['png'],
+  });
+  assert.equal(redone.length, 1);
+  assert.notDeepEqual(redone[0].storageRef, original.storageRef);
+  assert.deepEqual(fired, []);
+  assert.equal(replaced, undefined);
+
+  // The original's file is still there, so another size renders.
+  const { created: next } = await later.generate({
+    media: structuredClone(doc),
+    sizes: [{ width: 20, height: 20 }],
+    formats: ['png'],
+  });
+  assert.equal(next.length, 1);
+});
+
+for (const [name, change] of Object.entries({
+  'swaps the ref': (row: Preview) => {
+    row.storageRef = { key: 'forged' };
+  },
+  'removes the ref': (row: Preview) => {
+    Reflect.deleteProperty(row, 'storageRef');
+  },
+  'changes the ref in place': (row: Preview) => {
+    (row.storageRef as { key: string }).key = 'forged';
+  },
+})) {
+  test(`a tap that ${name} cannot change what generate() returns`, async () => {
+    const { w, doc, old } = await storedThenChanged();
+    const expected = structuredClone(old.storageRef);
+    const r = w.resizer(webpConfig(70));
+    r.hook('onPreviewReplaced', change);
+
+    const { replaced } = await r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    });
+
+    assert.deepEqual(replaced, [expected]);
+  });
+}
+
+for (const [name, row] of Object.entries({
+  'no row at all': null,
+  'a row whose ref cannot be read': {
+    get storageRef(): never {
+      throw new Error('a ref that cannot be read');
+    },
+  },
+  'a row with no ref': { identity: 'x' },
+})) {
+  test(`generate() over ${name} in what the store removed: it resolves, and replaced names the refs it can read`, async () => {
+    const { w, doc, old } = await storedThenChanged();
+    const r = replacingWith(w, async (id, identities, rows) => {
+      const result = await w.store.replacePreviews(id, identities, rows);
+      return {
+        ...result,
+        removed: [...result.removed, row as unknown as Preview],
+      };
+    });
+
+    const { created, replaced } = await r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    });
+
+    assert.equal(created.length, 1);
+    assert.deepEqual(replaced, [old.storageRef]);
+  });
+
+  test(`generate() over only ${name} in what the store removed: replaced stays unset`, async () => {
+    const { w, doc } = await storedThenChanged();
+    const r = replacingWith(w, async (id, identities, rows) => ({
+      ...(await w.store.replacePreviews(id, identities, rows)),
+      removed: [row as unknown as Preview],
+    }));
+
+    const result = await r.generate({
+      media: structuredClone(doc),
+      sizes: cell,
+      formats: ['webp'],
+    });
+
+    assert.equal('replaced' in result, false);
+  });
+}
+
+/** A store that keeps its own copy of every row it is given, as a database does. */
+const copiesRows = (inner: MediaStore): MediaStore =>
+  fakeMedia({
+    load: (id) => inner.loadMedia(id),
+    appendPreviews: (id, rows, dims) =>
+      inner.appendPreviews(id, structuredClone(rows), dims),
+    replacePreviews: (id, identities, rows) =>
+      inner.replacePreviews(id, identities, structuredClone(rows)),
+  });
+
+// What a tap may do to the row it gets: it is host code, and the row is only a report.
+const redactions: Record<string, (row: Preview) => void> = {
+  'nothing, the baseline': () => {},
+  'deletes origin': (row) => {
+    delete row.origin;
+  },
+  'deletes encodeSig': (row) => {
+    delete row.encodeSig;
+  },
+  'deletes sizeKey': (row) => {
+    delete (row as Partial<Preview>).sizeKey;
+  },
+  'changes the ref in place': (row) => {
+    (row.storageRef as { key: string }).key = 'redacted';
+  },
+  'swaps the ref': (row) => {
+    row.storageRef = { key: 'redacted' };
+  },
+  'changes a filter in place': (row) => {
+    (row.filters as { blur: number }).blur = 99;
+  },
+  'deletes the filters': (row) => {
+    delete row.filters;
+  },
+};
+const filtered = (): SizeInput[] => [
+  { width: 20, height: 20, filters: { blur: 2 } },
+];
+
+for (const [what, redact] of Object.entries(redactions)) {
+  test(`a tap of onPreviewGenerated that ${what}, on a store that copies rows: the worker's task completes and the row is fresh`, async () => {
+    const w = world({ wrap: copiesRows });
+    const r = w.resizer(webpConfig(80));
+    r.hook('onPreviewGenerated', redact);
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    const doc: MediaLike = { id: 'm1', original, previews: [] };
+    w.docs.set('m1', doc);
+
+    await w.read(r, doc, filtered());
+    await w.work(r);
+
+    assert.equal(w.tasks.rows[0].status, 'completed');
+    assert.equal(w.tasks.rows[0].attempts, 1);
+    const { decision } = await w.read(r, doc, filtered());
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+    assert.equal(w.tasks.rows.length, 1);
+  });
+
+  test(`a tap of onPreviewGenerated that ${what}, on a store that copies rows: generate() resolves, and what the store holds stays fresh`, async () => {
+    const w = world({ wrap: copiesRows });
+    const r = w.resizer(webpConfig(80));
+    r.hook('onPreviewGenerated', redact);
+    const original = await r.uploadOriginal({
+      body: png,
+      visibility: 'private',
+    });
+    const doc: MediaLike = { id: 'm1', original, previews: [] };
+    w.docs.set('m1', doc);
+
+    const { created, failed } = await r.generate({
+      media: structuredClone(doc),
+      sizes: filtered(),
+      formats: ['webp'],
+    });
+
+    assert.equal(created.length, 1);
+    assert.equal(failed, 0);
+    const { decision } = await w.read(r, doc, filtered());
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+  });
+}
+
+test('a row whose file a sweep deleted: a read still calls it ready, nothing renders it again, and invalidate() repairs it', async () => {
+  const w = world();
+  const r = w.resizer(webpConfig(80));
+  const doc = await w.seed(r);
+  const [row] = rowsOf(doc);
+  w.files.delete(keyOf(row));
+
+  const damaged = await w.read(r, doc);
+  assert.equal(damaged.decision.ready.length, 1);
+  assert.equal(damaged.decision.ready[0].stale, undefined);
+  assert.equal(damaged.decision.ready[0].url, `/m/${keyOf(row)}`);
+  assert.equal(damaged.decision.missing.length, 0);
+  assert.equal(w.tasks.rows.length, 0);
+
+  assert.deepEqual(await r.invalidate({ media: doc }), [row.storageRef]);
+  const repairing = await w.read(r, doc);
+  assert.equal(repairing.decision.ready.length, 0);
+  assert.equal(repairing.decision.missing.length, 1);
+  assert.equal(w.tasks.rows.length, 1);
+  await w.work(r);
+
+  const repaired = await w.read(r, doc);
+  assert.equal(repaired.decision.ready.length, 1);
+  assert.equal(repaired.decision.ready[0].stale, undefined);
+  assert.ok(w.files.has(keyOf(rowsOf(doc)[0])));
+});
+
+for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
+  test(`a ${hook} tap that outlasts taskTimeoutMs costs the attempt: at maxAttempts 1 the task is dead, with its rows stored`, async () => {
+    const w = world({ timing: { taskTimeoutMs: 100, maxAttempts: 1 } });
+    const a = w.resizer(webpConfig(80));
+    const doc = await w.seed(a);
+    resetResizerForTests();
+    const r = w.resizer(webpConfig(70));
+    r.hook(hook, () => new Promise((done) => setTimeout(done, 400)));
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    const [row] = w.tasks.rows;
+    assert.equal(row.status, 'dead');
+    assert.match(String(row.error), /exceeded taskTimeoutMs/);
+    const { decision } = await w.read(r, doc);
+    assert.equal(decision.ready.length, 1);
+    assert.equal(decision.ready[0].stale, undefined);
+  });
+
+  test(`a ${hook} tap that outlasts taskTimeoutMs costs the attempt: the next delivery finds the rows fresh, and the tap does not run again`, async () => {
+    const w = world({ timing: { taskTimeoutMs: 100, maxAttempts: 2 } });
+    const a = w.resizer(webpConfig(80));
+    const doc = await w.seed(a);
+    resetResizerForTests();
+    const r = w.resizer(webpConfig(70));
+    let calls = 0;
+    r.hook(hook, () => {
+      calls += 1;
+      return new Promise((done) => setTimeout(done, 400));
+    });
+
+    await w.read(r, doc);
+    await w.work(r);
+
+    const [row] = w.tasks.rows;
+    assert.equal(row.status, 'completed');
+    assert.equal(row.attempts, 2);
+    assert.equal(calls, 1);
+  });
+}
+
+// A row the store check cannot copy before the taps: its ref and filters are host data, and by then
+// the write is done.
+const refusesToObject = () => {
+  throw new Error('this cannot be read');
+};
+const uncopyable: Record<
+  string,
+  {
+    ref?: (ref: Record<string, unknown>) => Preview['storageRef'];
+    filters?: () => Record<string, unknown>;
+  }
+> = {
+  'a ref whose toObject method throws': {
+    ref: (ref) => ({ ...ref, toObject: refusesToObject }),
+  },
+  'a ref whose toObject getter throws': {
+    ref: (ref) =>
+      Object.defineProperty({ ...ref }, 'toObject', { get: refusesToObject }),
+  },
+  'filters whose toObject method throws': {
+    filters: () => ({ blur: 2, toObject: refusesToObject }),
+  },
+  'filters whose toObject getter throws': {
+    filters: () =>
+      Object.defineProperty({ blur: 2 }, 'toObject', { get: refusesToObject }),
+  },
+  'filters as a strict Proxy': {
+    filters: () =>
+      new Proxy(
+        { blur: 2 },
+        {
+          get: (target, key, receiver) =>
+            key === 'toObject'
+              ? refusesToObject()
+              : Reflect.get(target, key, receiver),
+        },
+      ),
+  },
+};
+
+/** A world and a Resizer for one case of `uncopyable`, its original stored; `fired` holds the taps. */
+async function uncopyableWorld(
+  { ref }: (typeof uncopyable)[string],
+  timing?: Partial<QueueTimingOptions>,
+) {
+  const w = world({ timing });
+  if (ref) {
+    const upload = w.storage.upload.bind(w.storage);
+    // Previews only: the original's ref is read before anything is written.
+    w.storage.upload = async (args) => {
+      const stored = await upload(args);
+      return args.visibility === 'public'
+        ? ref(stored as Record<string, unknown>)
+        : stored;
+    };
+  }
+  const r = w.resizer(webpConfig(80));
+  const fired: Preview[] = [];
+  r.hook('onPreviewGenerated', (row) => {
+    fired.push(row);
+  });
+  const original = await r.uploadOriginal({
+    body: png,
+    visibility: 'private',
+  });
+  const doc: MediaLike = { id: 'm1', original, previews: [] };
+  w.docs.set('m1', doc);
+  return { w, r, doc, fired };
+}
+
+for (const [what, parts] of Object.entries(uncopyable)) {
+  const sizes = (): SizeInput[] => [
+    {
+      width: 20,
+      height: 20,
+      ...(parts.filters
+        ? { filters: parts.filters() as SizeInput['filters'] }
+        : {}),
+    },
+  ];
+
+  test(`generate() over ${what}: it resolves, with the row stored and its report delivered`, async () => {
+    const { r, doc, fired } = await uncopyableWorld(parts);
+
+    const { created, failed } = await r.generate({
+      media: structuredClone(doc),
+      sizes: sizes(),
+      formats: ['webp'],
+    });
+
+    assert.equal(created.length, 1);
+    assert.equal(failed, 0);
+    assert.equal(doc.previews?.length, 1);
+    assert.equal(fired.length, 1);
+  });
+
+  test(`a worker over ${what}, at maxAttempts 1: the task completes, with the row stored and its report delivered`, async () => {
+    const { w, r, doc, fired } = await uncopyableWorld(parts, {
+      maxAttempts: 1,
+    });
+
+    await w.read(r, doc, sizes());
+    await w.work(r);
+
+    assert.equal(w.tasks.rows[0].error, undefined);
+    assert.equal(w.tasks.rows[0].status, 'completed');
+    assert.equal(doc.previews?.length, 1);
+    assert.equal(fired.length, 1);
+  });
+}

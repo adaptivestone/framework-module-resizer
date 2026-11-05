@@ -34,6 +34,7 @@ import {
   type TaskAddResult,
   TaskQueue,
 } from '../contracts/taskQueue.ts';
+import { storedDims } from '../freshness.ts';
 import type {
   EnqueueReceipt,
   MediaLike,
@@ -753,9 +754,9 @@ export interface DocMediaCalls {
  * A MediaStore over the media documents in `docs`: loadMedia returns the document, and stored
  * previews land on its `previews` (one row per preview identity), so a test that holds the
  * document sees what a worker stored. appendPreviews sets `backfillDims` on the document's
- * original before it stores any row, also when it stores none, as MongoMediaStore does;
- * replacePreviews follows the media contract on the document. Every call is kept in
- * `appendCalls` and `replaceCalls`.
+ * original before it stores any row, also when it stores none, and only while storedDims() finds
+ * no stored pair, as MongoMediaStore does; replacePreviews follows the media contract on the
+ * document. Every call is kept in `appendCalls` and `replaceCalls`.
  */
 export function docMedia(
   docs: Map<string, MediaLike>,
@@ -774,7 +775,7 @@ export function docMedia(
       if (!doc) {
         return [];
       }
-      if (backfillDims && doc.original) {
+      if (backfillDims && doc.original && !storedDims(doc.original)) {
         doc.original.width = backfillDims.width;
         doc.original.height = backfillDims.height;
       }

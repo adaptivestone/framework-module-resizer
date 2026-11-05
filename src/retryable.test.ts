@@ -531,6 +531,9 @@ const elsewhere: [code: string, retryable: boolean, file: string][] = [
   ['RESIZE_MEDIA_APPEND_RESULT_INVALID', true, 'previewRecorder.test.ts'],
   ['RESIZE_MEDIA_REPLACE_MISSING', true, 'previewRecorder.test.ts'],
   ['RESIZE_MEDIA_REPLACE_RESULT_INVALID', true, 'previewRecorder.test.ts'],
+  // The one exception to "a deploy included" (design C1): a deploy that fixes the store would help,
+  // but every retry until then costs a render, an upload and an orphaned file.
+  ['RESIZE_MEDIA_ROW_NOT_KEPT', false, 'regenerate.test.ts'],
 ];
 test('each code asserted elsewhere is in the test file named', () => {
   for (const [code, , file] of elsewhere) {

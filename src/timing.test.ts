@@ -68,6 +68,37 @@ describe('timingOf', () => {
     );
   });
 
+  test('a value that reaches a timer is refused above its limit, naming the key', () => {
+    for (const [key, code] of [
+      ['leaseMs', 'RESIZE_CONFIG_QUEUE_LEASE_INVALID'],
+      ['idlePollMs', 'RESIZE_CONFIG_QUEUE_INVALID'],
+      ['taskTimeoutMs', 'RESIZE_CONFIG_QUEUE_INVALID'],
+    ] as const) {
+      for (const value of [2_147_483_648, 3_000_000_000]) {
+        const tasks = new MemoryTaskQueue({ timing: { [key]: value } });
+        assert.throws(
+          () => timingOf(tasks, 'default'),
+          (err: unknown) =>
+            err instanceof ResizeConfigError &&
+            err.code === code &&
+            err.message.includes(`${key} must be at most 2147483647`) &&
+            /'default'/.test(err.message),
+          `${key} ${value}`,
+        );
+      }
+      const tasks = new MemoryTaskQueue({
+        timing: { [key]: 2_147_483_647 },
+      });
+      assert.equal(timingOf(tasks, 'default')[key], 2_147_483_647);
+    }
+  });
+
+  test('retryBackoffMs reaches no timer, so a longer backoff stays valid', () => {
+    const retryBackoffMs = { base: 3_000_000_000, max: 3_000_000_000 };
+    const tasks = new MemoryTaskQueue({ timing: { retryBackoffMs } });
+    assert.deepEqual(timingOf(tasks, 'default').retryBackoffMs, retryBackoffMs);
+  });
+
   test('timingOf reads each queue name once and keeps the names apart', () => {
     const reads: string[] = [];
     const tasks = new MemoryTaskQueue();

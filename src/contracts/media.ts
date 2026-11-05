@@ -13,6 +13,14 @@ export interface ReplacedPreviews {
 /**
  * The host's media documents and their preview rows. Both writes, appendPreviews and
  * replacePreviews, keep one stored row per preview identity.
+ *
+ * After a task's writes the worker reloads the media and compares the rows under each `storageRef`
+ * it wrote: `storageRef`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType`, `resizer`,
+ * `pipeline` and `filters` must read back as given, or the task dead-letters with
+ * RESIZE_MEDIA_ROW_NOT_KEPT. A row that is not back yet raises nothing. A kept row whose `identity`
+ * is absent or differs gets one warning per Resizer: reads do not use it, but invalidate() finds
+ * such rows only by identity, so it leaves them, and a replacePreviews that removes by stored
+ * identity leaves them too.
  */
 export abstract class MediaStore {
   /** Load a media document; `null` (deleted media) makes its task a logged no-op. */
@@ -22,16 +30,18 @@ export abstract class MediaStore {
    * Append generated previews, and save `backfillDims` on the original when it is given, whether or
    * not a preview is stored (also for `previews: []`): the freshness check needs the original's
    * dimensions, and a store that drops them makes every read of such a media queue a task that
-   * downloads the original. The store keeps
-   * one row per `identity`: a preview whose identity is already stored on the media is skipped, so
-   * two workers that rendered the same variant leave one row. The core identifies a stored row by
-   * its scope (`resizer` and `pipeline`, `default` when unset), size key, format and filters,
-   * derived from the row's own fields; it never reads a stored `identity` string. So "a preview
-   * whose identity is already stored" means a usable row with the same four. Resolve with the
-   * previews that were stored (`[]` when none were, e.g. the media is gone). Of the previews left
-   * out, the core counts one whose identity is already stored as covered, and any other as not
-   * recorded. Resolving with nothing is never a way to say "all of them": the core rejects it with
-   * RESIZE_MEDIA_APPEND_RESULT_INVALID.
+   * downloads the original. Write them only while the original holds no stored pair (both numbers),
+   * so they cannot land on an original swapped in during the render; a store that writes them
+   * anyway behaves as before. The store keeps one row per `identity`: a preview whose identity is
+   * already stored on the media is skipped, so two workers that rendered the same variant leave
+   * one row. The core identifies a stored row by its scope (`resizer` and `pipeline`, `default`
+   * when unset), size key, format and filters, derived from the row's own fields; it never
+   * identifies a row by a stored `identity` string. So "a preview whose identity is already
+   * stored" means a usable row with the same four. Resolve
+   * with the previews that were stored (`[]` when none were, e.g. the media is gone). Of the
+   * previews left out, the core counts one whose identity is already stored as covered, and any
+   * other as not recorded. Resolving with nothing is never a way to say "all of them": the core
+   * rejects it with RESIZE_MEDIA_APPEND_RESULT_INVALID.
    */
   abstract appendPreviews(
     mediaId: string,
@@ -48,9 +58,8 @@ export abstract class MediaStore {
    * call before anything is written (MongoMediaStore: a value its schema cannot cast, with
    * Mongoose's ValidationError, which is not a ResizeError; `storageRef` and `filters` are stored
    * as given, cast or not). It takes no dimensions: a caller that must backfill them uses
-   * appendPreviews(mediaId, [], dims), which writes them whether or not it stores a row. The rows
-   * MongoMediaStore writes here carry no sub-document `_id` (appended rows do); the module reads
-   * none.
+   * appendPreviews(mediaId, [], dims), which writes them whether or not it stores a row. The core
+   * reads no row `_id`, so a store needs none: key rows by `identity`.
    */
   abstract replacePreviews(
     mediaId: string,

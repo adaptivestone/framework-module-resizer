@@ -302,7 +302,15 @@ be loaded, since it may be a shared one. Resizers built only in other processes 
 construct every Resizer in the worker process too. Each task runs with the Resizer named in it and
 that Resizer's [coordination](#coordination), so a dead-letter gets that Resizer's `cooldownMs`.
 The task events and the three task observers (`afterTaskComplete`, `onTaskFailed`,
-`onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included).
+`onTaskDeadLettered`) receive the task with `attempts` (its deliveries, this one included). The
+worker awaits them in order, before its next task, up to `taskTimeoutMs`. Once it is stopping, it
+waits at most 5 s after the later of the stop and the task's end, so a stop adds at most 5 s per
+consume loop after the running task ends. Past either bound it logs one `warn` and goes on, and a
+tap still running keeps running beside the next task. A preview observer (`onPreviewGenerated`,
+`onPreviewReplaced`) runs inside its task, so it counts against `taskTimeoutMs`, during a stop too:
+one that outlasts it costs the attempt (`RESIZE_TASK_TIMEOUT`), and at `maxAttempts: 1` the task is
+dead, though its rows are stored. `generate()` sets no bound: a tap that never settles means
+`generate()` never returns.
 When a task's handler ends, the worker first waits for a lease renewal still in flight, on every
 task queue (a gating one too), within the same `min(leaseMs, 30000)` ms its gate calls get: a
 renewal that then answers `false` means the lease was lost, so there is no completion, failure or
@@ -492,19 +500,28 @@ default every name); `mongoParts` passes one `timing` for every name. A model-sh
 needs `findById` and `findOneAndUpdate`, and optionally `castObject`. Previews and the backfilled
 dimensions are appended with `findOneAndUpdate`, one write per preview plus one for the backfill,
 so the media model's `findOneAndUpdate` middleware runs for each; the document it receives has only
-`_id`, and is `null` when the preview was already stored or the media is gone. `replacePreviews`
+`_id`, and is `null` when the preview was already stored or the media is gone, or, for a backfill,
+when the pair is already stored. A model-shaped `MongoMediaModel` gets `$or`, `$not` and `$type` in
+the backfill's filter, and `strictQuery: false` in its options. `replacePreviews`
 (which `invalidate` uses) is one `findOneAndUpdate` with an update pipeline, an array update, and
 `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`, so a
 custom model-shaped `MongoMediaModel` must accept an update pipeline, and a `findOneAndUpdate`
-middleware on the media model also sees that call and must accept an array update. The rows are
+middleware on the media model also sees that call and must accept an array update. A row it writes
+stores the `_id` an appended row would get, read from the model's `schema` and `base`, so a
+model-shaped object without them writes none. The rows are
 first cast with the model's `castObject` when it has one (Mongoose's `Model.castObject`: strict rows
 lose the keys they do not declare, loose rows (`strict: false`) keep them, and a value it cannot
 cast rejects with Mongoose's `ValidationError` before anything is written; `storageRef` and
 `filters` are stored as given, cast or not); without it they are written as given, minus their
 `undefined` top-level keys. `MongoMediaStore.verify()` fails with
 `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` when the media schema declares preview rows as strict
-sub-documents without `identity`, `origin` or `encodeSig` (a mixed or plain `previews` array, or
-rows with `strict: false`, pass; `bytes` and `createdAt` are not checked) and logs one warning
+sub-documents without `identity`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType` or
+`storageRef` (a mixed or plain `previews` array, or rows with `strict: false`, pass; `bytes` and
+`createdAt` are not checked; a `storageRef` may be Mixed, or a sub-schema or nested paths that
+declare every key of the driver's ref: strict rows drop the rest, so a task completes and a read
+serves nothing, with an `error` line, and `verify()` cannot tell, since the key set is the driver's
+own) and
+logs one warning
 when such rows lack `fit` (declare it as `{ type: Boolean }`; the warning goes to the store's
 `logger` option, default `console`), `MongoLockStore.verify()`
 with `RESIZE_MONGO_LOCK_MODEL_OUTDATED` when a strict lock schema has no `owner` field (for example
@@ -601,6 +618,24 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
+  - `loadMedia` must return each stored row's `origin`, `encodeSig`, `sizeKey`, `format`,
+    `contentType`, `resizer`, `pipeline`, `filters` and `storageRef` as they were given. After a
+    task's writes the worker reloads the media and looks at the rows under each `storageRef` it
+    wrote. No such row raises nothing (a lagging reload; a store that reshapes refs is not
+    detected), unless a row with all those fields as written came back with no `storageRef` at all.
+    Rows there, and none matches what was written in those fields: the task fails with
+    `ResizeSetupError` `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields, because
+    such a store makes reads render the preview again and again. `fit` is exempt, and `contentType`
+    counts only when it is lost: a read needs one, in any form. A store that returns one ref for two
+    rows is judged against all of them, and a row the check cannot read is skipped. On a driver that
+    names files by their bytes, a lagging reload can show another row under the same ref, an older
+    row after a replacement or another size key's row on a first render: the task is dead although
+    its rows are stored, and the next read is fresh.
+  - `loadMedia` should return a stored row's `identity` as given too, but losing it fails no task: a
+    read does not use it, so a store keyed by the identity it computes works. A kept row whose
+    `identity` is absent or differs gets one `warn` per Resizer, because `invalidate()` finds such
+    rows only by identity, so it leaves them, and a `replacePreviews` that removes by stored identity
+    leaves them too.
   - `appendPreviews` stores a preview only when its `identity` is not stored on the media yet, and
     must resolve with the previews it stored (`[]` when none); resolving with something other than
     an array (e.g. `undefined`) fails with `ResizeSetupError` `RESIZE_MEDIA_APPEND_RESULT_INVALID`.
@@ -616,7 +651,13 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     when the media schema declares a strict `original` without `width` and `height` (rejects them
     under `strict: 'throw'`), and stores them with the wrong type (or rejects them when it cannot
     cast them) when it declares them as a type that does not read back as a number (not Number,
-    Int32 or Mixed); its `verify()` warns once about it.
+    Int32 or Mixed); its `verify()` warns once about it. Write them only while the original holds
+    no stored pair (both numbers), so they cannot land on an original swapped in during the render.
+    `MongoMediaStore` does, except that an older worker in a rolling deploy still writes with no
+    such condition. Its update form needs MongoDB 4.2, and the driver in use may require more
+    (tested on 6.0.9 to 8.2.6). A host's `findOneAndUpdate` pre hook that calls
+    `this.where({ $or })` replaces the guard's `$or`; `this.and([...])` keeps it. A store that
+    writes them anyway behaves as before.
   - `replacePreviews(id, identities, rows)` (required: `verify()` and worker start reject a store
     without it with `ResizeSetupError` `RESIZE_MEDIA_REPLACE_MISSING`, and so does `invalidate`
     when it has rows to remove): in one atomic write per media, remove every stored row whose
@@ -630,8 +671,8 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     backfill them uses `appendPreviews(id, [], dims)`). A row the store cannot store rejects the
     call before anything is written: `MongoMediaStore` casts the rows to the model's schema first,
     so a value that cannot be cast rejects with Mongoose's `ValidationError`, which is not a
-    `ResizeError`. The rows `MongoMediaStore.replacePreviews` writes carry no sub-document `_id`
-    (appended rows do); the module reads none, so do not rely on a preview row's `_id`.
+    `ResizeError`. The core reads no row `_id`, so a custom store needs none: key rows by `identity`
+    (see [Freshness](#freshness)).
 - `LockStore`: `acquire(key, owner, ttlMs)` (`true` when the key was free or its lock had expired;
   `false` while a live lock holds it, even one with the same owner), `extend(key, owner, ttlMs)`
   (only the owner's live lock), `release(key, owner)` (only while `owner` holds it, expired or
@@ -959,7 +1000,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation, at most `3600`, the longest Sharp accepts |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1039,6 +1080,10 @@ are `defaultQueueOptions` in `…/config/resize.js`:
 | `maxAttempts` | `5` | Every lease counts, including reclaimed ones |
 | `idlePollMs` | `1000` | Polling interval of an idle worker (a claim that waited counts toward it); each poll is one indexed query on Mongo. The claim index does not hold the Resizer, so a claim reads past every due task of a Resizer that no worker on the queue serves: give a Resizer that has no worker its own queue. Claim errors back off from it up to 10× |
 | `taskTimeoutMs` | `600000` | A longer task is failed |
+
+`leaseMs`, `idlePollMs` and `taskTimeoutMs` can be at most `2147483647` (about 24.8 days), the
+longest a timer can wait: a larger value is `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or
+`RESIZE_CONFIG_QUEUE_INVALID`.
 
 Sharp process tuning is a worker option: `runWorker({ sharp: { concurrency, cache } })`. Keep
 `concurrency × sharp.concurrency ≈ CPU cores`.
@@ -1376,7 +1421,7 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 
 **`LogMetrics`** (the default) writes metrics as log lines on a logger: `new LogMetrics(logger, {
 summaryIntervalMs?, debug? })` (`LogMetricsOptions`; defaults `60000` and `false`). An interval
-that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
+that is not a positive integer of at most `2147483647` is `RESIZE_METRICS_INVALID`.
 - **Summed** per Resizer, never a line of their own: the reads by outcome, the stale previews
   found, the uploads (stored and rejected, with their bytes), the variants stored, duplicate or
   rendered (with their bytes) and the claims (with their total wait). Once per window, one `info`
@@ -1474,20 +1519,50 @@ ones are required and queued like missing ones.
 **The worker and `generate()`** render the stale variants again and count only fresh rows as done.
 The worker judges freshness by its own settings: a queued variant that is fresh for it is skipped
 (nothing is uploaded) and counts as covered. The new rows of a stale identity replace the old ones
-in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists
-the storage refs of the rows the write of `generate()` removed (set only when there are some):
-the outdated rows, or a row of the same identity another worker stored meanwhile. `generate()`
-swaps the rows in the caller's `media.previews` too. Each replacing write logs one `info` line:
-"resize: replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs
-<refs>". Its count and refs are the rows that write removed, so they can include such a
-concurrent copy too.
+in one `replacePreviews` write; the other new rows are appended. `GenerateResult.replaced` lists the
+storage refs of the rows the write of `generate()` removed (set only when there are some): the
+outdated rows, or a row of the same identity another worker stored meanwhile. A ref a new row of
+that write or the original holds is left out, because that file is in use. `generate()` swaps the
+rows in the caller's `media.previews` too. Each replacing write logs one `info` line: "resize:
+replaced <n> outdated preview(s) of media <id>; their files are not deleted: storage refs <refs>".
+Its count and refs are the rows that write removed, so they can include such a concurrent copy too.
 
-**Old files are never deleted.** Clean them up from that log line, or with a sweep that deletes
-objects under the `previews/` prefix (below a ref's `namespace`) that no row references. Leave out
-every `original.storageRef`: an adopted public original sits in the same bucket, and no preview row
-references it. A row without an `identity` (written before 0.3.0) stays beside its replacement and
-keeps its file referenced, so a sweep never finds that file: delete such rows (and their files)
-yourself.
+**The module never deletes old files.** Clean them up in an `onPreviewReplaced` observer, which gets
+each row a write of `generate()` or the worker removed, so it can delete `row.storageRef`; from that
+log line; or with a sweep (below). A report is delivered at most once: a crash, a tap that outlasts
+its timeout and a failed delete each lose one, a write that commits but whose acknowledgement is
+lost leaves no `resize: replaced` line either, and that line is `info`, so keep the sweep if every
+file must go. A response or a cached page built before the write still names the old URL, so you may
+want to delete after your longest cache time. Do not wait in the tap for that: it runs inside the
+task, so a wait past `taskTimeoutMs` costs the attempt, and at `maxAttempts: 1` the task of a fresh
+preview is dead. Schedule the delete elsewhere, and return. The observer does not fire for
+`invalidate()`, which returns its refs, or for `persist: false`. A removed row can be a copy another
+worker stored meanwhile; its file is just as unreferenced. A host that adopts a stored preview as an
+original while a replacement runs can be told to delete it, since only the original the render read
+counts as live: check your own records before deleting a ref you may have adopted. Use a tap, not an
+event bus listener: an async listener that rejects kills the process, since the module cannot catch
+it and the framework's `app.events` is a plain `EventEmitter`.
+
+**A sweep** deletes objects under the `previews/` prefix (below a ref's `namespace`) that no row
+references, leaving out every `original.storageRef`: an adopted public original sits in the same
+bucket, and no preview row references it. A preview is uploaded before its row is written, so list
+the objects first and read the rows after, and delete only objects older than a day and more than
+twice `taskTimeoutMs`, by S3 `LastModified` or file mtime: a delivery that timed out can still write
+its row later, and `generate()` has no timer. Without that rule a sweep deletes the files of rows
+about to be written. A read then still reports such a row as ready, neither stale nor missing, so
+nothing renders it again and its URL fails. `invalidate()` on that media removes its rows, and the
+next read or `prewarm()` queues them again.
+
+The shipped drivers give every preview a new key. On a driver that names files by their bytes, a ref
+that a new row of the write or the original holds is not reported. Refs compare as JSON with sorted
+keys, so reordered keys are one ref, but a value that reads back in another form (a Buffer in a
+custom ref, as a bson `Binary`) counts as another, and that file is reported although it is in use.
+Such a driver also shares a ref across two size keys, two pipelines, two Resizers or two media with
+equal bytes, and a host that copies a media document shares files on any driver. The tap gets one
+row and no media id, so it cannot see any of that: such a host should use the sweep, which sees
+every row. The same goes for that log line, which still names a ref a new row kept. A row without an
+`identity` (written before 0.3.0) stays beside its replacement and keeps its file referenced, so a
+sweep never finds that file: delete such rows (and their files) yourself.
 
 **A media without stored dimensions** (`original.width` and `original.height` must both be numbers;
 a stored `null` counts as missing) has no row the read path can prove fresh, since it cannot
@@ -1533,8 +1608,14 @@ with the previews of new uploads, which wait behind it, so plan worker capacity 
 there. Call `generate()` to bring a catalog up to date; it is idempotent and renders only what is
 missing or stale.
 
-**Mongo `_id`.** Rows that `replacePreviews` writes carry no sub-document `_id`, so a replaced row
-loses the `_id` it had: key preview rows by `identity`, never by `_id`.
+**Mongo `_id`.** A row stores an `_id` exactly when the media schema gives an appended row one,
+unless working it out fails. The current `resizeMediaSchemaFragment` keeps Mongoose's automatic
+`_id`, and `replacePreviews` stores the same on the rows it writes, so `row._id` reads the same on
+every load. A row replaced under 0.3.0 has none stored: it reads a new random `_id` on each load (a
+lean read gives none) until it is next replaced. Nothing migrates it, and reading it renders
+nothing. Remove such a row by `identity` or with `invalidate()`: `row.deleteOne()`,
+`previews.pull(row._id)` or a `$pull` by the id it read removes nothing, and a `$pull` by the id of
+a lean read removes every row without a stored `_id`. Keying rows by `identity` avoids both.
 
 ## Operations
 
@@ -1555,7 +1636,7 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
     once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.
-    The module sets it on every `ResizeSecurityError` and on ten codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
+    The module sets it on every `ResizeSecurityError` and on eleven codes: the media store did not keep what a task wrote (`RESIZE_MEDIA_ROW_NOT_KEPT`), the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
     dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
     (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
     source has no dimensions or exceeds the pixel or byte limits
@@ -1570,7 +1651,9 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
     from other libraries are retried, whatever fields they carry. The rule for `false`: no later
     delivery of the same input can succeed, where a later delivery includes one after a rolling
     deploy reaches this worker, so `RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay
-    `true`, and so does every unclear case. `ResizeOriginalError` and `ResizeConfigError` default
+    `true`, and so does every unclear case. `RESIZE_MEDIA_ROW_NOT_KEPT` is the one exception: a
+    deployed store fix would help, but every retry until then costs a render, an upload and an
+    orphaned file. `ResizeOriginalError` and `ResizeConfigError` default
     to `false`, like `ResizeSecurityError`, and any other `ResizeError` to `true`;
     `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false` and
     the media still holds the original they were rendered from, and `generate()`'s
