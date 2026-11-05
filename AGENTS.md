@@ -360,9 +360,11 @@ source enlarges it, and so does a box the source exceeds on one side only (an `8
    (step 7).
    Push delivery (preview): an SQS-triggered Lambda can run tasks instead of a worker process, with
    `createSqsHandler()` from `…/lambda.js`. It has not run on real AWS. Standard queues only; do not
-   bundle it. Read the README `Push delivery (preview)` section first: batch size 1, a function
-   timeout well above the task's time, `maxReceiveCount` above `maxAttempts`, the visibility timeout,
-   `ReportBatchItemFailures` (without it failed tasks are lost silently), `deadLetterQueueUrl`.
+   bundle it, and install Sharp for the function's architecture, or the import fails. Read the README
+   `Push delivery (preview)` section first: `ReportBatchItemFailures` (without it failed tasks are
+   lost silently), batch size 1, a function timeout well above the task's time, `maxReceiveCount` =
+   `maxAttempts` + 2, the visibility timeout, `deadLetterQueueUrl`, the IAM permissions the managed
+   role lacks, `MaximumConcurrency` rather than low reserved concurrency.
    Eager mode needs no worker.
 
 ## Use
@@ -852,8 +854,8 @@ import { LogMetrics, NoopMetrics } from '@adaptivestone/framework-module-resize'
 | `RESIZE_DUPLICATE_RESIZER` at worker start, "the `resizers` list names '…' twice" | two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
 | `RESIZE_DELIVERY_UNSUPPORTED` from a Lambda handler | a consumed queue name is not on SQS, or no Resizer has a task queue — only the SQS driver takes pushed messages: consume that name with a worker, or leave it out of `createSqsHandler({ queue })`; when the message names other Resizers on that name that can take them, serve only those, with `createSqsHandler({ resizers })`, and consume the others with a worker |
 | failed tasks disappear on Lambda, with no retries and no dead-letter | the trigger lacks `ReportBatchItemFailures`, so Lambda deletes every message of a normal return — add it to `FunctionResponseTypes` |
-| `resize lambda: … the first record of this invocation, was not started` | the function timeout is too small for the reserve — raise it to what the line names; under 4 s no task starts with the default reserve, and the sixth delivery dead-letters it unrun |
-| `resize lambda: message … was not started` (`warn`), or tasks dead with `RESIZE_TASK_MAX_ATTEMPTS` and no run | a batch does not fit one function timeout: a tail record uses a receive without running, and healthy tasks die unrun — set batch size 1 |
+| `resize lambda: … the first record of this invocation, was not started` | the function timeout is too small — it needs the time the line names to start a task, plus the slowest task's time, so start at 300 s; under 4 s no task starts with the default reserve, and the sixth delivery dead-letters it unrun |
+| `resize lambda: message … was not started` (`warn`), or tasks dead with `RESIZE_TASK_MAX_ATTEMPTS` and no run | a batch does not fit one function timeout: a tail record uses a receive without running, and healthy tasks die unrun — set batch size 1; at batch size 1, an outage or a bad deploy used up their receives, see the README `How a record ends` |
 | `resize lambda: setting the visibility of message … had not answered` | the function has no route to SQS, and no task runs — in a VPC give it a NAT gateway or an SQS endpoint, and a route to S3 |
 | a task in the dead-letter queue with no `is dead` line and no `onTaskDeadLettered` | the redrive's `maxReceiveCount` is too low, so SQS moved the message first, and nothing logs it — set it to `maxAttempts` + 2 |
 | `RESIZE_QUEUE_INVALID` at worker start | `runWorker({ queue })` (or `runResizeWorker`) got an empty list, or a list entry or a single name that is blank or not a string (`queue: ''` is refused too) — pass a queue name or a list of names; `--queue` may be repeated |

@@ -1785,26 +1785,32 @@ in the [guide](https://framework.adaptivestone.com/docs/resize#push-delivery).
 
 In the order that saves tasks:
 
-1. **Batch size 1, with no batch window.** Records of a batch run one after another, so batch size × your slowest task must fit the function timeout minus the reserve. A record that does not fit is not started, yet its delivery counts as an attempt, so healthy tasks die unrun.
-2. **A function timeout well above your slowest task.** Start at 300 s. Lambda's default 3 s runs no task at all. The handler keeps back a reserve for the end of a task (`limits.processingTimeoutSeconds` + 5 s, never above half the time left), and the task gets the rest.
-3. **Redrive `maxReceiveCount` = `maxAttempts` + 2** (7 for the default 5), so the module's dead-letter, cooldown and hook run first. Too low, and SQS moves the message itself: below `maxAttempts` for every failing task, at `maxAttempts` when the last delivery is cut short. No module dead-letter, hook or cooldown then runs, and nothing logs it: the handler does not check this value.
-4. **The queue's visibility timeout at least 6 × the function timeout**, which is AWS's rule. A delivery that starts sets its own to the lease, 60 s by default, so a crash comes back soon. A record not started keeps the queue's, so this is how long it waits to come back. Set `coordination.gateTtlMs` at or above it: a 300 s function means at least 1800 s against a default of 600 s, the gate of a record not started then lapses first, and a read can queue a duplicate task. Nothing is lost, only work repeated.
-5. **`ReportBatchItemFailures` in the trigger's `FunctionResponseTypes`.** Without it Lambda ignores the returned list and deletes every message of a normal return, so retries are lost silently. The handler cannot detect this.
-6. **A `deadLetterQueueUrl` in the queue's entry.** Without one a dead task is deleted at its last delivery, and a malformed message stays listed until your redrive moves it. It can be the queue your redrive policy targets.
+1. **`ReportBatchItemFailures` in the trigger's `FunctionResponseTypes`.** Without it Lambda deletes every message of a normal return, so a failing task is gone after its first failure, with no copy, while its line says `retrying in 5000 ms`. The handler cannot detect this.
+2. **Batch size 1, with no batch window.** Records of a batch run one after another. One that does not fit in the time left is not started, yet its delivery counts as an attempt, so healthy tasks die unrun.
+3. **A function timeout well above your slowest task.** Start at 300 s. Lambda's default 3 s runs no task at all.
+4. **Redrive `maxReceiveCount` = `maxAttempts` + 2** (7 for the default 5). Too low, and SQS moves the message itself, with no module line, hook or cooldown.
+5. **A visibility timeout at least 6 × the function timeout**, which is AWS's rule. Set `coordination.gateTtlMs` at or above it.
+6. **A `deadLetterQueueUrl` in the queue's entry.** Without one a dead task is deleted at its last delivery.
+7. **The IAM permissions `AWSLambdaSQSQueueExecutionRole` lacks:** `sqs:ChangeMessageVisibility` on the queue, `sqs:SendMessage` on the dead-letter queue, and S3 get and put.
+8. **`MaximumConcurrency` on the trigger, rather than low reserved concurrency.** Reserved concurrency throttles, and a throttled receive may count as an attempt.
 
 What a wrong one costs:
 
 | Setting | Wrong | Cost | What tells you |
 |---|---|---|---|
-| Batch size | A batch that does not fit | Healthy tasks die unrun, as the next table shows. A crash or a timeout also costs every neighbour in the batch a receive | A `warn` per record not started, then the `is dead` line with `RESIZE_TASK_MAX_ATTEMPTS` |
-| Function timeout | Under 4 s, which includes Lambda's default 3 s | No task ever runs. Six deliveries, one visibility timeout apart, and every task is dead, unrun: 10 of 10 in the model, 90 s from the first at a visibility of 18 s. With no `deadLetterQueueUrl`, the sixth delivery deletes it | An `error` on each delivery, naming the timeout to raise to |
+| `ReportBatchItemFailures` | Missing | Lambda ignores the returned list, so every failed task is lost after its first failure, with no retry, no dead-letter and no copy | Nothing: its line still says `retrying in 5000 ms` |
+| Batch size | A batch that does not fit: batch size × your slowest task must fit the function timeout minus the reserve | Healthy tasks die unrun, as the next table shows. A crash or a timeout also costs every neighbour in the batch a receive | A `warn` per record not started, then the `is dead` line with `RESIZE_TASK_MAX_ATTEMPTS` |
+| Function timeout | Under 4 s, which includes Lambda's default 3 s | No task ever runs. Six deliveries, one visibility timeout apart, and every task is dead, unrun: 10 of 10 in the model, 90 s from the first at a visibility of 18 s. With no `deadLetterQueueUrl`, the sixth delivery deletes it | An `error` on each delivery, naming the time a task needs to start |
 | Function timeout | 4 s to about 4.3 s | A task that does not fit stores no row at return, and each delivery leaves 15 or 16 orphan files: see [the table below](#stopping-in-time) | A `warn` (`had not settled`) on each delivery |
 | Function timeout | Shorter than the task | `RESIZE_TASK_TIMEOUT` at the reserve. Finished variants are kept and the retry renders the rest | A `warn` per delivery |
-| `maxReceiveCount` | Too low | SQS moves the message first: no `is dead` line, no `onTaskDeadLettered`, no cooldown | Nothing |
+| `maxReceiveCount` | Too low: below `maxAttempts` for every failing task, at `maxAttempts` when the last delivery is cut short | SQS moves the message first: no `is dead` line, no `onTaskDeadLettered`, no cooldown. The handler does not check this value | Nothing |
 | Visibility timeout | Below the function timeout | AWS refuses the mapping | AWS, at deploy |
 | Visibility timeout | Below 6 × | A record not started comes back sooner, so a task's six deliveries pass quicker, and an alarm has less time | Nothing |
-| `ReportBatchItemFailures` | Missing | Every failed task is lost after its first failure, with no retry and no dead-letter | Nothing |
-| `deadLetterQueueUrl` | Unset | A dead task is deleted, and a malformed message loops until your redrive moves it | An `error` per delivery |
+| `coordination.gateTtlMs` | Below the visibility timeout: a 300 s function means at least 1800 s, against a default of 600 s | The gate of a record not started lapses first, and a read can queue a duplicate task. Nothing is lost, only work repeated | Nothing |
+| `deadLetterQueueUrl` | Unset | A dead task is deleted, and a malformed message stays listed until your redrive moves it. It can be the queue your redrive policy targets | An `error` per delivery |
+| IAM | No `sqs:ChangeMessageVisibility` | A task still runs, but a crash waits the whole visibility timeout and a failure comes back with no backoff | One `error` per environment for the adoption, and one per delivery from a task that fails |
+| IAM | No `sqs:SendMessage` on the dead-letter queue | A dead task stays in the queue and no event fires | An `error` per delivery |
+| `MaximumConcurrency` | Unset | A burst can use up the Mongo connections | Nothing |
 
 A batch that does not fit, on the real handler over a simulated standard queue and poller, with a virtual clock, one Lambda environment at a time, three seeds per row, `maxAttempts` 5 and a visibility timeout of 6 × the function timeout. It is a model, not AWS:
 
@@ -1829,7 +1835,7 @@ import { createSqsHandler } from '@adaptivestone/framework-module-resize/lambda.
 export const handler = createSqsHandler({ sharp: { concurrency: 1, cache: false } });
 ```
 
-Lead with those Sharp options. `concurrency: 1` keeps Sharp to one thread per image, whatever CPU count the function reports, and with `cache: false` an environment that lives on keeps nothing for its next task. Over one task, turning the cache off saved 0 to 60 MB across three runs each, in a Linux container of 1 CPU and 1,769 MB, not on Lambda. They are process-wide: with two handlers in one process, each applies its own at its first invocation, so the last first invocation wins. Every start check a worker runs at start runs on the first invocation, not at import: a check that rejects throws from the invocation and touches no record, and the next invocation checks again.
+Lead with those Sharp options. `concurrency: 1` keeps Sharp to one thread per image, whatever CPU count the function reports, and with `cache: false` an environment that lives on keeps nothing for its next task. Over one task, turning the cache off saved 0 to 60 MB across three runs each, in a Linux container of 1 CPU and 1,769 MB, not on Lambda. They are process-wide: with two handlers in one process, each applies its own at its first invocation, so the last first invocation wins. Every start check a worker runs at start runs on the first invocation, not at import: a check that rejects throws from the invocation, which uses a receive of each record in it (see [How a record ends](#how-a-record-ends)), and the next invocation checks again.
 
 | Option | Default | |
 |---|---|---|
@@ -1843,11 +1849,13 @@ Lead with those Sharp options. `concurrency: 1` keeps Sharp to one thread per im
 
 | Setting | Value | Why |
 |---|---|---|
-| IAM | `AWSLambdaSQSQueueExecutionRole`, plus `sqs:ChangeMessageVisibility` on the queue, `sqs:SendMessage` on the dead-letter queue, and S3 get and put | That role grants neither SQS action. Without the first a task still runs, but a crash waits the whole visibility timeout and a failure comes back with no backoff (one `error` per environment). Without the second a dead task stays in the queue and no event fires (an `error` per delivery) |
-| `MaximumConcurrency` on the trigger | Your Mongo connection budget ÷ `maxPoolSize`; AWS's minimum is 2 | Rather than low reserved concurrency, which throttles, and a throttled receive may count as an attempt. Unset, a burst can use up the Mongo connections, and nothing says so |
+| IAM | `AWSLambdaSQSQueueExecutionRole`, plus the permissions in the list above | That role grants only receive, delete and read attributes on SQS, and log writes. With a customer managed KMS key on a queue, add, per AWS, `kms:Decrypt` on the queue's key, and `kms:Decrypt` and `kms:GenerateDataKey` on the dead-letter queue's |
+| `MaximumConcurrency` on the trigger | Your Mongo connection budget ÷ `maxPoolSize`, shared across the function's triggers; AWS's minimum is 2 per trigger | It applies per event source mapping, so their combined concurrency must stay within the budget. One handler on `default` and `bulk` through two mappings, at 100 connections and `maxPoolSize` 10, gets 5 each: 10 each would be 20 environments and 200 connections. Keep any reserved concurrency at or above their total, or Lambda may throttle, per AWS |
+| `leaseMs`, `retryBackoffMs` | As for workers | A delivery never asks SQS for more than 11 h, since its 12 h limit on a message's visibility counts from the receipt, so a longer value is capped on push, and a crash at such a lease comes back after 11 h |
 | Memory | Start at 1,769 MB, about 1 vCPU | Chosen for CPU. A 12 MP JPEG to 12 webp and avif variants peaked at about 360 MB in 14 s, and an SVG at 440 to 490 MB, in a Linux container of 1 CPU, not on Lambda |
 | `concurrency` (image setting) | About the vCPU count: 1 or 2, not the default 4 | In that container the default 4 took 21 s against 14 s, with about 100 MB more |
 | Runtime | `nodejs24.x` | |
+| Architecture | The one Sharp is installed for: `arm64` in the example under Deployment | A mismatch fails at import, before your handler runs |
 | Storage | `s3`, with `bucketPrivate` | `local` does not outlive the environment. Without `bucketPrivate` a private original is refused: `RESIZE_S3_BUCKET_NOT_ALLOWED`, dead on its first delivery |
 | Indexes | From a migration, with `autoIndex: false` | As for workers. SQS needs no gate index, and the gate lock's TTL index comes from the same migration |
 | Image settings | The same as the API's | As for workers: otherwise each side re-makes the other's previews (see [Freshness](#freshness)) |
@@ -1872,13 +1880,15 @@ Sharp's binary must match the function's architecture, not your machine's. In a 
 
 ### How a record ends
 
-Only `completed`, `dead` and a malformed message moved aside are left out of `batchItemFailures`; everything else is listed, never thrown. A delivery that starts first sets the visibility to the lease. `attempts` is the receive count, so every delivery counts, also one not started, and past `maxAttempts` a record is dead-lettered unrun. `resize.claim` reads as deliveries here, with a wait near zero. A task's other lines keep their `resize worker:` prefix, since the same `Consumer` writes them.
+Only `completed`, `dead` and a malformed message moved aside are left out of `batchItemFailures`; everything else is listed, never thrown. A delivery that starts first sets the visibility to the lease, 60 s by default, so a crash comes back soon. `attempts` is the receive count, so every delivery counts, also one not started, and past `maxAttempts` a record is dead-lettered unrun. `resize.claim` reads as deliveries here, with a wait near zero. A task's other lines keep their `resize worker:` prefix, since the same `Consumer` writes them.
 
 No metric says a record was not started: `resize.claim` records 0, and no `resize.task` follows. So the time a short function gets before its tasks die needs a log-based alarm, on the `was not started` `error` line. Past `maxAttempts`, `resize.task` reads `outcome: 'dead'`, `code: 'RESIZE_TASK_MAX_ATTEMPTS'`.
 
+An outage or a bad deploy costs healthy tasks. A start check that rejects, or an import that fails, runs no task and makes no queue call, yet Lambda counts the invocation as failed, so it uses a receive of each record in it, and each comes back after the queue's visibility timeout. At a 300 s function, a visibility timeout of 1800 s and `maxReceiveCount` 7, with Mongo down or a wrong DSN: past about 2 h the first delivery after the fix is dead unrun, with `RESIZE_TASK_MAX_ATTEMPTS`, and past about 3 h SQS moves the message, with no module line, hook or cooldown. The dead-letter queue keeps a copy and a later read queues the media again, but a media only `prewarm()` queues stays without previews. So during a known outage disable the trigger, with `aws lambda update-event-source-mapping --uuid <UUID> --no-enabled`: Lambda stops polling, and the messages wait, up to the queue's retention. Afterwards call `prewarm()` again for what the dead-letter queue holds, whose bodies name each `mediaId` and `pipeline`. AWS's pages say a redrive makes each message a new one, with a new message ID, enqueue time and retention period; they do not state its receive count, which `attempts` reads, so a redrive stays on the check list (C19 in `RELEASE.md`), and `prewarm()` is the way until it passes.
+
 ### Stopping in time
 
-The stop at the reserve goes through the existing timeout path: `RESIZE_TASK_TIMEOUT`, whose message names the budget rather than your `taskTimeoutMs`, with backoff. Finished variants persist, so the retry renders only the rest.
+The handler keeps back a reserve for the end of a task (`limits.processingTimeoutSeconds` + 5 s, never above half the time left), and the task gets the rest. The stop at the reserve goes through the existing timeout path: `RESIZE_TASK_TIMEOUT`, whose message names the budget rather than your `taskTimeoutMs`, with backoff. Finished variants persist, so the retry renders only the rest.
 
 The handler then waits for the task to settle until 2 s before the deadline, lists the record and returns, with a `had not settled` `warn`. What still runs is frozen and may resume in a later invocation, which at worst repeats work, with one exception below. A metrics flush that hangs moves the return from 2 s to 1 s before the deadline.
 
@@ -1917,8 +1927,8 @@ Measured with `SIGSTOP` on one machine, not on Lambda's freeze: a delivery that 
 | `setting the visibility … failed` | The role lacks `sqs:ChangeMessageVisibility`. The task runs, but a crash waits the whole visibility timeout |
 | Failed tasks disappear | The trigger lacks `ReportBatchItemFailures` |
 | A task in the dead-letter queue with no `is dead` line and no `onTaskDeadLettered` | `maxReceiveCount` is too low, so SQS's redrive ran first, and nothing logs it: set it to `maxAttempts` + 2 |
-| `the first record … was not started` | Raise the function timeout, to at least what the line names |
-| `message … was not started` (`warn`), or `RESIZE_TASK_MAX_ATTEMPTS` on tasks that never rendered | A batch does not fit: set batch size 1 |
+| `the first record … was not started` | The function timeout is too small. A task needs the time the line names just to start, plus the slowest task's time: start at 300 s, as a function just past that line's time stores no row for a task that does not fit (see [Stopping in time](#stopping-in-time)) |
+| `message … was not started` (`warn`), or `RESIZE_TASK_MAX_ATTEMPTS` on tasks that never rendered | A batch does not fit: set batch size 1. With batch size 1 already, an outage or a bad deploy used up their receives: see [How a record ends](#how-a-record-ends) |
 | `had not settled` | Raise the function timeout. Raise `stopBeforeTimeoutMs` only from a function of well over 5 s: an explicit reserve starts nothing under `stopBeforeTimeoutMs` + 2 s |
 | `the start checks had not finished` | Every record is listed. The checks start over after a second miss, so ones that need more than two invocations' time never finish, and a hang in a driver given as a function gets no retry — check the connection settings, such as a `serverSelectionTimeoutMS` longer than the function timeout |
 | `no consumed queue … matches` | The `queue` option, or the URL's account and name: a queue URL's path must end in `<account>/<name>`. The region is not compared, so a same-name ARN in another region matches and runs |
