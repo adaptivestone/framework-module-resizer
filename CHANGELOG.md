@@ -7,18 +7,21 @@ it lists what to change before you run `npm i`.
 **Breaking changes**
 
 - A damaged source now fails. `limits.failOn` (new, default `'error'`) replaces the hard-coded
-  `failOn: 'none'`. A cut or unreadable original is dead-lettered on its first delivery with
-  `RESIZE_SOURCE_DAMAGED` (`retryable: false`) instead of rendering a garbled preview. A cut
-  animated GIF can still render the frames it has, so its preview can be shorter. Three limits:
-  bytes flipped mid-file can still render garbled; a JPEG missing only its end marker is usually
-  refused at every strict level; and a PNG with a bad IDAT checksum is refused at `'error'`
+  `failOn: 'none'`. An original the engine refuses as cut or unreadable is dead-lettered on its
+  first delivery with `RESIZE_SOURCE_DAMAGED` (`retryable: false`) instead of rendering a garbled
+  preview. Not every damaged original is refused: a cut animated GIF can still render the frames it
+  has, so its preview can be shorter, and damage the engine reports with an error the module does
+  not classify as damage (usually a cut TIFF, or a PNG cut to its 8 signature bytes) is the
+  retryable `RESIZE_SOURCE_DECODE_FAILED`, retried until `maxAttempts`. Three limits: bytes flipped
+  mid-file can still render garbled; a JPEG missing only its end marker is usually refused at every
+  strict level; and a PNG with a bad IDAT checksum is refused at `'error'`
   (`vipspng: libpng read error`), although it renders the same pixels as the intact file at
   `'none'`. `limits.failOn: 'none'` restores 0.3.0's rendering; a file whose header cannot be read
-  still fails, usually at once (a file with no usable detail is retried, and so, usually, is a cut
-  TIFF). It is not in `encodeSig`, so nothing regenerates; previews already made stay fresh,
-  and the README's `Damaged originals` shows how to find them. A complete config passed to
-  `new Resizer` must now hold `limits.failOn`. Sharp's pixel limit at decode is now
-  `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`), and at upload `RESIZE_ORIGINAL_TOO_MANY_PIXELS`.
+  still fails, usually at once (a file with no usable detail is retried). It is not in `encodeSig`,
+  so nothing regenerates; previews already made stay fresh, and the README's `Damaged originals`
+  shows how to find them. A complete config passed to `new Resizer` must now hold `limits.failOn`.
+  Sharp's pixel limit at decode is now `RESIZE_SOURCE_TOO_LARGE` (`retryable: false`), and at upload
+  `RESIZE_ORIGINAL_TOO_MANY_PIXELS`.
 - On a cut JPEG, which 0.3.0 rendered, `generate()` now rejects with `ResizeMediaError`
   `RESIZE_SOURCE_DAMAGED`, not `ResizeGenerateError`. A handler that catches only
   `ResizeGenerateError` returns 500 on a user's upload: catch `ResizeError` too, or refuse the file
@@ -47,7 +50,10 @@ it lists what to change before you run `npm i`.
   was retried. A final error of a whole task follows the same rule: when a reload finds another
   original on the media, the task fails with the retryable `RESIZE_WORKER_INCOMPLETE`, with that
   error as `cause`, and its next delivery renders the new one. `RESIZE_GENERATE_FAILED` is `false`
-  when every variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`)
+  when every variant failed with `false`. `uploadOriginal()`'s `RESIZE_ORIGINAL_UPLOAD_FAILED` is
+  `false` when its `cause`, the storage driver's refusal, is (an invalid `namespace`, no distinct
+  `bucketPrivate`, an S3 key over 1024 bytes), where it was always `true`: a host that branches on
+  `retryable` stops retrying those uploads. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`)
   from both shipped drivers, where it was the raw driver error.
 - A disabled worker logs `warn`, and the command resolves `false`, so a CLI entry that forwards the
   result, as the framework docs require, exits 1: a deploy that runs it with the flag off now
@@ -95,18 +101,21 @@ it lists what to change before you run `npm i`.
   there and none matches what was written in `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`,
   `pipeline` and `filters`, or none has a `contentType`, the task dead-letters with
   `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields. So does a row that comes back
-  with those fields as written but no `storageRef`. A custom store that dropped one of these, and so
-  rendered again on every read without a log line, now fails visibly. A store with no `identity`
-  column, or its own form of it, keeps working: a read does not use it. It gets one `warn` per
-  Resizer, because `invalidate()` finds such rows only by identity, so it leaves them, and a
-  `replacePreviews` that removes by stored identity leaves them too. A reload that lags raises
-  nothing, except on a driver that names files by their bytes, where it can show another row under
-  the same ref, an older row after a replacement (naming `encodeSig`) or another size key's row on a
-  first render (naming `sizeKey`): the task is dead, though its rows are stored and the next read is
-  fresh. `MongoMediaStore` with the current fragment and a driver that names files at random, as the
-  shipped ones do, is not affected. `verify()` now also rejects a strict row schema without
-  `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read
-  could never serve such a row.
+  with those fields as written but no `storageRef`. Rows are matched by `storageRef`, so a store
+  that changes a ref to another non-null value, or loses `storageRef` together with another field,
+  is not detected, and a `resizer`, `pipeline` or `filters` lost while it held its default
+  (`'default'`, or no filters) is no loss: a read applies the same default. A custom store that
+  dropped one of these, and so rendered again on every read without a log line, now fails visibly. A
+  store with no `identity` column, or its own form of it, keeps working: a read does not use it. It
+  gets one `warn` per Resizer, because `invalidate()` finds such rows only by identity, so it leaves
+  them, and a `replacePreviews` that removes by stored identity leaves them too. A reload that lags
+  raises nothing, except on a driver that names files by their bytes, where it can show another row
+  under the same ref, an older row after a replacement (naming `encodeSig`) or another size key's
+  row on a first render (naming `sizeKey`): the task is dead, though its rows are stored and the
+  next read is fresh. `MongoMediaStore` with the current fragment and a driver that names files at
+  random, as the shipped ones do, is not affected. `verify()` now also rejects a strict row schema
+  without `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`):
+  a read could never serve such a row.
 - **A custom model-shaped `MongoMediaModel` must accept a new filter.** The write of the original's
   dimensions in `MongoMediaStore` had the filter `{ _id }`. It now adds `$or`, `$not` and `$type`,
   so the write lands only while the original holds no stored pair, and its options add
@@ -166,12 +175,13 @@ it lists what to change before you run `npm i`.
 
 **Changed behaviour**
 
-- The scaffold writes an explicit `privateRootDir` and an absolute `publicBaseUrl` from
-  `RESIZE_PUBLIC_BASE_URL`, has new next steps, and appends `/var/` to `.gitignore` in the run that
-  writes the config, before it writes the config. A file it cannot write stops the run with exit 1,
-  naming what failed. A `!` line for `var` beside a host's rule gets a warning. Existing configs are
-  not touched. An override that moves `rootDir` on a scaffolded config must move `privateRootDir`
-  too, since it no longer follows.
+- The scaffold writes an explicit `privateRootDir` and a `publicBaseUrl` from
+  `RESIZE_PUBLIC_BASE_URL`, taken as given (a relative value stays relative), with the absolute
+  `http://localhost:3300/media` when the variable is unset or empty. It has new next steps, and
+  appends `/var/` to `.gitignore` in the run that writes the config, before it writes the config. A
+  file it cannot write stops the run with exit 1, naming what failed. A `!` line for `var` beside a
+  host's rule gets a warning. Existing configs are not touched. An override that moves `rootDir` on
+  a scaffolded config must move `privateRootDir` too, since it no longer follows.
 - The documented command is `npx --no -- resize-scaffold`. Without `--no`, a run with the package
   missing fetches and runs whatever the registry holds under that name. Without the `--`, npm takes
   the options for itself: npm 12 refuses them, and npm 11 runs the scaffold without them.
@@ -336,10 +346,11 @@ it lists what to change before you run `npm i`.
 - The README has one full error table, `## Error codes`: every code with its `retryable` and what to do.
   A test requires every code in it, and holds the values to the audited table.
 - `## Config reference` moved above `## Drivers` in the README, so it ends inside the 64 KiB npm shows.
-- `AGENTS.md` holds what a new integration needs, at most 5,000 words, from about 16,000. The rest moved
-  to `README.md` and `UPGRADING.md`, one link away. It shows how to serve local files in development
-  and the migration that creates the indexes, both run on a framework host. A test keeps it there, and
-  every link between the documents is checked, files on GitHub and `./dist/…` paths included.
+- `AGENTS.md` holds what a new integration needs, at most 5,000 words, from 11,170 in 0.3.0. The
+  rest moved to `README.md` and `UPGRADING.md`, one link away. It shows how to serve local files in
+  development and the migration that creates the indexes, both run on a framework host. A test keeps
+  it there, and every link between the documents is checked, files on GitHub and `./dist/…` paths
+  included.
 - A media schema without `resizeMediaSchemaFragment` fails nothing at boot: `uploadOriginal()`
   succeeds, `save()` drops the original, and reads count `no-original`. The README and `AGENTS.md`
   have a row for it.

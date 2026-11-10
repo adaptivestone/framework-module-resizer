@@ -9,7 +9,7 @@
 //                         still retries it unless it carries `retryable: false`)
 //   ResizeGenerateError — the operation produced nothing
 //   ResizeOriginalError — uploaded original bytes are invalid/unsupported/outside policy
-//   ResizeStorageError  — transient I/O; a retry may help
+//   ResizeStorageError  — storage I/O failed; a retry may help unless `retryable` is false
 //   ResizeSecurityError — a refusal (traversal, cross-bucket); never retry, log loudly
 //
 // The subclass guides a host's catch block; the task queue retries every error unless it is a
@@ -92,7 +92,10 @@ export class ResizeConfigError extends ResizeError {
   }
 }
 
-/** Transient storage I/O — a retry may help. */
+/**
+ * Storage I/O failed — a retry may help. `RESIZE_ORIGINAL_UPLOAD_FAILED` carries `retryable: false`
+ * when its `cause`, the storage driver's refusal, does: the same upload fails the same way.
+ */
 export class ResizeStorageError extends ResizeError {
   constructor(message: string, opts?: ResizeErrorOptions) {
     super(message, { ...opts, code: opts?.code ?? 'RESIZE_STORAGE' });

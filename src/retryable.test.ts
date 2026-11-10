@@ -516,6 +516,38 @@ for (const [code, retryable, trigger] of rows) {
   });
 }
 
+// RESIZE_ORIGINAL_UPLOAD_FAILED is `true` above, for a failure that gives no verdict. A driver's
+// final refusal as its cause makes it `false`: the same upload fails the same way until the setting
+// or the `namespace` changes. Each refusal comes from a shipped driver.
+const refusals: [cause: string, storage: ResizeStorage, namespace?: string][] =
+  [
+    ['RESIZE_STORAGE_NAMESPACE_INVALID', fs, '../bad'],
+    [
+      'RESIZE_S3_PRIVATE_BUCKET_REQUIRED',
+      new S3Storage({ bucketPublic: 'pub', client }),
+    ],
+    ['RESIZE_S3_KEY_TOO_LONG', s3, 'n'.repeat(1000)],
+  ];
+for (const [cause, storage, namespace] of refusals) {
+  test(`RESIZE_ORIGINAL_UPLOAD_FAILED is retryable: false when its cause is ${cause}`, async () => {
+    await assert.rejects(
+      async () =>
+        uploader(createDecoderSet(), { storage }).upload({
+          body: png,
+          visibility: 'private',
+          ...(namespace === undefined ? {} : { namespace }),
+        }),
+      (err: ResizeError) => {
+        assert.equal(err.code, 'RESIZE_ORIGINAL_UPLOAD_FAILED');
+        assert.equal(err.retryable, false);
+        assert.equal((err.cause as ResizeError).code, cause);
+        assert.equal((err.cause as ResizeError).retryable, false);
+        return true;
+      },
+    );
+  });
+}
+
 // Reached by a task, where a real run belongs in another test file. That test asserts this value;
 // here the file must at least hold the code.
 const elsewhere: [code: string, retryable: boolean, file: string][] = [

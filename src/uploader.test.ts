@@ -1130,8 +1130,88 @@ describe('uploadOriginal — typed failures', () => {
       (error: unknown) =>
         error instanceof ResizeStorageError &&
         error.code === 'RESIZE_ORIGINAL_UPLOAD_FAILED' &&
+        error.retryable === true &&
         error.cause === cause,
     );
+  });
+
+  test("a driver's final refusal makes RESIZE_ORIGINAL_UPLOAD_FAILED not retryable, with the refusal as its cause", async () => {
+    installApp();
+    const dir = await mkdtemp(join(tmpdir(), 'resize-original-'));
+    try {
+      const r = new FrameworkResizer({
+        storage: new LocalFsStorage({ rootDir: dir, publicBaseUrl: '/media' }),
+      });
+      await assert.rejects(
+        () =>
+          r.uploadOriginal({
+            body: png,
+            visibility: 'private',
+            namespace: '../bad',
+          }),
+        (error: unknown) =>
+          error instanceof ResizeStorageError &&
+          error.code === 'RESIZE_ORIGINAL_UPLOAD_FAILED' &&
+          error.retryable === false &&
+          error.cause instanceof ResizeSecurityError &&
+          error.cause.code === 'RESIZE_STORAGE_NAMESPACE_INVALID',
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(`${dir}-private`, { recursive: true, force: true });
+    }
+  });
+
+  test('an upload failure keeps retryable: true unless its cause is a ResizeError that says false, told by the brand', async () => {
+    installApp();
+    const failingWith = (cause: unknown): ResizeStorage => ({
+      download: async () => Buffer.alloc(0),
+      upload: async () => {
+        throw cause;
+      },
+      publicUrl: () => '',
+    });
+    // From a second copy of the package: the brand, not the class, says it is one.
+    const copied = Object.assign(new Error('refused'), {
+      [Symbol.for('@adaptivestone/framework-module-resize.error')]: true,
+      code: 'RESIZE_STORAGE_NAMESPACE_INVALID',
+      retryable: false,
+    });
+    // Another library's error with a retryable field of its own (an AWS SDK v2 4xx carries one).
+    const foreign = Object.assign(new Error('4xx'), { retryable: false });
+    const transient = new ResizeStorageError('slow down');
+    // A cause whose fields cannot be read gives no verdict.
+    const hostile = new Proxy(
+      {},
+      {
+        has() {
+          throw new Error('trap');
+        },
+        get() {
+          throw new Error('trap');
+        },
+      },
+    );
+    const cases = [
+      [copied, false],
+      [foreign, true],
+      [transient, true],
+      [hostile, true],
+    ] as const;
+    for (const [index, [cause, retryable]] of cases.entries()) {
+      const r = new FrameworkResizer({
+        storage: failingWith(cause),
+        name: `upload-cause-${index}`,
+      });
+      await assert.rejects(
+        () => r.uploadOriginal({ body: png, visibility: 'private' }),
+        (error: unknown) =>
+          error instanceof ResizeStorageError &&
+          error.code === 'RESIZE_ORIGINAL_UPLOAD_FAILED' &&
+          error.retryable === retryable &&
+          error.cause === cause,
+      );
+    }
   });
 
   test('rejects unsupported bytes with a stable input error', async () => {
