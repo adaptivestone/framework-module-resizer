@@ -8,6 +8,7 @@ import type {
   ObserverName,
   WaterfallName,
 } from './contracts/hooks.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import type { ResizeEventBus, ResizeLogger } from './types.d.ts';
 
 export interface HookBusDeps {
@@ -65,7 +66,11 @@ export class HookBus {
         value = await fn(value, ctx);
         succeeded = true;
       } catch (e) {
-        this.#logger.error(`resize waterfall ${name} tap failed (skipped)`, e);
+        logNeverThrow(
+          this.#logger,
+          `resize waterfall ${name} tap failed (skipped)`,
+          e,
+        );
       }
     }
     if (mode === 'optional' && !succeeded) {
@@ -84,13 +89,13 @@ export class HookBus {
     try {
       this.#events?.emit(`resize:${name}`, ...args);
     } catch (e) {
-      this.#logger.error(`resize event ${name} listener failed`, e);
+      logNeverThrow(this.#logger, `resize event ${name} listener failed`, e);
     }
     for (const fn of this.#taps.get(name) ?? []) {
       try {
         await fn(...args);
       } catch (e) {
-        this.#logger.error(`resize hook ${name} failed`, e);
+        logNeverThrow(this.#logger, `resize hook ${name} failed`, e);
       }
     }
   }

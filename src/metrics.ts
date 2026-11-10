@@ -14,8 +14,8 @@ import {
   ResizeMetrics,
 } from './contracts/metrics.ts';
 import { RESIZE_ERROR_CODES } from './errorCodes.ts';
-import { ResizeError, ResizeSetupError } from './errors.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { ResizeSetupError } from './errors.ts';
+import { codeText, isModuleError, logNeverThrow } from './helpers/log.ts';
 import type { ResizeLogger } from './types.d.ts';
 
 export interface LogMetricsOptions {
@@ -49,10 +49,12 @@ const isThenable = (value: unknown): value is PromiseLike<unknown> =>
  * The `code` label of a failure, to spread into a call's labels: the raw code of a module error
  * (told by its brand, so a duplicate copy of the package counts too), and no label for anything
  * else. The code is passed raw: the bound sink keeps the label to the module's own codes and moves
- * any other code to the context.
+ * any other code to the context. The value may be hostile, and the `resize.task` line prints the raw
+ * code, so a code that is not one token, or cannot be read, gives no label.
  */
 export function errorCodeLabel(err: unknown): { code?: string } {
-  return ResizeError.isResizeError(err) ? { code: err.code } : {};
+  const code = isModuleError(err) ? codeText(err) : 'none';
+  return code === 'none' ? {} : { code };
 }
 
 /** True when `value` has the count() and timing() functions of a metrics sink. */
@@ -141,7 +143,13 @@ function taskLine(
   labels: MetricLabels | undefined,
   context: MetricContext | undefined,
 ): string {
-  return `resize: task ${show(context?.taskId)} of media ${show(context?.mediaId)} ${show(labels?.outcome)} in ${Math.round(ms)} ms (Resizer '${show(labels?.resizer)}', queue '${show(labels?.queue)}', pipeline '${show(labels?.pipeline)}', attempt ${show(context?.attempts)}, variants ${show(context?.variants)}${codePart(labels, context)})`;
+  // Only a completed task carries `rendered`; one that rendered all it names keeps the short form.
+  const rendered = context?.rendered;
+  const variants =
+    typeof rendered === 'number' && rendered !== context?.variants
+      ? `${rendered} of ${show(context?.variants)}`
+      : show(context?.variants);
+  return `resize: task ${show(context?.taskId)} of media ${show(context?.mediaId)} ${show(labels?.outcome)} in ${Math.round(ms)} ms (Resizer '${show(labels?.resizer)}', queue '${show(labels?.queue)}', pipeline '${show(labels?.pipeline)}', attempt ${show(context?.attempts)}, variants ${variants}${codePart(labels, context)})`;
 }
 
 function failedVariantLine(
@@ -193,7 +201,7 @@ export class LogMetrics extends ResizeMetrics {
     labels?: MetricLabels,
     context?: MetricContext,
   ): void {
-    this.#debugLine(name, value, labels, context);
+    this.#debugLine(name, String(value), labels, context);
     switch (name) {
       case 'resize.read': {
         const tally = this.#tally(labels);
@@ -219,7 +227,7 @@ export class LogMetrics extends ResizeMetrics {
     labels?: MetricLabels,
     context?: MetricContext,
   ): void {
-    this.#debugLine(name, ms, labels, context);
+    this.#debugLine(name, `${Math.round(ms)} ms`, labels, context);
     switch (name) {
       case 'resize.task':
         this.#write(taskLine(ms, labels, context));
@@ -291,7 +299,7 @@ export class LogMetrics extends ResizeMetrics {
 
   #debugLine(
     name: string,
-    value: number,
+    value: string,
     labels: MetricLabels | undefined,
     context: MetricContext | undefined,
   ): void {

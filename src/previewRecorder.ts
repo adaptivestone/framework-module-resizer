@@ -13,6 +13,7 @@
 import type { Catalog } from './catalog.ts';
 import type { MediaStore, ReplacedPreviews } from './contracts/media.ts';
 import { ResizeSetupError } from './errors.ts';
+import { logNeverThrow } from './helpers/log.ts';
 import type {
   MediaLike,
   Preview,
@@ -228,7 +229,8 @@ export class PreviewRecorder {
         const total = appends.length + pending.length;
         if (total === 0) {
           // Only the dimensions were to be written: no upload is affected.
-          logger.error(
+          logNeverThrow(
+            logger,
             `resize: recording the original's dimensions failed for media ${mediaId}${backfillDims ? ` (${backfillDims.width}×${backfillDims.height})` : ''}; no uploaded preview is affected`,
             err,
           );
@@ -254,7 +256,8 @@ export class PreviewRecorder {
             : appends),
           ...pending,
         ];
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize: recording previews failed for media ${mediaId}; ${unrecorded.length} of ${total} uploaded preview(s) are not recorded${recorded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
           err,
         );
@@ -340,7 +343,8 @@ export class PreviewRecorder {
       const reloaded = await this.#reload(mediaId);
       const refs = new Set((reloaded?.previews ?? []).map(describeRef));
       const unrecorded = rows.filter((p) => !refs.has(describeRef(p)));
-      logger.error(
+      logNeverThrow(
+        logger,
         `resize: replacing previews failed for media ${mediaId}; ${unrecorded.length} of ${rows.length} uploaded preview(s) are not recorded${reloaded === undefined ? ' (the media could not be reloaded to check)' : ''}: storage refs ${describeRefs(unrecorded)}`,
         err,
       );

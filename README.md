@@ -292,8 +292,9 @@ renewal that then answers `false` means the lease was lost, so there is no compl
 event, and the task is left to its next delivery. A renewal that does not answer in that time is
 logged, and the task ends without it (its gate calls are then sent without waiting).
 `logger` receives the worker loop's own messages, failed gate lock calls included; a logger that
-throws never stops the loop. Framework hosts run `npm run cli ResizeWorker`, which serves the
-Resizers that `src/resizer.ts` constructs.
+throws never stops the loop. `runWorker` resolves `true` after a run, and `false` when no Resizer has
+a task queue, so the process consumes nothing (an `error` line says so). Framework hosts run
+`npm run cli ResizeWorker`, which serves the Resizers that `src/resizer.ts` constructs.
 
 ## Package exports
 
@@ -342,7 +343,7 @@ Resizers that `src/resizer.ts` constructs.
     `PictureUrls`, what `formatPictureUrls` makes of a decision;
   - the media and preview shapes: `MediaLike`, `Original`, `OriginalFormat`, `Preview`,
     `PreviewFormat`, `PreviewScope`, `Filters`, `StorageRef`;
-  - the config sections: the image settings `ResizeConfig` and `ResizeLimits`, and `DeepPartial`
+  - the config sections: the image settings `ResizeConfig`, `ResizeLimits` and `ResizeFailOn`, and `DeepPartial`
     for overrides; storage `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`; database
     `MongoDatabaseConfig`; coordination `CoordinationOptions`; worker `FrameworkWorkerConfig`; the
     framework config `FrameworkResizeConfig` and `PartialFrameworkResizeConfig`; the Resizer's
@@ -543,9 +544,15 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
 - `ResizeStorage`: `upload`, `download`, `publicUrl` (pure, no I/O), and optionally
   `signedUrl(ref, ttlSeconds)`. The module never calls `signedUrl`; a host calls it to give an
   owner the private original.
-  - The ref you return from `upload()` is opaque to the module and comes back unchanged.
+  - The ref you return from `upload()` is opaque to the module and comes back unchanged, and it must
+    stay the same on every load: a ref that changes per load (a per-access nonce, say) reads as a
+    replaced original.
   - `upload()` may receive a `namespace` hint (from `uploadOriginal`) or a `parentRef` (the
     original's ref, for previews). Never both.
+  - `download()` reports a missing object with a `ResizeStorageError` with the code
+    `RESIZE_STORAGE_NOT_FOUND`, retryable, as both shipped drivers do: each retry costs one 404,
+    and an object can appear later (a row written before its PUT finishes). An S3 role without
+    `s3:ListBucket` gets 403 for a missing key, which stays raw.
 - `MediaStore`: `loadMedia(id)` (`null` for deleted media: its task completes as a no-op),
   `appendPreviews(id, previews, dims?)`, and optionally `verify()`, awaited at startup — throw
   there to stop the worker before it claims anything.
@@ -594,7 +601,10 @@ is queued, and that owner travels with the task. `MongoLockStore` keeps the owne
     queue cannot say whether the task was stored, e.g. a response lost after the write: the read
     path logs it once until an add is confirmed again, `prewarm()` reports the retryable
     `RESIZE_ENQUEUE_UNCONFIRMED` (see [`prewarm()` issues](#prewarm-issues)); on a gating queue a stored task's row is the gate, and beside a
-    queue without `gatesByTask` the core keeps the gate lock for one lease, at most `gateTtlMs`). A
+    queue without `gatesByTask` the core keeps the gate lock for one lease, at most `gateTtlMs`).
+    `unconfirmed` may also carry `retryable: false` and a string `causeCode`: calling again cannot
+    help until someone fixes what `causeCode` names. `prewarm()` passes both on in its issue, and
+    `MongoTaskQueue` sets them for a missing or outdated `ResizeTask` model. A
     value in
     none of these shapes (a queue written for an older version, e.g. one that resolves a task id)
     is never counted as queued: the Resizer logs it once, and `prewarm()` reports its variants
@@ -726,8 +736,9 @@ reads that section (on first use or in `verify()`; the `storage` of a config obj
 at construction): an unregistered name is `RESIZE_CONFIG_INVALID`
 listing the registered ones (`` `storage` in <config> needs driver 'local', 's3' or 'gcs' ``). A
 framework config file accepts any non-empty driver name when it is read, so a disabled worker
-(`worker.enabled: false`) only logs that it is disabled. A queue build that fails reaches
-`prewarm()` as an issue (see [`prewarm()` issues](#prewarm-issues)): the error's own code when it
+(`worker.enabled: false`) never checks one: it logs a `warn`, and the command resolves `false`, so
+a CLI entry that forwards the result, as the framework docs require, exits 1. A queue build that
+fails reaches `prewarm()` as an issue (see [`prewarm()` issues](#prewarm-issues)): the error's own code when it
 is an issue code, else `RESIZE_ENQUEUE_QUEUE_FAILED` with the error's code in `causeCode`, and
 always the error's own `retryable`.
 
@@ -811,8 +822,10 @@ A decoder extends `SourceDecoder`, or is any object of the same shape (the core 
   frames (one when the decoder cannot animate), at least `box` on both sides where the decoder's
   limits allow. The core resizes it to each exact size either way, and a raster source smaller
   than the box is never enlarged. It respects `opts.limits` and stops when `opts.signal` aborts, if
-  its engine can. A raster whose `data` length does not match its `info` is
-  `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
+  its engine can. With `upload.verify: 'decode'` a host's `render` also runs in the API process
+  during `uploadOriginal()`, with no `opts.signal`, so the decoder bounds its own time; a source
+  that reports `vector` is not rendered there. A raster whose `data` length does not match its
+  `info` is `RESIZE_DECODER_INVALID`; one with more pixels (width × height × frames) than
   `min(limits.sourcePixels, limits.inputPixels)` is `ResizeMediaError` `RESIZE_SOURCE_TOO_LARGE`
   (`retryable: false`). A decoder's `ResizeMediaError` without a `mediaId` reaches the task, or
   `generate()`, as the same object with the media id set on it; one that cannot take it (frozen)
@@ -826,6 +839,8 @@ accepts the bytes measures them: its `format` is stored as `original.format` and
 `contentType` as `original.contentType`. `upload.formats` must list that format
 (`RESIZE_ORIGINAL_FORMAT_DISABLED` otherwise). Bytes that every decoder refuses are
 `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED`; bytes Sharp cannot read at all stay `RESIZE_ORIGINAL_INVALID`.
+A host decoder's plain error says nothing about the bytes, whatever its message holds:
+`RESIZE_ORIGINAL_INSPECT_FAILED`.
 In the worker and `generate()`, the stored `original.format` picks the decoder to try first. A
 format that no decoder lists, or one whose decoder refuses the bytes, is logged as a warning, and
 the bytes are probed through the other decoders; a format whose decoder reads the bytes as another
@@ -835,8 +850,8 @@ of its formats (JPEG bytes stored as `png`) is logged too, and rendered as what 
 resize worker: media <id> is stored as 'jpg' but its bytes are 'jpeg' (no decoder lists the stored format); rendering it as 'jpeg'
 ```
 
-(`its decoder refused the bytes` for the second case, `its decoder read another of its formats`
-for the third; when a host decoder lists the stored format,
+(`resize generate:` when `generate()` writes it; `its decoder refused the bytes` for the second
+case, `its decoder read another of its formats` for the third; when a host decoder lists the stored format,
 refuses the bytes and a later decoder reads them as that same format, the warning says
 `… is stored as 'jpeg'; the first decoder listing 'jpeg' refused these bytes, and another decoder
 read them`). So `original.format` should be the
@@ -846,6 +861,28 @@ decoder lists the stored format and none reads the bytes, the source fails with 
 it in `decoders` in every process). When the stored format's decoder refuses the bytes (or the
 media has no stored format) and every other decoder refuses them too, it fails with
 `ResizeMediaError` `RESIZE_SOURCE_FORMAT_UNSUPPORTED` (`retryable: false`: dead-lettered at once).
+
+**What an upload rejection says.** `uploadOriginal()` throws a `ResizeOriginalError` whose message
+carries the engine's line, for example `resize uploadOriginal: bytes are not a supported image:
+gifload_buffer: Unexpected end of GIF source data`. The code is the stable part: the text may change
+with Sharp, and it may reach end users through `badRequest(err.message)`. Check `err.retryable`:
+when it is `true`, the module gave no verdict on the file, so answer with your own text. A
+`ResizeOriginalError` is not retryable by default, since the same bytes get the same refusal. The
+exceptions say what they are:
+
+- `RESIZE_ORIGINAL_INSPECT_FAILED` (`retryable: true`): a decoder failed for a reason other than the
+  bytes, such as a timeout, a host decoder's own failure, a healthy file this build cannot decode or
+  an engine failure with no detail. Retry may help, and `cause` says why.
+- `RESIZE_ORIGINAL_VERIFY_FAILED` (`retryable: true`): the `upload.verify: 'decode'` check failed for
+  a reason other than damage, such as a timeout or a healthy file this build cannot decode. It gave
+  no verdict on the image, and `cause` says why. A host decoder's own error with `retryable: false`
+  (an encrypted PDF, say) is not this code: it keeps its code and `retryable`, as at `inspect`.
+
+`RESIZE_ORIGINAL_DAMAGED` (`retryable: false`) comes only from that check. Damage `inspect` finds
+first, such as a cut single-frame GIF or a cut inside an animation's first frame, stays
+`RESIZE_ORIGINAL_INVALID`. The check decodes the first frame only: an animation damaged in a later
+frame can be stored, and a worker then renders the frames it has or fails the task. Flipped bytes can
+pass too, since a decode does not always find them: a still JPEG or lossy WebP usually passes.
 
 ## Config reference
 
@@ -860,6 +897,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
+| `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, and flipped bytes can pass, since a decode does not always find them. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
 | `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
@@ -870,6 +908,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
 | `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation |
+| `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
 **Pipelines** (`pipelines` of `new Resizer` or `new FrameworkResizer`, fixed at construction) are
@@ -998,8 +1037,9 @@ and the worker use. They are read only from that file: in another file, or in th
   names the entry. Every entry is validated with the file, on first use. A driver name that the
   Resizer does not have (neither `'database'`, `'sqs'` nor a name in its `drivers`) passes the file
   read and is `RESIZE_CONFIG_INVALID` when the Resizer first reads `queues` (its first use or
-  `verify()`); a disabled worker only logs that it is disabled. An entry set to
-  `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
+  `verify()`); a disabled worker never checks it: it logs a `warn`, and the command resolves
+  `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1. An entry
+  set to `undefined` is not defined: set one to `undefined` in an environment file to remove it there (a
   Resizer that still names it gets `RESIZE_CONFIG_QUEUE_UNKNOWN`).
 - `worker`: `{ enabled, sharpConcurrency, sharpCache }` for the `ResizeWorker` command
   (`defaultWorkerOptions` from `…/framework.js`: `false`, `1`, `false`). Every key is optional and a
@@ -1156,7 +1196,9 @@ may then be rendered on both; the media store keeps one row per preview identity
   and the owner travels in the task as `gateOwner`. When the queue does not confirm that it stored
   the task (`unconfirmed`, a throw), the task may still be stored, so an ambiguous enqueue keeps the
   gate for one lease (`leaseMs`, at most `gateTtlMs`) instead of releasing it: a stored task is
-  claimed and extended within it, otherwise it lapses and a later read queues the task. The worker extends the lock: to
+  claimed and extended within it, otherwise it lapses and a later read queues the task, unless the
+  add was `unconfirmed` with `retryable: false`: calling again cannot help until someone fixes what
+  `causeCode` names. The worker extends the lock: to
   one lease plus one heartbeat interval (`leaseMs / 2`) when the task starts and on every
   heartbeat, so a redelivery after a worker crash still finds it held; to the retry time plus one
   lease after a failed attempt; to `cooldownMs` after a dead-letter; and to `gateTtlMs` when it
@@ -1221,8 +1263,8 @@ and it catches what they throw or reject.
 `new FrameworkResizer({ metrics })` take the sink; `resizer.metrics` returns it as given. Left out
 (only `undefined` means the default), `new Resizer` and `createResizer` use
 `new LogMetrics(logger)` on the Resizer's logger, and `FrameworkResizer` uses
-`new LogMetrics(logger, { debug: true })` on its `logger` option, else the app logger, so that
-logger decides whether the debug lines are kept. `new NoopMetrics()` turns metrics off. The sink is checked by shape at construction,
+`new LogMetrics(logger)` too, on its `logger` option, else the app logger. `new NoopMetrics()` turns
+metrics off. The sink is checked by shape at construction,
 before the Resizer's name is taken: `metrics: null`, or an object without `count()` and `timing()`
 functions, is `ResizeSetupError` `RESIZE_METRICS_INVALID` (`retryable: false`).
 
@@ -1246,7 +1288,7 @@ The Resizer puts a guard in front of its sink, and every call goes through it:
 | `resize.upload.bytes` | count | the stored original's bytes | `format` | — |
 | `resize.variant` | timing | ms of one variant | `pipeline`, `format`, `mode`: `task` or `eager`, `outcome`: `stored`, `duplicate`, `rendered` or `failed`; `code` (failed) | `mediaId`, `identity`, `taskId` (task mode), `rawFormat` (`format: 'unconfigured'`) |
 | `resize.variant.bytes` | count | the uploaded preview's bytes (stored, duplicate, rendered) | `pipeline`, `format` | — |
-| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `payloadQueue` (when the task names another queue) |
+| `resize.task` | timing | ms from the claim to the task's outcome | `queue`, `pipeline`, `outcome`: `completed`, `failed` or `dead`; `code` (failed or dead, for a module error) | `taskId`, `mediaId`, `attempts`, `variants`, `rendered` (on `completed`: the variants this delivery stored), `payloadQueue` (when the task names another queue) |
 | `resize.claim` | timing | ms the worker's loop waited for this task | `queue` | `taskId` |
 
 - **`resize.read` outcomes**, in the order a read decides them: `unknown-pipeline` (the pipeline is
@@ -1293,23 +1335,34 @@ that is not a positive safe integer is `RESIZE_METRICS_INVALID`.
 - **Written at once**, one `info` line each, because they are rare and worth reading alone:
 
   ```text
-  resize: task <taskId> of media <mediaId> <completed|failed|dead> in <ms> ms (Resizer '<r>', queue '<q>', pipeline '<p>', attempt <n>, variants <n>[, code <code>])
+  resize: task <taskId> of media <mediaId> <completed|failed|dead> in <ms> ms (Resizer '<r>', queue '<q>', pipeline '<p>', attempt <n>, variants <n>[ of <m>][, code <code>])
   resize: variant <identity> of media <mediaId> failed in <ms> ms (Resizer '<r>', pipeline '<p>', format '<f>'[, code <code>])
   ```
 
-  A missing value prints as `?`; a code reduced to `'other'` prints the raw code.
+  A missing value prints as `?`; a code reduced to `'other'` prints the raw code. `variants 5 of 9`
+  is a completed task that stored 5 of the 9 variants it names; the others were fresh already, or
+  its media is gone.
 - **The window** opens with the first summed event and closes when it is written, after
   `summaryIntervalMs`. Its timer is `unref`ed, so it never keeps a process alive, and no timer runs
   between windows. `flush()` writes the open window now. The worker flushes the sink of every
   Resizer it serves when it stops (once per distinct sink), waiting at most 5 s for each; that wait
-  keeps the process alive until the flush settles or the 5 s end. An API process should call
-  `await resizer.metrics.flush?.()` at shutdown, or the open window's counts are lost.
-- **`debug: true`** also writes every call as one `debug` line, `resize metric <name> <value>
-  <labels JSON> <context JSON>`, when the logger has a `debug` method (`ResizeLogger.debug` is
-  optional). It costs two `JSON.stringify` calls per event. The default sink of a
-  `FrameworkResizer` writes to its `logger` option, else the app logger, which always has `debug`,
-  so it pays that cost even when the app drops debug lines: pass `metrics: new LogMetrics(logger)`
-  to skip it.
+  keeps the process alive until the flush settles or the 5 s end. In a framework host the open
+  window is written on the framework's `shutdown` event, with no code of yours, wherever the
+  framework emits it: `startServer()` on SIGTERM or SIGINT, and its CLI after a command returns.
+  Everywhere else, call `await getResizer().metrics.flush?.()` yourself:
+  - a script that uses `new Server()` and `init()`, which never emits the event;
+  - a `FrameworkResizer` with every part passed in code that is first used before the `Server`
+    exists: it never registers for the event;
+  - a CLI command with a sink whose `flush` is asynchronous, before the command returns: the
+    listener does not wait, and the CLI entry calls `process.exit`;
+  - a process without the framework, in your own SIGTERM handler.
+
+  Under `startServer()`, a sink with an asynchronous `flush` must keep its own handle open until it
+  finishes, because the event does not wait for it.
+- **`debug: true`** (off by default for every Resizer) also writes every call as one `debug` line,
+  `resize metric <name> <value> <labels JSON> <context JSON>`, when the logger has a `debug` method
+  (`ResizeLogger.debug` is optional). `<value>` is the count, or a rounded `<n> ms`. It costs two
+  `JSON.stringify` calls per event.
 
 **`NoopMetrics`** records nothing.
 
@@ -1427,6 +1480,12 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
 
 ## Operations
 
+- **Starting a worker:** once its checks pass, before it claims anything, the worker logs one `info`
+  line naming what it serves: `resize worker started: queues 'default', 'bulk'; Resizers 'default',
+  'listings'`. A worker that consumes nothing writes no start line. Disabled
+  (`worker.enabled: false`), it logs a `warn`; with no task queue on any Resizer, the `error` line
+  `resize worker: no Resizer has a task queue (eager-only wiring)`. In both cases the command
+  resolves `false`, so a CLI entry that forwards the result, as the framework docs require, exits 1.
 - **Task states (Mongo):** `pending → processing → completed`. A row's `active` is `true` from
   `add()` until the task completes: the row is the gate of its Resizer, media, pipeline and queue (see
   [Coordination](#coordination)). Rows written before the gate have no `active` and never block a
@@ -1436,26 +1495,48 @@ loses the `_id` it had: key preview rows by `identity`, never by `_id`.
   without them keeps working (the times are dropped), but `resize-scaffold --check` reports it.
   - A failed attempt returns to `pending` with backoff, still active.
   - After `maxAttempts` the task is `dead`, and the lease never reclaims it. A task is `dead` at
-    once when its error has `retryable: false` (`ResizeError.retryable`, default `true`): no
-    retry can help. The module sets it on every `ResizeSecurityError` and on six codes: the
-    media has no original (`RESIZE_NO_ORIGINAL`), no decoder reads the source's bytes
-    (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source has no dimensions or exceeds the
+    once when its error has `retryable: false` (`ResizeError.retryable`): no retry can help.
+    The module sets it on every `ResizeSecurityError` and on ten codes: the media has no original (`RESIZE_NO_ORIGINAL`) or no id (`RESIZE_MEDIA_NO_ID`), a size has no usable
+    dimension (`RESIZE_SIZE_INVALID`), no decoder reads the source's bytes
+    (`RESIZE_SOURCE_FORMAT_UNSUPPORTED`), the source is damaged (`RESIZE_SOURCE_DAMAGED`), the
+    source has no dimensions or exceeds the
     pixel limits (`RESIZE_SOURCE_METADATA_MISSING`, `RESIZE_SOURCE_TOO_LARGE`), an SVG has
     dimensions that cannot fit the renderer (`RESIZE_SVG_DIMENSIONS_UNSUPPORTED`, also rejected
-    before storage by `uploadOriginal()`), or an SVG render ran past
-    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`). The worker reads
-    `retryable` on the error that fails the task, when it is a `ResizeError` — including one from
+    before storage by `uploadOriginal()`), an SVG render ran past
+    `limits.processingTimeoutSeconds` (`RESIZE_SVG_RENDER_TIMEOUT`), or the task was delivered more
+    often than `maxAttempts` because its workers kept crashing (`RESIZE_TASK_MAX_ATTEMPTS`).
+    The worker reads `retryable` on the error that fails the task, when it is a `ResizeError` —
+    including one from
     a duplicate copy of the package (it checks the `isResizeError` brand, not the class); errors
-    from other libraries are retried, whatever fields they carry. A `ResizeError` from
+    from other libraries are retried, whatever fields they carry. The rule for `false`: no later
+    delivery of the same input can succeed, where a later delivery includes one after a rolling
+    deploy reaches this worker, so `RESIZE_PIPELINE_UNKNOWN` and `RESIZE_DECODER_MISSING` stay
+    `true`, and so does every unclear case. `ResizeOriginalError` and `ResizeConfigError` default
+    to `false`, like `ResizeSecurityError`, and any other `ResizeError` to `true`;
+    `RESIZE_WORKER_INCOMPLETE` is `false` only when every missing variant failed with `false` and
+    the media still holds the original they were rendered from, and `generate()`'s
+    `RESIZE_GENERATE_FAILED` only when every variant did. A
+    `ResizeError` from
     `loadMedia`, `storage.download`, the decoder's checks and render, `beforeSteps` or
-    `appendPreviews` with `retryable: false` dead-letters the task at once. A source that cannot
-    be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
+    `appendPreviews` with `retryable: false` dead-letters the task at once. Once the media has
+    loaded, such a failure counts only for the original it came from: the worker reloads the media
+    once, and if it holds another original (another `storageRef` or stored size), the task fails
+    with the retryable `RESIZE_WORKER_INCOMPLETE`, whose `cause` is that failure, and the next
+    delivery renders the new one. A reload that fails, or a media that is gone, keeps it final. A
+    source that cannot be decoded fails the task (and `generate()`) with the decoder's error, or with the retryable
     `ResizeMediaError` `RESIZE_SOURCE_DECODE_FAILED` when that error is not a `ResizeError`
-    (Sharp's own, for example; it is the `cause`). An
+    (Sharp's own, for example; it is the `cause`). A damaged source stays retryable in two cases:
+    its download length differs from `original.size` (`RESIZE_SOURCE_DECODE_FAILED`), or no decoder
+    of this process lists its stored format (`RESIZE_DECODER_MISSING` when it fails at `inspect`,
+    `RESIZE_SOURCE_DECODE_FAILED` when it fails at render). An
     error inside one variant (`variantSteps`, encoding, `storage.upload`) fails only that
-    variant: it is logged, and the task fails with the retryable
-    `RESIZE_WORKER_INCOMPLETE` (retried for the missing variants only, then dead-lettered after
-    `maxAttempts`).
+    variant: it is logged as a `warn`, and the task fails with `RESIZE_WORKER_INCOMPLETE`, whose
+    `cause` is the first failure of a variant still missing, so the task row and the task's log
+    line say why (with several, the text counts them). It is retryable (retried for the missing
+    variants only, then dead-lettered after `maxAttempts`), unless every missing variant failed with
+    `retryable: false` and the original has not changed since, when the task is dead-lettered at
+    once. An original replaced during the render keeps the task retryable: the next delivery renders
+    the new one.
   - A dead row keeps the gate (`active`) until its `cooldownUntil` (`deadAt` +
     `coordination.cooldownMs`); then the next `add()` takes it over (see
     [Coordination](#coordination)).
@@ -1524,11 +1605,107 @@ await ResizeTask.updateOne(
   per Resizer (once more after its task queue is set up again): an unregistered pipeline name
   (`error`, once per name, for at most 100 names), a format list without `encode.formats` entries
   (`error`, once per list, for at most 100 lists), and, when the caller passed
-  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. A media without an original
-  logs nothing.
-  Every read is counted instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A
-  stored preview whose `publicUrl` throws, and an enqueue that throws, are still logged on every
-  read. `prewarm()` logs as before.
+  `enqueueMissing: true` to a Resizer without a task queue, one `warn`. Every read is counted
+  instead, as `resize.read` with its outcome (see [Metrics](#metrics)). A stored preview whose
+  `publicUrl` throws, and an enqueue that throws, are still logged on every read. `prewarm()` logs
+  as before.
+
+  A media loaded without the module's fields gets one `warn`, once per Resizer:
+
+  ```text
+  resize resolve: media <id> was loaded without its stored original and previews (a projection that drops resizeMediaPaths, or a row the module never wrote), so nothing is served or queued for it — add ...resizeMediaPaths to the query (logged once per Resizer)
+  ```
+
+  With only `previews` dropped, the line ends in "its previews are not seen and may be made again";
+  with previews and no original, in "its previews are served as stale and no task is queued". A
+  media loaded with an empty `previews` and no original logs nothing: it is a new row. One with
+  neither field gets the warning above, which is one harmless line for a lean row the module never
+  wrote.
+
+  On `MongoTaskQueue`, the first added task checks the gate index, once per model. A missing index
+  is one `error`, whose line ends in what that costs. With no index on those keys, or one that is
+  not unique, concurrent adds can each store a duplicate active task. With a unique index that lacks
+  the partial filter, every add after a completed task is in flight with no id and nothing is
+  queued. With a unique index on another filter, one active task per media, pipeline and queue is
+  not guaranteed. The check runs in the background, so it never slows the read, and it never creates
+  the index.
+- **What a worker logs:** the worker writes each task failure itself, one line on its own logger
+  (`runWorker({ logger })`; the app logger under `npm run cli ResizeWorker`). A failure that will
+  be retried is a `warn`, a dead task an `error`:
+
+  ```text
+  resize worker: task <taskId> of media <mediaId> failed (attempt 1 of 5, code RESIZE_SOURCE_DECODE_FAILED) — retrying in 5000 ms: <cause>
+  resize worker: task <taskId> of media <mediaId> is dead (attempt 5 of 5, code RESIZE_SOURCE_DECODE_FAILED, last attempt) — new tasks for its media and pipeline wait 600000 ms: <cause>
+  ```
+
+  They are written whatever the metrics sink is, `NoopMetrics` included. Each variant that fails
+  writes a `warn` of its own, on every attempt, in `generate()` too, whose caller gets the failed
+  count or the throw, with the first failure as its `cause`. So the worker writes one `error` line per dead task, however many variants and
+  attempts it took: alert on `error`, or on `is dead`. On SQS without a `deadLetterQueueUrl`, the
+  queue adds one more as it deletes the task (`resize sqs: task … is dead and no deadLetterQueueUrl
+  is set`). Other failures have `error` lines of their own, such as a media store write that failed,
+  which names the uploads it left unrecorded. A dead line gives one of three reasons: `last attempt`
+  (`maxAttempts` used up), `not retryable` (the error has `retryable: false`) or
+  `delivered more often than maxAttempts` (its workers kept crashing mid-task). The code is `none`
+  for an error without one. The cause fits one line of at most 1000 characters, with ` | ` for a
+  line break, and the task row holds the same text. A thrown value cannot break the module's line:
+  its cause and code stay on one line, and a line break anywhere in the line, such as in a `mediaId`
+  from an SQS message body, reads ` | `. The error (on a dead line, any error that is not a
+  `ResizeError`) goes to your logger as the second argument, and what it prints is your logger's,
+  so do not treat later lines as the module's own. On the global console every `%` in the line is
+  escaped, so a `%` in a URL cannot consume the error or rewrite the line. A logger that formats its
+  first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a cause
+  as a placeholder, and Winston, the framework's logger included, leaves the error out of an entry
+  whose line holds a format sequence such as `%c3` or `%s`: the line and its `(cause: …)` stay, the
+  stack does not.
+  A worker that no longer holds its task (a lost lease) writes a `warn` and never a dead line.
+- **Damaged originals:** a source the engine refuses is dead-lettered on its first delivery with
+  `RESIZE_SOURCE_DAMAGED`, unless the media was given another original while the task ran, when the
+  task is retried and renders that one. Its pixels are decoded at `limits.failOn`, and that message names the
+  level; its header is read at Sharp's own default level, whatever `limits.failOn` says. `'error'`
+  refuses a truncation that cuts image data; a cut TIFF is usually retried, not refused, and a cut
+  animated GIF can still render the frames it has, so its preview can be shorter. Three limits:
+  bytes flipped mid-file can still render garbled at every level; a JPEG missing only its end marker
+  is usually refused at every strict level (the few that pass have all their image data and render
+  the same pixels as the intact file); and a PNG with a bad IDAT checksum is refused at `'error'`
+  (`vipspng: libpng read error`), although it renders the same pixels as the intact file at
+  `'none'`. `'warning'` refuses more, including JPEGs that look identical to the intact file.
+  `'none'` restores 0.3.0's rendering; a file whose header cannot be read still
+  fails, usually at once. Decoding failures at the same moment in one process can blur which file
+  an engine message belongs to, so a failure with no usable detail is retried. They can also,
+  rarely, put a neighbour's damage line on a healthy file this build cannot render (7 of 800 decodes
+  with such files and cut JPEGs failing together); that file is then dead-lettered until the next
+  read after the cooldown. To refuse a damaged file at upload instead, set `upload.verify: 'decode'`.
+
+  **Previews made before this version.** A preview made from a damaged original stays fresh:
+  upgrading does not regenerate it. To find them, decode each original at the level the worker now
+  uses, with your `limits.inputPixels`. Skip SVG originals: SVG markup is untrusted, and the module
+  renders it only in a separate process with a time limit. The bytes decide, because a stored
+  `format` can hold a MIME type or a wrong value.
+
+  ```ts
+  import sharp from 'sharp';
+  const { format, storageRef } = media.original;
+  if (format !== 'svg') {
+    const bytes = await storage.download(storageRef);
+    const input = { limitInputPixels: limits.inputPixels };
+    if ((await sharp(bytes, input).metadata()).format !== 'svg') {
+      await sharp(bytes, { ...input, failOn: 'error' })
+        .resize(16)
+        .raw()
+        .toBuffer(); // rejects: look at this file
+    }
+  }
+  ```
+
+  A rejection from either call means "look at this file", not proof of damage: a healthy file this
+  build cannot decode rejects too. For each one that is damaged, call `invalidate()` and delete the
+  returned refs. Its next task is dead-lettered with `RESIZE_SOURCE_DAMAGED`, and while reads keep
+  asking, each cooldown costs one download, one decode and one `error` line, so mark that media in
+  your app or replace its original. A second pass at `failOn: 'warning'` also finds some mid-file
+  corruption, but it flags harmless JPEGs too, so look at those by eye. The worker accepts them, so
+  `invalidate()` alone makes the same preview again. Flipped bytes can pass every level: no decode
+  finds them. A cut animated GIF can pass too, and this recipe reads only its first frame.
 - **Removing previews:** `resizer.invalidate({ media, pipeline? })` removes this Resizer's stored
   previews of a media, of one pipeline or of all (only an omitted `pipeline` means all;
   `pipeline: null` matches nothing), in one media store write, and resolves with the
@@ -1559,11 +1736,12 @@ const refs = await getResizer().invalidate({ media: file, pipeline: 'photo' }); 
 and `result.issues` says why, each issue with the variants it covers and `retryable`. `false`: the
 module knows that no retry can help until the request, the config or the code changes. `true`: the
 module has not ruled a retry out. The cause may pass by itself, or it is a fault that the queue
-can only report in the logs (an unregistered or outdated `ResizeTask` model, a lock store that
-fails): fix the logged cause before you retry. An issue may also carry `causeCode`, the code of the
-error behind it when that code is not one of the issue codes below: a driver's own code, or
-`RESIZE_PEER_MISSING`, under `RESIZE_ENQUEUE_QUEUE_FAILED`, and `RESIZE_LOCKS_REQUIRED` under
-`RESIZE_ENQUEUE_LOCK_FAILED`. The set of issue codes is closed, so a `switch` over `code` stays
+can only report in the logs (a lock store that fails): fix the logged cause before you retry. An
+issue may also carry `causeCode`, the code of the error behind it when that code is not one of the
+issue codes below: a driver's own code, or `RESIZE_PEER_MISSING`, under
+`RESIZE_ENQUEUE_QUEUE_FAILED`, `RESIZE_LOCKS_REQUIRED` under `RESIZE_ENQUEUE_LOCK_FAILED`, and what
+a queue names (`RESIZE_MONGO_MODEL_MISSING` or `RESIZE_MONGO_MODEL_OUTDATED` from `MongoTaskQueue`)
+under `RESIZE_ENQUEUE_UNCONFIRMED`. The set of issue codes is closed, so a `switch` over `code` stays
 exhaustive.
 
 | `code` | When | `retryable` |
@@ -1578,7 +1756,7 @@ exhaustive.
 | `RESIZE_ENQUEUE_LOCK_CONTENDED` | A task queue without `gatesByTask` (SQS): the gate lock is held (a task queued, running or waiting for a retry, a dead task's cooldown, or the one-lease hold after an add that threw or was not confirmed); SQS cannot say which variants that task holds | `true`: call again after it ends |
 | `RESIZE_ENQUEUE_LOCK_FAILED` | A task queue without `gatesByTask`: acquiring the gate lock threw (logged). Also, with `causeCode: 'RESIZE_LOCKS_REQUIRED'`, a call on a queue whose backend has no gate of its own, on a Resizer with no lock store (a `RoutingTaskQueue`, whose need for locks is per name) | `true`, even when the lock store fails for good: fix the logged cause first; `false` with `causeCode: 'RESIZE_LOCKS_REQUIRED'` |
 | `RESIZE_ENQUEUE_QUEUE_FAILED` | `add()` threw (logged), e.g. an SQS send error; the task may still be stored. Beside a queue without `gatesByTask` the gate lock is then kept for one lease (at most `gateTtlMs`), so a `prewarm()` in that time reports `RESIZE_ENQUEUE_LOCK_CONTENDED` and the read path logs nothing. Also the backend of the call's queue failed to build (a `RoutingTaskQueue` route): the error's code is in `causeCode`, unless that code is itself an issue code, which is then the issue's code | `true`: fix the logged cause first. For a backend that failed to build, the error's own `retryable` (`true` for an error that is not a `ResizeError`) |
-| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue did not confirm the task (on Mongo a database error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`, even for an unregistered or outdated model: fix the logged cause first; `false` for a value in none of the shapes |
+| `RESIZE_ENQUEUE_UNCONFIRMED` | `add()` resolved `unconfirmed`: the queue did not confirm the task (on Mongo a database error, a duplicate key on another unique index of your model, or an unregistered or outdated `ResizeTask` model, each logged, the model with its code in `causeCode`; on SQS a send that returned no `MessageId`). Or `add()` resolved a value in none of the `TaskAddResult` shapes (a queue written for an older version), logged once | `true`: fix the logged cause first. `false` when the queue says so, as `MongoTaskQueue` does for an unregistered or outdated model (fix what `causeCode` names), and for a value in none of the shapes |
 | `RESIZE_ENQUEUE_CONFIRM_FAILED` | After an `in-flight` add, `findActive()` threw (logged), so what the active task holds is unknown | `true` |
 | `RESIZE_ENQUEUE_INTERNAL_ERROR` | An unexpected error (e.g. a media without an id, `RESIZE_MEDIA_NO_ID`), a Resizer that could not start (a part that did not load, an invalid config), a task queue that cannot be used (the error `verify()` reports, e.g. `RESIZE_LOCKS_REQUIRED`), or an invalid timing of the call's `queue` (a name used only per call; every variant is `unconfirmed`); the message is the error's | `false` when the error is a `ResizeError` with `retryable: false`, or a `ResizeMediaError`, `ResizeConfigError` or `ResizeSetupError` (or a subclass); otherwise `true` |
 

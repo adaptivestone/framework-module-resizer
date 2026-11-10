@@ -98,10 +98,9 @@ test('a store that resolves undefined is RESIZE_MEDIA_APPEND_RESULT_INVALID', as
   const result = await recorder.record('m1', scope, [
     preview('40x40', 'mine.jpg'),
   ]);
-  assert.equal(
-    (result.failure?.error as { code?: string } | undefined)?.code,
-    'RESIZE_MEDIA_APPEND_RESULT_INVALID',
-  );
+  const error = result.failure?.error as { code?: string; retryable?: boolean };
+  assert.equal(error.code, 'RESIZE_MEDIA_APPEND_RESULT_INVALID');
+  assert.equal(error.retryable, true);
   assert.deepEqual(result.stored, []);
   // The caller rethrows and reports it; the recorder itself logs nothing for it.
   assert.deepEqual(logs, { info: [], warn: [], error: [] });
@@ -222,10 +221,9 @@ test('a replace on a store without replacePreviews is RESIZE_MEDIA_REPLACE_MISSI
     [replacement, preview('40x40', 'added.jpg')],
     { replacing: new Set([replacement.identity as string]) },
   );
-  assert.equal(
-    (result.failure?.error as { code?: string } | undefined)?.code,
-    'RESIZE_MEDIA_REPLACE_MISSING',
-  );
+  const error = result.failure?.error as { code?: string; retryable?: boolean };
+  assert.equal(error.code, 'RESIZE_MEDIA_REPLACE_MISSING');
+  assert.equal(error.retryable, true);
   // It fails before any write.
   assert.equal(appended, false);
 });
@@ -239,8 +237,13 @@ test('a replace result that is not { stored, removed } is RESIZE_MEDIA_REPLACE_R
   const result = await recorder.record('m1', scope, [replacement], {
     replacing: new Set([replacement.identity as string]),
   });
-  const error = result.failure?.error as { code?: string; message?: string };
+  const error = result.failure?.error as {
+    code?: string;
+    message?: string;
+    retryable?: boolean;
+  };
   assert.equal(error.code, 'RESIZE_MEDIA_REPLACE_RESULT_INVALID');
+  assert.equal(error.retryable, true);
   assert.equal(
     error.message,
     "resize: the media store's replacePreviews resolved with something other than { stored, removed } — resolve with the rows it stored and removed ([] when none)",

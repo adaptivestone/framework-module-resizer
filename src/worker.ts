@@ -25,6 +25,7 @@ import type {
 import type { TaskCoordination } from './coordination.ts';
 import { ResizeSetupError } from './errors.ts';
 import { logNeverThrow } from './helpers/log.ts';
+import type { ProcessTaskResult } from './processor.ts';
 import {
   getResizer,
   listResizers,
@@ -48,7 +49,7 @@ import type { ResizeLogger } from './types.d.ts';
 export async function processTask(
   task: LeasedTask,
   taskOpts?: { signal: AbortSignal },
-): Promise<void> {
+): Promise<ProcessTaskResult> {
   return runTask(getResizer(task.resizer), task, taskOpts);
 }
 
@@ -57,7 +58,7 @@ async function runTask(
   resizer: Resizer,
   task: LeasedTask,
   taskOpts: { signal: AbortSignal } | undefined,
-): Promise<void> {
+): Promise<ProcessTaskResult> {
   await resizer.ready();
   return processorOf(resizer).processTask(task, taskOpts);
 }
@@ -275,7 +276,11 @@ export interface RunWorkerOptions {
   resizers?: Resizer[];
 }
 
-export async function runWorker(opts: RunWorkerOptions): Promise<void> {
+/**
+ * Serve the queues until `opts.signal` aborts. Resolves true after a run, and false when no Resizer
+ * has a task queue, so the process consumes nothing (an `error` line says so).
+ */
+export async function runWorker(opts: RunWorkerOptions): Promise<boolean> {
   const queues = queueNamesOf(opts.queue);
   const logger = opts.logger ?? console;
   // The served Resizers, taken once now, so one constructed later is not served (and neither is
@@ -308,7 +313,7 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
       logger,
       'resize worker: no Resizer has a task queue (eager-only wiring)',
     );
-    return;
+    return false;
   }
   // Every name's backends are found before anything is claimed, so a name that nothing serves or
   // whose backend fails to build stops the start instead of being skipped.
@@ -456,6 +461,15 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     });
   };
 
+  const quoted = (list: Iterable<string>) =>
+    [...list].map((n) => `'${n}'`).join(', ');
+  logNeverThrow(
+    logger,
+    `resize worker started: queues ${quoted(queues)}; Resizers ${quoted(names)}`,
+    undefined,
+    'info',
+  );
+
   if (opts.sharp) {
     sharp.concurrency(opts.sharp.concurrency);
     sharp.cache(opts.sharp.cache);
@@ -499,4 +513,5 @@ export async function runWorker(opts: RunWorkerOptions): Promise<void> {
     throw firstFailure.error;
   }
   logNeverThrow(logger, 'resize worker stopped', undefined, 'info');
+  return true;
 }

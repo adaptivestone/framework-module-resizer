@@ -4,7 +4,10 @@
 // maxAttempts, non-retryable errors), the dead-letter cooldown, the gate lock of a queue without
 // gatesByTask, task events, and the metrics of claims and task outcomes. Backends only implement
 // the atomic TaskQueue operations. The host logger is called only through logNeverThrow, so a
-// logger that throws never stops the loop.
+// logger that throws never stops the loop. A task's failure is logged here, whatever the metrics
+// sink is. A thrown value may be host code, so it is read only through the guarded helpers of
+// helpers/log.ts: it cannot stop the loop, and the module's own line is always one line. The stack
+// of an unexpected error follows that line as the logger prints it, so later lines are not ours.
 import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
@@ -18,7 +21,13 @@ import type {
 } from './contracts/taskQueue.ts';
 import type { TaskCoordination } from './coordination.ts';
 import { ResizeError } from './errors.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import {
+  causeText,
+  codeText,
+  isModuleError,
+  logNeverThrow,
+  notRetryable,
+} from './helpers/log.ts';
 import { sleep } from './helpers/sleep.ts';
 import { gateKey } from './lockKeys.ts';
 import { errorCodeLabel } from './metrics.ts';
@@ -47,12 +56,12 @@ export function toLeasedTask(task: ClaimedTask): LeasedTask {
   };
 }
 
-// A ResizeError says when no retry can help (`retryable: false`), so the task is dead-lettered at
-// once instead of being downloaded and decoded again. The brand, not `instanceof`, identifies one:
-// it also matches an error from a duplicate copy of this package. Errors from other libraries are
-// retried, even with a `retryable` field of their own (an AWS SDK v2 4xx carries one).
-function notRetryable(error: unknown): boolean {
-  return ResizeError.isResizeError(error) && error.retryable === false;
+// Why a task is dead, for its log line. The order is the order of `dead` in #finish.
+function deadReason(error: unknown, forceDead: boolean | undefined): string {
+  if (forceDead) {
+    return 'delivered more often than maxAttempts';
+  }
+  return notRetryable(error) ? 'not retryable' : 'last attempt';
 }
 
 export interface ConsumerDeps {
@@ -64,9 +73,10 @@ export interface ConsumerDeps {
   // check, so it is never dead-lettered here, and the loop waits idlePollMs before its next claim,
   // so a queue that holds only such tasks is not claimed in a tight loop.
   accepts?: (task: LeasedTask) => boolean;
-  // Runs one task: resolving completes it, rejecting fails it. The signal aborts on a lost lease,
-  // a timeout or the shutdown.
-  handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<void>;
+  // Runs one task: resolving completes it, rejecting fails it. A numeric `rendered` on the result
+  // goes on the task's completed outcome. The signal aborts on a lost lease, a timeout or the
+  // shutdown.
+  handle: (task: LeasedTask, opts: { signal: AbortSignal }) => Promise<unknown>;
   events?: TaskEventHandler;
   logger: ResizeLogger;
   // Optional: the Resizers this worker serves, passed to every claim, so a queue that filters
@@ -258,7 +268,8 @@ export class Consumer {
     let waitStart = performance.now();
     while (!signal.aborted) {
       let task: ClaimedTask | null;
-      const claimStarted = Date.now();
+      // The monotonic clock: a wall clock stepped back during the claim must not lengthen the wait.
+      const claimStarted = performance.now();
       try {
         task = await tasks.claim(queue, leaseMs, signal, claimOptions);
       } catch (err) {
@@ -279,7 +290,7 @@ export class Consumer {
       }
       claimFailures = 0;
       if (!task) {
-        const waited = Date.now() - claimStarted;
+        const waited = performance.now() - claimStarted;
         if (waited < idlePollMs) {
           await sleep(idlePollMs - waited, signal);
         }
@@ -311,7 +322,7 @@ export class Consumer {
           coordination,
           new ResizeError(
             `resize worker: task ${task.taskId} exceeded maxAttempts (${maxAttempts})`,
-            { code: 'RESIZE_TASK_MAX_ATTEMPTS' },
+            { code: 'RESIZE_TASK_MAX_ATTEMPTS', retryable: false },
           ),
           { forceDead: true, claim: { queue, start: claimedAt } },
         );
@@ -375,7 +386,15 @@ export class Consumer {
     // The renewals not answered yet: one may still report the lease lost when the task ends.
     const renewals = new Set<Promise<void>>();
     const heartbeat = setInterval(() => {
-      const renewal = tasks.renew(task, leaseMs).then(
+      // Inside an interval a synchronous throw, or a `then` on a plain value, would be an uncaught
+      // exception and end the process: a custom queue's `renew` may do either.
+      let renewed: Promise<boolean>;
+      try {
+        renewed = Promise.resolve(tasks.renew(task, leaseMs));
+      } catch (err) {
+        renewed = Promise.reject(err);
+      }
+      const renewal = renewed.then(
         (held) => {
           if (!held) {
             leaseLost = true;
@@ -404,6 +423,7 @@ export class Consumer {
     // detached handler that settles after a timeout never becomes an unhandled rejection.
     let handlerError: unknown;
     let ok = false;
+    let rendered: unknown;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<void>((resolve) => {
@@ -415,8 +435,9 @@ export class Consumer {
     try {
       await Promise.race([
         handle(toLeasedTask(task), { signal: taskController.signal }).then(
-          () => {
+          (result) => {
             ok = true;
+            rendered = (result as { rendered?: unknown } | undefined)?.rendered;
           },
           (err) => {
             handlerError = err;
@@ -461,9 +482,11 @@ export class Consumer {
       // release the gate of the delivery that runs it now. So no terminal call, no gate call and
       // no event: the task is left to its next delivery.
       taskController.abort();
+      const failure =
+        handlerError === undefined ? '' : `: ${causeText(handlerError)}`;
       logNeverThrow(
         logger,
-        `resize worker: task ${task.taskId} lost its lease — left to its next delivery`,
+        `resize worker: task ${task.taskId} lost its lease — left to its next delivery${failure}`,
         undefined,
         'warn',
       );
@@ -491,7 +514,14 @@ export class Consumer {
               this.#releaseGate(task, gate, deadline, detached),
             gateDeadline,
           );
-          await this.#report('completed', task, undefined, claim);
+          await this.#report('completed', task, undefined, claim, rendered);
+        } else {
+          logNeverThrow(
+            logger,
+            `resize worker: task ${task.taskId} finished, but this worker no longer holds it — its previews are stored; the next delivery finds them fresh`,
+            undefined,
+            'warn',
+          );
         }
       } catch (err) {
         logNeverThrow(
@@ -503,7 +533,11 @@ export class Consumer {
     } else if (signal.aborted && !notRetryable(handlerError)) {
       // Stopped by the shutdown, not by its own failure: not an attempt. A non-retryable error
       // still dead-letters: the task proved it can never succeed before the shutdown stopped it.
-      await this.#giveBackAtShutdown(task, coordination, { gateDeadline, run });
+      await this.#giveBackAtShutdown(task, coordination, {
+        gateDeadline,
+        run,
+        handlerError,
+      });
     } else {
       await this.#finish(task, coordination, handlerError, {
         gateDeadline,
@@ -517,12 +551,14 @@ export class Consumer {
    * A task's outcome, once the queue took it: recorded on its Resizer's metrics sink, labelled
    * with the queue this loop consumes and timed from its claim, then sent to the observers. The
    * queue a payload names is the producer's (an SQS body), so a different one is context only.
+   * `rendered` is what the handler resolved on a completed task; only that outcome passes it.
    */
   async #report(
     event: TaskEvent,
     task: ClaimedTask,
     error: unknown,
     claim: ClaimStart,
+    rendered?: unknown,
   ): Promise<void> {
     this.#deps.metricsOf?.(toLeasedTask(task))?.timing(
       'resize.task',
@@ -538,6 +574,7 @@ export class Consumer {
         mediaId: task.mediaId,
         attempts: task.attempts,
         variants: task.previews.length,
+        ...(typeof rendered === 'number' ? { rendered } : {}),
         ...(task.queue === claim.queue ? {} : { payloadQueue: task.queue }),
       },
     );
@@ -558,7 +595,8 @@ export class Consumer {
    * its Resizer's cooldown. Its gate lock is then held until the retry is due plus one lease, or
    * for the cooldown: the task's final gate action (see #finalGate), whose call waits until
    * `opts.gateDeadline` at most (default: one gate bound). `opts.claim` labels and times its
-   * outcome (see #report).
+   * outcome (see #report). Once the queue took the failure it is logged, before the gate hold, so
+   * the final gate hold cannot hold the line back.
    */
   async #finish(
     task: ClaimedTask,
@@ -576,14 +614,29 @@ export class Consumer {
       opts.forceDead ||
       notRetryable(error) ||
       task.attempts >= timing.maxAttempts;
-    const message = String(error).slice(0, 1000);
+    const text = causeText(error);
+    const attempt = `attempt ${task.attempts} of ${timing.maxAttempts}, code ${codeText(error)}`;
+    const noLongerHeld = () =>
+      logNeverThrow(
+        logger,
+        `resize worker: task ${task.taskId} failed, but this worker no longer holds it — left to its next delivery: ${text}`,
+        undefined,
+        'warn',
+      );
     const gate = this.#gate(task, coordination);
     const gateDeadline = opts.gateDeadline ?? gateDeadlineIn(this.#gateWaitMs);
     try {
       if (dead) {
         const cooldownMs =
           coordination?.cooldownMs ?? defaultCoordination.cooldownMs;
-        if (await tasks.fail(task, 'dead', message, { cooldownMs })) {
+        if (await tasks.fail(task, 'dead', text, { cooldownMs })) {
+          logNeverThrow(
+            logger,
+            `resize worker: task ${task.taskId} of media ${task.mediaId} is dead (${attempt}, ${deadReason(error, opts.forceDead)}) — new tasks for its media and pipeline wait ${cooldownMs} ms: ${text}`,
+            // A module error's line says it all. The stack of an unexpected error is what an operator
+            // needs: it follows as the logger prints it, and only the line above is the module's.
+            isModuleError(error) ? undefined : error,
+          );
           await this.#holdUntil(
             task,
             gate,
@@ -593,11 +646,20 @@ export class Consumer {
             opts.run,
           );
           await this.#report('deadLettered', task, error, opts.claim);
+        } else {
+          noLongerHeld();
         }
         return;
       }
-      const retryAt = new Date(Date.now() + backoffMs(task.attempts, timing));
-      if (await tasks.fail(task, { retryAt }, message)) {
+      const retryInMs = backoffMs(task.attempts, timing);
+      const retryAt = new Date(Date.now() + retryInMs);
+      if (await tasks.fail(task, { retryAt }, text)) {
+        logNeverThrow(
+          logger,
+          `resize worker: task ${task.taskId} of media ${task.mediaId} failed (${attempt}) — retrying in ${retryInMs} ms: ${text}`,
+          undefined,
+          'warn',
+        );
         await this.#holdUntil(
           task,
           gate,
@@ -607,11 +669,13 @@ export class Consumer {
           opts.run,
         );
         await this.#report('failed', task, error, opts.claim);
+      } else {
+        noLongerHeld();
       }
     } catch (err) {
       logNeverThrow(
         logger,
-        `resize worker: failing task ${task.taskId} failed`,
+        `resize worker: failing task ${task.taskId} failed (it had failed with: ${text})`,
         err,
       );
     }
@@ -816,17 +880,27 @@ export class Consumer {
     }
   }
 
-  // The worker's shutdown stopped the task before or while it ran.
+  // The worker's shutdown stopped the task before or while it ran. `opts.handlerError`: what its
+  // handler rejected with, for the log line. It is usually the shutdown itself (the remaining
+  // variants were skipped), not a failure, and the task is given back all the same.
   async #giveBackAtShutdown(
     task: ClaimedTask,
     coordination: TaskCoordination | undefined,
-    opts: { gateDeadline?: GateDeadline; run?: GateRun } = {},
+    opts: {
+      gateDeadline?: GateDeadline;
+      run?: GateRun;
+      handlerError?: unknown;
+    } = {},
   ): Promise<void> {
+    const failure =
+      opts.handlerError === undefined
+        ? ''
+        : ` (stopped with: ${causeText(opts.handlerError)})`;
     await this.#giveBack(
       task,
       coordination,
       `resize worker: task ${task.taskId} was stopped by a worker shutdown`,
-      `resize worker: shutdown — task ${task.taskId} is back in the queue`,
+      `resize worker: shutdown — task ${task.taskId} is back in the queue${failure}`,
       opts,
     );
   }

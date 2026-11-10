@@ -23,7 +23,7 @@ import type {
 } from './contracts/taskQueue.ts';
 import type { Coordination } from './coordination.ts';
 import { ResizeError } from './errors.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { codeText, firstTime, logNeverThrow } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import { canonicalizeVariants, getPreviewIdentity } from './images.ts';
 import { gateKey } from './lockKeys.ts';
@@ -204,7 +204,7 @@ export class Dispatcher {
   // The queue names a read found not served, with invalid timing, or on a backend that needs a
   // lock store there is not: each is logged once, since every later read on that name meets the
   // same answer. A backend that failed to build is logged once per name and message, so a
-  // different failure is logged too.
+  // different failure is logged too. A message can differ every time, so firstTime caps each set.
   readonly #loggedNotServed = new Set<string>();
   readonly #loggedTimingInvalid = new Set<string>();
   readonly #loggedLocksMissing = new Set<string>();
@@ -254,8 +254,7 @@ export class Dispatcher {
         // Normal: the active task, or the request that holds the gate lock, covers the media.
         return { added: 0, outcome: 'in-flight' };
       case 'not-served':
-        if (!this.#loggedNotServed.has(req.queue)) {
-          this.#loggedNotServed.add(req.queue);
+        if (firstTime(this.#loggedNotServed, req.queue)) {
           logNeverThrow(
             logger,
             `resize enqueue: Resizer '${name}' ${notServed(req.queue, outcome.reason)} — nothing is queued (logged once per queue name)`,
@@ -267,8 +266,7 @@ export class Dispatcher {
       case 'route-failed': {
         const { message } = routeFailureIssue(outcome.error);
         const key = `${req.queue}\u0000${message}`;
-        if (!this.#loggedRouteFailed.has(key)) {
-          this.#loggedRouteFailed.add(key);
+        if (firstTime(this.#loggedRouteFailed, key)) {
           logNeverThrow(
             logger,
             `resize enqueue: Resizer '${name}' cannot queue to '${req.queue}': its backend could not be built — nothing is queued (logged once per queue name and error)`,
@@ -278,8 +276,7 @@ export class Dispatcher {
         return failed;
       }
       case 'locks-missing':
-        if (!this.#loggedLocksMissing.has(req.queue)) {
-          this.#loggedLocksMissing.add(req.queue);
+        if (firstTime(this.#loggedLocksMissing, req.queue)) {
           logNeverThrow(
             logger,
             `resize enqueue: ${locksMissing(req.queue, name)} — nothing is queued (logged once per queue name)`,
@@ -287,8 +284,7 @@ export class Dispatcher {
         }
         return failed;
       case 'timing-invalid':
-        if (!this.#loggedTimingInvalid.has(req.queue)) {
-          this.#loggedTimingInvalid.add(req.queue);
+        if (firstTime(this.#loggedTimingInvalid, req.queue)) {
           logNeverThrow(
             logger,
             `resize enqueue: Resizer '${this.#deps.name}' cannot queue to '${req.queue}': its timing is invalid — nothing is queued (logged once per queue name)`,
@@ -299,19 +295,24 @@ export class Dispatcher {
       case 'unconfirmed':
         if (!this.#loggedUnconfirmed) {
           this.#loggedUnconfirmed = true;
+          // A queue's cause code can hold a line break: codeText keeps this one line.
           logger.error(
-            `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it (further unconfirmed adds are not logged until one is confirmed)`,
+            outcome.retryable === false
+              ? `resize enqueue: the task queue did not confirm the task for media ${mediaId} and says no call can queue it until its cause is fixed (cause code ${codeText({ code: outcome.causeCode })}; further unconfirmed adds are not logged until one is confirmed)`
+              : `resize enqueue: the task queue did not confirm the task for media ${mediaId} — a later read queues it (further unconfirmed adds are not logged until one is confirmed)`,
           );
         }
         return failed;
       case 'add-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize enqueue: adding the task threw for media ${mediaId} — a later read queues it`,
           outcome.error,
         );
         return failed;
       case 'gate-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize enqueue: the gate lock of media ${mediaId} could not be acquired — nothing queued`,
           outcome.error,
         );
@@ -410,12 +411,17 @@ export class Dispatcher {
           issues,
         );
       case 'unconfirmed':
-        return none(
-          'RESIZE_ENQUEUE_UNCONFIRMED',
-          'the task queue did not confirm the task',
-        );
+        return failed({
+          code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+          ...(typeof outcome.causeCode === 'string'
+            ? { causeCode: outcome.causeCode }
+            : {}),
+          message: 'the task queue did not confirm the task',
+          retryable: outcome.retryable !== false,
+        });
       case 'add-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize prewarm: adding the task threw for media ${mediaId}`,
           outcome.error,
         );
@@ -429,7 +435,8 @@ export class Dispatcher {
           "the gate lock of this media, pipeline and queue is held: a task of theirs is queued, running or waiting for a retry, or a dead task's cooldown runs",
         );
       case 'gate-failed':
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize prewarm: the gate lock of media ${mediaId} could not be acquired`,
           outcome.error,
         );
@@ -467,7 +474,9 @@ export class Dispatcher {
    *   never reports): the queue may still have stored the task (a lost response), so the lock is
    *   shortened to one lease of the request's queue, not released, and never kept longer than an
    *   added task's (min(leaseMs, gateTtlMs)). A stored task is claimed and its lock extended within
-   *   that time; otherwise the lock lapses and a later read queues the task.
+   *   that time; otherwise the lock lapses and a later read queues the task, unless the add was
+   *   `unconfirmed` with `retryable: false`: calling again cannot help until someone fixes what
+   *   `causeCode` names.
    * An `in-flight` outcome carries the carrier, which prewarm asks for the active task. Never
    * rejects.
    */
@@ -575,7 +584,8 @@ export class Dispatcher {
     }
     if (!this.#warnedInvalidAdd) {
       this.#warnedInvalidAdd = true;
-      this.#deps.logger.error(
+      logNeverThrow(
+        this.#deps.logger,
         `resize enqueue: Resizer '${this.#deps.name}' got an add result that is not a ${TASK_ADD_RESULT} — such a task is never counted as queued (a TaskQueue written for an older version of this module?)`,
         result,
       );
@@ -620,7 +630,8 @@ export class Dispatcher {
           queue,
         });
       } catch (error) {
-        logger.error(
+        logNeverThrow(
+          logger,
           `resize prewarm: active-task confirmation failed for media ${mediaId}`,
           error,
         );

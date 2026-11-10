@@ -14,6 +14,7 @@
 // host's own import line at bootstrap (no dynamic import(), no lazy loaders).
 import {
   GetObjectCommand,
+  type GetObjectCommandOutput,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
@@ -253,9 +254,21 @@ export class S3Storage extends ResizeStorage {
 
   async download(ref: StorageRef): Promise<Buffer> {
     const { bucket, key } = this.#ref(ref);
-    const out = await this.#getClient().send(
-      new GetObjectCommand({ Bucket: bucket, Key: key }),
-    );
+    let out: GetObjectCommandOutput;
+    try {
+      out = await this.#getClient().send(
+        new GetObjectCommand({ Bucket: bucket, Key: key }),
+      );
+    } catch (err) {
+      // By name only: a role without s3:ListBucket gets a 403 for a missing key, which stays raw.
+      if ((err as { name?: unknown } | null)?.name === 'NoSuchKey') {
+        throw new ResizeStorageError(
+          `resize s3: object not found: ${bucket}/${key}`,
+          { code: 'RESIZE_STORAGE_NOT_FOUND', cause: err },
+        );
+      }
+      throw err;
+    }
     const stream = out.Body;
     if (!stream) {
       throw new ResizeStorageError(

@@ -97,6 +97,33 @@ test('an SVG without a raster pixel on a side is RESIZE_SVG_DIMENSIONS_UNSUPPORT
   }
 });
 
+test('inspect reports unreadable markup as RESIZE_SOURCE_DAMAGED and the pixel limit as RESIZE_SOURCE_TOO_LARGE', async () => {
+  const decoder = new SvgDecoder();
+  // An SVG with no size, and markup that does not parse: neither can ever render.
+  for (const body of [
+    '<svg xmlns="http://www.w3.org/2000/svg"/>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><g></svg>',
+  ]) {
+    await assert.rejects(
+      decoder.inspect(Buffer.from(body), limits),
+      (err: ResizeError) => {
+        assert.equal(err.code, 'RESIZE_SOURCE_DAMAGED', err.message);
+        assert.equal(err.retryable, false);
+        assert.doesNotMatch(err.message, /failOn/);
+        return true;
+      },
+    );
+  }
+  await assert.rejects(
+    decoder.inspect(sizedSvg(100, 100), { ...limits, inputPixels: 100 }),
+    (err: ResizeError) => {
+      assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE', err.message);
+      assert.equal(err.retryable, false);
+      return true;
+    },
+  );
+});
+
 test('inspect checks limits.sourcePixels before the dimension probe', async () => {
   // 1×100000 is over both limits: the pixel count is what it reports.
   await assert.rejects(

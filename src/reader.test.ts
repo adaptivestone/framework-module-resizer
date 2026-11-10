@@ -4,12 +4,14 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
+import mongoose, { Schema } from 'mongoose';
 import { Catalog } from './catalog.ts';
 import { defaultCoordination } from './config/resize.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { NewTask, TaskAddResult } from './contracts/taskQueue.ts';
 import { Dispatcher } from './dispatcher.ts';
+import { resizeMediaSchemaFragment } from './drivers/mongo/mediaFragment.ts';
 import {
   ResizeConfigError,
   ResizeError,
@@ -1083,7 +1085,7 @@ describe('resolve — no task queue (eager-only host)', () => {
     const { warn } = installFakeApp();
     const r = new FrameworkResizer({ storage: makeStorage() });
     const { decision } = await r.resolve({
-      media: { id: 'm1' },
+      media: { id: 'm1', previews: [] },
       sizes: [
         { width: 300, height: 300 },
         { width: 100, height: 100 },
@@ -2081,13 +2083,39 @@ describe('read metrics', () => {
     });
     for (let i = 0; i < 3; i++) {
       await r.resolve({
-        media: { id: 'm1' },
+        media: { id: 'm1', previews: [] },
         sizes: stored,
         formats: ['jpeg'],
       });
     }
     assert.deepEqual(log.info, []);
     assert.deepEqual(log.warn, []);
+    assert.deepEqual(log.error, []);
+    assert.deepEqual(
+      readsOf(sink).map((call) => call.labels.outcome),
+      ['no-original', 'no-original', 'no-original'],
+    );
+  });
+
+  test('a read on a media with neither field warns exactly once in three reads', async () => {
+    const sink = recordingMetrics();
+    const log = recordingLogger();
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      metrics: sink,
+      logger: log.logger,
+    });
+    for (let i = 0; i < 3; i++) {
+      await r.resolve({
+        media: { id: 'm1' },
+        sizes: stored,
+        formats: ['jpeg'],
+      });
+    }
+    assert.equal(log.warn.length, 1);
+    assert.match(String(log.warn[0][0]), /was loaded without its stored/);
     assert.deepEqual(log.error, []);
     assert.deepEqual(
       readsOf(sink).map((call) => call.labels.outcome),
@@ -2484,6 +2512,238 @@ describe('freshness on the read path', () => {
     assert.deepEqual(
       named('resize.read').map((call) => call.labels.outcome),
       ['enqueued', 'in-flight'],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A media loaded without the module's fields
+// ---------------------------------------------------------------------------
+
+describe('resolve — media loaded without the module fields', () => {
+  // A real document needs no connection, and only isSelected can tell: `.select('name')` gives a
+  // truthy nested `original` there, with an undefined storageRef. Unlike a query, hydrate() does not
+  // add `_id` to an inclusive projection, so these projections name it.
+  const File = mongoose.model(
+    'ReadFile',
+    new Schema(
+      { name: String, ...resizeMediaSchemaFragment },
+      { minimize: false, autoCreate: false, autoIndex: false },
+    ),
+  );
+  const hydrated = (projection: object, fields: object = {}) =>
+    File.hydrate(
+      { _id: new mongoose.Types.ObjectId(), name: 'x', ...fields },
+      projection,
+    ) as unknown as MediaLike;
+  const row = {
+    storageRef: { key: 'p' },
+    sizeKey: '10x10',
+    format: 'jpeg',
+    contentType: 'image/jpeg',
+  };
+  const originalField = { storageRef: { key: 'o' }, width: 64, height: 48 };
+
+  function logged(name = 'default') {
+    const warns: string[] = [];
+    const errors: unknown[][] = [];
+    const tasks = new MemoryTaskQueue();
+    const resizer = new Resizer({
+      name,
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks,
+      metrics: new NoopMetrics(),
+      logger: {
+        info() {},
+        warn(message: unknown) {
+          warns.push(String(message));
+        },
+        error(...args: unknown[]) {
+          errors.push(args);
+        },
+      },
+    });
+    const read = (media: MediaLike) =>
+      resizer.resolve({
+        media,
+        sizes: [{ width: 10, height: 10 }],
+        formats: ['jpeg'],
+      });
+    return { read, warns, errors, tasks };
+  }
+
+  test('a hydrated document without the module fields warns once per Resizer', async () => {
+    const one = logged();
+    const media = hydrated({ _id: 1, name: 1 });
+    for (let i = 0; i < 3; i++) {
+      const { decision } = await one.read(media);
+      assert.equal(decision.missing.length, 1, 'the read still decides');
+    }
+    assert.equal(one.warns.length, 1);
+    assert.match(
+      one.warns[0],
+      /^resize resolve: media \S+ was loaded without its stored original and previews \(a projection that drops resizeMediaPaths, or a row the module never wrote\), so nothing is served or queued for it — add \.\.\.resizeMediaPaths to the query \(logged once per Resizer\)$/,
+    );
+    assert.equal(one.tasks.added.length, 0);
+    assert.deepEqual(one.errors, []);
+
+    const other = logged('other');
+    await other.read(media);
+    await other.read(hydrated({ _id: 1, name: 1 }));
+    assert.equal(other.warns.length, 1);
+    assert.equal(one.warns.length, 1);
+  });
+
+  test('a hydrated document with previews dropped says they may be made again', async () => {
+    const { read, warns, tasks } = logged();
+    await read(hydrated({ previews: 0 }, { original: originalField }));
+    assert.equal(warns.length, 1);
+    assert.match(
+      warns[0],
+      /stored previews \(.*so its previews are not seen and may be made again/,
+    );
+    assert.equal(tasks.added.length, 1, 'which is what the line says');
+  });
+
+  test('a hydrated document with the original dropped says what its previews become', async () => {
+    const withRows = logged();
+    const { decision } = await withRows.read(
+      hydrated({ original: 0 }, { previews: [row] }),
+    );
+    assert.equal(decision.ready[0].stale, true);
+    assert.equal(withRows.warns.length, 1);
+    assert.match(
+      withRows.warns[0],
+      /stored original \(.*so its previews are served as stale and no task is queued/,
+    );
+    const without = logged('other');
+    await without.read(hydrated({ original: 0 }));
+    assert.equal(without.warns.length, 1);
+    assert.match(
+      without.warns[0],
+      /stored original \(.*so nothing is served or queued for it/,
+    );
+  });
+
+  test('a lean row with previews but no original says they are served as stale', async () => {
+    const { read, warns, tasks } = logged();
+    const { decision } = await read({
+      id: 'm1',
+      previews: [row],
+    } as MediaLike);
+    assert.equal(decision.ready[0].stale, true);
+    assert.equal(tasks.added.length, 0);
+    assert.equal(warns.length, 1);
+    assert.match(
+      warns[0],
+      /stored original \(.*so its previews are served as stale and no task is queued/,
+    );
+  });
+
+  test('a lean row with neither warns; a new row with an empty previews array does not', async () => {
+    const neither = logged();
+    await neither.read({ id: 'm1' });
+    assert.equal(neither.warns.length, 1);
+    assert.match(
+      neither.warns[0],
+      /stored original and previews \(.*so nothing is served or queued for it/,
+    );
+    const newRow = logged('other');
+    await newRow.read({ id: 'm1', previews: [] });
+    assert.deepEqual(newRow.warns, []);
+  });
+
+  test('a fully loaded document never warns', async () => {
+    const { read, warns, errors } = logged();
+    for (const media of [
+      hydrated({}),
+      hydrated({}, { original: originalField, previews: [row] }),
+      hydrated({ _id: 1, name: 1, 'original.storageRef': 1, previews: 1 }),
+      hydrated({ name: 0 }),
+      hydrated({ _id: 1, original: 1, previews: 1 }),
+      new File({ name: 'new' }) as unknown as MediaLike,
+      { id: 'm1', original: originalField, previews: [] },
+      // Raw writes make these: a warning here would be a false alarm.
+      { id: 'm2', original: originalField },
+      { id: 'm3', original: null } as unknown as MediaLike,
+    ]) {
+      await read(media);
+    }
+    assert.deepEqual(warns, []);
+    assert.deepEqual(errors, []);
+  });
+
+  test('an isSelected that throws, or a getter for it that throws, does not warn and does not stop the read', async () => {
+    const boom = () => {
+      throw new Error('hostile');
+    };
+    const { read, warns, errors, tasks } = logged();
+    const medias = [
+      { id: 'm1', original: originalField, isSelected: boom },
+      {
+        id: 'm2',
+        original: originalField,
+        get isSelected() {
+          return boom();
+        },
+      },
+    ];
+    for (const media of medias) {
+      const { decision } = await read(media as MediaLike);
+      assert.equal(decision.missing.length, 1);
+    }
+    assert.deepEqual(warns, []);
+    assert.deepEqual(errors, []);
+    assert.equal(tasks.added.length, 2);
+  });
+
+  test('a previews getter that throws while the warning is written does not stop the read', async () => {
+    const { read, warns } = logged();
+    let reads = 0;
+    const media = {
+      id: 'm1',
+      isSelected: (path: string) => path !== 'original',
+      get previews() {
+        reads += 1;
+        if (reads === 1) {
+          throw new Error('hostile');
+        }
+        return [];
+      },
+    };
+    const { decision } = await read(media as unknown as MediaLike);
+    assert.equal(decision.missing.length, 1, 'not the safe empty decision');
+    assert.equal(warns.length, 1);
+  });
+
+  test('the warning stays inside the never-throw guard when the logger throws', async (t) => {
+    const fallback = t.mock.method(console, 'warn', () => {});
+    const r = new Resizer({
+      storage: makeStorage(),
+      media: fakeMedia(),
+      tasks: new MemoryTaskQueue(),
+      metrics: new NoopMetrics(),
+      logger: {
+        info() {},
+        warn() {
+          throw new Error('log sink down');
+        },
+        error() {},
+      },
+    });
+    for (let i = 0; i < 3; i++) {
+      const { decision } = await r.resolve({
+        media: { id: 'm1' },
+        sizes: [{ width: 10, height: 10 }],
+        formats: ['jpeg'],
+      });
+      assert.equal(decision.missing.length, 1);
+    }
+    assert.equal(fallback.mock.calls.length, 1, 'once, through the console');
+    assert.match(
+      String(fallback.mock.calls[0].arguments[0]),
+      /was loaded without its stored/,
     );
   });
 });

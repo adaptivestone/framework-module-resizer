@@ -15,6 +15,7 @@ const realSpawn = childProcess.spawn;
 const isUnavailable = (err: unknown) =>
   err instanceof ResizeSetupError &&
   err.code === 'RESIZE_SVG_RENDER_UNAVAILABLE' &&
+  err.retryable === true &&
   /child process/.test(err.message) &&
   /svgRasterChild/.test(err.message);
 

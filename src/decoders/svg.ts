@@ -3,7 +3,7 @@
 // `limits.processingTimeoutSeconds` or when the abort signal fires, and decodes only the PNG it
 // returns in-process. `inspect` reads the header without rendering: the natural size, which may be
 // fractional, and whether the SVG keeps a pixel on each side within the renderer's limits.
-import sharp from 'sharp';
+import sharp, { type Metadata } from 'sharp';
 import {
   type DecodeBox,
   type Raster,
@@ -12,6 +12,7 @@ import {
   type SourceInfo,
 } from '../contracts/decoder.ts';
 import { ResizeMediaError } from '../errors.ts';
+import { sharpDecodeError } from '../helpers/sharpError.ts';
 import { svgNaturalSize, svgRasterDensity } from '../helpers/svgDimensions.ts';
 import { rasterizeSvg } from '../helpers/svgRaster.ts';
 import type { ResizeLimits } from '../types.d.ts';
@@ -42,10 +43,17 @@ export class SvgDecoder extends SourceDecoder {
   readonly formats = Object.freeze(['svg'] as const);
 
   async inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
-    // Sharp's own error (bytes it cannot read, the pixel limit, the timeout) is rethrown as it is.
-    const meta = await sharp(bytes, { limitInputPixels: limits.inputPixels })
-      .timeout({ seconds: limits.processingTimeoutSeconds })
-      .metadata();
+    // Damage and the pixel limit become the module's errors; any other Sharp error (bytes it cannot
+    // read, the timeout) is rethrown as it is. It runs at Sharp's default level, so its error does
+    // not name limits.failOn.
+    let meta: Metadata;
+    try {
+      meta = await sharp(bytes, { limitInputPixels: limits.inputPixels })
+        .timeout({ seconds: limits.processingTimeoutSeconds })
+        .metadata();
+    } catch (err) {
+      throw sharpDecodeError(err, { inputPixels: limits.inputPixels });
+    }
     if (meta.format !== 'svg') {
       throw new ResizeMediaError(
         `resize: the SVG decoder does not read ${meta.format === undefined ? 'these bytes' : `format '${meta.format}'`}`,

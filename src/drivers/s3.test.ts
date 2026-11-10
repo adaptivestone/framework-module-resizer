@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { S3Client } from '@aws-sdk/client-s3';
-import { ResizeConfigError, ResizeSecurityError } from '../errors.ts';
+import {
+  ResizeConfigError,
+  ResizeSecurityError,
+  ResizeStorageError,
+} from '../errors.ts';
 import { asS3Client, silentLogger } from '../testHelpers/fakes.ts';
 import type { S3StorageConfig } from '../types.d.ts';
 import { S3Storage } from './s3.ts';
@@ -36,6 +40,52 @@ const args = (key: string, visibility: 'public' | 'private') => ({
 });
 
 describe('S3Storage', () => {
+  const rejectingWith = (thrown: unknown) =>
+    new S3Storage({
+      bucketPublic: 'pub',
+      client: asS3Client({
+        send: async () => {
+          throw thrown;
+        },
+      }),
+    });
+
+  test('S3Storage: NoSuchKey is RESIZE_STORAGE_NOT_FOUND, retryable, with its cause', async () => {
+    const thrown = Object.assign(new Error('x'), { name: 'NoSuchKey' });
+    await assert.rejects(
+      () => rejectingWith(thrown).download({ bucket: 'pub', key: 'k' }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeStorageError);
+        assert.equal(err.code, 'RESIZE_STORAGE_NOT_FOUND');
+        assert.equal(err.retryable, true);
+        assert.equal(err.message, 'resize s3: object not found: pub/k');
+        assert.equal(err.cause, thrown);
+        return true;
+      },
+    );
+  });
+
+  test('S3Storage: other failures stay raw', async () => {
+    for (const name of ['NoSuchBucket', 'AccessDenied']) {
+      const thrown = Object.assign(new Error('x'), { name });
+      await assert.rejects(
+        () => rejectingWith(thrown).download({ bucket: 'pub', key: 'k' }),
+        (err: unknown) => {
+          assert.equal(err, thrown, name);
+          return true;
+        },
+      );
+    }
+    // A value that is not an object has no name to read.
+    await assert.rejects(
+      () => rejectingWith(null).download({ bucket: 'pub', key: 'k' }),
+      (err: unknown) => {
+        assert.equal(err, null);
+        return true;
+      },
+    );
+  });
+
   test('routes original and derived preview to their own buckets while retaining grouping', async () => {
     const { client, sent } = fakeClient();
     const opts = { bucketPublic: 'pub', bucketPrivate: 'priv', client };

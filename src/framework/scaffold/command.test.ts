@@ -951,7 +951,7 @@ describe('scaffolded ResizeWorker command', () => {
       const { default: Command } = await import(
         pathToFileURL(join(root, COMMAND)).href
       );
-      assert.equal(await new Command({}, {}, {}).run(), true);
+      assert.equal(await new Command({}, {}, {}).run(), false);
       assert.equal(loadedWhenWorkerStarted, true);
     } finally {
       delete flags.resizeSiteLoaded;

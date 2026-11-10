@@ -236,10 +236,12 @@ test('the module-state scan sees typed collections, var and let', () => {
 });
 
 // Per-process state lives in the core's process registry, which resetResizerForTests() clears: the
-// framework adapter keeps none of its own, except the caches of validated config files, which are
-// keyed by the config objects and so cannot outlive them.
-test('the framework adapter keeps no module-level state except the config-validation caches', () => {
+// framework adapter keeps none of its own, except the caches of validated config files, keyed by
+// the config objects, and the sinks to flush at shutdown, keyed by the app's event bus. Each is
+// keyed by what it describes, so it cannot outlive it.
+test('the framework adapter keeps no module-level state except the caches keyed by the config objects and the flush list keyed by the app event bus', () => {
   const allowed = new Set([
+    'framework/app.ts flushing',
     'framework/config.ts resolvedFiles',
     'framework/config.ts resolvedProcess',
     'framework/config.ts missingProcessFile',

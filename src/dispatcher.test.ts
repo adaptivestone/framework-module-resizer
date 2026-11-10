@@ -429,6 +429,64 @@ describe('a task queue without gatesByTask', () => {
     assert.equal(unconfirmedLines(), 2);
   });
 
+  test('a final unconfirmed add on the read path names its causeCode and promises no later read, logged once', async () => {
+    const tasks = new MemoryTaskQueue();
+    const realAdd = tasks.add.bind(tasks);
+    let confirm = false;
+    tasks.add = async (task) =>
+      confirm
+        ? realAdd(task)
+        : {
+            status: 'unconfirmed',
+            retryable: false,
+            causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+          };
+    const d = makeDispatcher({ tasks });
+    const lines = () =>
+      errors
+        .map(([message]) => String(message))
+        .filter((message) => /did not confirm the task/.test(message));
+    for (let i = 0; i < 5; i++) {
+      assert.equal(await d.enqueue(requestFor([v300])), 0);
+    }
+    assert.equal(lines().length, 1);
+    assert.match(lines()[0], /cause code RESIZE_MONGO_MODEL_OUTDATED/);
+    assert.doesNotMatch(lines()[0], /a later read/);
+    // The same once-only rule: again after an add was confirmed.
+    confirm = true;
+    assert.equal(await d.enqueue(requestFor([v300])), 1);
+    confirm = false;
+    assert.equal(await d.enqueue(requestFor([v300], { mediaId: 'm2' })), 0);
+    assert.equal(lines().length, 2);
+  });
+
+  test('a plain unconfirmed add on the read path still says a later read queues it, with no cause code', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'unconfirmed', causeCode: 'X' });
+    assert.equal(
+      await makeDispatcher({ tasks }).enqueue(requestFor([v300])),
+      0,
+    );
+    assert.match(String(errors[0][0]), /a later read queues it/);
+    assert.doesNotMatch(String(errors[0][0]), /cause code/);
+  });
+
+  test("a final add's cause code that is not one token cannot forge a read path line", async () => {
+    for (const causeCode of ['X\nresize worker: forged', 42, undefined]) {
+      errors = [];
+      const tasks = new PlainTaskQueue();
+      tasks.add = async () =>
+        ({ status: 'unconfirmed', retryable: false, causeCode }) as never;
+      assert.equal(
+        await makeDispatcher({ tasks }).enqueue(requestFor([v300])),
+        0,
+      );
+      const line = String(errors[0][0]);
+      assert.match(line, /cause code none/);
+      assert.doesNotMatch(line, /\n/);
+    }
+  });
+
   test('the one-lease hold never exceeds gateTtlMs (a lease longer than the gate lock)', async () => {
     const now = 5_000;
     const tasks = new PlainTaskQueue();
@@ -653,6 +711,56 @@ describe('a task queue without gatesByTask', () => {
       errors.filter((e) => /TaskAddResult/.test(String(e[0]))).length,
       2,
     );
+  });
+
+  test('an unconfirmed add passes its retryable false and causeCode to the prewarm issue', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({
+      status: 'unconfirmed',
+      retryable: false,
+      causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+    });
+    const confirmed = await makeDispatcher({ tasks }).enqueueConfirmed(
+      requestFor([v300]),
+    );
+    assert.deepEqual(confirmed.accepted, []);
+    assert.deepEqual(confirmed.unconfirmed, [v300]);
+    assert.deepEqual(confirmed.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+        causeCode: 'RESIZE_MONGO_MODEL_OUTDATED',
+        message: 'the task queue did not confirm the task',
+        retryable: false,
+        previews: [v300],
+      },
+    ]);
+  });
+
+  test('a plain unconfirmed add stays retryable, with no causeCode', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () => ({ status: 'unconfirmed' });
+    const confirmed = await makeDispatcher({ tasks }).enqueueConfirmed(
+      requestFor([v300]),
+    );
+    assert.deepEqual(confirmed.issues, [
+      {
+        code: 'RESIZE_ENQUEUE_UNCONFIRMED',
+        message: 'the task queue did not confirm the task',
+        retryable: true,
+        previews: [v300],
+      },
+    ]);
+  });
+
+  test('a non-string causeCode from a JavaScript queue is dropped', async () => {
+    const tasks = new PlainTaskQueue();
+    tasks.add = async () =>
+      ({ status: 'unconfirmed', causeCode: 42, retryable: 'no' }) as never;
+    const confirmed = await makeDispatcher({ tasks }).enqueueConfirmed(
+      requestFor([v300]),
+    );
+    assert.equal('causeCode' in confirmed.issues[0], false);
+    assert.equal(confirmed.issues[0].retryable, true);
   });
 
   test('gate keys cannot collide: each part is URI-encoded', async () => {
@@ -1128,6 +1236,56 @@ describe('a task queue that routes queue names to backends', () => {
       assert.equal(await d.enqueue(requestFor([v300])), 1);
       assert.equal(memory.added.length, 1);
     }
+  });
+
+  test('a queue that fails with a new message every time logs at most 100 lines', async () => {
+    let builds = 0;
+    const d = makeDispatcher({
+      tasks: new RoutingTaskQueue({
+        default: new MemoryTaskQueue(),
+        // A failed build is forgotten, so every call builds and fails with its own text.
+        bulk: async () => {
+          builds += 1;
+          throw new Error(`boom ${builds}`);
+        },
+      }),
+    });
+    for (let i = 0; i < 150; i++) {
+      assert.equal(await d.enqueue(requestFor([v300], { queue: 'bulk' })), 0);
+    }
+    assert.equal(builds, 150);
+    assert.equal(errors.length, 100);
+  });
+
+  test('every once-log of the read path is capped at 100 queue names', async () => {
+    const names = Array.from({ length: 150 }, (_, i) => `q${i}`);
+    const drain = async (d: Dispatcher) => {
+      for (const queue of names) {
+        assert.equal(await d.enqueue(requestFor([v300], { queue })), 0);
+        assert.equal(await d.enqueue(requestFor([v300], { queue })), 0);
+      }
+    };
+    // Not served.
+    await drain(
+      makeDispatcher({ tasks: new MemoryTaskQueue({ queues: ['default'] }) }),
+    );
+    assert.equal(warnings.length, 100);
+    // Invalid timing.
+    errors = [];
+    await drain(
+      makeDispatcher({
+        timingOf: () => {
+          throw new ResizeSetupError('bad timing');
+        },
+      }),
+    );
+    assert.equal(errors.length, 100);
+    // A backend that needs a lock store there is not.
+    errors = [];
+    await drain(
+      makeDispatcher({ tasks: new PlainTaskQueue(), locks: undefined }),
+    );
+    assert.equal(errors.length, 100);
   });
 
   test('a name marked unavailable: prewarm is RESIZE_QUEUE_NOT_SERVED, not retryable, and the message names the package; resolve logs it once', async () => {

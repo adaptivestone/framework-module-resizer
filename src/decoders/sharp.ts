@@ -2,7 +2,7 @@
 // except SVG, which only the SVG decoder renders, in a separate process, and `raw`, which is not a
 // file format. A Sharp call cannot be cancelled, so `render` does not watch the abort signal:
 // `limits.processingTimeoutSeconds` bounds every call instead.
-import sharp from 'sharp';
+import sharp, { type Metadata, type OutputInfo } from 'sharp';
 import {
   type DecodeBox,
   type Raster,
@@ -13,6 +13,7 @@ import {
 } from '../contracts/decoder.ts';
 import { ResizeMediaError } from '../errors.ts';
 import { isAvifBuffer } from '../helpers/imageFormat.ts';
+import { sharpDecodeError } from '../helpers/sharpError.ts';
 import type { ResizeLimits } from '../types.d.ts';
 
 /** Sharp's buffer input formats, without svg and raw; `avif` too when `heif` is there. */
@@ -30,12 +31,20 @@ export class SharpDecoder extends SourceDecoder {
   readonly formats: readonly string[] = Object.freeze(sharpInputFormats());
 
   async inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
-    // Sharp's own error (bytes it cannot read, the pixel limit, the timeout) is rethrown as it is.
+    // Damage and the pixel limit become the module's errors; any other Sharp error (bytes it cannot
+    // read, the timeout) is rethrown as it is. It runs at Sharp's default level, whatever
+    // limits.failOn says, so its error does not name that setting, and a header that level refuses
+    // fails at every limits.failOn, also at 'none'.
     // The first frame only: the input limit applies to one frame, and the header still reports the
     // page count and timing. How many frames are decoded is bounded at render, by the plan.
-    const meta = await sharp(bytes, { limitInputPixels: limits.inputPixels })
-      .timeout({ seconds: limits.processingTimeoutSeconds })
-      .metadata();
+    let meta: Metadata;
+    try {
+      meta = await sharp(bytes, { limitInputPixels: limits.inputPixels })
+        .timeout({ seconds: limits.processingTimeoutSeconds })
+        .metadata();
+    } catch (err) {
+      throw sharpDecodeError(err, { inputPixels: limits.inputPixels });
+    }
     const format =
       meta.format === 'heif' && isAvifBuffer(bytes) ? 'avif' : meta.format;
     if (format === undefined || !this.formats.includes(format)) {
@@ -75,34 +84,44 @@ export class SharpDecoder extends SourceDecoder {
     // Never ask for more frames than the source has: a still image yields one.
     const frames = Math.max(1, Math.min(opts.frames, opts.source.pages ?? 1));
     const timeout = { seconds: limits.processingTimeoutSeconds };
-    let img = sharp(bytes, {
-      failOn: 'none',
-      sequentialRead: true,
-      limitInputPixels: limits.inputPixels,
-      pages: frames,
-    });
-    // Sharp cannot rotate a multi-page image; an animated source carries no EXIF orientation.
-    if (frames === 1) {
-      img = img.rotate();
+    let rendered: { data: Buffer; info: OutputInfo };
+    let meta: Metadata | undefined;
+    try {
+      let img = sharp(bytes, {
+        failOn: limits.failOn,
+        sequentialRead: true,
+        limitInputPixels: limits.inputPixels,
+        pages: frames,
+      });
+      // Sharp cannot rotate a multi-page image; an animated source carries no EXIF orientation.
+      if (frames === 1) {
+        img = img.rotate();
+      }
+      const rendering = img
+        .resize(box.width, box.height, {
+          fit: 'outside',
+          withoutEnlargement: true,
+        })
+        .toColorspace('srgb')
+        .raw({ depth: 'uchar' })
+        .timeout(timeout)
+        .toBuffer({ resolveWithObject: true });
+      // Raw pixels carry no animation timing: read it from the header for the encoder, over the
+      // frames decoded, never the whole stack.
+      const timing =
+        frames > 1
+          ? sharp(bytes, {
+              limitInputPixels: limits.inputPixels,
+              pages: frames,
+            })
+              .timeout(timeout)
+              .metadata()
+          : undefined;
+      [rendered, meta] = await Promise.all([rendering, timing]);
+    } catch (err) {
+      throw sharpDecodeError(err, limits);
     }
-    const rendering = img
-      .resize(box.width, box.height, {
-        fit: 'outside',
-        withoutEnlargement: true,
-      })
-      .toColorspace('srgb')
-      .raw({ depth: 'uchar' })
-      .timeout(timeout)
-      .toBuffer({ resolveWithObject: true });
-    // Raw pixels carry no animation timing: read it from the header for the encoder, over the
-    // frames decoded, never the whole stack.
-    const timing =
-      frames > 1
-        ? sharp(bytes, { limitInputPixels: limits.inputPixels, pages: frames })
-            .timeout(timeout)
-            .metadata()
-        : undefined;
-    const [{ data, info }, meta] = await Promise.all([rendering, timing]);
+    const { data, info } = rendered;
     // The frame count comes from the pixels themselves, by the rule of `readRaster` in
     // src/raster.ts (which decoders do not import): Sharp echoes the requested `pages` in
     // `info.pages` even when the loader read a single frame, and the page height is a frame height

@@ -247,4 +247,20 @@ describe('encodeSignature', () => {
       encodeSignature(lowInput, cover('gif')),
     );
   });
+
+  test('limits.failOn is not signed: changing it regenerates nothing', () => {
+    const cover = (format: string) => ({ format, fit: false });
+    const lax = makeImageConfig({ limits: { failOn: 'none' } });
+    const strict = makeImageConfig({ limits: { failOn: 'warning' } });
+    for (const format of ['webp', 'jpeg']) {
+      assert.equal(
+        encodeSignature(lax, cover(format)),
+        encodeSignature(strict, cover(format)),
+      );
+      assert.equal(
+        encodeSignature(lax, cover(format)),
+        encodeSignature(makeImageConfig(), cover(format)),
+      );
+    }
+  });
 });

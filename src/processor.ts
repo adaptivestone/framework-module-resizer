@@ -38,10 +38,10 @@ import {
   ResizeSetupError,
   ResizeStorageError,
 } from './errors.ts';
-import { storedDims } from './freshness.ts';
+import { expectedOrigin, sameOriginal, storedDims } from './freshness.ts';
 import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { logNeverThrow, notRetryable } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
 import type { HookBus } from './hooks.ts';
 import { previewScope, requireMediaId } from './images.ts';
@@ -184,11 +184,43 @@ function sourceError(err: unknown, mediaId: string): unknown {
   );
 }
 
+/**
+ * "Damaged" holds only when the bytes are the object's and a decoder owns the format. A short
+ * download looks like a cut file, and a decoder half-reading a container of a format no decoder of
+ * this process lists proves nothing: a rolling deploy must not dead-letter good media.
+ */
+function decodeFailure(
+  err: unknown,
+  mediaId: string,
+  bytes: Buffer,
+  { size, unlistedFormat }: { size?: unknown; unlistedFormat?: string },
+): unknown {
+  if (ResizeError.isResizeError(err) && err.code === 'RESIZE_SOURCE_DAMAGED') {
+    const why =
+      typeof size === 'number' && size !== bytes.length
+        ? `downloaded ${bytes.length} bytes, the upload stored ${size}`
+        : unlistedFormat === undefined
+          ? undefined
+          : `no decoder in this process lists its stored format '${unlistedFormat}'`;
+    if (why !== undefined) {
+      return new ResizeMediaError(
+        `resize: decoding the source failed for media ${mediaId}: ${why}: ${err.message}`,
+        { mediaId, code: 'RESIZE_SOURCE_DECODE_FAILED', cause: err },
+      );
+    }
+  }
+  return sourceError(err, mediaId);
+}
+
 /** The original's bytes, the decoder that reads them, and what it measured. */
 interface LoadedSource {
   bytes: Buffer;
   decoder: SourceDecoder;
   info: SourceInfo;
+  // The stored length of the upload, to tell a short download from a cut file at render.
+  size?: number;
+  // The stored format no decoder of this process lists, when one was stored.
+  unlistedFormat?: string;
 }
 
 /**
@@ -379,14 +411,19 @@ function snapshotOriginal(original: Original): {
   original: Original;
   signed: Original;
 } {
-  const { format, width, height } = original;
+  const { format, width, height, size } = original;
   const rest = {
     ...(format === undefined ? {} : { format }),
     ...(width === undefined ? {} : { width }),
     ...(height === undefined ? {} : { height }),
   };
   return {
-    original: { storageRef: copyLocator(original.storageRef), ...rest },
+    original: {
+      storageRef: copyLocator(original.storageRef),
+      ...rest,
+      ...(size === undefined ? {} : { size }),
+    },
+    // No `size`: the origin signature must not change on upgrade.
     signed: { storageRef: signedLocator(original.storageRef), ...rest },
   };
 }
@@ -402,24 +439,26 @@ async function loadSource(
     decoders: DecoderSet;
     limits: ResizeLimits;
     logger: ResizeLogger;
+    who: string; // the start of its log lines: the worker's, or generate()'s
   },
   original: Original,
   mediaId: string,
 ): Promise<LoadedSource> {
-  const { storage, decoders, limits, logger } = parts;
+  const { storage, decoders, limits, logger, who } = parts;
   const bytes = asBuffer(await storage.download(original.storageRef));
   let identified: IdentifiedSource;
   try {
     identified = await decoders.identify(bytes, limits, original.format);
   } catch (err) {
-    throw sourceError(err, mediaId);
+    // No unlisted format here: `identify` already reports damage on one as a missing decoder.
+    throw decodeFailure(err, mediaId, bytes, { size: original.size });
   }
   const { decoder, info, mismatch } = identified;
   if (mismatch !== undefined) {
     if (info.format === mismatch.stored) {
       // A host decoder lists a built-in format and refused these bytes; a later decoder read them.
       logger.warn(
-        `resize worker: media ${mediaId} is stored as '${mismatch.stored}'; the first decoder listing '${mismatch.stored}' refused these bytes, and another decoder read them`,
+        `${who}: media ${mediaId} is stored as '${mismatch.stored}'; the first decoder listing '${mismatch.stored}' refused these bytes, and another decoder read them`,
       );
     } else {
       const why =
@@ -429,7 +468,7 @@ async function loadSource(
             ? 'its decoder refused the bytes'
             : 'its decoder read another of its formats';
       logger.warn(
-        `resize worker: media ${mediaId} is stored as '${mismatch.stored}' but its bytes are '${info.format}' (${why}); rendering it as '${info.format}'`,
+        `${who}: media ${mediaId} is stored as '${mismatch.stored}' but its bytes are '${info.format}' (${why}); rendering it as '${info.format}'`,
       );
     }
   }
@@ -439,7 +478,15 @@ async function loadSource(
       { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
     );
   }
-  return { bytes, decoder, info };
+  return {
+    bytes,
+    decoder,
+    info,
+    size: original.size,
+    ...(mismatch?.reason === 'unlisted'
+      ? { unlistedFormat: mismatch.stored }
+      : {}),
+  };
 }
 
 /** The decoder's raster at `box`, checked (shape and pixel budget), in straight alpha. */
@@ -451,7 +498,7 @@ async function decodeSource(
 ): Promise<Raster> {
   try {
     const raster = await source.decoder.render(source.bytes, box, opts);
-    // A broken raster is the decoder's contract error: sourceError passes it on unchanged.
+    // A broken raster is the decoder's contract error: decodeFailure passes it on unchanged.
     checkRaster(raster);
     // A decoder that ignores its box or decodes more frames than asked must not hand the core more
     // pixels than the budget the plan was made for.
@@ -465,7 +512,7 @@ async function decodeSource(
     }
     return await straightAlpha(raster, opts.limits);
   } catch (err) {
-    throw sourceError(err, mediaId);
+    throw decodeFailure(err, mediaId, source.bytes, source);
   }
 }
 
@@ -542,10 +589,22 @@ interface RenderPendingResult {
   // the identities of the stored previews that replaced them.
   removed: Preview[];
   replaced: Set<string>;
-  // The size every row was signed with, once the original was measured.
+  // What each failed variant failed with, by identity, in the order they failed.
+  failures: Map<string, unknown>;
+  // The identities whose failure says no retry can help (`retryable: false`).
+  finalFailures: Set<string>;
+  // The size every row was signed with, once the original was measured, and the signature of the
+  // original this call rendered from.
   originDims?: { width: number; height: number };
+  origin?: string;
   // The dimensions the persist recorded on a media that had none stored.
   backfilled?: { width: number; height: number };
+}
+
+/** What a queued task did: the variants it asked for, and those this delivery stored. */
+export interface ProcessTaskResult {
+  requested: number;
+  rendered: number;
 }
 
 export interface ProcessorDeps {
@@ -622,29 +681,41 @@ export class Processor {
     )) as SizeInput[];
 
     // Expand sizes × formats; skip unbuildable sizes + fresh stored identities (idempotent).
-    const requested = catalog.missing(media, sizes, formats, {
-      resizer: name,
-      pipeline,
-    });
+    const scope: PreviewScope = { resizer: name, pipeline };
+    const requested = catalog.missing(media, sizes, formats, scope);
 
     const persist = opts.persist !== false;
-    const { generated, failedCount, removed, replaced, backfilled } =
-      await this.#renderPending({
-        media,
-        mediaId,
-        requested,
-        pipeline,
-        ctx,
-        persist,
-        mode: 'eager',
-      });
+    const {
+      generated,
+      failedCount,
+      failures,
+      finalFailures,
+      removed,
+      replaced,
+      backfilled,
+    } = await this.#renderPending({
+      media,
+      mediaId,
+      requested,
+      pipeline,
+      ctx,
+      persist,
+      mode: 'eager',
+    });
 
     // When the call throws, the caller's media keeps no dimensions, even if the store recorded them.
     if (requested.length > 0 && generated.length === 0 && failedCount > 0) {
+      // Final only when another call could change nothing: a variant with any other outcome (a
+      // retryable failure, a row the store left out) may still be made.
+      const allFinal = requested.every((preview) =>
+        finalFailures.has(catalog.identity(scope, preview)),
+      );
       throw new ResizeGenerateError({
         mediaId,
         failed: failedCount,
         requested: requested.length,
+        retryable: !allFinal,
+        cause: [...failures.values()][0],
       });
     }
 
@@ -758,12 +829,13 @@ export class Processor {
    * One queued task: the core, then a check that every requested identity is stored fresh. The
    * worker loop (src/consumer.ts) runs it through the worker; it SUCCEEDS by returning and FAILS by
    * throwing (which engages the queue's retry → dead-letter). It takes no locks: the lease keeps
-   * the task to one worker at a time, and the media store keeps one row per preview identity.
+   * the task to one worker at a time, and the media store keeps one row per preview identity. It
+   * resolves how many variants the task asked for and how many this delivery stored.
    */
   async processTask(
     task: LeasedTask,
     opts: { signal?: AbortSignal } = {},
-  ): Promise<void> {
+  ): Promise<ProcessTaskResult> {
     const { catalog, logger, media: mediaStore, name } = this.#deps;
     // ctx does NOT cross the queue — the worker's pipeline steps depend on media/source.
     const ctx: Record<string, unknown> = {};
@@ -777,7 +849,7 @@ export class Processor {
       logger.info(
         `resize worker: media ${task.mediaId} missing (no doc) — no-op complete`,
       );
-      return;
+      return { requested: task.previews.length, rendered: 0 };
     }
     if (media.original?.storageRef == null) {
       throw new ResizeNoOriginalError(task.mediaId);
@@ -792,18 +864,50 @@ export class Processor {
     }
     const requested = [...requestedByIdentity.values()];
     this.#warnIfAllFresh(task, media, scope, requested);
-    const { generated, failedCount, originDims, backfilled } =
-      await this.#renderPending({
-        media,
+    // The original as the render finds it, taken now: a store's cached document can change under
+    // this task, in place too, and would then look the same as its reload.
+    const { signed: held } = snapshotOriginal(media.original);
+    const {
+      generated,
+      failedCount,
+      failures,
+      finalFailures,
+      originDims,
+      origin,
+      backfilled,
+    } = await this.#renderPending({
+      media,
+      mediaId: task.mediaId,
+      requested,
+      pipeline: task.pipeline,
+      ctx,
+      persist: true,
+      signal: opts.signal,
+      mode: 'task',
+      taskId: task.taskId,
+    }).catch(async (err: unknown) => {
+      // A final failure says nothing about an original that replaced the one it came from: the next
+      // delivery renders the new one. Only a final failure pays for this read, and a reload that
+      // fails, or a media that is gone, proves no replacement.
+      const replaced =
+        notRetryable(err) &&
+        (await Promise.try(() => mediaStore.loadMedia(task.mediaId))
+          .then((now) => !!now && !sameOriginal(held, now.original))
+          .catch(() => false));
+      if (!replaced) {
+        throw err;
+      }
+      const missing = [...requestedByIdentity.keys()];
+      throw new ResizeGenerateError({
         mediaId: task.mediaId,
-        requested,
-        pipeline: task.pipeline,
-        ctx,
-        persist: true,
-        signal: opts.signal,
-        mode: 'task',
-        taskId: task.taskId,
+        failed: missing.length,
+        requested: missing.length,
+        missing,
+        message: `resize worker: task for media ${task.mediaId} is incomplete (its original was replaced while it ran); missing ${missing.join(', ')} — failing for retry/dead-letter`,
+        code: 'RESIZE_WORKER_INCOMPLETE',
+        cause: err,
       });
+    });
 
     // A queued task is complete only when every requested identity is now persisted fresh. Re-read
     // once so the rows of a concurrent worker running the same task (after an expired lease) count:
@@ -816,7 +920,7 @@ export class Processor {
       logger.info(
         `resize worker: media ${task.mediaId} was deleted while processing — no-op complete`,
       );
-      return;
+      return { requested: requested.length, rendered: 0 };
     }
     if (
       backfilled &&
@@ -847,15 +951,39 @@ export class Processor {
       const missingIdentities = missing.map((preview) =>
         catalog.identity(scope, preview),
       );
+      // Dead at once only when another delivery could change nothing: a variant missing for any
+      // other reason (a retryable failure, a row the store left out) may still be made, and a
+      // failure says nothing about an original that replaced the one it was rendered from.
+      const sameOriginal =
+        origin !== undefined &&
+        expectedOrigin(
+          refreshed.original,
+          storedDims(refreshed.original) ?? originDims,
+        ) === origin;
+      const allFinal =
+        sameOriginal &&
+        missingIdentities.every((identity) => finalFailures.has(identity));
+      // A task row outlives the logs, so the error says why: the first failure of a variant that is
+      // still missing (a variant another worker stored meanwhile no longer matters).
+      const failed = [...failures]
+        .filter(([identity]) => missingIdentities.includes(identity))
+        .map(([, failure]) => failure);
+      const counted =
+        failed.length > 1
+          ? ` (${failed.length} variants failed, the first is the cause)`
+          : '';
       throw new ResizeGenerateError({
         mediaId: task.mediaId,
         failed: Math.max(failedCount, missing.length),
         requested: requested.length,
         missing: missingIdentities,
-        message: `resize worker: task for media ${task.mediaId} is incomplete; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
+        message: `resize worker: task for media ${task.mediaId} is incomplete${counted}; missing ${missingIdentities.join(', ')} — failing for retry/dead-letter`,
         code: 'RESIZE_WORKER_INCOMPLETE',
+        retryable: !allFinal,
+        cause: failed[0],
       });
     }
+    return { requested: requested.length, rendered: generated.length };
   }
 
   /**
@@ -930,6 +1058,8 @@ export class Processor {
       storage,
     } = this.#deps;
     const { limits } = config;
+    // An eager failure is the caller's, and no worker is involved: its lines must not claim one.
+    const who = mode === 'eager' ? 'resize generate' : 'resize worker';
 
     // Before any download or decode, in both modes; the queue retries it like any failure.
     requirePipeline(pipelines, name, pipelineName);
@@ -938,11 +1068,15 @@ export class Processor {
     let failedCount = 0;
     let removed: Preview[] = [];
     const replaced = new Set<string>();
+    const failures = new Map<string, unknown>();
+    const finalFailures = new Set<string>();
     const nothing = (): RenderPendingResult => ({
       generated,
       failedCount,
       removed,
       replaced,
+      failures,
+      finalFailures,
     });
 
     // Nothing requested (e.g. eager re-run where everything is already fresh) → no download.
@@ -1013,11 +1147,14 @@ export class Processor {
     for (const v of unconfigured) {
       const identity = catalog.identity(scope, v);
       const error = formatNotConfiguredError([v.format]);
-      logger.error(
-        `resize worker: variant ${identity} failed for media ${mediaId}`,
+      logNeverThrow(
+        logger,
+        `${who}: variant ${identity} failed for media ${mediaId}`,
         error,
+        'warn',
       );
       failedCount += 1;
+      failures.set(identity, error);
       recordVariant(identity, 'unconfigured', 0, 'failed', {
         ...errorCodeLabel(error),
         rawFormat: v.format,
@@ -1029,7 +1166,7 @@ export class Processor {
     }
 
     let source: LoadedSource | undefined = await loadSource(
-      { storage, decoders, limits, logger },
+      { storage, decoders, limits, logger, who },
       original,
       mediaId,
     );
@@ -1226,11 +1363,19 @@ export class Processor {
         // One bad variant must not fail the whole task; the caller decides what the failures mean.
         // A media error from the pixel work (an SVG output) does not know its media: add it.
         const failure = lacksMediaId(err) ? withMediaId(err, mediaId) : err;
-        logger.error(
-          `resize worker: variant ${plan.identity} failed for media ${mediaId}`,
+        // A warning: the task may still succeed, and a task's `error` line is its dead line. An
+        // eager caller gets the failed count or the throw.
+        logNeverThrow(
+          logger,
+          `${who}: variant ${plan.identity} failed for media ${mediaId}`,
           failure,
+          'warn',
         );
         failedCount += 1;
+        failures.set(plan.identity, failure);
+        if (notRetryable(failure)) {
+          finalFailures.add(plan.identity);
+        }
         recordVariant(
           plan.identity,
           plan.variant.format,
@@ -1348,7 +1493,10 @@ export class Processor {
       failedCount,
       removed,
       replaced,
+      failures,
+      finalFailures,
       originDims: mediaDims,
+      origin,
       ...(backfillDims ? { backfilled: backfillDims } : {}),
     };
   }

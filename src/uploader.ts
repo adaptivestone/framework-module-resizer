@@ -1,17 +1,20 @@
 // Stores an original as uploaded. The decoders measure it (format, size, frames) to check the
-// upload rules; the bytes go to storage unchanged. It needs only the storage, the decoders and the
-// image config; it creates no media, queues no work and logs nothing. Each upload is timed and
-// counted on the metrics sink, stored or rejected.
+// upload rules, and with `upload.verify: 'decode'` decode it once; the bytes go to storage unchanged.
+// It needs only the storage, the decoders and the image config; it creates no media, queues no work
+// and logs nothing. Each upload is timed and counted on the metrics sink, stored or rejected.
+import type { SourceDecoder, SourceInfo } from './contracts/decoder.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
 import type { DecoderSet, IdentifiedSource } from './decoderSet.ts';
 import {
-  ResizeError,
+  type ResizeError,
   ResizeOriginalError,
   ResizeStorageError,
 } from './errors.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
+import { isModuleError, messageText, notRetryable } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
+import { engineDetail, isUnsupportedBytes } from './helpers/sharpError.ts';
 import { errorCodeLabel, NoopMetrics } from './metrics.ts';
 import type {
   Original,
@@ -22,6 +25,8 @@ import type {
 } from './types.d.ts';
 
 interface IdentifiedOriginal {
+  decoder: SourceDecoder;
+  info: SourceInfo;
   format: OriginalFormat;
   contentType: string;
   extension: string;
@@ -33,7 +38,8 @@ interface IdentifiedOriginal {
 const ORIGINAL_CODES = new Map([
   ['RESIZE_SOURCE_FORMAT_UNSUPPORTED', 'RESIZE_ORIGINAL_FORMAT_UNSUPPORTED'],
   ['RESIZE_SOURCE_METADATA_MISSING', 'RESIZE_ORIGINAL_METADATA_MISSING'],
-  // The SVG decoder checks limits.sourcePixels itself, before its density probe.
+  // Sharp's pixel limit, and the SVG decoder's own check of limits.sourcePixels, before its density
+  // probe.
   ['RESIZE_SOURCE_TOO_LARGE', 'RESIZE_ORIGINAL_TOO_MANY_PIXELS'],
 ]);
 
@@ -47,20 +53,55 @@ const WIRING_ERRORS: ReadonlySet<string> = new Set([
   'ResizeConfigError',
 ]);
 
+/** The engine's line for an upload's message: one line, short, since it may reach an end user. */
+function uploadDetail(message: string): string {
+  return engineDetail(message).slice(0, 200);
+}
+
 /**
- * What a decoder rejected the original with, as an upload error. A setup or config error is a
- * wiring bug, not an invalid original, and passes through unchanged; the class is told by the brand
- * and the class names, so an error from a duplicate copy of the package counts too.
+ * The engine's own line for a damage error. The error's message is the worker's, which can talk
+ * about limits.failOn; a decoder's damage without an engine error has only that message.
+ */
+function damageDetail(err: ResizeError): string {
+  return uploadDetail(
+    messageText(err.cause instanceof Error ? err.cause : err),
+  );
+}
+
+/**
+ * What a decoder rejected the original with, as an upload error. Only a failure that names the
+ * bytes refuses them for good; any other failure of a decoder gives no verdict on them, so a retry
+ * may help. A host decoder's final refusal (`retryable: false`), at `inspect` or in the upload check,
+ * keeps its code and `retryable`. A setup or config error is a wiring bug, not an invalid original,
+ * and passes through unchanged; the class is told by the brand and the class names, so an error
+ * from a duplicate copy of the package counts too.
  */
 function originalError(cause: unknown): ResizeError {
-  if (!ResizeError.isResizeError(cause)) {
-    return new ResizeOriginalError(
-      'resize uploadOriginal: bytes are not a supported image',
-      { code: 'RESIZE_ORIGINAL_INVALID', cause },
-    );
+  if (!isModuleError(cause)) {
+    const message = messageText(cause);
+    const detail = uploadDetail(message);
+    return isUnsupportedBytes(cause)
+      ? new ResizeOriginalError(
+          `resize uploadOriginal: bytes are not a supported image: ${detail}`,
+          { code: 'RESIZE_ORIGINAL_INVALID', cause },
+        )
+      : new ResizeOriginalError(
+          `resize uploadOriginal: the decoder could not read the image: ${detail}`,
+          { code: 'RESIZE_ORIGINAL_INSPECT_FAILED', retryable: true, cause },
+        );
   }
   if (hasErrorClass(cause, WIRING_ERRORS)) {
     return cause;
+  }
+  if (cause.code === 'RESIZE_SOURCE_DAMAGED') {
+    const detail = damageDetail(cause);
+    const xml = detail.match(/XML parse error: (.*)$/);
+    return new ResizeOriginalError(
+      xml
+        ? `resize uploadOriginal: the SVG could not be parsed: ${xml[1]}`
+        : `resize uploadOriginal: bytes are not a supported image: ${detail}`,
+      { code: 'RESIZE_ORIGINAL_INVALID', cause },
+    );
   }
   const code = ORIGINAL_CODES.get(cause.code);
   return code === undefined
@@ -70,6 +111,42 @@ function originalError(cause: unknown): ResizeError {
         cause,
       })
     : new ResizeOriginalError(cause.message, { code, cause });
+}
+
+/** One real decode: a truncated body often passes `inspect`, which reads only the header. */
+async function verifyDecodes(
+  { decoder, info }: IdentifiedOriginal,
+  body: Buffer,
+  config: ResizeConfig,
+): Promise<void> {
+  try {
+    await decoder.render(
+      body,
+      { width: 16, height: 16 },
+      { limits: config.limits, source: info, frames: 1 },
+    );
+  } catch (cause) {
+    if (isModuleError(cause)) {
+      if (hasErrorClass(cause, WIRING_ERRORS)) {
+        throw cause;
+      }
+      if (cause.code === 'RESIZE_SOURCE_DAMAGED') {
+        throw new ResizeOriginalError(
+          `resize uploadOriginal: the image is damaged: ${damageDetail(cause)}`,
+          { code: 'RESIZE_ORIGINAL_DAMAGED', cause },
+        );
+      }
+      // The decoder's own word that no retry can help (an encrypted PDF) stands, as at `inspect`.
+      if (ORIGINAL_CODES.has(cause.code) || notRetryable(cause)) {
+        throw originalError(cause);
+      }
+    }
+    // A timeout, or a file this build cannot decode, gives no verdict on the image.
+    throw new ResizeOriginalError(
+      `resize uploadOriginal: the decode check failed: ${uploadDetail(messageText(cause))}`,
+      { code: 'RESIZE_ORIGINAL_VERIFY_FAILED', retryable: true, cause },
+    );
+  }
 }
 
 async function identifyOriginal(
@@ -92,6 +169,8 @@ async function identifyOriginal(
     );
   }
   return {
+    decoder: identified.decoder,
+    info,
     format: info.format,
     contentType: info.contentType,
     extension: info.format === 'jpeg' ? 'jpg' : info.format,
@@ -194,6 +273,15 @@ export class Uploader {
         'resize uploadOriginal: SVG originals must be stored privately',
         { code: 'RESIZE_ORIGINAL_SVG_PUBLIC' },
       );
+    }
+    // No vector source renders on the request path: inspect has parsed an SVG's XML, and its render
+    // starts a process per upload. A host's vector decoder says so with `vector`.
+    if (
+      config.upload.verify === 'decode' &&
+      measured.format !== 'svg' &&
+      !measured.info.vector
+    ) {
+      await verifyDecodes(measured, body, config);
     }
     const key = `originals/${randomHex()}.${measured.extension}`;
     let ref: StorageRef;
