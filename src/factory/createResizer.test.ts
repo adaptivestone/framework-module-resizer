@@ -983,3 +983,37 @@ test('eagerDatabase with an async driver that rejects: construction does not cra
     process.off('unhandledRejection', onUnhandled);
   }
 });
+
+test('a stale storage.publicUrl: construction succeeds, verify() rejects, and reads log one error and serve nothing', async () => {
+  const errors: unknown[][] = [];
+  const resizer = createResizer(
+    {
+      storage: {
+        driver: 's3',
+        bucketPublic: 'cdn',
+        publicUrl: 'https://cdn.example.com',
+      },
+    } as never,
+    {
+      media: fakeMedia(),
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    },
+  );
+  await assert.rejects(resizer.verify(), { code: 'RESIZE_CONFIG_REMOVED_KEY' });
+  for (let read = 0; read < 3; read += 1) {
+    const { decision } = await resizer.resolve({
+      media: { id: 'm1' },
+      sizes: [{ width: 10, height: 10 }],
+    });
+    assert.deepEqual(decision, { ready: [], missing: [] });
+  }
+  assert.equal(errors.length, 1);
+  assert.equal(
+    (errors[0][1] as { code: string }).code,
+    'RESIZE_CONFIG_REMOVED_KEY',
+  );
+});

@@ -554,6 +554,45 @@ describe('ports', () => {
     );
   });
 
+  test('verify() warns when upload.maxBytes is above limits.sourceBytes, the limit that wins', async () => {
+    const warnings: unknown[] = [];
+    const logger = { ...silent, warn: (line: unknown) => warnings.push(line) };
+    const over = new Resizer({
+      logger,
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig({
+        upload: { maxBytes: 11 },
+        limits: { sourceBytes: 10 },
+      }),
+    });
+    await over.verify();
+    assert.equal(warnings.length, 1);
+    const [line] = warnings;
+    assert.match(String(line), /upload\.maxBytes \(11\)/);
+    assert.match(String(line), /limits\.sourceBytes \(10\)/);
+    assert.match(String(line), /raise limits\.sourceBytes/);
+    resetResizerForTests();
+
+    warnings.length = 0;
+    const equal = new Resizer({
+      logger,
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig({
+        upload: { maxBytes: 10 },
+        limits: { sourceBytes: 10 },
+      }),
+    });
+    await equal.verify();
+    assert.deepEqual(warnings, []);
+    resetResizerForTests();
+
+    const defaults = new Resizer({ logger, storage, media: fakeMedia() });
+    await defaults.verify();
+    assert.deepEqual(warnings, []);
+  });
+
   test('verify() rejects a media store without replacePreviews', async () => {
     let storeVerified = 0;
     // A custom store written before replacePreviews existed.
@@ -1696,6 +1735,66 @@ describe('metrics', () => {
       sink.calls.map((call) => call.labels),
       [{ resizer: 'default', pipeline: 'default', outcome: 'failed' }],
     );
+  });
+
+  test('a Resizer that cannot start logs one line per error however many reads fail, counts every read, and serves after a later good build', async () => {
+    const errors: unknown[][] = [];
+    const sink = recordingMetrics();
+    let failure: string | undefined = 'storage down';
+    const r = new Resizer({
+      storage: async () => {
+        if (failure) {
+          throw new Error(failure);
+        }
+        return fakeStorage();
+      },
+      media: fakeMedia(),
+      metrics: sink,
+      logger: {
+        info() {},
+        warn() {},
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    });
+    const resolve = () =>
+      r.resolve({ media: { id: 'm1' }, sizes: [{ width: 10, height: 10 }] });
+    const read = async () => {
+      const { decision } = await resolve();
+      assert.deepEqual(decision, { ready: [], missing: [] });
+    };
+    const logged = () => errors.map(([, err]) => (err as Error).message);
+
+    await read();
+    await read();
+    await read();
+    assert.deepEqual(logged(), ['storage down']);
+    assert.match(
+      String(errors[0][0]),
+      /the Resizer could not start .* \(logged once per Resizer and error\)$/,
+    );
+
+    // Each read builds again: another failure is news.
+    failure = 'storage still down';
+    await read();
+    await read();
+    assert.deepEqual(logged(), ['storage down', 'storage still down']);
+
+    // One seen before stays quiet.
+    failure = 'storage down';
+    await read();
+    assert.equal(errors.length, 2);
+
+    // The log is quiet, so the metric is what shows the rate.
+    const outcomes = () => sink.calls.map((call) => call.labels?.outcome);
+    assert.deepEqual(outcomes(), Array(6).fill('failed'));
+
+    // A good build ends the path: no line says so, and the next read gets past it.
+    failure = undefined;
+    const { decision } = await resolve();
+    assert.ok(decision.missing.length > 0);
+    assert.equal(errors.length, 2);
+    assert.equal(outcomes().length, 7);
+    assert.notEqual(outcomes().at(-1), 'failed');
   });
 
   test('resolve() never throws when reading the options throws inside the read', async () => {

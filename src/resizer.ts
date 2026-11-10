@@ -24,7 +24,7 @@ import {
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { ResizeSetupError } from './errors.ts';
-import { logNeverThrow } from './helpers/log.ts';
+import { firstTime, logNeverThrow, messageText } from './helpers/log.ts';
 import { HookBus } from './hooks.ts';
 import { boundMetrics, isMetrics, LogMetrics } from './metrics.ts';
 import { PipelineRegistry } from './pipelines.ts';
@@ -36,6 +36,7 @@ import { validateResizeConfig } from './resizeConfig.ts';
 import { carrierOf, isRouter, unavailableReason } from './routing.ts';
 import { timingOf } from './timing.ts';
 import type {
+  AdoptOriginalOpts,
   CoordinationOptions,
   GenerateOpts,
   GenerateResult,
@@ -213,6 +214,9 @@ export class Resizer {
   // flight. A part whose function failed is retried alone; the parts that loaded are kept.
   readonly #loadedParts = new Set<PartName>();
   readonly #loadingParts = new Map<PartName, Promise<void>>();
+  // Why resolve() could not start, each logged once: every read tries again and fails the same way,
+  // and a busy API would flood its log. A good build ends that path, so nothing here is cleared.
+  readonly #loggedStartFailures = new Set<string>();
   readonly #pipelines: PipelineRegistry;
   readonly #hooks: HookBus;
   // The decoders that read originals, built once: the Processor renders every task through them.
@@ -627,10 +631,18 @@ export class Resizer {
    * carrier of this Resizer's own queue is built and checked. Framework hosts call it after
    * `Server.init()` to fail at boot instead of at the first upload or read; it is the one call
    * that rejects for a task queue that cannot be used (the read path degrades instead). The worker
-   * runs the same checks for the queue names it consumes.
+   * runs the same checks for the queue names it consumes. It also logs a warning when
+   * `upload.maxBytes` is above `limits.sourceBytes`: the stricter limit wins, since a task could
+   * never read a larger stored file, so the host's larger number silently does nothing.
    */
   async verify(): Promise<void> {
     await this.#verifyServices(undefined);
+    const { upload, limits } = this.config;
+    if (upload.maxBytes > limits.sourceBytes) {
+      this.logger.warn(
+        `resize: upload.maxBytes (${upload.maxBytes}) is above limits.sourceBytes (${limits.sourceBytes}), so uploadOriginal() refuses a larger body with RESIZE_ORIGINAL_TOO_LARGE — raise limits.sourceBytes to accept it, or lower upload.maxBytes`,
+      );
+    }
     if (this.tasks) {
       await this.#verifyRoute(this.queueName, undefined);
     }
@@ -725,11 +737,13 @@ export class Resizer {
       // The Reader guards the rest, but it does not exist until ready() succeeds.
       services = await this.#services();
     } catch (err) {
-      logNeverThrow(
-        this.logger,
-        'resize resolve: the Resizer could not start — returning the safe empty decision',
-        err,
-      );
+      if (firstTime(this.#loggedStartFailures, messageText(err))) {
+        logNeverThrow(
+          this.logger,
+          'resize resolve: the Resizer could not start — returning the safe empty decision (logged once per Resizer and error)',
+          err,
+        );
+      }
       // Counted like a read that failed inside the Reader; `opts` may be missing (a JS host), and
       // reading it may throw (a getter): the label then falls back to 'default'.
       let pipeline = 'default';
@@ -800,6 +814,17 @@ export class Resizer {
   /** Store an untouched, byte-sniffed original. Does not create media or queue work. */
   async uploadOriginal(opts: UploadOriginalOpts): Promise<Original> {
     return (await this.#services()).uploader.upload(opts);
+  }
+
+  /**
+   * Measure and decode an object already in storage, and return the `Original` that
+   * `uploadOriginal` would return for it. It stores nothing, writes nothing and queues nothing. Save
+   * the result as it is: its `storageRef`, the JSON form of the one given, is signed into every
+   * preview's origin, so a changed ref regenerates that media's previews. On a request path pass
+   * `maxBytes`, which lowers `limits.sourceBytes` for this call.
+   */
+  async adoptOriginal(opts: AdoptOriginalOpts): Promise<Original> {
+    return (await this.#services()).uploader.adopt(opts);
   }
 }
 

@@ -141,15 +141,20 @@ export function logNeverThrow(
 // A once-log keeps at most this many keys: host input (pipeline names, format lists, the message of
 // an error) is unbounded.
 export const ONCE_LOG_KEYS = 100;
+// The most of a key it stores: a key can hold the message of an error, which has no length limit.
+export const ONCE_LOG_KEY_LENGTH = 1000;
 
 /**
  * True the first time `key` is seen, which it then records, while `seen` holds fewer than
- * ONCE_LOG_KEYS keys: past that, nothing new is logged.
+ * ONCE_LOG_KEYS keys: past that, nothing new is logged. Only the first ONCE_LOG_KEY_LENGTH
+ * characters count, so `seen` stays small however long a key is, and keys that differ only past
+ * them are one key.
  */
 export function firstTime(seen: Set<string>, key: string): boolean {
-  if (seen.has(key) || seen.size >= ONCE_LOG_KEYS) {
+  const stored = key.slice(0, ONCE_LOG_KEY_LENGTH);
+  if (seen.has(stored) || seen.size >= ONCE_LOG_KEYS) {
     return false;
   }
-  seen.add(key);
+  seen.add(stored);
   return true;
 }

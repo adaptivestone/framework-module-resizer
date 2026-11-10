@@ -10,10 +10,7 @@ export {
 } from '../drivers/mongo/mediaFragment.ts';
 export type {
   DatabaseQueueConfig,
-  FrameworkLocalStorageConfig,
   FrameworkResizeConfig,
-  FrameworkS3StorageConfig,
-  FrameworkStorageConfig,
   LocalStorageConfig,
   PartialFrameworkResizeConfig,
   QueueConfig,

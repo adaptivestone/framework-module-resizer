@@ -19,7 +19,7 @@ node --run types:check:src
                        # shipped code + type pins (CI also runs it on the minimum peers)
 node --run check       # biome
 node --run build       # preBuild → tsc → postBuild (emits dist/)
-npm test               # node --experimental-strip-types --test  (the full node:test suite)
+npm test               # the full node:test suite, with the noAws.ts preload (see package.json)
 npm run smoke          # builds, packs, installs into a throwaway consumer, verifies the
                        # published surface + the resize-scaffold bin end-to-end
 ```

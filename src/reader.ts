@@ -624,15 +624,21 @@ export class Reader {
 /**
  * The module's fields this media was loaded without. A hydrated document says so itself: there
  * `.select('name')` gives a truthy nested `original` with an undefined storageRef. A lean row with
- * `original` and no `previews` is not listed: raw writes make such rows. A throwing `isSelected`
- * says nothing.
+ * `original` and no `previews` is not listed: raw writes make such rows. It cannot say more, so a
+ * lean row stays silent: `{ id: 'm2', original: originalField }` is pinned as a raw write, and a
+ * stricter lean test turned `a fully loaded document never warns` red. A throwing `isSelected` says
+ * nothing.
  */
 function notLoaded(media: MediaLike): string[] {
   try {
     const { isSelected } = media as { isSelected?: (path: string) => boolean };
     if (typeof isSelected === 'function') {
+      // A sub-field projection such as { 'original.storageRef': 0 } leaves `original` selected.
       return ['original', 'previews'].filter(
-        (path) => !isSelected.call(media, path),
+        (path) =>
+          !isSelected.call(media, path) ||
+          (path === 'original' &&
+            !isSelected.call(media, 'original.storageRef')),
       );
     }
     if (media.original !== undefined) {

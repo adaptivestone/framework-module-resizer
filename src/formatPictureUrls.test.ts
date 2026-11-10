@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { afterEach, describe, test } from 'node:test';
+import sharp from 'sharp';
 import { formatPictureUrls } from './formatPictureUrls.ts';
-import type { ReadDecision, ReadyEntry } from './types.d.ts';
+import { Resizer, resetResizerForTests } from './resizer.ts';
+import {
+  docMedia,
+  MemoryTaskQueue,
+  memoryStorage,
+  silentLogger,
+} from './testHelpers/fakes.ts';
+import { makeImageConfig } from './testHelpers/resizeConfig.ts';
+import type { MediaLike, ReadDecision, ReadyEntry } from './types.d.ts';
 
 // A ready entry as resolve() builds it: always backed by a stored preview.
 function entry(
@@ -145,6 +154,93 @@ describe('formatPictureUrls', () => {
     });
   });
 
+  test('an entry carries the size its row records, since a size key does not promise a size', () => {
+    const stored = entry({
+      sizeKey: '720x720',
+      format: 'webp',
+      url: '/a.webp',
+    });
+    stored.preview = {
+      ...stored.preview,
+      actualWidth: 400,
+      actualHeight: 300,
+    };
+    const out = formatPictureUrls({ ready: [stored], missing: [] });
+    // A type pin, before the deepEqual: that assertion narrows `actual` to what it expects, so
+    // after it the line would compile on a type without these fields.
+    const width: number | undefined = out.sizes['720x720'].webp.width;
+    const height: number | undefined = out.sizes['720x720'].webp.height;
+    assert.deepEqual([width, height], [400, 300]);
+    assert.deepEqual(out.sizes['720x720'].webp, {
+      url: '/a.webp',
+      contentType: 'image/webp',
+      width: 400,
+      height: 300,
+    });
+  });
+
+  test('a row without both dimensions leaves them out, with no key set to undefined', () => {
+    const rows: Partial<ReadyEntry['preview']>[] = [
+      {},
+      { actualWidth: 400 },
+      { actualHeight: 300 },
+    ];
+    for (const row of rows) {
+      const stored = entry({
+        sizeKey: '720x720',
+        format: 'webp',
+        url: '/a.webp',
+      });
+      stored.preview = { ...stored.preview, ...row };
+      const cell = formatPictureUrls({ ready: [stored], missing: [] }).sizes[
+        '720x720'
+      ].webp;
+      assert.deepEqual(cell, { url: '/a.webp', contentType: 'image/webp' });
+      assert.deepEqual(Object.keys(cell), ['url', 'contentType']);
+    }
+  });
+
+  test('a dimension that is not a positive, finite number leaves both out', () => {
+    for (const bad of [Number.NaN, Infinity, -Infinity, 0, -1]) {
+      for (const row of [
+        { actualWidth: bad, actualHeight: 300 },
+        { actualWidth: 400, actualHeight: bad },
+        { actualWidth: bad, actualHeight: bad },
+      ]) {
+        const stored = entry({
+          sizeKey: '720x720',
+          format: 'webp',
+          url: '/a.webp',
+        });
+        stored.preview = { ...stored.preview, ...row };
+        const cell = formatPictureUrls({ ready: [stored], missing: [] }).sizes[
+          '720x720'
+        ].webp;
+        assert.deepEqual(
+          Object.keys(cell),
+          ['url', 'contentType'],
+          `${row.actualWidth}x${row.actualHeight}`,
+        );
+      }
+    }
+  });
+
+  test('an entry an untyped host built, with no row, keeps its URL', () => {
+    const { preview: _row, ...bare } = entry({
+      sizeKey: '720x720',
+      format: 'webp',
+      url: '/a.webp',
+    });
+    const out = formatPictureUrls({
+      ready: [bare as ReadyEntry],
+      missing: [],
+    });
+    assert.deepEqual(out.sizes['720x720'].webp, {
+      url: '/a.webp',
+      contentType: 'image/webp',
+    });
+  });
+
   test('skips filtered variants so they cannot collide on sizeKey+format', () => {
     const decision: ReadDecision = {
       ready: [
@@ -166,6 +262,73 @@ describe('formatPictureUrls', () => {
     assert.deepEqual(out.sizes['300x300'].jpeg, {
       url: 'https://cdn/plain.jpg',
       contentType: 'image/jpeg',
+    });
+  });
+});
+
+describe('formatPictureUrls — the size a row records is not part of its freshness', () => {
+  afterEach(resetResizerForTests);
+
+  test('a row with or without it reads as fresh, at one URL, and queues nothing', async () => {
+    const body = await sharp({
+      create: {
+        width: 100,
+        height: 60,
+        channels: 3,
+        background: { r: 255, g: 0, b: 0 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const docs = new Map<string, MediaLike>();
+    const { storage } = memoryStorage();
+    const tasks = new MemoryTaskQueue();
+    const r = new Resizer({
+      storage,
+      media: docMedia(docs),
+      tasks,
+      config: makeImageConfig({ formats: ['webp'] }),
+      logger: silentLogger,
+    });
+    const original = await r.uploadOriginal({ body, visibility: 'private' });
+    docs.set('m1', { id: 'm1', original, previews: [] });
+    const sizes = [{ width: 160, height: 160 }];
+    await r.generate({
+      media: structuredClone(docs.get('m1') as MediaLike),
+      sizes,
+      formats: ['webp'],
+    });
+    const recorded = structuredClone(docs.get('m1') as MediaLike);
+    const [row] = recorded.previews ?? [];
+    assert.deepEqual([row.actualWidth, row.actualHeight], [100, 60]);
+
+    // A row as an older writer left it: the same signatures, no recorded size.
+    const { actualWidth: _w, actualHeight: _h, ...bareRow } = row;
+    const bare: MediaLike = { ...recorded, previews: [bareRow] };
+
+    const cells = [];
+    for (const media of [recorded, bare]) {
+      const { decision } = await r.resolve({
+        media,
+        sizes,
+        formats: ['webp'],
+      });
+      assert.equal(decision.missing.length, 0);
+      assert.equal(decision.stale, undefined);
+      assert.equal(decision.ready.length, 1);
+      assert.equal(decision.ready[0].stale, undefined);
+      cells.push(formatPictureUrls(decision).sizes['160x160'].webp);
+    }
+    assert.equal(tasks.rows.length, 0);
+    assert.deepEqual(cells[0], {
+      url: cells[1].url,
+      contentType: 'image/webp',
+      width: 100,
+      height: 60,
+    });
+    assert.deepEqual(cells[1], {
+      url: cells[0].url,
+      contentType: 'image/webp',
     });
   });
 });

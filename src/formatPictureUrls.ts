@@ -3,6 +3,10 @@
 import { getFilterSig } from './images.ts';
 import type { PictureUrls, ReadDecision } from './types.d.ts';
 
+// A hand-built entry can hold anything, and JSON turns NaN into a null a client would render.
+const isSide = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0;
+
 export function formatPictureUrls(
   decision: ReadDecision,
   opts: { id?: string; mediaType?: string } = {},
@@ -21,9 +25,14 @@ export function formatPictureUrls(
       byFormat = new Map();
       sizes.set(entry.sizeKey, byFormat);
     }
+    // A preview can be smaller than its size key says, so a host reads its real size from here.
+    // `?.`: this function never read the row before, so an entry an untyped host built keeps working.
+    const width = entry.preview?.actualWidth;
+    const height = entry.preview?.actualHeight;
     byFormat.set(entry.format, {
       url: entry.url,
       contentType: entry.contentType,
+      ...(isSide(width) && isSide(height) ? { width, height } : {}),
     });
   }
   const out: PictureUrls = {

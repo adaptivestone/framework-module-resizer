@@ -18,6 +18,35 @@ export const storage: ResizeStorage = {
   publicUrl: () => '',
 };
 
+// A driver may honour maxBytes; one written before the option, with one parameter, still fits.
+export const boundedStorage: ResizeStorage = {
+  download: async (_ref, opts) =>
+    Buffer.alloc(opts?.maxBytes === undefined ? 0 : 1),
+  upload: async () => ({ key: 'k' }),
+  publicUrl: () => '',
+};
+export const unboundedStorage: ResizeStorage = {
+  download: async (_ref) => Buffer.alloc(0),
+  upload: async () => ({ key: 'k' }),
+  publicUrl: () => '',
+};
+
+// A decoder's public-originals flag is optional, on a plain object too.
+export const publicDecoder: SourceDecoder = {
+  formats: ['x'],
+  publicOriginals: true,
+  inspect: async () => ({
+    format: 'x',
+    contentType: 'image/x',
+    width: 1,
+    height: 1,
+  }),
+  render: async () => ({
+    data: Buffer.alloc(3),
+    info: { width: 1, height: 1, channels: 3 },
+  }),
+};
+
 export const tasks: TaskQueue = {
   add: async () => ({ status: 'unconfirmed' }),
   claim: async () => null,

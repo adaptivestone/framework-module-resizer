@@ -24,10 +24,18 @@
   its message says, is the new `RESIZE_ORIGINAL_INSPECT_FAILED` (`true`), where it was
   `RESIZE_ORIGINAL_INVALID`. A complete config passed to `new Resizer` must
   now hold `upload.verify`.
-- `upload.verify` and `limits.failOn` are required in the config type. A host file with
-  `upload: { maxBytes, formats }` or a hand-written `limits`, and `satisfies FrameworkResizeConfig`,
-  now fails `tsc`; spreading the defaults' `upload` and `limits` still compiles. At run time such a
-  file still works: the module merges it over the defaults.
+- **`limits.sourceBytes`, default 256 MiB.** A worker, `generate()`, `adoptOriginal()` and
+  `uploadOriginal()` refuse a larger original with `RESIZE_SOURCE_TOO_LARGE`
+  (`RESIZE_ORIGINAL_TOO_LARGE` at upload), since a ref to a 3 GB file would otherwise kill a worker
+  on every delivery. A host with larger originals raises it; it is not signed, so nothing
+  regenerates. A host that raised `upload.maxBytes` above 256 MiB has such uploads refused after the
+  upgrade, until it raises `limits.sourceBytes` too, and
+  `verify()` logs a warning naming both. A complete config passed to `new Resizer({ config })` must
+  hold the key.
+- `upload.verify`, `limits.failOn` and `limits.sourceBytes` are required in the config type. A host
+  file with `upload: { maxBytes, formats }` or a hand-written `limits`, and
+  `satisfies FrameworkResizeConfig`, now fails `tsc`; spreading the defaults' `upload` and `limits`
+  still compiles. At run time such a file still works: the module merges it over the defaults.
 - `ResizeConfigError` defaults to `retryable: false`. `RESIZE_TASK_MAX_ATTEMPTS`,
   `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are `false`. `RESIZE_WORKER_INCOMPLETE` is `false`
   when every missing variant failed with `false` and the media still holds the original they were
@@ -35,17 +43,46 @@
   was retried. A final error of a whole task follows the same rule: when a reload finds another
   original on the media, the task fails with the retryable `RESIZE_WORKER_INCOMPLETE`, with that
   error as `cause`, and its next delivery renders the new one. `RESIZE_GENERATE_FAILED` is `false`
-  when every
-  variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`) from both
-  shipped drivers, where it was the raw driver error.
+  when every variant failed with `false`. A missing object is `RESIZE_STORAGE_NOT_FOUND` (`true`)
+  from both shipped drivers, where it was the raw driver error.
 - A disabled worker logs `warn`, and the command resolves `false`, so a CLI entry that forwards the
   result, as the framework docs require, exits 1: a deploy that runs it with the flag off now
   reports a failure. The eager-only path (`resize worker: no Resizer has a task queue`, still an
   `error` line) does the same, since that process consumes nothing either. `runWorker` and
   `runResizeWorker` resolve `true` after a run and `false` in those cases.
+- **Removed, as promised:** the types `FrameworkStorageConfig`, `FrameworkLocalStorageConfig` and
+  `FrameworkS3StorageConfig` (use `StorageConfig`, `LocalStorageConfig`, `S3StorageConfig`), and the
+  `S3Storage` option `publicUrl` (use `publicBaseUrl`). The option now throws
+  `RESIZE_CONFIG_REMOVED_KEY` when `S3Storage` is constructed. In a config section the same code
+  comes at the Resizer's first use or `verify()`, where 0.3.0 ignored the key, so its previews used
+  the bucket's own URL; until it is fixed, `resolve()` logs an `error` and serves nothing, so call
+  `verify()` at boot.
+- **`@aws-sdk/client-s3` 3.729 to 3.734 are out of the peer range,** which is now
+  `^3.572.0 <3.729.0 || ^3.735.0`. They collect a body with a full-object checksum inside `send()`,
+  so on them the byte limit (`limits.sourceBytes`, `adoptOriginal({ maxBytes })`) runs after the
+  read. A host pinned to one of those versions fails `npm install` until it bumps to 3.735 or later.
+- **A host decoder's originals are private unless the decoder sets `publicOriginals: true`.** A
+  public upload otherwise throws `RESIZE_ORIGINAL_PUBLIC_REFUSED`. `SharpDecoder` sets it; a host
+  decoder that takes over a built-in format adds one line.
+- **`rootDir: ''` and `privateRootDir: ''` are refused** with `RESIZE_CONFIG_INVALID`, and so is a
+  whitespace-only root. An empty root resolves to the working directory: `rootDir: ''` put previews
+  there and originals in `<cwd>-private`, and `privateRootDir: ''` put private originals there. A
+  whitespace-only root made a folder of that name. From a config the refusal comes at first use or
+  `verify()`, and `resolve()` then logs an `error` and returns an empty decision, so previews stored
+  earlier stop being served until the root is fixed. `new LocalFsStorage()` throws at construction.
+  The replacement for `''` is `'.'`, which is the same folder.
 
 **Changed behaviour**
 
+- The scaffold writes an explicit `privateRootDir` and an absolute `publicBaseUrl` from
+  `RESIZE_PUBLIC_BASE_URL`, has new next steps, and appends `/var/` to `.gitignore` in the run that
+  writes the config, before it writes the config. A file it cannot write stops the run with exit 1,
+  naming what failed. A `!` line for `var` beside a host's rule gets a warning. Existing configs are
+  not touched. An override that moves `rootDir` on a scaffolded config must move `privateRootDir`
+  too, since it no longer follows.
+- The documented command is `npx --no -- resize-scaffold`. Without `--no`, a run with the package
+  missing fetches and runs whatever the registry holds under that name. Without the `--`, npm takes
+  the options for itself: npm 12 refuses them, and npm 11 runs the scaffold without them.
 - The worker logs task failures itself: `warn` on a retried failure, `error` on a dead-letter, with
   the code, attempt and cause on one line. `NoopMetrics` does not silence them, so a host that
   alerts on `error` gets new alerts. The task row holds the same one-line text, so a multi-line
@@ -58,22 +95,38 @@
   the task row and the retried and dead lines say why, and how many failed when there are several.
   `RESIZE_GENERATE_FAILED` carries the first failure as its `cause` too; its message leaves it out,
   for a handler that answers with `err.message`.
-- The module's line is always one line, and the error still goes to your logger as the second
-  argument: what it prints is your logger's. On the global console every `%` in the line is now
-  escaped, so a `%c3` in a cause cannot consume the error or rewrite the line. A logger that formats
-  its first argument itself (pino, or a wrapper around `console.error`) can still treat a `%` in a
-  cause as a placeholder, and Winston, the framework's logger included, leaves the error out of an
-  entry whose line holds a format sequence such as `%c3` or `%s`.
-- `resolve()` warns once per Resizer when the module's fields were not loaded. After the first added
-  task, `MongoTaskQueue` checks the gate index once per model in the background and logs an `error`
-  when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
+- A line the module logs with an error is one line, and the error still goes to your logger as the
+  second argument: what it prints is your logger's. On the global console every `%` in the line is
+  now escaped, so a `%c3` in a cause cannot consume the error or rewrite the line. A logger that
+  formats its first argument itself (pino, or a wrapper around `console.error`) can still treat a
+  `%` in a cause as a placeholder, and Winston, the framework's logger included, leaves the error
+  out of an entry whose line holds a format sequence such as `%c3` or `%s`.
+- `resolve()` warns once per Resizer when the module's fields were not loaded. A sub-field projection
+  that drops `original.storageRef` counts for a hydrated document only; a lean row stays silent.
+  After the first added task, `MongoTaskQueue` checks the gate index once per model in the background
+  and logs an `error` when it is missing. `MongoTaskQueue.add` reads before it inserts, so a waiting read costs one
   indexed query instead of a failed insert; the first add costs about 1 ms more, and the unique
   index still settles races. The gate read and `findActive` read from the primary.
+- A custom driver whose `download()` resolves with something other than bytes gets
+  `ResizeSetupError` `RESIZE_STORAGE_DOWNLOAD_INVALID` from `generate()` and on a task, where it is
+  retried. It was a raw `TypeError`, or a string decoded as if it were the file. An `ArrayBuffer` is
+  still read.
+- `S3Storage.download` returns a view over the SDK's array instead of a copy, which helps workers
+  too: for a 250 MiB object the peak falls from about 3.3 to about 2.3 times the object on a current
+  AWS SDK, and from about 4 to about 3.3 times on SDK 3.572.
 - `FrameworkResizer`'s default sink writes no debug lines; pass
   `new LogMetrics(logger, { debug: true })` to keep them. A debug timing is rounded, with a unit.
   The worker logs one `info` line at start naming its queues and Resizers. Eager failures say
   `resize generate:`, not `resize worker:`. A completed task says `variants 5 of 9` when it rendered
   fewer, and `resize.task` gains the context `rendered`.
+- The S3 driver reads any key except control characters, `.` or `..` parts, a leading `/` or an
+  empty part. `publicUrl` encodes each part of such a key; the URL of a key the module wrote does
+  not change. Keys the module writes, `namespace` and the local driver stay strict.
+- The S3 driver loads `@aws-sdk/s3-request-presigner` only inside `signedUrl`. `verify()` no longer
+  asks for it; a missing one is `RESIZE_PEER_MISSING` at that call.
+- `resolve()` on a Resizer that could not start logs its `error` once per Resizer and error, where
+  it logged on every read, so a busy API does not flood its log. `resize.read` with the outcome
+  `failed` still counts every read. `prewarm()` logs as before.
 
 **Features**
 
@@ -81,12 +134,22 @@
   storing it, with `RESIZE_ORIGINAL_DAMAGED` (`false`) and `RESIZE_ORIGINAL_VERIFY_FAILED` (`true`).
 - `unconfirmed` may carry `retryable: false` and `causeCode`; `MongoTaskQueue` sets them for a
   missing or outdated model, and `prewarm()` passes them on.
+- `download(ref, { maxBytes })`: an optional argument, which a custom driver may honour.
+- `hasOriginal(media)` and `resizer.adoptOriginal({ storageRef, maxBytes? })`: put an object you
+  already hold on the module without re-uploading it. It measures and decodes the object, returns
+  the `Original` that `uploadOriginal` would return for it, with the ref in its JSON form, and writes
+  nothing. `maxBytes` lowers `limits.sourceBytes` for one call, for an adoption on a request path. New
+  codes `RESIZE_ORIGINAL_DOWNLOAD_FAILED`, `RESIZE_ORIGINAL_PUBLIC_REFUSED`,
+  `RESIZE_ADOPT_MAX_BYTES_INVALID`.
+- `formatPictureUrls` entries carry `width` and `height` when the row has them, since a size key
+  does not promise a size. A host that snapshots its API JSON sees two new fields.
 
 **Fixes**
 
 - A custom queue's `renew` that throws synchronously no longer kills the worker. The idle wait uses
   the monotonic clock, so a clock step cannot lengthen it.
-- The dispatcher's once-log sets are capped at 100 keys.
+- The dispatcher's once-log sets are capped at 100 keys, and every once-log stores at most 1000
+  characters of a key.
 - A framework host's open metrics window is written on the framework's `shutdown` event, which
   `startServer()` and its CLI emit. A script on `new Server()` and `init()`, a `FrameworkResizer`
   with every part in code first used before the `Server` exists, and a CLI command with an

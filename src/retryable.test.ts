@@ -445,6 +445,14 @@ const rows: [code: string, retryable: boolean, trigger: () => unknown][] = [
     false,
     () => upload(cutJpeg, { config: { upload: { verify: 'decode' } } }),
   ],
+  [
+    'RESIZE_ORIGINAL_PUBLIC_REFUSED',
+    false,
+    () =>
+      uploader(new DecoderSet([decoder()]), {
+        config: { upload: { formats: ['pdf'] } },
+      }).upload({ body: png, visibility: 'public' }),
+  ],
   // An upload, true: the bytes may be fine.
   ['RESIZE_ORIGINAL_INSPECT_FAILED', true, () => uploadThrough(crashing)],
   [
@@ -466,6 +474,27 @@ const rows: [code: string, retryable: boolean, trigger: () => unknown][] = [
           },
         },
       }),
+  ],
+  [
+    'RESIZE_ADOPT_MAX_BYTES_INVALID',
+    false,
+    () =>
+      uploader(createDecoderSet()).adopt({
+        storageRef: { key: 'k' },
+        maxBytes: 0,
+      }),
+  ],
+  [
+    'RESIZE_ORIGINAL_DOWNLOAD_FAILED',
+    true,
+    () =>
+      uploader(createDecoderSet(), {
+        storage: {
+          download: async () => {
+            throw new Error('x');
+          },
+        },
+      }).adopt({ storageRef: { key: 'k' } }),
   ],
   [
     'RESIZE_ORIGINAL_STORAGE_REF_INVALID',
@@ -496,6 +525,7 @@ const elsewhere: [code: string, retryable: boolean, file: string][] = [
   ['RESIZE_WORKER_INCOMPLETE', true, 'worker.test.ts'], // false only when every missing variant failed with false
   ['RESIZE_SVG_RENDER_UNAVAILABLE', true, 'helpers/svgRaster.test.ts'],
   ['RESIZE_PIPELINE_STEP_INVALID', true, 'processor.test.ts'],
+  ['RESIZE_STORAGE_DOWNLOAD_INVALID', true, 'processor.test.ts'],
   ['RESIZE_SVG_PUBLIC_PREVIEW', true, 'processor.test.ts'], // a custom step's output: a deploy can fix it
   ['RESIZE_PREVIEW_STORAGE_REF_INVALID', true, 'processor.test.ts'],
   ['RESIZE_MEDIA_APPEND_RESULT_INVALID', true, 'previewRecorder.test.ts'],

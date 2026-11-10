@@ -51,7 +51,11 @@ export type {
   Pipeline,
   VariantStep,
 } from './contracts/pipeline.ts';
-export { ResizeStorage, type StorageUploadArgs } from './contracts/storage.ts';
+export {
+  ResizeStorage,
+  type StorageDownloadOptions,
+  type StorageUploadArgs,
+} from './contracts/storage.ts';
 export {
   type ClaimedTask,
   type ClaimOptions,
@@ -91,6 +95,7 @@ export type { ResizerConfig } from './factory/types.ts';
 export { formatPictureUrls } from './formatPictureUrls.ts';
 export {
   getSizeKey,
+  hasOriginal,
   isCatalogCovered,
   parseSizeKey,
 } from './images.ts';

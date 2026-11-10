@@ -55,7 +55,7 @@ export interface Original {
   format?: string;
   size?: number;
   contentType?: string;
-  width?: number; // captured at upload; backfilled by the worker if missing
+  width?: number; // captured at upload or adoption; backfilled by the worker if missing
   height?: number;
 }
 
@@ -63,6 +63,16 @@ export interface UploadOriginalOpts {
   body: Buffer | Uint8Array;
   visibility: 'public' | 'private';
   namespace?: string;
+}
+
+export interface AdoptOriginalOpts {
+  // The driver's locator of an object already in storage, built from the host's own records. The
+  // result holds its JSON form, which is what gets saved and what every preview's origin signs. A ref
+  // JSON cannot represent is RESIZE_ORIGINAL_STORAGE_REF_INVALID.
+  storageRef: StorageRef;
+  // The most this call reads, in bytes: a positive safe integer, for an adoption on a request path.
+  // It lowers limits.sourceBytes for this call and cannot raise it. Over it: RESIZE_ORIGINAL_TOO_LARGE.
+  maxBytes?: number;
 }
 
 // Which Resizer and pipeline rendered a preview. Part of the preview identity, so different
@@ -212,7 +222,12 @@ export interface PictureUrls {
   id?: string;
   sizes: {
     [sizeKey: string]: {
-      [format: string]: { url: string; contentType?: string };
+      [format: string]: {
+        url: string;
+        contentType?: string;
+        width?: number; // the preview's real size, when its row records it
+        height?: number;
+      };
     };
   };
 }
@@ -293,6 +308,7 @@ export type ResizeFailOn = 'none' | 'truncated' | 'error' | 'warning';
 export interface ResizeLimits {
   inputPixels: number; // default 268402689 — sharp limitInputPixels (decoder bomb guard)
   sourcePixels: number; // default 50_000_000 — rejected BEFORE decode (width*height*frames)
+  sourceBytes: number; // default 268_435_456 — largest original a worker or adoptOriginal() reads into memory
   resultDimension: number; // default 5000 — clamp on the cover branch
   animationFrames: number; // default 64 — cap decoded frames (animation-bomb guard)
   processingTimeoutSeconds: number; // default 30 — Sharp native processing timeout
@@ -362,12 +378,12 @@ export interface FrameworkWorkerConfig {
 // default provider chain.
 export interface LocalStorageConfig {
   driver: 'local'; // LocalFsStorage
-  rootDir: string; // public previews; serve only this directory
+  rootDir: string; // public previews; non-empty; serve exactly this directory, never a parent
   publicBaseUrl: string; // URL prefix, e.g. '/media'
-  privateRootDir?: string; // private originals; default rootDir + '-private'
+  privateRootDir?: string; // private originals; non-empty; default rootDir + '-private'
 }
 export interface S3StorageConfig {
-  driver: 's3'; // S3Storage (needs @aws-sdk/client-s3 and @aws-sdk/s3-request-presigner)
+  driver: 's3'; // S3Storage (needs @aws-sdk/client-s3; signedUrl also needs @aws-sdk/s3-request-presigner)
   bucketPublic: string; // previews
   bucketPrivate?: string; // originals; must differ from bucketPublic
   publicBaseUrl?: string; // CDN/base URL
@@ -376,12 +392,6 @@ export interface S3StorageConfig {
   forcePathStyle?: boolean;
 }
 export type StorageConfig = LocalStorageConfig | S3StorageConfig;
-/** @deprecated The same type under its core name: use LocalStorageConfig. */
-export type FrameworkLocalStorageConfig = LocalStorageConfig;
-/** @deprecated The same type under its core name: use S3StorageConfig. */
-export type FrameworkS3StorageConfig = S3StorageConfig;
-/** @deprecated The same type under its core name: use StorageConfig. */
-export type FrameworkStorageConfig = StorageConfig;
 
 // The database a Resizer's media store (and its gate locks and database queue) lives in: the
 // config's `database` section.

@@ -7,8 +7,8 @@ import {
   ResizeStorageError,
 } from '../errors.ts';
 import { asS3Client, silentLogger } from '../testHelpers/fakes.ts';
-import type { S3StorageConfig } from '../types.d.ts';
-import { S3Storage } from './s3.ts';
+import type { S3StorageConfig, StorageRef } from '../types.d.ts';
+import { S3Storage, type S3StorageOptions } from './s3.ts';
 
 function fakeClient() {
   const sent: Array<{
@@ -39,6 +39,25 @@ const args = (key: string, visibility: 'public' | 'private') => ({
   contentType: 'image/jpeg',
 });
 
+const REFUSED_KEYS = [
+  '',
+  '/a.jpg',
+  'a//b.jpg',
+  'a/',
+  '.',
+  '..',
+  'a/../b.jpg',
+  './a.jpg',
+  'a/./b.jpg',
+  'a\u0000b.jpg',
+  'a\nb.jpg',
+  'a\rb.jpg',
+  'a\tb.jpg',
+  'a\u007fb.jpg',
+  'a\u0085b.jpg',
+  'a\uD800b.jpg',
+];
+
 describe('S3Storage', () => {
   const rejectingWith = (thrown: unknown) =>
     new S3Storage({
@@ -49,6 +68,25 @@ describe('S3Storage', () => {
         },
       }),
     });
+
+  test('download hands over the memory the SDK read, not a copy of it', async () => {
+    const backing = new ArrayBuffer(8);
+    const bytes = new Uint8Array(backing, 2, 4);
+    bytes.set([1, 2, 3, 4]);
+    const storage = new S3Storage({
+      bucketPublic: 'pub',
+      client: asS3Client({
+        send: async () => ({
+          Body: { transformToByteArray: async () => bytes },
+        }),
+      }),
+    });
+    const got = await storage.download({ bucket: 'pub', key: 'k' });
+    assert.ok(Buffer.isBuffer(got));
+    assert.equal(got.buffer, backing, 'the same memory');
+    assert.equal(got.byteOffset, 2);
+    assert.deepEqual([...got], [1, 2, 3, 4]);
+  });
 
   test('S3Storage: NoSuchKey is RESIZE_STORAGE_NOT_FOUND, retryable, with its cause', async () => {
     const thrown = Object.assign(new Error('x'), { name: 'NoSuchKey' });
@@ -62,6 +100,15 @@ describe('S3Storage', () => {
         assert.equal(err.cause, thrown);
         return true;
       },
+    );
+  });
+
+  test('a response with no ContentLength is read, for the core to check', async () => {
+    const { client } = fakeClient();
+    const s = new S3Storage({ bucketPublic: 'pub', client });
+    assert.deepEqual(
+      await s.download({ bucket: 'pub', key: 'k' }, { maxBytes: 1 }),
+      Buffer.from([1, 2, 3]),
     );
   });
 
@@ -358,11 +405,147 @@ describe('S3Storage', () => {
       () => s.upload(args('previews/a?b.jpg', 'public')),
       /invalid logical key/,
     );
-    assert.throws(
-      () => s.publicUrl({ bucket: 'pub', key: 'previews/a#b.jpg' }),
-      /invalid logical key/,
+    assert.ok(
+      s
+        .publicUrl({ bucket: 'pub', key: 'previews/a#b.jpg' })
+        .endsWith('/previews/a%23b.jpg'),
     );
     assert.equal(sent.length, 0);
+  });
+
+  for (const key of REFUSED_KEYS) {
+    test(`refuses the key ${JSON.stringify(key)} on every read, with no S3 call`, async () => {
+      const { client, sent } = fakeClient();
+      const s = new S3Storage({
+        bucketPublic: 'pub',
+        bucketPrivate: 'priv',
+        client,
+      });
+      const ref = { bucket: 'pub', key };
+      const refused = { code: 'RESIZE_STORAGE_KEY_INVALID', retryable: false };
+      await assert.rejects(s.download(ref), refused);
+      await assert.rejects(s.signedUrl(ref, 60), refused);
+      assert.throws(() => s.publicUrl(ref), refused);
+      await assert.rejects(
+        s.upload({ ...args('previews/a.jpg', 'public'), parentRef: ref }),
+        refused,
+      );
+      assert.equal(sent.length, 0);
+    });
+  }
+
+  test('a key in the upload alphabet comes out of publicUrl unchanged in all three URL forms', () => {
+    const key = 'users/u1/previews/ABCXYZabcxyz0189_.-x.webp';
+    const ref = { bucket: 'pub', key };
+    assert.equal(
+      new S3Storage({
+        bucketPublic: 'pub',
+        publicBaseUrl: 'https://cdn.example.com',
+      }).publicUrl(ref),
+      `https://cdn.example.com/${key}`,
+    );
+    assert.equal(
+      new S3Storage({
+        bucketPublic: 'pub',
+        endpoint: 'http://localhost:9000',
+        forcePathStyle: true,
+      }).publicUrl(ref),
+      `http://localhost:9000/pub/${key}`,
+    );
+    assert.equal(
+      new S3Storage({ bucketPublic: 'pub', region: 'eu-west-1' }).publicUrl(
+        ref,
+      ),
+      `https://pub.s3.eu-west-1.amazonaws.com/${key}`,
+    );
+  });
+
+  test('publicUrl encodes each part of any other key, and never its slashes', () => {
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      publicBaseUrl: 'https://cdn.example.com',
+    });
+    const url = (key: string) =>
+      s
+        .publicUrl({ bucket: 'pub', key })
+        .replace('https://cdn.example.com/', '');
+    assert.equal(url('photos/my cat (1).jpg'), 'photos/my%20cat%20%281%29.jpg');
+    assert.equal(url('a+b#c?d%e.jpg'), 'a%2Bb%23c%3Fd%25e.jpg');
+    assert.equal(url("it's!*.jpg"), 'it%27s%21%2A.jpg');
+    assert.equal(url('фото.jpg'), '%D1%84%D0%BE%D1%82%D0%BE.jpg');
+  });
+
+  test('what the driver writes stays strict, and previews take no part of a stored key', async () => {
+    const { client } = fakeClient();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    const preview = (parentRef: StorageRef) =>
+      s.upload({ ...args('previews/x.webp', 'public'), parentRef });
+    assert.deepEqual(
+      await preview({ bucket: 'priv', key: 'photos/my cat.jpg' }),
+      { bucket: 'pub', key: 'previews/x.webp' },
+    );
+    assert.deepEqual(
+      await preview({
+        bucket: 'priv',
+        key: 'users/7/my cat.jpg',
+        namespace: 'users/7',
+      }),
+      { bucket: 'pub', key: 'users/7/previews/x.webp', namespace: 'users/7' },
+    );
+    await assert.rejects(
+      s.download({ bucket: 'priv', key: 'my cat.jpg', namespace: 'users/7' }),
+      { code: 'RESIZE_S3_REF_INVALID' },
+    );
+    await assert.rejects(s.upload(args('previews/a b.jpg', 'public')), {
+      code: 'RESIZE_STORAGE_KEY_INVALID',
+    });
+    await assert.rejects(
+      s.upload({ ...args('a.jpg', 'public'), namespace: 'users 7' }),
+      { code: 'RESIZE_STORAGE_NAMESPACE_INVALID' },
+    );
+  });
+
+  test('a read holds a namespace to the strict alphabet, though its key may hold anything', async () => {
+    const { client, sent } = fakeClient();
+    const s = new S3Storage({
+      bucketPublic: 'pub',
+      bucketPrivate: 'priv',
+      client,
+    });
+    await assert.rejects(
+      s.download({
+        bucket: 'priv',
+        key: 'users 7/a.jpg',
+        namespace: 'users 7',
+      }),
+      { code: 'RESIZE_STORAGE_NAMESPACE_INVALID' },
+    );
+    assert.deepEqual(sent, []);
+  });
+
+  test('the removed publicUrl option throws at construction, because a host would otherwise fall through to bucket URLs', () => {
+    const opts = {
+      bucketPublic: 'pub',
+      publicUrl: 'https://cdn.example.com',
+    } as unknown as S3StorageOptions;
+    assert.throws(
+      () => new S3Storage(opts),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeConfigError);
+        assert.equal(err.code, 'RESIZE_CONFIG_REMOVED_KEY');
+        assert.match(err.message, /publicBaseUrl/);
+        return true;
+      },
+    );
+    // Nothing is lost when it is undefined, for example from an unset environment variable.
+    new S3Storage({
+      bucketPublic: 'pub',
+      publicUrl: undefined,
+    } as unknown as S3StorageOptions);
   });
 
   test('signed URL uses the exact persisted private bucket and expiry', async () => {
@@ -498,6 +681,42 @@ describe('S3Storage.fromConfig', () => {
         ctx,
       ).publicUrl(ref),
       'https://s3.eu-west-1.amazonaws.com/pub/previews/a.jpg',
+    );
+  });
+
+  test('storage.publicUrl in a config section is refused the same way', () => {
+    assert.throws(
+      () =>
+        S3Storage.fromConfig(
+          {
+            driver: 's3',
+            bucketPublic: 'pub',
+            publicUrl: 'https://cdn',
+          } as unknown as S3StorageConfig,
+          ctx,
+        ),
+      {
+        code: 'RESIZE_CONFIG_REMOVED_KEY',
+        message:
+          /`storage\.publicUrl` in src\/config\/resize\.production\.ts is no longer supported — use `storage\.publicBaseUrl`/,
+      },
+    );
+  });
+
+  test('storage.publicUrl left undefined is not refused, since nothing is lost', () => {
+    // For example from an unset environment variable.
+    const s = S3Storage.fromConfig(
+      {
+        driver: 's3',
+        bucketPublic: 'pub',
+        region: 'eu-west-1',
+        publicUrl: undefined,
+      } as unknown as S3StorageConfig,
+      ctx,
+    );
+    assert.equal(
+      s.publicUrl(ref),
+      'https://pub.s3.eu-west-1.amazonaws.com/previews/a.jpg',
     );
   });
 

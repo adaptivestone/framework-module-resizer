@@ -1,7 +1,7 @@
 // A host's own decoders, through `new Resizer({ decoders })`: a test-only PDF decoder stores and
-// renders a source kind the package does not ship, eager and queued, with no core change; a host
-// decoder for a built-in format is asked first; an invalid list fails at construction; and
-// `verify()` runs each decoder's own check.
+// renders a source kind the package does not ship, eager and queued, with no core change; its
+// originals stay private unless it says otherwise; a host decoder for a built-in format is asked
+// first; an invalid list fails at construction; and `verify()` runs each decoder's own check.
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import sharp from 'sharp';
@@ -9,7 +9,11 @@ import defaultResizeConfig from './config/resize.ts';
 import type { DecodeBox, SourceDecoder } from './contracts/decoder.ts';
 import type { LeasedTask } from './contracts/taskQueue.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
-import { ResizeMediaError, ResizeSetupError } from './errors.ts';
+import {
+  ResizeMediaError,
+  ResizeOriginalError,
+  ResizeSetupError,
+} from './errors.ts';
 import {
   Resizer,
   type ResizerOptions,
@@ -192,6 +196,182 @@ test('a pdf original in a process without the pdf decoder is RESIZE_DECODER_MISS
   );
   await assert.rejects(processTask(pdfTask()), missing);
   assert.equal(files.size, 1, 'nothing was stored');
+});
+
+/** Storage in memory that reads every ref as public and records the visibility of each upload. */
+function recordedStorage() {
+  const { storage, files } = memoryStorage();
+  const { upload } = storage;
+  const visibilities: string[] = [];
+  storage.upload = (args) => {
+    visibilities.push(args.visibility);
+    return upload(args);
+  };
+  return { storage, files, visibilities };
+}
+
+class PublicPdfDecoder extends TestPdfDecoder {
+  readonly publicOriginals = true;
+}
+
+test("a host decoder's original is private unless the decoder sets publicOriginals", async () => {
+  const body = fakePdf(30, 20, RED);
+  const { storage, files, visibilities } = recordedStorage();
+  const resizerWith = (decoder: SourceDecoder, name: string) =>
+    new Resizer({
+      name,
+      storage,
+      media: fakeMedia(),
+      config: withPdf(),
+      logger: silent,
+      decoders: [decoder],
+    });
+  const closed = resizerWith(new TestPdfDecoder(), 'closed');
+  await assert.rejects(
+    closed.uploadOriginal({ body, visibility: 'public' }),
+    (err: ResizeOriginalError) => {
+      assert.ok(err instanceof ResizeOriginalError);
+      assert.equal(err.code, 'RESIZE_ORIGINAL_PUBLIC_REFUSED');
+      assert.equal(err.retryable, false);
+      assert.equal(
+        err.message,
+        "resize uploadOriginal: format 'pdf' is stored privately unless its decoder sets publicOriginals: true — pass visibility: 'private', or set publicOriginals on the decoder",
+      );
+      return true;
+    },
+  );
+  assert.equal(files.size, 0, 'nothing was stored');
+
+  const stored = await closed.uploadOriginal({ body, visibility: 'private' });
+  assert.equal(stored.format, 'pdf');
+  assert.deepEqual(visibilities, ['private']);
+
+  const open = resizerWith(new PublicPdfDecoder(), 'open');
+  await open.uploadOriginal({ body, visibility: 'public' });
+  assert.deepEqual(visibilities, ['private', 'public']);
+  assert.equal(files.size, 2);
+});
+
+test('a host decoder that takes over jpeg needs the flag too', async () => {
+  const builtIn = new SharpDecoder();
+  const body = await sharp({
+    create: { width: 8, height: 6, channels: 3, background: '#0f0' },
+  })
+    .jpeg()
+    .toBuffer();
+  const ownJpeg = (over: Partial<SourceDecoder> = {}): SourceDecoder => ({
+    formats: ['jpeg'],
+    inspect: (bytes, limits) => builtIn.inspect(bytes, limits),
+    render: (bytes, box, opts) => builtIn.render(bytes, box, opts),
+    ...over,
+  });
+  const { storage, files } = recordedStorage();
+  await assert.rejects(
+    new Resizer({
+      name: 'closed',
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig(),
+      logger: silent,
+      decoders: [ownJpeg()],
+    }).uploadOriginal({ body, visibility: 'public' }),
+    { code: 'RESIZE_ORIGINAL_PUBLIC_REFUSED', retryable: false },
+  );
+  assert.equal(files.size, 0);
+  // Only `true` opens it, not a value that merely reads as true.
+  await assert.rejects(
+    new Resizer({
+      name: 'truthy',
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig(),
+      logger: silent,
+      decoders: [ownJpeg({ publicOriginals: 1 as never })],
+    }).uploadOriginal({ body, visibility: 'public' }),
+    { code: 'RESIZE_ORIGINAL_PUBLIC_REFUSED' },
+  );
+  assert.equal(files.size, 0);
+  const stored = await new Resizer({
+    name: 'open',
+    storage,
+    media: fakeMedia(),
+    config: makeImageConfig(),
+    logger: silent,
+    decoders: [ownJpeg({ publicOriginals: true })],
+  }).uploadOriginal({ body, visibility: 'public' });
+  assert.equal(stored.format, 'jpeg');
+  assert.equal(files.size, 1);
+});
+
+test('a host decoder listing svg stays refused, even with the flag', async () => {
+  const { storage, files } = recordedStorage();
+  const ownSvg: SourceDecoder = {
+    formats: ['svg'],
+    publicOriginals: true,
+    inspect: async () => ({
+      format: 'svg',
+      contentType: 'image/svg+xml',
+      width: 4,
+      height: 3,
+    }),
+    render: async () => {
+      throw new Error('an SVG must not render at upload');
+    },
+  };
+  await assert.rejects(
+    new Resizer({
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig(),
+      logger: silent,
+      decoders: [ownSvg],
+    }).uploadOriginal({ body: Buffer.from('<svg/>'), visibility: 'public' }),
+    { code: 'RESIZE_ORIGINAL_SVG_PUBLIC', retryable: false },
+  );
+  assert.equal(files.size, 0);
+});
+
+test('a public object read by a decoder without the flag is refused at adoption, and adopted with it', async () => {
+  const body = fakePdf(30, 20, RED);
+  const { storage, files } = recordedStorage();
+  files.set('legacy/a.pdf', body);
+  const storageRef = { key: 'legacy/a.pdf' };
+  // `upload.formats` has no pdf: adoption does not read it.
+  const resizerWith = (decoder: SourceDecoder, name: string) =>
+    new Resizer({
+      name,
+      storage,
+      media: fakeMedia(),
+      config: makeImageConfig(),
+      logger: silent,
+      decoders: [decoder],
+    });
+  await assert.rejects(
+    resizerWith(new TestPdfDecoder(), 'closed').adoptOriginal({ storageRef }),
+    (err: ResizeOriginalError) => {
+      assert.ok(err instanceof ResizeOriginalError);
+      assert.equal(err.code, 'RESIZE_ORIGINAL_PUBLIC_REFUSED');
+      assert.equal(err.retryable, false);
+      assert.equal(
+        err.message,
+        "resize adoptOriginal: this 'pdf' object is public, and its decoder does not set publicOriginals: true — move it to private storage, or set publicOriginals on the decoder",
+      );
+      return true;
+    },
+  );
+  const original = await resizerWith(
+    new PublicPdfDecoder(),
+    'open',
+  ).adoptOriginal({ storageRef });
+  assert.deepEqual(original, {
+    storageRef,
+    format: 'pdf',
+    contentType: 'application/pdf',
+    size: body.byteLength,
+    width: 30,
+    height: 20,
+  });
+  assert.equal(files.size, 1, 'adoption stored nothing');
 });
 
 test('a decoder for a built-in format is chosen before the built-in one', async () => {

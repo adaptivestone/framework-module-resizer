@@ -18,6 +18,13 @@ test("a complete config comes back deep-equal, with the host's own objects", () 
   assert.strictEqual(merged.limits, config.limits);
 });
 
+test('a partial limits section gets the default sourceBytes', () => {
+  assert.equal(
+    merge({ limits: { sourcePixels: 1 } }).limits.sourceBytes,
+    268435456,
+  );
+});
+
 test('encode.formats is replaced as a whole', () => {
   const formats = { webp: {} };
   const merged = merge({ encode: { formats } });

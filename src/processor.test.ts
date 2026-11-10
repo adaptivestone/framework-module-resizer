@@ -8,6 +8,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { afterEach, describe, mock, test } from 'node:test';
 import v8 from 'node:v8';
 import vm from 'node:vm';
@@ -36,6 +37,7 @@ import type { LeasedTask, NewTask } from './contracts/taskQueue.ts';
 import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
 import { SvgDecoder } from './decoders/svg.ts';
+import { LocalFsStorage } from './drivers/fs.ts';
 import {
   ResizeConfigError,
   ResizeError,
@@ -81,6 +83,7 @@ import type {
   ResizeLogger,
   SizeInput,
 } from './types.d.ts';
+import { Uploader } from './uploader.ts';
 import { processTask, runWorker } from './worker.ts';
 
 // ---------------------------------------------------------------------------
@@ -473,6 +476,7 @@ function recordingLogger(): {
 class RecordingDecoder extends SourceDecoder {
   readonly formats: readonly string[];
   readonly renders: DecodeBox[] = [];
+  inspects = 0;
   rejectWith: unknown;
   returns: Raster | undefined;
   readonly #inner: SourceDecoder;
@@ -484,6 +488,7 @@ class RecordingDecoder extends SourceDecoder {
   }
 
   inspect(bytes: Buffer, limits: ResizeLimits): Promise<SourceInfo> {
+    this.inspects += 1;
     return this.#inner.inspect(bytes, limits);
   }
 
@@ -657,6 +662,217 @@ describe('decoding the source', () => {
       media: () => mediaDoc({ original: opts.original }),
     };
   }
+
+  test('every download asks for limits.sourceBytes', async () => {
+    const seen: unknown[] = [];
+    const { deps, media } = decodeDeps(redPng);
+    deps.storage.download = async (_ref, opts) => {
+      seen.push(opts);
+      return redPng;
+    };
+    await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.deepEqual(seen, [{ maxBytes: 268435456 }]);
+  });
+
+  test('a driver that ignores maxBytes is caught by the core before any decode', async () => {
+    const recording = new RecordingDecoder(new SharpDecoder());
+    const { deps, uploads, media } = decodeDeps(Buffer.alloc(11), {
+      config: { limits: { sourceBytes: 10 } },
+      decoders: createDecoderSet([recording]),
+    });
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        assert.match(err.message, /limits\.sourceBytes \(10\)/);
+        return true;
+      },
+    );
+    assert.equal(recording.inspects, 0);
+    assert.equal(uploads.length, 0);
+  });
+
+  test('a source of exactly limits.sourceBytes renders', async () => {
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: redPng.length } },
+    });
+    const { created, failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(created.length, 1);
+    assert.equal(uploads.length, 1);
+  });
+
+  test('a refused Uint8Array is not copied', async () => {
+    // A Proxy hides a typed array's bytes from native code, so any copy of them (Buffer.from,
+    // new Uint8Array, Buffer.copyBytesFrom) has to come through this trap. A refusal needs only
+    // byteLength; `then` is the promise that delivers the array.
+    const read = new Set<string | symbol>();
+    const body = new Proxy(new Uint8Array(11), {
+      get(target, key) {
+        read.add(key);
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const { deps, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: 10 } },
+    });
+    deps.storage.download = async () => body;
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      { code: 'RESIZE_SOURCE_TOO_LARGE' },
+    );
+    read.delete('then');
+    assert.deepEqual([...read], ['byteLength']);
+  });
+
+  test('a Uint8Array from a driver within the limit renders', async () => {
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: redPng.length } },
+    });
+    deps.storage.download = async () => new Uint8Array(redPng);
+    const { failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(uploads.length, 1);
+  });
+
+  test('an ArrayBuffer from a driver renders', async () => {
+    const { deps, uploads, media } = decodeDeps(redPng);
+    deps.storage.download = async () =>
+      redPng.buffer.slice(
+        redPng.byteOffset,
+        redPng.byteOffset + redPng.byteLength,
+      ) as never;
+    const { failed } = await new Processor(deps).generate({
+      media: media(),
+      sizes: [{ width: 10 }],
+    });
+    assert.equal(failed, 0);
+    assert.equal(uploads.length, 1);
+  });
+
+  test('a driver that resolves with something other than bytes is RESIZE_STORAGE_DOWNLOAD_INVALID, from generate() and on a task', async () => {
+    for (const value of [
+      undefined,
+      null,
+      'text',
+      {},
+      5,
+      Readable.from([redPng]),
+      new DataView(new ArrayBuffer(1)),
+      new Uint16Array(1),
+    ]) {
+      const { deps, media } = decodeDeps(redPng);
+      deps.storage.download = async () => value as never;
+      const named = (err: unknown) => {
+        assert.ok(err instanceof ResizeSetupError);
+        assert.equal(err.code, 'RESIZE_STORAGE_DOWNLOAD_INVALID');
+        assert.equal(err.retryable, true);
+        assert.match(err.message, /storage\.download\(\)/);
+        assert.match(err.message, /m1/);
+        return true;
+      };
+      await assert.rejects(
+        new Processor(deps).generate({
+          media: media(),
+          sizes: [{ width: 10 }],
+        }),
+        named,
+      );
+      await assert.rejects(
+        new Processor(deps).processTask(task({ previews: [variant()] })),
+        named,
+      );
+    }
+  });
+
+  test('a worker and an adoption accept exactly the same shapes from a driver', async () => {
+    const outcome = async (value: unknown) => {
+      const { deps, media } = decodeDeps(redPng);
+      deps.storage.download = async () => value as never;
+      const rendered = await new Processor(deps)
+        .generate({ media: media(), sizes: [{ width: 10 }] })
+        .then(
+          () => true,
+          (err: { code?: string }) =>
+            err.code === 'RESIZE_STORAGE_DOWNLOAD_INVALID'
+              ? false
+              : Promise.reject(err),
+        );
+      const adopted = await new Uploader({
+        storage: deps.storage,
+        decoders: createDecoderSet(),
+        config: makeImageConfig(),
+      })
+        .adopt({ storageRef: { key: 'k' } })
+        .then(
+          () => true,
+          (err: { code?: string }) =>
+            err.code === 'RESIZE_ORIGINAL_DOWNLOAD_FAILED'
+              ? false
+              : Promise.reject(err),
+        );
+      return [rendered, adopted];
+    };
+    const arrayBuffer = redPng.buffer.slice(
+      redPng.byteOffset,
+      redPng.byteOffset + redPng.byteLength,
+    );
+    for (const accepted of [redPng, new Uint8Array(redPng), arrayBuffer]) {
+      assert.deepEqual(await outcome(accepted), [true, true]);
+    }
+    for (const refused of [
+      undefined,
+      null,
+      'text',
+      {},
+      5,
+      new DataView(arrayBuffer),
+      new Uint16Array(1),
+    ]) {
+      assert.deepEqual(await outcome(refused), [false, false]);
+    }
+  });
+
+  test("a driver's refusal names the media, as the core's does", async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'resize-source-bytes-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await writeFile(join(dir, 'big.jpg'), Buffer.alloc(11));
+    const { deps, uploads, media } = decodeDeps(redPng, {
+      config: { limits: { sourceBytes: 10 } },
+      original: { storageRef: { path: 'big.jpg', visibility: 'public' } },
+    });
+    deps.storage = new LocalFsStorage({
+      rootDir: dir,
+      publicBaseUrl: '/media',
+    });
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.code, 'RESIZE_SOURCE_TOO_LARGE');
+        assert.equal(err.retryable, false);
+        assert.equal(err.mediaId, 'm1');
+        assert.match(err.message, /limits\.sourceBytes/);
+        assert.match(err.message, /media m1/);
+        assert.doesNotMatch(err.message, /big\.jpg/);
+        return true;
+      },
+    );
+    assert.equal(uploads.length, 0);
+  });
 
   test('the source is decoded once per task, at the largest box the previews need', async () => {
     const recording = new RecordingDecoder(new SharpDecoder());
@@ -1446,6 +1662,34 @@ describe('decoding the source', () => {
         assert.equal(err.cause, guarded);
         assert.match(err.message, /host: guarded refusal \(media m1\)/);
         assert.equal(guarded.message, 'host: guarded refusal');
+        return true;
+      },
+    );
+  });
+
+  test('a driver refusal with no readable message and no room for the id gets a text that blames no decoder', async () => {
+    const refusal = new ResizeMediaError('host: refused', {
+      code: 'HOST_REFUSED',
+      retryable: false,
+    });
+    Object.defineProperty(refusal, 'message', {
+      get: () => {
+        throw new Error('host: the message is private');
+      },
+    });
+    Object.freeze(refusal);
+    const { deps, media } = decodeDeps(redPng);
+    deps.storage.download = async () => {
+      throw refusal;
+    };
+    await assert.rejects(
+      new Processor(deps).generate({ media: media(), sizes: [{ width: 10 }] }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResizeMediaError);
+        assert.equal(err.message, 'resize: the source was refused (media m1)');
+        assert.equal(err.code, 'HOST_REFUSED');
+        assert.equal(err.retryable, false);
+        assert.equal(err.cause, refusal);
         return true;
       },
     );

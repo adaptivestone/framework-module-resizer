@@ -6,25 +6,43 @@
 // no I/O — the read path calls it). Credentials are NEVER options — they resolve via the
 // standard AWS provider chain.
 //
-// SUBPATH-ONLY ENTRY, STATIC SDK IMPORTS: `@aws-sdk/client-s3` and
-// `@aws-sdk/s3-request-presigner` are imported plainly at the top of this module. This is safe
-// precisely because this driver is NOT re-exported from the main package entry —
-// hosts import `@adaptivestone/framework-module-resize/drivers/s3.js` directly, so the optional
-// peers are resolved ONLY when this subpath is imported, and a missing SDK fails loudly at the
-// host's own import line at bootstrap (no dynamic import(), no lazy loaders).
+// SUBPATH-ONLY ENTRY: `@aws-sdk/client-s3` stays a plain import at the top of this module. This is
+// safe precisely because this driver is NOT re-exported from the main package entry — hosts import
+// `@adaptivestone/framework-module-resize/drivers/s3.js` directly, so the optional peer is resolved
+// ONLY when this subpath is imported, and a missing SDK fails loudly at the host's own import line
+// at bootstrap. `@aws-sdk/s3-request-presigner` is loaded only by `signedUrl`, the one thing that
+// needs it and that the module itself never calls.
+//
+// TWO KEY RULES: what this driver writes keeps the strict alphabet of `validateLogicalKey` and
+// `validateNamespace`, and a preview never takes a part of a stored key. What it reads may be any
+// key a bucket already holds (`validateStoredKey`), since a real library's keys hold clients' file
+// names. The SDK encodes such a key itself; `publicUrl` builds a string, so it encodes it here.
 import {
   GetObjectCommand,
   type GetObjectCommandOutput,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { DriverContext } from '../contracts/drivers.ts';
-import { ResizeStorage } from '../contracts/storage.ts';
-import { ResizeSecurityError, ResizeStorageError } from '../errors.ts';
+import {
+  ResizeStorage,
+  type StorageDownloadOptions,
+} from '../contracts/storage.ts';
+import {
+  ResizeConfigError,
+  ResizeMediaError,
+  ResizeSecurityError,
+  ResizeSetupError,
+  ResizeStorageError,
+} from '../errors.ts';
 import { optionalString, requiredString } from '../helpers/configSection.ts';
+import { missingPackageOf } from '../helpers/peers.ts';
 import type { S3StorageConfig, StorageRef } from '../types.d.ts';
-import { validateLogicalKey, validateNamespace } from './placement.ts';
+import {
+  validateLogicalKey,
+  validateNamespace,
+  validateStoredKey,
+} from './placement.ts';
 
 // The Cache-Control header of every public object (see `upload` for why it is safe).
 const PUBLIC_CACHE_CONTROL = 'public, max-age=31536000, immutable';
@@ -39,8 +57,6 @@ export interface S3StorageOptions {
   bucketPublic: string; // previews land here (upload visibility 'public')
   bucketPrivate?: string; // required for visibility:'private'; must differ from bucketPublic
   publicBaseUrl?: string; // CDN/base URL for public objects, e.g. 'https://cdn.example.com'
-  /** @deprecated Use `publicBaseUrl`. Same string; kept for one minor. */
-  publicUrl?: string;
   region?: string;
   endpoint?: string; // S3-compatible: MinIO / localstack / R2
   forcePathStyle?: boolean;
@@ -49,6 +65,37 @@ export interface S3StorageOptions {
   // region/endpoint/forcePathStyle. (This option is also the injection point exercised by the
   // tests — the driver ships NO test-only seams.)
   client?: S3Client;
+}
+
+// A key as a URL path: each `/` part as the SDK puts it on the wire. encodeURIComponent leaves
+// `!'()*` alone, and a quote in a URL could break a host's HTML attribute. The alphabet of the keys
+// this driver writes holds nothing to encode, so their URLs stay as they were.
+function encodeKeyForUrl(key: string): string {
+  return key
+    .split('/')
+    .map((part) =>
+      encodeURIComponent(part).replace(
+        /[!'()*]/g,
+        (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+      ),
+    )
+    .join('/');
+}
+
+// Only the presigner itself missing is the host's to install. A package missing deeper in its tree
+// stays the raw error, as in importDriver, since the message would otherwise blame the wrong one.
+async function importPresigner() {
+  try {
+    return await import('@aws-sdk/s3-request-presigner');
+  } catch (cause) {
+    if (missingPackageOf(cause) === '@aws-sdk/s3-request-presigner') {
+      throw new ResizeSetupError(
+        'resize s3: signedUrl() needs the optional peer `@aws-sdk/s3-request-presigner` — install it',
+        { code: 'RESIZE_PEER_MISSING', cause },
+      );
+    }
+    throw cause;
+  }
 }
 
 export class S3Storage extends ResizeStorage {
@@ -60,6 +107,13 @@ export class S3Storage extends ResizeStorage {
 
   constructor(opts: S3StorageOptions) {
     super();
+    // A JavaScript host would otherwise fall through silently to bucket URLs. Unset loses nothing.
+    if ((opts as { publicUrl?: unknown }).publicUrl !== undefined) {
+      throw new ResizeConfigError(
+        'resize s3: the `publicUrl` option is removed — use `publicBaseUrl`',
+        { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+      );
+    }
     // erasableSyntaxOnly: no parameter properties — assign fields explicitly.
     this.#opts = opts;
   }
@@ -70,11 +124,20 @@ export class S3Storage extends ResizeStorage {
    * the merged section. A key set to `undefined` is left out, so the SDK's defaults apply. A
    * missing or empty bucketPublic, or an optional key set to something other than a string, is
    * RESIZE_CONFIG_INVALID naming `ctx.where`; '' passes as before (`publicBaseUrl: ''` means no
-   * CDN base: the bucket URL), and `forcePathStyle` is passed on as given. Credentials come from
-   * the AWS provider chain; a host that needs its own client constructs S3Storage itself.
+   * CDN base: the bucket URL), and `forcePathStyle` is passed on as given. A `publicUrl` key that
+   * is set is RESIZE_CONFIG_REMOVED_KEY naming `ctx.where`, as the constructor refuses the option:
+   * every other unknown key is ignored here, so it would otherwise fall through to bucket URLs.
+   * Credentials come from the AWS provider chain; a host that needs its own client constructs
+   * S3Storage itself.
    */
   static fromConfig(section: S3StorageConfig, ctx: DriverContext): S3Storage {
     const { where } = ctx;
+    if ((section as { publicUrl?: unknown }).publicUrl !== undefined) {
+      throw new ResizeConfigError(
+        `resize config: \`storage.publicUrl\` in ${where} is no longer supported — use \`storage.publicBaseUrl\``,
+        { code: 'RESIZE_CONFIG_REMOVED_KEY' },
+      );
+    }
     const bucketPublic = requiredString(
       section.bucketPublic,
       'storage.bucketPublic',
@@ -155,13 +218,14 @@ export class S3Storage extends ResizeStorage {
       });
     }
     this.#assertAllowedBucket(ref.bucket);
-    validateLogicalKey(ref.key);
+    validateStoredKey(ref.key);
     const namespace = validateNamespace(ref.namespace);
     if (namespace && !ref.key.startsWith(`${namespace}/`)) {
       throw new ResizeSecurityError('resize s3: namespace does not match key', {
         code: 'RESIZE_S3_REF_INVALID',
       });
     }
+    // The raw ref, never a copy with an encoded key: its JSON form is signed into every `origin`.
     return ref as unknown as S3StorageRef;
   }
 
@@ -252,7 +316,10 @@ export class S3Storage extends ResizeStorage {
     };
   }
 
-  async download(ref: StorageRef): Promise<Buffer> {
+  async download(
+    ref: StorageRef,
+    opts?: StorageDownloadOptions,
+  ): Promise<Buffer> {
     const { bucket, key } = this.#ref(ref);
     let out: GetObjectCommandOutput;
     try {
@@ -269,6 +336,21 @@ export class S3Storage extends ResizeStorage {
       }
       throw err;
     }
+    // From the response's own length, so no HeadObject and no new IAM permission. A response
+    // without one is read, and the core checks the bytes.
+    const length = out.ContentLength;
+    if (
+      opts?.maxBytes !== undefined &&
+      length !== undefined &&
+      length > opts.maxBytes
+    ) {
+      // The body is unread and its connection open: dropping it is what stops the transfer.
+      (out.Body as { destroy?: () => void } | undefined)?.destroy?.();
+      throw new ResizeMediaError(
+        `resize s3: object is ${length} bytes, over the ${opts.maxBytes} byte limit (limits.sourceBytes)`,
+        { code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
+      );
+    }
     const stream = out.Body;
     if (!stream) {
       throw new ResizeStorageError(
@@ -277,11 +359,12 @@ export class S3Storage extends ResizeStorage {
       );
     }
     const bytes = await stream.transformToByteArray();
-    return Buffer.from(bytes);
+    // A view: the SDK's array is this call's alone, and a copy would hold the object once more.
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
 
   // PURE string building — no SDK, no I/O (called on the read path). Three forms:
-  // explicit publicUrl base → CDN; endpoint/forcePathStyle → path-style; else
+  // explicit publicBaseUrl → CDN; endpoint/forcePathStyle → path-style; else
   // virtual-hosted.
   publicUrl(ref: StorageRef): string {
     const { bucket, key } = this.#ref(ref);
@@ -299,9 +382,10 @@ export class S3Storage extends ResizeStorage {
         { code: 'RESIZE_S3_PRIVATE_ORIGINAL_PUBLIC_URL' },
       );
     }
-    const publicBase = this.#opts.publicBaseUrl ?? this.#opts.publicUrl;
-    if (publicBase) {
-      return `${publicBase.replace(/\/+$/, '')}/${key}`;
+    const urlKey = encodeKeyForUrl(key);
+    const { publicBaseUrl } = this.#opts;
+    if (publicBaseUrl) {
+      return `${publicBaseUrl.replace(/\/+$/, '')}/${urlKey}`;
     }
     // AWS's own host name: the China regions live under amazonaws.com.cn.
     const region = this.#opts.region ?? 'us-east-1';
@@ -311,14 +395,16 @@ export class S3Storage extends ResizeStorage {
         /\/+$/,
         '',
       );
-      return `${base}/${bucket}/${key}`;
+      return `${base}/${bucket}/${urlKey}`;
     }
-    return `https://${bucket}.${awsHost}/${key}`;
+    return `https://${bucket}.${awsHost}/${urlKey}`;
   }
 
-  // Time-limited signed URL for owner/admin reads of a private original.
+  // Time-limited signed URL for owner/admin reads of a private original. The ref is checked before
+  // the import, so a refused ref is the same refusal with or without the presigner installed.
   async signedUrl(ref: StorageRef, ttlSeconds: number): Promise<string> {
     const { bucket, key } = this.#ref(ref);
+    const { getSignedUrl } = await importPresigner();
     return getSignedUrl(
       this.#getClient(),
       new GetObjectCommand({ Bucket: bucket, Key: key }),

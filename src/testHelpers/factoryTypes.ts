@@ -1,9 +1,9 @@
 // Compiled by `npm run types:check:src` (`tsconfig.type-pins.json`, which the minimum-peers CI
 // job runs) and by `npm run types:check` (`tsconfig.tests.json`), never run. It pins the config
-// types: the core section types and their deprecated framework names, the sections a registered
-// custom driver adds, custom queue entries with and without timing keys, the nested partial a
-// file that overrides part of a config writes, the shipped drivers as drivers of their own
-// sections, and FrameworkResizer's `drivers` and `config` options.
+// types: the core section types, the sections a registered custom driver adds, custom queue entries
+// with and without timing keys, the nested partial a file that overrides part of a config writes,
+// the shipped drivers as drivers of their own sections, and FrameworkResizer's `drivers` and
+// `config` options.
 import type {
   DatabaseDriver,
   DriverContext,
@@ -24,7 +24,6 @@ import { sqsBackendKey, validateSqsEntries } from '../helpers/queueSections.ts';
 import type { Resizer } from '../resizer.ts';
 import type {
   DatabaseQueueConfig,
-  FrameworkLocalStorageConfig,
   FrameworkResizeConfig,
   LocalStorageConfig,
   MongoDatabaseConfig,
@@ -39,8 +38,6 @@ export const local: LocalStorageConfig = {
   rootDir: 'r',
   publicBaseUrl: '/m',
 };
-// The framework names stay as aliases of the core ones.
-export const legacy: FrameworkLocalStorageConfig = local;
 
 export const file = {
   ...defaultFrameworkResizeConfig,
