@@ -159,9 +159,9 @@ test('every package specifier and …/x.js path README and AGENTS.md name is a k
   assert.ok(shortPaths >= 30, `only ${shortPaths} …/x.js paths found`);
 });
 
-// The files outside src/decoders/ and src/drivers/ that a task runs through, where a code can be
-// marked terminal (`retryable: false`). Every decoder and driver file is read from its folder, so
-// a new one is scanned without an edit here.
+// The files outside src/decoders/, src/drivers/ and src/engines/ that a task runs through, where a
+// code can be marked terminal (`retryable: false`). Every decoder, driver and engine file is read
+// from its folder, so a new one is scanned without an edit here.
 const TASK_PATH = [
   'errors.ts',
   'decoderSet.ts',
@@ -169,7 +169,7 @@ const TASK_PATH = [
   'helpers/svgRaster.ts',
   'processor.ts',
   'render.ts',
-  'raster.ts',
+  'helpers/raster.ts',
   'plan.ts',
   'previewRecorder.ts',
   'catalog.ts',
@@ -194,6 +194,7 @@ const taskPathFiles = (): string[] => [
   ...TASK_PATH,
   ...sourceFiles('decoders'),
   ...sourceFiles('drivers'),
+  ...sourceFiles('engines'),
 ];
 
 // A comment as spaces, its line breaks kept, so every index of the text stays on its line.

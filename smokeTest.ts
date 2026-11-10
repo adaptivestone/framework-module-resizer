@@ -60,6 +60,8 @@ const expected = [
   'MediaStore',
   'ResizeStorage',
   'SourceDecoder',
+  'ImageEngine',
+  'SharpEngine',
   'TaskQueue',
   'RoutingTaskQueue',
   'carrierOf',

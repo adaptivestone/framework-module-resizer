@@ -1,17 +1,17 @@
-// The boundary between a Raster and Sharp: the shape check, and the helpers a Sharp-based
-// beforeStep uses to wrap a raster and read one back.
+// The boundary between a Raster and Sharp: the shape check, and the helpers a Sharp-based step
+// uses to wrap a raster and read one back.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
-import type { Raster } from './contracts/decoder.ts';
-import { ResizeError } from './errors.ts';
+import type { Raster } from '../contracts/decoder.ts';
+import { ResizeError } from '../errors.ts';
 import {
   checkRaster,
+  limitStepRaster,
   rasterProblem,
-  rasterToSharp,
-  readRaster,
-  sharpToRaster,
-} from './raster.ts';
+  stepRasterTimeout,
+} from '../helpers/raster.ts';
+import { rasterToSharp, readRaster, sharpToRaster } from './sharpRaster.ts';
 
 /** A raster of one solid colour (one value per channel). */
 function solid(width: number, height: number, colour: number[]): Raster {
@@ -89,6 +89,37 @@ test('rasterToSharp and sharpToRaster round-trip the pixels', async () => {
   assert.equal(grey.data.length, 4 * 4 * 3);
 });
 
+test('a raster read back from a limited chain carries the limit, and only that one', async () => {
+  const handed = solid(4, 2, [10, 20, 30]);
+  limitStepRaster(handed, 7);
+  const next = await sharpToRaster(rasterToSharp(handed).blur(1));
+  assert.equal(stepRasterTimeout(next), 7);
+  // On and on: the next chain starts with the limit, and so does what it reads back.
+  assert.equal(
+    stepRasterTimeout(await sharpToRaster(rasterToSharp(next).blur(1))),
+    7,
+  );
+  // A chain's own timeout is that chain's: the next one starts with the limit again.
+  assert.equal(
+    stepRasterTimeout(
+      await sharpToRaster(rasterToSharp(handed).timeout({ seconds: 0 })),
+    ),
+    7,
+  );
+  // The host's own raster, a fresh sharp(), a clone, and a raster no limit was put on: none.
+  const unlimited = [
+    rasterToSharp({ ...handed }),
+    rasterToSharp(handed).clone(),
+    sharp(handed.data, {
+      raw: { width: 4, height: 2, channels: 3 },
+    }),
+    rasterToSharp(solid(4, 2, [10, 20, 30])),
+  ];
+  for (const img of unlimited) {
+    assert.equal(stepRasterTimeout(await sharpToRaster(img)), undefined);
+  }
+});
+
 test('sharpToRaster never forwards the premultiplied flag', async () => {
   const raster = solid(40, 30, [100, 50, 200, 128]);
   const back = await sharpToRaster(rasterToSharp(raster).resize(20, 15));
@@ -105,7 +136,7 @@ test('sharpToRaster rejects a multi-page image with RESIZE_PIPELINE_STEP_INVALID
       assert.ok(ResizeError.isResizeError(err));
       assert.equal(err.name, 'ResizeSetupError');
       assert.equal(err.code, 'RESIZE_PIPELINE_STEP_INVALID');
-      assert.match(err.message, /a beforeStep must return one frame/);
+      assert.match(err.message, /a pipeline step must return one frame/);
       return true;
     },
   );

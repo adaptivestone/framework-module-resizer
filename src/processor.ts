@@ -24,6 +24,7 @@ import type {
   SourceDecoder,
   SourceInfo,
 } from './contracts/decoder.ts';
+import type { ImageEngine } from './contracts/engine.ts';
 import type { ObserverName } from './contracts/hooks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type { ResizeMetrics } from './contracts/metrics.ts';
@@ -44,6 +45,7 @@ import { runBounded } from './helpers/concurrency.ts';
 import { hasErrorClass } from './helpers/errorClass.ts';
 import { logNeverThrow, notRetryable } from './helpers/log.ts';
 import { randomHex } from './helpers/random.ts';
+import { checkRaster } from './helpers/raster.ts';
 import type { HookBus } from './hooks.ts';
 import { previewScope, requireMediaId } from './images.ts';
 import { errorCodeLabel, NoopMetrics } from './metrics.ts';
@@ -65,7 +67,6 @@ import {
   rowsNotKept,
   rowsWithoutIdentity,
 } from './previewRecorder.ts';
-import { checkRaster } from './raster.ts';
 import {
   type EncodedVariant,
   encodeVariant,
@@ -112,7 +113,7 @@ function requirePipeline(
 /** A per-call argument names an unconfigured format: a wiring error at the call site. */
 function formatNotConfiguredError(formats: string[]): ResizeSetupError {
   return new ResizeSetupError(
-    `resize: formats [${formats.join(', ')}] have no encode.formats entry — request configured Sharp format ids such as 'jpeg', not aliases such as 'jpg'`,
+    `resize: formats [${formats.join(', ')}] have no encode.formats entry — request configured format ids such as 'jpeg'`,
     { code: 'RESIZE_FORMAT_NOT_CONFIGURED' },
   );
 }
@@ -566,7 +567,7 @@ async function decodeSource(
         { mediaId, code: 'RESIZE_SOURCE_TOO_LARGE', retryable: false },
       );
     }
-    return await straightAlpha(raster, opts.limits);
+    return straightAlpha(raster);
   } catch (err) {
     throw decodeFailure(err, mediaId, source.bytes, source);
   }
@@ -673,6 +674,7 @@ export interface ProcessorDeps {
   media: MediaStore;
   storage: ResizeStorage;
   decoders: DecoderSet; // reads the originals: one decode per task
+  engine: ImageEngine; // every pixel operation after the decode
   pipelines: PipelineRegistry;
   hooks: HookBus;
   config: ResizeConfig;
@@ -1174,6 +1176,7 @@ export class Processor {
       catalog,
       config,
       decoders,
+      engine,
       hooks,
       logger,
       name,
@@ -1354,6 +1357,7 @@ export class Processor {
     // by reference); the steps are kept by reference, their lists copied.
     const settings = snapshotSettings(config);
     const { limits: renderLimits } = settings;
+    const engineOptions = { limits: renderLimits, signal };
     const pipeline = pipelines.get(pipelineName);
     const beforeSteps = [...(pipeline.beforeSteps ?? [])];
     const variantSteps = [...(pipeline.variantSteps ?? [])];
@@ -1363,7 +1367,12 @@ export class Processor {
         catalog.encodeSig(pipelineName, v.format, v.fit === true),
       ]),
     );
-    const rules = planRules(settings, scope, { beforeSteps, variantSteps });
+    const rules = planRules(
+      settings,
+      scope,
+      { beforeSteps, variantSteps },
+      engine.animatedFormats,
+    );
     let plans = planVariants(info, pending, rules);
 
     // ONE decode per task, at the largest box the plan needs; with beforeSteps at least the
@@ -1391,7 +1400,6 @@ export class Processor {
         raster,
         beforeSteps,
         { media, source: info, ctx },
-        renderLimits,
       );
       // While the steps run, runBeforeSteps holds the only reference to the decoded raster, so
       // it is freed as soon as the first step resolves.
@@ -1427,19 +1435,24 @@ export class Processor {
       raster = await reduceToBox(
         raster,
         decodeBox(planned, plans, { atLeastOwnSize: false }),
-        renderLimits,
+        engine,
+        engineOptions,
       );
     }
 
     // From here only `sized` holds the raster; it is cleared once the variants are done, so the
     // persist and the observers below do not keep the pixels alive.
-    const sized = new SizedRasters(raster, plans, renderLimits);
+    const sized = new SizedRasters(raster, plans, engine, engineOptions);
     raster = undefined;
     const encodeOptions = {
       variantSteps,
       ctx,
       encode: settings.encode,
       limits: renderLimits,
+      engine,
+      media,
+      source: info,
+      signal,
     };
     // Each variant's stored row, by plan; read back in request order after the pool.
     const rows = new Map<VariantPlan, Preview>();

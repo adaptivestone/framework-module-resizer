@@ -16,7 +16,7 @@ import {
   resetAppInstance,
   setAppInstance,
 } from '@adaptivestone/framework/helpers/appInstance.js';
-import sharp, { type Sharp } from 'sharp';
+import sharp from 'sharp';
 import { Catalog } from './catalog.ts';
 import {
   type DecodeBox,
@@ -25,6 +25,7 @@ import {
   SourceDecoder,
   type SourceInfo,
 } from './contracts/decoder.ts';
+import type { EngineCallOptions, ImageEngine } from './contracts/engine.ts';
 import type { LockStore } from './contracts/locks.ts';
 import type { MediaStore } from './contracts/media.ts';
 import type {
@@ -38,6 +39,8 @@ import { createDecoderSet, type DecoderSet } from './decoderSet.ts';
 import { SharpDecoder } from './decoders/sharp.ts';
 import { SvgDecoder } from './decoders/svg.ts';
 import { LocalFsStorage } from './drivers/fs.ts';
+import { SharpEngine } from './engines/sharp.ts';
+import { rasterToSharp, sharpToRaster } from './engines/sharpRaster.ts';
 import {
   ResizeConfigError,
   ResizeError,
@@ -54,7 +57,6 @@ import { HookBus } from './hooks.ts';
 import { getSizeKey, toMissingPreview } from './images.ts';
 import { PipelineRegistry } from './pipelines.ts';
 import { Processor, type ProcessorDeps } from './processor.ts';
-import { rasterToSharp, sharpToRaster } from './raster.ts';
 import { processorOf, Resizer, resetResizerForTests } from './resizer.ts';
 import { encodeSignature, previewOrigin } from './signatures.ts';
 import {
@@ -437,6 +439,7 @@ function processorDeps(
     media: fakeMedia({ load: async () => mediaDoc() }),
     storage: makeStorage(redPng).storage,
     decoders: opts.decoders ?? createDecoderSet(),
+    engine: new SharpEngine(),
     pipelines: new PipelineRegistry(),
     hooks: new HookBus({ logger: silent }),
     config,
@@ -1380,24 +1383,33 @@ describe('decoding the source', () => {
       .toBuffer();
     const refs = new Map<string, WeakRef<Buffer>>();
     let most = 0;
-    const watch: VariantStep = async (img, { variant }) => {
-      const side = variant.requestedWidth ?? variant.requestedHeight;
-      const input = (
-        img as unknown as { options: { input: { buffer: Buffer } } }
-      ).options.input.buffer;
-      refs.set(String(side), new WeakRef(input));
+    // The step sees a copy, so the engine takes the reference to the sized pixels themselves.
+    const inner = new SharpEngine();
+    const recording: ImageEngine = {
+      id: 'recording',
+      formats: inner.formats,
+      animatedFormats: inner.animatedFormats,
+      encode: (raster, req, opts) => inner.encode(raster, req, opts),
+      resize: async (frame, req, opts) => {
+        const out = await inner.resize(frame, req, opts);
+        refs.set(`${req.width}x${req.height}`, new WeakRef(out.data));
+        return out;
+      },
+    };
+    const watch: VariantStep = async (raster) => {
       await new Promise((resolve) => setImmediate(resolve));
       gc();
       await new Promise((resolve) => setImmediate(resolve));
       gc();
       const alive = [...refs.values()].filter((r) => r.deref() !== undefined);
       most = Math.max(most, alive.length);
-      return img;
+      return raster;
     };
     const { deps, media } = decodeDeps(square, {
       config: { concurrency },
       pipeline: { variantSteps: [watch] },
     });
+    deps.engine = recording;
     const { created } = await new Processor(deps).generate({
       media: media(),
       sizes,
@@ -1725,22 +1737,24 @@ describe('decoding the source', () => {
   });
 
   test('an SVG preview output fails its variant with RESIZE_SVG_PUBLIC_PREVIEW naming the media', async () => {
-    // A variantStep whose encoder reports SVG output (Sharp writes none; a custom step could).
-    const svgOutput = {
-      toFormat: () => ({
-        timeout: () => ({
-          toBuffer: async () => ({
-            data: Buffer.from('<svg/>'),
-            info: { format: 'svg', width: 20, height: 20 },
-          }),
-        }),
+    // An engine whose encoder reports SVG output (Sharp writes none; a custom engine could).
+    const inner = new SharpEngine();
+    const svgEngine: ImageEngine = {
+      id: 'svg-output',
+      formats: inner.formats,
+      animatedFormats: inner.animatedFormats,
+      resize: (frame, req, opts) => inner.resize(frame, req, opts),
+      encode: async () => ({
+        data: Buffer.from('<svg/>'),
+        format: 'svg',
+        contentType: 'image/svg+xml',
+        width: 20,
+        height: 20,
       }),
     };
     const { logger, logs } = recordingLogger();
-    const { deps, uploads, media } = decodeDeps(redPng, {
-      logger,
-      pipeline: { variantSteps: [() => svgOutput as unknown as Sharp] },
-    });
+    const { deps, uploads, media } = decodeDeps(redPng, { logger });
+    deps.engine = svgEngine;
     await assert.rejects(
       new Processor(deps).generate({
         media: media(),
@@ -1754,10 +1768,44 @@ describe('decoding the source', () => {
     assert.match(String(message), /variant .* failed for media m1/);
     assert.ok(err instanceof ResizeMediaError);
     assert.equal(err.code, 'RESIZE_SVG_PUBLIC_PREVIEW');
-    // Only a custom step reaches it, and a deploy with a fixed step can succeed.
+    // Only a custom engine reaches it, and a deploy with a fixed engine can succeed.
     assert.equal(err.retryable, true);
     assert.equal(err.mediaId, 'm1');
     assert.match(err.message, /\(media m1\)$/);
+  });
+
+  test('the engine gets the limits and the task signal on every call, the reduction after beforeSteps included', async () => {
+    const inner = new SharpEngine();
+    const calls: [string, EngineCallOptions][] = [];
+    const recording: ImageEngine = {
+      id: 'recording',
+      formats: inner.formats,
+      animatedFormats: inner.animatedFormats,
+      resize: (frame, req, opts) => {
+        calls.push([req.coverBox ? 'reduce' : 'resize', opts]);
+        return inner.resize(frame, req, opts);
+      },
+      encode: (raster, req, opts) => {
+        calls.push(['encode', opts]);
+        return inner.encode(raster, req, opts);
+      },
+    };
+    const { deps } = decodeDeps(redPng, {
+      pipeline: { beforeSteps: [(raster) => raster] },
+    });
+    deps.engine = recording;
+    const { signal } = new AbortController();
+    await new Processor(deps).processTask(task({ previews: [variant()] }), {
+      signal,
+    });
+    assert.deepEqual(
+      calls.map(([call]) => call),
+      ['reduce', 'resize', 'encode'],
+    );
+    for (const [call, opts] of calls) {
+      assert.equal(opts.signal, signal, call);
+      assert.deepEqual(opts.limits, deps.config.limits, call);
+    }
   });
 
   test('a storage upload that returns no locator fails its variant with RESIZE_PREVIEW_STORAGE_REF_INVALID, retryable', async () => {
@@ -2426,8 +2474,10 @@ describe('processTask — variants', () => {
     const { storage, uploads } = makeStorage(redPng);
     const pipeline: Pipeline = {
       variantSteps: [
-        async (img, { variant: v }) =>
-          v.filters?.blur ? img.blur(Number(v.filters.blur)) : img,
+        async (r, { variant: v }) =>
+          v.filters?.blur
+            ? sharpToRaster(rasterToSharp(r).blur(Number(v.filters.blur)))
+            : r,
       ],
     };
     const { mediaStore, appendCalls } = makeMediaStore(mediaDoc());
@@ -3725,8 +3775,12 @@ describe('animated sources', () => {
       pipelines: {
         default: {
           variantSteps: [
-            async (img) =>
-              img.composite([{ input: mark, gravity: 'southeast' }]),
+            async (r) =>
+              sharpToRaster(
+                rasterToSharp(r).composite([
+                  { input: mark, gravity: 'southeast' },
+                ]),
+              ),
           ],
         },
       },
@@ -5069,9 +5123,13 @@ describe('a source smaller than the box', () => {
       pipelines: {
         default: {
           variantSteps: [
-            async (img) => {
+            async (r) => {
               steps += 1;
-              return img.composite([{ input: mark, gravity: 'southeast' }]);
+              return sharpToRaster(
+                rasterToSharp(r).composite([
+                  { input: mark, gravity: 'southeast' },
+                ]),
+              );
             },
           ],
         },
@@ -5852,6 +5910,7 @@ describe('preview rows record bytes, createdAt, origin and encodeSig', () => {
         }),
       storage,
       decoders: createDecoderSet(),
+      engine: new SharpEngine(),
       pipelines,
       hooks: new HookBus({ logger: silent }),
       config,

@@ -526,7 +526,8 @@ const elsewhere: [code: string, retryable: boolean, file: string][] = [
   ['RESIZE_SVG_RENDER_UNAVAILABLE', true, 'helpers/svgRaster.test.ts'],
   ['RESIZE_PIPELINE_STEP_INVALID', true, 'processor.test.ts'],
   ['RESIZE_STORAGE_DOWNLOAD_INVALID', true, 'processor.test.ts'],
-  ['RESIZE_SVG_PUBLIC_PREVIEW', true, 'processor.test.ts'], // a custom step's output: a deploy can fix it
+  ['RESIZE_SVG_PUBLIC_PREVIEW', true, 'processor.test.ts'], // a custom engine's output: a deploy can fix it
+  ['RESIZE_ENGINE_INVALID', true, 'render.test.ts'],
   ['RESIZE_PREVIEW_STORAGE_REF_INVALID', true, 'processor.test.ts'],
   ['RESIZE_MEDIA_APPEND_RESULT_INVALID', true, 'previewRecorder.test.ts'],
   ['RESIZE_MEDIA_REPLACE_MISSING', true, 'previewRecorder.test.ts'],
@@ -566,6 +567,7 @@ const NOT_READ = [
   'RESIZE_DRIVER_CONFLICT',
   'RESIZE_DRIVER_INVALID',
   'RESIZE_DUPLICATE_RESIZER',
+  'RESIZE_ENGINE_FORMAT_UNSUPPORTED',
   'RESIZE_ENQUEUE_CONFIRM_FAILED',
   'RESIZE_ENQUEUE_INTERNAL_ERROR',
   'RESIZE_ENQUEUE_LOCK_CONTENDED',

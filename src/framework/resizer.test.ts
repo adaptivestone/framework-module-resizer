@@ -350,6 +350,29 @@ describe('flushAtShutdown', () => {
   });
 });
 
+for (const option of ['engine', 'decoders']) {
+  test(`a \`${option}\` key in a config file is refused by verify(), naming the option`, async () => {
+    installApp({
+      resize: { ...makeResizeConfig({ storage: localStorage }), [option]: [] },
+    });
+    await assert.rejects(
+      new FrameworkResizer().verify(),
+      configError(
+        'RESIZE_CONFIG_INVALID',
+        `\`${option}\` is not a config key`,
+        `new FrameworkResizer({ ${option} })`,
+      ),
+    );
+  });
+}
+
+test('FrameworkResizer passes the engine option to the Resizer', () => {
+  installApp();
+  assert.throws(() => new FrameworkResizer({ storage, engine: {} as never }), {
+    code: 'RESIZE_ENGINE_INVALID',
+  });
+});
+
 test('a FrameworkResizer rejects metrics: null as new Resizer does; only undefined means the default', () => {
   installApp();
   assert.throws(

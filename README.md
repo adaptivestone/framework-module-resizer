@@ -209,7 +209,7 @@ store over `mediaModel`, and the lock store and the database queue on the packag
 and `ResizeTask` models, as `mongoParts` builds them), `queue` (the Resizer's queue name: a key of
 `queues`, or `false`), `queues` (each name with its driver and timing) and `coordination`. Options
 win over the config: `opts` takes every `new Resizer` option (`pipelines`, `hooks`, `decoders`,
-`name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager
+`engine`, `name`, `logger`, `metrics`, …), the parts `storage`, `media`, `locks` and `tasks` (`false`: eager
 only), `coordination` and `queueName`, each of which replaces what the config would build, and `drivers`
 (see [Drivers by name](#drivers-by-name)). Only the drivers the config selects are loaded, so the
 AWS SDKs are needed only when a section names S3 or SQS (`RESIZE_PEER_MISSING`, naming the
@@ -281,8 +281,8 @@ its task events are logged and dropped. The worker logs each such Resizer once. 
 counts every receive, so there a task given back often can still use up its `maxAttempts` and be
 dead-lettered by the worker that serves it. Before it claims anything, the worker readies every
 listed Resizer and runs the checks of `verify()`: for each Resizer its parts, config, media store,
-lock store (unless its task queue routes names to several backends) and decoders; then, for each
-queue it consumes, the route of every listed Resizer that uses that name (the backend, built now,
+lock store (unless its task queue routes names to several backends), decoders and engine; then, for
+each queue it consumes, the route of every listed Resizer that uses that name (the backend, built now,
 the name's timing, the backend's own `verify()`, and a lock store beside a backend without
 `gatesByTask`). A Resizer's own `queueName` is checked only when the worker consumes it, and each
 backend and lock store is verified once, however many Resizers share it. So a Resizer that cannot
@@ -349,6 +349,8 @@ a task queue, so the process consumes nothing (an `error` line says so). Framewo
   `TaskEvent`, `TaskEventHandler`);
 - the decoder contract `SourceDecoder` and the decoder types `SourceInfo`, `Raster`, `RasterInfo`,
   `DecodeBox`, `RenderOptions`;
+- the engine contract `ImageEngine`, the default engine `SharpEngine`, and the engine types
+  `EngineCallOptions`, `ResizeRequest`, `EncodeRequest`, `EncodedImage`;
 - metrics: the contract `ResizeMetrics`, the sinks `LogMetrics` (its options `LogMetricsOptions`)
   and `NoopMetrics`, and the types `MetricLabels` and `MetricContext`;
 - the errors: `ResizeError`, `ResizeConfigError`, `ResizeSetupError`, `ResizeMediaError`,
@@ -884,7 +886,8 @@ A decoder turns the stored bytes of one source kind into pixels: `uploadOriginal
 original only through the decoders, and the worker and `generate()` render every source through
 them. The built-in decoders read every format the installed Sharp reads from a buffer (except SVG
 and `raw`), and SVG (rendered in a separate process). To add a source kind, pass decoders to the
-Resizer: `new Resizer({ decoders: [new PdfDecoder()] })` (or `new FrameworkResizer({ decoders })`).
+Resizer: `new Resizer({ decoders: [new PdfDecoder()] })` (or `new FrameworkResizer({ decoders })`); a
+`decoders` key in a config is `RESIZE_CONFIG_INVALID`.
 They are asked first, in order, before the built-in Sharp and SVG decoders, so a host decoder can
 also take over a built-in format. Pass the same decoders in every process that uploads or
 generates previews (API and worker). An entry that is not a decoder (a non-empty `formats` list of
@@ -976,6 +979,86 @@ pass too, since a decode does not always find them: a still JPEG or lossy WebP u
 cut in its last rows can pass too (measured at 1200×900, up to about 1% of its tail), and a larger
 render then dead-letters it.
 
+### Engines
+
+An engine does the resize and the encode. The default, `SharpEngine`, writes the same files as
+0.3.0. A host passes its own in code, like `decoders`, in every process that renders or calls
+`verify()`: `new Resizer({ engine })`, `createResizer(config, { engine })` or
+`new FrameworkResizer({ engine })`. An API process that only reads but calls `verify()` without it is
+refused, naming `sharp`, for a format only the worker's engine writes. There is no config driver, and
+an `engine` key in a config is `RESIZE_CONFIG_INVALID`. Decoders stay separate, `Raster` is all the two
+share, and Sharp stays a dependency.
+
+An engine extends `ImageEngine`, or is any object of the same shape (the core never checks
+`instanceof`):
+
+- `id` names the engine in messages.
+- `formats` lists the ids `encode` writes. `verify()` and worker start refuse an entry of `formats`,
+  and an `encode.formats` entry the host wrote or changed, that it does not list
+  (`RESIZE_ENGINE_FORMAT_UNSUPPORTED`). A package default outside `formats` that the host left alone
+  is not checked: on a build without HEIF, `formats: ['jpeg', 'webp']` passes, and a per-call
+  `formats: ['avif']` then fails at render, as on 0.3.0.
+- `animatedFormats` lists the ids `encode` writes with every frame. Any other format gets the first
+  frame. With `[]`, an animated source decodes one frame.
+- `resize(frame, { width, height, mode, sharpen, coverBox }, { limits, signal })` takes one frame and
+  resolves with one frame at exactly `width × height` (with `coverBox`: within a pixel of it, covering
+  the box), 8-bit sRGB, 3 channels or 4 with alpha; a grey frame comes back as colour. `mode: 'fill'`
+  puts the whole frame into that size, and `'cover'` scales to cover it and crops from the centre. An
+  engine without a sharpener ignores `sharpen`. `coverBox` is set only on the reduction after
+  `beforeSteps`: it is the box `width × height` was computed from, and any engine may ignore it. A
+  result marked `info.premultiplied: true` is converted to straight alpha in plain JS, on the event
+  loop (182 ms at 24 MP), before a step or `encode` sees it, unless its `info.format` is `'raw'`: that
+  is Sharp's own `info`, whose flag is true on straight bytes after a resize, so it reads as straight.
+- `encode(raster, { format, options, background }, { limits, signal })` takes one frame of 1 to 4
+  channels with straight alpha, or `info.frames` of them (with `info.delay` and `info.loop`) for a
+  format in `animatedFormats`. `options` is `encode.formats[format]`. When `background` is set, flatten
+  onto it first: it holds `encode.flatten.background` as written, such as `'white'` or `'#ffffff'`, so
+  an engine parses colour names too, or the host writes hex. It resolves with
+  `{ data, format, contentType, width, height }`, where the size is that of the raster, one frame. The
+  result's `format` is the preview's file extension, letters and digits only; the row keeps the id the
+  host configured. `encode` must refuse a format it does not write: only `verify()` compares
+  `formats`, so a png-only engine asked for avif otherwise writes a row `avif`, `image/png`, `.png`.
+- `verify()` is optional, and runs in `resizer.verify()` and at worker start, after the decoders'.
+
+Two rules the types cannot state. An engine must not write to its inputs, because the formats of one
+size share one raster. It must be re-entrant, because calls run concurrently, up to `concurrency`. A
+result of another size, one without those fields, one with empty `data` or a `contentType` that is not
+`image/…`, and an animation frame with another channel count are `RESIZE_ENGINE_INVALID`. An encode
+result that says SVG (by `format` or `contentType`), HTML or XML is `RESIZE_SVG_PUBLIC_PREVIEW`, on
+that variant. These guard against a mislabelled file; they are no boundary, since an engine is host
+code.
+
+The core sets no timer on an engine's calls. An engine applies `limits.processingTimeoutSeconds`
+itself, and stops when `signal` aborts, where its library can; `generate()` passes no `signal`. A call
+that never settles holds its task until a worker's `taskTimeoutMs`; `generate()` has no such bound.
+An engine that stops on `signal` stores no late row, where `SharpEngine`, which ignores it, does: a
+step slower than `taskTimeoutMs` then ends dead after `maxAttempts` with no row, so such a pipeline
+needs a longer `taskTimeoutMs`.
+
+Steps do not change with the engine. Both kinds receive and resolve with a `Raster`, so a step needs
+no image library: it reads `raster.info` and `raster.data` (`width × height × channels` bytes, row by
+row, 8-bit sRGB with straight alpha) and resolves with `{ data, info }`. `rasterToSharp` and
+`sharpToRaster` are helpers for a step written with Sharp, and no part of the engine contract: they
+run Sharp, whichever engine the Resizer has. A `rasterToSharp` chain in a `variantStep`, from a raster
+the module handed over or made from one through `sharpToRaster` (a raster read back from a `.clone()`
+has none), keeps its limit on any engine. A step on another library has none, so it bounds its own time
+(see Pipelines).
+
+A step's result marked `info.premultiplied: true` is converted to straight alpha, unless its
+`info.format` is `'raw'`. That is Sharp's own `{ data, info }` from `toBuffer({ resolveWithObject: true })`,
+whose flag is true on straight bytes after a resize, so such a result is read as straight alpha. A step
+that premultiplies its own bytes must not spread Sharp's `info`.
+
+The engine is not part of `encodeSig` and declares no version. Switching engines does not regenerate
+stored previews; bump each pipeline's `version` to do that. An engine that animates a format other
+than `gif` or `webp` does not sign `animated` into that format's `encodeSig`, so after changing
+`animated`, bump `version` too.
+
+`SharpEngine.formats` lists every id Sharp's `toFormat` accepts that this build can write, aliases
+included. An alias takes nothing from `jpeg`'s settings: `formats: ['jpg']` needs its own
+`encode.formats.jpg`, and `encode.flatten.formats` must name it, or transparent pixels turn black.
+Naming it there changes its signature, so its stored previews regenerate.
+
 ## Config reference
 
 The Resizer's config holds image settings only. `new Resizer({ config })` defaults to
@@ -986,13 +1069,13 @@ created; a config function (the framework adapter passes one) on first use (`rea
 
 | Key | Default | Notes |
 |---|---|---|
-| `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry |
+| `formats` | `['jpeg', 'webp', 'avif']` | Generated formats; each needs an `encode.formats` entry, and the engine must write it (see [Engines](#engines)) |
 | `upload.maxBytes` | `26214400` (25 MiB) | Largest accepted original. `limits.sourceBytes` caps it too, so a larger value here accepts nothing more until that is raised as well; `verify()` logs a warning when it is above |
 | `upload.formats` | `['jpeg', 'png', 'webp', 'avif', 'gif', 'svg']` | Accepted originals, detected from the bytes; a decoder must identify the format (see [Decoders](#decoders)) |
 | `upload.verify` | `'none'` | `'decode'`: `uploadOriginal()` also decodes a raster original to a 16 px raster, at `limits.failOn`, before storing it. A damaged one is `RESIZE_ORIGINAL_DAMAGED`. It decodes the first frame only, so an animation damaged in a later frame can be stored, flipped bytes can pass, since a decode does not always find them, and a JPEG cut in its last rows can pass (measured at 1200×900, up to about 1% of its tail), and a larger render then dead-letters it. A vector source, such as SVG, is skipped. It costs about 0.1 s for a 24 MP JPEG and about 1 s for a 24 MP PNG on a Sharp thread, not on the event loop |
 | `maxSize` | `{ width: 2000, height: 1200 }` | Box for `fit` |
 | `animated` | `false` | `true`: WebP and GIF previews of an animated original keep its frames, for a pipeline without `beforeSteps` or `variantSteps`; other formats, pipelines with steps, and animations with an EXIF orientation get the first frame. `actualWidth`/`actualHeight` are one frame's size |
-| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to `sharp.toFormat(id, options)`; `{}` keeps Sharp's defaults |
+| `encode.formats` | jpeg `{ quality: 88, mozjpeg: true, chromaSubsampling: '4:2:0' }`, webp `{ quality: 82, effort: 4 }`, avif `{ quality: 64, effort: 4 }` | Passed to the engine's `encode` (`SharpEngine`: `toFormat(id, options)`); `{}` keeps its defaults, except `heif` and `heic`, which Sharp has no default compression for: `heic: {}` passes `verify()`, then every render fails with `Expected one of: av1, hevc for compression`, retried until dead, as on 0.3.0, and `heic: { compression: 'av1' }` writes. The engine must write each key the host wrote or changed, also one no call requests |
 | `encode.sharpen` | `{ cover: true, fit: false }` | Mild sharpening after downscaling, or `false` |
 | `encode.flatten` | `{ formats: ['jpeg'], background: '#ffffff' }` | Formats whose transparency is flattened |
 | `limits.inputPixels` | `268402689` | Sharp's input limit on the bytes a decoder reads (one frame of an animation); pixels the module renders itself are not limited by it |
@@ -1000,7 +1083,7 @@ created; a config function (the framework adapter passes one) on first use (`rea
 | `limits.sourceBytes` | `268435456` (256 MiB) | Largest original a worker, `generate()` or `adoptOriginal()` reads into memory, and largest body `uploadOriginal()` accepts whatever `upload.maxBytes` says. Over it: a task is dead-lettered at once with `RESIZE_SOURCE_TOO_LARGE`, `generate()` and `adoptOriginal()` reject with that code, and `uploadOriginal()` rejects with `RESIZE_ORIGINAL_TOO_LARGE` and stores nothing. Not signed into previews, so raising it regenerates nothing. It holds an uncompressed 8-bit TIFF at the default `limits.sourcePixels` (143 MiB), not a 16-bit one (286 MiB), which is refused. A host that holds those or long animated GIFs, or that raises `limits.sourcePixels`, raises this too |
 | `limits.resultDimension` | `5000` | Largest output side for width/height sizes; when the side derived from the aspect ratio of a width-only or height-only size would exceed it, the preview is cropped to it |
 | `limits.animationFrames` | `64` | Frame limit for animated input; an animation is also shortened to the frames that fit the pixel budget `min(sourcePixels, inputPixels)` at the larger of the source's size and the preview's |
-| `limits.processingTimeoutSeconds` | `30` | Timeout per Sharp operation, at most `3600`, the longest Sharp accepts |
+| `limits.processingTimeoutSeconds` | `30` | Timeout per decode, resize and encode operation, at most `3600`, the longest Sharp accepts. A `variantStep`'s `rasterToSharp` chain, from a raster the module handed over or made from one through `sharpToRaster` (a raster read back from a `.clone()` has none), gets it too; `beforeSteps` and other host code in a step do not (see Pipelines). An AVIF encode is not interrupted by it: at effort 9 on 2000×1200, with a limit of 1 s, it ran about a minute, as on 0.3.0, and created the file. A custom engine applies it itself (see [Engines](#engines)) |
 | `limits.failOn` | `'error'` | How strict decoding is: `'none'`, `'truncated'`, `'error'` or `'warning'` (Sharp's `failOn`). A source refused at this level is dead-lettered with `RESIZE_SOURCE_DAMAGED`. Not part of `encodeSig`, so changing it regenerates nothing |
 | `concurrency` | `4` | Variants processed in parallel per task or `generate()` call |
 
@@ -1033,15 +1116,83 @@ const pipelines = {
 upright original at its own size; a vector source (SVG) is rendered at least at its natural size
 and can be larger, so multiply coordinates stored in the source's units by `scale` (the width of
 the raster the step receives divided by `source.width`). When a step changes the size, every
-variant is planned from its result. A step that resolves with anything that is not a one-frame
-`Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not match its `info`)
-fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does `sharpToRaster` given a
-multi-page image. A `variantStep` is `(img, { variant, ctx }) => Sharp` (or a promise of one): it
-runs per variant, after the resize and before the encode, on a Sharp instance over that size's
-pixels, so `metadata()` reports the preview's size (with `format: 'raw'`, no EXIF, ICC profile,
-density or orientation, and `hasAlpha` as the sized pixels have it), a `resize()` resizes the
-preview, and operations Sharp used to apply before its resize (such as `trim()`) apply to the
-preview.
+variant is planned from its result. A `beforeStep` or `variantStep` that resolves with anything that
+is not a one-frame `Raster` (a `Buffer`, a Sharp instance, a raster whose `data` length does not
+match its `info`) fails with `ResizeSetupError` `RESIZE_PIPELINE_STEP_INVALID`, and so does
+`sharpToRaster` given a multi-page image.
+
+A `variantStep` is `(raster, { variant, ctx, media, source }) => Raster` (or a promise of one). It
+runs per variant, after the resize and before the encode, on one frame of that size's pixels, and
+resolves with one frame. Read the preview's size from `raster.info` (`width`, `height`, `channels`).
+The raster is the step's own copy, so the step may write to it, and the formats of one size never
+see each other's marks. A `resize()` in a step resizes the preview, and operations Sharp used to
+apply before its resize (such as `trim()`) apply to the preview. The `encode.flatten` decision reads
+the channels of the last step's result, so transparency a step adds is flattened on a flattened
+format. `media` is the live object, so read it and never write to it: a write reaches the next
+variant and your own document. `MediaLike` has no host fields, so TypeScript needs a cast.
+
+```ts
+variantSteps: [
+  async (r) => {
+    const { width, height } = r.info;
+    const input = await sharp(logo)
+      .resize(Math.ceil(width / 4), Math.ceil(height / 4), { fit: 'inside', withoutEnlargement: true })
+      .toBuffer();
+    return sharpToRaster(rasterToSharp(r).composite([{ input, gravity: 'southeast' }]));
+  },
+],
+```
+
+Fit the overlay on both sides, with `.resize(w, h, { fit: 'inside', withoutEnlargement: true })`: Sharp
+refuses one larger than the preview on either side (`Image to composite must have same dimensions or
+smaller`). Scaled by `r.info.width` alone, a 400×400 logo failed on 6 of 9 variants of a 4000×300
+banner. `withoutEnlargement` keeps a smaller logo at its own size: without it, a 64×64 logo came out
+300×300 on a 1600×1200 preview. `composite` on an opaque preview returns 4 channels with
+alpha 255, which costs an AVIF about 200 bytes per file, which matters only on very flat images: add
+`.removeAlpha()` when `r.info.channels === 3`.
+
+A `rasterToSharp` chain in a `variantStep`, from a raster the module handed over or made from one
+through `sharpToRaster` (a raster read back from a `.clone()` has none), runs under
+`limits.processingTimeoutSeconds`: past it Sharp rejects, and only that variant fails. Each chain and the encode have their own limit, so the longest a variant holds a
+thread is (chains + 1) × the limit. The chain's own `.timeout({ seconds: 60 })` replaces the limit on
+that chain, and `.timeout({ seconds: 0 })` turns it off there. The limit follows those raster objects,
+so a raster spread into a new object or built by the step has none, and neither has a fresh `sharp()`.
+It does not cross a duplicate copy of the package: `rasterToSharp` from a second copy reads no limit,
+with no error, so dedupe the package.
+
+Nothing else in a step is bounded: Sharp work that does not go through `rasterToSharp`, such as
+`sharp(raster.data, { raw: raster.info })`, and any other host code. `beforeSteps` are unbounded too,
+through `rasterToSharp` as well, as in 0.3.0. Such work can starve other tasks and dead-letter healthy
+ones, because stuck Sharp calls hold libuv's threads: with 4 slow variants beside one healthy task, at
+`taskTimeoutMs` 2000 and `maxAttempts` 3, the healthy task was dead after about 12 s with no previews,
+where a limit of 1 s let it complete in 1.5 s. A worker's `taskTimeoutMs` ends the task but not its
+variants in progress: each keeps its thread and memory until it ends, and can still store its row. So
+a step slower than `taskTimeoutMs` still stores its row, and the next delivery finds it fresh and
+completes, if one is left. With none left, because the step outlasts them (5000 ms at `taskTimeoutMs`
+1000) or `maxAttempts` is 1, the task ends dead with its row stored, as on 0.3.0. Such a late write can
+also replace a newer row, even one from a newer original: the next
+read finds that row stale and queues it again. `generate()` has no such bound.
+
+A single step that only composites an overlay writes the same files as 0.3.0 on an opaque source
+(with `png` added to `encode.flatten.formats`, it writes RGB where 0.3.0 wrote RGBA, with no pixel
+difference) and on every format that keeps alpha. On a flattened format, a transparent source can
+move wherever the preview has partly transparent pixels: at most 2 levels before the JPEG encoder, up
+to 20 of 255 measured in the JPEG. Other steps can write different files, on new previews only:
+`encodeSig` does not change, so stored previews stay, and `verify()` does not run steps, so look at
+the logs and the files after the first upload.
+
+- On a transparent source and a flattened format, the step now runs before the flatten, where Sharp
+  ran it after, so most operations change that format's pixels. `negate()` also negates alpha: use
+  `negate({ alpha: false })`. `removeAlpha()` shows the colours under transparent pixels, which are
+  black after a resize.
+- Several steps now run in order, each on the last one's result, where 0.3.0 gathered them in one
+  Sharp chain: a second `composite`, `blur` or `resize` replaced the first, and Sharp chose the order.
+- `sharpToRaster` reads raw sRGB pixels, so three things go wrong with no error. `greyscale()` on a
+  transparent source loses alpha, so a JPEG shows the colours under transparent pixels, which are
+  black after a resize: use `modulate({ saturation: 0 })`. `toColourspace('b-w')` stays in
+  colour: use `greyscale()` on an opaque source, or `modulate({ saturation: 0 })`. Metadata calls in a
+  step do nothing: `withMetadata`, `withExif` and `keepExif` add nothing, so a copyright set this way
+  disappears, and `withIccProfile` also shifts the colours, so leave it out.
 
 **Rounding.** Preview sizes are computed from the source's display dimensions and rounded once
 per side, so a preview side can differ by one pixel from what Sharp derived in earlier releases,
@@ -1548,8 +1699,9 @@ references, leaving out every `original.storageRef`: an adopted public original 
 bucket, and no preview row references it. A preview is uploaded before its row is written, so list
 the objects first and read the rows after, and delete only objects older than a day and more than
 twice `taskTimeoutMs`, by S3 `LastModified` or file mtime: a delivery that timed out can still write
-its row later, and `generate()` has no timer. Without that rule a sweep deletes the files of rows
-about to be written. A read then still reports such a row as ready, neither stale nor missing, so
+its row later, and `generate()` has no timer. Such a late write is not fenced, so it can replace a
+newer row, even one from a newer original; the next read finds that row stale and queues it again.
+Without that rule a sweep deletes the files of rows about to be written. A read then still reports such a row as ready, neither stale nor missing, so
 nothing renders it again and its URL fails. `invalidate()` on that media removes its rows, and the
 next read or `prewarm()` queues them again.
 
@@ -1697,7 +1849,14 @@ a lean read removes every row without a stored `_id`. Keying rows by `identity` 
   limit after `beforeSteps` (`min(limits.sourcePixels, limits.inputPixels)`) is checked once, on
   the dimensions of the raster the last step returned, so a step that grows the image has already
   allocated it at its full size when it is rejected (`RESIZE_SOURCE_TOO_LARGE`,
-  `retryable: false`). Steps are host code.
+  `retryable: false`). Steps are host code. With `variantSteps`, a worker also holds one copy of the
+  size's pixels and the step's result per variant in progress, up to
+  `width × height × (channels + 4)` bytes each, up to `concurrency` at once: about 117 MB per variant
+  at a 5000-wide size of a 3:2 source. Measured with one `composite` step at the default
+  `concurrency` of 4, writing JPEG and WebP, the process's peak RSS is about 185 MB (0.3.0: about
+  130 MB) on a 24 MP JPEG at 1920, 1280 and 620 wide and 300×300, about 975 MB (0.3.0: about 590 MB)
+  on that JPEG at 5000, 4000, 3000 and 2000 wide, and about 1.9 GB (0.3.0: about 1.5 GB) on a 24 MP
+  PNG with alpha at those widths.
 - **At-least-once delivery:** a task can run more than once. The worker skips previews that
   already exist fresh, and the media store keeps one row per preview identity, so a repeat never
   duplicates them. A task completes only when every requested

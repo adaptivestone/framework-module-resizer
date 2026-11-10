@@ -3,7 +3,6 @@
 // values: no Sharp, no port, no I/O. The Processor turns the plan into pixels.
 import type { DecodeBox, SourceInfo } from './contracts/decoder.ts';
 import type { Pipeline } from './contracts/pipeline.ts';
-import { isAnimatedFormat } from './helpers/imageFormat.ts';
 import {
   calculateResizedDimensions,
   coverDimensions,
@@ -26,6 +25,8 @@ export interface PlanRules {
   ownSize: boolean;
   /** config.animated, and the pipeline has neither beforeSteps nor variantSteps. */
   animate: boolean;
+  /** What the engine writes with every frame; any other format is rendered from the first frame. */
+  animatedFormats: readonly string[];
 }
 
 /** One exact output geometry; variants with one key share one render. */
@@ -53,6 +54,7 @@ export function planRules(
   config: ResizeConfig,
   scope: PreviewScope,
   pipeline: Pipeline,
+  animatedFormats: readonly string[],
 ): PlanRules {
   const hasVariantSteps = (pipeline.variantSteps ?? []).length > 0;
   const hasBeforeSteps = (pipeline.beforeSteps ?? []).length > 0;
@@ -64,6 +66,7 @@ export function planRules(
     sharpen: sharpen ? { cover: sharpen.cover, fit: sharpen.fit } : false,
     ownSize: !hasVariantSteps,
     animate: config.animated && !hasBeforeSteps && !hasVariantSteps,
+    animatedFormats,
   };
 }
 
@@ -176,7 +179,7 @@ export function planVariants(
   const animatedKeys = new Set<string>();
   if (rules.animate && info.animated) {
     requests.forEach((v, i) => {
-      if (isAnimatedFormat(v.format)) {
+      if (rules.animatedFormats.includes(v.format)) {
         animatedKeys.add(geometryKey(geometries[i]));
       }
     });
