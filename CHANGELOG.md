@@ -101,21 +101,24 @@ it lists what to change before you run `npm i`.
   there and none matches what was written in `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`,
   `pipeline` and `filters`, or none has a `contentType`, the task dead-letters with
   `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), naming the fields. So does a row that comes back
-  with those fields as written but no `storageRef`. Rows are matched by `storageRef`, so a store
-  that changes a ref to another non-null value, or loses `storageRef` together with another field,
-  is not detected, and a `resizer`, `pipeline` or `filters` lost while it held its default
-  (`'default'`, or no filters) is no loss: a read applies the same default. A custom store that
-  dropped one of these, and so rendered again on every read without a log line, now fails visibly. A
-  store with no `identity` column, or its own form of it, keeps working: a read does not use it. It
-  gets one `warn` per Resizer, because `invalidate()` finds such rows only by identity, so it leaves
-  them, and a `replacePreviews` that removes by stored identity leaves them too. A reload that lags
-  raises nothing, except on a driver that names files by their bytes, where it can show another row
-  under the same ref, an older row after a replacement (naming `encodeSig`) or another size key's
-  row on a first render (naming `sizeKey`): the task is dead, though its rows are stored and the
-  next read is fresh. `MongoMediaStore` with the current fragment and a driver that names files at
-  random, as the shipped ones do, is not affected. `verify()` now also rejects a strict row schema
-  without `sizeKey`, `format`, `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`):
-  a read could never serve such a row.
+  with those fields as written but no `storageRef`. Rows are matched by `storageRef`: with no row
+  under a written ref nothing is reported, as for a lagging reload, unless a row with no ref matches
+  it in every compared field. So a ref changed to another value is caught only when the rows now
+  under the old ref differ in a compared field (two rows' refs swapped), and a lost `storageRef`
+  only when every compared field is as written: losing it with `encodeSig` escapes, while a
+  `resizer`, `pipeline` or `filters` lost at its default compares equal, and `identity` and `fit`
+  are not compared. A custom store that dropped one of these, and so rendered again on every read
+  without a log line, now fails visibly. A store with no `identity` column, or its own form of it,
+  keeps working: a read does not use it. It gets one `warn` per Resizer, because `invalidate()`
+  finds such rows only by identity, so it leaves them, and a `replacePreviews` that removes by
+  stored identity leaves them too. A reload that lags raises nothing, except on a driver that names
+  files by their bytes, where it can show another row under the same ref, an older row after a
+  replacement (naming `encodeSig`) or another size key's row on a first render (naming `sizeKey`):
+  the task is dead, though its rows are stored and the next read is fresh. `MongoMediaStore` with
+  the current fragment and a driver that names files at random, as the shipped ones do, is not
+  affected. `verify()` now also rejects a strict row schema without `sizeKey`, `format`,
+  `contentType` or `storageRef` (`RESIZE_MONGO_MEDIA_MODEL_OUTDATED`): a read could never serve such
+  a row.
 - **A custom model-shaped `MongoMediaModel` must accept a new filter.** The write of the original's
   dimensions in `MongoMediaStore` had the filter `{ _id }`. It now adds `$or`, `$not` and `$type`,
   so the write lands only while the original holds no stored pair, and its options add

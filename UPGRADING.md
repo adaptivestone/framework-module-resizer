@@ -76,11 +76,13 @@ npm i @adaptivestone/framework-module-resize
   `findOneAndUpdate` middleware or a strict row schema that loses `contentType`, or loses or changes
   `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline` or `filters`, gets
   `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), where it rendered again on every read with no
-  log line; so does one that loses only `storageRef`. Rows are matched by `storageRef`, so a store
-  that changes a ref to another non-null value, or loses `storageRef` together with another field,
-  is not detected, and a `resizer`, `pipeline` or `filters` lost while it held its default
-  (`'default'`, or no filters) is no loss: a read applies the same default. Store those fields as
-  given.
+  log line; so does one that loses `storageRef`. Rows are matched by `storageRef`: with no row under
+  a written ref nothing is reported, as for a lagging reload, unless a row with no ref matches it in
+  every compared field. So a ref changed to another value is caught only when the rows now under the
+  old ref differ in a compared field (two rows' refs swapped), and a lost `storageRef` only when
+  every compared field is as written: losing it with `encodeSig` escapes, while a `resizer`,
+  `pipeline` or `filters` lost at its default compares equal, and `identity` and `fit` are not
+  compared. Store those fields as given.
 - **A `findOneAndUpdate` pre hook on the media model** that calls `this.where({ $or })` replaces the
   store's guard on the dimension write, with no error. Use `this.and([...])`.
 - **A custom model-shaped `MongoMediaModel`** gets `$or`, `$not` and `$type` in the filter of the

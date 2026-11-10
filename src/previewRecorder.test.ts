@@ -506,6 +506,45 @@ test('rowsNotKept: a row that comes back without a storageRef, every compared fi
   assert.deepEqual(rowsNotKept([row], [back as Preview, row]), []);
 });
 
+test('rowsNotKept: where matching by storageRef stops, as the docs state it', () => {
+  const row: Preview = { ...signed('20x20', 'a'), fit: true };
+  const {
+    storageRef: _ref,
+    resizer: _resizer,
+    pipeline: _pipeline,
+    identity: _identity,
+    fit: _fit,
+    ...lostWithDefaults
+  } = row;
+  // Lost with fields at their defaults, and with identity and fit, which are not compared: caught.
+  assert.deepEqual(rowsNotKept([row], [lostWithDefaults as Preview]), [
+    { identity: row.identity as string, fields: ['storageRef'] },
+  ]);
+  // Lost with encodeSig: no row is under the ref, and the row without one differs, so it escapes.
+  const { storageRef: _ref2, encodeSig: _sig, ...lostWithSig } = row;
+  assert.deepEqual(rowsNotKept([row], [lostWithSig as Preview]), []);
+  // Changed to another value, with nothing left under the old ref: it escapes.
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, storageRef: { key: 'z' } }]),
+    [],
+  );
+  // Two rows' refs swapped: the row now under each old ref differs in sizeKey, so both are caught.
+  const other = signed('40x40', 'b');
+  assert.deepEqual(
+    rowsNotKept(
+      [row, other],
+      [
+        { ...row, storageRef: other.storageRef },
+        { ...other, storageRef: row.storageRef },
+      ],
+    ),
+    [
+      { identity: row.identity as string, fields: ['sizeKey'] },
+      { identity: other.identity as string, fields: ['sizeKey'] },
+    ],
+  );
+});
+
 test('rowsNotKept: an old row without a ref, of the same size and format, is not this row: it has no signatures', () => {
   const row = signed('20x20', 'a');
   // A flat row from before rows had a storageRef, which 0.3.0 left unmigrated.
