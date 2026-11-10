@@ -7,8 +7,8 @@
 // - plan.ts (the pure size plan) reaches no sharp at runtime and imports no port but the decoder
 //   and pipeline types;
 // - helpers and contracts are leaves: they import only each other, errors and types;
-// - resizer.ts is the composition root: only the entry points (index.ts, worker.ts), the factory
-//   that builds a Resizer from a config (factory/createResizer.ts) and the framework adapter
+// - resizer.ts is the composition root: only the entry points (index.ts, worker.ts, lambda.ts), the
+//   factory that builds a Resizer from a config (factory/createResizer.ts) and the framework adapter
 //   import it, and nothing it reaches imports it back, not even as a type; nor does any other
 //   file import the main entry, which re-exports the Resizer;
 // - outside the drivers, only factory/builtins.ts imports a driver module dynamically (the
@@ -90,6 +90,7 @@ for (const entry of [
   'drivers/s3.ts',
   'drivers/sqs.ts',
   'drivers/mongo/index.ts',
+  'lambda.ts',
 ]) {
   test(`${entry} reaches no framework code and no mongoose at runtime`, () => {
     const { files, bare } = walk(entry);
@@ -114,6 +115,20 @@ for (const entry of [
     );
   });
 }
+
+test('lambda.ts reaches no AWS SDK at runtime', () => {
+  const { files, bare } = walk('lambda.ts');
+  assert.ok(
+    files.has('worker.ts'),
+    'sanity check: the walk reaches the shared wiring',
+  );
+  assert.deepEqual(
+    [...bare.entries()]
+      .filter(([spec]) => spec.startsWith('@aws-sdk/'))
+      .map(([, chain]) => chain.join(' → ')),
+    [],
+  );
+});
 
 test('drivers import only contracts, errors, helpers, types and other drivers', () => {
   const allowed = (t: string) =>
@@ -285,14 +300,15 @@ test('the framework adapter is reachable from its own entry', () => {
   );
 });
 
-test('only index.ts, worker.ts, factory/createResizer.ts and the framework adapter import resizer.ts', () => {
+test('only index.ts, worker.ts, lambda.ts, factory/createResizer.ts and the framework adapter import resizer.ts', () => {
   assert.ok(
     localImports('index.ts', { types: true }).includes('resizer.ts'),
     'sanity check: the listing does see index.ts importing resizer.ts',
   );
   const allowed = (f: string) =>
-    ['index.ts', 'worker.ts', 'factory/createResizer.ts'].includes(f) ||
-    f.startsWith('framework/');
+    ['index.ts', 'worker.ts', 'lambda.ts', 'factory/createResizer.ts'].includes(
+      f,
+    ) || f.startsWith('framework/');
   assert.deepEqual(
     sourceFiles()
       .filter(

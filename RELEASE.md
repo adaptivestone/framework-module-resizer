@@ -169,6 +169,141 @@ actual framework host and run it against real infra._
 - [ ] Confirm eager mode (`generate()`, no `queue` or `queues` in the config) on a host scaffolded with
       `--eager`; `npx resize-scaffold --check --eager` passes.
 
+### Push delivery (needs an AWS account)
+
+Nothing in `Push delivery (preview)` has run on real AWS: the handler was measured with stand-ins and
+a model on one machine. Use a throwaway account or prefix, and delete everything afterwards. The
+script below has not been run either, so check its flags as you go. Run C2 and C5 first, since they
+are the two that can change the design. Until C1, C2, C5 and C8 have passed once, the docs keep the
+mark.
+
+To remove the mark, run `grep -rn "Push delivery (preview)" README.md AGENTS.md CHANGELOG.md src/lambda.ts`
+here and the same `grep` on `docs/12-resize.md` in the guide's repository, change each hit and the
+`createSqsHandler` JSDoc, update the README's opening sentence of that section, and fix the guide's
+link to the README's `#push-delivery-preview` anchor, which the new heading changes.
+
+The handler is the guide's, with two steps and a hook for this list. Each step runs past the 120 s
+timeout, and only for a task that names its pipeline:
+
+```js
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+createResizer(config, {
+  pipelines: {
+    default: {},
+    // Blocks the event loop, so no timer fires and REPORT says `Status: timeout`.
+    block: {
+      beforeSteps: [
+        async (raster) => {
+          const end = Date.now() + 150_000;
+          while (Date.now() < end);
+          return raster;
+        },
+      ],
+    },
+    // Awaits, ignoring the abort.
+    hang: {
+      beforeSteps: [
+        async (raster) => {
+          await wait(150_000);
+          return raster;
+        },
+      ],
+    },
+  },
+  hooks: {
+    onTaskDeadLettered: (task) => console.log('onTaskDeadLettered', task.mediaId),
+  },
+});
+```
+
+```bash
+# MONGO_DSN, PUBLIC_BUCKET and PRIVATE_BUCKET are yours. In a clean copy of the handler:
+npm install --omit=dev --os=linux --cpu=arm64 --libc=glibc
+zip -qr function.zip handler.mjs package.json node_modules
+
+# The queues first: the function's environment needs their URLs.
+DEAD_URL=$(aws sqs create-queue --queue-name resize-check-dead --query QueueUrl --output text)
+DEAD_ARN=$(aws sqs get-queue-attributes --queue-url "$DEAD_URL" --attribute-names QueueArn \
+  --query Attributes.QueueArn --output text)
+QUEUE_URL=$(aws sqs create-queue --queue-name resize-check --query QueueUrl --output text \
+  --attributes "{\"VisibilityTimeout\":\"720\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DEAD_ARN\\\",\\\"maxReceiveCount\\\":\\\"7\\\"}\"}")
+QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names QueueArn \
+  --query Attributes.QueueArn --output text)
+
+# The role: the managed policy, and what the docs say it lacks. No s3:ListBucket, as the docs say.
+ROLE_ARN=$(aws iam create-role --role-name resize-check --query Role.Arn --output text \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}')
+aws iam attach-role-policy --role-name resize-check \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+aws iam put-role-policy --role-name resize-check --policy-name resize-check --policy-document "{
+  \"Version\":\"2012-10-17\",\"Statement\":[
+  {\"Effect\":\"Allow\",\"Action\":\"sqs:ChangeMessageVisibility\",\"Resource\":\"$QUEUE_ARN\"},
+  {\"Effect\":\"Allow\",\"Action\":\"sqs:SendMessage\",\"Resource\":\"$DEAD_ARN\"},
+  {\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\"],
+   \"Resource\":[\"arn:aws:s3:::$PUBLIC_BUCKET/*\",\"arn:aws:s3:::$PRIVATE_BUCKET/*\"]}]}"
+
+# The function, with the queues' URLs. A new role can take a few seconds: repeat if it is refused.
+cat > env.json <<EOF
+{"Variables":{"MONGO_DSN":"$MONGO_DSN","PUBLIC_BUCKET":"$PUBLIC_BUCKET","PRIVATE_BUCKET":"$PRIVATE_BUCKET",
+ "QUEUE_URL":"$QUEUE_URL","DEAD_LETTER_QUEUE_URL":"$DEAD_URL"}}
+EOF
+aws lambda create-function --function-name resize-check --runtime nodejs24.x --architectures arm64 \
+  --memory-size 1769 --timeout 120 --role "$ROLE_ARN" --handler handler.handler \
+  --zip-file fileb://function.zip --environment file://env.json
+
+# The trigger, and the metrics C1 and C15 read: Lambda does not log its poller's deletes.
+UUID=$(aws lambda create-event-source-mapping --function-name resize-check \
+  --event-source-arn "$QUEUE_ARN" --batch-size 1 \
+  --function-response-types ReportBatchItemFailures \
+  --scaling-config MaximumConcurrency=2 --metrics-config Metrics=EventCount \
+  --query UUID --output text)
+
+# Feed it with resizer.prewarm() from a process with the same config. To name a step, or to send a
+# body of your own, use a task's JSON. Its gateOwner takes the gate when the delivery starts.
+aws sqs send-message --queue-url "$QUEUE_URL" --message-body '{
+  "resizer":"default","queue":"default","mediaId":"<MEDIA_ID>","pipeline":"block",
+  "previews":[{"sizeKey":"620w","format":"jpeg","requestedWidth":620}],"gateOwner":"check-1"}'
+
+# What the rows read. The mapping first: after a create or an update, wait for Enabled, as AWS refuses
+# an update to one in Creating (ResourceInUseException). The metric can lag by the function's timeout
+# and more.
+aws lambda get-event-source-mapping --uuid "$UUID" --query State --output text
+aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names \
+  ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name DeletedEventCount \
+  --dimensions Name=EventSourceMappingUUID,Value="$UUID" --statistics Sum --period 60 \
+  --start-time <START> --end-time <END>
+aws logs tail /aws/lambda/resize-check --since 15m
+```
+
+Each row says what to run, what passing looks like, and where to read it. "The log" is the function's
+log, with its `START` and `REPORT` lines; "the queue" and "the metric" are the last commands above.
+The per-task line reads `resize: task … of media … in … ms (… attempt n, …)`, and a retry reads
+`failed (attempt n of 5, code …) — retrying in … ms`.
+
+| # | Run | Pass | Read it in | If not |
+|---|---|---|---|---|
+| C1 | `prewarm()` on a new media: one good task | Previews stored. No message in the queue now, or after 720 s. A nonzero `DeletedEventCount` for the records the function deleted: a failed delete emits 0, per AWS | The media's row, the queue, the metric | Stop deleting in the handler: leave the record out and let Lambda delete it, releasing the gate afterwards |
+| **C2** | A task that fails with a retryable error: a new media whose original is gone from S3. With the docs' IAM (no `s3:ListBucket`) it reads as raw `AccessDenied`, `code none`, not `RESIZE_STORAGE_NOT_FOUND`, and is retried the same way | **Attempts about 5 s, 10 s, 20 s apart, not 720 s** | The log: `retrying in`, and the `START` times | Safe but slow: document it, and set a shorter visibility or use `DelaySeconds` |
+| C3 | Keep C2 failing. Then set `maxReceiveCount` to 3 with `aws sqs set-queue-attributes` and repeat on a new media, since the cooldown blocks `prewarm()` for the first one for 600 s. Set it back to 7 | Dead at attempt 5: in the dead-letter queue with the module's body, which holds `attempts` and `error`, `onTaskDeadLettered` fired, and `prewarm()` on that media reports `RESIZE_ENQUEUE_LOCK_CONTENDED`. At 3: SQS moves it with its own body, no `is dead` line, no hook and no cooldown, as the docs warn | `aws sqs receive-message --queue-url "$DEAD_URL"`, the log, `prewarm()`'s `issues` | Check `sqs:SendMessage`. Whatever you see, decide here whether the first invocation should check `maxReceiveCount` with one `GetQueueAttributes` call |
+| C4 | Function timeout 30 s, `stopBeforeTimeoutMs: 10000`, a catalog that takes longer than that at this memory | `RESIZE_TASK_TIMEOUT`, no `Status: timeout`, some rows stored, retried with backoff, and the retry renders only the rest | The log, the media's row | Raise the default reserve |
+| **C5** | The task's JSON with pipeline `block`, on a new media | Measured from the first `START`: the second delivery starts about one lease (60 s) later, not 720 s. That is about 60 s before the first `Status: timeout`, in a second environment, so expect the overlap. While it runs, the gate is held: `prewarm()` on that media and pipeline reports `RESIZE_ENQUEUE_LOCK_CONTENDED` | The log: `START` and `REPORT` by request id. `prewarm()`'s `issues` | Adoption failed: check IAM |
+| C6 | `aws lambda update-event-source-mapping --uuid "$UUID" --batch-size 3 --maximum-batching-window-in-seconds 1`, wait for `State` to read `Enabled`, then three tasks together with `aws sqs send-message-batch`: two good, one failing. Send three more if their lines do not fall in one `START`/`REPORT`. Set it back to batch size 1, window 0 | Only the failed record comes back: its task's line repeats, and the other two appear once. Count the row only when the three tasks' lines fall in one `START`/`REPORT`: the same result at batch size 1 tests nothing, and no AWS page says when a new batch size starts | The log: `resize: task …` by media, between one `START` and its `REPORT` | Check `itemIdentifier` |
+| C7 | Remove the setting with `--function-response-types '[]'`, repeat C2, and put it back | Message gone after the first failure, with its line still saying `retrying in 5000 ms`, confirming the trap in the docs | The log: one `START` for it. The queue reads 0, and so does the dead-letter queue | Update the docs with what you see |
+| C8 | One 12 MP JPEG, one SVG | Both render. Note `Init Duration` and `Max Memory Used` | The media's rows, `REPORT` | SVG: capture the error; document rasterising elsewhere, or drop SVG on Lambda |
+| C9 | Drop the scaling config for this row, as `MaximumConcurrency` caps the burst and nothing would throttle: `--scaling-config '{}'`, then `aws lambda put-function-concurrency --function-name resize-check --reserved-concurrent-executions 2`. Lower the visibility to the function timeout, so a throttled receive costs 120 s, not 720 s: `aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --attributes VisibilityTimeout=120`. Run `prewarm()` on 300 new media, as a repeated media renders nothing: tasks of about 5 s, 2 at a time, drain in about 750 s, past the 5 × 120 s a task needs to die unrun. Undo all three, with the visibility back at 720 | `Throttles` above 0 and a drain over 600 s, or the row tested nothing: send more. No `RESIZE_TASK_MAX_ATTEMPTS` on tasks that never ran, and no new message in the dead-letter queue, which SQS would move there with no line. Note the highest receive count: it is the margin left | `Throttles` in `AWS/Lambda` by `FunctionName`. The queue: the drain, and `$DEAD_URL`. The log: `is dead` lines, and the highest `attempt n` | Raise `maxAttempts`, or document `MaximumConcurrency` only |
+| C10 | Invoke, wait 20 minutes, invoke again | The frozen Mongo connection recovers without a failed task. Count the row only when the second invocation's `REPORT` is in the first's log stream, the same execution environment: no `Init Duration` proves less, as AWS says an environment may be initialized ahead of its invocation. Otherwise shorten the gap and note the longest one that kept the environment | The log: the stream name `aws logs tail` prints beside each `REPORT`, and no `failed` line | Tune `maxIdleTimeMS`; document it |
+| C11 | The task's JSON with pipeline `hang`, on a new media | `REPORT` ends about 2 s before the timeout with no `Status: timeout`, a `had not settled` line, the record back after its backoff, and no harm when the frozen step resumes | The log | Check that an async handler's return ends the invocation |
+| C12 | Function timeout 3 s, Lambda's default, with the queue's visibility timeout at 18 s for this run | An `error` line naming the first record on each delivery, nothing rendered, deliveries about 18 s apart (a record not started gets no visibility call), then dead with `RESIZE_TASK_MAX_ATTEMPTS` at the sixth delivery | The log: `was not started`, `START` times, `is dead` | Check the receive count reaches the handler |
+| C13 | A function in a VPC with no NAT and no endpoint, with Mongo reachable from the VPC: the guide's handler connects at import, so with Mongo unreachable the expected line never appears | An `error` naming the route to SQS on each delivery, and no task run. Note how long one delivery takes | The log: `had not answered`, and `REPORT`'s `Duration` | Set a shorter request timeout on the SDK client, and document it |
+| C14 | In C10's second invocation, watch the first SQS and S3 calls after the thaw. Count it only as C10 counts | No failed task from a stale socket: the SDK retries | The log: the second `REPORT` in the first's log stream, and no `failed` line | Document it |
+| C15 | C6 again, for the records the function already deleted itself beside the one it listed. Count it only as C6 counts | A nonzero `DeletedEventCount` for those: a failed delete emits 0, per AWS. The listed record comes back after the visibility the function set, not 720 s | The metric. The log: `START` times of the listed record | Stop deleting in the handler, as in C1 |
+| C16 | The `hang` step with a real Sharp chain in flight and an upload after it: let the function return, invoke again within a minute, and once more with `limits.processingTimeoutSeconds` shorter than the gap | Whether a late S3 PUT and a late Mongo write land after the thaw, as a row a read judges as any other. Whether frozen time counts toward Sharp's limit: it did under `SIGSTOP` on one machine, so the chain failed just after the thaw and its retry rendered it | The bucket, the media's row, the log | Document what you see in the README's `Stopping in time` |
+| C17 | A package without `@aws-sdk/*`: log `import.meta.resolve('@aws-sdk/client-sqs')` from `/var/task` at init, then deliver one task | Either it resolves to the runtime's copy, and the docs can say a host need not ship the SDK once its version is checked against the peer range, or the task is refused with `RESIZE_PEER_MISSING`, as the docs assume | The log | Document which, and the runtime's SDK version |
+| C18 | SQS's 12 h limit, which counts from the receipt. With `leaseMs: 43200000` on the queue's entry, one good task. Then, with the trigger off (`--no-enabled`): `aws sqs send-message`, `aws sqs receive-message`, wait a minute, and `aws sqs change-message-visibility --visibility-timeout` with its receipt, 43200 and then 39600. AWS's page counts the 12 h from when the message is "first received", so if you can leave it 11 h, ask 39600, receive it again after they pass, and ask 39600 once more. Delete it, and turn the trigger on | The capped adoption is accepted: previews stored, no `lost its receipt` line. At the prompt, 39600 is accepted, and 43200 is refused, with the code `isLostReceipt` reads as a lost receipt (`InvalidParameterValue`), which AWS's page does not name. On the second receive 39600 is accepted too, so each receive starts its own 12 h, as the cap assumes | The log, the media's row, the CLI's answer | Lower the cap in `src/delivery.ts`. A different code, or 43200 accepted: note it in the README's settings table |
+| C19 | What a redrive does to the receive count, which AWS's pages do not state. With the trigger off, `aws sqs start-message-move-task --source-arn "$DEAD_ARN" --destination-arn "$QUEUE_ARN"`, for one body SQS moved and one the module wrote (C3): with no destination, AWS fails a message written with `SendMessage` as `CouldNotDetermineMessageSource`. Wait for `aws sqs list-message-move-tasks --source-arn "$DEAD_ARN"` to read `COMPLETED`, then `aws sqs receive-message --queue-url "$QUEUE_URL" --attribute-names ApproximateReceiveCount`. AWS says each is a new message, with a new ID, enqueue time and retention period | The move task reads `COMPLETED`, with both moved. 1 on the first receive, so a redriven task gets all its attempts: the README can then offer a redrive beside `prewarm()`. Delete both, and turn the trigger on | The CLI's answers: `Results[0].Status`, `FailureReason` and `ApproximateNumberOfMessagesMoved`, then `Attributes.ApproximateReceiveCount` | Anything above 1: say in `How a record ends` that a redriven task starts that far along, and keep `prewarm()` as the way |
+
 ## Notes
 
 - **No publish workflow on purpose.** Both sibling repos release manually; a tagged-release

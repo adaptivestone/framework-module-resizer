@@ -11,6 +11,11 @@ import type { MediaStore } from '../contracts/media.ts';
 import type { VariantStep } from '../contracts/pipeline.ts';
 import type { ResizeStorage } from '../contracts/storage.ts';
 import type { TaskQueue } from '../contracts/taskQueue.ts';
+import type {
+  LambdaContextLike,
+  SqsBatchResponse,
+  SqsEventLike,
+} from '../lambda.ts';
 import { NoopMetrics } from '../metrics.ts';
 import type { ResizeLogger } from '../types.d.ts';
 
@@ -211,3 +216,29 @@ export const hostDebugLogger: ResizeLogger = hostLogger;
 export const rasterStep: VariantStep = (raster) => raster;
 // @ts-expect-error — a variantStep receives a Raster, not a Sharp instance.
 export const oldStep: VariantStep = (img) => img.composite([]);
+
+// Pinned from the documented SQS event: AWS's own record must assign to these, so a host needs no
+// @types/aws-lambda. The extra fields are what a real record also carries.
+const documentedRecord = {
+  messageId: '059f36b4-87a3-44ab-83d2-661975830a7d',
+  receiptHandle: 'AQEBwJnKyrHigUMZj6rYigCgxlaS3SLy0a',
+  body: '{}',
+  attributes: {
+    ApproximateReceiveCount: '1',
+    SentTimestamp: '1545082649183',
+    SenderId: 'AIDAENQZJOLO23YVJ4VO',
+    ApproximateFirstReceiveTimestamp: '1545082649185',
+  },
+  messageAttributes: {},
+  md5OfBody: 'e4e68fb7bd0e697a0ae8f1bb342846b3',
+  eventSource: 'aws:sqs',
+  eventSourceARN: 'arn:aws:sqs:us-east-2:123456789012:my-queue',
+  awsRegion: 'us-east-2',
+};
+export const sqsEvent: SqsEventLike = { Records: [documentedRecord] };
+export const pushContext: LambdaContextLike = {
+  getRemainingTimeInMillis: () => 1,
+};
+export const batchResponse: SqsBatchResponse = {
+  batchItemFailures: [{ itemIdentifier: 'id' }],
+};

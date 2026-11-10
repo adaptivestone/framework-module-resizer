@@ -17,7 +17,8 @@
     "./drivers/fs.js": "./dist/drivers/fs.js",
     "./drivers/s3.js": "./dist/drivers/s3.js",
     "./drivers/mongo.js": "./dist/drivers/mongo/index.js",
-    "./drivers/sqs.js": "./dist/drivers/sqs.js"
+    "./drivers/sqs.js": "./dist/drivers/sqs.js",
+    "./lambda.js": "./dist/lambda.js"
   },
   "bin": {
     "resize-scaffold": "./dist/framework/scaffold/command.js"
