@@ -31,6 +31,7 @@ import { importDriver } from './helpers/peers.ts';
 import { getSizeKey, requireMediaId } from './images.ts';
 import { validateResizeConfig } from './resizeConfig.ts';
 import { Resizer, resetResizerForTests } from './resizer.ts';
+import { errorTableRows } from './testHelpers/errorTable.ts';
 import {
   asS3Client,
   fakeMedia,
@@ -607,4 +608,18 @@ test('every error code has been placed: a new code must choose', () => {
     [...rows.map(([c]) => c), ...elsewhere.map(([c]) => c), ...NOT_READ].sort(),
     [...RESIZE_ERROR_CODES].sort(),
   );
+});
+
+test('the README Error codes table states what this file audits', () => {
+  const stated = Object.fromEntries(
+    errorTableRows(
+      readFileSync(new URL('../README.md', import.meta.url), 'utf8'),
+    ).map((row) => [row.code, row.retryable]),
+  );
+  const audited = Object.fromEntries([
+    ...rows.map(([code, retryable]) => [code, `\`${retryable}\``]),
+    ...elsewhere.map(([code, retryable]) => [code, `\`${retryable}\``]),
+    ...NOT_READ.map((code) => [code, '—']),
+  ]);
+  assert.deepEqual(stated, audited);
 });

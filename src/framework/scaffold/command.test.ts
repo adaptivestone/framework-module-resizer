@@ -271,6 +271,15 @@ describe('runScaffold — idempotency & --force', () => {
     assert.equal(await read(MODEL), beforeContent);
   });
 
+  test('a space sets each status off from its path, after the longest status too', async () => {
+    await run([]);
+    const { out } = await run([]);
+    assert.match(out, /^exists \(skipped\) +src\/resizer\.ts$/m);
+    for (const line of out.split('\n')) {
+      assert.doesNotMatch(line, /^exists \(skipped\)\S/, line);
+    }
+  });
+
   test('--force overwrites an existing file', async () => {
     await run([]);
     await writeFile(join(root, MODEL), '// hand-edited\n');
@@ -793,6 +802,15 @@ describe('runScaffold — --help', () => {
     assert.match(out, /resize-scaffold/);
     assert.equal(await exists(RESIZER), false);
   });
+
+  test('it says --no refuses to install, since npx still looks the name up', async () => {
+    const { out } = await run(['--help']);
+    assert.match(
+      out,
+      /--no refuses to install a package of that name from the registry/,
+    );
+    assert.doesNotMatch(out, /refuses to fetch/);
+  });
 });
 
 describe('runScaffold — --agents pointer', () => {
@@ -1294,7 +1312,7 @@ describe('runScaffold — local storage', () => {
     );
   });
 
-  test('the usage names one invocation, after the install, in the form that cannot fetch', async () => {
+  test('the usage names one invocation, after the install, in the form that cannot install', async () => {
     const { out } = await run(['--help']);
     assert.match(
       out,
@@ -1311,6 +1329,9 @@ describe('runScaffold — local storage', () => {
     const sources = [
       join(repo, 'README.md'),
       join(repo, 'AGENTS.md'),
+      join(repo, 'UPGRADING.md'),
+      join(repo, 'RELEASE.md'),
+      join(repo, 'CHANGELOG.md'),
       fileURLToPath(new URL('./command.ts', import.meta.url)),
       ...(await readdir(templates)).map((name) => join(templates, name)),
     ];

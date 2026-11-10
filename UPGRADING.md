@@ -1,4 +1,208 @@
-# Host adoption required for nested storage refs
+# Upgrading `@adaptivestone/framework-module-resize`
+
+Read the section for the version you are on, and every section above it, in order from the bottom up:
+a host on 0.2.x reads both. This file says what a host may have to do. Every change is in the
+[changelog](./CHANGELOG.md).
+
+## From 0.3.x to 0.4.0
+
+Stored previews do not regenerate on this upgrade. Deploy the API and the workers together.
+
+Push delivery is new in this release. It is optional and a preview, so it is not an upgrade step: see
+[Push delivery (preview)](./README.md#push-delivery-preview).
+
+### Before you run `npm i`
+
+**Move `@aws-sdk/client-s3` off 3.729 to 3.734.** They are out of the peer range. On them
+`limits.sourceBytes` and `adoptOriginal({ maxBytes })` run after the read, so a 3 GB object is in
+memory before it is refused. npm's default resolver stops a host pinned to one of them (`ERESOLVE`),
+so the install below fails. Nothing else does: `--legacy-peer-deps`, `--force`, pnpm and yarn install
+them, and the module does not check the version at run time. Move to 3.735 or later.
+
+**Add `await getResizer().verify()` after `Server.init()` (or `startServer()`).** 0.3.0 accepted the
+settings below, and 0.4.0 refuses them. Unless a row says otherwise, a refusal from a config file
+comes at first use or `verify()`. On a framework host with no boot `verify()`, the first `resolve()`
+logs it once as an `error`, and every read then serves nothing, with no further line: **previews
+stored earlier stop being served until the value is fixed.** A quiet log after that line is not a
+recovery. `verify()` does not run steps, so it says
+nothing about them: see [Pipeline steps](#pipeline-steps).
+
+| Setting | Code | Fix |
+|---|---|---|
+| An S3 `storage.publicUrl`, which 0.3.0 ignored, so previews used the bucket's own URL. The `S3Storage` option `publicUrl` throws at construction. A `'local'` section still ignores the key, with no error | `RESIZE_CONFIG_REMOVED_KEY` | Use `publicBaseUrl`. Check the URLs it gives: the value 0.3.0 ignored applies now |
+| `leaseMs`, `idlePollMs` or `taskTimeoutMs` above `2147483647`, the longest a Node timer takes. A `leaseMs` of 24.8 to 49.7 days ran on 0.3.0 | `RESIZE_CONFIG_QUEUE_LEASE_INVALID` or `RESIZE_CONFIG_QUEUE_INVALID` | Lower it. A task queue passed in code keeps serving stored previews, queues nothing, and logs once per queue name |
+| `new LogMetrics(logger, { summaryIntervalMs })` above `2147483647` | `RESIZE_METRICS_INVALID`, at construction | Lower it |
+| `limits.processingTimeoutSeconds` above `3600`, where every Sharp call threw | `RESIZE_CONFIG_INVALID` | Lower it |
+| `rootDir: ''`, `privateRootDir: ''`, or a whitespace-only root. `new LocalFsStorage()` throws at construction | `RESIZE_CONFIG_INVALID` | Write `'.'` for `''`: it is the same folder |
+| An `engine` or `decoders` key in a config. `decoders` was dropped silently, so those decoders never ran | `RESIZE_CONFIG_INVALID` | Pass each as an option, in code |
+| An id in `formats`, or an `encode.formats` entry you wrote, that the engine does not write: `jxl` on the prebuilt Sharp binaries, or an id in another case, such as `JPG` | `RESIZE_ENGINE_FORMAT_UNSUPPORTED`, from `verify()` and worker start only | Remove the entry, or rename the id, which regenerates its previews |
+
+Then upgrade, and go through the rest of this list:
+
+```bash
+npm i @adaptivestone/framework-module-resize
+```
+
+### Limits
+
+- **`limits.sourceBytes` is new, default 256 MiB.** A host that raised `upload.maxBytes` above it has
+  such uploads refused (`RESIZE_ORIGINAL_TOO_LARGE`), and tasks for larger stored originals are dead
+  at once (`RESIZE_SOURCE_TOO_LARGE`). Raise it too. `verify()` logs a warning naming both. It is not
+  signed, so nothing regenerates.
+- **A damaged source now fails.** `limits.failOn` defaults to `'error'`: a cut or unreadable original
+  is dead on its first delivery (`RESIZE_SOURCE_DAMAGED`), where 0.3.0 rendered a garbled preview.
+  `'none'` restores 0.3.0's rendering. Previews already made stay fresh; to find them, see **Damaged
+  originals** in [Operations](./README.md#operations).
+- **`generate()` on a cut JPEG** rejects with `ResizeMediaError`, not `ResizeGenerateError`, so a
+  handler catching only `ResizeGenerateError` returns 500 on a user's upload. Catch `ResizeError`, or
+  refuse the file at upload with `upload.verify: 'decode'`.
+- **Upload routes that branch on a code.** A decoder failure during `inspect` that is not about the
+  bytes is `RESIZE_ORIGINAL_INSPECT_FAILED` (`retryable: true`), where it was
+  `RESIZE_ORIGINAL_INVALID`. Sharp's pixel limit is `RESIZE_SOURCE_TOO_LARGE` at decode and
+  `RESIZE_ORIGINAL_TOO_MANY_PIXELS` at upload.
+
+### Schemas and custom drivers
+
+- **Strict preview rows need more fields.** A hand-written schema that declares rows as strict
+  sub-documents must now declare `sizeKey`, `format` and `contentType` (each `{ type: String }`) and
+  `storageRef` (`{ type: 'Mixed' }`), beside `identity`, `origin` and `encodeSig`, or `verify()` throws
+  `RESIZE_MONGO_MEDIA_MODEL_OUTDATED`. Spreading `resizeMediaSchemaFragment` already has them.
+- **A media store that loses a field now dead-letters.** After its writes the worker compares the rows
+  it reads back. A custom `MediaStore`, a `findOneAndUpdate` middleware or a strict row schema that
+  loses `storageRef`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType`, `resizer`, `pipeline`
+  or `filters` gets `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), where it rendered again on every
+  read with no log line. Store those fields as given.
+- **A `findOneAndUpdate` pre hook on the media model** that calls `this.where({ $or })` replaces the
+  store's guard on the dimension write, with no error. Use `this.and([...])`.
+- **A custom model-shaped `MongoMediaModel`** gets `$or`, `$not` and `$type` in the filter of the
+  dimension write, where it got `{ _id }`, and `strictQuery: false` in its options. Accept them, as
+  it accepts the update pipeline of `replacePreviews`. A Mongoose model needs nothing.
+- **A host decoder's originals are private** unless the decoder sets `publicOriginals: true`
+  (`RESIZE_ORIGINAL_PUBLIC_REFUSED`). A raster it marks `premultiplied` now converts in plain JS, which
+  blocks the event loop (182 ms at 24 MP): that matters for `generate()` on an API route.
+- **A custom `download()`** that resolves with anything but bytes gets
+  `RESIZE_STORAGE_DOWNLOAD_INVALID`, where it was a raw `TypeError` or a garbled decode.
+- **Types.** `upload.verify`, `limits.failOn` and `limits.sourceBytes` are required in the config type,
+  so a host file with a hand-written `upload` or `limits` fails `tsc`: spread the defaults. A complete
+  config passed to `new Resizer` must hold them. `FrameworkStorageConfig`,
+  `FrameworkLocalStorageConfig` and `FrameworkS3StorageConfig` are gone (`TS2305` or `TS2724`; TypeScript
+  may suggest `FrameworkWorkerConfig`, which is another type): use `StorageConfig`, `LocalStorageConfig`
+  and `S3StorageConfig`.
+
+### Pipeline steps
+
+`variantSteps` now take and return a `Raster`, as `beforeSteps` do. TypeScript rejects an old step. In
+plain JavaScript it fails with `img.composite is not a function`, its variant fails, and the task
+retries. An old step with a `typeof img.composite === 'function'` check or a
+`try { } catch { return img; }` raises no error and renders with no watermark, so search for those
+too. A step that resolves with a `Buffer` or a Sharp instance fails with
+`RESIZE_PIPELINE_STEP_INVALID`. `verify()` does not run steps, and stored previews stay, so a broken
+step shows only on new media or new sizes: check the logs after the first upload.
+
+```ts
+variantSteps: [(img) => img.composite([{ input: logo, gravity: 'southeast' }])], // before
+variantSteps: [async (r) => sharpToRaster(rasterToSharp(r).composite([{ input: logo, gravity: 'southeast' }]))], // now
+```
+
+A logo larger than a preview on either side fails on both forms (`Image to composite must have same
+dimensions or smaller`): fit it first, as **Pipelines** in the
+[Config reference](./README.md#config-reference) shows.
+
+What `img.metadata()` gave is in `raster.info`: `width`, `height`, `channels`. `hasAlpha` is
+`channels === 2 || channels === 4`.
+
+- **Memory, for a pipeline with a step only.** A worker holds a copy of the size's pixels and the step's
+  result per variant in progress. Measured with one `composite` step at the default `concurrency` of 4
+  on a 24 MP JPEG, at 5000, 4000, 3000 and 2000 wide, in JPEG and WebP: about 975 MB peak RSS against
+  about 590 MB on 0.3.0. At 1920 wide and below: about 185 MB against 130 MB. On a 24 MP PNG with
+  alpha at 5000 to 2000 wide: about 1.9 GB against about 1.5 GB. A pipeline without steps pays
+  nothing. Size worker containers before you deploy.
+- **What a rewritten step writes.** Stored previews stay, and only new previews change. Look at the
+  first ones, and bump the pipeline's `version` to remake the old ones. A single `composite` writes the
+  same files on an opaque source and on every format that keeps alpha. On a flattened format and a
+  transparent source it can move partly transparent pixels by at most 2 levels before the JPEG encoder,
+  up to 20 of 255 measured in the JPEG. Any other step can differ:
+  - on a transparent source and a flattened format, the step runs before the flatten, where Sharp ran
+    it after (`negate()` also negates alpha: use `negate({ alpha: false })`);
+  - several steps run in order, each on the last one's result, where 0.3.0 gathered them in one Sharp
+    chain, in which a second `composite`, `blur` or `resize` replaced the first;
+  - with no error: `greyscale()` on a transparent source loses alpha, and a JPEG then shows black there
+    (use `modulate({ saturation: 0 })`), `toColourspace('b-w')` stays in colour, and metadata calls in
+    a step do nothing.
+- **New previews of a step you did not touch.** A `beforeStep` that returns
+  `toBuffer({ resolveWithObject: true })` no longer shifts colours. A step that adds transparency to an
+  opaque preview now gets the `encode.flatten` background, where a JPEG came out black. Bump the
+  pipeline's `version` to remake stored ones.
+- **Time limit.** Sharp work in a step that does not go through `rasterToSharp`
+  (`sharp(raster.data, { raw: raster.info })`, or a raster spread into a new object) has no limit, where
+  0.3.0 held it under `limits.processingTimeoutSeconds`. It can starve other tasks.
+
+### Operations
+
+- **Alerts.** The worker logs a retried failure at `warn` and a dead task at `error`, whatever the
+  metrics sink. A failed variant's line is now a `warn`, so alert on `error` or on `is dead`.
+- **A log search on old words.** Eager failures say `resize generate:`, not `resize worker:`. Messages
+  about formats say `format id`, not `Sharp format id`.
+- **A worker that consumes nothing exits 1.** Disabled, or with no task queue on any Resizer, the
+  command resolves `false`, so a CLI entry that forwards the result exits 1. Do not deploy the command
+  with the flag off.
+- **`retryable` changed.** `ResizeOriginalError` and `ResizeConfigError` default to `false`.
+  `RESIZE_TASK_MAX_ATTEMPTS`, `RESIZE_MEDIA_NO_ID` and `RESIZE_SIZE_INVALID` are now `false`.
+  `RESIZE_WORKER_INCOMPLETE` and `RESIZE_GENERATE_FAILED` are `false` when every variant failed with
+  `false`, and a storage refusal from a preview upload now counts as such a failure, so the task is dead
+  at once, where it was retried. A missing object is `RESIZE_STORAGE_NOT_FOUND` from both shipped
+  drivers. The current values are in [Error codes](./README.md#error-codes).
+- **`npx --no -- resize-scaffold --check` reports nothing new** on a host scaffolded by 0.3.0, and an
+  ejected model written by 0.3.0 stays current. A config it leaves alone keeps
+  `publicBaseUrl: '/media'`: re-scaffolding writes the new shape, with an explicit `privateRootDir`, so
+  an override that moves `rootDir` must then move it too.
+- **Add `/var/` to `.gitignore`** on a host scaffolded by 0.3.0. With the scaffold's local storage,
+  its private originals sit under `./var/media-private`, and no rule keeps them out of git. Append
+  it at the end of `.gitignore`: a `/var/` above a `!var/`, `!/var/` or `!**/var` line leaves the
+  originals unignored. `git check-ignore var/media-private/x` prints the path when the rule works.
+  Files already committed stay tracked: if `git ls-files var` lists any, run
+  `git rm -r --cached var` (it keeps them on disk) and commit. The 0.4.0 scaffold adds the rule
+  only in the run that writes a config, and `--check` does not report it.
+- **The scaffold's spelling is `npx --no -- resize-scaffold`.** Without `--no`, a run with the package
+  missing installs and runs whatever the registry holds under that name. Without the `--`, npm takes the options
+  for itself.
+- **Debug lines.** `FrameworkResizer`'s default sink writes none: pass
+  `new LogMetrics(logger, { debug: true })` to keep them.
+
+### Visible without a change
+
+These need no code change. A strict response schema, an API snapshot test or an alert on any
+`error` line sees them:
+
+- **`formatPictureUrls` entries carry `width` and `height`** when the stored row has them:
+  `{ url, contentType, width, height }`. A size key does not promise a size.
+- **A read can log one `warn` per Resizer** for a media loaded without the module's fields
+  (`resize resolve: media … was loaded without its stored …`): add `...resizeMediaPaths` to the
+  query's projection.
+- **The database queue checks the gate index** in the background after the first added task, and
+  logs one `error` line when it is missing (`… has no gate index …`, ending in
+  `(code RESIZE_MONGO_INDEX_MISSING, logged once)`): create it through your migration.
+
+### A sweep written from the 0.3.0 docs
+
+The 0.3.0 docs said to delete preview objects no row references, with no age rule. Such a sweep can
+delete the file of a row about to be written. A read still calls that row ready, neither stale nor
+missing, so nothing renders it again and its URL fails.
+
+- Fix the sweep: list the objects first and read the rows after, leave out every `original.storageRef`
+  (an adopted public original sits in the same bucket), and delete only objects older than a day and
+  more than twice `taskTimeoutMs`, by S3 `LastModified` or file mtime.
+- Repair the damage: for a media whose preview URL fails, call `invalidate()` on it. Its rows go, and
+  the next read or `prewarm()` queues them again.
+- Use `onPreviewReplaced` for prompt deletes if you like, but keep the sweep if every file must go: a
+  report is delivered at most once.
+
+## From 0.2.x to 0.3.0
+
+A host on a 0.3.0 release candidate needs only what came after its rc: see
+[Upgrading from a release candidate](#upgrading-from-a-release-candidate).
+
+### Nested storage refs
 
 This package changes the persisted resize fields from flat `key`/`bucket` fields to
 `original.storageRef` and `previews[].storageRef`. It has no reader or migration for
@@ -33,17 +237,7 @@ survive persistence. Framework `BaseModel` already supplies this default; direct
 Mongoose schemas must set it explicitly. The field fragment alone cannot configure
 the enclosing schema's options.
 
-## Installing
-
-```bash
-npm i @adaptivestone/framework-module-resize
-```
-
-A host on 0.2.x reads every section below. A host on a 0.3.0 release candidate needs only what
-came after its rc: see [Upgrading from a release candidate](#upgrading-from-a-release-candidate).
-`CHANGELOG.md` (`# 0.3.0`) has the details of everything below.
-
-## Named queues: from `queue: { … }` to `queues`
+### Named queues: from `queue: { … }` to `queues`
 
 Each queue is now defined once, by name, in the process-wide `queues` map of
 `src/config/resize.ts`, with its own timing. Each Resizer's config file names its queue with
@@ -166,7 +360,25 @@ export default {
   `RESIZE_CONFIG_QUEUE_TIMING_CONFLICT` is gone: a queue is defined once, so two files can no longer
   disagree about its timing.
 
-## Six things to know after the upgrade
+### Removed keys
+
+Each fails with `RESIZE_CONFIG_REMOVED_KEY`, and the message says where the value goes.
+
+| Old key | Use instead |
+|---|---|
+| `webpAvifOnly: true` | `formats: ['webp', 'avif']` |
+| `encode.quality.<format>`, `encode.effort.<format>` | `encode.formats.<format>.quality`, `encode.formats.<format>.effort` |
+| `encode.mozjpeg`, `encode.chromaSubsampling` | `encode.formats.jpeg.mozjpeg`, `encode.formats.jpeg.chromaSubsampling` |
+| `encode.flattenBackground` | `encode.flatten.background` |
+| `worker.concurrency` | the top-level `concurrency` |
+| `queue` and `worker` in a config passed to `new Resizer` | timing goes to the task queue's `timing`; framework hosts define queues in `queues` and keep `worker` in `src/config/resize.ts` |
+| `queue: { driver, … }` in a framework config file | `queues: { default: { driver, … } }` in `src/config/resize.ts`, and `queue: 'default'` |
+| `queue.queues: { bulk: url }` (SQS), `queues.<name>.queues` | one `queues` entry per name: `bulk: { driver: 'sqs', queueUrl: url, … }` |
+| `queue.lockTtlMs` (or `queues.<name>.lockTtlMs`, or a task queue's `timing.lockTtlMs`) | `coordination`: `dispatch` → `gateTtlMs` (a different lock: the old one held one variant for 60 s, the new one holds a queued task's media; set it to your worst queue wait), `failed` → `cooldownMs`; drop `worker` |
+| `npm run cli ResizeWorker -- --config=<name>`, `runResizeWorker({ configName })` | nothing: the worker reads `worker` and `queues` from `src/config/resize.ts` |
+| An S3 `storage.publicUrl`, or the `S3Storage` option `publicUrl` | `publicBaseUrl` |
+
+### Six things to know after the upgrade
 
 1. **`resize-scaffold --check` reports drift right after the upgrade.** It does so for every
    `src/config/resize.ts`, and every `resize.<NODE_ENV>.ts` override of it, scaffolded by an
@@ -175,11 +387,12 @@ export default {
    `configName` file is not checked), and for every ejected `ResizeTask` model. This is intended.
    To clear it:
    - rewrite the config to the new shape (above), or move it aside, re-run
-     `npx resize-scaffold` and copy your settings back;
+     `npx --no -- resize-scaffold` and copy your settings back;
    - add `startedAt: { type: Date }` and `finishedAt: { type: Date }` to an ejected model, or
-     move `src/models/ResizeTask.ts` aside (or delete it), re-run `npx resize-scaffold --eject`,
-     then restore your customizations (the scaffold never overwrites a file, so re-running `--eject`
-     alone changes nothing). Without them the model keeps working, but loses the two times.
+     move `src/models/ResizeTask.ts` aside (or delete it), re-run
+     `npx --no -- resize-scaffold --eject`, then restore your customizations (the scaffold never
+     overwrites a file, so re-running `--eject` alone changes nothing). Without them the model keeps
+     working, but loses the two times.
 2. **A custom model-shaped `MongoMediaModel` must accept an update pipeline.** `replacePreviews`
    (which `invalidate` uses) calls `findOneAndUpdate` with an array update and
    `{ updatePipeline: true, returnDocument: 'before', lean: true, projection: { previews: 1 } }`,
@@ -210,9 +423,9 @@ export default {
      until its replacement is stored, and regenerated on its next read, `prewarm()` or
      `generate()`. The old files stay in storage, since the module never deletes them: plan the
      storage cost and clean them up (in an `onPreviewReplaced` observer, from the "resize: replaced
-     … outdated preview(s)" log line, or with a sweep of preview objects no row references, deleting
-     only objects older than a day and more than twice `taskTimeoutMs`; see "Freshness" in
-     `README.md`).
+     … outdated preview(s)" log line, or with a sweep: list the objects first and read the rows
+     after, leave out every `original.storageRef`, and delete only objects older than a day and more
+     than twice `taskTimeoutMs`; see "Freshness" in `README.md`).
    - The same holds after any change of image settings or of a pipeline `version`. That
      regeneration wave shares the queue with new uploads' previews: plan worker capacity for it.
    - Roll out image settings and pipeline versions to every worker at once (or after the old
@@ -221,7 +434,7 @@ export default {
    - Rows without an `identity` are never removed by `invalidate` or `replacePreviews`, and a sweep
      never finds their files; the host deletes those rows and files itself.
 
-## Other changes a host must make for 0.3.0
+### Other changes a host must make for 0.3.0
 
 - Construct the Resizer with `new FrameworkResizer({ pipelines, hooks })` in
   `src/resizer.ts`, and move `storage` and the queues into `src/config/resize.ts`
@@ -255,8 +468,8 @@ export default {
   framework CLI with `autoIndex` off, so it never builds the indexes: they must
   exist before the first worker starts.
 - Regenerate the model shim, which now imports `…/framework/ResizeTaskModel.js`:
-  delete `src/models/ResizeTask.ts` and re-run `npx resize-scaffold` (`--force`
-  would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or
+  delete `src/models/ResizeTask.ts` and re-run `npx --no -- resize-scaffold`
+  (`--force` would also overwrite `src/resizer.ts` and `src/config/resize.ts`). An ejected or
   hand-written model must add the `resizer`, `queue`, `availableAt`, `active` and
   `cooldownUntil` fields, the claim index and the gate index;
   `resize-scaffold --check` and `resizer.verify()` report a model without the fields
@@ -373,7 +586,7 @@ export default {
   of them, whatever their own queue (else `RESIZE_QUEUE_SHARED_RESIZER_UNLISTED`).
   `npm run cli ResizeWorker` serves every Resizer and is not affected.
 
-## Pipeline steps and decoders
+### Pipeline steps and decoders
 
 - `beforeSteps` receive and return a `Raster`, for every source kind:
   `(raster, { media, source, scale, ctx }) => Raster`. `raster` is the decoded
@@ -396,12 +609,12 @@ export default {
   raster source a step sees the upright original at its own size; for a vector
   source (SVG) the pixels can be larger, so multiply coordinates stored in the
   source's units by `meta.scale`.
-- `variantSteps` keep their Sharp instance, now over each size's pixels:
-  `metadata()` reports the preview (`format: 'raw'`, no EXIF, ICC profile, density
-  or orientation; `hasAlpha` as the sized pixels have it), a step's `resize()`
-  resizes the preview, and operations Sharp used to apply before its resize (such
-  as `trim()`) now apply to the preview. A raster form waits for a release that
-  puts the image engine behind a port.
+- `variantSteps` keep their Sharp instance, now over each size's pixels (0.4.0
+  changes that again: see [Pipeline steps](#pipeline-steps)): `metadata()` reports
+  the preview (`format: 'raw'`, no EXIF, ICC profile, density or orientation;
+  `hasAlpha` as the sized pixels have it), a step's `resize()` resizes the preview,
+  and operations Sharp used to apply before its resize (such as `trim()`) now apply
+  to the preview.
 - With `animated: true`, an animation keeps its frames only for a pipeline with
   neither `beforeSteps` nor `variantSteps`; `beforeSteps` receive its first frame.
 - With `beforeSteps`, a worker holds the decoded source as raw pixels plus a step's
@@ -423,7 +636,7 @@ export default {
   `RESIZE_ORIGINAL_FORMAT_UNSUPPORTED` now means that no decoder reads the
   uploaded bytes.
 
-## Upgrading from a release candidate
+### Upgrading from a release candidate
 
 0.3.0 was published first as release candidates, under the npm tag `next`. A host on one of them
 needs only what came after its rc. 0.3.0 itself changed nothing a host sees after `0.3.0-rc.5`.
@@ -459,17 +672,18 @@ regenerate on their next read. So, for a host on an earlier rc:
 
 - plan worker capacity and storage for that wave, which shares the queue with new uploads;
 - clean up the old files, which the module never deletes (in an `onPreviewReplaced` observer, from
-  the "resize: replaced … outdated preview(s)" log line, or with a sweep of preview objects no row
-  references, deleting only objects older than a day and more than twice `taskTimeoutMs`; see
-  "Freshness" in `README.md`);
+  the "resize: replaced … outdated preview(s)" log line, or with a sweep: list the objects first and
+  read the rows after, leave out every `original.storageRef`, and delete only objects older than a
+  day and more than twice `taskTimeoutMs`; see "Freshness" in `README.md`);
 - roll out image settings and pipeline versions with every worker at once (or after the old
   workers have stopped): two worker versions with different settings re-make each other's rows,
   and each replaced preview costs one render, one upload and one orphaned file;
 - a custom `MediaStore` must save `backfillDims` in `appendPreviews`, also with `previews: []`.
 
 `0.3.0-rc.5` removed and renamed nothing: it widened two types (the `NoopMetrics` parameters, and
-the timing keys of a custom queue driver's `queues` entry; see Fixes in `CHANGELOG.md`), and every
-public object `S3Storage` uploads (previews and public raster originals, and your own direct
+the timing keys of a custom queue driver's `queues` entry; see Fixes in the
+[changelog](./CHANGELOG.md)), and
+every public object `S3Storage` uploads (previews and public raster originals, and your own direct
 uploads, which must use new keys) carries `Cache-Control: public, max-age=31536000, immutable`, so
 purge your CDN when you delete one that must disappear sooner (browsers that already have it may
 keep it until it expires).

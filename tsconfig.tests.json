@@ -9,6 +9,7 @@
   "include": [
     "src/**/*.ts",
     "smokeTest.ts",
+    "checkDocLinks.ts",
     "preBuild.ts",
     "postBuild.ts",
     "bench/**/*.ts"
