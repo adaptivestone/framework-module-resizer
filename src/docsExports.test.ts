@@ -280,6 +280,7 @@ test('the terminal-code scan reads every decoder and driver file, and the consum
 test('the README lists exactly the codes a task is dead-lettered with at once', () => {
   const expected = [
     'RESIZE_MEDIA_NO_ID',
+    'RESIZE_MEDIA_ROW_NOT_KEPT',
     'RESIZE_NO_ORIGINAL',
     'RESIZE_SIZE_INVALID',
     'RESIZE_SOURCE_DAMAGED',

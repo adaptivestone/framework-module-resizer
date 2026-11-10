@@ -7,15 +7,15 @@
 // once on that raster, which is then reduced to the box of the plan made from their result; each
 // exact size is resized once and each format encoded from it, then uploaded (bounded by
 // config.concurrency); one PreviewRecorder persist appends the new rows and replaces the stale ones
-// in one write each, and onPreviewGenerated fires over the rows it kept. The sizes come from the
-// pure plan (plan.ts), the pixel work from render.ts, and a source kind needs only a decoder: the
-// Processor itself imports no image engine. It also fires the task observers, and invalidate()
-// removes stored previews for `resizer.invalidate` (one media store write). It takes no locks: the
-// queue leases a task to one worker at a time, the lease token fences the task's writes, and the
-// media store keeps one row per preview identity when an expired lease lets two workers render the
-// same variant. Each variant is timed from its encode to the end
-// of its upload and recorded on the metrics sink once the persist says what became of it. It takes
-// its parts explicitly and knows no Resizer.
+// in one write each, onPreviewGenerated fires over the rows it kept, and onPreviewReplaced over the
+// rows it removed. The sizes come from the pure plan (plan.ts), the pixel work from render.ts, and a
+// source kind needs only a decoder: the Processor itself imports no image engine. It also fires the
+// task observers, and invalidate() removes stored previews for `resizer.invalidate` (one media store
+// write). It takes no locks: the queue leases a task to one worker at a time, the lease token fences
+// the task's writes, and the media store keeps one row per preview identity when an expired lease
+// lets two workers render the same variant. Each variant is timed from its encode to the end of its
+// upload and recorded on the metrics sink once the persist says what became of it. It takes its
+// parts explicitly and knows no Resizer.
 import type { Catalog } from './catalog.ts';
 import type {
   DecodeBox,
@@ -58,8 +58,12 @@ import {
 } from './plan.ts';
 import {
   checkReplaced,
+  describeRef,
   PreviewRecorder,
+  type RowNotKept,
   requireReplacePreviews,
+  rowsNotKept,
+  rowsWithoutIdentity,
 } from './previewRecorder.ts';
 import { checkRaster } from './raster.ts';
 import {
@@ -399,6 +403,38 @@ function signedLocator(ref: StorageRef): StorageRef {
 }
 
 /**
+ * A written row as the store check will compare it, with its nested ref and filters copied too:
+ * the taps get the row itself, and may change it. A row that cannot be copied stays as it is: the
+ * write is done, so this must not fail the call, and the check skips what it cannot read.
+ */
+function writtenRow(row: Preview): Preview {
+  try {
+    return {
+      ...row,
+      storageRef: copyLocator(row.storageRef),
+      ...(row.filters
+        ? { filters: copyLocator(row.filters) as Preview['filters'] }
+        : {}),
+    };
+  } catch {
+    return row;
+  }
+}
+
+/**
+ * A removed row's ref as generate() reports it, copied: none when the store's row holds no ref or
+ * cannot be read, since the write is done and only that row is affected.
+ */
+function readableRef(row: Preview): StorageRef[] {
+  try {
+    const ref = copyLocator(row.storageRef);
+    return ref == null ? [] : [ref];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * What a render reads of the original, taken once: `original` holds the driver's copy of the
  * locator (download and upload parent), `signed` the same original with the locator in the form
  * every signature of this render is computed from.
@@ -585,8 +621,8 @@ const OBSERVER: Record<TaskEvent, ObserverName> = {
 
 // ---------------------------------------------------------------------------
 // The shared core. Both modes expand their inputs into a `requested` MissingPreview[] and call
-// #renderPending. `persist` toggles the single appendPreviews + onPreviewGenerated firing
-// (eager `persist:false` returns raw).
+// #renderPending. `persist` toggles the single appendPreviews + the onPreviewGenerated and
+// onPreviewReplaced firing (eager `persist:false` returns raw).
 // ---------------------------------------------------------------------------
 
 interface RenderPendingArgs {
@@ -604,10 +640,15 @@ interface RenderPendingArgs {
 interface RenderPendingResult {
   // Previews this call stored (or, with persist:false, produced).
   generated: Preview[];
+  // Copies of the rows of `generated`, and of those the store left out although it holds no row of
+  // their identity (its answer can already lack the field it lost), as they were before any
+  // observer ran. Empty without a persist.
+  written: Preview[];
   failedCount: number;
-  // The stored rows the persist replaced (outdated, or a concurrent row of the same identity), and
-  // the identities of the stored previews that replaced them.
-  removed: Preview[];
+  // The refs of the stored rows the persist replaced (outdated, or a concurrent row of the same
+  // identity), but not a ref a row of this write or the original holds, and the identities of the
+  // stored previews that replaced them.
+  removedRefs: StorageRef[];
   replaced: Set<string>;
   // What each failed variant failed with, by identity, in the order they failed.
   failures: Map<string, unknown>;
@@ -655,6 +696,10 @@ export class Processor {
   readonly #warnedAllFresh = new Set<string>();
   // Whether a media store that dropped the dimension backfill was warned about.
   #warnedBackfill = false;
+  // Whether a media store that kept rows without their identity was warned about.
+  #warnedIdentity = false;
+  // Whether a check of what the store kept that failed was logged.
+  #warnedKeptCheck = false;
 
   constructor(deps: ProcessorDeps) {
     this.#deps = deps;
@@ -710,7 +755,7 @@ export class Processor {
       failedCount,
       failures,
       finalFailures,
-      removed,
+      removedRefs,
       replaced,
       backfilled,
     } = await this.#renderPending({
@@ -758,16 +803,15 @@ export class Processor {
     return {
       created: generated,
       failed: failedCount,
-      ...(removed.length > 0
-        ? { replaced: removed.map((row) => row.storageRef) }
-        : {}),
+      ...(removedRefs.length > 0 ? { replaced: removedRefs } : {}),
     };
   }
 
   /**
-   * The dimensions the persist recorded, set on the caller's in-memory original too, so a
-   * same-request resolve() can prove the new rows fresh. The store has them already, so an
-   * original that cannot be changed (a frozen one, say) is only logged.
+   * The dimensions the persist sent to the store, set on the caller's in-memory original too, so a
+   * same-request resolve() can prove the new rows fresh. The store usually holds them already, but
+   * not after an original swapped in during the render, which keeps its own pair. Either way the
+   * persist is done, so an original that cannot be changed (a frozen one, say) is only logged.
    */
   #setDims(
     media: MediaLike,
@@ -846,11 +890,12 @@ export class Processor {
   }
 
   /**
-   * One queued task: the core, then a check that every requested identity is stored fresh. The
-   * worker loop (src/consumer.ts) runs it through the worker; it SUCCEEDS by returning and FAILS by
-   * throwing (which engages the queue's retry → dead-letter). It takes no locks: the lease keeps
-   * the task to one worker at a time, and the media store keeps one row per preview identity. It
-   * resolves how many variants the task asked for and how many this delivery stored.
+   * One queued task: the core, then a check that the store kept what this delivery wrote and that
+   * every requested identity is stored fresh. The worker loop (src/consumer.ts) runs it through the
+   * worker; it SUCCEEDS by returning and FAILS by throwing (which engages the queue's retry →
+   * dead-letter). It takes no locks: the lease keeps the task to one worker at a time, and the media
+   * store keeps one row per preview identity. It resolves how many variants the task asked for and
+   * how many this delivery stored.
    */
   async processTask(
     task: LeasedTask,
@@ -889,6 +934,7 @@ export class Processor {
     const { signed: held } = snapshotOriginal(media.original);
     const {
       generated,
+      written,
       failedCount,
       failures,
       finalFailures,
@@ -952,6 +998,23 @@ export class Processor {
         `resize worker: the media store did not record the original's dimensions of media ${task.mediaId} — every read of such a media queues a task that downloads the original; a MediaStore must save backfillDims in appendPreviews`,
       );
     }
+    // The coverage below counts this worker's own rows, so it cannot see a store that lost a field
+    // of them. Rows are compared with what was written, not with the current settings: a settings
+    // change or a swapped original is staleness, and must not raise this.
+    const notKept = this.#checkKept(task, written, refreshed);
+    if (notKept.length > 0) {
+      const fields = [...new Set(notKept.flatMap((row) => row.fields))].join(
+        ', ',
+      );
+      const rows = notKept
+        .map((row) => `${row.identity} (${row.fields.join(', ')})`)
+        .join('; ');
+      // The fields come before the row list: a dead line cuts the error's text at 1000 characters.
+      throw new ResizeSetupError(
+        `resize worker: the media store did not keep ${fields} of ${notKept.length} preview row(s) of media ${task.mediaId}, so reads may render them again and again — a MediaStore must store and return storageRef, origin, encodeSig, sizeKey, format, contentType, resizer, pipeline and filters as given: ${rows}`,
+        { code: 'RESIZE_MEDIA_ROW_NOT_KEPT', retryable: false },
+      );
+    }
     const covered = catalog.freshIdentities(
       {
         original: refreshed.original,
@@ -1004,6 +1067,46 @@ export class Processor {
       });
     }
     return { requested: requested.length, rendered: generated.length };
+  }
+
+  /**
+   * What the store did not keep of the rows this delivery wrote, with one warning per Resizer for
+   * rows it kept without their identity. It never throws: the work is done, so a check that cannot
+   * read what came back must not fail the task, which then keeps its result.
+   */
+  #checkKept(
+    task: LeasedTask,
+    written: Preview[],
+    refreshed: MediaLike,
+  ): RowNotKept[] {
+    const { logger } = this.#deps;
+    try {
+      const { previews } = refreshed;
+      if (!this.#warnedIdentity) {
+        const rows = rowsWithoutIdentity(written, previews);
+        if (rows.length > 0) {
+          this.#warnedIdentity = true;
+          logNeverThrow(
+            logger,
+            `resize worker: the media store did not keep the identity of ${rows.length} preview row(s) of media ${task.mediaId}: invalidate() finds such rows only by identity, so it leaves them, and a replacePreviews that removes by stored identity leaves them too — store and return identity as given: ${rows.join('; ')}`,
+            undefined,
+            'warn',
+          );
+        }
+      }
+      return rowsNotKept(written, previews);
+    } catch (err) {
+      if (!this.#warnedKeptCheck) {
+        this.#warnedKeptCheck = true;
+        logNeverThrow(
+          logger,
+          `resize worker: could not check what the media store kept of media ${task.mediaId}; the task keeps its result`,
+          err,
+          'warn',
+        );
+      }
+      return [];
+    }
   }
 
   /**
@@ -1086,14 +1189,17 @@ export class Processor {
 
     let generated: Preview[] = [];
     let failedCount = 0;
-    let removed: Preview[] = [];
+    let removedRefs: StorageRef[] = [];
+    let written: Preview[] = [];
+    const leftOut: Preview[] = [];
     const replaced = new Set<string>();
     const failures = new Map<string, unknown>();
     const finalFailures = new Set<string>();
     const nothing = (): RenderPendingResult => ({
       generated,
+      written: [],
       failedCount,
-      removed,
+      removedRefs,
       replaced,
       failures,
       finalFailures,
@@ -1425,7 +1531,8 @@ export class Processor {
 
     // ONE persist for everything generated: one append of the new rows (+ display-dim backfill
     // when the original never carried dims) and one replace of the stale ones
-    // (previewRecorder.ts), then fire onPreviewGenerated per stored preview (ctx {}).
+    // (previewRecorder.ts), then fire onPreviewGenerated per stored preview and onPreviewReplaced
+    // per removed row (ctx {}).
     if (persist && (generated.length > 0 || backfillDims)) {
       const recorded = await this.#recorder.record(mediaId, scope, generated, {
         backfillDims,
@@ -1458,7 +1565,6 @@ export class Processor {
         throw error;
       }
       generated = recorded.stored;
-      removed = recorded.removed;
       for (const row of generated) {
         const identity = catalog.identity(scope, row);
         if (replacing.has(identity)) {
@@ -1488,11 +1594,29 @@ export class Processor {
         } else {
           // The media store left it out and does not hold it (or the media is gone): logged by
           // the recorder, and not stored.
+          leftOut.push(row);
           recordVariant(plan.identity, plan.variant.format, ms, 'failed');
         }
       }
+      // A driver that names a file by its bytes can give a new row the ref of the row it replaced,
+      // and a preview the ref of its own original: that file is in use, so it is not reported to a
+      // host that deletes what it is told is gone. A row the store left out of its answer counts:
+      // the store may hold it all the same.
+      const live = new Set(
+        [...generated, ...leftOut, original].map(describeRef),
+      );
+      const removed = recorded.removed.filter(
+        (row) => !live.has(describeRef(row)),
+      );
+      // Read before the taps, which get these rows: a tap cannot change what generate() returns,
+      // or what the store check compares (a tap that redacts a row is no store that lost a field).
+      removedRefs = removed.flatMap(readableRef);
+      written = [...generated, ...leftOut].map(writtenRow);
       for (const preview of generated) {
         await hooks.runObservers('onPreviewGenerated', preview, {});
+      }
+      for (const row of removed) {
+        await hooks.runObservers('onPreviewReplaced', row, {});
       }
     } else if (!persist) {
       for (const { plan, row } of rendered) {
@@ -1510,8 +1634,9 @@ export class Processor {
 
     return {
       generated,
+      written,
       failedCount,
-      removed,
+      removedRefs,
       replaced,
       failures,
       finalFailures,

@@ -7,7 +7,12 @@ import { test } from 'node:test';
 import { Catalog } from './catalog.ts';
 import type { MediaStore } from './contracts/media.ts';
 import { getPreviewIdentity } from './images.ts';
-import { PreviewRecorder } from './previewRecorder.ts';
+import {
+  describeRef,
+  PreviewRecorder,
+  rowsNotKept,
+  rowsWithoutIdentity,
+} from './previewRecorder.ts';
 import { fakeMedia } from './testHelpers/fakes.ts';
 import { stampFresh } from './testHelpers/fresh.ts';
 import { makeImageConfig } from './testHelpers/resizeConfig.ts';
@@ -354,4 +359,432 @@ test('a failed append of the dimensions alone is logged as such, and returned', 
     "resize: recording the original's dimensions failed for media m1 (64×48); no uploaded preview is affected",
   );
   assert.equal(logs.error[0][1], db);
+});
+
+// A row as the worker writes it: signed.
+const signed = (sizeKey: string, key: string): Preview => ({
+  ...preview(sizeKey, key),
+  origin: 'o1',
+  encodeSig: 'e1',
+});
+
+test('rowsNotKept: a row read back as written is kept, whatever else the store added or dropped', () => {
+  const row: Preview = { ...signed('20x20', 'a'), fit: true, bytes: 5 };
+  const { fit: _fit, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [{ ...back, bytes: 6 }]), []);
+});
+
+test('rowsNotKept: no row under the ref raises nothing (a lagging reload, or a reshaped ref)', () => {
+  const row = signed('20x20', 'a');
+  for (const back of [
+    undefined,
+    null,
+    [],
+    [signed('20x20', 'other')],
+    [{ ...row, encodeSig: 'x', storageRef: { key: 'a', extra: 1 } }],
+  ]) {
+    assert.deepEqual(rowsNotKept([row], back), []);
+  }
+});
+
+test('rowsNotKept: names every field the row under the ref lost or changed, in one order', () => {
+  const row = signed('20x20', 'a');
+  const { encodeSig: _sig, origin: _origin, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [{ ...back, format: 'webp' }]), [
+    {
+      identity: row.identity as string,
+      fields: ['origin', 'encodeSig', 'format'],
+    },
+  ]);
+});
+
+test('rowsNotKept: one ref for two rows: each written row finds its own in the group', () => {
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  assert.deepEqual(rowsNotKept([a, b], [a, b]), []);
+  // The first row under the ref is another size key's: comparing with it alone is a false alarm.
+  assert.deepEqual(rowsNotKept([b], [a, b]), []);
+});
+
+test('rowsNotKept: one ref for two rows, one lost a field: that row and that field, from the closest row of the group', () => {
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  const { encodeSig: _sig, ...lost } = b;
+  assert.deepEqual(rowsNotKept([a, b], [a, lost]), [
+    { identity: b.identity as string, fields: ['encodeSig'] },
+  ]);
+});
+
+test('rowsNotKept: a read-back row without a ref, and a ref JSON cannot encode, do not throw', () => {
+  const big: Preview = { ...signed('20x20', 'a'), storageRef: { n: 1n } };
+  const noRef = { sizeKey: '20x20' } as Preview;
+  assert.deepEqual(rowsNotKept([big], [noRef, big]), []);
+});
+
+test('rowsNotKept: a read finds a row by its resizer, pipeline and filters too', () => {
+  const row: Preview = {
+    ...signed('20x20', 'a'),
+    resizer: 'listings',
+    pipeline: 'x',
+    filters: { blur: 2, mode: 'soft' },
+  };
+  const { resizer: _r, pipeline: _p, filters: _f, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [back]), [
+    {
+      identity: row.identity as string,
+      fields: ['resizer', 'pipeline', 'filters'],
+    },
+  ]);
+  // Another key order and an absent default say nothing.
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, filters: { mode: 'soft', blur: 2 } }]),
+    [],
+  );
+  const { resizer: _d, pipeline: _e, ...plain } = signed('20x20', 'b');
+  assert.deepEqual(rowsNotKept([signed('20x20', 'b')], [plain]), []);
+});
+
+test('rowsNotKept: a row that lost its contentType cannot be served, so it is named', () => {
+  const row = signed('20x20', 'a');
+  const { contentType: _type, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [back as Preview]), [
+    { identity: row.identity as string, fields: ['contentType'] },
+  ]);
+});
+
+test("rowsNotKept: a contentType in the store's own form still serves the row, so only losing it counts", () => {
+  const row = signed('20x20', 'a');
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, contentType: 'IMAGE/JPEG' }]),
+    [],
+  );
+  assert.deepEqual(rowsNotKept([row], [{ ...row, contentType: '' }]), [
+    { identity: row.identity as string, fields: ['contentType'] },
+  ]);
+});
+
+test('rowsNotKept: identity does not decide: absent, null or in its own form, the row is kept', () => {
+  const row = signed('20x20', 'a');
+  const { identity: _identity, ...absent } = row;
+  for (const back of [
+    absent,
+    { ...row, identity: null },
+    { ...row, identity: 'own/20x20' },
+  ]) {
+    assert.deepEqual(rowsNotKept([row], [back as Preview]), []);
+  }
+});
+
+test('rowsNotKept: the group rule picks a row by what a read uses, not by identity', () => {
+  const noIdentity = ({ identity: _identity, ...row }: Preview) =>
+    row as Preview;
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  assert.deepEqual(rowsNotKept([a, b], [noIdentity(a), noIdentity(b)]), []);
+  // Another size key's row differs in one field too, sizeKey, but a read would never take it for
+  // this row: the row of this size key decides.
+  const { encodeSig: _sig, ...lost } = noIdentity(b);
+  assert.deepEqual(rowsNotKept([b], [noIdentity(a), lost as Preview]), [
+    { identity: b.identity as string, fields: ['encodeSig'] },
+  ]);
+});
+
+test('rowsNotKept: a row that comes back without a storageRef, every compared field as written, names storageRef', () => {
+  const row = signed('20x20', 'a');
+  const { storageRef: _ref, ...back } = row;
+  assert.deepEqual(rowsNotKept([row], [back as Preview]), [
+    { identity: row.identity as string, fields: ['storageRef'] },
+  ]);
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...back, storageRef: null } as unknown as Preview]),
+    [{ identity: row.identity as string, fields: ['storageRef'] }],
+  );
+  // Another row's: a read would not take it for this one.
+  const { storageRef: _other, ...another } = signed('40x40', 'b');
+  assert.deepEqual(rowsNotKept([row], [another as Preview]), []);
+  // The row is there under its ref: nothing was lost.
+  assert.deepEqual(rowsNotKept([row], [back as Preview, row]), []);
+});
+
+test('rowsNotKept: an old row without a ref, of the same size and format, is not this row: it has no signatures', () => {
+  const row = signed('20x20', 'a');
+  // A flat row from before rows had a storageRef, which 0.3.0 left unmigrated.
+  const flat = {
+    key: 'old.jpg',
+    bucket: 'b',
+    sizeKey: row.sizeKey,
+    format: row.format,
+    contentType: row.contentType,
+  } as unknown as Preview;
+  assert.deepEqual(rowsNotKept([row], [flat]), []);
+  // One signature matching does not make it this row either.
+  assert.deepEqual(rowsNotKept([row], [{ ...flat, origin: row.origin }]), []);
+});
+
+for (const field of ['format', 'filters', 'pipeline'] as const) {
+  test(`rowsNotKept: one ref for two rows, one lost ${field}: a tie with the other size key's row goes to the row of this identity`, () => {
+    const scoped = (sizeKey: string): Preview => ({
+      ...signed(sizeKey, 'same'),
+      pipeline: 'x',
+      filters: { blur: 2 },
+      identity: `default:x:${sizeKey}:jpeg:blur:2`,
+    });
+    const a = scoped('20x20');
+    const b = scoped('40x40');
+    const { [field]: _lost, ...lost } = b;
+    // Each differs in one field a read uses, and the other size key's row comes first.
+    assert.deepEqual(rowsNotKept([b], [a, lost as Preview]), [
+      { identity: b.identity as string, fields: [field] },
+    ]);
+  });
+}
+
+test('rowsNotKept: a tie with no identity to break it stays with the first row, and an identity that cannot be read breaks none', () => {
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  const { format: _format, identity: _identity, ...lost } = b;
+  assert.deepEqual(rowsNotKept([b], [a, lost as Preview]), [
+    { identity: b.identity as string, fields: ['sizeKey'] },
+  ]);
+  const { format: _lostFormat, ...kept } = b;
+  assert.deepEqual(
+    rowsNotKept([b], [throwing(a, 'identity'), kept as Preview]),
+    [{ identity: b.identity as string, fields: ['format'] }],
+  );
+  assert.deepEqual(
+    rowsNotKept([b], [a, throwing(kept as Preview, 'identity')]),
+    [{ identity: b.identity as string, fields: ['sizeKey'] }],
+  );
+});
+
+test('rowsWithoutIdentity: names a kept row whose identity is absent or differs, and no other', () => {
+  const row = signed('20x20', 'a');
+  const { identity: _identity, ...absent } = row;
+  assert.deepEqual(rowsWithoutIdentity([row], [row]), []);
+  for (const back of [
+    absent,
+    { ...row, identity: null },
+    { ...row, identity: 'own/20x20' },
+  ]) {
+    assert.deepEqual(rowsWithoutIdentity([row], [back as Preview]), [
+      row.identity,
+    ]);
+  }
+  // Not kept, or not back: the task's fate is decided elsewhere.
+  const { origin: _origin, ...lost } = absent;
+  assert.deepEqual(rowsWithoutIdentity([row], [lost as Preview]), []);
+  assert.deepEqual(rowsWithoutIdentity([row], []), []);
+  assert.deepEqual(rowsWithoutIdentity([row], undefined), []);
+  // One ref for two rows: another size key's identity says nothing about this row.
+  const a = signed('20x20', 'same');
+  const b = signed('40x40', 'same');
+  assert.deepEqual(rowsWithoutIdentity([a, b], [a, b]), []);
+  // Two rows kept for one identity: one that holds it is enough.
+  assert.deepEqual(rowsWithoutIdentity([row], [absent as Preview, row]), []);
+});
+
+// ---- The check must never fail a task whose work is done.
+
+const hostileRef = (): Preview['storageRef'] => ({
+  toJSON() {
+    throw new TypeError('no JSON');
+  },
+  toString() {
+    throw new TypeError('no string');
+  },
+});
+
+const throwing = (row: Preview, field: keyof Preview): Preview =>
+  Object.defineProperty({ ...row }, field, {
+    enumerable: true,
+    get() {
+      throw new TypeError(`no ${field}`);
+    },
+  });
+
+test('a ref whose JSON and String() both throw: an unrelated row, and a row under the written ref, are skipped', () => {
+  const row = signed('20x20', 'a');
+  const hostile = { ...signed('40x40', 'b'), storageRef: hostileRef() };
+  assert.deepEqual(rowsNotKept([row], [hostile, row]), []);
+  assert.deepEqual(rowsWithoutIdentity([row], [hostile, row]), []);
+  // A written row with that ref cannot be judged, whatever came back with it.
+  const written = { ...row, storageRef: hostileRef() };
+  const { encodeSig: _sig, ...lost } = written;
+  assert.deepEqual(rowsNotKept([written], [lost as Preview, hostile]), []);
+  assert.deepEqual(rowsWithoutIdentity([written], [lost as Preview]), []);
+});
+
+test('two refs JSON cannot encode are not one locator: an unrelated row raises nothing', () => {
+  const row: Preview = { ...signed('20x20', 'a'), storageRef: { n: 1n } };
+  const other: Preview = { ...signed('40x40', 'b'), storageRef: { n: 2n } };
+  assert.deepEqual(rowsNotKept([row], [other]), []);
+});
+
+test('a throwing identity getter: an unrelated row, and a row under the written ref, raise nothing', () => {
+  const row = signed('20x20', 'a');
+  const unrelated = throwing(signed('40x40', 'b'), 'identity');
+  const under = throwing(row, 'identity');
+  for (const back of [[unrelated, row], [under], [unrelated]]) {
+    assert.deepEqual(rowsNotKept([row], back), []);
+    assert.deepEqual(rowsWithoutIdentity([row], back), []);
+  }
+});
+
+test('a row whose compared field throws is skipped; the rows beside it still decide', () => {
+  const row = signed('20x20', 'a');
+  const unreadable = throwing(row, 'encodeSig');
+  assert.deepEqual(rowsNotKept([row], [unreadable]), []);
+  assert.deepEqual(rowsNotKept([row], [unreadable, row]), []);
+  const { origin: _origin, ...lost } = row;
+  assert.deepEqual(rowsNotKept([row], [unreadable, lost as Preview]), [
+    { identity: row.identity as string, fields: ['origin'] },
+  ]);
+  // A null among the rows reads as a row that cannot be read.
+  assert.deepEqual(rowsNotKept([row], [null as unknown as Preview, row]), []);
+});
+
+test('nothing written: the rows that came back are never read', () => {
+  const unreadable = {
+    [Symbol.iterator]() {
+      throw new TypeError('no rows');
+    },
+  } as unknown as Preview[];
+  assert.deepEqual(rowsNotKept([], unreadable), []);
+  assert.deepEqual(rowsWithoutIdentity([], unreadable), []);
+});
+
+test('a failed replace with a hostile ref on a reloaded row still returns the store error, and logs its line', async () => {
+  const db = new Error('db');
+  const hostile = { ...signed('40x40', 'b'), storageRef: hostileRef() };
+  const media = fakeMedia({
+    load: async (): Promise<MediaLike> => ({ original, previews: [hostile] }),
+    replacePreviews: async () => {
+      throw db;
+    },
+  });
+  const { recorder, logs } = recorderOver(media);
+  const replacement = preview('20x20', 'new.jpg');
+  const result = await recorder.record('m1', scope, [replacement], {
+    replacing: new Set([replacement.identity as string]),
+  });
+  assert.equal(result.failure?.error, db);
+  assert.equal(logs.error.length, 1);
+  assert.match(String(logs.error[0][0]), /new\.jpg/);
+});
+
+test('a hostile ref on an uploaded row still gets its log line', async () => {
+  const hostile = { ...preview('20x20', 'x'), storageRef: hostileRef() };
+  const media = fakeMedia({
+    load: async (): Promise<MediaLike> => ({ original, previews: [] }),
+    appendPreviews: async () => [],
+  });
+  const { recorder, logs } = recorderOver(media);
+  const result = await recorder.record('m1', scope, [hostile]);
+  assert.equal(result.failure, undefined);
+  assert.match(String(logs.error[0][0]), /cannot be printed/);
+});
+
+test('describeRef: key order does not matter, at any depth, and refs of another value stay apart', () => {
+  const ref = (storageRef: unknown) => ({ storageRef }) as Preview;
+  assert.equal(
+    describeRef(
+      ref({ key: 'k', bucket: 'b', extra: { z: 1, a: [{ y: 1, x: 2 }] } }),
+    ),
+    describeRef(
+      ref({ extra: { a: [{ x: 2, y: 1 }], z: 1 }, bucket: 'b', key: 'k' }),
+    ),
+  );
+  assert.equal(
+    describeRef(ref({ key: 'k', bucket: 'b' })),
+    '{"bucket":"b","key":"k"}',
+  );
+  assert.notEqual(
+    describeRef(ref({ key: 'k', bucket: 'b' })),
+    describeRef(ref({ key: 'k', bucket: 'c' })),
+  );
+  assert.equal(describeRef(ref('plain/key.webp')), '"plain/key.webp"');
+});
+
+test('describeRef: reads a ref as the database stores it, and never throws', () => {
+  const ref = (storageRef: unknown) => ({ storageRef }) as Preview;
+  assert.equal(
+    describeRef(ref({ toJSON: (key: string) => ({ under: key }) })),
+    '{"under":"storageRef"}',
+  );
+  assert.equal(describeRef(ref(1n)), '1');
+  assert.equal(describeRef(ref(undefined)), 'undefined');
+  const unprintable = {
+    toJSON() {
+      throw new Error('no JSON');
+    },
+    toString() {
+      throw new Error('no text');
+    },
+  };
+  assert.equal(
+    describeRef(ref(unprintable)),
+    '(a storage ref that cannot be printed)',
+  );
+  assert.equal(
+    describeRef(null as unknown as Preview),
+    '(a storage ref that cannot be printed)',
+  );
+});
+
+test('rowsNotKept: a ref read back with its keys in another order is the same ref', () => {
+  const row: Preview = {
+    ...preview('20x20', 'a'),
+    origin: 'o1',
+    encodeSig: 's1',
+    storageRef: { bucket: 'b', key: 'a', namespace: 'n' },
+  };
+  const reordered = { key: 'a', bucket: 'b', namespace: 'n' };
+  assert.deepEqual(rowsNotKept([row], [{ ...row, storageRef: reordered }]), []);
+  assert.deepEqual(
+    rowsNotKept([row], [{ ...row, storageRef: reordered, encodeSig: 's2' }]),
+    [{ identity: row.identity, fields: ['encodeSig'] }],
+  );
+  assert.deepEqual(
+    rowsWithoutIdentity(
+      [row],
+      [{ ...row, storageRef: reordered, identity: 'its own form' }],
+    ),
+    [row.identity],
+  );
+});
+
+test('a failed replace does not name as lost an upload the store holds with its keys in another order', async () => {
+  const row: Preview = {
+    ...preview('20x20', 'x'),
+    storageRef: { bucket: 'b', key: 'held' },
+  };
+  const other: Preview = {
+    ...preview('30x30', 'y'),
+    storageRef: { bucket: 'b', key: 'lost' },
+  };
+  const { logger, logs } = recordingLogger();
+  const recorder = new PreviewRecorder({
+    catalog: new Catalog({ config }),
+    logger,
+    media: fakeMedia({
+      load: async () => ({
+        id: 'm1',
+        original,
+        previews: [{ ...row, storageRef: { key: 'held', bucket: 'b' } }],
+      }),
+      replacePreviews: async () => {
+        throw new Error('the answer was lost');
+      },
+    }),
+  });
+
+  const result = await recorder.record('m1', scope, [row, other], {
+    replacing: new Set([row.identity as string, other.identity as string]),
+  });
+
+  assert.ok(result.failure);
+  const line = String(logs.error[0][0]);
+  assert.match(line, /1 of 2 uploaded preview\(s\) are not recorded/);
+  assert.match(line, /"lost"/);
+  assert.doesNotMatch(line, /"held"/);
 });

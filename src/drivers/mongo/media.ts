@@ -13,6 +13,7 @@ export interface MongoMediaUpdateOptions {
   returnDocument?: 'before' | 'after';
   updatePipeline?: boolean;
   lean?: boolean;
+  strictQuery?: false;
 }
 
 /**
@@ -22,7 +23,8 @@ export interface MongoMediaUpdateOptions {
  * its `previews` before the write, as a plain object) or null. replacePreviews sends an update
  * pipeline (an array update) through `findOneAndUpdate`, so host middleware on that hook must
  * accept an array update. When the model also exposes its `schema`, verify() checks it keeps the
- * preview fields the store relies on.
+ * preview fields the store relies on, and with its `base` (the Mongoose instance) replacePreviews
+ * stores the `_id` an appended row would get.
  */
 export interface MongoMediaModel {
   modelName?: string;
@@ -45,6 +47,8 @@ export interface MongoMediaStoreOptions {
 
 // Each append asks for the matched document's id only, not the whole media document.
 const ID_ONLY = { projection: { _id: 1 as const } };
+
+const BACKFILL_OPTIONS = { ...ID_ONLY, strictQuery: false as const };
 
 // A replacement reads the rows it removes from the document as it was before the write, in the
 // same write. Mongoose refuses an update pipeline unless `updatePipeline` is set.
@@ -227,6 +231,47 @@ function previewRowSchema(
   return typeof rows?.path === 'function' ? rows : undefined;
 }
 
+// The `_id` a row appended through `$push` would get: `$push` casts its row, so it gets the
+// schema's automatic id or the default of a declared `_id`. Anything else gets none: no `_id` path
+// (`_id: false`, a mixed or plain array, a model without a schema), `auto: false`, a declared `_id`
+// with no default. The class is the model's own Mongoose instance's, so no import of mongoose here.
+// A default is the host's code, run here on a plain row where Mongoose runs it on a subdocument
+// (`this.get()`, `this.parent()`), so it can fail where an append does not. A failure here gives no
+// `_id`, which is what 0.3.0 wrote, and must not fail a task that writing none would complete.
+function appendedRowId(model: MongoMediaModel, row: Preview): unknown {
+  try {
+    const idPath = previewRowSchema(model)?.path?.('_id') as
+      | { options?: { auto?: unknown; default?: unknown } }
+      | undefined;
+    const made = idPath?.options?.default;
+    if (made !== undefined) {
+      return typeof made === 'function' ? made.call(row, row) : made;
+    }
+    const { base } = model as {
+      base?: { Types?: { ObjectId?: new () => unknown } };
+    };
+    const ObjectId = base?.Types?.ObjectId;
+    return idPath?.options?.auto === true && ObjectId
+      ? new ObjectId()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Mongoose does not cast an update pipeline, so nothing generates an `_id` on the rows a
+// replacement writes, and a row stored without one would read a new random id on every load. Each
+// row gets what an appended row would; an `_id` it already carries stays.
+function withRowIds(model: MongoMediaModel, rows: Preview[]): Preview[] {
+  return rows.map((row) => {
+    if ((row as { _id?: unknown })._id != null) {
+      return row;
+    }
+    const _id = appendedRowId(model, row);
+    return _id == null ? row : ({ ...row, _id } as Preview);
+  });
+}
+
 // Whether a model's preview rows are declared with `strict: false`, read once per model: a schema
 // does not change once its model is compiled.
 const looseRowModels = new WeakMap<object, boolean>();
@@ -285,7 +330,22 @@ const REQUIRED_ROW_PATHS: ReadonlyArray<[path: string, lost: string]> = [
     'encodeSig',
     'a preview would not record the encode settings it was made with',
   ],
+  ['sizeKey', 'a read would never find a preview by its size'],
+  ['format', 'a read would never find a preview by its format'],
+  ['contentType', 'a read could never serve a preview'],
+  ['storageRef', 'a read would have no file to serve'],
 ];
+
+// Whether strict rows declare `path`. Mongoose's path() gives nothing for a shape declared as
+// nested paths, though the rows keep what that shape declares. Only `storageRef` may be such a
+// shape, being the driver's own object: every other required field is a string, so a nested one
+// can never hold what the worker writes.
+function declaresRowPath(rows: Partial<SchemaLike>, path: string): boolean {
+  return (
+    Boolean(rows.path?.(path)) ||
+    (path === 'storageRef' && rows.pathType?.(path) === 'nested')
+  );
+}
 
 export class MongoMediaStore extends MediaStore {
   readonly #model: () => MongoMediaModel;
@@ -311,12 +371,15 @@ export class MongoMediaStore extends MediaStore {
 
   /**
    * Startup check: the media model must resolve, and its preview rows must keep `identity`,
-   * `origin` and `encodeSig`. Only rows declared as sub-documents with a strict shape lose them
-   * (Mongoose strict mode strips an undeclared field from every row: without `identity` every
-   * worker that renders a variant would add its own row, and without the signatures no row could
-   * say what it was made from); a mixed or plain array, or rows with `strict: false`, keep any
-   * field. Such rows without `fit` only get a warning, once per store: freshness still holds
-   * without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
+   * `origin`, `encodeSig`, `sizeKey`, `format`, `contentType` and `storageRef`. Only rows declared
+   * as sub-documents with a strict shape lose them (Mongoose strict mode strips an undeclared field
+   * from every row: without `identity` every worker that renders a variant would add its own row,
+   * without the signatures no row could say what it was made from, and without the last four no
+   * read could serve a row); a mixed or plain array, or rows with `strict: false`, keep any field.
+   * A `storageRef` may be Mixed, or a strict sub-schema or nested paths that declare every key of
+   * the driver's ref: strict rows drop the rest, and this check cannot tell, since the key set is
+   * the driver's own. Such rows without `fit` only get a warning, once per store: freshness still
+   * holds without it. `bytes` and `createdAt` are informational and not checked. A strict `original`
    * without `width` or `height`, or any `original` declaring one with a type that does not read
    * back as a number (not Number, Int32 or Mixed), also gets one warning per store (it does not
    * throw, so a setup that passed before keeps passing): Mongoose drops the dimensions the worker
@@ -334,7 +397,9 @@ export class MongoMediaStore extends MediaStore {
     if (!rows?.path || rows.options?.strict === false) {
       return;
     }
-    const missing = REQUIRED_ROW_PATHS.filter(([path]) => !rows.path?.(path));
+    const missing = REQUIRED_ROW_PATHS.filter(
+      ([path]) => !declaresRowPath(rows, path),
+    );
     if (missing.length > 0) {
       const fields = missing.map(([path]) => `previews.${path}`);
       const named =
@@ -366,17 +431,34 @@ export class MongoMediaStore extends MediaStore {
   ): Promise<Preview[]> {
     const model = this.mediaModel();
     // When the worker measured the original, set its dimensions first: a reader that sees the
-    // previews then sees the dimensions too. Applied whether or not any preview is stored.
+    // previews then sees the dimensions too. Applied whether or not any preview is stored, and only
+    // while the pair is not stored, the rule of storedDims(), so the dimensions of the bytes that
+    // were rendered cannot land on an original the host swapped in meanwhile. The three $type names
+    // are what reads back as a number: 'number' also matches Decimal128, which storedDims() cannot
+    // read. Two originals without dimensions swapped during one render still get the first one's
+    // pair: closing that needs the measured ref in the filter, an exact BSON match that could
+    // silently stop every backfill. `strictQuery: false` keeps the filter whole, as in
+    // MongoLockStore; Mongoose casts `$or` in place, so the filter is built per call.
     if (backfillDims) {
       await model.findOneAndUpdate(
-        { _id: mediaId },
+        {
+          _id: mediaId,
+          $or: [
+            {
+              'original.width': { $not: { $type: ['double', 'int', 'long'] } },
+            },
+            {
+              'original.height': { $not: { $type: ['double', 'int', 'long'] } },
+            },
+          ],
+        },
         {
           $set: {
             'original.width': backfillDims.width,
             'original.height': backfillDims.height,
           },
         },
-        ID_ONLY,
+        BACKFILL_OPTIONS,
       );
     }
     // One conditional write per preview: the filter and the push are atomic on the document, so of
@@ -409,8 +491,10 @@ export class MongoMediaStore extends MediaStore {
    * pipeline, so the rows are cast to the schema first when the model can (strict rows lose the
    * keys their schema does not declare, loose rows keep them, as with appendPreviews; `storageRef`
    * and `filters` are stored as given, cast or not); a value that cannot be cast rejects with
-   * Mongoose's ValidationError before anything is written. The rows it writes carry no
-   * sub-document `_id` (appended rows do); the module reads none.
+   * Mongoose's ValidationError before anything is written. A row it writes stores an `_id` exactly
+   * when an appended row would: the schema's automatic id or the default of a declared `_id`, on a
+   * model that exposes its `schema` and `base`, as any Mongoose model does; when working that out
+   * fails, it stores none.
    */
   async replacePreviews(
     mediaId: string,
@@ -418,7 +502,7 @@ export class MongoMediaStore extends MediaStore {
     rows: Preview[],
   ): Promise<ReplacedPreviews> {
     const model = this.mediaModel();
-    const unique = uniqueRows(rows);
+    const unique = withRowIds(model, uniqueRows(rows));
     // A copy: Mongoose casts into its own array type, and callers get plain arrays.
     let written = unique;
     if (model.castObject) {

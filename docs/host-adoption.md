@@ -209,8 +209,10 @@ export default {
    - Rows without `origin` and `encodeSig` (written by 0.2.x or earlier) are stale: each is served
      until its replacement is stored, and regenerated on its next read, `prewarm()` or
      `generate()`. The old files stay in storage, since the module never deletes them: plan the
-     storage cost and clean them up (from the "resize: replaced … outdated preview(s)" log line, or
-     with a sweep of preview objects no row references; see "Freshness" in `README.md`).
+     storage cost and clean them up (in an `onPreviewReplaced` observer, from the "resize: replaced
+     … outdated preview(s)" log line, or with a sweep of preview objects no row references, deleting
+     only objects older than a day and more than twice `taskTimeoutMs`; see "Freshness" in
+     `README.md`).
    - The same holds after any change of image settings or of a pipeline `version`. That
      regeneration wave shares the queue with new uploads' previews: plan worker capacity for it.
    - Roll out image settings and pipeline versions to every worker at once (or after the old
@@ -275,15 +277,20 @@ export default {
   without `gatesByTask` (SQS). Set it to your worst queue wait, not to the old
   dispatch value.
 - A hand-written media schema that declares preview rows as strict sub-documents must declare
-  `identity`, `origin` and `encodeSig` in them, each `{ type: String }`, and `fit` as
-  `{ type: Boolean }` (the fragment already has them, with `bytes` and `createdAt`);
-  `resizer.verify()` throws `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first three, and logs
-  one warning without `fit`. Rows written earlier have no identity and are
-  not migrated. A custom model-shaped `MongoMediaModel` needs `findById` and `findOneAndUpdate`
-  (and optionally `castObject`), and must accept an update pipeline (statement 2). A
-  `findOneAndUpdate` middleware on the media model runs once per preview write (and once for the
-  dimension backfill) and receives a document with only `_id`, or `null` when the preview was
-  already stored or the media is gone; it also sees the update pipeline of `replacePreviews`.
+  `identity`, `origin`, `encodeSig`, `sizeKey`, `format` and `contentType` in them, each
+  `{ type: String }`, `storageRef` as `{ type: 'Mixed' }`, and `fit` as `{ type: Boolean }` (the
+  fragment already has them, with `bytes` and `createdAt`); `resizer.verify()` throws
+  `RESIZE_MONGO_MEDIA_MODEL_OUTDATED` without the first seven, and logs one warning without `fit`.
+  Rows written earlier have no identity and are not migrated. A replaced row stores an `_id` exactly
+  when an appended one would, unless working it out fails; one replaced under 0.3.0 has none stored
+  and reads a new random one on each load until it is next replaced, so remove it by `identity` or
+  with `invalidate()`. A custom model-shaped `MongoMediaModel` needs `findById` and
+  `findOneAndUpdate` (and optionally `castObject`, and `schema` and `base` for a replaced row's
+  `_id`), and must accept an update pipeline (statement 2). A `findOneAndUpdate` middleware on the
+  media model runs once per preview write (and once for the dimension backfill) and receives a
+  document with only `_id`, or `null` when the preview was already stored or the media is gone, or,
+  for a backfill, when the pair is already stored; it also sees the update pipeline of
+  `replacePreviews`.
 - A custom `MediaStore` must implement `replacePreviews(mediaId, identities, rows)`: in one
   atomic write per media, remove every stored row whose `identity` is in `identities` or belongs
   to one of `rows`, then store `rows`, and resolve with `{ stored, removed }` (`ReplacedPreviews`),
@@ -337,9 +344,9 @@ export default {
   been drained. Task rows from before the gate have no `active` field and are not
   gates, so during a rolling deploy a read can queue a second task for such a media.
   The next `add()` takes over a row that a worker from before the gate completed or
-  dead-lettered (such a worker leaves it active and sets no cooldown). There are no dispatch or worker locks any more: the only lock is the
-  gate lock of a task queue without `gatesByTask` (SQS), which lasts
-  `coordination.gateTtlMs` until a worker extends it. An older SQS worker ignores
+  dead-lettered (such a worker leaves it active and sets no cooldown). There are no dispatch or
+  worker locks any more: the only lock is the gate lock of a task queue without `gatesByTask`
+  (SQS), which lasts `coordination.gateTtlMs` until a worker extends it. An older SQS worker ignores
   the lock's owner, so the gate lock of a task it ran expires only after
   `gateTtlMs`. Lock rows that an older version wrote are never read again and expire
   by their TTL.
@@ -451,8 +458,10 @@ from another original, with other image settings or pipeline `version`, or befor
 regenerate on their next read. So, for a host on an earlier rc:
 
 - plan worker capacity and storage for that wave, which shares the queue with new uploads;
-- clean up the old files, which the module never deletes (from the "resize: replaced …
-  outdated preview(s)" log line, or with a sweep of preview objects no row references);
+- clean up the old files, which the module never deletes (in an `onPreviewReplaced` observer, from
+  the "resize: replaced … outdated preview(s)" log line, or with a sweep of preview objects no row
+  references, deleting only objects older than a day and more than twice `taskTimeoutMs`; see
+  "Freshness" in `README.md`);
 - roll out image settings and pipeline versions with every worker at once (or after the old
   workers have stopped): two worker versions with different settings re-make each other's rows,
   and each replaced preview costs one render, one upload and one orphaned file;

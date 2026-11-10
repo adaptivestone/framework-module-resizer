@@ -106,6 +106,23 @@ describe('resizeMediaSchemaFragment — host usage', () => {
   });
 });
 
+describe('resizeMediaSchemaFragment — preview rows', () => {
+  test('keep the default _id: the fragment declares none, and the compiled rows have an automatic ObjectId', () => {
+    assert.equal('_id' in resizeMediaSchemaFragment.previews[0], false);
+    const schema = new mongoose.Schema({ ...resizeMediaSchemaFragment });
+    const rows = schema.path('previews') as unknown as {
+      schema: mongoose.Schema;
+    };
+    const id = rows.schema.path('_id') as unknown as {
+      instance: string;
+      options: { auto?: boolean };
+    };
+    assert.equal(id.instance, 'ObjectId');
+    assert.equal(id.options.auto, true);
+    assert.ok(rows.schema.path('identity'));
+  });
+});
+
 describe('resizeMediaSchemaFragment — §15/§16 no-import invariant', () => {
   test('the fragment source is import-free (no mongoose, no framework)', () => {
     const src = readFileSync(

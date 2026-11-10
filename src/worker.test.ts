@@ -5,7 +5,9 @@
 // queueing the same failing work. runWorker serves only the Resizers it starts with, claims only their tasks
 // on a task queue that filters claims, and runs each task with its own Resizer's coordination.
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { afterEach, describe, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import type { LockStore } from './contracts/locks.ts';
 import type { ResizeStorage } from './contracts/storage.ts';
@@ -2324,6 +2326,82 @@ describe('worker metrics', () => {
     assert.equal(outcomes[0].labels.pipeline, 'unregistered');
     assert.equal(outcomes[0].labels.outcome, 'dead');
     assert.equal(outcomes[0].context.pipeline, 'ghost');
+  });
+
+  test('a hung task observer of one Resizer: another Resizer on the loop is served, and the stop logs and flushes', async () => {
+    const tasks = new MemoryTaskQueue({
+      timing: { ...fast, taskTimeoutMs: 300 },
+    });
+    const rec = recordingMetrics();
+    const logs = recordingLogger();
+    const a = resizerOn(tasks, { metrics: rec });
+    const b = resizerOn(tasks, { name: 'b', metrics: rec });
+    a.hook('afterTaskComplete', () => new Promise<void>(() => {}));
+    await addTask(tasks);
+    await addTask(tasks, { resizer: 'b' });
+    await workUntil({ logger: logs, resizers: [a, b] }, () =>
+      tasks.rows.every((row) => row.status === 'completed'),
+    );
+    assert.equal(rec.flushes, 1);
+    assert.ok(logs.lines.info.includes('resize worker stopped'));
+    assert.equal(
+      logs.lines.warn.filter((line) => /observers of task/.test(line)).length,
+      1,
+    );
+  });
+
+  test('SIGTERM on a real worker whose task observer never settles: the process exits, and the stop is logged', async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        '--experimental-strip-types',
+        '--import',
+        fileURLToPath(new URL('./testHelpers/noAws.ts', import.meta.url)),
+        fileURLToPath(
+          new URL('./testHelpers/hungObserverWorker.ts', import.meta.url),
+        ),
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let out = '';
+    let err = '';
+    child.stderr.on('data', (chunk) => {
+      err += String(chunk);
+    });
+    const exited = new Promise<number | null>((resolve) => {
+      child.once('exit', (code) => {
+        resolve(code);
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const failed = setTimeout(
+          () => reject(new Error(`the tap never ran: ${out} ${err}`)),
+          20_000,
+        );
+        child.stdout.on('data', (chunk) => {
+          out += String(chunk);
+          if (out.includes('the tap is hanging')) {
+            clearTimeout(failed);
+            resolve();
+          }
+        });
+      });
+      const stopped = performance.now();
+      child.kill('SIGTERM');
+      const code = await Promise.race([
+        exited,
+        new Promise((resolve) => {
+          setTimeout(resolve, 20_000, 'still running');
+        }),
+      ]);
+      assert.equal(code, 0, err);
+      assert.ok(performance.now() - stopped < 8000);
+      assert.match(out, /resize worker stopped/);
+      assert.match(out, /the completed observers of task .+ did not settle/);
+    } finally {
+      child.kill('SIGKILL');
+    }
   });
 
   test("the worker awaits each served sink's flush once when it stops", async () => {

@@ -83,7 +83,8 @@ export class HookBus {
    * Fire an observer. First a fire-and-forget mirror onto the event bus as
    * `resize:<name>` (its own try/catch) so ecosystem subscribers see it BEFORE the taps;
    * then await each registered tap sequentially, error-isolated (log + continue). Return
-   * values are ignored.
+   * values are ignored. The try/catch sees only a listener's synchronous throw: an async listener
+   * that rejects is out of reach here, and kills the process.
    */
   async runObservers(name: ObserverName, ...args: unknown[]): Promise<void> {
     try {

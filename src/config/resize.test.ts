@@ -323,6 +323,31 @@ describe('config split: core validation vs framework loading', () => {
     }
   });
 
+  test('limits.processingTimeoutSeconds is refused above what Sharp accepts, which also keeps it within a timer', () => {
+    const config = makeImageConfig();
+    assert.throws(
+      () =>
+        validateResizeConfig({
+          ...config,
+          limits: { ...config.limits, processingTimeoutSeconds: 3601 },
+        }),
+      (err: ResizeConfigError) => {
+        assert.equal(err.code, 'RESIZE_CONFIG_INVALID');
+        assert.equal(
+          err.message,
+          'resize config: `limits.processingTimeoutSeconds` must be at most 3600, the longest Sharp accepts',
+        );
+        return true;
+      },
+    );
+    assert.ok(
+      validateResizeConfig({
+        ...config,
+        limits: { ...config.limits, processingTimeoutSeconds: 3600 },
+      }),
+    );
+  });
+
   test('limits.failOn defaults to error and rejects anything else', () => {
     assert.equal(defaultResizeConfig.limits.failOn, 'error');
     assert.equal(makeResizeConfig().limits.failOn, 'error');
