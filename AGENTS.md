@@ -298,7 +298,8 @@ rejection from a sharp/S3/mongo failure. Subclasses say what to do — `ResizeSe
 is wrong), `ResizeConfigError` (crash at boot), `ResizeMediaError` (skip this record in the
 request path; `ResizeNoOriginalError` and `ResizeOriginalError` extend it), `ResizeGenerateError`
 (eager produced nothing or queued coverage is incomplete),
-`ResizeStorageError` (transient; retry may help), `ResizeSecurityError` (refusal; never retry).
+`ResizeStorageError` (storage failed; a retry may help, unless `retryable` is `false`: the driver
+refused an upload), `ResizeSecurityError` (refusal; never retry).
 Every instance carries a stable `err.code` and `err.retryable`, and `false` means no later delivery
 of the same input can succeed: a worker dead-letters the task at once. A retryable error gave no
 verdict on the file, and its message can be raw engine text, so answer it in your own words. Use
@@ -435,7 +436,7 @@ message, not the code, so find its row by the message's words.
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` | optional peer not installed — install the packages named, see step 1 |
 | `a Resizer named '…' already exists`, `RESIZE_DUPLICATE_RESIZER` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx --no -- resize-scaffold` |
-| `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: dead-lettered on its first delivery, since no retry can help — replace the original |
+| `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: dead-lettered on its first delivery, since no retry can help — replace the original. Damage the module does not classify is the retryable `RESIZE_SOURCE_DECODE_FAILED` |
 | the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews` — add `...resizeMediaPaths` to the query |
 | reads count `no-original` though `uploadOriginal()` succeeded | step 6 was skipped: the media schema has no `original`, so `save()` dropped it, and `verify()` passes — spread `resizeMediaSchemaFragment`, then store the original again |
 | `resize worker: task … is dead (…)` at `error` | the line holds the code, the reason and the cause — fix the cause first; the next read after `coordination.cooldownMs` queues the media again |

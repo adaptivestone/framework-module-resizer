@@ -336,9 +336,15 @@ export class Uploader {
         ...(opts.namespace === undefined ? {} : { namespace: opts.namespace }),
       });
     } catch (cause) {
+      // A driver's final refusal (an invalid namespace, no private bucket) fails the same upload the
+      // same way, so it stays final here; any other failure gives no verdict on the upload.
       throw new ResizeStorageError(
         `resize uploadOriginal: storage upload failed for ${measured.format} original`,
-        { code: 'RESIZE_ORIGINAL_UPLOAD_FAILED', cause },
+        {
+          code: 'RESIZE_ORIGINAL_UPLOAD_FAILED',
+          retryable: !notRetryable(cause),
+          cause,
+        },
       );
     }
     if (ref === null || ref === undefined) {

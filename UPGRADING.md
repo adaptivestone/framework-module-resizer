@@ -49,10 +49,14 @@ npm i @adaptivestone/framework-module-resize
   such uploads refused (`RESIZE_ORIGINAL_TOO_LARGE`), and tasks for larger stored originals are dead
   at once (`RESIZE_SOURCE_TOO_LARGE`). Raise it too. `verify()` logs a warning naming both. It is not
   signed, so nothing regenerates.
-- **A damaged source now fails.** `limits.failOn` defaults to `'error'`: a cut or unreadable original
-  is dead on its first delivery (`RESIZE_SOURCE_DAMAGED`), where 0.3.0 rendered a garbled preview.
-  `'none'` restores 0.3.0's rendering. Previews already made stay fresh; to find them, see **Damaged
-  originals** in [Operations](./README.md#operations).
+- **A damaged source now fails.** `limits.failOn` defaults to `'error'`: an original the engine
+  refuses as cut or unreadable is dead on its first delivery (`RESIZE_SOURCE_DAMAGED`), where 0.3.0
+  rendered a garbled preview. Not every damaged original is refused: a cut animated GIF can still
+  render the frames it has, and damage the engine reports with an error the module does not classify
+  as damage (usually a cut TIFF, or a PNG cut to its 8 signature bytes) is the retryable
+  `RESIZE_SOURCE_DECODE_FAILED`, retried until `maxAttempts`. `'none'` restores 0.3.0's rendering.
+  Previews already made stay fresh; to find them, see **Damaged originals** in
+  [Operations](./README.md#operations).
 - **`generate()` on a cut JPEG** rejects with `ResizeMediaError`, not `ResizeGenerateError`, so a
   handler catching only `ResizeGenerateError` returns 500 on a user's upload. Catch `ResizeError`, or
   refuse the file at upload with `upload.verify: 'decode'`.
@@ -67,11 +71,18 @@ npm i @adaptivestone/framework-module-resize
   sub-documents must now declare `sizeKey`, `format` and `contentType` (each `{ type: String }`) and
   `storageRef` (`{ type: 'Mixed' }`), beside `identity`, `origin` and `encodeSig`, or `verify()` throws
   `RESIZE_MONGO_MEDIA_MODEL_OUTDATED`. Spreading `resizeMediaSchemaFragment` already has them.
-- **A media store that loses a field now dead-letters.** After its writes the worker compares the rows
-  it reads back. A custom `MediaStore`, a `findOneAndUpdate` middleware or a strict row schema that
-  loses `storageRef`, `origin`, `encodeSig`, `sizeKey`, `format`, `contentType`, `resizer`, `pipeline`
-  or `filters` gets `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), where it rendered again on every
-  read with no log line. Store those fields as given.
+- **A media store that loses a field now dead-letters.** After its writes the worker reloads the
+  media and compares the rows under each `storageRef` it wrote. A custom `MediaStore`, a
+  `findOneAndUpdate` middleware or a strict row schema that loses `contentType`, or loses or changes
+  `origin`, `encodeSig`, `sizeKey`, `format`, `resizer`, `pipeline` or `filters`, gets
+  `RESIZE_MEDIA_ROW_NOT_KEPT` (`retryable: false`), where it rendered again on every read with no
+  log line; so does one that loses `storageRef`. Rows are matched by `storageRef`: with no row under
+  a written ref nothing is reported, as for a lagging reload, unless a row with no ref matches it in
+  every compared field. So a ref changed to another value is caught only when the rows now under the
+  old ref differ in a compared field (two rows' refs swapped), and a lost `storageRef` only when
+  every compared field is as written: losing it with `encodeSig` escapes, while a `resizer`,
+  `pipeline` or `filters` lost at its default compares equal, and `identity` and `fit` are not
+  compared. Store those fields as given.
 - **A `findOneAndUpdate` pre hook on the media model** that calls `this.where({ $or })` replaces the
   store's guard on the dimension write, with no error. Use `this.and([...])`.
 - **A custom model-shaped `MongoMediaModel`** gets `$or`, `$not` and `$type` in the filter of the
