@@ -351,11 +351,13 @@ not gate a publish while the feature is marked preview.
       JPEGs that render the same pixels as at `'none'`. A stricter default now needs a breaking
       0.5.0, so count a larger, mixed sample (several cameras and apps) before proposing one.
 - [ ] **A frontend** handling the empty-`sizes` window, which needs a frontend.
-- [ ] **The npm name `resize-scaffold`:** still free on 2026-11-14. The docs say
-      `npx --no -- resize-scaffold`, which never installs or runs it: with this package missing, npx
-      only looks the name up in the registry and stops with an error. A host that leaves out `--no`
-      would run whatever is published there. Claiming the name is cheap insurance, and only the owner
-      can do it.
+- [x] **The npm name `resize-scaffold`:** claimed on 2026-11-14 by the module's npm owner, with a
+      placeholder (`resize-scaffold@1.0.0`) whose command only prints which package to install and
+      exits with an error. The docs say `npx --no -- resize-scaffold`, which never installs or runs
+      it: with this package missing, npx only looks the name up in the registry and stops with an
+      error. A host that leaves out `--no` now gets the placeholder's message, not someone else's
+      code. Its three files are not in this repository: `npm pack resize-scaffold` fetches them, and
+      a change is a new version published from the same npm account.
 - [x] **The npm page,** after `npm publish`: npmjs.com shows the README up to 64 KiB. For 0.4.0 it
       shows the whole `## Config reference`, which ends at byte 62,888 of 65,536. About 2.6 KiB more
       text above its end pushes its tail off the page, so check again whenever the README grows
