@@ -102,7 +102,9 @@ lock store (`FrameworkLockStore`, the framework's `Lock` model), used only for a
 without `gatesByTask` (the SQS driver, or a custom queue without the flag; the database queue needs
 none), and the app logger and events. Import `src/resizer.ts` wherever you
 need it; a normal static import is fine. To fail at boot on a bad config, call
-`await resizer.verify()` after `await server.init()`. Switch to S3 per environment in
+`await resizer.verify()` after `await server.init()`. It sends no request to storage, so a
+misspelt bucket or wrong credentials still show only at the first upload, adoption or task.
+Switch to S3 per environment in
 `resize.production.ts`:
 
 ```ts
@@ -270,10 +272,13 @@ most custom queues), which takes one gate lock per media, pipeline and queue it 
 [Coordination](#coordination)): without it `verify()` and the worker reject with
 `RESIZE_LOCKS_REQUIRED`, and reads serve stored previews only (see [Drivers](#drivers)).
 `MongoTaskQueue` keeps the gate in its own rows and uses no lock; `mongoParts` still returns a lock
-store, for a Resizer that swaps in `SqsTaskQueue`. With the parts (or `database: { driver:
-'mongo' }`), create the indexes of both models through your migration process (for example
-`await mongoose.connection.models.ResizeTask.createIndexes()`, and the same for `ResizeLock`); the
-module never creates them at runtime (`createResizeModels` sets `autoIndex: false`), and
+store, for a Resizer that swaps in `SqsTaskQueue`. With the parts, or with `database: { driver:
+'mongo' }`, create the indexes of both models through your migration process (for example
+`await mongoose.connection.models.ResizeTask.createIndexes()`, and the same for `ResizeLock`).
+`mongoParts` registers the models when it is called, but `database: { driver: 'mongo' }` registers
+them on first use: call `await resizer.ready()` before that line, or `models.ResizeTask` is
+`undefined` and it throws a `TypeError`. The module never creates the indexes at runtime
+(`createResizeModels` sets `autoIndex: false`), and
 `verify()` rejects with `RESIZE_MONGO_INDEX_MISSING` until the gate index exists (with Mongoose's
 `autoIndex` on it first waits for the model's own index build).
 
