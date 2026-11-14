@@ -111,9 +111,10 @@ only; a pipeline with `variantSteps` always gets the full box. Read `width` and 
    ```
 
 4. Import `src/resizer.ts` wherever you need the Resizer. Call `await getResizer().verify()` after
-   `Server.init()` (or `startServer()`), so a bad config fails at boot. Without it, a config error
-   appears at the first call: `resolve()`, which never throws, logs it once as an `error`, and every
-   read then serves nothing, previews stored earlier included. A task queue passed in code that
+   `Server.init()` (or `startServer()`), so a bad config fails at boot. It sends no request to
+   storage: a misspelt bucket or wrong credentials show at the first upload. Without it, a config
+   error appears at the first call: `resolve()`, which never throws, logs it once as an `error`, and
+   every read then serves nothing, previews stored earlier included. A task queue passed in code that
    cannot be used does not fail calls: it is logged once, reads serve stored previews and queue
    nothing, uploads and `generate()` work, and only `verify()`, `prewarm()` and worker start report
    it.

@@ -335,12 +335,21 @@ The per-task line reads `resize: task … of media … in … ms (… attempt n,
 Nothing below can run in CI or in a build. Each was left out of the build, not skipped silently.
 
 0.4.0 was published on 2026-11-14, after the count on real originals. **Real S3** was skipped by the
-owner's choice, so `adoptOriginal` and the key rule have still never touched real S3: a failure
-there is a 0.4.x fix. The open items below carry to the next release. The push delivery list does
+owner's choice, so `adoptOriginal` and the key rule have run only against local emulators (below):
+a failure on real S3 is a 0.4.x fix. The open items below carry to the next release. The push delivery list does
 not gate a publish while the feature is marked preview.
 
 - [ ] **Real S3:** one adopted object, including a key with a space, through `adoptOriginal` and a
-      worker. Not run for 0.4.0.
+      worker. Not run for 0.4.0; the owner checks it on the first deployment. On 2026-11-14 the
+      published 0.4.0 passed it against two local emulators, moto and SeaweedFS (MinIO's images
+      can no longer be pulled). It passed with keys holding a space, `+`, `%` and non-ASCII
+      letters, through a worker, eager `generate()`, signed URLs and seven documented refusals.
+      An emulator cannot show what real AWS adds:
+      - virtual-hosted URLs;
+      - IAM, where a missing key reads as `AccessDenied` without `s3:ListBucket`, so
+        `adoptOriginal` gives `RESIZE_ORIGINAL_DOWNLOAD_FAILED`, not `RESIZE_STORAGE_NOT_FOUND`;
+      - Block Public Access refusing the public bucket's policy;
+      - throttling and latency.
 - [ ] **Real SQS:** a queued task through a worker.
 - [ ] **Real Lambda:** the [push delivery list](#push-delivery-needs-an-aws-account),
       C2 and C5 first. Until C1, C2, C5 and C8 pass, push delivery stays "preview".
