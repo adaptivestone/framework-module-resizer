@@ -34,8 +34,9 @@ rewritten relative import paths, the optional-subpath loud-fail contract, and th
 need a build of the docs site, on the branch to publish. Run it from the commit you will merge.
 Publish the guide right after the merge, before `npm publish`. Before the merge, the guide's new links
 into this repository's default branch find nothing there. After it, until the guide is published,
-the README's and `AGENTS.md`'s links to the guide's new sections (`adopting`, `serve-local-files`,
-`push-delivery`) land at the top of the page, since the published guide lacks them.
+the README's and `AGENTS.md`'s links to the guide's new sections (in 0.4.0: `adopting`,
+`serve-local-files`, `push-delivery`) land at the top of the page, since the published guide lacks
+them.
 
 ```bash
 cd <docs site checkout> && npm ci && npx --no -- docusaurus build
@@ -86,7 +87,8 @@ developer deciding whether to upgrade: what breaks, what is new, and what they m
 
 ## 3. Publish
 
-**0.4.0:** merge and run the checks that gate the publish first, as [§6](#6-the-owners-checks-for-040) says.
+**Before the next publish:** read [§6](#6-the-owners-checks-for-040). The checks 0.4.0 shipped
+without are still open there.
 
 This is a **scoped** package (`@adaptivestone/…`). npm defaults scoped packages to **restricted**
 (private) access, so the **first** publish must opt into public access explicitly. Neither this
@@ -332,43 +334,32 @@ The per-task line reads `resize: task … of media … in … ms (… attempt n,
 
 Nothing below can run in CI or in a build. Each was left out of the build, not skipped silently.
 
-**Real S3** and **A count on real originals** pass before `npm publish`. Real S3 runs code that has
-never touched real S3 (`adoptOriginal`, the key rule), and the `failOn` default cannot change once
-0.4.0 is on `latest` without a breaking 0.5.0. The push delivery list does not gate the publish,
-since the feature ships marked preview.
+0.4.0 was published on 2026-11-14, after the count on real originals. **Real S3** was skipped by the
+owner's choice, so `adoptOriginal` and the key rule have still never touched real S3: a failure
+there is a 0.4.x fix. The open items below carry to the next release. The push delivery list does
+not gate a publish while the feature is marked preview.
 
 - [ ] **Real S3:** one adopted object, including a key with a space, through `adoptOriginal` and a
-      worker.
+      worker. Not run for 0.4.0.
 - [ ] **Real SQS:** a queued task through a worker.
 - [ ] **Real Lambda:** the [push delivery list](#push-delivery-needs-an-aws-account),
       C2 and C5 first. Until C1, C2, C5 and C8 pass, push delivery stays "preview".
-- [ ] **A count on real originals:** decode a sample at `failOn: 'error'` and `'warning'` and count
-      refusals. If `'warning'` refuses about as few, it is the stricter default worth taking. Note how
-      many of the files `'error'` refuses render the same pixels at `'none'`, such as a PNG with a bad
-      IDAT CRC: those previews looked healthy under 0.3.0.
+- [x] **A count on real originals:** done for 0.4.0, on 540 photos from one folder (464 JPEG,
+      76 PNG). Refused: `'none'` 0, `'truncated'` 1, `'error'` 1, `'warning'` 1, the same cut JPEG
+      each time, which 0.3.0 rendered. No PNG was refused, so none had a bad IDAT checksum. The
+      default stays `'error'`: `'warning'` refused no more here, but the design measured it refusing
+      JPEGs that render the same pixels as at `'none'`. A stricter default now needs a breaking
+      0.5.0, so count a larger, mixed sample (several cameras and apps) before proposing one.
 - [ ] **A frontend** handling the empty-`sizes` window, which needs a frontend.
-- [ ] **The npm name `resize-scaffold`:** free today. The docs say `npx --no -- resize-scaffold`,
-      which never installs or runs it: with this package missing, npx only looks the name up in the
-      registry and stops with an error. A host that leaves out `--no` would run whatever is published
-      there. Claiming the name is cheap insurance, and only the owner can do it.
-- [ ] **The npm page,** after `npm publish`: npmjs.com shows the README up to 64 KiB. Check that it
-      shows the whole `## Config reference`.
-
-### Merging 0.4.0
-
-0.4.0 is six stacked PRs, #71 (`feat/0.4-a-operate`, into `main`) to #76 (`feat/0.4-f-docs-release`).
-Merge them in order, each with a merge commit, not a squash: a squash makes each next PR replay the
-earlier commits. After each merge the next PR's base must be `main`: GitHub retargets it when you
-delete the merged branch. Then confirm that nothing is left out, and tag that merge commit:
-
-```bash
-git checkout main && git pull
-git diff feat/0.4-f-docs-release main   # prints nothing
-git tag v0.4.0                          # main's head: the merge commit of #76
-git push origin v0.4.0
-```
-
-Then publish the guide (§1), run `npm publish` (§3) and publish the GitHub Release (§4).
+- [ ] **The npm name `resize-scaffold`:** still free on 2026-11-14. The docs say
+      `npx --no -- resize-scaffold`, which never installs or runs it: with this package missing, npx
+      only looks the name up in the registry and stops with an error. A host that leaves out `--no`
+      would run whatever is published there. Claiming the name is cheap insurance, and only the owner
+      can do it.
+- [x] **The npm page,** after `npm publish`: npmjs.com shows the README up to 64 KiB. For 0.4.0 it
+      shows the whole `## Config reference`, which ends at byte 62,888 of 65,536. About 2.6 KiB more
+      text above its end pushes its tail off the page, so check again whenever the README grows
+      before that point.
 
 ## Notes
 

@@ -781,7 +781,7 @@ test('the docs say `--no` refuses to install, since npx still looks the name up'
   }
 });
 
-test('RELEASE.md says what gates the 0.4.0 publish, and how to merge and tag it', () => {
+test('RELEASE.md records how 0.4.0 shipped, and what stays open for the next release', () => {
   const text = read('RELEASE.md');
   const section = (heading: string): string => {
     const start = text.indexOf(heading);
@@ -800,13 +800,15 @@ test('RELEASE.md says what gates the 0.4.0 publish, and how to merge and tag it'
   );
   const checks = section("## 6. The owner's checks");
   for (const needle of [
-    '**Real S3** and **A count on real originals** pass before `npm publish`',
+    '0.4.0 was published on 2026-11-14',
+    "**Real S3** was skipped by the owner's choice",
+    '- [ ] **Real S3:**',
+    '- [x] **A count on real originals:**',
     '**The npm page,** after `npm publish`',
     '`## Config reference`',
-    'not a squash',
-    'git diff feat/0.4-f-docs-release main',
-    'git tag v0.4.0',
   ]) {
     assert.ok(checks.includes(needle), needle);
   }
+  // The stacked-PR merge steps were for 0.4.0 only; git history keeps them.
+  assert.doesNotMatch(checks, /### Merging 0\.4\.0/);
 });
