@@ -345,7 +345,10 @@ Pipelines: `beforeSteps` run once on the decoded first frame, and `variantSteps`
 on that size's pixels, after the resize and before the encode; both take a `Raster` and return a
 `Raster`. A variantStep reads the preview's size from `raster.info` and owns its copy of the pixels.
 An optional pipeline `version` (string) is part of each preview row's `encodeSig`: bump it when a
-step's output changes, and the pipeline's stored previews are regenerated on their next read.
+step's output changes, and the pipeline's stored previews are regenerated on their next read. Until
+then the old ones are served, as stale. For a change that must hide them (a blur, a redaction),
+rename the pipeline instead: see
+[Changing what a pipeline removes](./README.md#changing-what-a-pipeline-removes).
 
 ```ts
 import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
@@ -391,8 +394,9 @@ still logged. See [Metrics](./README.md#metrics).
   `beforeStep` can get pixels larger than the source, so multiply coordinates stored in the source's
   units by `meta.scale`.
 - Register every pipeline in `src/resizer.ts`, so the API and the worker both have it
-  (`resizer.hasPipeline(name)` checks). When you add or rename a pipeline, deploy the worker before
-  the API requests it, and the indexes before both.
+  (`resizer.hasPipeline(name)` checks). A process that reads a pipeline it does not know serves its
+  stored previews as fresh, since it cannot judge them. When you add or rename a pipeline, deploy
+  the worker before the API requests it, and the indexes before both.
 - The API and the workers must run the same image settings and pipeline versions: two worker versions
   with different settings re-make each other's rows. Deploy every worker at once, or change the
   settings only after the old workers have stopped.
@@ -402,8 +406,10 @@ still logged. See [Metrics](./README.md#metrics).
   `uploadOriginal()` returns it.
 - Never resize/encode with sharp on the request path: a read (`resolve()`, a DTO builder, a list
   route) never runs it. Eager `generate()` on an upload route is the documented exception.
-- The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
-  must keep its `import '../resizer.ts'`.
+- The scaffolded model/command shims re-use the package: do not vendor or fork them. Extending the
+  command is allowed, for a host check before `super.run()` (see
+  [Operations](./README.md#checking-a-host-precondition-at-worker-start)). The command must keep its
+  `import '../resizer.ts'`.
 - SVG originals stay private, and no original is ever served, so uploaded SVG markup never reaches a
   reader. The module does not sanitize SVG markup.
 - Deleting storage objects is the HOST's job: the module only appends rows, `invalidate` only removes

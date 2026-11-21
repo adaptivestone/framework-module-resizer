@@ -101,7 +101,8 @@ storage, the task queue, the media store (`FrameworkMediaStore`, over the app's 
 lock store (`FrameworkLockStore`, the framework's `Lock` model), used only for a queue on a backend
 without `gatesByTask` (the SQS driver, or a custom queue without the flag; the database queue needs
 none), and the app logger and events. Import `src/resizer.ts` wherever you
-need it; a normal static import is fine. To fail at boot on a bad config, call
+need it; a normal static import is fine (a test runner that evaluates it twice can [reuse the
+first Resizer](#tests-that-evaluate-srcresizerts-twice)). To fail at boot on a bad config, call
 `await resizer.verify()` after `await server.init()`. It sends no request to storage, so a
 misspelt bucket or wrong credentials still show only at the first upload, adoption or task.
 Switch to S3 per environment in
@@ -237,9 +238,9 @@ is `RESIZE_CONFIG_STORAGE_MISSING`; without a `database` section or a `media` op
 `RESIZE_MEDIA_REQUIRED`; a `'database'` queue without a `database` section is
 `RESIZE_CONFIG_INVALID`.
 
-With strict types, a loaded Mongoose document is not a `MediaLike` (Mongoose types the nested
-fields as nullable): pass it as `media: doc as MediaLike` (`import type { MediaLike }` from the
-main entry), or type the model's `original` and `previews` paths with `Original` and `Preview`.
+With strict types, a loaded Mongoose document is not a `MediaLike` (Mongoose types nested fields
+as nullable): pass `media: doc as MediaLike`. One cast is enough; `as unknown as` hides real
+mismatches. Or type the model's `original` and `previews` paths with `Original` and `Preview`.
 
 Wired by hand, the same Resizer is:
 
@@ -805,6 +806,10 @@ may then be rendered on both; the media store keeps one row per preview identity
   effort across a lost lease, an ambiguous enqueue (one lease) and a lock store failure: at worst a
   second task renders the same variants, and the media store keeps one row per preview identity.
 
+The cooldown does not look at why a task died: once it ends, the next read or `prewarm()` queues
+the media again, after a `retryable: false` error too. So a task that cannot succeed runs and dies
+again once per cooldown, for as long as reads keep asking.
+
 There are no per-identity locks. The lease keeps a task with one worker at a time, its token fences
 every write, and `appendPreviews` keeps one row per preview identity when an expired lease lets two
 workers render the same variant.
@@ -897,6 +902,11 @@ Serve `rootDir` with a long-lived cache too, for example
 `express.static(rootDir, { immutable: true, maxAge: '1y' })`: every file name the module writes
 there is new (previews and public raster originals), so a file never changes under its URL; if you
 write your own files under `rootDir`, give each a new name.
+
+It has no `signedUrl` (`storage.signedUrl` is `undefined`). To hand a private original to its owner
+in development, read it with `storage.download(original.storageRef)` in your own route, after your
+access check, and send it with `Content-Disposition: attachment`: an SVG original is untrusted
+markup.
 
 **`S3Storage`**
 
@@ -1803,6 +1813,51 @@ nothing. Remove such a row by `identity` or with `invalidate()`: `row.deleteOne(
 `previews.pull(row._id)` or a `$pull` by the id it read removes nothing, and a `$pull` by the id of
 a lean read removes every row without a stored `_id`. Keying rows by `identity` avoids both.
 
+### Changing what a pipeline removes
+
+A pipeline `version` bump makes every stored preview of the pipeline stale, and a stale preview is
+served until its replacement is stored: while the task waits, while it is retried, and while a dead
+task's cooldown lasts (on an eager-only host, until it calls `generate()`). If the new pipeline keeps
+failing, the old image stays served. That is fine for a new look, but not for a change that must
+hide something: a blur, a redaction, a removed watermark.
+
+For such a change, rename the pipeline instead, for example `avatar` → `avatar-blur`. A preview keeps
+the pipeline it was made in, so the new name never serves an old one: until the worker makes the new
+previews, they are missing, as for a new upload. Like a version bump, a rename renders every preview
+of the pipeline again as it is read.
+
+1. Register the new pipeline beside the old one in `src/resizer.ts`, and deploy the worker before
+   the API.
+2. Change every `resolve()`, `prewarm()` and `generate()` call to the new name, and deploy the API.
+3. Remove the old pipeline from `src/resizer.ts`, and remove its previews: call
+   `invalidate({ media, pipeline: 'avatar' })` for each media, then delete the refs it returns (see
+   **Removing previews** under [Operations](#operations)). The pipeline need not be registered for
+   that. Until its previews are gone, a read that still names the old pipeline serves them as
+   fresh, since it is no longer registered.
+
+To keep the version bump and still hide the old image, drop the stale entries of that pipeline in a
+`formatPublicUrls` tap. Those variants then have no URL until the new previews are stored:
+
+```ts
+// src/resizer.ts
+export const resizer = new FrameworkResizer({
+  pipelines: { avatar: { version: '2', variantSteps: [blurFaces] } },
+  hooks: {
+    // Never serve the old render of 'avatar' while its replacement is pending or failing.
+    formatPublicUrls: (decision) => {
+      decision.ready = decision.ready.filter(
+        (entry) => !(entry.stale && (entry.preview.pipeline ?? 'default') === 'avatar'),
+      );
+      return toMyDto(decision); // your response shape
+    },
+  },
+});
+```
+
+The tap gets the `decision` object that `resolve()` returns, so the entries it drops are gone from
+both. A tap that throws before it drops them leaves them in `decision`, and a caller that then maps
+`decision` itself (`output` is `undefined` when the only tap throws) serves them.
+
 ## Push delivery (preview)
 
 An SQS-triggered Lambda can run queued tasks instead of a worker process, with the same lease,
@@ -2249,6 +2304,104 @@ const refs = await getResizer().invalidate({ media: file, pipeline: 'photo' }); 
   (the module's part is [`adoptOriginal()`](#adoptoriginal)), and domain image analysis such as face
   blurring (in pipeline steps).
 
+### Checking a host precondition at worker start
+
+Before it claims anything, the worker runs the checks of `verify()`. It cannot check what your own
+steps need, such as a logo file or a font. To stop a worker that would fail every task, extend the
+scaffolded command; do not copy it:
+
+```ts
+// src/commands/ResizeWorker.ts
+import { access } from 'node:fs/promises';
+import '../resizer.ts';
+import { ResizeWorker } from '@adaptivestone/framework-module-resize/framework.js';
+
+export default class HostResizeWorker extends ResizeWorker {
+  async run(): Promise<boolean> {
+    await access('assets/watermark.png'); // the watermark step reads it; throws when it is missing
+    return super.run();
+  }
+}
+```
+
+A throw in `run()` comes before the worker starts: the CLI logs its stack and the command resolves
+`false`, so no task is claimed. The file still imports `../resizer.ts` and the module's
+`ResizeWorker`, so `npx --no -- resize-scaffold --check` still passes. Without the framework, run the
+same check before `runWorker()`.
+
+### Stopping a worker
+
+`npm run cli ResizeWorker` stops on SIGTERM or SIGINT, and `runWorker()` when its `signal` aborts.
+Then:
+
+1. Each consume loop stops claiming. A task claimed just as the stop came goes back to the queue
+   without running.
+2. The task in progress starts no new variant. The variants already in progress finish, and their
+   rows are stored. The task then goes back to the queue, and the next worker makes the rest. A task
+   whose variants were all done completes as usual.
+3. All of this stays within the task's `taskTimeoutMs`, counted from the task's start. A task that
+   reaches it fails with `RESIZE_TASK_TIMEOUT`, and that counts as an attempt.
+4. The observers of a task that ended (`afterTaskComplete`, `onTaskFailed`, `onTaskDeadLettered`) get
+   at most 5 s from the later of the stop and the task's end.
+5. The worker flushes the metrics of the Resizers it serves, waiting at most 5 s, and returns.
+
+With several queues, each consume loop does this at the same time. A task given back at a stop does
+not count as an attempt on Mongo. On SQS it does, because SQS counts every receive.
+
+**A SIGKILL** before the end (a stop timeout that runs out, an out-of-memory kill) costs more:
+- The task's lease must run out before another worker can claim it: up to `leaseMs` (60 s by
+  default) of delay.
+- One attempt: the claim counted it, and nothing gives it back. Kills and failures add up: a task
+  delivered more often than `maxAttempts` is dead with `RESIZE_TASK_MAX_ATTEMPTS`.
+- Files it uploaded but did not record stay in storage with no row: a task records its rows once,
+  after its last variant. A sweep finds such files (see [Freshness](#freshness)). Rows it recorded
+  are kept, and the next delivery finds them fresh.
+
+**The stop timeout.** Give the worker's container a stop timeout of at least `taskTimeoutMs` + 20 s:
+10 s of margin for the queue and lock calls at the task's end, and 10 s for the observers and the
+flush. The
+defaults of most platforms are far shorter (Docker 10 s, Kubernetes 30 s), and the default
+`taskTimeoutMs` is 10 minutes. Lower `taskTimeoutMs` to a little above what your slowest task needs,
+which also bounds the stop, or accept the SIGKILL cost above. Most stops take much less: the worker
+waits for the work in progress, not for the whole task.
+
+### Waiting for a task in tests and monitors
+
+A task stores its preview rows first, and only then is it marked `completed` (on SQS, its message is
+deleted). In between, `resolve()` already serves the new previews, and the gate is still held, so a
+read that finds other variants missing queues nothing yet. A test or a monitor that needs the task
+to be over waits on the task, not on its previews: on Mongo, until the `ResizeTask` row of the
+`taskId` that `prewarm()` returned is `completed` (or `dead`); in the worker's process, on any queue,
+for `afterTaskComplete`, which runs after the completion.
+
+### Tests that evaluate `src/resizer.ts` twice
+
+Some test runners evaluate a file more than once in one process. The second `new
+FrameworkResizer(…)` then throws `RESIZE_DUPLICATE_RESIZER`. To reuse the first Resizer instead:
+
+```ts
+// src/resizer.ts
+import { getResizer, ResizeError } from '@adaptivestone/framework-module-resize';
+import { FrameworkResizer } from '@adaptivestone/framework-module-resize/framework.js';
+
+function constructOnce() {
+  try {
+    return getResizer(); // a second evaluation reuses the first Resizer
+  } catch (err) {
+    if (!ResizeError.isResizeError(err) || err.code !== 'RESIZE_NO_RESIZER') throw err;
+    return new FrameworkResizer({ pipelines: { default: {} } });
+  }
+}
+
+export const resizer = constructOnce();
+```
+
+For a named Resizer, pass its name to `getResizer(name)`. No `globalThis` holder is needed: the
+error comes only when the runner keeps one copy of the package, and its registry already holds the
+first Resizer. A runner that loads the package again starts with an empty registry, so the guard
+constructs. The guard also hides a real second construction site, so use it only where a runner
+needs it.
+
 ### `adoptOriginal()`
 
 `resizer.adoptOriginal({ storageRef, maxBytes? })` measures and decodes an object already in storage
@@ -2359,7 +2512,7 @@ Every code the module raises, sorted so you can search for it. `retryable` is wh
 | `RESIZE_DELIVERY_UNSUPPORTED` | — | See the table in [Push delivery (preview)](#troubleshooting). |
 | `RESIZE_DRIVER_CONFLICT` | — | From `new FrameworkResizer()`: every `FrameworkResizer` of the process shares one task queue set, so each must pass the same `drivers.queue` map (the same names, the same driver objects): this one passes another driver, an extra name, or no map where an earlier one passed one (or the reverse). Eager-only Resizers and Resizers with `tasks` in code are compared too; the Resizer's name stays free — pass every `FrameworkResizer` the same `drivers.queue` (e.g. one shared object). A host that passes no `drivers` anywhere is unaffected, and storage drivers may differ per Resizer |
 | `RESIZE_DRIVER_INVALID` | — | At construction (the Resizer's name stays free): the `drivers` option is not an object, has a kind other than `storage`, `database` or `queue`, or an entry has no `fromConfig` function (a queue driver's `backendOf` and `validate` must be functions when given) — the message names `drivers.<kind>.<name>`. On first use: a driver's `fromConfig` returned something that is not the part (a storage needs `upload`, `download`, `publicUrl`; a media store `loadMedia`, `appendPreviews`, `replacePreviews`; a task queue the five required methods and every name of its entries), or a `RoutingTaskQueue` builder resolved something that is not a task queue — fix the driver |
-| `RESIZE_DUPLICATE_RESIZER` | — | From a constructor, `a Resizer named '…' already exists`: each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)`. At worker start, "the `resizers` list names '…' twice": two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
+| `RESIZE_DUPLICATE_RESIZER` | — | From a constructor, `a Resizer named '…' already exists`: each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)`. A test runner that evaluates `src/resizer.ts` twice: see [Tests that evaluate `src/resizer.ts` twice](#tests-that-evaluate-srcresizerts-twice). At worker start, "the `resizers` list names '…' twice": two different Resizers in `runWorker({ resizers })` share a name, so tasks could reach only one — give each its own name |
 | `RESIZE_ENGINE_FORMAT_UNSUPPORTED` | — | From `verify()` or at worker start: a format in `formats`, or an `encode.formats` entry the host wrote or changed, is not in `engine.formats` (a package default outside `formats` that the host left alone is not checked) — remove it, use an id the message lists (ids are matched exactly: `jpg`, not `JPG`), or, for a custom engine, list it in `formats`. An API process that calls `verify()` needs the worker's `engine` too |
 | `RESIZE_ENGINE_INVALID` | `true` | The `engine` option is not an image engine (at construction: it needs `id`, `formats`, `animatedFormats`, `resize` and `encode`), or an engine broke the contract (a resize result of another size, an animation frame with another channel count, an encode result without `data`, `contentType` or a size, with empty `data`, a `contentType` that is not `image/…`, a size other than its raster's, or a `format` that is not a file extension) — fix the engine |
 | `RESIZE_ENQUEUE_CONFIRM_FAILED` | — | A `prewarm()` issue: see [`prewarm()` issues](#prewarm-issues). |

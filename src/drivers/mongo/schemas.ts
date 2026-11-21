@@ -86,7 +86,8 @@ export const resizeTaskIndexes: readonly IndexSpec[] = [
       partialFilterExpression: { status: 'completed' },
     },
   ],
-  // Dead rows are kept ~30 days for inspection and replay.
+  // Dead rows are kept ~30 days for inspection. To run one again, see "Retrying a dead task" in
+  // the README's Operations.
   [
     { deadAt: 1 },
     {
