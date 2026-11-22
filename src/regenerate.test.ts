@@ -2945,6 +2945,11 @@ test('a row whose file a sweep deleted: a read still calls it ready, nothing ren
  * which a loaded machine can stretch past a short taskTimeoutMs. The tests below keep
  * taskTimeoutMs well above it, and their tap waits until the worker has stopped, so it is the tap
  * that outlasts the timeout, not the work before it.
+ *
+ * One wall-clock dependence remains: delivery 1 must reach the tap within taskTimeoutMs (2000 ms).
+ * It needs about 0.3 s on an idle machine, these 300 ms included. So each test records the task row at the tap's
+ * first call and asserts `attempts: 1, status: 'processing'`: a machine too slow fails there, with
+ * that message, and not later with a confusing status.
  */
 const slowFirstDownload = (w: ReturnType<typeof world>) => {
   const download = w.storage.download;
@@ -2968,9 +2973,10 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
     const r = w.resizer(webpConfig(70));
     const { promise: released, resolve: release } =
       Promise.withResolvers<void>();
-    let attemptsAtFirstCall: number | undefined;
+    let firstCall: { attempts: number; status: string } | undefined;
     r.hook(hook, () => {
-      attemptsAtFirstCall ??= w.tasks.rows[0].attempts;
+      const { attempts, status } = w.tasks.rows[0];
+      firstCall ??= { attempts, status };
       return released;
     });
 
@@ -2981,8 +2987,13 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
       release();
     }
 
-    // Delivery 1 reached the tap, so its rows were stored before its timeout.
-    assert.equal(attemptsAtFirstCall, 1);
+    // Delivery 1 reached the tap while it was still processing, so its rows were stored before its
+    // timeout.
+    assert.deepEqual(
+      firstCall,
+      { attempts: 1, status: 'processing' },
+      'delivery 1 did not reach the tap within taskTimeoutMs (2000 ms)',
+    );
     const [row] = w.tasks.rows;
     assert.equal(row.status, 'dead');
     assert.match(String(row.error), /exceeded taskTimeoutMs/);
@@ -3001,10 +3012,11 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
     const { promise: released, resolve: release } =
       Promise.withResolvers<void>();
     let calls = 0;
-    let attemptsAtFirstCall: number | undefined;
+    let firstCall: { attempts: number; status: string } | undefined;
     r.hook(hook, () => {
       calls += 1;
-      attemptsAtFirstCall ??= w.tasks.rows[0].attempts;
+      const { attempts, status } = w.tasks.rows[0];
+      firstCall ??= { attempts, status };
       return released;
     });
 
@@ -3015,8 +3027,13 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
       release();
     }
 
-    // Delivery 1 reached the tap, so its rows were stored before its timeout.
-    assert.equal(attemptsAtFirstCall, 1);
+    // Delivery 1 reached the tap while it was still processing, so its rows were stored before its
+    // timeout.
+    assert.deepEqual(
+      firstCall,
+      { attempts: 1, status: 'processing' },
+      'delivery 1 did not reach the tap within taskTimeoutMs (2000 ms)',
+    );
     const [row] = w.tasks.rows;
     assert.equal(row.status, 'completed');
     assert.equal(row.attempts, 2);
