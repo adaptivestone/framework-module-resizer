@@ -37,7 +37,9 @@ See [Coordination](./README.md#coordination).
 **Previews.** Stored previews are separate per Resizer and per pipeline, so different renderings of
 the same media keep separate previews (rename a pipeline, e.g. `watermark-v2`, to regenerate its
 images). The original is never served: `resolve()` returns stored previews only. To hand the private
-original to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself. A size key
+original to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself
+(`S3Storage` has it; `LocalFsStorage` has none, see **`LocalFsStorage`** under
+[Drivers](./README.md#drivers)). A size key
 does not promise a size: a raster that fits inside a `WxH` box keeps its own size, a width-only or
 height-only size larger than the source enlarges it, and so does a box the source exceeds on one side
 only; a pipeline with `variantSteps` always gets the full box. Read `width` and `height` from
@@ -441,7 +443,7 @@ message, not the code, so find its row by the message's words.
 | `RESIZE_PIPELINE_STEP_INVALID` | a step resolved with something that is not a one-frame `Raster` — return `{ data, info }`, or `sharpToRaster(…)` from a Sharp chain |
 | `formats [...] have no encode.formats entry`, `RESIZE_FORMAT_NOT_CONFIGURED` | use an id the defaults hold, such as `jpeg`, or add `encode.formats.<id>`, or request only configured ids |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` | optional peer not installed — install the packages named, see step 1 |
-| `a Resizer named '…' already exists`, `RESIZE_DUPLICATE_RESIZER` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
+| `a Resizer named '…' already exists`, `RESIZE_DUPLICATE_RESIZER` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)`. A test runner that evaluates `src/resizer.ts` twice: [reuse the first](./README.md#tests-that-evaluate-srcresizerts-twice) |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx --no -- resize-scaffold` |
 | `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: dead-lettered on its first delivery, since no retry can help — replace the original. Damage the module does not classify is the retryable `RESIZE_SOURCE_DECODE_FAILED` |
 | the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews` — add `...resizeMediaPaths` to the query |

@@ -1816,10 +1816,10 @@ a lean read removes every row without a stored `_id`. Keying rows by `identity` 
 ### Changing what a pipeline removes
 
 A pipeline `version` bump makes every stored preview of the pipeline stale, and a stale preview is
-served until its replacement is stored: while the task waits, while it is retried, and while a dead
-task's cooldown lasts (on an eager-only host, until it calls `generate()`). If the new pipeline keeps
-failing, the old image stays served. That is fine for a new look, but not for a change that must
-hide something: a blur, a redaction, a removed watermark.
+served until its replacement is stored. It is served while the task waits, while it is retried, and
+while a dead task's cooldown lasts; on an eager-only host, until the host calls `generate()`. If the
+new pipeline keeps failing, the old image stays served. That is fine for a new look, but not for a
+change that must hide something: a blur, a redaction, a removed watermark.
 
 For such a change, rename the pipeline instead, for example `avatar` → `avatar-blur`. A preview keeps
 the pipeline it was made in, so the new name never serves an old one: until the worker makes the new
@@ -1855,7 +1855,9 @@ export const resizer = new FrameworkResizer({
 ```
 
 The tap gets the `decision` object that `resolve()` returns, so the entries it drops are gone from
-both. A tap that throws before it drops them leaves them in `decision`, and a caller that then maps
+both. It hides a stale preview of that pipeline whatever made it stale (a new original, an
+image-settings change, a row without signatures), so remove it once the new previews are stored. A
+tap that throws before it drops them leaves them in `decision`, and a caller that then maps
 `decision` itself (`output` is `undefined` when the only tap throws) serves them.
 
 ## Push delivery (preview)
@@ -2359,7 +2361,8 @@ not count as an attempt on Mongo. On SQS it does, because SQS counts every recei
 
 **The stop timeout.** Give the worker's container a stop timeout of at least `taskTimeoutMs` + 20 s:
 10 s of margin for the queue and lock calls at the task's end, and 10 s for the observers and the
-flush. The
+flush. Those calls usually take milliseconds, but a lease renewal or a lock store that hangs can
+hold the task's end for up to `min(leaseMs, 30000)` ms (see [Coordination](#coordination)). The
 defaults of most platforms are far shorter (Docker 10 s, Kubernetes 30 s), and the default
 `taskTimeoutMs` is 10 minutes. Lower `taskTimeoutMs` to a little above what your slowest task needs,
 which also bounds the stop, or accept the SIGKILL cost above. Most stops take much less: the worker
@@ -2370,9 +2373,9 @@ waits for the work in progress, not for the whole task.
 A task stores its preview rows first, and only then is it marked `completed` (on SQS, its message is
 deleted). In between, `resolve()` already serves the new previews, and the gate is still held, so a
 read that finds other variants missing queues nothing yet. A test or a monitor that needs the task
-to be over waits on the task, not on its previews: on Mongo, until the `ResizeTask` row of the
-`taskId` that `prewarm()` returned is `completed` (or `dead`); in the worker's process, on any queue,
-for `afterTaskComplete`, which runs after the completion.
+to be over waits on the task, not on its previews. On Mongo, it waits until the `ResizeTask` row of
+the `taskId` that `prewarm()` returned is `completed` (or `dead`). In the worker's process, on any
+queue, it waits for `afterTaskComplete`, which runs after the completion.
 
 ### Tests that evaluate `src/resizer.ts` twice
 
