@@ -1856,9 +1856,9 @@ export const resizer = new FrameworkResizer({
 
 The tap gets the `decision` object that `resolve()` returns, so the entries it drops are gone from
 both. It hides a stale preview of that pipeline whatever made it stale (a new original, an
-image-settings change, a row without signatures), so remove it once the new previews are stored. A
-tap that throws before it drops them leaves them in `decision`, and a caller that then maps
-`decision` itself (`output` is `undefined` when the only tap throws) serves them.
+image-settings change, a row without signatures), so remove the tap once the new previews are
+stored. A tap that throws before it drops them leaves them in `decision`, and a caller that then
+maps `decision` itself (`output` is `undefined` when the only tap throws) serves them.
 
 ## Push delivery (preview)
 

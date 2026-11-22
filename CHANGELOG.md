@@ -1,3 +1,37 @@
+# 0.4.1
+
+Docs and tests only: no shipped behaviour changes, and nothing to change before you upgrade. The
+behaviour changes are planned for 0.5.0.
+
+**Documentation**
+
+- A pipeline change that must hide the old image (a blur, a redaction) renames the pipeline:
+  [Changing what a pipeline removes](./README.md#changing-what-a-pipeline-removes).
+- A host check at worker start extends the scaffolded command:
+  [Checking a host precondition at worker start](./README.md#checking-a-host-precondition-at-worker-start).
+- What a worker does on SIGTERM, and how to size its stop timeout:
+  [Stopping a worker](./README.md#stopping-a-worker).
+- Previews are served before their task is `completed`, so a test waits on the task:
+  [Waiting for a task in tests and monitors](./README.md#waiting-for-a-task-in-tests-and-monitors).
+- A test runner that evaluates `src/resizer.ts` twice reuses the first Resizer:
+  [Tests that evaluate `src/resizer.ts` twice](./README.md#tests-that-evaluate-srcresizerts-twice).
+- A dead task runs again after the cooldown, whatever its error: [Coordination](./README.md#coordination).
+- `LocalFsStorage` has no `signedUrl`, and what to do in development: [Drivers](./README.md#drivers).
+- One `as MediaLike` cast is enough: [Without the framework](./README.md#without-the-framework).
+- `AGENTS.md` links to the rename, worker-start, test-runner and `LocalFsStorage` notes, and says why
+  every process must register every pipeline.
+- The guide: set the framework's body-parser limits at or below `upload.maxBytes`.
+- The guide: a resumable migration checks preview coverage, not only `hasOriginal`.
+
+**Known issues**
+
+- A dead task runs again after each cooldown whatever its error, `retryable: false` included.
+
+**Internal**
+
+- Two `src/regenerate.test.ts` tests that failed under load no longer depend on timing.
+- The comments on dead task rows point at the README's "Retrying a dead task".
+
 # 0.4.0
 
 Before you upgrade, read
