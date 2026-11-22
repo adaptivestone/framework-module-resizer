@@ -21,7 +21,8 @@ behaviour changes are planned for 0.5.0.
 - `AGENTS.md` links to the rename, worker-start, test-runner and `LocalFsStorage` notes, and says why
   every process must register every pipeline.
 - The guide: set the framework's body-parser limits at or below `upload.maxBytes`.
-- The guide: a resumable migration checks preview coverage, not only `hasOriginal`.
+- The guide: a resumable migration selects every media in scope and always calls `generate()`, which
+  skips previews that are already stored and fresh.
 
 **Known issues**
 
