@@ -37,7 +37,9 @@ See [Coordination](./README.md#coordination).
 **Previews.** Stored previews are separate per Resizer and per pipeline, so different renderings of
 the same media keep separate previews (rename a pipeline, e.g. `watermark-v2`, to regenerate its
 images). The original is never served: `resolve()` returns stored previews only. To hand the private
-original to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself. A size key
+original to its owner, call `storage.signedUrl(original.storageRef, ttlSeconds)` yourself
+(`S3Storage` has it; `LocalFsStorage` has none, see **`LocalFsStorage`** under
+[Drivers](./README.md#drivers)). A size key
 does not promise a size: a raster that fits inside a `WxH` box keeps its own size, a width-only or
 height-only size larger than the source enlarges it, and so does a box the source exceeds on one side
 only; a pipeline with `variantSteps` always gets the full box. Read `width` and `height` from
@@ -345,7 +347,10 @@ Pipelines: `beforeSteps` run once on the decoded first frame, and `variantSteps`
 on that size's pixels, after the resize and before the encode; both take a `Raster` and return a
 `Raster`. A variantStep reads the preview's size from `raster.info` and owns its copy of the pixels.
 An optional pipeline `version` (string) is part of each preview row's `encodeSig`: bump it when a
-step's output changes, and the pipeline's stored previews are regenerated on their next read.
+step's output changes, and the pipeline's stored previews are regenerated on their next read. Until
+then the old ones are served, as stale. For a change that must hide them (a blur, a redaction),
+rename the pipeline instead: see
+[Changing what a pipeline removes](./README.md#changing-what-a-pipeline-removes).
 
 ```ts
 import { rasterToSharp, sharpToRaster } from '@adaptivestone/framework-module-resize';
@@ -391,8 +396,9 @@ still logged. See [Metrics](./README.md#metrics).
   `beforeStep` can get pixels larger than the source, so multiply coordinates stored in the source's
   units by `meta.scale`.
 - Register every pipeline in `src/resizer.ts`, so the API and the worker both have it
-  (`resizer.hasPipeline(name)` checks). When you add or rename a pipeline, deploy the worker before
-  the API requests it, and the indexes before both.
+  (`resizer.hasPipeline(name)` checks). A process that reads a pipeline it does not know serves its
+  stored previews as fresh, since it cannot judge them. When you add or rename a pipeline, deploy
+  the worker before the API requests it, and the indexes before both.
 - The API and the workers must run the same image settings and pipeline versions: two worker versions
   with different settings re-make each other's rows. Deploy every worker at once, or change the
   settings only after the old workers have stopped.
@@ -402,8 +408,10 @@ still logged. See [Metrics](./README.md#metrics).
   `uploadOriginal()` returns it.
 - Never resize/encode with sharp on the request path: a read (`resolve()`, a DTO builder, a list
   route) never runs it. Eager `generate()` on an upload route is the documented exception.
-- The scaffolded model/command shims re-use the package: do not vendor or fork them. The command
-  must keep its `import '../resizer.ts'`.
+- The scaffolded model/command shims re-use the package: do not vendor or fork them. Extending the
+  command is allowed, for a host check before `super.run()` (see
+  [Operations](./README.md#checking-a-host-precondition-at-worker-start)). The command must keep its
+  `import '../resizer.ts'`.
 - SVG originals stay private, and no original is ever served, so uploaded SVG markup never reaches a
   reader. The module does not sanitize SVG markup.
 - Deleting storage objects is the HOST's job: the module only appends rows, `invalidate` only removes
@@ -435,7 +443,7 @@ message, not the code, so find its row by the message's words.
 | `RESIZE_PIPELINE_STEP_INVALID` | a step resolved with something that is not a one-frame `Raster` — return `{ data, info }`, or `sharpToRaster(…)` from a Sharp chain |
 | `formats [...] have no encode.formats entry`, `RESIZE_FORMAT_NOT_CONFIGURED` | use an id the defaults hold, such as `jpeg`, or add `encode.formats.<id>`, or request only configured ids |
 | `ERR_MODULE_NOT_FOUND: @aws-sdk/...` at your driver import, or `RESIZE_PEER_MISSING` | optional peer not installed — install the packages named, see step 1 |
-| `a Resizer named '…' already exists`, `RESIZE_DUPLICATE_RESIZER` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)` |
+| `a Resizer named '…' already exists`, `RESIZE_DUPLICATE_RESIZER` | each name is constructed once per process — import the single construction site; elsewhere `getResizer(name)`. A test runner that evaluates `src/resizer.ts` twice: [reuse the first](./README.md#tests-that-evaluate-srcresizerts-twice) |
 | `RESIZE_NO_RESIZER` at worker start | `src/commands/ResizeWorker.ts` does not import `../resizer.ts` — delete it and re-run `npx --no -- resize-scaffold` |
 | `RESIZE_SOURCE_DAMAGED` | the source is cut or unreadable: dead-lettered on its first delivery, since no retry can help — replace the original. Damage the module does not classify is the retryable `RESIZE_SOURCE_DECODE_FAILED` |
 | the warning `resize resolve: media … was loaded without its stored …` (once per Resizer) | the query's projection dropped `original` or `previews` — add `...resizeMediaPaths` to the query |

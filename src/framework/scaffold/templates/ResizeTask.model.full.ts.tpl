@@ -85,7 +85,8 @@ export default class ResizeTask extends BaseModel {
         partialFilterExpression: { status: 'completed' },
       },
     );
-    // Keep dead-letter rows ~30d for inspection/replay (edit expireAfterSeconds to taste).
+    // Keep dead-letter rows ~30d for inspection (edit expireAfterSeconds to taste). To run one
+    // again, see "Retrying a dead task" in the module README's Operations.
     schema.index(
       { deadAt: 1 },
       {

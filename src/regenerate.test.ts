@@ -2940,18 +2940,60 @@ test('a row whose file a sweep deleted: a read still calls it ready, nothing ren
   assert.ok(w.files.has(keyOf(rowsOf(doc)[0])));
 });
 
+/**
+ * Make the first download after the seed wait 300 ms: the delivery's work before its variants,
+ * which a loaded machine can stretch past a short taskTimeoutMs. The tests below keep
+ * taskTimeoutMs well above it, and their tap waits until the worker has stopped, so it is the tap
+ * that outlasts the timeout, not the work before it.
+ *
+ * One wall-clock dependence remains: delivery 1 must reach the tap within taskTimeoutMs (2000 ms).
+ * It needs about 0.3 s on an idle machine, these 300 ms included. So each test records the task row at the tap's
+ * first call and asserts `attempts: 1, status: 'processing'`: a machine too slow fails there, with
+ * that message, and not later with a confusing status.
+ */
+const slowFirstDownload = (w: ReturnType<typeof world>) => {
+  const download = w.storage.download;
+  let downloads = 0;
+  w.storage.download = async (ref, options) => {
+    downloads += 1;
+    if (downloads === 1) {
+      await new Promise((done) => setTimeout(done, 300));
+    }
+    return download(ref, options);
+  };
+};
+
 for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
   test(`a ${hook} tap that outlasts taskTimeoutMs costs the attempt: at maxAttempts 1 the task is dead, with its rows stored`, async () => {
-    const w = world({ timing: { taskTimeoutMs: 100, maxAttempts: 1 } });
+    const w = world({ timing: { taskTimeoutMs: 2000, maxAttempts: 1 } });
     const a = w.resizer(webpConfig(80));
     const doc = await w.seed(a);
     resetResizerForTests();
+    slowFirstDownload(w);
     const r = w.resizer(webpConfig(70));
-    r.hook(hook, () => new Promise((done) => setTimeout(done, 400)));
+    const { promise: released, resolve: release } =
+      Promise.withResolvers<void>();
+    let firstCall: { attempts: number; status: string } | undefined;
+    r.hook(hook, () => {
+      const { attempts, status } = w.tasks.rows[0];
+      firstCall ??= { attempts, status };
+      return released;
+    });
 
     await w.read(r, doc);
-    await w.work(r);
+    try {
+      await w.work(r);
+    } finally {
+      release();
+    }
 
+    // Delivery 1 reached the tap while it was still processing, so its rows were stored before its
+    // timeout.
+    assert.deepEqual(
+      firstCall,
+      { attempts: 1, status: 'processing' },
+      'delivery 1 did not reach the tap within taskTimeoutMs (2000 ms)',
+    );
     const [row] = w.tasks.rows;
     assert.equal(row.status, 'dead');
     assert.match(String(row.error), /exceeded taskTimeoutMs/);
@@ -2961,20 +3003,37 @@ for (const hook of ['onPreviewGenerated', 'onPreviewReplaced'] as const) {
   });
 
   test(`a ${hook} tap that outlasts taskTimeoutMs costs the attempt: the next delivery finds the rows fresh, and the tap does not run again`, async () => {
-    const w = world({ timing: { taskTimeoutMs: 100, maxAttempts: 2 } });
+    const w = world({ timing: { taskTimeoutMs: 2000, maxAttempts: 2 } });
     const a = w.resizer(webpConfig(80));
     const doc = await w.seed(a);
     resetResizerForTests();
+    slowFirstDownload(w);
     const r = w.resizer(webpConfig(70));
+    const { promise: released, resolve: release } =
+      Promise.withResolvers<void>();
     let calls = 0;
+    let firstCall: { attempts: number; status: string } | undefined;
     r.hook(hook, () => {
       calls += 1;
-      return new Promise((done) => setTimeout(done, 400));
+      const { attempts, status } = w.tasks.rows[0];
+      firstCall ??= { attempts, status };
+      return released;
     });
 
     await w.read(r, doc);
-    await w.work(r);
+    try {
+      await w.work(r);
+    } finally {
+      release();
+    }
 
+    // Delivery 1 reached the tap while it was still processing, so its rows were stored before its
+    // timeout.
+    assert.deepEqual(
+      firstCall,
+      { attempts: 1, status: 'processing' },
+      'delivery 1 did not reach the tap within taskTimeoutMs (2000 ms)',
+    );
     const [row] = w.tasks.rows;
     assert.equal(row.status, 'completed');
     assert.equal(row.attempts, 2);
