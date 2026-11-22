@@ -1822,18 +1822,27 @@ new pipeline keeps failing, the old image stays served. That is fine for a new l
 change that must hide something: a blur, a redaction, a removed watermark.
 
 For such a change, rename the pipeline instead, for example `avatar` → `avatar-blur`. A preview keeps
-the pipeline it was made in, so the new name never serves an old one: until the worker makes the new
-previews, they are missing, as for a new upload. Like a version bump, a rename renders every preview
-of the pipeline again as it is read.
+the pipeline it was made in, so the new name never serves an old one: until its new previews are
+stored, they are missing, as for a new upload. Like a version bump, a rename renders every preview
+of the pipeline again: with a worker, as each is read; on an eager-only host, only when `generate()`
+is called (step 2).
 
-1. Register the new pipeline beside the old one in `src/resizer.ts`, and deploy the worker before
-   the API.
-2. Change every `resolve()`, `prewarm()` and `generate()` call to the new name, and deploy the API.
-3. Remove the old pipeline from `src/resizer.ts`, and remove its previews: call
+1. Register the new pipeline beside the old one in `src/resizer.ts`. With a worker, deploy the
+   worker before the API.
+2. Eager-only host: `resolve()` queues nothing, so the new name would show no image. Before you
+   switch reads, run `generate({ media, pipeline: 'avatar-blur', sizes })` for every media in a
+   backfill script. Run it once more after step 3: it skips fresh previews, so it renders only the
+   uploads made in between.
+3. Change every `resolve()`, `prewarm()` and `generate()` call to the new name, and deploy the API.
+4. Remove the old pipeline from `src/resizer.ts`, and remove its previews: call
    `invalidate({ media, pipeline: 'avatar' })` for each media, then delete the refs it returns (see
    **Removing previews** under [Operations](#operations)). The pipeline need not be registered for
    that. Until its previews are gone, a read that still names the old pipeline serves them as
    fresh, since it is no longer registered.
+5. Purge the CDN paths of those refs too. URLs handed out before the rename still show the old
+   image: the module never deletes files, so each file stays until you delete it, and CDNs and
+   browsers can keep a copy for a year (`immutable`, see
+   [Symptoms without a code](#symptoms-without-a-code)).
 
 To keep the version bump and still hide the old image, drop the stale entries of that pipeline in a
 `formatPublicUrls` tap. Those variants then have no URL until the new previews are stored:
@@ -2359,14 +2368,21 @@ not count as an attempt on Mongo. On SQS it does, because SQS counts every recei
   after its last variant. A sweep finds such files (see [Freshness](#freshness)). Rows it recorded
   are kept, and the next delivery finds them fresh.
 
-**The stop timeout.** Give the worker's container a stop timeout of at least `taskTimeoutMs` + 20 s:
-10 s of margin for the queue and lock calls at the task's end, and 10 s for the observers and the
-flush. Those calls usually take milliseconds, but a lease renewal or a lock store that hangs can
-hold the task's end for up to `min(leaseMs, 30000)` ms (see [Coordination](#coordination)). The
-defaults of most platforms are far shorter (Docker 10 s, Kubernetes 30 s), and the default
+**The stop timeout.** Give the worker's container a stop timeout of at least `taskTimeoutMs` +
+`min(leaseMs, 30 s)` + 10 s (10 min 40 s with the defaults):
+- `min(leaseMs, 30 s)` is for the lease renewals and gate calls at the task's end. They usually take
+  milliseconds. When one hangs, the worker waits for them up to that long in all (see
+  [Coordination](#coordination)).
+- 10 s is for the observers and the flush.
+
+The defaults of most platforms are far shorter (Docker 10 s, Kubernetes 30 s), and the default
 `taskTimeoutMs` is 10 minutes. Lower `taskTimeoutMs` to a little above what your slowest task needs,
 which also bounds the stop, or accept the SIGKILL cost above. Most stops take much less: the worker
 waits for the work in progress, not for the whole task.
+
+No setting covers a database or queue that hangs on a task's last queue write (complete, fail or
+give back): that write has no time limit. The task is then recovered as after the SIGKILL above:
+its lease runs out, and another worker claims it.
 
 ### Waiting for a task in tests and monitors
 
@@ -2374,8 +2390,9 @@ A task stores its preview rows first, and only then is it marked `completed` (on
 deleted). In between, `resolve()` already serves the new previews, and the gate is still held, so a
 read that finds other variants missing queues nothing yet. A test or a monitor that needs the task
 to be over waits on the task, not on its previews. On Mongo, it waits until the `ResizeTask` row of
-the `taskId` that `prewarm()` returned is `completed` (or `dead`). In the worker's process, on any
-queue, it waits for `afterTaskComplete`, which runs after the completion.
+each `taskId` in `prewarm()`'s `result.tasks[]` is `completed` (or `dead`). In the worker's process,
+on any queue, it waits for `afterTaskComplete`, which runs after the completion, or for
+`onTaskDeadLettered`, since a task that dies never completes.
 
 ### Tests that evaluate `src/resizer.ts` twice
 
@@ -2399,11 +2416,11 @@ function constructOnce() {
 export const resizer = constructOnce();
 ```
 
-For a named Resizer, pass its name to `getResizer(name)`. No `globalThis` holder is needed: the
-error comes only when the runner keeps one copy of the package, and its registry already holds the
-first Resizer. A runner that loads the package again starts with an empty registry, so the guard
-constructs. The guard also hides a real second construction site, so use it only where a runner
-needs it.
+For a named Resizer, pass the same `name` to `getResizer(name)` and to the constructor. No
+`globalThis` holder is needed: the error comes only when the runner keeps one copy of the package,
+and its registry already holds the first Resizer. A runner that loads the package again starts with
+an empty registry, so the guard constructs. The guard also hides a real second construction site,
+so use it only where a runner needs it.
 
 ### `adoptOriginal()`
 
